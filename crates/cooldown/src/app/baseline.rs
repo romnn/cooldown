@@ -6,8 +6,8 @@
 //! ratchet: baseline once, then the set only shrinks.
 
 use cooldown_core::CoreError;
-use jiff::civil::Date;
 use jiff::Timestamp;
+use jiff::civil::Date;
 
 pub const BASELINE_FILE: &str = ".cooldown-baseline.toml";
 
@@ -138,7 +138,7 @@ impl crate::app::Workspace {
         &self,
         opts: &super::RunOpts,
     ) -> Result<Vec<AckEntry>, CoreError> {
-        use cooldown_core::{check_pin, ArtifactScope, DepScope, Status, TargetContext};
+        use cooldown_core::{ArtifactScope, DepScope, Status, TargetContext, check_pin};
         use futures::stream::{self, StreamExt};
 
         let mut entries = Vec::new();

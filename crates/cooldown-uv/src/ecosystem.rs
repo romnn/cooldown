@@ -3,7 +3,7 @@
 //! `uv`-driven resolution/apply. The core owns the verdict; uv only resolves/applies a window.
 
 use crate::lock::UvLock;
-use crate::pypi::{PyPi, PYPI};
+use crate::pypi::{PYPI, PyPi};
 use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;

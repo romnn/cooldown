@@ -13,14 +13,14 @@ pub mod policy;
 pub mod ports;
 
 pub use error::{CoreError, Diagnostic, DiagnosticKind, Result};
-pub use evaluate::{check_pin, evaluate, ResolveContext};
+pub use evaluate::{ResolveContext, check_pin, evaluate};
 pub use model::*;
 pub use policy::{
-    resolve, ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,
-    ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep, WindowSpec,
+    ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
+    ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve,
 };
 pub use ports::{
-    debug_assert_sorted, normalize_native, Capabilities, Ecosystem, LockSnapshot,
-    NativePolicyLayer, NativeRule, PackageRegistry, RawArtifact, RawRelease, RawWindow,
-    ResolvedPolicy, SyncReport,
+    Capabilities, Ecosystem, LockSnapshot, NativePolicyLayer, NativeRule, PackageRegistry,
+    RawArtifact, RawRelease, RawWindow, ResolvedPolicy, SyncReport, debug_assert_sorted,
+    normalize_native,
 };

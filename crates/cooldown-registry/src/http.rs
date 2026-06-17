@@ -7,7 +7,7 @@
 //! - On a transient failure with a cached copy, the stale copy is served (better than failing an
 //!   `outdated`); with no cache, the transient error propagates so `check` can fail closed.
 
-use crate::cache::{read_entry, write_entry, CacheEntry, PublishStore};
+use crate::cache::{CacheEntry, PublishStore, read_entry, write_entry};
 use cooldown_core::CoreError;
 use jiff::Timestamp;
 use std::collections::HashMap;

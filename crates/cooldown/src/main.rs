@@ -2,7 +2,7 @@
 //! exit with the policy taxonomy's code.
 
 use clap::Parser;
-use cooldown::cli::{run, Cli};
+use cooldown::cli::{Cli, run};
 
 fn main() -> std::process::ExitCode {
     let _ = color_eyre::install();

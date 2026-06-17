@@ -3,7 +3,7 @@
 //! that `cargo update --precise` cannot move are reported as `GraphHeld`/`ResolverConflict` skips.
 
 use crate::cargocmd::Cargo;
-use crate::index::{CratesIoIndex, CRATES_IO};
+use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};

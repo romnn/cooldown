@@ -7,5 +7,5 @@ pub mod gocmd;
 pub mod proxy;
 pub mod semver;
 
-pub use ecosystem::{GoEcosystem, GO_ID};
+pub use ecosystem::{GO_ID, GoEcosystem};
 pub use proxy::GoProxy;

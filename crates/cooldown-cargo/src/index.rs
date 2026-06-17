@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use cooldown_core::{ArtifactId, CoreError, PackageId, PackageRegistry, RawRelease, Version};
-use cooldown_registry::{ttl, SharedHttp};
+use cooldown_registry::{SharedHttp, ttl};
 use jiff::Timestamp;
 
 const DEFAULT_INDEX: &str = "https://index.crates.io";

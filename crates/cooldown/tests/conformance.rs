@@ -455,8 +455,9 @@ async fn explain_applies_registry_scoped_rule() {
         out.meta.effective.decided_by,
         "repo:cooldown.toml:registry=proxy.example"
     );
-    assert!(out
-        .steps
-        .iter()
-        .any(|s| s.applied && s.selector.as_deref() == Some("registry=proxy.example")));
+    assert!(
+        out.steps
+            .iter()
+            .any(|s| s.applied && s.selector.as_deref() == Some("registry=proxy.example"))
+    );
 }

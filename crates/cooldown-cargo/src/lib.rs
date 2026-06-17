@@ -8,5 +8,5 @@ pub mod ecosystem;
 pub mod index;
 pub mod version;
 
-pub use ecosystem::{CargoEcosystem, CARGO_ID};
+pub use ecosystem::{CARGO_ID, CargoEcosystem};
 pub use index::CratesIoIndex;

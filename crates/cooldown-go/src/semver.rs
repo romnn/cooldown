@@ -3,9 +3,9 @@
 //! `PseudoVersionTime`, and `module.SplitPathVersion`. Versions are never compared as lexicographic
 //! strings; publish times are typed instants.
 
+use jiff::Timestamp;
 use jiff::civil;
 use jiff::tz::TimeZone;
-use jiff::Timestamp;
 use regex::Regex;
 use std::cmp::Ordering;
 use std::sync::OnceLock;

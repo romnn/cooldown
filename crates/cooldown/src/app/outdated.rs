@@ -1,10 +1,10 @@
 //! `outdated` — what could update, split into "adoptable now" vs "in cooldown". Reasons over the
 //! candidate set; informational, so per-dep failures never change the exit code.
 
-use super::{age_days, diag_from_error, render_window, Exit, RunOpts, Workspace};
+use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    evaluate, resolve, ArtifactScope, DepScope, Dependency, Diagnostic, Release, ResolveKind,
-    ResolveQuery, TargetContext,
+    ArtifactScope, DepScope, Dependency, Diagnostic, Release, ResolveKind, ResolveQuery,
+    TargetContext, evaluate, resolve,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};

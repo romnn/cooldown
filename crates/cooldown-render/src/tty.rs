@@ -43,11 +43,7 @@ fn status_label(s: OutdatedStatus) -> &'static str {
 
 fn cell_colored(text: impl Into<String>, color: Color, use_color: bool) -> Cell {
     let c = Cell::new(text.into());
-    if use_color {
-        c.fg(color)
-    } else {
-        c
-    }
+    if use_color { c.fg(color) } else { c }
 }
 
 fn fmt_days(d: f64) -> String {

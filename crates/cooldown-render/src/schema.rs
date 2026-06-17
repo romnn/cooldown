@@ -1,7 +1,7 @@
 //! The machine-readable JSON schema for `--json` output, printed by `cooldown schema`.
 
 use crate::model::SCHEMA_VERSION;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A JSON Schema (draft 2020-12) describing the common envelope and the per-command item shapes.
 pub fn json_schema() -> Value {

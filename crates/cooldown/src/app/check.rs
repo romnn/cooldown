@@ -2,10 +2,10 @@
 //! attributable to a dependency you couldn't evaluate forces a non-zero exit. Evaluates the
 //! resolved graph (direct + transitive) by default.
 
-use super::{age_days, diag_from_error, render_window, Exit, RunOpts, Workspace};
+use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    check_pin, resolve, ArtifactScope, DepScope, Dependency, Diagnostic, DiagnosticKind, Origin,
-    Resolution, ResolveKind, ResolveQuery, Status, TargetContext,
+    ArtifactScope, DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution,
+    ResolveKind, ResolveQuery, Status, TargetContext, check_pin, resolve,
 };
 use cooldown_render as render;
 use cooldown_render::tty::check_status_of;

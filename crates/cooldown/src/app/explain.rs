@@ -2,8 +2,8 @@
 //! that applied), and `config` — the fully-resolved policy with the origin of each value. Together
 //! they keep the override system from being a black box.
 
-use super::{round2, Exit, ProjectCtx, RunOpts, Workspace};
-use cooldown_core::{resolve, DepScope, ResolveKind, ResolveQuery};
+use super::{Exit, ProjectCtx, RunOpts, Workspace, round2};
+use cooldown_core::{DepScope, ResolveKind, ResolveQuery, resolve};
 use cooldown_render as render;
 
 pub struct ExplainOutcome {

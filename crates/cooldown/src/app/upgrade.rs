@@ -6,10 +6,10 @@
 //! committing a lock a subsequent `check` would reject.
 
 use super::lock::ProjectLock;
-use super::{diag_from_error, Exit, RunOpts, Workspace};
+use super::{Exit, RunOpts, Workspace, diag_from_error};
 use cooldown_core::{
-    check_pin, evaluate, ArtifactScope, Change, DepScope, Dependency, Diagnostic, MajorKey,
-    PackageId, Plan, Release, SkipReason, Status, TargetContext,
+    ArtifactScope, Change, DepScope, Dependency, Diagnostic, MajorKey, PackageId, Plan, Release,
+    SkipReason, Status, TargetContext, check_pin, evaluate,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};

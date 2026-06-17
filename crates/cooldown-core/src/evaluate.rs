@@ -9,7 +9,7 @@ use crate::model::{
     Candidate, Dependency, EcosystemId, MajorKey, PinVerdict, Release, ReleaseQuality, Status,
     Verdict, Version,
 };
-use crate::policy::{resolve, PolicyLayer, ResolveKind, ResolveQuery};
+use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
 use jiff::Timestamp;
 

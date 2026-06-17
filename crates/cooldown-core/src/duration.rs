@@ -7,7 +7,7 @@
 //! Years and months are rejected as ambiguous — there is no fixed number of days in them.
 
 use crate::error::CoreError;
-use jiff::{civil, tz::TimeZone, SignedDuration, Span, Timestamp};
+use jiff::{SignedDuration, Span, Timestamp, civil, tz::TimeZone};
 use std::str::FromStr;
 
 const SECS_PER_DAY: i64 = 86_400;

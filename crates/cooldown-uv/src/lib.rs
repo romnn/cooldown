@@ -9,5 +9,5 @@ pub mod pypi;
 pub mod uvcmd;
 pub mod version;
 
-pub use ecosystem::{UvEcosystem, UV_ID};
+pub use ecosystem::{UV_ID, UvEcosystem};
 pub use pypi::PyPi;

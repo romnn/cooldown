@@ -6,10 +6,10 @@ use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 use cooldown_cargo::CargoEcosystem;
-use cooldown_core::config::{builtin_default_layer, layer_from_fields, WindowFields};
+use cooldown_core::config::{WindowFields, builtin_default_layer, layer_from_fields};
 use cooldown_core::{
-    ecosystem_id, normalize_native, CoreError, Ecosystem, EcosystemId, Origin, PatternGlob,
-    PolicyLayer, PolicyStack, Project,
+    CoreError, Ecosystem, EcosystemId, Origin, PatternGlob, PolicyLayer, PolicyStack, Project,
+    ecosystem_id, normalize_native,
 };
 use cooldown_go::GoEcosystem;
 use cooldown_registry::{HttpOptions, SharedHttp};
