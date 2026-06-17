@@ -1,0 +1,26 @@
+[package]
+name = "cooldown-core"
+description = "The pure policy core of the cooldown CLI: domain model, evaluate/check_pin/resolve, ports, and config — no concrete I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+jiff.workspace = true
+serde.workspace = true
+toml.workspace = true
+globset.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+camino.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+jiff.workspace = true
+camino.workspace = true

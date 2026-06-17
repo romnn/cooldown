@@ -1,0 +1,26 @@
+//! The pure policy core: domain model, the two decision functions
+//! ([`evaluate`](evaluate::evaluate) and [`check_pin`](evaluate::check_pin)), the policy
+//! [`resolve`](policy::resolve)r, the ports, and config parsing. No concrete I/O, no clock, no
+//! version parsing — everything that decides "is this version too fresh?" lives here, once, for
+//! every ecosystem.
+
+pub mod config;
+pub mod duration;
+pub mod error;
+pub mod evaluate;
+pub mod model;
+pub mod policy;
+pub mod ports;
+
+pub use error::{CoreError, Diagnostic, DiagnosticKind, Result};
+pub use evaluate::{check_pin, evaluate, ResolveContext};
+pub use model::*;
+pub use policy::{
+    resolve, ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,
+    ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep, WindowSpec,
+};
+pub use ports::{
+    debug_assert_sorted, normalize_native, Capabilities, Ecosystem, LockSnapshot,
+    NativePolicyLayer, NativeRule, PackageRegistry, RawArtifact, RawRelease, RawWindow,
+    ResolvedPolicy, SyncReport,
+};

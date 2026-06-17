@@ -1,0 +1,50 @@
+[package]
+name = "cooldown"
+description = "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across ecosystems, from one policy core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+default-run = "cooldown"
+
+[lib]
+name = "cooldown"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cooldown"
+path = "src/main.rs"
+
+[dependencies]
+cooldown-core.workspace = true
+cooldown-registry.workspace = true
+cooldown-render.workspace = true
+cooldown-go.workspace = true
+cooldown-cargo.workspace = true
+cooldown-uv.workspace = true
+clap.workspace = true
+tokio.workspace = true
+color-eyre.workspace = true
+camino.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
+pretty_assertions.workspace = true
+cooldown-core.workspace = true
+cooldown-render.workspace = true
+async-trait.workspace = true
+jiff.workspace = true
+camino.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
