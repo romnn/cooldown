@@ -2,8 +2,8 @@
 //! that applied), and `config` — the fully-resolved policy with the origin of each value. Together
 //! they keep the override system from being a black box.
 
-use super::{round2, Exit, RunOpts, Workspace};
-use cooldown_core::{resolve, ResolveKind, ResolveQuery};
+use super::{round2, Exit, ProjectCtx, RunOpts, Workspace};
+use cooldown_core::{resolve, DepScope, ResolveKind, ResolveQuery};
 use cooldown_render as render;
 
 pub struct ExplainOutcome {
@@ -19,8 +19,12 @@ pub struct ConfigOutcome {
 }
 
 impl Workspace {
-    /// Explain the window for `pkg` in the first in-scope project.
-    pub fn explain(&self, pkg: &str, opts: &RunOpts) -> ExplainOutcome {
+    /// Explain the window for `pkg` in the first in-scope project. If `pkg` is a resolved
+    /// dependency, its registry is looked up from the dependency graph so that registry-scoped
+    /// rules (`[registry."…"]`) participate in the derivation. The lookup is best-effort: a missing
+    /// lock or a tool failure falls back to a registry-less resolution, so `explain` still answers
+    /// for a package that is not (yet) a dependency.
+    pub async fn explain(&self, pkg: &str, opts: &RunOpts) -> ExplainOutcome {
         let Some(pctx) = self.scoped_projects(opts).next() else {
             return ExplainOutcome {
                 meta: empty_meta(),
@@ -29,13 +33,11 @@ impl Workspace {
             };
         };
 
-        // Use the package's registry if it is a known dependency (so registry rules apply); else
-        // resolve with no registry.
-        let registry = None;
+        let registry = self.registry_of(pctx, pkg).await;
         let q = ResolveQuery {
             ecosystem: pctx.ecosystem,
             package: pkg,
-            registry,
+            registry: registry.as_deref(),
             project: &pctx.rel_path,
             kind: ResolveKind::CurrentPin,
         };
@@ -56,7 +58,7 @@ impl Workspace {
 
         let meta = render::ExplainMeta {
             project: pctx.rel_path.to_string(),
-            registry: None,
+            registry,
             effective: render::EffectiveInfo {
                 min_age_days: round2(res.window.effective_min_age_days(self.now)),
                 decided_by: res.window.source(),
@@ -68,6 +70,20 @@ impl Workspace {
             steps,
             exit: Exit::Ok,
         }
+    }
+
+    /// The registry a package resolves to within a project, if it is a known dependency. Reads the
+    /// resolved graph (which may invoke the toolchain but never the registry network); any error or
+    /// a no-match yields `None` so callers degrade to a registry-less resolution.
+    async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
+        let adapter = self.adapter(pctx.ecosystem)?;
+        let deps = adapter
+            .dependencies(&pctx.project, DepScope::Graph)
+            .await
+            .ok()?;
+        deps.into_iter()
+            .find(|d| d.package.name == pkg)
+            .and_then(|d| d.package.registry)
     }
 
     /// The fully-resolved config per project (effective default window + provenance + strict-native).

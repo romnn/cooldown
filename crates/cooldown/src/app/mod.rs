@@ -189,15 +189,7 @@ pub(crate) fn diag_from_error(
     project: &str,
     package: Option<&str>,
 ) -> Diagnostic {
-    use cooldown_core::DiagnosticKind as K;
-    let kind = match err.diagnostic_kind() {
-        "not_found" => K::NotFound,
-        "tool_failed" => K::ToolFailed,
-        "stale_lock" => K::StaleLock,
-        "lockfile_unreadable" => K::LockfileUnreadable,
-        _ => K::Transient,
-    };
-    let mut d = Diagnostic::new(kind, err.to_string())
+    let mut d = Diagnostic::new(err.diagnostic_kind(), err.to_string())
         .with_ecosystem(ecosystem.as_str())
         .with_project(project);
     if let Some(p) = package {

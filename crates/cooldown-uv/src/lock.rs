@@ -114,8 +114,8 @@ pub struct UvLock {
 
 impl UvLock {
     pub fn parse(content: &str) -> Result<Self, CoreError> {
-        let raw: UvLockToml =
-            toml::from_str(content).map_err(|e| CoreError::Parse(format!("uv.lock: {e}")))?;
+        let raw: UvLockToml = toml::from_str(content)
+            .map_err(|e| CoreError::LockUnreadable(format!("uv.lock: {e}")))?;
         Ok(UvLock {
             packages: raw.package,
         })

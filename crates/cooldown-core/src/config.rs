@@ -79,7 +79,7 @@ fn build_window(
         .filter(|b| **b)
         .count();
     if set > 1 {
-        return Err(CoreError::Parse(format!(
+        return Err(CoreError::Config(format!(
             "{ctx}: `min-age`, `latest`, and `freeze` are mutually exclusive; set at most one"
         )));
     }
@@ -120,7 +120,7 @@ fn selector_rule(selector: Selector, s: &SelectorToml, ctx: &str) -> Result<Rule
 /// Parse a config file's contents into a [`PolicyLayer`] at the given origin.
 pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreError> {
     let cfg: ConfigToml = toml::from_str(content)
-        .map_err(|e| CoreError::Parse(format!("{}: {e}", origin.token())))?;
+        .map_err(|e| CoreError::Config(format!("{}: {e}", origin.token())))?;
     let mut layer = PolicyLayer::new(origin.clone());
 
     // Top-level default rule (only if it sets anything).
@@ -143,7 +143,7 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
     if let Some(langs) = cfg.lang {
         for (name, s) in langs {
             let eco = ecosystem_id(&name).ok_or_else(|| {
-                CoreError::Parse(format!(
+                CoreError::Config(format!(
                     "unknown ecosystem `{name}` in [lang.{name}]; recognised: go, rust, python, node"
                 ))
             })?;
@@ -229,7 +229,7 @@ pub fn layer_from_fields(
         .filter(|b| **b)
         .count();
     if set > 1 {
-        return Err(CoreError::Parse(format!(
+        return Err(CoreError::Config(format!(
             "{ctx}: `min-age`, `latest`, and `freeze` are mutually exclusive"
         )));
     }

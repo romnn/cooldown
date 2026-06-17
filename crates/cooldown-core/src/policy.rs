@@ -75,7 +75,7 @@ impl PatternGlob {
             .literal_separator(false)
             .build()
             .map_err(|e| {
-                crate::error::CoreError::Parse(format!("invalid glob {pattern:?}: {e}"))
+                crate::error::CoreError::Config(format!("invalid glob {pattern:?}: {e}"))
             })?;
         Ok(PatternGlob {
             raw: pattern.to_string(),

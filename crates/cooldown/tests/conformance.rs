@@ -402,9 +402,61 @@ async fn explain_traces_the_default_window() {
         root,
     };
     let ws = workspace(fake, Baseline::default());
-    let out = ws.explain("a", &opts());
+    let out = ws.explain("a", &opts()).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.meta.effective.min_age_days, 7.0);
     assert_eq!(out.meta.effective.decided_by, "default");
     assert!(out.steps.iter().any(|s| s.applied && s.field == "default"));
+}
+
+/// `explain` resolves the package's registry from the dependency graph, so a `[registry."…"]`
+/// rule is applied (it would be silently skipped if explain resolved with no registry).
+#[tokio::test]
+async fn explain_applies_registry_scoped_rule() {
+    let (_g, root) = tmp_root();
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)], // dep `a` is published from registry "proxy.example"
+        transitive: vec![],
+        fresh_transitive: None,
+        releases: HashMap::new(),
+        locked: HashMap::new(),
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+
+    // A repo layer with a registry-scoped 30d window — above the 7d default.
+    let mut repo = PolicyLayer::new(Origin::Repo(Utf8PathBuf::from("cooldown.toml")));
+    let mut rule = Rule::new(Selector::Registry("proxy.example".into()));
+    rule.window = ByKind::scalar(WindowSpec::MinAge(jiff::SignedDuration::from_hours(
+        24 * 30,
+    )));
+    repo.rules.push(rule);
+
+    let project = fake.project();
+    let ctx = ProjectCtx {
+        ecosystem: GO,
+        project,
+        rel_path: Utf8PathBuf::from("."),
+        policy: PolicyStack {
+            layers: vec![builtin_default_layer(), repo],
+            strict_native: false,
+        },
+    };
+    let ws = Workspace::new(vec![Box::new(fake)], vec![ctx], now(), Baseline::default());
+
+    let out = ws.explain("a", &opts()).await;
+    assert_eq!(out.exit, Exit::Ok);
+    // The resolved registry is surfaced and the registry rule (30d) beats the 7d default.
+    assert_eq!(out.meta.registry.as_deref(), Some("proxy.example"));
+    assert_eq!(out.meta.effective.min_age_days, 30.0);
+    assert_eq!(
+        out.meta.effective.decided_by,
+        "repo:cooldown.toml:registry=proxy.example"
+    );
+    assert!(out
+        .steps
+        .iter()
+        .any(|s| s.applied && s.selector.as_deref() == Some("registry=proxy.example")));
 }

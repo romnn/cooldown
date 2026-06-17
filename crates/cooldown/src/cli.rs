@@ -174,7 +174,9 @@ pub async fn run(cli: Cli) -> Exit {
 
 fn exit_for_error(e: &CoreError) -> Exit {
     match e {
-        CoreError::Parse(_) => Exit::Usage,
+        // Bad user input (config/CLI/duration/glob) is a usage error; everything else — a stale or
+        // unreadable lock, a malformed registry payload, a tool failure — is an environment fault.
+        CoreError::Config(_) => Exit::Usage,
         CoreError::Io(_) => Exit::Usage,
         _ => Exit::Environment,
     }
@@ -348,7 +350,7 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         .iter()
         .any(|p| opts.lang.is_empty() || opts.lang.contains(&p.ecosystem));
     if mutating_or_explain && !lang_matches_a_project {
-        return Err(CoreError::Parse(
+        return Err(CoreError::Config(
             "--lang matched no detected project in scope".to_string(),
         ));
     }
@@ -412,10 +414,10 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         }
         Command::Upgrade => {
             if g.include_indirect {
-                return Err(CoreError::Parse("`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal".into()));
+                return Err(CoreError::Config("`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal".into()));
             }
             if g.major && g.package.is_empty() && !g.major_all {
-                return Err(CoreError::Parse("`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all".into()));
+                return Err(CoreError::Config("`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all".into()));
             }
             let out = ws.upgrade(&opts).await;
             let env = render::Envelope::new(
@@ -445,7 +447,7 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
             out.exit
         }
         Command::Explain { package } => {
-            let out = ws.explain(&package, &opts);
+            let out = ws.explain(&package, &opts).await;
             let env = render::Envelope::new(
                 "explain",
                 out.exit.is_ok(),
@@ -506,7 +508,7 @@ fn parse_langs(langs: &[String]) -> Result<Vec<EcosystemId>, CoreError> {
         .iter()
         .map(|l| {
             ecosystem_id(l).ok_or_else(|| {
-                CoreError::Parse(format!(
+                CoreError::Config(format!(
                     "unknown --lang `{l}`; recognised: go, rust, python, node"
                 ))
             })

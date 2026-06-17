@@ -88,7 +88,7 @@ impl Baseline {
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 let parsed: BaselineToml = toml::from_str(&content)
-                    .map_err(|e| CoreError::Parse(format!("{path}: {e}")))?;
+                    .map_err(|e| CoreError::Config(format!("{path}: {e}")))?;
                 Ok(Baseline {
                     entries: parsed.acknowledged,
                 })
@@ -121,7 +121,7 @@ impl Baseline {
         let body = toml::to_string_pretty(&BaselineToml {
             acknowledged: self.entries.clone(),
         })
-        .map_err(|e| CoreError::Parse(format!("serialize baseline: {e}")))?;
+        .map_err(|e| CoreError::Io(format!("serialize baseline: {e}")))?;
         Ok(format!("{header}{body}"))
     }
 

@@ -107,7 +107,7 @@ impl Go {
         let mut out = Vec::new();
         let de = serde_json::Deserializer::from_str(&stdout);
         for v in de.into_iter::<ModuleJson>() {
-            let m = v.map_err(|e| CoreError::Parse(format!("go list -m -json: {e}")))?;
+            let m = v.map_err(|e| CoreError::LockUnreadable(format!("go list -m -json: {e}")))?;
             let (replace_path, replace_version) = match &m.replace {
                 Some(r) => (Some(r.path.clone()), r.version.clone()),
                 None => (None, None),

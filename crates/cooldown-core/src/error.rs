@@ -32,9 +32,21 @@ pub enum CoreError {
         stderr: String,
     },
 
-    /// A parse/normalisation failure (bad TOML, malformed duration, unparseable registry payload).
+    /// Invalid configuration or command input: a malformed `cooldown.toml`, a bad duration or
+    /// glob, or a disallowed flag combination. A *usage* error — the user must fix their input.
+    #[error("config error: {0}")]
+    Config(String),
+
+    /// An upstream **registry** payload could not be parsed (a Go `.info`/`@latest` document, a
+    /// PyPI JSON response, or a crates.io sparse-index line). An environment-level data fault.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// The resolved dependency graph could not be read: a malformed `uv.lock`, or unparseable
+    /// `go list`/`cargo metadata` output. Distinct from [`CoreError::StaleLock`] (which is present
+    /// but out of date) — here the lock data itself is unreadable.
+    #[error("unreadable lock: {0}")]
+    LockUnreadable(String),
 
     /// A lockfile/manifest is stale relative to its source, or absent, making evaluation unsound.
     #[error("stale or absent lock: {0}")]
@@ -51,7 +63,7 @@ pub enum CoreError {
 
 impl CoreError {
     /// Whether retrying the operation could plausibly succeed. Network/5xx/429 are transient; a
-    /// `NotFound`, a parse error, or a non-zero tool exit are not.
+    /// `NotFound`, a config or parse error, or a non-zero tool exit are not.
     pub fn is_transient(&self) -> bool {
         matches!(self, CoreError::Transient(_))
     }
@@ -61,15 +73,18 @@ impl CoreError {
         CoreError::Transient(e.into())
     }
 
-    /// A short, stable machine kind for the JSON `Diagnostic.kind` field.
-    pub fn diagnostic_kind(&self) -> &'static str {
+    /// The structured kind for the JSON `Diagnostic.kind` field. Each error class maps to exactly
+    /// one kind, so a consumer never has to disambiguate by message string.
+    pub fn diagnostic_kind(&self) -> DiagnosticKind {
         match self {
-            CoreError::NotFound(_) => "not_found",
-            CoreError::Transient(_) | CoreError::OfflineMiss(_) => "transient",
-            CoreError::Tool { .. } => "tool_failed",
-            CoreError::Parse(_) => "lockfile_unreadable",
-            CoreError::StaleLock(_) => "stale_lock",
-            CoreError::Io(_) => "transient",
+            CoreError::NotFound(_) => DiagnosticKind::NotFound,
+            CoreError::Transient(_) | CoreError::OfflineMiss(_) => DiagnosticKind::Transient,
+            CoreError::Tool { .. } => DiagnosticKind::ToolFailed,
+            CoreError::Config(_) => DiagnosticKind::Config,
+            CoreError::Parse(_) => DiagnosticKind::Parse,
+            CoreError::LockUnreadable(_) => DiagnosticKind::LockfileUnreadable,
+            CoreError::StaleLock(_) => DiagnosticKind::StaleLock,
+            CoreError::Io(_) => DiagnosticKind::Transient,
         }
     }
 }
@@ -115,7 +130,12 @@ pub enum DiagnosticKind {
     Yanked,
     StaleLock,
     ToolFailed,
+    /// A local lockfile/manifest or resolved-graph dump could not be read.
     LockfileUnreadable,
+    /// Invalid configuration or command input (the user must fix it).
+    Config,
+    /// An upstream registry payload could not be parsed.
+    Parse,
 }
 
 impl fmt::Display for DiagnosticKind {
@@ -129,6 +149,8 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::StaleLock => "stale_lock",
             DiagnosticKind::ToolFailed => "tool_failed",
             DiagnosticKind::LockfileUnreadable => "lockfile_unreadable",
+            DiagnosticKind::Config => "config",
+            DiagnosticKind::Parse => "parse",
         };
         f.write_str(s)
     }

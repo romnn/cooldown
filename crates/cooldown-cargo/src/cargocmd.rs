@@ -128,7 +128,7 @@ impl Cargo {
             .run(dir, &["metadata", "--format-version", "1"])
             .await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
-            .map_err(|e| CoreError::Parse(format!("cargo metadata: {e}")))?;
+            .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
         let mut packages = HashMap::new();
         for p in raw.packages {
             packages.insert(

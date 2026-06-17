@@ -9,7 +9,7 @@ pub fn json_schema() -> Value {
         "type": "object",
         "required": ["kind", "message"],
         "properties": {
-            "kind": { "enum": ["transient","not_found","unknown_age","stricter_native","yanked","stale_lock","tool_failed","lockfile_unreadable"] },
+            "kind": { "enum": ["transient","not_found","unknown_age","stricter_native","yanked","stale_lock","tool_failed","lockfile_unreadable","config","parse"] },
             "message": { "type": "string" },
             "ecosystem": { "type": "string" },
             "project": { "type": "string" },

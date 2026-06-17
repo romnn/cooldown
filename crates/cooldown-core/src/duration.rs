@@ -16,9 +16,9 @@ const SECS_PER_DAY: i64 = 86_400;
 pub fn parse_duration(s: &str) -> Result<SignedDuration, CoreError> {
     let trimmed = s.trim();
     let span = Span::from_str(trimmed)
-        .map_err(|e| CoreError::Parse(format!("invalid duration {trimmed:?}: {e}")))?;
+        .map_err(|e| CoreError::Config(format!("invalid duration {trimmed:?}: {e}")))?;
     if span.get_years() != 0 || span.get_months() != 0 {
-        return Err(CoreError::Parse(format!(
+        return Err(CoreError::Config(format!(
             "duration {trimmed:?} uses years/months, which have no fixed length; use days, weeks, hours, minutes, or seconds"
         )));
     }
@@ -28,7 +28,7 @@ pub fn parse_duration(s: &str) -> Result<SignedDuration, CoreError> {
         + span.get_minutes() * 60
         + span.get_seconds();
     if secs < 0 {
-        return Err(CoreError::Parse(format!(
+        return Err(CoreError::Config(format!(
             "duration {trimmed:?} is negative; a window must be non-negative"
         )));
     }
@@ -43,14 +43,14 @@ pub fn parse_freeze(s: &str) -> Result<Timestamp, CoreError> {
         return Ok(ts);
     }
     let date = civil::Date::from_str(trimmed).map_err(|e| {
-        CoreError::Parse(format!(
+        CoreError::Config(format!(
             "invalid freeze cutoff {trimmed:?}: expected an RFC3339 instant or a YYYY-MM-DD date ({e})"
         ))
     })?;
     date.at(0, 0, 0, 0)
         .to_zoned(TimeZone::UTC)
         .map(|z| z.timestamp())
-        .map_err(|e| CoreError::Parse(format!("invalid freeze date {trimmed:?}: {e}")))
+        .map_err(|e| CoreError::Config(format!("invalid freeze date {trimmed:?}: {e}")))
 }
 
 /// Render a [`SignedDuration`] as a float number of days for display (the JSON `minAgeDays`).
