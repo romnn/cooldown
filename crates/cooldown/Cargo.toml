@@ -3,7 +3,6 @@ name = "cooldown"
 description = "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across ecosystems, from one policy core."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -11,6 +10,9 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 default-run = "cooldown"
+
+[lints]
+workspace = true
 
 [lib]
 name = "cooldown"

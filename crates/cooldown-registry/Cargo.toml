@@ -3,11 +3,13 @@ name = "cooldown-registry"
 description = "Shared HTTP client, on-disk metadata cache (with a monotonic publish-time floor), and per-host concurrency for cooldown registry adapters."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 cooldown-core.workspace = true

@@ -3,13 +3,15 @@ name = "cooldown-core"
 description = "The pure policy core of the cooldown CLI: domain model, evaluate/check_pin/resolve, ports, and config — no concrete I/O."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 jiff.workspace = true

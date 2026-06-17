@@ -3,11 +3,13 @@ name = "cooldown-render"
 description = "Presentation for the cooldown CLI: the stable JSON envelope and colorful TTY tables."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 cooldown-core.workspace = true

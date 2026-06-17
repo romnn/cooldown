@@ -3,11 +3,13 @@ name = "cooldown-uv"
 description = "Python/uv ecosystem adapter for cooldown: uv.lock + PyPI (PEP 700) publish times, with uv-driven resolution/apply."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 cooldown-core.workspace = true

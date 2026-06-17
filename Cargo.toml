@@ -4,14 +4,35 @@ members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.96"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/romnn/cooldown"
 homepage = "https://github.com/romnn/cooldown"
 authors = ["romnn <roman@airtype.de>"]
 keywords = ["supply-chain", "security", "dependencies", "cooldown", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+indexing_slicing = "deny"
 
 [workspace.dependencies]
 # Internal crates
@@ -26,10 +47,10 @@ cooldown-uv = { path = "crates/cooldown-uv", version = "0.1.0" }
 jiff = { version = "0.2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 async-trait = "0.1"
 thiserror = "2"
 color-eyre = "0.6"
@@ -45,7 +66,3 @@ comfy-table = "7"
 insta = { version = "1", features = ["json", "redactions"] }
 tempfile = "3"
 pretty_assertions = "1"
-
-[profile.release]
-lto = "thin"
-strip = true
