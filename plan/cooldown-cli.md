@@ -263,7 +263,7 @@ Raising the whole repo to 14 days is one line of `cooldown.toml`. Everything pas
   own child `cooldown.toml`, not just the root's. The walk auto-stops at the repo root, resolved
   robustly: a `.git` _directory_, a `.git` _file_ (worktrees/submodules — follow to the real
   worktree root), else the nearest ancestor with a `cooldown.toml`, else `$HOME`. `cooldown config`
-  prints the detected root (mis-detecting it would silently drop an org floor).
+  prints the detected root (misdetecting it would silently drop an org floor).
 - **Native** — each project's own manifest config, read in place, normalized once by the core, and
   scoped to **that project** (never merged into a shared native layer, so one project's native
   default can't leak into a sibling).

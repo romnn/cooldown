@@ -184,14 +184,14 @@ impl Workspace {
                         kind: ResolveKind::CurrentPin,
                     };
                     let res = resolve(&pctx.policy.layers, &q, self.now);
-                    if let Some(nd) = stricter_native_days(&res) {
+                    if let Some(native_days) = stricter_native_days(&res) {
                         warnings.push(
                             Diagnostic::new(
                                 DiagnosticKind::StricterNative,
                                 format!(
                                     "repo/global policy ({:.0}d) overrides a stricter native min-age ({:.0}d)",
                                     res.window.effective_min_age_days(self.now),
-                                    nd
+                                    native_days
                                 ),
                             )
                             .with_ecosystem(pctx.ecosystem.as_str())

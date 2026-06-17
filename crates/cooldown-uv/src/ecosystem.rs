@@ -116,7 +116,7 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
     }
     if let Some(table) = uv.get("exclude-newer-package").and_then(|v| v.as_table()) {
         for (pkg, val) in table {
-            // One unparseable package pattern must not discard the entire native policy.
+            // One unparsable package pattern must not discard the entire native policy.
             let Ok(glob) = cooldown_core::PatternGlob::new(pkg) else {
                 continue;
             };

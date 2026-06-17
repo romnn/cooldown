@@ -462,7 +462,7 @@ mod tests {
             ReleaseQuality::Incompatible
         );
         assert_eq!(
-            classify_quality("v0.0.0-20191109021931-daa7c04131f5"),
+            classify_quality("v0.0.0-20191109021931-daa7c04131f5"), // spellcheck:ignore-line
             ReleaseQuality::Pseudo
         );
     }

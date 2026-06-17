@@ -42,7 +42,7 @@ pub enum CoreError {
     #[error("parse error: {0}")]
     Parse(String),
 
-    /// The resolved dependency graph could not be read: a malformed `uv.lock`, or unparseable
+    /// The resolved dependency graph could not be read: a malformed `uv.lock`, or unparsable
     /// `go list`/`cargo metadata` output. Distinct from [`CoreError::StaleLock`] (which is present
     /// but out of date) — here the lock data itself is unreadable.
     #[error("unreadable lock: {0}")]

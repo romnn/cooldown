@@ -214,25 +214,25 @@ fn compare_prerelease(x: &str, y: &str) -> Ordering {
         // drop a leading '-' or '.'
         x = &x[1..];
         y = &y[1..];
-        let dx = next_ident(x);
-        let dy = next_ident(y);
-        if dx != dy {
-            let ix = is_digits(dx);
-            let iy = is_digits(dy);
-            if ix != iy {
-                return if ix {
+        let ident_x = next_ident(x);
+        let ident_y = next_ident(y);
+        if ident_x != ident_y {
+            let x_is_numeric = is_digits(ident_x);
+            let y_is_numeric = is_digits(ident_y);
+            if x_is_numeric != y_is_numeric {
+                return if x_is_numeric {
                     Ordering::Less
                 } else {
                     Ordering::Greater
                 };
             }
-            if ix {
-                return compare_int(dx, dy);
+            if x_is_numeric {
+                return compare_int(ident_x, ident_y);
             }
-            return dx.cmp(dy);
+            return ident_x.cmp(ident_y);
         }
-        x = &x[dx.len()..];
-        y = &y[dy.len()..];
+        x = &x[ident_x.len()..];
+        y = &y[ident_y.len()..];
         if x.is_empty() || y.is_empty() {
             break;
         }
@@ -414,14 +414,14 @@ mod tests {
 
     #[test]
     fn pseudo_detection_and_time() {
-        assert!(is_pseudo("v0.0.0-20191109021931-daa7c04131f5"));
-        assert!(is_pseudo("v1.2.4-0.20191109021931-daa7c04131f5"));
-        assert!(is_pseudo("v1.2.3-pre.0.20191109021931-daa7c04131f5"));
-        assert!(is_pseudo("v2.0.0-20191109021931-daa7c04131f5+incompatible"));
+        assert!(is_pseudo("v0.0.0-20191109021931-daa7c04131f5")); // spellcheck:ignore-line
+        assert!(is_pseudo("v1.2.4-0.20191109021931-daa7c04131f5")); // spellcheck:ignore-line
+        assert!(is_pseudo("v1.2.3-pre.0.20191109021931-daa7c04131f5")); // spellcheck:ignore-line
+        assert!(is_pseudo("v2.0.0-20191109021931-daa7c04131f5+incompatible")); // spellcheck:ignore-line
         assert!(!is_pseudo("v1.2.3"));
         assert!(!is_pseudo("v1.2.3-pre"));
 
-        let t = pseudo_time("v0.0.0-20191109021931-daa7c04131f5").unwrap();
+        let t = pseudo_time("v0.0.0-20191109021931-daa7c04131f5").unwrap(); // spellcheck:ignore-line
         assert_eq!(t.to_string(), "2019-11-09T02:19:31Z");
         assert_eq!(pseudo_time("v1.2.3"), None);
     }

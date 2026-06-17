@@ -64,7 +64,7 @@ impl AckEntry {
                     let today = now.to_zoned(jiff::tz::TimeZone::UTC).date();
                     until >= today
                 }
-                Err(_) => true, // unparseable `until` errs on the side of keeping the ack
+                Err(_) => true, // unparsable `until` errs on the side of keeping the ack
             },
         }
     }
