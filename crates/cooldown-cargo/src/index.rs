@@ -8,6 +8,11 @@ use cooldown_registry::{SharedHttp, ttl};
 use jiff::Timestamp;
 
 const DEFAULT_INDEX: &str = "https://index.crates.io";
+
+/// The registry name attached to crates.io [`PackageId`]s.
+///
+/// Used as the registry component of a [`PackageId`] so that releases resolved
+/// here are unambiguously tagged as coming from crates.io.
 pub const CRATES_IO: &str = "crates.io";
 
 /// A crates.io sparse-index client over the shared HTTP layer.
@@ -27,6 +32,11 @@ struct IndexLine {
 }
 
 impl CratesIoIndex {
+    /// Creates a client for the default crates.io sparse index over the shared HTTP layer.
+    ///
+    /// The base URL is `https://index.crates.io`; all fetches reuse the caching and
+    /// rate-limiting of the supplied [`SharedHttp`].
+    #[must_use]
     pub fn new(http: SharedHttp) -> Self {
         CratesIoIndex {
             http,
@@ -34,6 +44,8 @@ impl CratesIoIndex {
         }
     }
 
+    /// Returns the registry name ([`CRATES_IO`]) this index publishes under.
+    #[must_use]
     pub fn registry_name(&self) -> String {
         CRATES_IO.to_string()
     }

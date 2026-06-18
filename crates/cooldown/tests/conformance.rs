@@ -2,6 +2,10 @@
 //! canned data, asserting the universal invariants and the cross-cutting behaviours (the check
 //! gate, baseline acknowledgement, and the upgrade trial-rollback that never commits a violating
 //! lock).
+#![allow(
+    clippy::unwrap_used,
+    reason = "integration-test helpers and the in-file fake adapter; unwrap on known-good fixtures is the intended immediate test failure (clippy.toml sets allow-unwrap-in-tests)"
+)]
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -24,7 +28,7 @@ fn rel(v: &str, ord: u32, pub_at: Option<&str>, kind: Option<UpdateKind>) -> Rel
     Release {
         version: Version::new(v),
         order: ReleaseOrder(ord.to_be_bytes().to_vec()),
-        major: MajorKey("".into()),
+        major: MajorKey(String::new()),
         kind_from_current: kind,
         published_at: pub_at.map(ts),
         yanked: false,
@@ -90,10 +94,10 @@ impl Ecosystem for FakeEco {
         let mut out = self.direct.clone();
         if scope == DepScope::Graph {
             out.extend(self.transitive.clone());
-            if self.state.lock().unwrap().fresh_transitive_present {
-                if let Some(ft) = &self.fresh_transitive {
-                    out.push(ft.clone());
-                }
+            if self.state.lock().unwrap().fresh_transitive_present
+                && let Some(ft) = &self.fresh_transitive
+            {
+                out.push(ft.clone());
             }
         }
         Ok(out)
@@ -404,7 +408,7 @@ async fn explain_traces_the_default_window() {
     let ws = workspace(fake, Baseline::default());
     let out = ws.explain("a", &opts()).await;
     assert_eq!(out.exit, Exit::Ok);
-    assert_eq!(out.meta.effective.min_age_days, 7.0);
+    assert!((out.meta.effective.min_age_days - 7.0).abs() < 1e-9);
     assert_eq!(out.meta.effective.decided_by, "default");
     assert!(out.steps.iter().any(|s| s.applied && s.field == "default"));
 }
@@ -450,7 +454,7 @@ async fn explain_applies_registry_scoped_rule() {
     assert_eq!(out.exit, Exit::Ok);
     // The resolved registry is surfaced and the registry rule (30d) beats the 7d default.
     assert_eq!(out.meta.registry.as_deref(), Some("proxy.example"));
-    assert_eq!(out.meta.effective.min_age_days, 30.0);
+    assert!((out.meta.effective.min_age_days - 30.0).abs() < 1e-9);
     assert_eq!(
         out.meta.effective.decided_by,
         "repo:cooldown.toml:registry=proxy.example"

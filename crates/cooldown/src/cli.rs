@@ -18,6 +18,9 @@ use cooldown_uv::UvEcosystem;
 use std::io::IsTerminal;
 use std::time::Duration;
 
+/// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
+///
+/// Construct it with clap's [`Parser`] (`Cli::parse()`) and hand it to [`run`].
 #[derive(Parser)]
 #[command(
     name = "cooldown",
@@ -63,6 +66,10 @@ enum Command {
 }
 
 #[derive(Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI flags; clap maps each bool to a --flag"
+)]
 struct GlobalArgs {
     /// Window: "7d", "2 weeks", "36h", ISO-8601 "P7D" (default 7d).
     #[arg(long, global = true, value_name = "DUR", conflicts_with_all = ["latest", "freeze"])]
@@ -138,7 +145,7 @@ struct GlobalArgs {
     /// Resolve and print the plan; never mutate.
     #[arg(long = "dry-run", short = 'n', global = true, env = "COOLDOWN_DRY_RUN")]
     dry_run: bool,
-    /// Cache only; cache misses become UnknownAge (never a false "ok").
+    /// Cache only; cache misses become `UnknownAge` (never a false "ok").
     #[arg(long, global = true, env = "COOLDOWN_OFFLINE")]
     offline: bool,
     /// Ignore the local cache; always hit the registry (use in CI gates).
@@ -161,7 +168,10 @@ struct GlobalArgs {
     json: bool,
 }
 
-/// Parse and run, returning the process exit.
+/// Run a parsed [`Cli`], returning the process [`Exit`].
+///
+/// Any [`CoreError`] that escapes the dispatch is printed to stderr and mapped to an exit by its
+/// kind, so this function itself is infallible.
 pub async fn run(cli: Cli) -> Exit {
     match run_inner(cli).await {
         Ok(exit) => exit,
@@ -176,9 +186,31 @@ fn exit_for_error(e: &CoreError) -> Exit {
     match e {
         // Bad user input (config/CLI/duration/glob) is a usage error; everything else — a stale or
         // unreadable lock, a malformed registry payload, a tool failure — is an environment fault.
-        CoreError::Config(_) => Exit::Usage,
-        CoreError::Io(_) => Exit::Usage,
+        CoreError::Config(_) | CoreError::Io(_) => Exit::Usage,
         _ => Exit::Environment,
+    }
+}
+
+/// Handle the commands that need neither a workspace nor the network (`schema`, `init`, `sync`).
+///
+/// Returns `Some` with the command's result when `command` is one of those; `None` otherwise, so
+/// the caller proceeds to build a workspace.
+fn run_workspace_free(command: &Command, g: &GlobalArgs) -> Option<Result<Exit, CoreError>> {
+    match command {
+        Command::Schema => Some(
+            render::json_schema_string()
+                .map_err(|e| CoreError::Io(format!("serialize schema: {e}")))
+                .map(|schema| {
+                    println!("{schema}");
+                    Exit::Ok
+                }),
+        ),
+        Command::Init => Some(cmd_init(g)),
+        Command::Sync => {
+            eprintln!("`cooldown sync` is not implemented in this build (a later phase).");
+            Some(Ok(Exit::Usage))
+        }
+        _ => None,
     }
 }
 
@@ -186,18 +218,8 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     let g = &cli.global;
     let color = std::io::stdout().is_terminal() && !g.json;
 
-    // Commands that need neither workspace nor network.
-    match &cli.command {
-        Command::Schema => {
-            println!("{}", render::json_schema_string());
-            return Ok(Exit::Ok);
-        }
-        Command::Init => return cmd_init(g),
-        Command::Sync => {
-            eprintln!("`cooldown sync` is not implemented in this build (a later phase).");
-            return Ok(Exit::Usage);
-        }
-        _ => {}
+    if let Some(res) = run_workspace_free(&cli.command, g) {
+        return res;
     }
 
     let workdir = match &g.dir {
@@ -211,23 +233,7 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     let lang_ids = parse_langs(&g.lang)?;
     let package_globs = parse_globs(&g.package)?;
 
-    // Shared HTTP + cache.
-    let http = SharedHttp::new(
-        discovery::cache_dir().into_std_path_buf(),
-        HttpOptions {
-            offline: g.offline,
-            fresh: g.fresh,
-            request_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
-
-    // The adapter set — one line per ecosystem.
-    let adapters: Vec<Box<dyn Ecosystem>> = vec![
-        Box::new(GoEcosystem::from_http(http.clone())),
-        Box::new(CargoEcosystem::from_http(http.clone())),
-        Box::new(UvEcosystem::from_http(http.clone())),
-    ];
+    let adapters = adapter_set(g)?;
 
     // Detect projects under the working dir.
     let mut projects: Vec<(EcosystemId, Project)> = Vec::new();
@@ -245,78 +251,10 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         return Ok(Exit::NoEcosystem);
     }
 
-    // Shared layers (built once).
-    let global_layer = if g.no_global {
-        None
-    } else {
-        discovery::global_layer()?
-    };
-    let explicit_layer = match &g.config {
-        Some(p) => Some(discovery::explicit_config_layer(p)?),
-        None => None,
-    };
-    let env_layer = layer_from_fields(Origin::Env, &env_window_fields())?;
-    let cli_layer = layer_from_fields(Origin::Cli, &cli_window_fields(g))?;
-
-    // Per-project policy assembly.
+    let shared = build_shared_layers(g)?;
     let mut ctxs: Vec<ProjectCtx> = Vec::new();
     for (eco, project) in projects {
-        let native = if g.no_native {
-            None
-        } else {
-            match adapters.iter().find(|a| a.id() == eco) {
-                Some(a) => a
-                    .native_policy(&project)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(normalize_native),
-                None => None,
-            }
-        };
-        let cascade = discovery::repo_cascade_layers(&repo_root, &project.root)?;
-
-        let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
-        if let Some(l) = &global_layer {
-            layers.push(l.clone());
-        }
-        if let Some(n) = native {
-            layers.push(n);
-        }
-        layers.extend(cascade);
-        if let Some(l) = &explicit_layer {
-            layers.push(l.clone());
-        }
-        if let Some(l) = &env_layer {
-            layers.push(l.clone());
-        }
-        if let Some(l) = &cli_layer {
-            layers.push(l.clone());
-        }
-
-        let strict_native = compute_strict_native(&layers, g);
-        let rel_path = project
-            .root
-            .strip_prefix(&repo_root)
-            .ok()
-            .map(|p| {
-                if p.as_str().is_empty() {
-                    Utf8PathBuf::from(".")
-                } else {
-                    p.to_owned()
-                }
-            })
-            .unwrap_or_else(|| project.root.clone());
-
-        ctxs.push(ProjectCtx {
-            ecosystem: eco,
-            project,
-            rel_path,
-            policy: PolicyStack {
-                layers,
-                strict_native,
-            },
-        });
+        ctxs.push(assemble_ctx(&adapters, &repo_root, eco, project, &shared, g).await?);
     }
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
@@ -356,135 +294,322 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     }
 
     let generated_at = generated_at(now);
-    let exit = match cli.command {
-        Command::Outdated => {
-            let out = ws.outdated(&opts).await;
-            let env = render::Envelope::new(
-                "outdated",
-                out.exit.is_ok(),
-                generated_at,
-                render::OutdatedMeta {},
-                out.summary.clone(),
-                out.items.clone(),
-            );
-            let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-            if g.json {
-                println!("{}", render::to_json(&env));
-            } else {
-                print!(
-                    "{}",
-                    render::tty::render_outdated(
-                        &out.summary,
-                        &out.items,
-                        &out.warnings,
-                        &out.errors,
-                        color
-                    )
-                );
-            }
-            out.exit
+    dispatch(cli.command, &ws, &opts, &repo_root, g, color, &generated_at).await
+}
+
+/// The shared, project-independent policy layers, assembled once per run.
+struct SharedLayers {
+    global: Option<PolicyLayer>,
+    explicit: Option<PolicyLayer>,
+    env: Option<PolicyLayer>,
+    cli: Option<PolicyLayer>,
+}
+
+/// Build the ecosystem adapter set (one per supported ecosystem) over a shared HTTP cache.
+fn adapter_set(g: &GlobalArgs) -> Result<Vec<Box<dyn Ecosystem>>, CoreError> {
+    let http = SharedHttp::new(
+        discovery::cache_dir().into_std_path_buf(),
+        HttpOptions {
+            offline: g.offline,
+            fresh: g.fresh,
+            request_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )?;
+    Ok(vec![
+        Box::new(GoEcosystem::from_http(http.clone())),
+        Box::new(CargoEcosystem::from_http(http.clone())),
+        Box::new(UvEcosystem::from_http(http.clone())),
+    ])
+}
+
+/// Build the project-independent layers (global file, explicit `--config`, env, CLI) once per run.
+fn build_shared_layers(g: &GlobalArgs) -> Result<SharedLayers, CoreError> {
+    let global = if g.no_global {
+        None
+    } else {
+        discovery::global_layer()?
+    };
+    let explicit = match &g.config {
+        Some(p) => Some(discovery::explicit_config_layer(p)?),
+        None => None,
+    };
+    Ok(SharedLayers {
+        global,
+        explicit,
+        env: layer_from_fields(Origin::Env, &env_window_fields())?,
+        cli: layer_from_fields(Origin::Cli, &cli_window_fields(g))?,
+    })
+}
+
+/// Assemble one project's [`ProjectCtx`]: its native layer, the repo cascade, the shared layers,
+/// and the relative path used by `project` selectors.
+async fn assemble_ctx(
+    adapters: &[Box<dyn Ecosystem>],
+    repo_root: &Utf8Path,
+    eco: EcosystemId,
+    project: Project,
+    shared: &SharedLayers,
+    g: &GlobalArgs,
+) -> Result<ProjectCtx, CoreError> {
+    let native = if g.no_native {
+        None
+    } else {
+        match adapters.iter().find(|a| a.id() == eco) {
+            Some(a) => a
+                .native_policy(&project)
+                .await
+                .ok()
+                .flatten()
+                .map(normalize_native),
+            None => None,
         }
-        Command::Check => {
-            let out = ws.check(&opts).await;
-            let env = render::Envelope::new(
-                "check",
-                out.exit.is_ok(),
-                generated_at,
-                out.meta.clone(),
-                out.summary.clone(),
-                out.items.clone(),
-            );
-            let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-            if g.json {
-                println!("{}", render::to_json(&env));
+    };
+    let cascade = discovery::repo_cascade_layers(repo_root, &project.root)?;
+
+    let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
+    if let Some(l) = &shared.global {
+        layers.push(l.clone());
+    }
+    if let Some(n) = native {
+        layers.push(n);
+    }
+    layers.extend(cascade);
+    for l in [&shared.explicit, &shared.env, &shared.cli]
+        .into_iter()
+        .flatten()
+    {
+        layers.push(l.clone());
+    }
+
+    let strict_native = compute_strict_native(&layers, g);
+    let rel_path = project.root.strip_prefix(repo_root).ok().map_or_else(
+        || project.root.clone(),
+        |p| {
+            if p.as_str().is_empty() {
+                Utf8PathBuf::from(".")
             } else {
-                print!(
-                    "{}",
-                    render::tty::render_check(
-                        &out.meta,
-                        &out.summary,
-                        &out.items,
-                        &out.warnings,
-                        &out.errors,
-                        color
-                    )
-                );
+                p.to_owned()
             }
-            out.exit
-        }
-        Command::Upgrade => {
-            if g.include_indirect {
-                return Err(CoreError::Config("`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal".into()));
-            }
-            if g.major && g.package.is_empty() && !g.major_all {
-                return Err(CoreError::Config("`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all".into()));
-            }
-            let out = ws.upgrade(&opts).await;
-            let env = render::Envelope::new(
-                "upgrade",
-                out.exit.is_ok(),
-                generated_at,
-                out.meta.clone(),
-                out.summary.clone(),
-                out.items.clone(),
-            );
-            let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-            if g.json {
-                println!("{}", render::to_json(&env));
-            } else {
-                print!(
-                    "{}",
-                    render::tty::render_upgrade(
-                        &out.meta,
-                        &out.summary,
-                        &out.items,
-                        &out.warnings,
-                        &out.errors,
-                        color
-                    )
-                );
-            }
-            out.exit
-        }
+        },
+    );
+
+    Ok(ProjectCtx {
+        ecosystem: eco,
+        project,
+        rel_path,
+        policy: PolicyStack {
+            layers,
+            strict_native,
+        },
+    })
+}
+
+/// Run the chosen workspace command and emit its output (JSON or TTY), returning its [`Exit`].
+///
+/// The workspace-free commands (`schema`/`init`/`sync`) are handled before a workspace exists, so
+/// they never reach here.
+async fn dispatch(
+    command: Command,
+    ws: &Workspace,
+    opts: &RunOpts,
+    repo_root: &Utf8Path,
+    g: &GlobalArgs,
+    color: bool,
+    generated_at: &str,
+) -> Result<Exit, CoreError> {
+    let exit = match command {
+        Command::Outdated => run_outdated(ws, opts, g, color, generated_at).await?,
+        Command::Check => run_check(ws, opts, g, color, generated_at).await?,
+        Command::Upgrade => run_upgrade(ws, opts, g, color, generated_at).await?,
         Command::Explain { package } => {
-            let out = ws.explain(&package, &opts).await;
-            let env = render::Envelope::new(
-                "explain",
-                out.exit.is_ok(),
-                generated_at,
-                out.meta.clone(),
-                render::ExplainSummary {},
-                out.steps.clone(),
-            );
-            if g.json {
-                println!("{}", render::to_json(&env));
-            } else {
-                print!(
-                    "{}",
-                    render::tty::render_explain(&out.meta, &out.steps, color)
-                );
-            }
-            out.exit
+            run_explain(ws, opts, &package, g, color, generated_at).await?
         }
-        Command::Config => {
-            let out = ws.config(&opts, &generated_at);
-            if g.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&out.json).unwrap_or_default()
-                );
-            } else {
-                print!("{}", out.text);
-            }
-            out.exit
-        }
+        Command::Config => run_config(ws, opts, g, generated_at),
         Command::Baseline { prune } => {
-            cmd_baseline(&ws, &opts, &repo_root, prune, g.json, &generated_at).await?
+            cmd_baseline(ws, opts, repo_root, prune, g.json, generated_at).await?
         }
+        // `run_workspace_free` returns `Some` for exactly these, so `run_inner` returns before a
+        // workspace is built; they can never reach `dispatch`.
+        #[allow(
+            clippy::unreachable,
+            reason = "schema/init/sync are dispatched by run_workspace_free before any workspace exists"
+        )]
         Command::Schema | Command::Init | Command::Sync => unreachable!("handled earlier"),
     };
 
     Ok(exit)
+}
+
+async fn run_outdated(
+    ws: &Workspace,
+    opts: &RunOpts,
+    g: &GlobalArgs,
+    color: bool,
+    generated_at: &str,
+) -> Result<Exit, CoreError> {
+    let out = ws.outdated(opts).await;
+    let env = render::Envelope::new(
+        "outdated",
+        out.exit.is_ok(),
+        generated_at.to_owned(),
+        render::OutdatedMeta {},
+        out.summary.clone(),
+        out.items.clone(),
+    );
+    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
+    if g.json {
+        let json = render::to_json(&env)
+            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
+        println!("{json}");
+    } else {
+        print!(
+            "{}",
+            render::tty::render_outdated(
+                &out.summary,
+                &out.items,
+                &out.warnings,
+                &out.errors,
+                color
+            )
+        );
+    }
+    Ok(out.exit)
+}
+
+async fn run_check(
+    ws: &Workspace,
+    opts: &RunOpts,
+    g: &GlobalArgs,
+    color: bool,
+    generated_at: &str,
+) -> Result<Exit, CoreError> {
+    let out = ws.check(opts).await;
+    let env = render::Envelope::new(
+        "check",
+        out.exit.is_ok(),
+        generated_at.to_owned(),
+        out.meta.clone(),
+        out.summary.clone(),
+        out.items.clone(),
+    );
+    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
+    if g.json {
+        let json = render::to_json(&env)
+            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
+        println!("{json}");
+    } else {
+        print!(
+            "{}",
+            render::tty::render_check(
+                &out.meta,
+                &out.summary,
+                &out.items,
+                &out.warnings,
+                &out.errors,
+                color
+            )
+        );
+    }
+    Ok(out.exit)
+}
+
+/// Validate the `upgrade`-specific flag combinations before running, then render the result.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] for `--include-indirect` (a non-goal) or for `--major` without a
+/// scoping `--package`/`--major-all`.
+async fn run_upgrade(
+    ws: &Workspace,
+    opts: &RunOpts,
+    g: &GlobalArgs,
+    color: bool,
+    generated_at: &str,
+) -> Result<Exit, CoreError> {
+    if g.include_indirect {
+        return Err(CoreError::Config(
+            "`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal"
+                .into(),
+        ));
+    }
+    if g.major && g.package.is_empty() && !g.major_all {
+        return Err(CoreError::Config(
+            "`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all"
+                .into(),
+        ));
+    }
+    let out = ws.upgrade(opts).await;
+    let env = render::Envelope::new(
+        "upgrade",
+        out.exit.is_ok(),
+        generated_at.to_owned(),
+        out.meta.clone(),
+        out.summary.clone(),
+        out.items.clone(),
+    );
+    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
+    if g.json {
+        let json = render::to_json(&env)
+            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
+        println!("{json}");
+    } else {
+        print!(
+            "{}",
+            render::tty::render_upgrade(
+                &out.meta,
+                &out.summary,
+                &out.items,
+                &out.warnings,
+                &out.errors,
+                color
+            )
+        );
+    }
+    Ok(out.exit)
+}
+
+async fn run_explain(
+    ws: &Workspace,
+    opts: &RunOpts,
+    package: &str,
+    g: &GlobalArgs,
+    color: bool,
+    generated_at: &str,
+) -> Result<Exit, CoreError> {
+    let out = ws.explain(package, opts).await;
+    let env = render::Envelope::new(
+        "explain",
+        out.exit.is_ok(),
+        generated_at.to_owned(),
+        out.meta.clone(),
+        render::ExplainSummary {},
+        out.steps.clone(),
+    );
+    if g.json {
+        let json = render::to_json(&env)
+            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
+        println!("{json}");
+    } else {
+        print!(
+            "{}",
+            render::tty::render_explain(&out.meta, &out.steps, color)
+        );
+    }
+    Ok(out.exit)
+}
+
+fn run_config(ws: &Workspace, opts: &RunOpts, g: &GlobalArgs, generated_at: &str) -> Exit {
+    let out = ws.config(opts, generated_at);
+    if g.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out.json).unwrap_or_default()
+        );
+    } else {
+        print!("{}", out.text);
+    }
+    out.exit
 }
 
 fn with_diags<M: serde::Serialize, S: serde::Serialize, I: serde::Serialize>(
@@ -499,8 +624,7 @@ fn with_diags<M: serde::Serialize, S: serde::Serialize, I: serde::Serialize>(
 
 fn generated_at(now: jiff::Timestamp) -> String {
     jiff::Timestamp::from_second(now.as_second())
-        .map(|t| t.to_string())
-        .unwrap_or_else(|_| now.to_string())
+        .map_or_else(|_| now.to_string(), |t| t.to_string())
 }
 
 fn parse_langs(langs: &[String]) -> Result<Vec<EcosystemId>, CoreError> {

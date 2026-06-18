@@ -5,3 +5,7 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# Proper nouns that look like code identifiers but should not be backticked in docs.
+# `..` appends to clippy's built-in list (GitHub, PyTorch, …) rather than replacing it.
+doc-valid-idents = ["PyPI", "GOPROXY", "PEP", ".."]

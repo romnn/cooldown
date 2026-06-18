@@ -1,5 +1,12 @@
 //! Shared builders for the core test suites.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test builders; each integration-test binary links only the subset it uses"
+)]
+#![allow(
+    clippy::expect_used,
+    reason = "test-support helpers: panicking on malformed fixture input is the intended immediate test failure (clippy.toml sets allow-expect-in-tests)"
+)]
 
 use cooldown_core::*;
 use jiff::Timestamp;

@@ -130,25 +130,20 @@ tasks:
   lint:
     desc: "lint cargo workspace"
     cmds:
-      - cargo clippy --workspace --all-targets --all-features {{.CLI_ARGS}}
+      - cargo lint --workspace --all-features {{.CLI_ARGS}}
       - task: lint:ast-grep
 
   lint:fc:
     desc: "lint cargo workspace for all combinations of features"
     cmds:
-      - cargo fc clippy --workspace --all-targets {{.CLI_ARGS}}
+      - cargo fc lint {{.CLI_ARGS}}
       - task: lint:ast-grep
 
   lint:fix:
     desc: "lint and fix cargo workspace"
     aliases: [fix]
     cmds:
-      # prettier-ignore
-      - >-
-        cargo clippy
-        --fix --allow-dirty --allow-staged
-        --workspace --all-targets --all-features
-        {{.CLI_ARGS}}
+      - cargo fixit --workspace --all-features {{.CLI_ARGS}}
       - task: lint:ast-grep
 
   lint:actions:

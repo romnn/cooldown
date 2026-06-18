@@ -1,5 +1,5 @@
 //! The Python/uv [`Ecosystem`]: detection, the resolved graph + per-file upload times from
-//! `uv.lock`, PyPI as the publish-time fallback, native `[tool.uv]` cooldown config, and
+//! `uv.lock`, `PyPI` as the publish-time fallback, native `[tool.uv]` cooldown config, and
 //! `uv`-driven resolution/apply. The core owns the verdict; uv only resolves/applies a window.
 
 use crate::lock::UvLock;
@@ -16,20 +16,33 @@ use cooldown_core::{
 };
 use cooldown_registry::SharedHttp;
 
+/// The [`EcosystemId`] for the Python/uv adapter.
 pub const UV_ID: EcosystemId = EcosystemId("python");
 
+/// The Python/uv implementation of the [`Ecosystem`] port.
+///
+/// It detects `uv.lock` projects, reads the resolved graph and per-file upload
+/// times from the lock (falling back to [`PyPi`] for the publish instant), parses
+/// `[tool.uv]` cooldown config as a native policy layer, and drives the `uv` CLI
+/// to re-resolve and apply a chosen window. The verdict itself is the core's;
+/// uv only resolves and applies.
 pub struct UvEcosystem {
     pypi: PyPi,
     uv: Uv,
 }
 
 impl UvEcosystem {
+    /// Creates the adapter from a configured [`PyPi`] client.
+    #[must_use]
     pub fn new(pypi: PyPi) -> Self {
         UvEcosystem {
             pypi,
             uv: Uv::new(),
         }
     }
+
+    /// Creates the adapter from a shared HTTP client, building the [`PyPi`] client.
+    #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         UvEcosystem::new(PyPi::new(http))
     }
@@ -43,6 +56,15 @@ fn classify_quality(v: &str) -> ReleaseQuality {
     }
 }
 
+/// Builds the sorted, deduplicated [`Release`] list the core consumes.
+///
+/// Unparsable versions are dropped, the rest are sorted by [`version::compare`]
+/// and deduplicated, then each is stamped with its update kind relative to
+/// `current`, its quality, and an opaque [`ReleaseOrder`] token: the big-endian
+/// index, so byte-lexicographic order matches PEP 440 order. The index is widened
+/// with [`u32::try_from`] and saturated at [`u32::MAX`], which a real release count
+/// can never reach.
+#[must_use]
 pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec<Release> {
     let mut releases: Vec<Release> = raw
         .into_iter()
@@ -63,7 +85,8 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
     releases.sort_by(|a, b| version::compare(a.version.as_str(), b.version.as_str()));
     releases.dedup_by(|a, b| a.version == b.version);
     for (i, r) in releases.iter_mut().enumerate() {
-        r.order = ReleaseOrder((i as u32).to_be_bytes().to_vec());
+        let token = u32::try_from(i).unwrap_or(u32::MAX);
+        r.order = ReleaseOrder(token.to_be_bytes().to_vec());
     }
     releases
 }
@@ -106,13 +129,13 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
     let uv = value.get("tool").and_then(|t| t.get("uv"))?;
     let mut rules = Vec::new();
 
-    if let Some(en) = uv.get("exclude-newer").and_then(|v| v.as_str()) {
-        if let Some(w) = parse_raw_window(en) {
-            rules.push(NativeRule {
-                selector: Selector::Default,
-                window: w,
-            });
-        }
+    if let Some(en) = uv.get("exclude-newer").and_then(|v| v.as_str())
+        && let Some(w) = parse_raw_window(en)
+    {
+        rules.push(NativeRule {
+            selector: Selector::Default,
+            window: w,
+        });
     }
     if let Some(table) = uv.get("exclude-newer-package").and_then(|v| v.as_table()) {
         for (pkg, val) in table {
@@ -126,13 +149,13 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
                     selector,
                     window: RawWindow::OptOut,
                 });
-            } else if let Some(s) = val.as_str() {
-                if let Some(w) = parse_raw_window(s) {
-                    rules.push(NativeRule {
-                        selector,
-                        window: w,
-                    });
-                }
+            } else if let Some(s) = val.as_str()
+                && let Some(w) = parse_raw_window(s)
+            {
+                rules.push(NativeRule {
+                    selector,
+                    window: w,
+                });
             }
         }
     }
@@ -221,7 +244,7 @@ impl Ecosystem for UvEcosystem {
         // Prefer the lock's recorded per-file upload time; fall back to PyPI.
         let from_lock = read_lock(ctx.project).ok().and_then(|lock| {
             lock.find(&dep.package.name, dep.current.as_str())
-                .and_then(|p| p.newest_upload_time())
+                .and_then(super::lock::Package::newest_upload_time)
         });
         let time = match from_lock {
             Some(t) => Some(t),

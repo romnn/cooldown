@@ -7,16 +7,24 @@
 
 use crate::model::{
     Candidate, Dependency, EcosystemId, MajorKey, PinVerdict, Release, ReleaseQuality, Status,
-    Verdict, Version,
+    Verdict,
 };
 use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
 use jiff::Timestamp;
 
 /// The context the core needs to build resolution queries and apply the candidate filter.
+///
+/// Threaded into both [`evaluate`] and [`check_pin`], it carries the per-invocation knobs that
+/// are not properties of the [`Dependency`] itself: which ecosystem is being evaluated, which
+/// project the policy cascade resolves against, and whether cross-major jumps are admissible
+/// candidates. It is `Copy`, so it is cheap to pass by value or reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveContext<'a> {
+    /// The ecosystem being evaluated, used to build the [`ResolveQuery`](crate::ResolveQuery)
+    /// for each candidate.
     pub ecosystem: EcosystemId,
+    /// The project root the policy cascade resolves against (matches `project=` selectors).
     pub project: &'a Utf8Path,
     /// `--major`: allow cross-major jumps as candidates (default: within the current major).
     pub allow_major: bool,
@@ -46,11 +54,107 @@ fn quality_eligible(r: &Release, current_quality: ReleaseQuality) -> bool {
     }
 }
 
+/// Whether a candidate's major makes it eligible: cross-major jumps are admitted only under
+/// `--major` (`allow_major`); otherwise a candidate must share the current pin's [`MajorKey`].
 fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> bool {
     allow_major || r.major == *current_major
 }
 
-/// Evaluate a dependency against its classified releases, producing a per-candidate verdict.
+/// Evaluates a dependency against its classified releases, producing a per-candidate [`Verdict`].
+///
+/// This is the engine behind the `outdated` and `upgrade` commands. Given the currently-locked
+/// [`Dependency`], the full set of classified [`Release`]s for that package, the resolved policy
+/// `layers`, the [`ResolveContext`], and the `now` boundary, it decides for every newer eligible
+/// release whether adoption may proceed and aggregates a headline [`Status`].
+///
+/// # Decision
+///
+/// Releases are first filtered to the *eligible* set — those adoption could target: stable-like
+/// quality (with the prerelease rule from [`ReleaseQuality`], honouring the current pin), within
+/// the current major unless [`ResolveContext::allow_major`] is set, and not yanked. Each eligible
+/// release newer than the current pin becomes a [`Candidate`]: its per-kind cooldown window is
+/// [`resolve`](crate::resolve)d, and its publish instant is judged against that window's
+/// [`cutoff`](crate::ResolvedWindow::cutoff) at `now`:
+///
+/// - [`Status::Exempt`] — an `allow` rule waives the window.
+/// - [`Status::UnknownAge`] — no publish time is known; *never* treated as mature (the core's
+///   one conservative rule, enforced here).
+/// - [`Status::Adoptable`] — published at or before the cutoff, i.e. matured past its window.
+/// - [`Status::InCooldown`] — published after the cutoff, still too fresh.
+///
+/// # Returned verdict
+///
+/// The [`Verdict`] carries the per-candidate breakdown plus three rollups: `candidates` (ascending
+/// by release order), `latest` (the newest eligible version, for context), and `adoptable_target`
+/// (the newest candidate that is [`Adoptable`](Status::Adoptable) or [`Exempt`](Status::Exempt), or
+/// `None`). The headline `status` is the newest candidate's status, or [`Status::UpToDate`] when no
+/// newer candidate exists. Two special cases short-circuit: a commit pin (pseudo-version) has no
+/// tagged version to compare and yields [`Status::Held`]; if the current pin is absent from
+/// `releases` the result is conservatively [`Status::UpToDate`] (`check`, via [`check_pin`], is the
+/// real gate and does not rely on this).
+///
+/// # Examples
+///
+/// ```
+/// use camino::Utf8Path;
+/// use cooldown_core::{
+///     ByKind, Dependency, EcosystemId, MajorKey, Origin, PackageId, PolicyLayer, Release,
+///     ReleaseOrder, ReleaseQuality, ResolveContext, Rule, Selector, Status, UpdateKind, Version,
+///     WindowSpec, evaluate,
+/// };
+/// use jiff::{SignedDuration, Timestamp};
+///
+/// // A package locked at 1.0.0 with a fresh 1.0.1 patch released "now".
+/// let dep = Dependency {
+///     package: PackageId::new(EcosystemId("rust"), "widget", None),
+///     current: Version::new("1.0.0"),
+///     current_quality: ReleaseQuality::Stable,
+///     direct: true,
+///     artifacts: Vec::new(),
+///     graph_floor: None,
+/// };
+/// let now: Timestamp = "2026-01-08T00:00:00Z".parse()?;
+/// let mature: Timestamp = "2026-01-01T00:00:00Z".parse()?;
+/// let releases = vec![
+///     Release {
+///         version: Version::new("1.0.0"),
+///         order: ReleaseOrder(vec![0]),
+///         major: MajorKey("1".into()),
+///         kind_from_current: None,
+///         published_at: Some(mature),
+///         yanked: false,
+///         quality: ReleaseQuality::Stable,
+///     },
+///     Release {
+///         version: Version::new("1.0.1"),
+///         order: ReleaseOrder(vec![1]),
+///         major: MajorKey("1".into()),
+///         kind_from_current: Some(UpdateKind::Patch),
+///         published_at: Some(now), // published right now → still cooling
+///         yanked: false,
+///         quality: ReleaseQuality::Stable,
+///     },
+/// ];
+///
+/// // A single 7-day `min-age` policy.
+/// let mut layer = PolicyLayer::new(Origin::Default);
+/// let mut rule = Rule::new(Selector::Default);
+/// rule.window = ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 7)));
+/// layer.rules.push(rule);
+///
+/// let ctx = ResolveContext {
+///     ecosystem: EcosystemId("rust"),
+///     project: Utf8Path::new("/repo"),
+///     allow_major: false,
+/// };
+/// let verdict = evaluate(&dep, &releases, &[layer], &ctx, now);
+///
+/// assert_eq!(verdict.status, Status::InCooldown);
+/// assert_eq!(verdict.latest, Some(Version::new("1.0.1")));
+/// assert!(verdict.adoptable_target.is_none()); // 1.0.1 is still too fresh
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
 pub fn evaluate(
     dep: &Dependency,
     releases: &[Release],
@@ -59,7 +163,7 @@ pub fn evaluate(
     now: Timestamp,
 ) -> Verdict {
     debug_assert!(
-        releases.windows(2).all(|w| w[0].order <= w[1].order),
+        releases.is_sorted_by(|a, b| a.order <= b.order),
         "releases must be sorted ascending by ReleaseOrder"
     );
 
@@ -135,24 +239,23 @@ pub fn evaluate(
         });
     }
 
-    if candidates.is_empty() {
+    // `candidates` is in ascending order (from sorted releases); the headline is the newest. An
+    // empty candidate set means no newer eligible release, i.e. up to date.
+    let Some(headline) = candidates.last() else {
         return Verdict {
             status: Status::UpToDate,
             adoptable_target: None,
             latest,
             candidates,
         };
-    }
+    };
+    let status = headline.status;
 
-    // `candidates` is in ascending order (from sorted releases); the headline is the newest.
     let adoptable_target = candidates
         .iter()
         .rev()
         .find(|c| matches!(c.status, Status::Adoptable | Status::Exempt))
         .map(|c| c.version.clone());
-
-    let headline = candidates.last().expect("non-empty");
-    let status = headline.status;
 
     Verdict {
         status,
@@ -162,9 +265,30 @@ pub fn evaluate(
     }
 }
 
-/// The `check` gate over the currently-locked release. Resolves the bare `min-age` (a pin has no
-/// from→to kind) and judges the locked publish instant against it. A graph-pinned fresh pin is
-/// still a violation, annotated `graph_held` — never a silent pass.
+/// Judges the currently-locked release against the cooldown policy — the `check` gate.
+///
+/// Where [`evaluate`] reasons about *upgrade candidates*, `check_pin` reasons about the version
+/// already in the lockfile: is the release the project currently depends on old enough to satisfy
+/// the policy? Because a locked pin has no from→to [`UpdateKind`], it resolves the bare `min-age`
+/// window (the [`ResolveKind::CurrentPin`](crate::ResolveKind) field) and judges `locked`'s
+/// publish instant against that window's [`cutoff`](crate::ResolvedWindow::cutoff) at `now`.
+///
+/// # Decision
+///
+/// - [`Status::Exempt`] — an `allow` rule waives the window, or `locked` is a pseudo-version /
+///   commit pin (no tagged version to quarantine against).
+/// - [`Status::UnknownAge`] — the locked release has no known publish time; never mature.
+/// - [`Status::UpToDate`] — published at or before the cutoff; the pin passes the gate.
+/// - [`Status::CurrentInCooldown`] — published after the cutoff; the pin is too fresh, a violation.
+///
+/// # Returned verdict
+///
+/// The [`PinVerdict`] carries the `status`, the resolved [`window`](crate::ResolvedWindow), and the
+/// `published_at` instant for rendering. It additionally annotates whether the resolved graph forces
+/// this pin: when [`Dependency::graph_floor`] equals the locked version, `graph_held` is set. A
+/// graph-held but too-fresh pin is *still* a [`Status::CurrentInCooldown`] violation — the flag lets
+/// it be baselined deliberately rather than silently passed.
+#[must_use]
 pub fn check_pin(
     dep: &Dependency,
     locked: &Release,
@@ -196,10 +320,4 @@ pub fn check_pin(
         graph_floor: dep.graph_floor.clone(),
         published_at: locked.published_at,
     }
-}
-
-/// Construct a `Version` — small convenience re-export point for tests in sibling modules.
-#[allow(dead_code)]
-pub(crate) fn v(s: &str) -> Version {
-    Version::new(s)
 }

@@ -15,264 +15,97 @@ use cooldown_render as render;
 use futures::stream::{self, StreamExt};
 use std::collections::HashSet;
 
+/// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
+/// be), plus the re-lock/build status and the exit it implies.
 pub struct UpgradeOutcome {
+    /// Whether anything was applied, the final lock-verification result, and the build outcome.
     pub meta: render::UpgradeMeta,
+    /// Applied / skipped / error counts.
     pub summary: render::UpgradeSummary,
+    /// One entry per planned change, marked applied, skipped (with reason), or errored.
     pub items: Vec<render::UpgradeItem>,
+    /// Non-fatal diagnostics (currently unused; reserved for parity with other commands).
     pub warnings: Vec<Diagnostic>,
+    /// Project-level errors (a failed apply, a failed re-lock probe, etc.).
     pub errors: Vec<Diagnostic>,
+    /// The process exit; non-zero on any error, or under `--strict` when a change was skipped.
     pub exit: Exit,
 }
 
+/// The evolving lock state during one project's one-change-at-a-time apply loop: the snapshot to
+/// restore to, and the violation set as of that snapshot.
+struct LockState {
+    snapshot: cooldown_core::LockSnapshot,
+    /// In-cooldown, non-baselined pins present at `snapshot` — the ones we are NOT introducing.
+    baseline_violations: HashSet<(String, String)>,
+}
+
+/// The mutable state accumulated across all projects in an upgrade run.
+#[derive(Default)]
+struct UpgradeAccum {
+    items: Vec<render::UpgradeItem>,
+    errors: Vec<Diagnostic>,
+    any_skipped: bool,
+    /// `None` until a build is attempted; `Some(false)` once any project's build fails.
+    build_ok: Option<bool>,
+    build_requested: bool,
+    /// `None` until the lock is verified; `Some(false)` once any project's lock is non-current.
+    lock_verified: Option<bool>,
+}
+
+/// The read-only per-project context shared by the upgrade helpers: the ecosystem adapter, the
+/// scoped project, the run options, and the artifact-target context.
+struct UpgradeCtx<'a> {
+    adapter: &'a dyn cooldown_core::Ecosystem,
+    pctx: &'a super::ProjectCtx,
+    opts: &'a RunOpts,
+    tctx: &'a TargetContext<'a>,
+}
+
 impl Workspace {
+    /// Move direct deps to the newest version older than the cooldown, applying changes one at a
+    /// time and re-locking after each.
+    ///
+    /// If a re-lock drags in a too-fresh, non-baselined transitive, the lock snapshot is restored
+    /// and that change is reported as skipped — never committing a lock a subsequent `check` would
+    /// reject. With `--dry-run` the plan is reported without mutation.
     pub async fn upgrade(&self, opts: &RunOpts) -> UpgradeOutcome {
-        let mut items: Vec<render::UpgradeItem> = Vec::new();
-        let mut errors: Vec<Diagnostic> = Vec::new();
-        let warnings: Vec<Diagnostic> = Vec::new();
-        let mut any_skipped = false;
-        let mut build_ok: Option<bool> = None;
-        let mut build_requested = opts.build;
-        let mut lock_verified: Option<bool> = None;
+        let mut acc = UpgradeAccum {
+            build_requested: opts.build,
+            ..UpgradeAccum::default()
+        };
 
         for pctx in self.scoped_projects(opts) {
             let Some(adapter) = self.adapter(pctx.ecosystem) else {
                 continue;
             };
-            let project_label = pctx.rel_path.to_string();
-
-            // upgrade only changes DIRECT deps.
-            let deps = match adapter.dependencies(&pctx.project, DepScope::Direct).await {
-                Ok(d) => d,
-                Err(e) => {
-                    errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                    continue;
-                }
-            };
-            let deps: Vec<Dependency> = deps
-                .into_iter()
-                .filter(|d| Self::package_in_scope(opts, &d.package.name))
-                .collect();
-
-            // Build the candidate change list from each dep's adoptable target.
-            let mut planned: Vec<Change> = Vec::new();
-            let rctx = self.resolve_ctx(pctx, opts);
-            let tctx = TargetContext {
-                project: &pctx.project,
-                environments: &[],
-                artifacts: if opts.all_artifacts {
-                    ArtifactScope::All
-                } else {
-                    ArtifactScope::Environment
-                },
-            };
-            for dep in &deps {
-                let releases = match adapter.releases(dep, &tctx).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        errors.push(diag_from_error(
-                            &e,
-                            pctx.ecosystem,
-                            &project_label,
-                            Some(&dep.package.name),
-                        ));
-                        continue;
-                    }
-                };
-                let verdict = evaluate(dep, &releases, &pctx.policy.layers, &rctx, self.now);
-                let Some(target) = verdict.adoptable_target else {
-                    continue;
-                };
-                if target == dep.current {
-                    continue;
-                }
-                let kind = verdict
-                    .candidates
-                    .iter()
-                    .find(|c| c.version == target)
-                    .map(|c| c.kind)
-                    .unwrap_or(cooldown_core::UpdateKind::Minor);
-                let current_major = releases
-                    .iter()
-                    .find(|r| r.version == dep.current)
-                    .map(|r| r.major.clone())
-                    .unwrap_or(MajorKey(String::new()));
-                let target_major = releases
-                    .iter()
-                    .find(|r| r.version == target)
-                    .map(|r| r.major.clone())
-                    .unwrap_or(current_major.clone());
-                let package = target_package(dep, &current_major, &target_major);
-                planned.push(Change {
-                    package,
-                    from: dep.current.clone(),
-                    to: target,
-                    kind,
-                });
-            }
-
-            if opts.dry_run {
-                for c in planned {
-                    items.push(plan_item(
-                        &c,
-                        &project_label,
-                        pctx.ecosystem.as_str(),
-                        false,
-                        None,
-                    ));
-                }
-                continue;
-            }
-
-            // Acquire the advisory lock for the mutating run.
-            let _guard = match ProjectLock::acquire(&pctx.project.root) {
-                Ok(g) => g,
-                Err(e) => {
-                    errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                    continue;
-                }
-            };
-
-            // The pre-existing violation set: in-cooldown pins we are NOT introducing.
-            let mut baseline_violations =
-                match self.graph_violations(adapter, pctx, opts, &tctx).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                        continue;
-                    }
-                };
-
-            let mut snapshot = match adapter.snapshot_lock(&pctx.project).await {
-                Ok(s) => s,
-                Err(e) => {
-                    errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                    continue;
-                }
-            };
-
-            for change in planned {
-                let single = Plan {
-                    changes: vec![change.clone()],
-                };
-                let report = match adapter.apply(&pctx.project, &single).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // A hard apply error → restore and record an item error.
-                        let _ = adapter.restore_lock(&pctx.project, &snapshot).await;
-                        let diag = diag_from_error(
-                            &e,
-                            pctx.ecosystem,
-                            &project_label,
-                            Some(&change.package.name),
-                        );
-                        let mut it = plan_item(
-                            &change,
-                            &project_label,
-                            pctx.ecosystem.as_str(),
-                            false,
-                            None,
-                        );
-                        it.error = Some(diag);
-                        items.push(it);
-                        continue;
-                    }
-                };
-
-                if !report.applied.is_empty() {
-                    // Did the re-lock introduce a fresh, non-baselined transitive?
-                    let after = self
-                        .graph_violations(adapter, pctx, opts, &tctx)
-                        .await
-                        .unwrap_or_default();
-                    let introduced: Vec<(String, String)> =
-                        after.difference(&baseline_violations).cloned().collect();
-                    if let Some((offending_pkg, _)) = introduced.first() {
-                        let _ = adapter.restore_lock(&pctx.project, &snapshot).await;
-                        any_skipped = true;
-                        items.push(plan_item(
-                            &change,
-                            &project_label,
-                            pctx.ecosystem.as_str(),
-                            false,
-                            Some(render::SkippedInfo {
-                                reason: SkipReason::TransitiveInCooldown,
-                                message: SkipReason::TransitiveInCooldown.message().to_string(),
-                                offending: Some(offending_pkg.clone()),
-                            }),
-                        ));
-                    } else {
-                        // Accept: refresh the snapshot/baseline for subsequent changes.
-                        snapshot = adapter
-                            .snapshot_lock(&pctx.project)
-                            .await
-                            .unwrap_or(snapshot);
-                        baseline_violations = after;
-                        items.push(plan_item(
-                            &change,
-                            &project_label,
-                            pctx.ecosystem.as_str(),
-                            true,
-                            None,
-                        ));
-                    }
-                } else {
-                    // The adapter itself skipped (MVS/resolver conflict).
-                    any_skipped = true;
-                    let sk = report.skipped.into_iter().next();
-                    let info = sk.map(|s| render::SkippedInfo {
-                        reason: s.reason,
-                        message: s.reason.message().to_string(),
-                        offending: s.offending.map(|p| p.name),
-                    });
-                    items.push(plan_item(
-                        &change,
-                        &project_label,
-                        pctx.ecosystem.as_str(),
-                        false,
-                        info,
-                    ));
-                }
-            }
-
-            // Re-verify the final lock is current. A failed probe is a non-`ok` lock, not silence.
-            match adapter.verify_lock_current(&pctx.project).await {
-                Ok(v) => lock_verified = Some(lock_verified.unwrap_or(true) && v.ok),
-                Err(e) => {
-                    lock_verified = Some(false);
-                    errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                }
-            }
-
-            if opts.build {
-                build_requested = true;
-                match adapter.build(&pctx.project).await {
-                    Ok(v) => build_ok = Some(build_ok.unwrap_or(true) && v.ok),
-                    Err(_) => build_ok = Some(false),
-                }
-            }
+            self.upgrade_project(adapter, pctx, opts, &mut acc).await;
         }
 
-        let applied = items.iter().filter(|i| i.applied).count();
-        let skipped = items.iter().filter(|i| i.skipped.is_some()).count();
-        let err_count = items.iter().filter(|i| i.error.is_some()).count() + errors.len();
-        let any_applied = applied > 0;
+        let applied = acc.items.iter().filter(|i| i.applied).count();
+        let skipped = acc.items.iter().filter(|i| i.skipped.is_some()).count();
+        let err_count = acc.items.iter().filter(|i| i.error.is_some()).count() + acc.errors.len();
 
         // Fail-closed on a failed re-lock or build: a passing `upgrade` must leave a sound lock.
-        let lock_or_build_failed = lock_verified == Some(false) || build_ok == Some(false);
+        let lock_or_build_failed = acc.lock_verified == Some(false) || acc.build_ok == Some(false);
         let exit = if err_count > 0 || lock_or_build_failed {
             Exit::Environment
-        } else if opts.strict && any_skipped {
+        } else if opts.strict && acc.any_skipped {
             Exit::Policy
         } else {
             Exit::Ok
         };
 
         let meta = render::UpgradeMeta {
-            applied: any_applied,
-            lock_verified: if opts.dry_run { None } else { lock_verified },
+            applied: applied > 0,
+            lock_verified: if opts.dry_run {
+                None
+            } else {
+                acc.lock_verified
+            },
             build: render::BuildInfo {
-                requested: build_requested,
-                ok: build_ok,
+                requested: acc.build_requested,
+                ok: acc.build_ok,
             },
         };
         let summary = render::UpgradeSummary {
@@ -283,10 +116,289 @@ impl Workspace {
         UpgradeOutcome {
             meta,
             summary,
-            items,
-            warnings,
-            errors,
+            items: acc.items,
+            warnings: Vec::new(),
+            errors: acc.errors,
             exit,
+        }
+    }
+
+    /// Plan and apply the upgrade for one project, recording into `acc`.
+    async fn upgrade_project(
+        &self,
+        adapter: &dyn cooldown_core::Ecosystem,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        acc: &mut UpgradeAccum,
+    ) {
+        let project_label = pctx.rel_path.to_string();
+        let tctx = TargetContext {
+            project: &pctx.project,
+            environments: &[],
+            artifacts: if opts.all_artifacts {
+                ArtifactScope::All
+            } else {
+                ArtifactScope::Environment
+            },
+        };
+        let ctx = UpgradeCtx {
+            adapter,
+            pctx,
+            opts,
+            tctx: &tctx,
+        };
+
+        // upgrade only changes DIRECT deps.
+        let deps = match adapter.dependencies(&pctx.project, DepScope::Direct).await {
+            Ok(d) => d
+                .into_iter()
+                .filter(|d| Self::package_in_scope(opts, &d.package.name))
+                .collect::<Vec<Dependency>>(),
+            Err(e) => {
+                acc.errors
+                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                return;
+            }
+        };
+
+        let planned = self.plan_changes(&ctx, &deps, &project_label, acc).await;
+
+        if opts.dry_run {
+            for c in planned {
+                acc.items.push(plan_item(
+                    &c,
+                    &project_label,
+                    pctx.ecosystem.as_str(),
+                    false,
+                    None,
+                ));
+            }
+            return;
+        }
+
+        // Acquire the advisory lock for the mutating run.
+        let _guard = match ProjectLock::acquire(&pctx.project.root) {
+            Ok(g) => g,
+            Err(e) => {
+                acc.errors
+                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                return;
+            }
+        };
+
+        // The pre-existing violation set: in-cooldown pins we are NOT introducing.
+        let baseline_violations = match self.graph_violations(adapter, pctx, opts, &tctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                acc.errors
+                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                return;
+            }
+        };
+
+        let snapshot = match adapter.snapshot_lock(&pctx.project).await {
+            Ok(s) => s,
+            Err(e) => {
+                acc.errors
+                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                return;
+            }
+        };
+
+        let mut lock = LockState {
+            snapshot,
+            baseline_violations,
+        };
+        for change in planned {
+            self.apply_change(&ctx, change, &mut lock, acc).await;
+        }
+
+        self.finalize_project(adapter, pctx, opts, &project_label, acc)
+            .await;
+    }
+
+    /// Build the candidate change list from each dep's adoptable target, recording any
+    /// release-fetch error.
+    async fn plan_changes(
+        &self,
+        ctx: &UpgradeCtx<'_>,
+        deps: &[Dependency],
+        project_label: &str,
+        acc: &mut UpgradeAccum,
+    ) -> Vec<Change> {
+        let UpgradeCtx {
+            adapter,
+            pctx,
+            opts,
+            tctx,
+        } = *ctx;
+        let rctx = Self::resolve_ctx(pctx, opts);
+        let mut planned: Vec<Change> = Vec::new();
+        for dep in deps {
+            let releases = match adapter.releases(dep, tctx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    acc.errors.push(diag_from_error(
+                        &e,
+                        pctx.ecosystem,
+                        project_label,
+                        Some(&dep.package.name),
+                    ));
+                    continue;
+                }
+            };
+            let verdict = evaluate(dep, &releases, &pctx.policy.layers, &rctx, self.now);
+            let Some(target) = verdict.adoptable_target else {
+                continue;
+            };
+            if target == dep.current {
+                continue;
+            }
+            let kind = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == target)
+                .map_or(cooldown_core::UpdateKind::Minor, |c| c.kind);
+            let current_major = releases
+                .iter()
+                .find(|r| r.version == dep.current)
+                .map_or(MajorKey(String::new()), |r| r.major.clone());
+            let target_major = releases
+                .iter()
+                .find(|r| r.version == target)
+                .map(|r| r.major.clone())
+                .unwrap_or(current_major.clone());
+            let package = target_package(dep, &current_major, &target_major);
+            planned.push(Change {
+                package,
+                from: dep.current.clone(),
+                to: target,
+                kind,
+            });
+        }
+        planned
+    }
+
+    /// Apply a single planned change with restore-on-regression, updating `lock` on acceptance.
+    async fn apply_change(
+        &self,
+        ctx: &UpgradeCtx<'_>,
+        change: Change,
+        lock: &mut LockState,
+        acc: &mut UpgradeAccum,
+    ) {
+        let UpgradeCtx {
+            adapter,
+            pctx,
+            opts,
+            tctx,
+        } = *ctx;
+        let project_label = pctx.rel_path.to_string();
+        let project_label = project_label.as_str();
+        let single = Plan {
+            changes: vec![change.clone()],
+        };
+        let report = match adapter.apply(&pctx.project, &single).await {
+            Ok(r) => r,
+            Err(e) => {
+                // A hard apply error → restore and record an item error.
+                let _ = adapter.restore_lock(&pctx.project, &lock.snapshot).await;
+                let diag = diag_from_error(
+                    &e,
+                    pctx.ecosystem,
+                    project_label,
+                    Some(&change.package.name),
+                );
+                let mut it =
+                    plan_item(&change, project_label, pctx.ecosystem.as_str(), false, None);
+                it.error = Some(diag);
+                acc.items.push(it);
+                return;
+            }
+        };
+
+        if report.applied.is_empty() {
+            // The adapter itself skipped (MVS/resolver conflict).
+            acc.any_skipped = true;
+            let info = report
+                .skipped
+                .into_iter()
+                .next()
+                .map(|s| render::SkippedInfo {
+                    reason: s.reason,
+                    message: s.reason.message().to_string(),
+                    offending: s.offending.map(|p| p.name),
+                });
+            acc.items.push(plan_item(
+                &change,
+                project_label,
+                pctx.ecosystem.as_str(),
+                false,
+                info,
+            ));
+            return;
+        }
+
+        // Did the re-lock introduce a fresh, non-baselined transitive?
+        let after = self
+            .graph_violations(adapter, pctx, opts, tctx)
+            .await
+            .unwrap_or_default();
+        if let Some((offending_pkg, _)) = after.difference(&lock.baseline_violations).next() {
+            let _ = adapter.restore_lock(&pctx.project, &lock.snapshot).await;
+            acc.any_skipped = true;
+            acc.items.push(plan_item(
+                &change,
+                project_label,
+                pctx.ecosystem.as_str(),
+                false,
+                Some(render::SkippedInfo {
+                    reason: SkipReason::TransitiveInCooldown,
+                    message: SkipReason::TransitiveInCooldown.message().to_string(),
+                    offending: Some(offending_pkg.clone()),
+                }),
+            ));
+        } else {
+            // Accept: refresh the snapshot/baseline for subsequent changes.
+            if let Ok(s) = adapter.snapshot_lock(&pctx.project).await {
+                lock.snapshot = s;
+            }
+            lock.baseline_violations = after;
+            acc.items.push(plan_item(
+                &change,
+                project_label,
+                pctx.ecosystem.as_str(),
+                true,
+                None,
+            ));
+        }
+    }
+
+    /// Re-verify the final lock and, when requested, build — folding both into `acc`.
+    async fn finalize_project(
+        &self,
+        adapter: &dyn cooldown_core::Ecosystem,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        project_label: &str,
+        acc: &mut UpgradeAccum,
+    ) {
+        // Re-verify the final lock is current. A failed probe is a non-`ok` lock, not silence.
+        match adapter.verify_lock_current(&pctx.project).await {
+            Ok(v) => acc.lock_verified = Some(acc.lock_verified.unwrap_or(true) && v.ok),
+            Err(e) => {
+                acc.lock_verified = Some(false);
+                acc.errors
+                    .push(diag_from_error(&e, pctx.ecosystem, project_label, None));
+            }
+        }
+
+        if opts.build {
+            acc.build_requested = true;
+            match adapter.build(&pctx.project).await {
+                Ok(v) => acc.build_ok = Some(acc.build_ok.unwrap_or(true) && v.ok),
+                Err(_) => acc.build_ok = Some(false),
+            }
         }
     }
 
@@ -299,7 +411,7 @@ impl Workspace {
         tctx: &TargetContext<'_>,
     ) -> cooldown_core::Result<HashSet<(String, String)>> {
         let deps = adapter.dependencies(&pctx.project, DepScope::Graph).await?;
-        let rctx = self.resolve_ctx(pctx, opts);
+        let rctx = Self::resolve_ctx(pctx, opts);
         let fetched: Vec<(Dependency, cooldown_core::Result<Release>)> = stream::iter(deps)
             .map(|dep| async move {
                 let r = adapter.locked_release(&dep, tctx).await;
@@ -332,7 +444,7 @@ impl Workspace {
     }
 }
 
-/// Reconstruct the target `PackageId`, handling Go-style `/vN` path-major changes (the MajorKey is a
+/// Reconstruct the target `PackageId`, handling Go-style `/vN` path-major changes (the `MajorKey` is a
 /// path suffix). For ecosystems where the package name is stable across majors, the name is kept.
 fn target_package(
     dep: &Dependency,

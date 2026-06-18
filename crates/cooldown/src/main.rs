@@ -20,5 +20,6 @@ fn main() -> std::process::ExitCode {
     };
 
     let exit = runtime.block_on(run(cli));
-    std::process::ExitCode::from(exit.code() as u8)
+    // Exit codes are the fixed 0..=4 taxonomy, so the conversion never saturates.
+    std::process::ExitCode::from(u8::try_from(exit.code()).unwrap_or(1))
 }

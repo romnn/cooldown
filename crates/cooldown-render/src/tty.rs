@@ -1,9 +1,13 @@
 //! Colorful TTY tables. Rendering is deterministic when `use_color` is false (snapshot tests use
 //! that), and styled for the terminal otherwise.
 
-use crate::model::*;
+use crate::model::{
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
+    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary,
+};
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, Status};
+use std::fmt::Write as _;
 
 fn base_table(use_color: bool) -> Table {
     let mut t = Table::new();
@@ -20,11 +24,10 @@ fn status_color(s: OutdatedStatus) -> Color {
         OutdatedStatus::Adoptable => Color::Green,
         OutdatedStatus::UpToDate => Color::DarkGreen,
         OutdatedStatus::InCooldown => Color::Yellow,
-        OutdatedStatus::CurrentInCooldown => Color::Red,
+        OutdatedStatus::CurrentInCooldown | OutdatedStatus::Error => Color::Red,
         OutdatedStatus::Exempt => Color::Cyan,
         OutdatedStatus::Held => Color::DarkGrey,
         OutdatedStatus::UnknownAge => Color::Magenta,
-        OutdatedStatus::Error => Color::Red,
     }
 }
 
@@ -50,13 +53,14 @@ fn fmt_days(d: f64) -> String {
     if d == 0.0 {
         "0d".to_string()
     } else if d < 1.0 {
-        format!("{:.1}d", d)
+        format!("{d:.1}d")
     } else {
-        format!("{:.0}d", d)
+        format!("{d:.0}d")
     }
 }
 
 /// Render the `outdated` report.
+#[must_use]
 pub fn render_outdated(
     summary: &OutdatedSummary,
     items: &[OutdatedItem],
@@ -83,8 +87,7 @@ pub fn render_outdated(
             let latest = it
                 .latest
                 .as_ref()
-                .map(|l| l.version.clone())
-                .unwrap_or_else(|| "—".into());
+                .map_or_else(|| "—".into(), |l| l.version.clone());
             let window = match &it.window.clamped_by {
                 Some(by) => format!("{} (≥{by})", fmt_days(it.window.min_age_days)),
                 None => fmt_days(it.window.min_age_days),
@@ -102,7 +105,8 @@ pub fn render_outdated(
         out.push_str(&t.to_string());
         out.push('\n');
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "\n{} adoptable · {} in cooldown · {} up-to-date · {} exempt · {} held · {} unknown-age",
         summary.adoptable,
         summary.in_cooldown,
@@ -110,9 +114,9 @@ pub fn render_outdated(
         summary.exempt,
         summary.held,
         summary.unknown_age,
-    ));
+    );
     if summary.errors > 0 {
-        out.push_str(&format!(" · {} errors", summary.errors));
+        let _ = write!(out, " · {} errors", summary.errors);
     }
     out.push('\n');
     push_diagnostics(&mut out, warnings, errors, use_color);
@@ -130,10 +134,11 @@ pub fn render_check(
 ) -> String {
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() {
-        out.push_str(&format!(
-            "✓ {} dependencies pass the cooldown gate ({} scope).\n",
+        let _ = writeln!(
+            out,
+            "✓ {} dependencies pass the cooldown gate ({} scope).",
             summary.checked, meta.scope
-        ));
+        );
     } else {
         let mut t = base_table(use_color);
         t.set_header(vec![
@@ -146,7 +151,7 @@ pub fn render_check(
                 CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
                 CheckStatus::Error => ("error", Color::Red),
             };
-            let age = it.age_days.map(fmt_days).unwrap_or_else(|| "?".to_string());
+            let age = it.age_days.map_or_else(|| "?".to_string(), fmt_days);
             let mut notes = Vec::new();
             if it.graph_held {
                 notes.push("graph-held".to_string());
@@ -170,8 +175,9 @@ pub fn render_check(
         out.push_str(&t.to_string());
         out.push('\n');
     }
-    out.push_str(&format!(
-        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} exempt · {} unknown-age · {} errors\n",
+    let _ = writeln!(
+        out,
+        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} exempt · {} unknown-age · {} errors",
         summary.checked,
         summary.direct,
         summary.violations,
@@ -179,12 +185,13 @@ pub fn render_check(
         summary.exempt,
         summary.unknown_age,
         summary.errors,
-    ));
+    );
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
 }
 
 /// Render the `upgrade` report.
+#[must_use]
 pub fn render_upgrade(
     meta: &UpgradeMeta,
     summary: &UpgradeSummary,
@@ -226,19 +233,21 @@ pub fn render_upgrade(
         Some(false) => "lock verification FAILED",
         None => "dry-run (lock untouched)",
     };
-    out.push_str(&format!(
-        "\n{} applied · {} skipped · {} errors · {}\n",
+    let _ = writeln!(
+        out,
+        "\n{} applied · {} skipped · {} errors · {}",
         summary.applied, summary.skipped, summary.errors, lock
-    ));
+    );
     if meta.build.requested {
-        out.push_str(&format!(
-            "build: {}\n",
+        let _ = writeln!(
+            out,
+            "build: {}",
             match meta.build.ok {
                 Some(true) => "ok",
                 Some(false) => "FAILED",
                 None => "not run",
             }
-        ));
+        );
     }
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
@@ -247,14 +256,15 @@ pub fn render_upgrade(
 /// Render the `explain` derivation.
 pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "effective window: {} (decided by {})\n",
+    let _ = writeln!(
+        out,
+        "effective window: {} (decided by {})",
         fmt_days(meta.effective.min_age_days),
         meta.effective.decided_by
-    ));
-    out.push_str(&format!("project: {}\n", meta.project));
+    );
+    let _ = writeln!(out, "project: {}", meta.project);
     if let Some(r) = &meta.registry {
-        out.push_str(&format!("registry: {r}\n"));
+        let _ = writeln!(out, "registry: {r}");
     }
     out.push('\n');
     let mut t = base_table(use_color);
@@ -290,15 +300,16 @@ fn push_diagnostics(
 ) {
     for w in warnings {
         let pkg = w.package.as_deref().unwrap_or("");
-        out.push_str(&format!("warning [{}] {} {}\n", w.kind, pkg, w.message));
+        let _ = writeln!(out, "warning [{}] {} {}", w.kind, pkg, w.message);
     }
     for e in errors {
         let pkg = e.package.as_deref().unwrap_or("");
-        out.push_str(&format!("error [{}] {} {}\n", e.kind, pkg, e.message));
+        let _ = writeln!(out, "error [{}] {} {}", e.kind, pkg, e.message);
     }
 }
 
 /// Map a core [`Status`] to a `check` finding status. `UpToDate`/`Exempt` are not findings.
+#[must_use]
 pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus> {
     if acknowledged {
         return Some(CheckStatus::Acknowledged);
@@ -306,8 +317,13 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
     match status {
         Status::CurrentInCooldown => Some(CheckStatus::Violation),
         Status::UnknownAge => Some(CheckStatus::UnknownAge),
-        Status::UpToDate | Status::Exempt => None,
-        // The remaining variants are not produced by check_pin, but map defensively.
-        Status::Adoptable | Status::InCooldown | Status::Held => None,
+        // `UpToDate`/`Exempt` are passing, not findings. The remaining variants
+        // (`Adoptable`/`InCooldown`/`Held`) are not produced by check_pin, but
+        // map defensively to "not a finding".
+        Status::UpToDate
+        | Status::Exempt
+        | Status::Adoptable
+        | Status::InCooldown
+        | Status::Held => None,
     }
 }

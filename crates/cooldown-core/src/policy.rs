@@ -41,6 +41,7 @@ pub enum Origin {
 
 impl Origin {
     /// The stable token used in the JSON `minAgeSource` (`default|global|native|repo:<path>|…`).
+    #[must_use]
     pub fn token(&self) -> String {
         match self {
             Origin::Default => "default".into(),
@@ -68,6 +69,26 @@ pub struct PatternGlob {
 }
 
 impl PatternGlob {
+    /// Compiles a glob `pattern`, preserving the original text for display and equality.
+    ///
+    /// `*` is allowed to cross `/` (the separator is not treated as literal), so a prefix
+    /// pattern such as `github.com/acme/*` matches nested paths and `@acme/*` matches a whole
+    /// scope — the intended "everything under this prefix" semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`](crate::CoreError::Config) when `pattern` is not a valid glob.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::PatternGlob;
+    ///
+    /// let glob = PatternGlob::new("github.com/acme/*")?;
+    /// assert!(glob.is_match("github.com/acme/widget"));
+    /// assert!(!glob.is_match("github.com/other/widget"));
+    /// # Ok::<(), cooldown_core::CoreError>(())
+    /// ```
     pub fn new(pattern: &str) -> Result<Self, crate::error::CoreError> {
         // `*` crosses `/` (literal_separator = false), so `github.com/acme/*` matches nested paths
         // and `@acme/*` matches a scope — the intended "everything under this prefix" semantics.
@@ -83,10 +104,14 @@ impl PatternGlob {
         })
     }
 
+    /// Returns whether `s` matches the compiled glob.
+    #[must_use]
     pub fn is_match(&self, s: &str) -> bool {
         self.matcher.is_match(s)
     }
 
+    /// Returns the original pattern text the glob was compiled from.
+    #[must_use]
     pub fn raw(&self) -> &str {
         &self.raw
     }
@@ -102,15 +127,21 @@ impl Eq for PatternGlob {}
 /// What a rule applies to. Specificity: `Package` > `Registry` > `Project` > `Lang` > `Default`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
+    /// Matches every package; the catch-all with the lowest specificity.
     Default,
+    /// Matches every package in one ecosystem (e.g. all Cargo dependencies).
     Lang(EcosystemId),
+    /// Matches packages served by a specific registry, by registry identifier.
     Registry(String),
+    /// Matches packages whose project path matches the [`PatternGlob`].
     Project(PatternGlob),
+    /// Matches packages whose name matches the [`PatternGlob`]; the most specific selector.
     Package(PatternGlob),
 }
 
 impl Selector {
     /// Higher = more specific; breaks ties *within* a layer.
+    #[must_use]
     pub fn specificity(&self) -> u8 {
         match self {
             Selector::Package(_) => 4,
@@ -122,6 +153,7 @@ impl Selector {
     }
 
     /// Whether this selector applies to the queried package.
+    #[must_use]
     pub fn matches(&self, q: &ResolveQuery<'_>) -> bool {
         match self {
             Selector::Default => true,
@@ -133,6 +165,7 @@ impl Selector {
     }
 
     /// The `<selector>` half of the `minAgeSource` string, e.g. `package=left-pad`.
+    #[must_use]
     pub fn token(&self) -> Option<String> {
         match self {
             Selector::Default => None,
@@ -157,6 +190,7 @@ pub enum WindowSpec {
 
 impl WindowSpec {
     /// The cutoff instant *before* any floor clamp: a release published at or before it is mature.
+    #[must_use]
     pub fn base_cutoff(&self, now: Timestamp) -> Timestamp {
         match self {
             WindowSpec::MinAge(d) => now - *d,
@@ -170,13 +204,33 @@ impl WindowSpec {
 /// `UpdateKind`, no heap alloc.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ByKind {
+    /// The bare `min-age` window, used as the per-kind fallback and for an already-locked pin.
     pub default: Option<WindowSpec>,
+    /// The window for major-version updates, when set.
     pub major: Option<WindowSpec>,
+    /// The window for minor-version updates, when set.
     pub minor: Option<WindowSpec>,
+    /// The window for patch-version updates, when set.
     pub patch: Option<WindowSpec>,
 }
 
 impl ByKind {
+    /// Builds a [`ByKind`] that sets only the bare [`default`](ByKind::default) window to `spec`.
+    ///
+    /// This is the common case where a rule declares a single scalar `min-age` rather than a
+    /// per-kind table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::{ByKind, WindowSpec};
+    /// use jiff::SignedDuration;
+    ///
+    /// let window = ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 7)));
+    /// assert!(window.default.is_some());
+    /// assert!(window.major.is_none());
+    /// ```
+    #[must_use]
     pub fn scalar(spec: WindowSpec) -> Self {
         ByKind {
             default: Some(spec),
@@ -188,7 +242,9 @@ impl ByKind {
 /// A single config rule: a selector and the values it sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
+    /// What the rule applies to.
     pub selector: Selector,
+    /// The per-kind windows this rule sets.
     pub window: ByKind,
     /// Whether this selector is exempted from the cooldown (an `allow` entry).
     pub allow: bool,
@@ -197,6 +253,22 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Builds an empty rule for `selector`: no windows, not exempt, no floor.
+    ///
+    /// Set [`window`](Rule::window), [`allow`](Rule::allow), and [`floor`](Rule::floor) on the
+    /// returned value to declare the policy this selector contributes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::{ByKind, Rule, Selector, WindowSpec};
+    /// use jiff::SignedDuration;
+    ///
+    /// let mut rule = Rule::new(Selector::Default);
+    /// rule.window = ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 14)));
+    /// assert!(!rule.allow);
+    /// ```
+    #[must_use]
     pub fn new(selector: Selector) -> Self {
         Rule {
             selector,
@@ -210,13 +282,29 @@ impl Rule {
 /// One layer of policy from a single origin.
 #[derive(Debug, Clone)]
 pub struct PolicyLayer {
+    /// Where this layer's policy came from, which fixes its authority in a [`PolicyStack`].
     pub origin: Origin,
+    /// The rules this layer contributes, in declaration order.
     pub rules: Vec<Rule>,
     /// A config layer may set `strict-native`; combined monotonically on the stack.
     pub strict_native: Option<bool>,
 }
 
 impl PolicyLayer {
+    /// Builds an empty layer for `origin`: no rules and no `strict-native` setting.
+    ///
+    /// Push [`Rule`]s onto [`rules`](PolicyLayer::rules) to populate the layer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::{Origin, PolicyLayer, Rule, Selector};
+    ///
+    /// let mut layer = PolicyLayer::new(Origin::Cli);
+    /// layer.rules.push(Rule::new(Selector::Default));
+    /// assert_eq!(layer.origin, Origin::Cli);
+    /// ```
+    #[must_use]
     pub fn new(origin: Origin) -> Self {
         PolicyLayer {
             origin,
@@ -248,28 +336,41 @@ pub enum ResolveKind {
 /// A resolution query: which package, in which ecosystem/registry/project, for which kind.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveQuery<'a> {
+    /// The ecosystem the package belongs to.
     pub ecosystem: EcosystemId,
+    /// The package name, matched against [`Selector::Package`] globs.
     pub package: &'a str,
+    /// The registry serving the package, if known; matched against [`Selector::Registry`].
     pub registry: Option<&'a str>,
+    /// The project path, matched against [`Selector::Project`] globs.
     pub project: &'a Utf8Path,
+    /// Which window to resolve: the bare pin or a per-kind candidate.
     pub kind: ResolveKind,
 }
 
 /// One step of an `explain` derivation.
 #[derive(Debug, Clone)]
 pub struct TraceStep {
+    /// The layer that contributed this step.
     pub layer: Origin,
+    /// The field being resolved (e.g. `default`, `major`, `floor`, `allow`).
     pub field: String,
+    /// The selector of the rule this step came from, if any.
     pub selector: Option<Selector>,
+    /// The step's window expressed as a number of days, when applicable.
     pub min_age_days: Option<f64>,
+    /// Whether this step won (was applied) rather than merely considered.
     pub applied: bool,
+    /// A human-readable explanation of why the step was considered or applied.
     pub note: String,
 }
 
 /// The resolved window plus the field-by-field trace `explain` prints.
 #[derive(Debug, Clone)]
 pub struct Resolution {
+    /// The window selected for the query.
     pub window: ResolvedWindow,
+    /// The field-by-field derivation, in the order `explain` prints it.
     pub trace: Vec<TraceStep>,
 }
 
@@ -280,12 +381,15 @@ pub struct ResolvedWindow {
     pub spec: WindowSpec,
     /// The layer+selector that decided the window (or the `allow` rule, when exempt).
     pub decided_by: Origin,
+    /// The selector of the rule that decided the window, paired with [`decided_by`](Self::decided_by).
     pub decided_selector: Selector,
     /// The binding (maximum) floor across layers, if any.
     pub floor: Option<SignedDuration>,
+    /// The origin of the binding [`floor`](Self::floor), if one applies.
     pub floor_origin: Option<Origin>,
     /// Whether an `allow` entry exempts this package (and bypasses any floor).
     pub exempt: bool,
+    /// The origin of the `allow` entry that granted the exemption, if [`exempt`](Self::exempt).
     pub exempt_origin: Option<Origin>,
 }
 
@@ -293,6 +397,7 @@ impl ResolvedWindow {
     /// The effective cutoff at `now`, applying the floor max-clamp. A release published at or
     /// before this instant is mature. An `allow` is reflected by `spec == Latest` (base = `now`),
     /// so a residual floor it could not bypass still clamps — the floor is never short-circuited.
+    #[must_use]
     pub fn cutoff(&self, now: Timestamp) -> Timestamp {
         let base = self.spec.base_cutoff(now);
         match self.floor {
@@ -303,6 +408,7 @@ impl ResolvedWindow {
     }
 
     /// The origin of a floor that actually tightened the window at `now`, for the JSON `clampedBy`.
+    #[must_use]
     pub fn clamped_by(&self, now: Timestamp) -> Option<&Origin> {
         let floor = self.floor?;
         let base = self.spec.base_cutoff(now);
@@ -314,12 +420,14 @@ impl ResolvedWindow {
     }
 
     /// The effective window as a float number of days, for display.
+    #[must_use]
     pub fn effective_min_age_days(&self, now: Timestamp) -> f64 {
         let cutoff = self.cutoff(now);
         duration_as_days(since(now, cutoff))
     }
 
     /// The `minAgeSource` string: `<origin>` or `<origin>:<selector>`.
+    #[must_use]
     pub fn source(&self) -> String {
         match self.decided_selector.token() {
             Some(sel) => format!("{}:{}", self.decided_by.token(), sel),
@@ -390,33 +498,117 @@ fn field_name(kind: ResolveKind) -> &'static str {
     }
 }
 
-fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> Option<f64> {
+fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
     match spec {
-        WindowSpec::MinAge(d) => Some(duration_as_days(*d)),
-        WindowSpec::Latest => Some(0.0),
-        WindowSpec::Freeze(t) => Some(duration_as_days(since(now, *t))),
+        WindowSpec::MinAge(d) => duration_as_days(*d),
+        WindowSpec::Latest => 0.0,
+        WindowSpec::Freeze(t) => duration_as_days(since(now, *t)),
     }
 }
 
-/// Resolve the effective window for a query, with a full trace. Per-field combine:
-/// authority-first `min-age`, max-clamp `floor`, union `allow` (floor-aware).
+/// Resolves the effective window for `query` against `layers`, with a full derivation trace.
+///
+/// Each field is combined by its own rule: `min-age` (and the per-kind windows) is
+/// **authority-first** — the highest layer that sets it wins, tie-broken within the layer by
+/// selector specificity, with a per-kind fall-through to the bare `default`; `floor` is
+/// **max-clamped** across layers; and `allow` is a floor-aware **union** that zeroes an ordinary
+/// window but bypasses a floor only when it is co-declared in that floor's layer or is an audited
+/// env/CLI override. The returned [`Resolution::trace`] records every rule considered and which one
+/// applied.
+///
+/// `layers` are expected low → high authority. If no layer sets the resolved field (e.g. the
+/// caller omitted the built-in `Default` layer), a 7-day `min-age` safety net is used.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_core::{
+///     ByKind, EcosystemId, Origin, PolicyLayer, ResolveKind, ResolveQuery, Rule, Selector,
+///     WindowSpec, resolve,
+/// };
+/// use camino::Utf8Path;
+/// use jiff::{SignedDuration, Timestamp};
+///
+/// let mut layer = PolicyLayer::new(Origin::Cli);
+/// let mut rule = Rule::new(Selector::Default);
+/// rule.window = ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 14)));
+/// layer.rules.push(rule);
+///
+/// let now: Timestamp = "2026-01-15T00:00:00Z".parse()?;
+/// let query = ResolveQuery {
+///     ecosystem: EcosystemId("rust"),
+///     package: "serde",
+///     registry: None,
+///     project: Utf8Path::new("."),
+///     kind: ResolveKind::CurrentPin,
+/// };
+///
+/// let resolution = resolve(&[layer], &query, now);
+/// assert_eq!(resolution.window.decided_by, Origin::Cli);
+/// assert!((resolution.window.effective_min_age_days(now) - 14.0).abs() < 1e-9);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
 pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp) -> Resolution {
     let mut trace: Vec<TraceStep> = Vec::new();
+    let pick = pick_window(layers, query, now, &mut trace);
+    let floors = collect_floor_candidates(layers, query, &mut trace);
+    let allow = resolve_allows(layers, query, &floors, &mut trace);
 
-    // --- min-age / per-kind window (authority-first, with per-kind fallthrough to bare default).
+    // An `allow` reflects as `spec = Latest` (base cutoff = now); a residual floor it could not
+    // bypass still clamps. Fully exempt only when no residual floor remains.
+    let spec = if allow.matched {
+        WindowSpec::Latest
+    } else {
+        pick.spec.clone()
+    };
+    let exempt = allow.matched && allow.effective_floor.is_none();
+    let (floor_dur, floor_origin) = match &allow.effective_floor {
+        Some((_, d, o)) => (Some(*d), Some(o.clone())),
+        None => (None, None),
+    };
+    // Provenance: when an allow applied, point at the highest-layer matching allow; else the pick.
+    let (decided_by, decided_selector, exempt_origin) = match allow.provenance {
+        Some((origin, selector)) => (origin.clone(), selector, Some(origin)),
+        None => (pick.origin.clone(), pick.selector.clone(), None),
+    };
+
+    let window = ResolvedWindow {
+        spec,
+        decided_by,
+        decided_selector,
+        floor: floor_dur,
+        floor_origin,
+        exempt,
+        exempt_origin,
+    };
+
+    Resolution { window, trace }
+}
+
+/// Picks the authority-first window field for `query` and traces every rule considered.
+///
+/// `min-age` (and the per-kind windows) is authority-first: the highest layer that sets it wins,
+/// tie-broken within the layer by selector specificity, with a per-kind fall-through to the bare
+/// `default`. The built-in `Default` layer always sets `default = 7d`, so a pick effectively always
+/// exists; if a caller omits that layer, a 7-day safety net is used.
+fn pick_window(
+    layers: &[PolicyLayer],
+    query: &ResolveQuery<'_>,
+    now: Timestamp,
+    trace: &mut Vec<TraceStep>,
+) -> FieldPick {
     let kind_pick = pick_field(layers, query, field_for_kind(query.kind));
     let used_fallthrough = kind_pick.is_none() && query.kind != ResolveKind::CurrentPin;
-    let pick = kind_pick.or_else(|| pick_field(layers, query, |bk| bk.default.as_ref()));
-
-    // The built-in Default layer always sets `default = 7d`, so `pick` is effectively always Some;
-    // fall back to a 7d safety net if a caller passes layers without it.
-    let pick = pick.unwrap_or(FieldPick {
-        layer_index: 0,
-        specificity: 0,
-        origin: Origin::Default,
-        selector: Selector::Default,
-        spec: WindowSpec::MinAge(SignedDuration::from_hours(24 * 7)),
-    });
+    let pick = kind_pick
+        .or_else(|| pick_field(layers, query, |bk| bk.default.as_ref()))
+        .unwrap_or(FieldPick {
+            layer_index: 0,
+            specificity: 0,
+            origin: Origin::Default,
+            selector: Selector::Default,
+            spec: WindowSpec::MinAge(SignedDuration::from_hours(24 * 7)),
+        });
 
     // Trace every rule that set the resolved field, marking the winner.
     let resolved_field = if used_fallthrough {
@@ -424,7 +616,7 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
     } else {
         query.kind
     };
-    for layer in layers.iter() {
+    for layer in layers {
         for rule in &layer.rules {
             if !rule.selector.matches(query) {
                 continue;
@@ -437,7 +629,7 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
                     layer: layer.origin.clone(),
                     field: field_name(resolved_field).to_string(),
                     selector: Some(rule.selector.clone()),
-                    min_age_days: min_age_days_of(spec, now),
+                    min_age_days: Some(min_age_days_of(spec, now)),
                     applied: is_winner,
                     note: if is_winner {
                         "selected (highest layer, most specific selector)".into()
@@ -461,8 +653,16 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
             ),
         });
     }
+    pick
+}
 
-    // --- floors: every matching floor rule, with its declaring layer.
+/// Collects every matching `floor` rule (with its declaring layer index and origin), tracing each
+/// as a floor candidate.
+fn collect_floor_candidates(
+    layers: &[PolicyLayer],
+    query: &ResolveQuery<'_>,
+    trace: &mut Vec<TraceStep>,
+) -> Vec<(usize, SignedDuration, Origin)> {
     let mut floors: Vec<(usize, SignedDuration, Origin)> = Vec::new();
     for (li, layer) in layers.iter().enumerate() {
         for rule in &layer.rules {
@@ -482,13 +682,32 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
             }
         }
     }
+    floors
+}
 
-    // --- allows (accumulated union). The floor-bypass rule is the security-load-bearing part: an
-    // `allow` always zeroes an ordinary window, but it bypasses a *floor* only when it is the
-    // audited invocation override (env/CLI) or it is **co-declared in the same layer** as that
-    // floor. Crucially this is decided PER FLOOR, not against a single max-clamped binding floor —
-    // so a repo `allow` co-declared with a repo floor still cannot escape a *separate* org (global)
-    // floor in a different layer. That residual floor remains and clamps the window.
+/// The outcome of applying `allow` exemptions: whether any matched, the residual binding floor (if
+/// any), and the provenance (highest-layer matching allow) used to attribute the decision.
+struct AllowOutcome {
+    matched: bool,
+    effective_floor: Option<(usize, SignedDuration, Origin)>,
+    provenance: Option<(Origin, Selector)>,
+}
+
+/// Accumulates `allow` exemptions, resolves the residual binding floor, and traces each allow plus
+/// the floor that survives.
+///
+/// The floor-bypass rule is the security-load-bearing part: an `allow` always zeroes an ordinary
+/// window, but it bypasses a *floor* only when it is the audited invocation override (env/CLI) or it
+/// is **co-declared in the same layer** as that floor. Crucially this is decided PER FLOOR, not
+/// against a single max-clamped binding floor — so a repo `allow` co-declared with a repo floor
+/// still cannot escape a *separate* org (global) floor in a different layer; that residual floor
+/// remains and clamps the window.
+fn resolve_allows(
+    layers: &[PolicyLayer],
+    query: &ResolveQuery<'_>,
+    floors: &[(usize, SignedDuration, Origin)],
+    trace: &mut Vec<TraceStep>,
+) -> AllowOutcome {
     let mut allows: Vec<(usize, Origin, Selector)> = Vec::new();
     for (li, layer) in layers.iter().enumerate() {
         for rule in &layer.rules {
@@ -515,9 +734,7 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         .cloned();
 
     for (li, origin, selector) in &allows {
-        let note = if !allow_matched {
-            unreachable!()
-        } else if has_env_cli_allow {
+        let note = if has_env_cli_allow {
             "exemption applies (audited env/CLI override bypasses all floors)"
         } else {
             "exemption zeroes the window; floors in other layers still bind (residual)"
@@ -547,34 +764,13 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         });
     }
 
-    // An `allow` reflects as `spec = Latest` (base cutoff = now); a residual floor it could not
-    // bypass still clamps. Fully exempt only when no residual floor remains.
-    let spec = if allow_matched {
-        WindowSpec::Latest
-    } else {
-        pick.spec.clone()
-    };
-    let exempt = allow_matched && effective_floor.is_none();
-    let (floor_dur, floor_origin) = match &effective_floor {
-        Some((_, d, o)) => (Some(*d), Some(o.clone())),
-        None => (None, None),
-    };
-    // Provenance: when an allow applied, point at the highest-layer matching allow; else the pick.
-    let allow_provenance = allows.iter().max_by_key(|(li, ..)| *li);
-    let (decided_by, decided_selector, exempt_origin) = match allow_provenance {
-        Some((_, o, sel)) => (o.clone(), sel.clone(), Some(o.clone())),
-        None => (pick.origin.clone(), pick.selector.clone(), None),
-    };
-
-    let window = ResolvedWindow {
-        spec,
-        decided_by,
-        decided_selector,
-        floor: floor_dur,
-        floor_origin,
-        exempt,
-        exempt_origin,
-    };
-
-    Resolution { window, trace }
+    let provenance = allows
+        .iter()
+        .max_by_key(|(li, ..)| *li)
+        .map(|(_, o, sel)| (o.clone(), sel.clone()));
+    AllowOutcome {
+        matched: allow_matched,
+        effective_floor,
+        provenance,
+    }
 }

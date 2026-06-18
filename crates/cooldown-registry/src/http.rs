@@ -16,14 +16,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// Knobs for the shared client.
+/// Configuration knobs for a [`SharedHttp`] client.
 #[derive(Debug, Clone)]
 pub struct HttpOptions {
+    /// Serve from cache only; a miss is a hard [`CoreError::OfflineMiss`] (the `--offline` mode).
     pub offline: bool,
+    /// Always hit the registry, ignoring a fresh cache hit (the `--fresh`/`--no-cache` mode).
     pub fresh: bool,
+    /// The `User-Agent` header sent on every request.
     pub user_agent: String,
+    /// The maximum number of in-flight requests allowed per host.
     pub per_host_concurrency: usize,
+    /// The per-request timeout applied by the underlying `reqwest::Client`.
     pub request_timeout: Duration,
+    /// The number of times a 429/5xx backoff is retried before the request fails.
     pub max_retries: usize,
 }
 
@@ -45,25 +51,37 @@ impl Default for HttpOptions {
     }
 }
 
-/// A fetched response (from network or cache).
+/// A response served by [`SharedHttp::get`], from the network or the on-disk cache.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
+    /// The HTTP status code (a cached or revalidated copy carries its original status).
     pub status: u16,
+    /// The response body as text.
     pub body: String,
+    /// `true` if served from cache (a fresh hit, a 304 revalidation, or a stale fallback).
     pub from_cache: bool,
 }
 
 impl HttpResponse {
+    /// Returns `true` if the status is a 2xx success.
+    #[must_use]
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
+    /// Returns `true` if the status signals "absent" (404 or 410).
+    ///
     /// 404/410 are the single "absent" signal in the GOPROXY protocol and crates.io index.
+    #[must_use]
     pub fn is_not_found(&self) -> bool {
         self.status == 404 || self.status == 410
     }
 }
 
-/// The shared HTTP client + cache + per-host limiter, cloneable via `Arc`.
+/// The shared HTTP client, on-disk cache, and per-host concurrency limiter.
+///
+/// Cheap to [`Clone`] — the state lives behind an [`Arc`], so every clone shares one
+/// `reqwest::Client`, one cache directory, one [`PublishStore`], and one set of per-host
+/// semaphores. Construct it with [`Self::new`] and fetch through [`Self::get`].
 #[derive(Clone)]
 pub struct SharedHttp {
     inner: Arc<Inner>,
@@ -78,6 +96,15 @@ struct Inner {
 }
 
 impl SharedHttp {
+    /// Builds a client rooted at `cache_dir` with the given [`HttpOptions`].
+    ///
+    /// Loads the [`PublishStore`] from `cache_dir` eagerly so the monotonic publish-time floor is
+    /// in effect from the first request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if the underlying `reqwest::Client` cannot be built (for example,
+    /// the platform TLS backend fails to initialize).
     pub fn new(cache_dir: impl Into<PathBuf>, opts: HttpOptions) -> Result<Self, CoreError> {
         let cache_dir = cache_dir.into();
         let client = reqwest::Client::builder()
@@ -98,23 +125,47 @@ impl SharedHttp {
         })
     }
 
+    /// Returns the shared [`PublishStore`] backing the monotonic publish-time floor.
+    ///
+    /// Adapters use it to [`guard`](PublishStore::guard) observed publish instants and to
+    /// [`save`](PublishStore::save) the floor at the end of a run.
+    #[must_use]
     pub fn publish_store(&self) -> Arc<PublishStore> {
         self.inner.publish.clone()
     }
 
+    /// Returns the [`HttpOptions`] this client was built with.
+    #[must_use]
     pub fn options(&self) -> &HttpOptions {
         &self.inner.opts
     }
 
     fn semaphore_for(&self, host: &str) -> Arc<Semaphore> {
-        let mut hosts = self.inner.hosts.lock().expect("hosts mutex");
+        let mut hosts = self
+            .inner
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         hosts
             .entry(host.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.inner.opts.per_host_concurrency)))
             .clone()
     }
 
-    /// GET `url`, honoring the cache TTL, offline/fresh modes, ETag refresh, and 429 backoff.
+    /// Performs a `GET` of `url`, honoring the cache `ttl`, offline/fresh modes, `ETag`
+    /// revalidation, and 429/5xx backoff.
+    ///
+    /// Resolution order: an offline build serves a cached non-error copy or fails with
+    /// [`CoreError::OfflineMiss`]; otherwise a fresh cached hit short-circuits (unless
+    /// [`HttpOptions::fresh`] is set); otherwise the request goes out under the per-host
+    /// concurrency cap, retrying transient backoff up to [`HttpOptions::max_retries`] and falling
+    /// back to a stale cached copy when the network fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::OfflineMiss`] for an offline cache miss; [`CoreError::Transient`] if a
+    /// network failure has no stale cache to fall back on, or if the host keeps rate-limiting past
+    /// the retry budget.
     pub async fn get(&self, url: &str, ttl: Duration) -> Result<HttpResponse, CoreError> {
         let cached = read_entry(&self.inner.cache_dir, url);
 
@@ -131,16 +182,16 @@ impl SharedHttp {
         }
 
         // Fresh cache hit (and not forced fresh): serve it.
-        if !self.inner.opts.fresh {
-            if let Some(e) = &cached {
-                if e.status < 400 && cache_is_fresh(e, ttl) {
-                    return Ok(HttpResponse {
-                        status: e.status,
-                        body: e.body.clone(),
-                        from_cache: true,
-                    });
-                }
-            }
+        if !self.inner.opts.fresh
+            && let Some(e) = &cached
+            && e.status < 400
+            && cache_is_fresh(e, ttl)
+        {
+            return Ok(HttpResponse {
+                status: e.status,
+                body: e.body.clone(),
+                from_cache: true,
+            });
         }
 
         let host = reqwest::Url::parse(url)
@@ -148,7 +199,12 @@ impl SharedHttp {
             .and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_else(|| "unknown".to_string());
         let sem = self.semaphore_for(&host);
-        let _permit = sem.acquire().await.expect("semaphore not closed");
+        // The per-host semaphores are never closed, so `acquire` only fails if one were; treat
+        // that impossible case as a transient error rather than panicking.
+        let _permit = sem
+            .acquire()
+            .await
+            .map_err(|e| CoreError::transient(e.to_string()))?;
 
         let etag = cached.as_ref().and_then(|e| e.etag.clone());
         let mut attempt = 0;
@@ -161,14 +217,14 @@ impl SharedHttp {
                 }
                 Err(FetchError::Transient(e)) => {
                     // Fall back to a stale cached copy if we have one; else propagate.
-                    if let Some(c) = &cached {
-                        if c.status < 400 {
-                            return Ok(HttpResponse {
-                                status: c.status,
-                                body: c.body.clone(),
-                                from_cache: true,
-                            });
-                        }
+                    if let Some(c) = &cached
+                        && c.status < 400
+                    {
+                        return Ok(HttpResponse {
+                            status: c.status,
+                            body: c.body.clone(),
+                            from_cache: true,
+                        });
                     }
                     return Err(CoreError::transient(e));
                 }
@@ -201,17 +257,17 @@ impl SharedHttp {
             .map_err(|e| FetchError::Transient(e.to_string()))?;
         let status = resp.status().as_u16();
 
-        if status == 304 {
-            if let Some(c) = cached {
-                let mut refreshed = c.clone();
-                refreshed.fetched_at = Timestamp::now().to_string();
-                let _ = write_entry(&self.inner.cache_dir, &refreshed);
-                return Ok(HttpResponse {
-                    status: c.status,
-                    body: c.body.clone(),
-                    from_cache: true,
-                });
-            }
+        if status == 304
+            && let Some(c) = cached
+        {
+            let mut refreshed = c.clone();
+            refreshed.fetched_at = Timestamp::now().to_string();
+            let _ = write_entry(&self.inner.cache_dir, &refreshed);
+            return Ok(HttpResponse {
+                status: c.status,
+                body: c.body.clone(),
+                from_cache: true,
+            });
         }
 
         if status == 429 || (500..600).contains(&status) {
@@ -220,8 +276,7 @@ impl SharedHttp {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or_else(|| Duration::from_millis(750));
+                .map_or_else(|| Duration::from_millis(750), Duration::from_secs);
             return Err(FetchError::Backoff(delay));
         }
 
@@ -265,5 +320,7 @@ fn cache_is_fresh(entry: &CacheEntry, ttl: Duration) -> bool {
     };
     let now = Timestamp::now();
     let age = now.as_second().saturating_sub(fetched.as_second());
-    age >= 0 && (age as u64) < ttl.as_secs()
+    // A negative age means the entry was fetched "in the future" (clock skew); treat it as not
+    // fresh. `try_from` both drops that case and converts without a sign-loss cast.
+    u64::try_from(age).is_ok_and(|secs| secs < ttl.as_secs())
 }

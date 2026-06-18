@@ -5,16 +5,25 @@
 use super::{Exit, ProjectCtx, RunOpts, Workspace, round2};
 use cooldown_core::{DepScope, ResolveKind, ResolveQuery, resolve};
 use cooldown_render as render;
+use std::fmt::Write as _;
 
+/// The result of `explain <pkg>`: the package's effective window plus the ordered derivation steps.
 pub struct ExplainOutcome {
+    /// The resolved window and the project/registry it was derived for.
     pub meta: render::ExplainMeta,
+    /// Each layer-and-rule step that contributed to (or was shadowed in) the derivation.
     pub steps: Vec<render::ExplainStep>,
+    /// The process exit (`Ok`, or `NoEcosystem` when no project is in scope).
     pub exit: Exit,
 }
 
+/// The result of `config`: the fully-resolved policy per project in both JSON and text form.
 pub struct ConfigOutcome {
+    /// The machine-readable envelope (`--json`).
     pub json: serde_json::Value,
+    /// The human-readable rendering.
     pub text: String,
+    /// The process exit (always `Ok`).
     pub exit: Exit,
 }
 
@@ -49,7 +58,7 @@ impl Workspace {
             .map(|s| render::ExplainStep {
                 layer: s.layer.token(),
                 field: s.field.clone(),
-                selector: s.selector.as_ref().and_then(|sel| sel.token()),
+                selector: s.selector.as_ref().and_then(cooldown_core::Selector::token),
                 min_age_days: s.min_age_days.map(round2),
                 applied: s.applied,
                 note: s.note.clone(),
@@ -87,6 +96,7 @@ impl Workspace {
     }
 
     /// The fully-resolved config per project (effective default window + provenance + strict-native).
+    #[must_use]
     pub fn config(&self, opts: &RunOpts, generated_at: &str) -> ConfigOutcome {
         let mut items = Vec::new();
         let mut text = String::new();
@@ -108,15 +118,17 @@ impl Workspace {
                 .map(|l| l.origin.token())
                 .collect();
 
-            text.push_str(&format!(
-                "{} [{}]\n  effective default window: {}d (decided by {})\n  strict-native: {}\n  layers: {}\n",
+            // Infallible: writing to a String never errors.
+            let _ = writeln!(
+                text,
+                "{} [{}]\n  effective default window: {}d (decided by {})\n  strict-native: {}\n  layers: {}",
                 pctx.rel_path,
                 pctx.ecosystem,
                 days,
                 res.window.source(),
                 pctx.policy.strict_native,
                 layers.join(" < "),
-            ));
+            );
 
             items.push(serde_json::json!({
                 "project": pctx.rel_path.to_string(),

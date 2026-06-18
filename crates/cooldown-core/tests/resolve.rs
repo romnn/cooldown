@@ -113,7 +113,7 @@ fn floor_max_clamps_window() {
         "but clamped up to 7d"
     );
     assert_eq!(
-        w.clamped_by(now()).map(|o| o.token()),
+        w.clamped_by(now()).map(cooldown_core::Origin::token),
         Some("global".to_string())
     );
 }
@@ -128,7 +128,10 @@ fn allow_union_exempts_against_window() {
     ];
     let w = win(&layers, "left-pad", ResolveKind::CurrentPin);
     assert!(w.exempt);
-    assert_eq!(w.effective_min_age_days(now()), 0.0);
+    assert!(
+        w.effective_min_age_days(now()).abs() < 1e-9,
+        "an exempt window resolves to a 0-day cooldown"
+    );
 }
 
 /// The security rule: a repo `allow` cannot undercut an org (global) floor; a co-declared global
@@ -233,7 +236,7 @@ fn codeclared_allow_cannot_escape_a_separate_global_floor() {
         w.effective_min_age_days(now())
     );
     assert_eq!(
-        w.clamped_by(now()).map(|o| o.token()),
+        w.clamped_by(now()).map(cooldown_core::Origin::token),
         Some("global".to_string())
     );
 }

@@ -4,6 +4,7 @@ use crate::model::SCHEMA_VERSION;
 use serde_json::{Value, json};
 
 /// A JSON Schema (draft 2020-12) describing the common envelope and the per-command item shapes.
+#[must_use]
 pub fn json_schema() -> Value {
     let diagnostic = json!({
         "type": "object",
@@ -54,7 +55,25 @@ pub fn json_schema() -> Value {
     })
 }
 
-/// The schema, pretty-printed.
-pub fn json_schema_string() -> String {
-    serde_json::to_string_pretty(&json_schema()).expect("schema serializes")
+/// Returns the schema from [`json_schema`] as a pretty-printed JSON string.
+///
+/// This backs `cooldown schema`, which prints the document to stdout.
+///
+/// # Errors
+///
+/// Returns the underlying [`serde_json::Error`] if the schema [`Value`] cannot
+/// be serialized. The schema is a fixed literal of JSON-representable values, so
+/// this does not fail in practice.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_render::json_schema_string;
+///
+/// let s = json_schema_string()?;
+/// assert!(s.contains("\"cooldown --json envelope\""));
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+pub fn json_schema_string() -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&json_schema())
 }

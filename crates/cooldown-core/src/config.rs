@@ -14,7 +14,22 @@ use std::collections::BTreeMap;
 
 const SEVEN_DAYS: SignedDuration = SignedDuration::from_hours(24 * 7);
 
-/// The built-in default layer: `min-age = 7d`.
+/// Returns the built-in default policy layer: a single [`Selector::Default`] rule of `min-age = 7d`.
+///
+/// This is the lowest-authority layer ([`Origin::Default`]) that every cascade starts from, so an
+/// unconfigured project still enforces a one-week cooldown.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_core::config::builtin_default_layer;
+/// use cooldown_core::Origin;
+///
+/// let layer = builtin_default_layer();
+/// assert_eq!(layer.origin, Origin::Default);
+/// assert_eq!(layer.rules.len(), 1);
+/// ```
+#[must_use]
 pub fn builtin_default_layer() -> PolicyLayer {
     let mut layer = PolicyLayer::new(Origin::Default);
     let mut rule = Rule::new(Selector::Default);
@@ -66,11 +81,21 @@ struct ConfigToml {
     project: Option<BTreeMap<String, SelectorToml>>,
 }
 
-/// Build the `ByKind` window for one selector, enforcing the latest/freeze/min-age exclusivity.
+/// Builds the [`ByKind`] window for one selector, enforcing the `latest`/`freeze`/`min-age`
+/// exclusivity.
+///
+/// `ctx` is a human-readable label (e.g. `"top-level"` or `"[lang.rust]"`) interpolated into any
+/// error message so the user can locate the offending selector.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when more than one of `min-age`, `latest`, and `freeze` is set on
+/// the same selector, or when a `freeze` timestamp or a `min-age` duration (scalar or any per-kind
+/// table entry) fails to parse.
 fn build_window(
-    min_age: &Option<MinAgeToml>,
+    min_age: Option<&MinAgeToml>,
     latest: Option<bool>,
-    freeze: &Option<String>,
+    freeze: Option<&str>,
     ctx: &str,
 ) -> Result<ByKind, CoreError> {
     let latest_set = latest == Some(true);
@@ -108,23 +133,59 @@ fn build_window(
     }
 }
 
+/// Builds a [`Rule`] for `selector` from its parsed [`SelectorToml`] block.
+///
+/// `ctx` labels the selector in any error message (see [`build_window`]).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when [`build_window`] rejects the window settings or when the
+/// `floor` duration fails to parse.
 fn selector_rule(selector: Selector, s: &SelectorToml, ctx: &str) -> Result<Rule, CoreError> {
     let mut rule = Rule::new(selector);
-    rule.window = build_window(&s.min_age, s.latest, &s.freeze, ctx)?;
+    rule.window = build_window(s.min_age.as_ref(), s.latest, s.freeze.as_deref(), ctx)?;
     if let Some(f) = &s.floor {
         rule.floor = Some(parse_duration(f)?);
     }
     Ok(rule)
 }
 
-/// Parse a config file's contents into a [`PolicyLayer`] at the given origin.
+/// Parses a `cooldown.toml`'s `content` into a [`PolicyLayer`] tagged with `origin`.
+///
+/// The top-level `min-age`/`latest`/`freeze`/`floor` keys become a [`Selector::Default`] rule, each
+/// `allow` glob becomes an exempt [`Selector::Package`] rule, and every `[lang.*]`, `[registry.*]`,
+/// `[package.*]`, and `[project.*]` table becomes its own selector rule. `strict-native` is carried
+/// onto the layer as-is.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when `content` is not valid TOML or has unknown fields, when a
+/// `[lang.*]` key is not a recognised ecosystem (`go`, `rust`, `python`, `node`), when a `min-age`
+/// duration, `freeze` timestamp, or `floor` duration fails to parse, when a `package`/`project`
+/// glob is invalid, or when a selector sets more than one of `min-age`, `latest`, and `freeze`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_core::config::parse_config;
+/// use cooldown_core::Origin;
+///
+/// let layer = parse_config("min-age = \"14d\"\n", Origin::Global).unwrap();
+/// assert_eq!(layer.rules.len(), 1);
+/// ```
 pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreError> {
     let cfg: ConfigToml = toml::from_str(content)
         .map_err(|e| CoreError::Config(format!("{}: {e}", origin.token())))?;
-    let mut layer = PolicyLayer::new(origin.clone());
+    // Consume `origin` (rather than clone) so the by-value parameter is genuinely used.
+    let mut layer = PolicyLayer::new(origin);
 
     // Top-level default rule (only if it sets anything).
-    let top_window = build_window(&cfg.min_age, cfg.latest, &cfg.freeze, "top-level")?;
+    let top_window = build_window(
+        cfg.min_age.as_ref(),
+        cfg.latest,
+        cfg.freeze.as_deref(),
+        "top-level",
+    )?;
     let top_floor = cfg.floor.as_ref().map(|f| parse_duration(f)).transpose()?;
     if top_window != ByKind::default() || top_floor.is_some() {
         let mut rule = Rule::new(Selector::Default);
@@ -187,14 +248,25 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
 }
 
 /// Policy fields gathered from env vars or CLI flags (the same shape for both).
+///
+/// Strings are kept unparsed here; [`layer_from_fields`] parses them when it builds the
+/// [`PolicyLayer`], so an invalid duration or glob surfaces as a [`CoreError::Config`] at that
+/// point rather than at collection time.
 #[derive(Debug, Clone, Default)]
 pub struct WindowFields {
+    /// The bare `min-age` duration string (e.g. `"7d"`), used as the per-kind fallback.
     pub min_age: Option<String>,
+    /// The `min-age` override for major-version updates, when set.
     pub min_age_major: Option<String>,
+    /// The `min-age` override for minor-version updates, when set.
     pub min_age_minor: Option<String>,
+    /// The `min-age` override for patch-version updates, when set.
     pub min_age_patch: Option<String>,
+    /// Whether `--latest` (or its env var) requests the newest version with no cooldown.
     pub latest: bool,
+    /// The `freeze` cutoff timestamp string, admitting only versions published on or before it.
     pub freeze: Option<String>,
+    /// Glob patterns exempted from the cooldown, each becoming an `allow` package rule.
     pub allow: Vec<String>,
 }
 
@@ -210,8 +282,17 @@ impl WindowFields {
     }
 }
 
-/// Build a [`PolicyLayer`] from env/CLI fields. Returns `None` if nothing is set. Enforces the
-/// latest/freeze/min-age exclusivity as a backstop (clap also enforces it for CLI).
+/// Builds a [`PolicyLayer`] from env/CLI [`WindowFields`], tagged with `origin`.
+///
+/// Returns `None` when `f` sets nothing at all. Any window settings become a
+/// [`Selector::Default`] rule and each `allow` glob becomes an exempt [`Selector::Package`] rule.
+/// The `latest`/`freeze`/`min-age` exclusivity is enforced here as a backstop (clap also enforces
+/// it for CLI flags).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when more than one of `min-age`, `latest`, and `freeze` is set,
+/// when a `min-age` or `freeze` string fails to parse, or when an `allow` glob is invalid.
 pub fn layer_from_fields(
     origin: Origin,
     f: &WindowFields,

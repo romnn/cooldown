@@ -13,6 +13,7 @@ use cooldown_core::{
 };
 use cooldown_registry::SharedHttp;
 
+/// The [`EcosystemId`] for the Go adapter.
 pub const GO_ID: EcosystemId = EcosystemId("go");
 
 /// The Go adapter, constructed from a [`GoProxy`] (itself built over the shared HTTP layer).
@@ -22,6 +23,8 @@ pub struct GoEcosystem {
 }
 
 impl GoEcosystem {
+    /// Creates the adapter over `proxy`, using a default [`Go`] driver for resolution/apply.
+    #[must_use]
     pub fn new(proxy: GoProxy) -> Self {
         GoEcosystem {
             proxy,
@@ -30,6 +33,7 @@ impl GoEcosystem {
     }
 
     /// Convenience: build the proxy from `GOPROXY` over the shared HTTP client.
+    #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         GoEcosystem::new(GoProxy::from_env(http))
     }
@@ -40,6 +44,7 @@ impl GoEcosystem {
 }
 
 /// Classify a version string into a [`ReleaseQuality`].
+#[must_use]
 pub fn classify_quality(v: &str) -> ReleaseQuality {
     if semver::is_pseudo(v) {
         ReleaseQuality::Pseudo
@@ -52,7 +57,7 @@ pub fn classify_quality(v: &str) -> ReleaseQuality {
     }
 }
 
-/// The MajorKey for a module *path* — the `/vN` suffix (`""` for v0/v1/+incompatible base paths).
+/// The `MajorKey` for a module *path* — the `/vN` suffix (`""` for v0/v1/+incompatible base paths).
 fn major_key_for_path(path: &str) -> MajorKey {
     let (_, path_major, _) = semver::split_path_version(path);
     MajorKey(path_major)
@@ -60,7 +65,7 @@ fn major_key_for_path(path: &str) -> MajorKey {
 
 /// The update kind of `cand` relative to `current`, by semver.
 fn classify_kind(current: &str, cand: &str) -> Option<cooldown_core::UpdateKind> {
-    use cooldown_core::UpdateKind::*;
+    use cooldown_core::UpdateKind::{Major, Minor, Patch};
     if !semver::is_valid(current) || !semver::is_valid(cand) {
         return None;
     }
@@ -77,6 +82,7 @@ fn classify_kind(current: &str, cand: &str) -> Option<cooldown_core::UpdateKind>
 /// and `kind_from_current`, derive each release's `MajorKey` from the path it came from, sort by
 /// semver, dedupe by canonical version, and assign a within-package order token. Pure (no I/O), so
 /// the adapter's classification logic is unit-testable without network.
+#[must_use]
 pub fn build_releases(
     current: &str,
     raw: Vec<(String, cooldown_core::RawRelease)>,
@@ -110,7 +116,10 @@ pub fn build_releases(
             == semver::canonical_version(b.version.as_str())
     });
     for (i, r) in releases.iter_mut().enumerate() {
-        r.order = ReleaseOrder((i as u32).to_be_bytes().to_vec());
+        // `i` is a release index, which cannot realistically approach `u32::MAX`; saturate
+        // rather than truncate so the big-endian order token stays monotonic.
+        let order = u32::try_from(i).unwrap_or(u32::MAX);
+        r.order = ReleaseOrder(order.to_be_bytes().to_vec());
     }
     releases
 }
@@ -214,14 +223,14 @@ impl GoEcosystem {
                     if let Some(up) = Utf8Path::from_path(&p) {
                         walk(up, old, new, count);
                     }
-                } else if p.extension().and_then(|s| s.to_str()) == Some("go") {
-                    if let Ok(src) = std::fs::read_to_string(&p) {
-                        let replaced = src
-                            .replace(&format!("\"{old}\""), &format!("\"{new}\""))
-                            .replace(&format!("\"{old}/"), &format!("\"{new}/"));
-                        if replaced != src && std::fs::write(&p, replaced).is_ok() {
-                            *count += 1;
-                        }
+                } else if p.extension().and_then(|s| s.to_str()) == Some("go")
+                    && let Ok(src) = std::fs::read_to_string(&p)
+                {
+                    let replaced = src
+                        .replace(&format!("\"{old}\""), &format!("\"{new}\""))
+                        .replace(&format!("\"{old}/"), &format!("\"{new}/"));
+                    if replaced != src && std::fs::write(&p, replaced).is_ok() {
+                        *count += 1;
                     }
                 }
             }
@@ -256,8 +265,7 @@ impl Ecosystem for GoEcosystem {
             .map(|manifest| Project {
                 root: manifest
                     .parent()
-                    .map(|p| p.to_owned())
-                    .unwrap_or_else(|| root.to_owned()),
+                    .map_or_else(|| root.to_owned(), std::borrow::ToOwned::to_owned),
                 kind: GO_ID,
                 manifest,
             })
@@ -360,10 +368,10 @@ impl Ecosystem for GoEcosystem {
             {
                 Ok(()) => {
                     // Cross-major path change → rewrite imports old→new (best-effort).
-                    if let Some(old_path) = old_import_path(change) {
-                        if old_path != *target_path {
-                            GoEcosystem::rewrite_imports(&project.root, &old_path, target_path);
-                        }
+                    if let Some(old_path) = old_import_path(change)
+                        && old_path != *target_path
+                    {
+                        GoEcosystem::rewrite_imports(&project.root, &old_path, target_path);
                     }
                     report.applied.push(change.clone());
                 }
@@ -480,7 +488,10 @@ mod tests {
 
     #[test]
     fn major_key_is_per_path() {
-        assert_eq!(major_key_for_path("example.com/foo"), MajorKey("".into()));
+        assert_eq!(
+            major_key_for_path("example.com/foo"),
+            MajorKey(String::new())
+        );
         assert_eq!(
             major_key_for_path("example.com/foo/v2"),
             MajorKey("/v2".into())

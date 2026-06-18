@@ -8,14 +8,45 @@ use camino::Utf8PathBuf;
 use std::fmt;
 
 /// Canonical display form of a version. The core treats this as opaque; it never parses it.
+///
+/// Go pseudo-versions, `/vN` majors, `+incompatible`, PEP 440 and semver share no parse
+/// rules, so a `Version` is just the string an ecosystem chose to display. Ordering and
+/// same-major comparisons go through the opaque [`ReleaseOrder`] and [`MajorKey`] tokens
+/// instead, never through this string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
-pub struct Version(pub String);
+pub struct Version(
+    /// The verbatim display string, exactly as the ecosystem produced it.
+    pub String,
+);
 
 impl Version {
+    /// Wraps a string in a [`Version`].
+    ///
+    /// The string is stored verbatim; the core never parses or normalises it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::Version;
+    ///
+    /// let v = Version::new("1.2.3");
+    /// assert_eq!(v.as_str(), "1.2.3");
+    /// ```
     pub fn new(s: impl Into<String>) -> Self {
         Version(s.into())
     }
+
+    /// Returns the version's display string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::Version;
+    ///
+    /// assert_eq!(Version::new("v0.1.0").as_str(), "v0.1.0");
+    /// ```
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -30,19 +61,49 @@ impl fmt::Display for Version {
 /// An opaque "same major?" token, compared for **equality only** — never ordered. `--major` gates
 /// same-major vs cross-major jumps with this; the minor/patch distinction comes from
 /// [`Release::kind_from_current`].
+///
+/// Two releases share a major when their `MajorKey`s are equal. Because the token is only
+/// ever tested for equality, the ecosystem is free to encode the major however it likes
+/// (e.g. `"1"`, `"v2"`, the module path for a Go `/vN` major).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MajorKey(pub String);
+pub struct MajorKey(
+    /// The opaque major identifier; only compared for equality.
+    pub String,
+);
 
 /// An opaque total-order token, meaningful only **within one package**. The core sorts and compares
 /// releases with this; it carries a `debug_assert` of sortedness at the port boundary.
+///
+/// Ordering follows the natural lexicographic ordering of the byte vector, which the
+/// ecosystem constructs so that "newer" sorts greater. Tokens from different packages are
+/// not comparable in any meaningful way.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ReleaseOrder(pub Vec<u8>);
+pub struct ReleaseOrder(
+    /// The opaque ordering bytes; sorted lexicographically, newest greatest.
+    pub Vec<u8>,
+);
 
 /// An ecosystem identifier, registered by its adapter. `Copy + 'static` so it threads cheaply.
+///
+/// The wrapped string is the stable language name used in config (`[lang.<name>]`) and on
+/// the `--lang` flag; see [`RECOGNIZED_ECOSYSTEMS`] and [`ecosystem_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EcosystemId(pub &'static str);
+pub struct EcosystemId(
+    /// The stable language name, e.g. `"rust"` or `"go"`.
+    pub &'static str,
+);
 
 impl EcosystemId {
+    /// Returns the ecosystem's stable language name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::EcosystemId;
+    ///
+    /// assert_eq!(EcosystemId("rust").as_str(), "rust");
+    /// ```
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         self.0
     }
@@ -59,6 +120,7 @@ pub const RECOGNIZED_ECOSYSTEMS: &[EcosystemId] = &[
 ];
 
 /// Resolve a language name to its canonical [`EcosystemId`], or `None` if unrecognised.
+#[must_use]
 pub fn ecosystem_id(name: &str) -> Option<EcosystemId> {
     RECOGNIZED_ECOSYSTEMS.iter().copied().find(|e| e.0 == name)
 }
@@ -79,12 +141,28 @@ impl serde::Serialize for EcosystemId {
 /// registry/index it resolves from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageId {
+    /// The ecosystem the package belongs to.
     pub ecosystem: EcosystemId,
+    /// The package name as it appears in the ecosystem's index.
     pub name: String,
+    /// The registry/index the package resolves from (e.g. `crates.io`), or `None` for the
+    /// ecosystem's default.
     pub registry: Option<String>,
 }
 
 impl PackageId {
+    /// Assembles a [`PackageId`] from its ecosystem, name, and optional registry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::{EcosystemId, PackageId};
+    ///
+    /// let id = PackageId::new(EcosystemId("rust"), "serde", None);
+    /// assert_eq!(id.name, "serde");
+    /// assert_eq!(id.ecosystem.as_str(), "rust");
+    /// assert!(id.registry.is_none());
+    /// ```
     pub fn new(ecosystem: EcosystemId, name: impl Into<String>, registry: Option<String>) -> Self {
         PackageId {
             ecosystem,
@@ -100,14 +178,33 @@ impl PackageId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseQuality {
+    /// A normal tagged release; the usual adoption target.
     Stable,
+    /// A prerelease (alpha/beta/rc); excluded unless the current pin is itself a prerelease.
     Prerelease,
+    /// A commit pin (Go pseudo-version); [`Status::Held`] in `outdated` and exempt in `check`.
     Pseudo,
+    /// A Go `+incompatible` release; adoptable, treated as stable-like.
     Incompatible,
 }
 
 impl ReleaseQuality {
-    /// Stable and `+incompatible` are the "real release" qualities adoption normally targets.
+    /// Returns `true` for the "real release" qualities adoption normally targets.
+    ///
+    /// [`Stable`](ReleaseQuality::Stable) and [`Incompatible`](ReleaseQuality::Incompatible)
+    /// are stable-like; [`Prerelease`](ReleaseQuality::Prerelease) and
+    /// [`Pseudo`](ReleaseQuality::Pseudo) are not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::ReleaseQuality;
+    ///
+    /// assert!(ReleaseQuality::Stable.is_stable_like());
+    /// assert!(ReleaseQuality::Incompatible.is_stable_like());
+    /// assert!(!ReleaseQuality::Prerelease.is_stable_like());
+    /// ```
+    #[must_use]
     pub fn is_stable_like(self) -> bool {
         matches!(self, ReleaseQuality::Stable | ReleaseQuality::Incompatible)
     }
@@ -118,8 +215,11 @@ impl ReleaseQuality {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateKind {
+    /// A cross-major jump (different [`MajorKey`]).
     Major,
+    /// A same-major change that is not a patch.
     Minor,
+    /// A same-major patch-level change.
     Patch,
 }
 
@@ -127,19 +227,31 @@ pub enum UpdateKind {
 /// crates.io) leave `Dependency::artifacts` empty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
-pub struct ArtifactId(pub String);
+pub struct ArtifactId(
+    /// The non-empty artifact identifier (e.g. a wheel/sdist filename).
+    pub String,
+);
 
 /// A classified release. The `published_at` aggregate is the newest upload over the *selected*
 /// artifacts (environment-relevant, else all), but `None` if **any** selected artifact's time is
 /// unknown — conservative: a partially-known release is never treated as mature.
 #[derive(Debug, Clone)]
 pub struct Release {
+    /// The release's display version.
     pub version: Version,
+    /// The opaque ordering token used to sort releases within the package.
     pub order: ReleaseOrder,
+    /// The opaque same-major token, compared for equality with the current pin's.
     pub major: MajorKey,
+    /// The update kind relative to the current pin, or `None` when not comparable (e.g. a
+    /// commit pin).
     pub kind_from_current: Option<UpdateKind>,
+    /// The newest upload time over the selected artifacts, or `None` if any selected
+    /// artifact's time is unknown.
     pub published_at: Option<jiff::Timestamp>,
+    /// Whether the release has been yanked/withdrawn.
     pub yanked: bool,
+    /// The quality classification the adapter assigned.
     pub quality: ReleaseQuality,
 }
 
@@ -149,11 +261,18 @@ pub struct Release {
 /// permits (MVS floor / a `=` pin), read from the lock.
 #[derive(Debug, Clone)]
 pub struct Dependency {
+    /// The dependency's package identity.
     pub package: PackageId,
+    /// The currently-locked version.
     pub current: Version,
+    /// The quality of the currently-locked release; mirrors `locked_release(dep, ctx).quality`.
     pub current_quality: ReleaseQuality,
+    /// Whether this is a direct dependency (as opposed to transitive).
     pub direct: bool,
+    /// The locked artifacts for this dependency; empty for version-granular ecosystems.
     pub artifacts: Vec<ArtifactId>,
+    /// The lowest version the resolved graph permits (MVS floor or a `=` pin), read from the
+    /// lock; `None` when unconstrained.
     pub graph_floor: Option<Version>,
 }
 
@@ -182,9 +301,13 @@ pub enum Status {
 /// major still cools.
 #[derive(Debug, Clone)]
 pub struct Candidate {
+    /// The candidate version.
     pub version: Version,
+    /// The update kind relative to the current pin.
     pub kind: UpdateKind,
+    /// The cooldown window resolved for this candidate.
     pub window: ResolvedWindow,
+    /// The verdict for this candidate.
     pub status: Status,
     /// The candidate's publish instant, threaded through for rendering (`ageDays`).
     pub published_at: Option<jiff::Timestamp>,
@@ -193,9 +316,13 @@ pub struct Candidate {
 /// The aggregate verdict for a dependency over its candidate set.
 #[derive(Debug, Clone)]
 pub struct Verdict {
+    /// The aggregate status over the candidate set.
     pub status: Status,
+    /// The newest candidate that has matured past its window, if any.
     pub adoptable_target: Option<Version>,
+    /// The newest existing version, adoptable or not.
     pub latest: Option<Version>,
+    /// The per-candidate verdicts, newest first.
     pub candidates: Vec<Candidate>,
 }
 
@@ -204,9 +331,13 @@ pub struct Verdict {
 /// silently passed.
 #[derive(Debug, Clone)]
 pub struct PinVerdict {
+    /// The verdict over the currently-locked release.
     pub status: Status,
+    /// The cooldown window resolved for the locked release.
     pub window: ResolvedWindow,
+    /// Whether the resolved graph forces this (too-fresh) version (MVS floor / `=` pin).
     pub graph_held: bool,
+    /// The graph-imposed floor version, when one is responsible for the hold.
     pub graph_floor: Option<Version>,
     /// The locked release's publish instant, threaded for rendering.
     pub published_at: Option<jiff::Timestamp>,
@@ -215,8 +346,11 @@ pub struct PinVerdict {
 /// A detected project rooted at a manifest within one ecosystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
+    /// The project's root directory.
     pub root: Utf8PathBuf,
+    /// The ecosystem the project belongs to.
     pub kind: EcosystemId,
+    /// The path to the project's manifest (e.g. `Cargo.toml`, `go.mod`).
     pub manifest: Utf8PathBuf,
 }
 
@@ -232,15 +366,20 @@ pub enum DepScope {
 /// A single planned version change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
+    /// The package being changed.
     pub package: PackageId,
+    /// The version being replaced.
     pub from: Version,
+    /// The version being adopted.
     pub to: Version,
+    /// The update kind of the change.
     pub kind: UpdateKind,
 }
 
 /// A set of planned changes handed to an adapter's `apply`.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
+    /// The planned version changes.
     pub changes: Vec<Change>,
 }
 
@@ -259,6 +398,19 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Returns a human-readable explanation of the skip reason.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::SkipReason;
+    ///
+    /// assert_eq!(
+    ///     SkipReason::ResolverConflict.message(),
+    ///     "the resolver rejected this change",
+    /// );
+    /// ```
+    #[must_use]
     pub fn message(self) -> &'static str {
         match self {
             SkipReason::GraphHeld => "graph requires this version newer; cannot downgrade",
@@ -274,7 +426,9 @@ impl SkipReason {
 /// A change that was not applied, with the reason and any offending package.
 #[derive(Debug, Clone)]
 pub struct Skipped {
+    /// The change that was not applied.
     pub change: Change,
+    /// Why it was skipped.
     pub reason: SkipReason,
     /// The package responsible for the skip (e.g. the too-fresh transitive), when known.
     pub offending: Option<PackageId>,
@@ -283,7 +437,9 @@ pub struct Skipped {
 /// The outcome of an `apply`: what changed and what was skipped. Skips are non-fatal data.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyReport {
+    /// The changes that were applied.
     pub applied: Vec<Change>,
+    /// The changes that were skipped, with reasons.
     pub skipped: Vec<Skipped>,
 }
 
@@ -291,7 +447,9 @@ pub struct ApplyReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactScope {
+    /// Gate only environment-relevant artifacts.
     Environment,
+    /// Gate every recorded artifact (`--all-artifacts`).
     All,
 }
 
@@ -299,20 +457,26 @@ pub enum ArtifactScope {
 /// this empty.
 #[derive(Debug, Clone, Default)]
 pub struct Environment {
+    /// The platform/abi/python-version/marker strings the lock must satisfy.
     pub markers: Vec<String>,
 }
 
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.
 #[derive(Debug, Clone)]
 pub struct TargetContext<'a> {
+    /// The project being evaluated.
     pub project: &'a Project,
+    /// The environments the lock must satisfy; empty for version-granular ecosystems.
     pub environments: &'a [Environment],
+    /// Which artifacts to gate.
     pub artifacts: ArtifactScope,
 }
 
 /// The result of an opt-in `build`/`sync` verification step.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
+    /// Whether the verification step succeeded.
     pub ok: bool,
+    /// Human-readable detail (e.g. the build output or failure reason).
     pub detail: String,
 }

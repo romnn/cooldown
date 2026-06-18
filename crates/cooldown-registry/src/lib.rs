@@ -16,7 +16,7 @@ pub mod ttl {
     use std::time::Duration;
 
     /// A specific version's metadata is immutable; cache it for a week.
-    pub const IMMUTABLE: Duration = Duration::from_secs(7 * 24 * 3600);
+    pub const IMMUTABLE: Duration = Duration::from_hours(168);
     /// A version listing can grow; refresh hourly.
-    pub const LISTING: Duration = Duration::from_secs(3600);
+    pub const LISTING: Duration = Duration::from_hours(1);
 }

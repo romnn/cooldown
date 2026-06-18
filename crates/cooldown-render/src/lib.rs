@@ -11,9 +11,49 @@ pub use schema::{json_schema, json_schema_string};
 
 use serde::Serialize;
 
-/// Serialize an [`Envelope`] to pretty JSON.
-pub fn to_json<M: Serialize, S: Serialize, I: Serialize>(env: &Envelope<M, S, I>) -> String {
-    serde_json::to_string_pretty(env).expect("envelope serializes")
+/// Serializes an [`Envelope`] to pretty (indented) JSON.
+///
+/// This is the entry point for `--json` output: it renders the stable, versioned
+/// envelope as a multi-line JSON document. The shape is identical across
+/// ecosystems and commands; see [`model`] for the contract.
+///
+/// # Errors
+///
+/// Returns the underlying [`serde_json::Error`] if the envelope cannot be
+/// serialized. In practice the render data model contains only
+/// JSON-representable types, so a failure indicates a non-finite float (e.g. a
+/// `NaN` age in days) reaching serialization.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_render::{to_json, Envelope, OutdatedMeta, OutdatedSummary, OutdatedItem};
+///
+/// let env = Envelope::new(
+///     "outdated",
+///     true,
+///     "2026-06-17T13:00:00Z".to_string(),
+///     OutdatedMeta {},
+///     OutdatedSummary {
+///         total: 0,
+///         adoptable: 0,
+///         in_cooldown: 0,
+///         up_to_date: 0,
+///         exempt: 0,
+///         held: 0,
+///         unknown_age: 0,
+///         errors: 0,
+///     },
+///     Vec::<OutdatedItem>::new(),
+/// );
+/// let json = to_json(&env)?;
+/// assert!(json.contains("\"schemaVersion\": 1"));
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+pub fn to_json<M: Serialize, S: Serialize, I: Serialize>(
+    env: &Envelope<M, S, I>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(env)
 }
 
 #[cfg(test)]
@@ -59,7 +99,7 @@ mod tests {
                 error: None,
             }],
         );
-        let json = to_json(&env);
+        let json = to_json(&env).expect("envelope serializes");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schemaVersion"], 1);
         assert_eq!(v["command"], "outdated");
@@ -91,7 +131,8 @@ mod tests {
             },
             Vec::<CheckItem>::new(),
         );
-        let v: serde_json::Value = serde_json::from_str(&to_json(&env)).unwrap();
+        let json = to_json(&env).expect("envelope serializes");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["scope"], "lockfile-graph");
         assert_eq!(v["artifactScope"], "environment");
         assert_eq!(v["summary"]["violations"], 1);
@@ -99,7 +140,7 @@ mod tests {
 
     #[test]
     fn schema_is_valid_json() {
-        let s = json_schema_string();
+        let s = json_schema_string().expect("schema serializes");
         let _: serde_json::Value = serde_json::from_str(&s).unwrap();
     }
 }

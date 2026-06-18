@@ -7,18 +7,39 @@ use cooldown_core::{
 use jiff::Timestamp;
 use std::collections::HashMap;
 
-/// An in-memory registry. Build it with the chained `with_*` helpers in tests.
+/// An in-memory [`PackageRegistry`] for tests, built with the chained `with_*` helpers.
+///
+/// It serves whatever releases the test registers, with no network access, so adapter and
+/// conformance tests can exercise classification, the cooldown floor, and artifact-granular
+/// publish-time logic deterministically.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_registry::FakeRegistry;
+///
+/// let registry = FakeRegistry::new()
+///     .with_release("serde", "1.0.0", Some("2026-01-01T00:00:00Z"), false)
+///     .with_release("serde", "1.0.1", None, true);
+/// ```
 #[derive(Default, Clone)]
 pub struct FakeRegistry {
     releases: HashMap<String, Vec<RawRelease>>,
 }
 
 impl FakeRegistry {
+    /// Creates an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add a version-granular release (no per-file artifacts).
+    /// Registers a version-granular release (no per-file artifacts) for `pkg`.
+    ///
+    /// `published_at` is an RFC 3339 instant, or `None` for an unknown time. An unparsable
+    /// string is also treated as `None`, matching the conservative "unknown time" handling used
+    /// throughout the registry.
+    #[must_use]
     pub fn with_release(
         mut self,
         pkg: &str,
@@ -28,7 +49,7 @@ impl FakeRegistry {
     ) -> Self {
         let rr = RawRelease {
             version: Version::new(version),
-            published_at: published_at.map(parse),
+            published_at: published_at.and_then(parse),
             yanked,
             artifacts: Vec::new(),
         };
@@ -36,7 +57,12 @@ impl FakeRegistry {
         self
     }
 
-    /// Add an artifact-granular release (e.g. a PyPI release with several files).
+    /// Registers an artifact-granular release for `pkg` (e.g. a `PyPI` release with several files).
+    ///
+    /// Each `artifacts` entry pairs an artifact id with its RFC 3339 upload time (`None`, or an
+    /// unparsable string, for an unknown time). The version-level publish instant is derived as
+    /// the newest known artifact time, or `None` if any artifact time is unknown.
+    #[must_use]
     pub fn with_artifact_release(
         mut self,
         pkg: &str,
@@ -47,7 +73,7 @@ impl FakeRegistry {
             .iter()
             .map(|(id, t)| RawArtifact {
                 id: ArtifactId((*id).to_string()),
-                published_at: t.map(parse),
+                published_at: t.and_then(parse),
                 markers: Vec::new(),
             })
             .collect();
@@ -64,8 +90,12 @@ impl FakeRegistry {
     }
 }
 
-fn parse(s: &str) -> Timestamp {
-    s.parse().expect("valid RFC3339 in test fixture")
+/// Parses an RFC 3339 instant, returning `None` for an unparsable string.
+///
+/// An unparsable fixture collapses to the conservative "unknown time" (`None`) rather than
+/// panicking, keeping the test builders total and free of fallible-unwrap conversions.
+fn parse(s: &str) -> Option<Timestamp> {
+    s.parse().ok()
 }
 
 /// Newest of the times, but `None` if any is unknown (conservative).

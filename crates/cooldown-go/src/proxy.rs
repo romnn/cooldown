@@ -16,9 +16,12 @@ pub struct GoProxy {
     bases: Vec<String>,
 }
 
+/// The metadata for a single module version, parsed from a proxy `.info`/`@latest` response.
 #[derive(Debug, Clone)]
 pub struct ProxyInfo {
+    /// The canonical version string reported by the proxy.
     pub version: String,
+    /// The publish time, if the `.info` response carried a parseable `Time` field.
     pub time: Option<Timestamp>,
 }
 
@@ -31,11 +34,21 @@ struct InfoJson {
 }
 
 impl GoProxy {
+    /// Creates a proxy client over `http` that tries each base URL in `bases` in order.
+    ///
+    /// `bases` should already be filtered to HTTP(S) endpoints (the `direct`/`off`
+    /// `GOPROXY` keywords are not valid base URLs); use [`GoProxy::from_env`] to derive
+    /// them from the environment.
+    #[must_use]
     pub fn new(http: SharedHttp, bases: Vec<String>) -> Self {
         GoProxy { http, bases }
     }
 
-    /// Build from the `GOPROXY` environment variable (default `https://proxy.golang.org,direct`).
+    /// Builds a proxy client from the `GOPROXY` environment variable.
+    ///
+    /// Defaults to `https://proxy.golang.org,direct` when `GOPROXY` is unset. The
+    /// `direct` and `off` keywords are dropped, leaving the ordered HTTP(S) bases.
+    #[must_use]
     pub fn from_env(http: SharedHttp) -> Self {
         let raw = std::env::var("GOPROXY")
             .unwrap_or_else(|_| "https://proxy.golang.org,direct".to_string());
@@ -44,6 +57,7 @@ impl GoProxy {
     }
 
     /// The reporting registry name (the first proxy host), for the JSON `registry` field.
+    #[must_use]
     pub fn registry_name(&self) -> Option<String> {
         self.bases.first().and_then(|b| host_of(b))
     }
@@ -71,7 +85,7 @@ impl GoProxy {
         for base in &self.bases {
             let url = format!("{}/{}", base.trim_end_matches('/'), suffix);
             match self.http.get(&url, ttl).await {
-                Ok(resp) if resp.is_not_found() => continue, // advance proxy on 404/410
+                Ok(resp) if resp.is_not_found() => {} // advance to the next proxy on 404/410
                 Ok(resp) if resp.is_success() => return Ok(Some(resp.body)),
                 Ok(resp) => {
                     last_err = Some(CoreError::transient(format!("{url}: HTTP {}", resp.status)));
@@ -86,7 +100,15 @@ impl GoProxy {
         }
     }
 
-    /// `@v/list` — tagged versions (no pseudo-versions; includes prereleases), one per line.
+    /// Fetches `@v/list`: the module's tagged versions, one per line.
+    ///
+    /// Includes prereleases but not pseudo-versions. Returns an empty vector when no
+    /// proxy has a listing for the module (a 404/410 from every base).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] if a proxy responds with a non-success, non-404 status
+    /// or the transport itself fails (see [`cooldown_core::CoreError`]).
     pub async fn list(&self, module: &str) -> Result<Vec<String>, CoreError> {
         let suffix = format!("{}/@v/list", Self::escape(module));
         match self.get_first(&suffix, ttl::LISTING).await? {
@@ -94,13 +116,21 @@ impl GoProxy {
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
+                .map(std::string::ToString::to_string)
                 .collect()),
             None => Ok(Vec::new()),
         }
     }
 
-    /// `@v/<version>.info` — the version's metadata (immutable; cached long).
+    /// Fetches `@v/<version>.info`: the metadata for a specific version.
+    ///
+    /// The response is immutable and cached long. Returns `None` when no proxy has the
+    /// version (a 404/410 from every base).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Parse`] if the response body is not valid `.info` JSON,
+    /// or a transport-level [`CoreError`] (see [`list`](Self::list)).
     pub async fn info(&self, module: &str, version: &str) -> Result<Option<ProxyInfo>, CoreError> {
         let suffix = format!("{}/@v/{}.info", Self::escape(module), Self::escape(version));
         let Some(body) = self.get_first(&suffix, ttl::IMMUTABLE).await? else {
@@ -118,7 +148,15 @@ impl GoProxy {
         }))
     }
 
-    /// `@latest` — the proxy's notion of the latest version (used when `@v/list` is empty).
+    /// Fetches `@latest`: the proxy's notion of the module's latest version.
+    ///
+    /// Used as a fallback when [`list`](Self::list) returns no tagged versions. Returns
+    /// `None` when no proxy can resolve a latest version.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Parse`] if the response body is not valid `.info` JSON,
+    /// or a transport-level [`CoreError`] (see [`list`](Self::list)).
     pub async fn latest(&self, module: &str) -> Result<Option<ProxyInfo>, CoreError> {
         let suffix = format!("{}/@latest", Self::escape(module));
         let Some(body) = self.get_first(&suffix, ttl::LISTING).await? else {
@@ -149,10 +187,10 @@ impl PackageRegistry for GoProxy {
     async fn releases(&self, package: &PackageId) -> Result<Vec<RawRelease>, CoreError> {
         let module = &package.name;
         let mut versions = self.list(module).await?;
-        if versions.is_empty() {
-            if let Some(latest) = self.latest(module).await? {
-                versions.push(latest.version);
-            }
+        if versions.is_empty()
+            && let Some(latest) = self.latest(module).await?
+        {
+            versions.push(latest.version);
         }
 
         // Fetch .info for every listed version concurrently; the per-host semaphore bounds load.
@@ -166,9 +204,9 @@ impl PackageRegistry for GoProxy {
         for (version, info) in infos {
             let time = match info {
                 Ok(Some(i)) => self.guard(module, &version, i.time),
-                Ok(None) => None,
                 Err(e) if e.is_transient() => return Err(e),
-                Err(_) => None, // a single missing .info → unknown age for that version
+                // A proxy 404 or a single non-transient `.info` failure → unknown age.
+                Ok(None) | Err(_) => None,
             };
             out.push(RawRelease {
                 version: Version::new(version),
@@ -203,7 +241,7 @@ fn parse_goproxy(raw: &str) -> Vec<String> {
     raw.split(['|', ','])
         .map(str::trim)
         .filter(|e| e.starts_with("http://") || e.starts_with("https://"))
-        .map(|e| e.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 

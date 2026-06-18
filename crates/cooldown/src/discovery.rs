@@ -9,9 +9,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::parse_config;
 use cooldown_core::{CoreError, Origin, PolicyLayer};
 
+/// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
+/// detection.
 pub const CONFIG_FILE: &str = "cooldown.toml";
 
 /// Resolve the repo root from `start`, walking up.
+#[must_use]
 pub fn find_repo_root(start: &Utf8Path) -> Utf8PathBuf {
     let mut nearest_with_config: Option<Utf8PathBuf> = None;
     let mut dir = Some(start.to_owned());
@@ -23,7 +26,7 @@ pub fn find_repo_root(start: &Utf8Path) -> Utf8PathBuf {
         if nearest_with_config.is_none() && d.join(CONFIG_FILE).is_file() {
             nearest_with_config = Some(d.clone());
         }
-        dir = d.parent().map(|p| p.to_owned());
+        dir = d.parent().map(std::borrow::ToOwned::to_owned);
     }
     if let Some(c) = nearest_with_config {
         return c;
@@ -32,6 +35,10 @@ pub fn find_repo_root(start: &Utf8Path) -> Utf8PathBuf {
 }
 
 /// The global config path: `${XDG_CONFIG_HOME:-~/.config}/cooldown/config.toml`.
+///
+/// Returns `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set, so no base directory can
+/// be derived.
+#[must_use]
 pub fn global_config_path() -> Option<Utf8PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -42,6 +49,13 @@ pub fn global_config_path() -> Option<Utf8PathBuf> {
 }
 
 /// Load the global config as a layer, if it exists.
+///
+/// Returns `Ok(None)` when no global config path can be derived or the file is absent.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Io`] if the file exists but cannot be read, or [`CoreError::Config`] if its
+/// contents do not parse as a valid config.
 pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
     let Some(path) = global_config_path() else {
         return Ok(None);
@@ -50,6 +64,14 @@ pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
 }
 
 /// Load an explicit `--config` / `COOLDOWN_CONFIG` file as a shared top file layer.
+///
+/// Unlike [`global_layer`], an explicit path that names a missing file is an error rather than a
+/// silently-skipped layer: the user asked for this file by name.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Io`] if `path` does not exist or cannot be read, or [`CoreError::Config`]
+/// if its contents do not parse as a valid config.
 pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> {
     match read_layer(path, Origin::Config(path.to_owned()))? {
         Some(layer) => Ok(layer),
@@ -59,6 +81,14 @@ pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> 
 
 /// The repo cascade for a project: layers from the repo root down to the project dir, lowest
 /// authority first (root) → highest (the project's own `cooldown.toml`).
+///
+/// Directories without a `cooldown.toml` contribute no layer. Both `repo_root` and `project_dir`
+/// are expected to be absolute and to share a common root.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Io`] if a discovered `cooldown.toml` cannot be read, or
+/// [`CoreError::Config`] if one does not parse as a valid config.
 pub fn repo_cascade_layers(
     repo_root: &Utf8Path,
     project_dir: &Utf8Path,
@@ -110,6 +140,9 @@ fn home_dir() -> Option<Utf8PathBuf> {
 }
 
 /// The XDG cache dir for cooldown: `${XDG_CACHE_HOME:-~/.cache}/cooldown`.
+///
+/// Falls back to a relative `.cache/cooldown` when neither `XDG_CACHE_HOME` nor `HOME` is set.
+#[must_use]
 pub fn cache_dir() -> Utf8PathBuf {
     std::env::var("XDG_CACHE_HOME")
         .ok()

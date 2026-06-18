@@ -26,9 +26,13 @@ use jiff::Timestamp;
 /// Per-project context: which ecosystem, the detected project, its path relative to the repo root
 /// (for `project` selectors), and its fully-assembled policy stack.
 pub struct ProjectCtx {
+    /// The ecosystem the project belongs to.
     pub ecosystem: EcosystemId,
+    /// The detected project (manifest, lock, root).
     pub project: Project,
+    /// The project root relative to the repo root, used by `project` policy selectors.
     pub rel_path: Utf8PathBuf,
+    /// The fully-assembled, project-scoped policy layers.
     pub policy: PolicyStack,
 }
 
@@ -48,6 +52,17 @@ pub enum Exit {
 }
 
 impl Exit {
+    /// The process exit code for this variant (`0`–`4`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown::Exit;
+    ///
+    /// assert_eq!(Exit::Ok.code(), 0);
+    /// assert_eq!(Exit::Policy.code(), 1);
+    /// ```
+    #[must_use]
     pub fn code(self) -> i32 {
         match self {
             Exit::Ok => 0,
@@ -57,6 +72,9 @@ impl Exit {
             Exit::Environment => 4,
         }
     }
+
+    /// Whether this is the clean exit ([`Exit::Ok`]).
+    #[must_use]
     pub fn is_ok(self) -> bool {
         self == Exit::Ok
     }
@@ -65,6 +83,10 @@ impl Exit {
 /// Per-run invocation controls (the non-policy flags). Policy lives in each project's
 /// [`PolicyStack`].
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent run-option flags; grouping into enums would obscure them"
+)]
 pub struct RunOpts {
     /// Restrict to these ecosystems (empty = all detected).
     pub lang: Vec<EcosystemId>,
@@ -109,6 +131,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Assemble a workspace from the detected adapters, per-project contexts, the run's single
+    /// `now`, and the loaded baseline.
+    #[must_use]
     pub fn new(
         ecosystems: Vec<Box<dyn Ecosystem>>,
         projects: Vec<ProjectCtx>,
@@ -123,14 +148,20 @@ impl Workspace {
         }
     }
 
+    /// The single `now` snapshotted once for the whole run.
+    #[must_use]
     pub fn now(&self) -> Timestamp {
         self.now
     }
 
+    /// The per-project contexts in this workspace.
+    #[must_use]
     pub fn projects(&self) -> &[ProjectCtx] {
         &self.projects
     }
 
+    /// Whether no projects were detected.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.projects.is_empty()
     }
@@ -139,7 +170,7 @@ impl Workspace {
         self.ecosystems
             .iter()
             .find(|e| e.id() == id)
-            .map(|b| b.as_ref())
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// Projects in scope for this run (filtered by `--lang`).
@@ -153,7 +184,7 @@ impl Workspace {
         opts.package.is_empty() || opts.package.iter().any(|g| g.is_match(name))
     }
 
-    fn resolve_ctx<'a>(&self, pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
+    fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
         ResolveContext {
             ecosystem: pctx.ecosystem,
             project: &pctx.rel_path,
@@ -167,7 +198,7 @@ pub(crate) fn render_window(w: &ResolvedWindow, now: Timestamp) -> render::Windo
     render::Window {
         min_age_days: round2(w.effective_min_age_days(now)),
         source: w.source(),
-        clamped_by: w.clamped_by(now).map(|o| o.token()),
+        clamped_by: w.clamped_by(now).map(cooldown_core::Origin::token),
     }
 }
 

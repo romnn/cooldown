@@ -10,13 +10,17 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
-/// The exact `golang.org/x/mod/module` pseudo-version regex.
-fn pseudo_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^v[0-9]+\.(0\.0-|\d+\.\d+-([^+]*\.)?0\.)\d{14}-[A-Za-z0-9]+(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$")
-            .expect("valid pseudo-version regex")
-    })
+/// The source for the exact `golang.org/x/mod/module` pseudo-version regex.
+const PSEUDO_RE_SRC: &str = r"^v[0-9]+\.(0\.0-|\d+\.\d+-([^+]*\.)?0\.)\d{14}-[A-Za-z0-9]+(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$";
+
+/// Returns the compiled, cached `golang.org/x/mod/module` pseudo-version regex.
+///
+/// Returns `None` only if [`PSEUDO_RE_SRC`] fails to compile, which is impossible
+/// for the constant pattern (it is exercised by the unit tests). Callers therefore
+/// treat a `None` here as "not a pseudo-version" rather than panicking.
+fn pseudo_re() -> Option<&'static Regex> {
+    static RE: OnceLock<Option<Regex>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(PSEUDO_RE_SRC).ok()).as_ref()
 }
 
 struct Parsed {
@@ -35,14 +39,17 @@ fn is_digits(s: &str) -> bool {
 
 /// Parse one numeric component (no leading zeros, ≥1 digit). Returns the digits and the rest.
 fn parse_int(s: &str) -> Option<(&str, &str)> {
-    if s.is_empty() || !s.as_bytes()[0].is_ascii_digit() {
-        return None;
+    let bytes = s.as_bytes();
+    match bytes {
+        // A leading `0` followed by another digit is an illegal leading zero.
+        [b'0', d, ..] if d.is_ascii_digit() => None,
+        [first, ..] if first.is_ascii_digit() => {
+            let end = s.bytes().take_while(u8::is_ascii_digit).count();
+            // `end` counts ASCII digits from the start, so it is a valid char boundary.
+            Some(s.split_at(end))
+        }
+        _ => None,
     }
-    if s.as_bytes()[0] == b'0' && s.len() > 1 && s.as_bytes()[1].is_ascii_digit() {
-        return None; // leading zero
-    }
-    let end = s.bytes().take_while(|b| b.is_ascii_digit()).count();
-    Some((&s[..end], &s[end..]))
 }
 
 fn valid_identifiers(s: &str, numeric_no_leading_zero: bool) -> bool {
@@ -86,12 +93,16 @@ fn parse(v: &str) -> Option<Parsed> {
     let (patch, rest) = parse_int(rest)?;
 
     let (prerelease, rest) = if let Some(r) = rest.strip_prefix('-') {
-        let end = r.find('+').unwrap_or(r.len());
-        let pre = &r[..end];
+        // The prerelease runs up to the build separator `+` (if any); `rest` keeps the `+…` build,
+        // or is empty when no build is present. `+` is ASCII, so this is a valid split point.
+        let (pre, rest) = match r.find('+') {
+            Some(plus) => r.split_at(plus),
+            None => (r, ""),
+        };
         if !valid_identifiers(pre, true) {
             return None;
         }
-        (format!("-{pre}"), &r[end..])
+        (format!("-{pre}"), rest)
     } else {
         (String::new(), rest)
     };
@@ -126,12 +137,43 @@ fn parsed(major: &str, minor: &str, patch: &str, pre: &str, build: &str) -> Pars
     }
 }
 
-/// Is `v` a valid `v`-prefixed semver?
+/// Reports whether `v` is a valid `v`-prefixed semver string.
+///
+/// Mirrors `semver.IsValid` from `golang.org/x/mod`. Short forms such as `v1` and
+/// `v1.2` are accepted (Go canonicalises them), but a prerelease or build suffix is
+/// only legal after a full `vMAJOR.MINOR.PATCH` triple.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert!(semver::is_valid("v1.2.3"));
+/// assert!(semver::is_valid("v1")); // short form is accepted
+/// assert!(!semver::is_valid("1.2.3")); // missing `v` prefix
+/// assert!(!semver::is_valid("v1-pre")); // suffix needs the full triple
+/// ```
+#[must_use]
 pub fn is_valid(v: &str) -> bool {
     parse(v).is_some()
 }
 
-/// The canonical form: fills missing minor/patch, strips build metadata. `""` if invalid.
+/// Returns the canonical form of `v`, or `""` if `v` is invalid.
+///
+/// Mirrors `semver.Canonical`: missing minor/patch components are filled with `0`
+/// and build metadata is stripped. The prerelease suffix is preserved.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::canonical("v1.2"), "v1.2.0");
+/// assert_eq!(semver::canonical("v1.2.3+meta"), "v1.2.3");
+/// assert_eq!(semver::canonical("v1.2.3-pre+meta"), "v1.2.3-pre");
+/// assert_eq!(semver::canonical("nope"), "");
+/// ```
+#[must_use]
 pub fn canonical(v: &str) -> String {
     match parse(v) {
         Some(p) => format!("v{}.{}.{}{}", p.major, p.minor, p.patch, p.prerelease),
@@ -139,7 +181,20 @@ pub fn canonical(v: &str) -> String {
     }
 }
 
-/// `module.CanonicalVersion`: like [`canonical`] but preserves a `+incompatible` build suffix.
+/// Returns the canonical form of `v`, preserving a `+incompatible` build suffix.
+///
+/// Mirrors `module.CanonicalVersion`: like [`canonical`], but the Go module system's
+/// special `+incompatible` marker is retained (all other build metadata is dropped).
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::canonical_version("v3.0.0+incompatible"), "v3.0.0+incompatible");
+/// assert_eq!(semver::canonical_version("v1.2.3+meta"), "v1.2.3");
+/// ```
+#[must_use]
 pub fn canonical_version(v: &str) -> String {
     let c = canonical(v);
     if c.is_empty() {
@@ -152,7 +207,19 @@ pub fn canonical_version(v: &str) -> String {
     }
 }
 
-/// `semver.Major` → `vN` (or `""`).
+/// Returns the major-version prefix `vN` of `v`, or `""` if `v` is invalid.
+///
+/// Mirrors `semver.Major`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::major("v2.1.0"), "v2");
+/// assert_eq!(semver::major("nope"), "");
+/// ```
+#[must_use]
 pub fn major(v: &str) -> String {
     match parse(v) {
         Some(p) => format!("v{}", p.major),
@@ -160,7 +227,18 @@ pub fn major(v: &str) -> String {
     }
 }
 
-/// `semver.MajorMinor` → `vN.M` (or `""`).
+/// Returns the major/minor prefix `vN.M` of `v`, or `""` if `v` is invalid.
+///
+/// Mirrors `semver.MajorMinor`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::major_minor("v2.1.0"), "v2.1");
+/// ```
+#[must_use]
 pub fn major_minor(v: &str) -> String {
     match parse(v) {
         Some(p) => format!("v{}.{}", p.major, p.minor),
@@ -168,28 +246,90 @@ pub fn major_minor(v: &str) -> String {
     }
 }
 
-/// `semver.Prerelease` → the `-...` suffix including the leading `-`, or `""`.
+/// Returns the prerelease suffix of `v` including the leading `-`, or `""` if absent or invalid.
+///
+/// Mirrors `semver.Prerelease`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::prerelease("v2.1.0-pre+meta"), "-pre");
+/// assert_eq!(semver::prerelease("v2.1.0"), "");
+/// ```
+#[must_use]
 pub fn prerelease(v: &str) -> String {
     parse(v).map(|p| p.prerelease).unwrap_or_default()
 }
 
-/// `semver.Build` → the `+...` suffix including the leading `+`, or `""`.
+/// Returns the build-metadata suffix of `v` including the leading `+`, or `""` if absent or invalid.
+///
+/// Mirrors `semver.Build`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::build("v2.1.0-pre+meta"), "+meta");
+/// assert_eq!(semver::build("v2.1.0"), "");
+/// ```
+#[must_use]
 pub fn build(v: &str) -> String {
     parse(v).map(|p| p.build).unwrap_or_default()
 }
 
-/// A stable release ⟺ no prerelease segment (build metadata, incl. `+incompatible`, does not count).
+/// Reports whether `v` is a stable release, i.e. valid and with no prerelease segment.
+///
+/// Build metadata (including `+incompatible`) does not make a version unstable.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert!(semver::is_stable("v1.2.3"));
+/// assert!(semver::is_stable("v3.0.0+incompatible"));
+/// assert!(!semver::is_stable("v1.2.3-rc1"));
+/// ```
+#[must_use]
 pub fn is_stable(v: &str) -> bool {
     is_valid(v) && prerelease(v).is_empty()
 }
 
+/// Reports whether `v` carries the Go module system's `+incompatible` build marker.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert!(semver::is_incompatible("v3.0.0+incompatible"));
+/// assert!(!semver::is_incompatible("v3.0.0"));
+/// ```
+#[must_use]
 pub fn is_incompatible(v: &str) -> bool {
     build(v) == "+incompatible"
 }
 
-/// `module.IsPseudoVersion`: at least two `-`, valid semver, and the exact x/mod regex.
+/// Reports whether `v` is a Go pseudo-version.
+///
+/// Mirrors `module.IsPseudoVersion`: `v` must contain at least two `-`, be valid
+/// semver, and match the exact `golang.org/x/mod/module` pseudo-version regex.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert!(semver::is_pseudo("v0.0.0-20191109021931-daa7c04131f5")); // spellcheck:ignore-line
+/// assert!(!semver::is_pseudo("v1.2.3"));
+/// assert!(!semver::is_pseudo("v1.2.3-pre"));
+/// ```
+#[must_use]
 pub fn is_pseudo(v: &str) -> bool {
-    v.matches('-').count() >= 2 && is_valid(v) && pseudo_re().is_match(v)
+    v.matches('-').count() >= 2 && is_valid(v) && pseudo_re().is_some_and(|re| re.is_match(v))
 }
 
 /// Numeric comparison: shorter (smaller magnitude, since no leading zeros) first, then bytewise.
@@ -211,9 +351,10 @@ fn compare_prerelease(x: &str, y: &str) -> Ordering {
     let mut x = x;
     let mut y = y;
     loop {
-        // drop a leading '-' or '.'
-        x = &x[1..];
-        y = &y[1..];
+        // Drop the single leading separator (`-` or `.`); both are one ASCII byte. The loop is
+        // only entered/continued while `x` and `y` are non-empty, so a byte is always present.
+        x = x.get(1..).unwrap_or("");
+        y = y.get(1..).unwrap_or("");
         let ident_x = next_ident(x);
         let ident_y = next_ident(y);
         if ident_x != ident_y {
@@ -231,8 +372,9 @@ fn compare_prerelease(x: &str, y: &str) -> Ordering {
             }
             return ident_x.cmp(ident_y);
         }
-        x = &x[ident_x.len()..];
-        y = &y[ident_y.len()..];
+        // `ident_*` is a prefix of the corresponding string, so the suffix slice is in bounds.
+        x = x.get(ident_x.len()..).unwrap_or("");
+        y = y.get(ident_y.len()..).unwrap_or("");
         if x.is_empty() || y.is_empty() {
             break;
         }
@@ -247,13 +389,32 @@ fn compare_prerelease(x: &str, y: &str) -> Ordering {
     }
 }
 
+/// Returns the leading dot-free identifier of `s` (everything up to the first `.`, or all of `s`).
 fn next_ident(s: &str) -> &str {
-    let end = s.find('.').unwrap_or(s.len());
-    &s[..end]
+    match s.split_once('.') {
+        Some((ident, _)) => ident,
+        None => s,
+    }
 }
 
-/// `semver.Compare`: invalid < valid; major.minor.patch numerically; prerelease per the algorithm;
-/// build metadata fully ignored.
+/// Compares two semver strings, mirroring `semver.Compare`.
+///
+/// An invalid version sorts below any valid one. Valid versions are ordered by
+/// major, then minor, then patch numerically, then by prerelease per the
+/// `comparePrerelease` algorithm (numeric identifiers below alphanumeric, fewer
+/// fields below more). Build metadata is ignored entirely.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+/// use std::cmp::Ordering;
+///
+/// assert_eq!(semver::compare("v1.0.0", "v1.0.1"), Ordering::Less);
+/// assert_eq!(semver::compare("v1.0.0-rc.1", "v1.0.0"), Ordering::Less);
+/// assert_eq!(semver::compare("v1.0.0+meta", "v1.0.0"), Ordering::Equal);
+/// ```
+#[must_use]
 pub fn compare(a: &str, b: &str) -> Ordering {
     match (parse(a), parse(b)) {
         (None, None) => Ordering::Equal,
@@ -266,38 +427,69 @@ pub fn compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// The embedded pseudo-version commit timestamp (UTC), or `None` if not a pseudo-version.
+/// Returns the commit timestamp (UTC) embedded in a pseudo-version, or `None`.
+///
+/// Mirrors `module.PseudoVersionTime`: the 14-digit `YYYYMMDDhhmmss` run immediately
+/// preceding the final `-rev[+build]` segment is decoded as a UTC instant. Returns
+/// `None` when `v` is not a pseudo-version (see [`is_pseudo`]) or the encoded instant
+/// is not a valid calendar time.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// let t = semver::pseudo_time("v0.0.0-20191109021931-daa7c04131f5").unwrap(); // spellcheck:ignore-line
+/// assert_eq!(t.to_string(), "2019-11-09T02:19:31Z");
+/// assert_eq!(semver::pseudo_time("v1.2.3"), None);
+/// ```
+#[must_use]
 pub fn pseudo_time(v: &str) -> Option<Timestamp> {
     if !is_pseudo(v) {
         return None;
     }
     // The 14-digit timestamp is the run of digits immediately before the final `-rev[+build]`.
-    let caps = pseudo_re().captures(v)?;
+    let caps = pseudo_re()?.captures(v)?;
     let whole = caps.get(0)?.as_str();
-    // Find the `\d{14}-` segment: scan for 14 digits followed by '-'.
+    // Find the `\d{14}-` segment: scan for a 15-byte window of 14 digits followed by '-',
+    // where the byte before the window (if any) is not itself a digit.
     let bytes = whole.as_bytes();
-    for i in 0..bytes.len().saturating_sub(14) {
-        if bytes[i..i + 14].iter().all(|b| b.is_ascii_digit())
-            && bytes.get(i + 14) == Some(&b'-')
-            && (i == 0 || !bytes[i - 1].is_ascii_digit())
-        {
-            let ts = &whole[i..i + 14];
-            return parse_pseudo_timestamp(ts);
+    for (i, window) in bytes.windows(15).enumerate() {
+        let (Some(digits), Some(&sep)) = (window.get(..14), window.last()) else {
+            continue;
+        };
+        let preceded_by_digit = i
+            .checked_sub(1)
+            .and_then(|prev| bytes.get(prev))
+            .is_some_and(u8::is_ascii_digit);
+        if digits.iter().all(u8::is_ascii_digit) && sep == b'-' && !preceded_by_digit {
+            return parse_pseudo_timestamp(digits);
         }
     }
     None
 }
 
-fn parse_pseudo_timestamp(ts: &str) -> Option<Timestamp> {
-    if ts.len() != 14 || !ts.bytes().all(|b| b.is_ascii_digit()) {
+/// Parses a 14-byte `YYYYMMDDhhmmss` digit run into a UTC [`Timestamp`].
+///
+/// Returns `None` if `ts` is not exactly 14 ASCII digits or the encoded
+/// calendar instant is invalid.
+fn parse_pseudo_timestamp(ts: &[u8]) -> Option<Timestamp> {
+    if ts.len() != 14 || !ts.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let year: i16 = ts[0..4].parse().ok()?;
-    let month: i8 = ts[4..6].parse().ok()?;
-    let day: i8 = ts[6..8].parse().ok()?;
-    let hour: i8 = ts[8..10].parse().ok()?;
-    let min: i8 = ts[10..12].parse().ok()?;
-    let sec: i8 = ts[12..14].parse().ok()?;
+    // Each digit is ASCII `0..=9`; fold a fixed-width field into its integer value
+    // without slicing or string re-parsing.
+    let field = |range: std::ops::Range<usize>| -> Option<i64> {
+        ts.get(range)?
+            .iter()
+            .try_fold(0_i64, |acc, &b| Some(acc * 10 + i64::from(b - b'0')))
+    };
+    let year = i16::try_from(field(0..4)?).ok()?;
+    let month = i8::try_from(field(4..6)?).ok()?;
+    let day = i8::try_from(field(6..8)?).ok()?;
+    let hour = i8::try_from(field(8..10)?).ok()?;
+    let min = i8::try_from(field(10..12)?).ok()?;
+    let sec = i8::try_from(field(12..14)?).ok()?;
     civil::date(year, month, day)
         .at(hour, min, sec, 0)
         .to_zoned(TimeZone::UTC)
@@ -305,26 +497,63 @@ fn parse_pseudo_timestamp(ts: &str) -> Option<Timestamp> {
         .map(|z| z.timestamp())
 }
 
-/// `module.SplitPathVersion(path) -> (prefix, pathMajor, ok)`.
+/// Splits a module `path` into `(prefix, path_major, ok)`, mirroring `module.SplitPathVersion`.
+///
+/// `path_major` is the trailing major-version element (`/vN`, or `.vN` for `gopkg.in`
+/// paths), and is empty for a base path at major v0/v1. `ok` is `false` when the path
+/// carries a malformed version element (e.g. a dotted `/v2.0.0`, a leading-zero major,
+/// or an explicit `/v1`), in which case `prefix` is the unchanged `path`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(
+///     semver::split_path_version("example.com/foo"),
+///     ("example.com/foo".to_string(), String::new(), true)
+/// );
+/// assert_eq!(
+///     semver::split_path_version("example.com/foo/v2"),
+///     ("example.com/foo".to_string(), "/v2".to_string(), true)
+/// );
+/// assert_eq!(
+///     semver::split_path_version("gopkg.in/yaml.v2"),
+///     ("gopkg.in/yaml".to_string(), ".v2".to_string(), true)
+/// );
+/// assert!(!semver::split_path_version("example.com/foo/v1").2);
+/// ```
+#[must_use]
 pub fn split_path_version(path: &str) -> (String, String, bool) {
     if let Some(rest) = path.strip_prefix("gopkg.in/") {
         return split_gopkg_in(path, rest);
     }
     let bytes = path.as_bytes();
+    // Walk back over the trailing run of digits and dots; `i` lands on its first byte.
     let mut i = bytes.len();
     let mut dot = false;
-    while i > 0 && (bytes[i - 1].is_ascii_digit() || bytes[i - 1] == b'.') {
-        if bytes[i - 1] == b'.' {
+    while let Some(&b) = i.checked_sub(1).and_then(|prev| bytes.get(prev)) {
+        if b == b'.' {
             dot = true;
+        } else if !b.is_ascii_digit() {
+            break;
         }
         i -= 1;
     }
-    if i <= 1 || i == bytes.len() || bytes[i - 1] != b'v' || bytes[i - 2] != b'/' {
+    // The major suffix must be `/vN`: at least `/v` before the run, and a non-empty run.
+    let is_versioned = i > 1
+        && i != bytes.len()
+        && i.checked_sub(1).and_then(|p| bytes.get(p)) == Some(&b'v')
+        && i.checked_sub(2).and_then(|p| bytes.get(p)) == Some(&b'/');
+    if !is_versioned {
         return (path.to_string(), String::new(), true);
     }
-    let prefix = &path[..i - 2];
-    let path_major = &path[i - 2..];
-    if dot || path_major.len() <= 2 || bytes[i] == b'0' || path_major == "/v1" {
+    let (Some(prefix), Some(path_major)) = (path.get(..i - 2), path.get(i - 2..)) else {
+        return (path.to_string(), String::new(), true);
+    };
+    // Reject a dotted run (e.g. `/v2.0.0`), a bare `/v`, a leading-zero major, and `/v1`.
+    let leading_zero = bytes.get(i) == Some(&b'0');
+    if dot || path_major.len() <= 2 || leading_zero || path_major == "/v1" {
         return (path.to_string(), String::new(), false);
     }
     (prefix.to_string(), path_major.to_string(), true)
@@ -335,19 +564,34 @@ fn split_gopkg_in(path: &str, _rest: &str) -> (String, String, bool) {
     // from the returned pathMajor, so the boundary is found on the stripped base and pathMajor is
     // a bare `.vN`. gopkg.in accepts `.v0`/`.v1`, but rejects a leading-zero major like `.v02`.
     let base = path.strip_suffix("-unstable").unwrap_or(path);
-    if let Some(dot) = base.rfind(".v") {
-        let num_part = &base[dot + 2..];
+    // `.v` is two ASCII bytes, so `dot` and `dot + 2` are valid `str` boundaries.
+    if let Some(dot) = base.rfind(".v")
+        && let (Some(prefix), Some(path_major), Some(num_part)) =
+            (base.get(..dot), base.get(dot..), base.get(dot + 2..))
+    {
         let leading_zero = num_part.len() > 1 && num_part.starts_with('0');
         if !num_part.is_empty() && num_part.bytes().all(|b| b.is_ascii_digit()) && !leading_zero {
-            let path_major = &base[dot..]; // ".vN" (without -unstable)
-            return (base[..dot].to_string(), path_major.to_string(), true);
+            // `path_major` is the bare `.vN` (with any `-unstable` suffix already stripped).
+            return (prefix.to_string(), path_major.to_string(), true);
         }
     }
     (path.to_string(), String::new(), false)
 }
 
-/// Build the module path for major `n` (≥2) given a base path's `prefix`. Returns `prefix/vN`
-/// (or `prefix.vN` for gopkg.in).
+/// Builds the module path for major version `n` (≥ 2) from a base path's `prefix`.
+///
+/// Returns `prefix/vN`, or `prefix.vN` for a `gopkg.in` prefix. The inverse of the
+/// `prefix` returned by [`split_path_version`].
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_go::semver;
+///
+/// assert_eq!(semver::major_path("example.com/foo", 3), "example.com/foo/v3");
+/// assert_eq!(semver::major_path("gopkg.in/yaml", 2), "gopkg.in/yaml.v2");
+/// ```
+#[must_use]
 pub fn major_path(prefix: &str, n: u32) -> String {
     if prefix.starts_with("gopkg.in/") {
         format!("{prefix}.v{n}")
@@ -452,7 +696,7 @@ mod tests {
     fn split_path_version_cases() {
         assert_eq!(
             split_path_version("example.com/foo"),
-            ("example.com/foo".into(), "".into(), true)
+            ("example.com/foo".into(), String::new(), true)
         );
         assert_eq!(
             split_path_version("example.com/foo/v2"),

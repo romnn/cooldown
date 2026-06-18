@@ -15,20 +15,36 @@ use cooldown_core::{
 };
 use cooldown_registry::SharedHttp;
 
+/// The [`EcosystemId`] identifying the Rust/Cargo ecosystem (`"rust"`).
 pub const CARGO_ID: EcosystemId = EcosystemId("rust");
 
+/// The Rust/Cargo implementation of the [`Ecosystem`] port.
+///
+/// Pairs the crates.io sparse-index client ([`CratesIoIndex`]) with a [`Cargo`]
+/// CLI wrapper: the index supplies publish times and the release set, while
+/// `cargo` resolves the dependency graph and applies precise version changes.
 pub struct CargoEcosystem {
     index: CratesIoIndex,
     cargo: Cargo,
 }
 
 impl CargoEcosystem {
+    /// Creates an ecosystem from an existing crates.io [`CratesIoIndex`] client.
+    ///
+    /// The [`Cargo`] CLI wrapper is constructed with its defaults (honoring the
+    /// `COOLDOWN_CARGO` environment override).
+    #[must_use]
     pub fn new(index: CratesIoIndex) -> Self {
         CargoEcosystem {
             index,
             cargo: Cargo::new(),
         }
     }
+
+    /// Creates an ecosystem backed by the shared HTTP layer, building the index for you.
+    ///
+    /// Convenience constructor equivalent to `CargoEcosystem::new(CratesIoIndex::new(http))`.
+    #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         CargoEcosystem::new(CratesIoIndex::new(http))
     }
@@ -42,7 +58,13 @@ fn classify_quality(v: &str) -> ReleaseQuality {
     }
 }
 
-/// Classify raw crates.io releases into ordered, deduped releases relative to the current pin.
+/// Classifies raw crates.io releases into ordered, deduped [`Release`]s relative to `current`.
+///
+/// Unparsable versions are dropped, the rest are sorted by [`version::compare`] and deduplicated,
+/// then each is stamped with a [`ReleaseOrder`] token reflecting its rank (ascending). `current` is
+/// the currently pinned version, used to compute each release's [`UpdateKind`](cooldown_core::UpdateKind)
+/// via [`version::classify_kind`].
+#[must_use]
 pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec<Release> {
     let mut releases: Vec<Release> = raw
         .into_iter()
@@ -63,7 +85,10 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
     releases.sort_by(|a, b| version::compare(a.version.as_str(), b.version.as_str()));
     releases.dedup_by(|a, b| a.version == b.version);
     for (i, r) in releases.iter_mut().enumerate() {
-        r.order = ReleaseOrder((i as u32).to_be_bytes().to_vec());
+        // The release index is the ascending rank; a big-endian u32 token preserves that order
+        // lexicographically. Saturating at u32::MAX is purely defensive — no crate approaches it.
+        let rank = u32::try_from(i).unwrap_or(u32::MAX);
+        r.order = ReleaseOrder(rank.to_be_bytes().to_vec());
     }
     releases
 }

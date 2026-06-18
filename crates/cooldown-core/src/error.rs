@@ -3,6 +3,11 @@
 
 use std::fmt;
 
+/// A [`Result`](std::result::Result) specialized to [`CoreError`].
+///
+/// Defaulting the error parameter to [`CoreError`] lets functions in the core
+/// write `Result<T>` while still permitting `Result<T, OtherError>` where a
+/// different error type is needed.
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
 
 /// A boxed, thread-safe error used to carry an opaque transient cause.
@@ -27,8 +32,11 @@ pub enum CoreError {
     /// An external tool (`go`, `cargo`, `uv`) exited non-zero.
     #[error("tool `{tool}` failed with status {status}: {stderr}")]
     Tool {
+        /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
         tool: String,
+        /// The process exit status reported by the tool.
         status: i32,
+        /// The captured standard-error output, used as the failure detail.
         stderr: String,
     },
 
@@ -38,7 +46,7 @@ pub enum CoreError {
     Config(String),
 
     /// An upstream **registry** payload could not be parsed (a Go `.info`/`@latest` document, a
-    /// PyPI JSON response, or a crates.io sparse-index line). An environment-level data fault.
+    /// `PyPI` JSON response, or a crates.io sparse-index line). An environment-level data fault.
     #[error("parse error: {0}")]
     Parse(String),
 
@@ -64,6 +72,7 @@ pub enum CoreError {
 impl CoreError {
     /// Whether retrying the operation could plausibly succeed. Network/5xx/429 are transient; a
     /// `NotFound`, a config or parse error, or a non-zero tool exit are not.
+    #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, CoreError::Transient(_))
     }
@@ -75,16 +84,18 @@ impl CoreError {
 
     /// The structured kind for the JSON `Diagnostic.kind` field. Each error class maps to exactly
     /// one kind, so a consumer never has to disambiguate by message string.
+    #[must_use]
     pub fn diagnostic_kind(&self) -> DiagnosticKind {
         match self {
             CoreError::NotFound(_) => DiagnosticKind::NotFound,
-            CoreError::Transient(_) | CoreError::OfflineMiss(_) => DiagnosticKind::Transient,
+            CoreError::Transient(_) | CoreError::OfflineMiss(_) | CoreError::Io(_) => {
+                DiagnosticKind::Transient
+            }
             CoreError::Tool { .. } => DiagnosticKind::ToolFailed,
             CoreError::Config(_) => DiagnosticKind::Config,
             CoreError::Parse(_) => DiagnosticKind::Parse,
             CoreError::LockUnreadable(_) => DiagnosticKind::LockfileUnreadable,
             CoreError::StaleLock(_) => DiagnosticKind::StaleLock,
-            CoreError::Io(_) => DiagnosticKind::Transient,
         }
     }
 }
@@ -101,20 +112,34 @@ impl From<std::io::Error> for CoreError {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
+    /// The structured class of the diagnostic. Always set.
     pub kind: DiagnosticKind,
+    /// The human-readable description shown on the TTY and serialized in the
+    /// JSON envelope. Always set.
     pub message: String,
+    /// The ecosystem the diagnostic originates from (for example `go`, `cargo`,
+    /// or `uv`), when it is package-specific.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ecosystem: Option<String>,
+    /// The project (workspace member or manifest) the diagnostic applies to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The package or module name the diagnostic applies to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
+    /// The package version the diagnostic applies to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The upstream registry consulted (for example a crates.io or `PyPI`
+    /// endpoint), when relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
+    /// The external tool involved (for example `go`, `cargo`, or `uv`), when the
+    /// diagnostic stems from a tool invocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// The filesystem path involved (for example a lockfile or manifest), when
+    /// relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
@@ -123,12 +148,22 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticKind {
+    /// A transient failure (network blip, 5xx, 429, or an incidental I/O error)
+    /// that a retry might resolve.
     Transient,
+    /// The requested package, version, or module was not found upstream.
     NotFound,
+    /// The release age of a version could not be determined, so the cooldown
+    /// policy could not be evaluated for it.
     UnknownAge,
+    /// A native ecosystem constraint is stricter than the configured cooldown,
+    /// so the ecosystem's own rule governs instead.
     StricterNative,
+    /// The version under consideration has been yanked upstream.
     Yanked,
+    /// A lockfile or manifest is stale relative to its source, or absent.
     StaleLock,
+    /// An external tool (`go`, `cargo`, `uv`) exited non-zero.
     ToolFailed,
     /// A local lockfile/manifest or resolved-graph dump could not be read.
     LockfileUnreadable,
@@ -157,7 +192,26 @@ impl fmt::Display for DiagnosticKind {
 }
 
 impl Diagnostic {
-    /// Start a diagnostic with just the required fields; chain the `with_*` setters for the rest.
+    /// Starts a diagnostic with only the required [`kind`](Diagnostic::kind)
+    /// and [`message`](Diagnostic::message) fields.
+    ///
+    /// This is the entry point of the builder chain: every optional field starts
+    /// as `None` and is filled in by chaining the `with_*` setters such as
+    /// [`Diagnostic::with_package`] or [`Diagnostic::with_version`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cooldown_core::{Diagnostic, DiagnosticKind};
+    ///
+    /// let diag = Diagnostic::new(DiagnosticKind::Yanked, "version was yanked")
+    ///     .with_ecosystem("cargo")
+    ///     .with_package("serde")
+    ///     .with_version("1.0.0");
+    ///
+    /// assert_eq!(diag.kind, DiagnosticKind::Yanked);
+    /// assert_eq!(diag.package.as_deref(), Some("serde"));
+    /// ```
     pub fn new(kind: DiagnosticKind, message: impl Into<String>) -> Self {
         Diagnostic {
             kind,
@@ -172,30 +226,44 @@ impl Diagnostic {
         }
     }
 
+    /// Sets the [`ecosystem`](Diagnostic::ecosystem) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_ecosystem(mut self, e: impl Into<String>) -> Self {
         self.ecosystem = Some(e.into());
         self
     }
+    /// Sets the [`project`](Diagnostic::project) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_project(mut self, p: impl Into<String>) -> Self {
         self.project = Some(p.into());
         self
     }
+    /// Sets the [`package`](Diagnostic::package) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_package(mut self, p: impl Into<String>) -> Self {
         self.package = Some(p.into());
         self
     }
+    /// Sets the [`version`](Diagnostic::version) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_version(mut self, v: impl Into<String>) -> Self {
         self.version = Some(v.into());
         self
     }
+    /// Sets the [`registry`](Diagnostic::registry) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_registry(mut self, r: impl Into<String>) -> Self {
         self.registry = Some(r.into());
         self
     }
+    /// Sets the [`tool`](Diagnostic::tool) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_tool(mut self, t: impl Into<String>) -> Self {
         self.tool = Some(t.into());
         self
     }
+    /// Sets the [`path`](Diagnostic::path) field and returns `self` for chaining.
+    #[must_use]
     pub fn with_path(mut self, p: impl Into<String>) -> Self {
         self.path = Some(p.into());
         self

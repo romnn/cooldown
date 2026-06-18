@@ -1,4 +1,4 @@
-//! The PyPI JSON-API [`PackageRegistry`]: the full version list and per-file upload times
+//! The `PyPI` JSON-API [`PackageRegistry`]: the full version list and per-file upload times
 //! (`upload_time_iso_8601`). A release has several files (wheels per platform + an sdist), each
 //! with its own time; the release time is the newest, but `None` if any file lacks one.
 
@@ -9,8 +9,18 @@ use jiff::Timestamp;
 use std::collections::HashMap;
 
 const DEFAULT_BASE: &str = "https://pypi.org";
+
+/// The registry name used to tag PyPI-sourced [`PackageId`]s.
 pub const PYPI: &str = "pypi";
 
+/// A client for the [PyPI JSON API], implementing [`PackageRegistry`].
+///
+/// It fetches the full version list and, per release, the newest per-file upload
+/// time (PyPI's PEP 700 `upload_time_iso_8601`). HTTP is shared and cached via
+/// [`SharedHttp`]; publish times pass through the store's monotonic guard so a
+/// version's recorded time never moves backwards across runs.
+///
+/// [PyPI JSON API]: https://docs.pypi.org/api/json/
 #[derive(Clone)]
 pub struct PyPi {
     http: SharedHttp,
@@ -60,6 +70,8 @@ fn all_yanked(files: &[PyFile]) -> bool {
 }
 
 impl PyPi {
+    /// Creates a client against the public PyPI instance (`https://pypi.org`).
+    #[must_use]
     pub fn new(http: SharedHttp) -> Self {
         PyPi {
             http,
@@ -67,6 +79,8 @@ impl PyPi {
         }
     }
 
+    /// Returns this registry's name, [`PYPI`], for tagging [`PackageId`]s.
+    #[must_use]
     pub fn registry_name(&self) -> String {
         PYPI.to_string()
     }

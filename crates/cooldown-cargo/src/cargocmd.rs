@@ -15,13 +15,22 @@ pub struct ResolvedGraph {
     pub edges: HashMap<String, Vec<String>>,
 }
 
+/// A single resolved package from `cargo metadata`.
 pub struct PkgInfo {
+    /// The crate name (e.g. `serde`).
     pub name: String,
+    /// The exact resolved version (e.g. `1.0.197`).
     pub version: String,
+    /// The source registry/path URL, or [`None`] for path/workspace members.
     pub source: Option<String>,
 }
 
 impl PkgInfo {
+    /// Returns `true` when this package was resolved from the crates.io registry.
+    ///
+    /// Only crates.io packages have publish times in the sparse index, so this
+    /// gates which dependencies the cooldown policy can evaluate.
+    #[must_use]
     pub fn is_crates_io(&self) -> bool {
         self.source.as_deref() == Some("registry+https://github.com/rust-lang/crates.io-index")
     }
@@ -29,6 +38,7 @@ impl PkgInfo {
 
 impl ResolvedGraph {
     /// Is `id` an edge target of any root node (a direct dep)?
+    #[must_use]
     pub fn is_direct(&self, id: &str) -> bool {
         self.roots
             .iter()
@@ -36,6 +46,7 @@ impl ResolvedGraph {
             .any(|deps| deps.iter().any(|d| d == id))
     }
     /// Is `id` required by a non-root node (held by the graph)?
+    #[must_use]
     pub fn is_graph_held(&self, id: &str) -> bool {
         self.edges
             .iter()
@@ -74,6 +85,10 @@ struct RawNodeDep {
     pkg: String,
 }
 
+/// A thin wrapper around the `cargo` executable used for resolution and apply.
+///
+/// The binary defaults to `cargo` but can be overridden via the `COOLDOWN_CARGO`
+/// environment variable (resolved once in [`Cargo::default`]).
 #[derive(Clone)]
 pub struct Cargo {
     bin: String,
@@ -88,6 +103,10 @@ impl Default for Cargo {
 }
 
 impl Cargo {
+    /// Creates a `Cargo` wrapper, honoring the `COOLDOWN_CARGO` binary override.
+    ///
+    /// Equivalent to [`Cargo::default`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -122,7 +141,12 @@ impl Cargo {
         }
     }
 
-    /// The resolved graph via `cargo metadata`.
+    /// Resolves the dependency graph for `dir` via `cargo metadata --format-version 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned or exits non-zero, and
+    /// [`CoreError::LockUnreadable`] if its JSON output cannot be parsed.
     pub async fn metadata(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
         let stdout = self
             .run(dir, &["metadata", "--format-version", "1"])
@@ -153,8 +177,14 @@ impl Cargo {
         })
     }
 
-    /// Whether `Cargo.lock` is current relative to `Cargo.toml` (`cargo metadata --locked`, exit
-    /// 101 = stale).
+    /// Returns whether `Cargo.lock` is current relative to `Cargo.toml`.
+    ///
+    /// Runs `cargo metadata --locked --offline`; a stale lock exits 101 and yields `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned, or if it fails for a reason other
+    /// than a stale lock (e.g. a missing offline index).
     pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
         let out = self
             .output(
@@ -179,8 +209,14 @@ impl Cargo {
         }
     }
 
-    /// `cargo update -p <name>@<from> --precise <to>`. The `@<from>` disambiguates when a crate
-    /// name resolves to multiple versions in the graph.
+    /// Pins `name` from `from` to `to` via `cargo update -p <name>@<from> --precise <to>`.
+    ///
+    /// The `@<from>` disambiguates when a crate name resolves to multiple versions in the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned or the update is rejected (e.g. a
+    /// `=`-pin or resolver conflict that blocks `--precise`).
     pub async fn update_precise(
         &self,
         dir: &Utf8Path,
@@ -194,7 +230,14 @@ impl Cargo {
             .map(|_| ())
     }
 
-    /// `cargo build` — the opt-in compile verification.
+    /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].
+    ///
+    /// A failed build is **not** an error: it is surfaced as `VerifyReport { ok: false, .. }` with
+    /// the compiler's stderr in `detail`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Tool`] only if the `cargo` process itself cannot be spawned.
     pub async fn build(&self, dir: &Utf8Path) -> Result<VerifyReport, CoreError> {
         let out = self.output(dir, &["build"]).await?;
         Ok(VerifyReport {

@@ -9,21 +9,28 @@ use tokio::process::Command;
 /// A resolved module from `go list -m -json all`.
 #[derive(Debug, Clone)]
 pub struct GoModule {
+    /// The declared module path.
     pub path: String,
+    /// The resolved version, or `None` for the main module or a local-path replace.
     pub version: Option<String>,
+    /// Whether this is the main module (the one being built).
     pub main: bool,
+    /// Whether the module is an indirect (transitive) dependency.
     pub indirect: bool,
-    /// The effective path/version if a `replace` directive applies.
+    /// The effective path if a `replace` directive applies.
     pub replace_path: Option<String>,
+    /// The effective version if a `replace` directive applies; `None` for a local-path replace.
     pub replace_version: Option<String>,
 }
 
 impl GoModule {
     /// The module path actually resolved (after `replace`).
+    #[must_use]
     pub fn effective_path(&self) -> &str {
         self.replace_path.as_deref().unwrap_or(&self.path)
     }
     /// The version actually resolved (after `replace`). `None` for a local-path replace.
+    #[must_use]
     pub fn effective_version(&self) -> Option<&str> {
         if self.replace_path.is_some() {
             self.replace_version.as_deref()
@@ -32,6 +39,7 @@ impl GoModule {
         }
     }
     /// A local filesystem `replace` (no upstream version to gate).
+    #[must_use]
     pub fn is_local_replace(&self) -> bool {
         self.replace_path.is_some() && self.replace_version.is_none()
     }
@@ -66,6 +74,10 @@ impl Default for Go {
 }
 
 impl Go {
+    /// Creates a driver bound to the `go` binary, honoring the `COOLDOWN_GO` override.
+    ///
+    /// Equivalent to [`Go::default`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -102,6 +114,11 @@ impl Go {
     }
 
     /// The resolved module graph (`go list -m -json all`). The main module is marked `main: true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] if the `go` command fails to spawn or exits
+    /// non-zero, or a [`CoreError::LockUnreadable`] if its JSON output cannot be parsed.
     pub async fn list_modules(&self, dir: &Utf8Path) -> Result<Vec<GoModule>, CoreError> {
         let stdout = self.run(dir, &["list", "-m", "-json", "all"]).await?;
         let mut out = Vec::new();
@@ -127,6 +144,11 @@ impl Go {
     /// The MVS floor each module is held at by *other* modules' requirements, from `go mod graph`.
     /// A module whose resolved version equals this floor cannot be lowered by changing direct deps
     /// alone → `check` annotates it `graph_held`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] if the `go mod graph` command fails to spawn or
+    /// exits non-zero.
     pub async fn mod_graph_floors(
         &self,
         dir: &Utf8Path,
@@ -160,6 +182,12 @@ impl Go {
 
     /// Whether `go.mod`/`go.sum` are current relative to source (`go mod tidy -diff`, Go ≥ 1.23).
     /// `Ok(true)` = clean; `Ok(false)` = stale; `Err` = the probe itself failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] if `go mod tidy -diff` fails for a reason other than
+    /// reporting a diff (e.g. the binary is missing or the flag is unsupported on an
+    /// older Go).
     pub async fn mod_tidy_is_clean(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
         let out = self.output(dir, &["mod", "tidy", "-diff"]).await?;
         if out.status.success() {
@@ -177,6 +205,11 @@ impl Go {
     }
 
     /// `go get <module>@<version>` — updates `go.mod` and re-runs MVS.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] if `go get` fails to spawn or exits non-zero (e.g.
+    /// the resolver rejects the requested version).
     pub async fn get(&self, dir: &Utf8Path, module: &str, version: &str) -> Result<(), CoreError> {
         self.run(dir, &["get", &format!("{module}@{version}")])
             .await
@@ -184,11 +217,22 @@ impl Go {
     }
 
     /// `go mod tidy` — prune/add indirects and sync `go.sum`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] if `go mod tidy` fails to spawn or exits non-zero.
     pub async fn mod_tidy(&self, dir: &Utf8Path) -> Result<(), CoreError> {
         self.run(dir, &["mod", "tidy"]).await.map(|_| ())
     }
 
     /// `go build ./...` — the opt-in compile verification (`--build`).
+    ///
+    /// A build failure is reported in the returned [`VerifyReport`] (with `ok: false`),
+    /// not as an `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError::Tool`] only if the `go` binary cannot be spawned at all.
     pub async fn build(&self, dir: &Utf8Path) -> Result<VerifyReport, CoreError> {
         let out = self.output(dir, &["build", "./..."]).await?;
         Ok(VerifyReport {
