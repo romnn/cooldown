@@ -5,5 +5,6 @@
 pub mod app;
 pub mod cli;
 pub mod discovery;
+mod scan;
 
 pub use app::Exit;

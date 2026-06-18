@@ -1,6 +1,7 @@
 use crate::app::AdapterSet;
 use crate::cli::GlobalArgs;
 use crate::discovery;
+use crate::scan::find_marker_dirs;
 use camino::Utf8PathBuf;
 use cooldown_cargo::CargoTool;
 use cooldown_core::config::ScanConfig;
@@ -58,7 +59,7 @@ pub(super) fn detect_projects(
         // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
         let marker = adapter.project_marker();
         let exclude = scan.exclude_for(command_key, id.as_str());
-        let dirs = cooldown_scan::find_marker_dirs(
+        let dirs = find_marker_dirs(
             workdir,
             marker.lockfile,
             respect_gitignore,

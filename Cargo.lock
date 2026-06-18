@@ -363,11 +363,12 @@ dependencies = [
  "cooldown-go",
  "cooldown-registry",
  "cooldown-render",
- "cooldown-scan",
  "cooldown-toml-util",
  "cooldown-uv",
  "fs4",
  "futures",
+ "globset",
+ "ignore",
  "insta",
  "jiff",
  "pretty_assertions",
@@ -466,18 +467,6 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cooldown-scan"
-version = "0.1.0"
-dependencies = [
- "camino",
- "cooldown-core",
- "globset",
- "ignore",
- "tempfile",
- "tracing",
 ]
 
 [[package]]
