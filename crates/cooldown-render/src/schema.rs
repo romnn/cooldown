@@ -41,6 +41,7 @@ pub fn json_schema() -> Value {
                 "properties": { "requested": {"type":"boolean"}, "ok": {"type":["boolean","null"]} },
                 "description": "upgrade only"
             },
+            "path": { "type": "string", "description": "baseline only" },
             "effective": {
                 "type": "object",
                 "properties": { "minAgeDays": {"type":"number"}, "decidedBy": {"type":"string"} },

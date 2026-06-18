@@ -55,12 +55,12 @@ pub struct Capabilities {
 /// Implementors must uphold the invariants documented on each method. In particular, [`releases`]
 /// must return candidates sorted ascending by release order (see [`debug_assert_sorted`]), and
 /// [`apply`] must perform no intra-plan rollback — the application layer drives trials and
-/// rollback using [`snapshot_lock`]/[`restore_lock`].
+/// rollback using [`snapshot_state`]/[`restore_state`].
 ///
 /// [`releases`]: Ecosystem::releases
 /// [`apply`]: Ecosystem::apply
-/// [`snapshot_lock`]: Ecosystem::snapshot_lock
-/// [`restore_lock`]: Ecosystem::restore_lock
+/// [`snapshot_state`]: Ecosystem::snapshot_state
+/// [`restore_state`]: Ecosystem::restore_state
 #[async_trait]
 pub trait Ecosystem: Send + Sync {
     /// Returns the stable identifier of this ecosystem (e.g. Go, Cargo, uv).
@@ -142,8 +142,8 @@ pub trait Ecosystem: Send + Sync {
     /// Applies `plan` to `project` and reports what was applied or skipped.
     ///
     /// Mechanics only (manifest rewrites, MVS, resolver runs); there is **no intra-plan rollback** —
-    /// the application layer drives trials and rollback via [`snapshot_lock`](Ecosystem::snapshot_lock)
-    /// and [`restore_lock`](Ecosystem::restore_lock). Skips are reported as `Ok` data in the
+    /// the application layer drives trials and rollback via [`snapshot_state`](Ecosystem::snapshot_state)
+    /// and [`restore_state`](Ecosystem::restore_state). Skips are reported as `Ok` data in the
     /// [`ApplyReport`], not errors.
     ///
     /// # Errors
@@ -171,22 +171,27 @@ pub trait Ecosystem: Send + Sync {
     /// reported in the [`VerifyReport`].
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
 
-    /// Captures an opaque [`LockSnapshot`] of the project's lock state.
+    /// Captures an opaque [`ProjectSnapshot`] of the project's trial-relevant state.
     ///
-    /// Used by `upgrade` to restore the lock after a trial via
-    /// [`restore_lock`](Ecosystem::restore_lock).
+    /// Used by `upgrade` to restore the project after a rejected trial via
+    /// [`restore_state`](Ecosystem::restore_state). Adapters include whatever files they mutate
+    /// during `apply`: lockfiles for Cargo/uv, and source files as well when a Go major upgrade
+    /// rewrites imports.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the lock-relevant files cannot be read.
-    async fn snapshot_lock(&self, project: &Project) -> Result<LockSnapshot>;
+    /// Returns a [`CoreError`](crate::CoreError) if the snapshot-relevant files cannot be read.
+    async fn snapshot_state(&self, project: &Project) -> Result<ProjectSnapshot>;
 
-    /// Restores a previously-taken [`LockSnapshot`], returning the project's lock to that state.
+    /// Restores a previously-taken [`ProjectSnapshot`], returning the project to that state.
+    ///
+    /// Snapshot entries with no captured bytes represent files that were absent when the snapshot
+    /// was taken and must therefore be removed if `apply` created them.
     ///
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the snapshotted files cannot be written back.
-    async fn restore_lock(&self, project: &Project, snapshot: &LockSnapshot) -> Result<()>;
+    async fn restore_state(&self, project: &Project, snapshot: &ProjectSnapshot) -> Result<()>;
 
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
@@ -205,12 +210,21 @@ pub trait Ecosystem: Send + Sync {
     }
 }
 
-/// An opaque snapshot of a project's lockfiles, taken before an `upgrade` trial so it can be
-/// restored if the trial introduces a too-fresh transitive.
+/// An opaque snapshot of the project state an adapter may mutate during an `upgrade` trial.
 #[derive(Debug, Clone, Default)]
-pub struct LockSnapshot {
-    /// `(relative path, bytes)` for each lock-relevant file the adapter wants to be able to restore.
-    pub files: Vec<(camino::Utf8PathBuf, Vec<u8>)>,
+pub struct ProjectSnapshot {
+    /// The per-file snapshot entries the adapter needs in order to roll back a rejected trial.
+    pub files: Vec<ProjectSnapshotFile>,
+}
+
+/// One trial-relevant file recorded in a [`ProjectSnapshot`].
+#[derive(Debug, Clone)]
+pub struct ProjectSnapshotFile {
+    /// The path relative to the project root.
+    pub path: camino::Utf8PathBuf,
+    /// The captured bytes when the file existed, or `None` when it was absent and must be removed
+    /// on restore.
+    pub contents: Option<Vec<u8>>,
 }
 
 /// Native cooldown config, in the adapter's own structural terms.

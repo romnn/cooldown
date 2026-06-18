@@ -6,6 +6,7 @@
 //! ratchet: baseline once, then the set only shrinks.
 
 use cooldown_core::CoreError;
+use cooldown_toml_util::read_toml_file;
 use jiff::Timestamp;
 use jiff::civil::Date;
 
@@ -105,17 +106,13 @@ impl Baseline {
     /// Returns [`CoreError::Config`] if the file exists but is not valid baseline TOML, or
     /// [`CoreError::Io`] if it exists but cannot be read. A missing file is not an error.
     pub fn load(path: &camino::Utf8Path) -> Result<Self, CoreError> {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                let parsed: BaselineToml = toml::from_str(&content)
-                    .map_err(|e| CoreError::Config(format!("{path}: {e}")))?;
-                Ok(Baseline {
-                    entries: parsed.acknowledged,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Baseline::default()),
-            Err(e) => Err(CoreError::Io(format!("{path}: {e}"))),
-        }
+        let parsed = read_toml_file::<BaselineToml>(path, "baseline file")?;
+        Ok(match parsed {
+            Some(parsed) => Baseline {
+                entries: parsed.acknowledged,
+            },
+            None => Baseline::default(),
+        })
     }
 
     /// Whether a pin is acknowledged: an exact `(ecosystem, project, package, version, registry)`
@@ -176,7 +173,7 @@ impl crate::app::Workspace {
         &self,
         opts: &super::RunOpts,
     ) -> Result<Vec<AckEntry>, CoreError> {
-        use cooldown_core::{DepScope, FetchContext, Status, check_pin};
+        use cooldown_core::{DepScope, Status, check_pin};
         use futures::stream::{self, StreamExt};
 
         let mut entries = Vec::new();
@@ -184,16 +181,10 @@ impl crate::app::Workspace {
             let Some(adapter) = self.adapter(pctx.ecosystem) else {
                 continue;
             };
-            let deps = adapter.dependencies(&pctx.project, DepScope::Graph).await?;
-            let deps: Vec<_> = deps
-                .into_iter()
-                .filter(|d| Self::package_in_scope(opts, &d.package.name))
-                .collect();
-            let fctx = FetchContext {
-                project: &pctx.project,
-                environments: &[],
-                artifacts: opts.artifact_scope(),
-            };
+            let deps = self
+                .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
+                .await?;
+            let fctx = Self::fetch_context(pctx, opts);
             let rctx = Self::resolve_ctx(pctx, opts);
             let fctx_ref = &fctx;
             let fetched: Vec<_> = stream::iter(deps)

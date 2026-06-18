@@ -19,8 +19,10 @@ pub struct ExplainOutcome {
 
 /// The result of `config`: the fully-resolved policy per project in both JSON and text form.
 pub struct ConfigOutcome {
-    /// The machine-readable envelope (`--json`).
-    pub json: serde_json::Value,
+    /// The aggregate project count.
+    pub summary: render::ConfigSummary,
+    /// One resolved policy row per project.
+    pub items: Vec<render::ConfigItem>,
     /// The human-readable rendering.
     pub text: String,
     /// The process exit (always `Ok`).
@@ -97,8 +99,8 @@ impl Workspace {
 
     /// The fully-resolved config per project (effective default window + provenance + strict-native).
     #[must_use]
-    pub fn config(&self, opts: &RunOpts, generated_at: &str) -> ConfigOutcome {
-        let mut items = Vec::new();
+    pub fn config(&self, opts: &RunOpts) -> ConfigOutcome {
+        let mut items: Vec<render::ConfigItem> = Vec::new();
         let mut text = String::new();
         for pctx in self.scoped_projects(opts) {
             // Resolve the bare default for a sentinel name unlikely to match a package glob.
@@ -130,30 +132,21 @@ impl Workspace {
                 layers.join(" < "),
             );
 
-            items.push(serde_json::json!({
-                "project": pctx.rel_path.to_string(),
-                "ecosystem": pctx.ecosystem.as_str(),
-                "effectiveDefaultMinAgeDays": days,
-                "source": res.window.source(),
-                "strictNative": pctx.policy.strict_native,
-                "layers": layers,
-            }));
+            items.push(render::ConfigItem {
+                project: pctx.rel_path.to_string(),
+                ecosystem: pctx.ecosystem.as_str().to_string(),
+                effective_default_min_age_days: days,
+                source: res.window.source(),
+                strict_native: pctx.policy.strict_native,
+                layers,
+            });
         }
 
-        // The common envelope shape, identical across commands.
-        let json = serde_json::json!({
-            "schemaVersion": render::SCHEMA_VERSION,
-            "command": "config",
-            "ok": true,
-            "generatedAt": generated_at,
-            "summary": { "projects": items.len() },
-            "items": items,
-            "warnings": [],
-            "errors": [],
-        });
-
         ConfigOutcome {
-            json,
+            summary: render::ConfigSummary {
+                projects: items.len(),
+            },
+            items,
             text,
             exit: Exit::Ok,
         }

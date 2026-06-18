@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, Ecosystem, EcosystemId,
-    FetchContext, LockSnapshot, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
-    Project, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector, SkipReason,
-    Skipped, VerifyReport, Version,
+    FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project,
+    ProjectSnapshot, ProjectSnapshotFile, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result,
+    Selector, SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_toml_util::read_toml_file;
@@ -335,17 +335,32 @@ impl Ecosystem for UvEcosystem {
         }
     }
 
-    async fn snapshot_lock(&self, project: &Project) -> Result<LockSnapshot> {
-        let mut files = Vec::new();
-        if let Ok(bytes) = std::fs::read(project.root.join("uv.lock")) {
-            files.push((Utf8PathBuf::from("uv.lock"), bytes));
-        }
-        Ok(LockSnapshot { files })
+    async fn snapshot_state(&self, project: &Project) -> Result<ProjectSnapshot> {
+        let path = project.root.join("uv.lock");
+        let contents = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(ProjectSnapshot {
+            files: vec![ProjectSnapshotFile {
+                path: Utf8PathBuf::from("uv.lock"),
+                contents,
+            }],
+        })
     }
 
-    async fn restore_lock(&self, project: &Project, snapshot: &LockSnapshot) -> Result<()> {
-        for (rel, bytes) in &snapshot.files {
-            std::fs::write(project.root.join(rel), bytes)?;
+    async fn restore_state(&self, project: &Project, snapshot: &ProjectSnapshot) -> Result<()> {
+        for file in &snapshot.files {
+            let path = project.root.join(&file.path);
+            match &file.contents {
+                Some(bytes) => std::fs::write(path, bytes)?,
+                None => match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
         }
         Ok(())
     }
@@ -414,5 +429,39 @@ requests = false
 
         let result = skipped_on_apply_error(&change, err);
         assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
+    }
+
+    #[tokio::test]
+    async fn restore_state_removes_lock_created_after_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let eco = UvEcosystem::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest,
+        };
+
+        let snapshot = eco.snapshot_state(&project).await.expect("snapshot");
+        let lock = root.join("uv.lock");
+        std::fs::write(&lock, "generated").expect("write lock");
+
+        eco.restore_state(&project, &snapshot)
+            .await
+            .expect("restore");
+        assert!(!lock.exists());
     }
 }

@@ -1,34 +1,74 @@
-//! A per-project advisory file lock so a concurrent `cargo`/`go`/`uv` (or another `cooldown`) can't
-//! corrupt a lockfile while a mutating command is applying changes.
+//! A per-project filesystem lock so concurrent `cooldown` mutating runs cannot overlap on the same
+//! project state.
 
 use cooldown_core::CoreError;
-use std::fs::OpenOptions;
-use std::io::Write;
+use fs4::fs_std::FileExt;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 
-/// Holds an advisory lock file for the lifetime of the value; best-effort, removed on drop.
+/// Holds an OS-backed exclusive lock on `<root>/.cooldown.lock` for the lifetime of the value.
+#[derive(Debug)]
 pub struct ProjectLock {
-    path: camino::Utf8PathBuf,
+    file: File,
 }
 
 impl ProjectLock {
-    /// Acquire `<root>/.cooldown.lock`. Fails if it already exists (another mutator is running).
+    /// Acquire `<root>/.cooldown.lock`, failing immediately if another process already holds it.
     pub fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
         let path = root.join(".cooldown.lock");
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                let _ = writeln!(f, "locked by cooldown pid {}", std::process::id());
-                Ok(ProjectLock { path })
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(CoreError::Io(format!(
+                    "{path} is locked by another mutating cooldown run"
+                )));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(CoreError::Io(format!(
-                "{path} exists; another mutating cooldown/package-manager run may be in progress (remove it if stale)"
-            ))),
-            Err(e) => Err(CoreError::Io(format!("{path}: {e}"))),
+            Err(e) => return Err(CoreError::Io(format!("{path}: {e}"))),
         }
+
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        let _ = writeln!(file, "locked by cooldown pid {}", std::process::id());
+        let _ = file.sync_data();
+        Ok(ProjectLock { file })
     }
 }
 
 impl Drop for ProjectLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_acquire_fails_while_first_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let _first = ProjectLock::acquire(root).expect("first lock");
+
+        let err = ProjectLock::acquire(root).expect_err("second lock must fail");
+        assert!(matches!(err, CoreError::Io(_)));
+    }
+
+    #[test]
+    fn lock_can_be_reacquired_after_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+
+        {
+            let _lock = ProjectLock::acquire(root).expect("first lock");
+        }
+
+        ProjectLock::acquire(root).expect("lock reacquired");
     }
 }

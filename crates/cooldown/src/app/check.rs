@@ -4,8 +4,8 @@
 
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext, Origin, Resolution,
-    ResolveKind, ResolveQuery, Status, check_pin, resolve,
+    DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution, ResolveKind,
+    ResolveQuery, Status, check_pin, resolve,
 };
 use cooldown_render as render;
 use cooldown_render::tty::check_status_of;
@@ -104,7 +104,7 @@ impl Workspace {
                 LockProbe::Skip => continue,
             }
 
-            let deps = match adapter.dependencies(&pctx.project, scope).await {
+            let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
                 Ok(d) => d,
                 Err(e) => {
                     acc.errors
@@ -112,16 +112,7 @@ impl Workspace {
                     continue;
                 }
             };
-            let deps: Vec<Dependency> = deps
-                .into_iter()
-                .filter(|d| Self::package_in_scope(opts, &d.package.name))
-                .collect();
-
-            let fctx = FetchContext {
-                project: &pctx.project,
-                environments: &[],
-                artifacts: opts.artifact_scope(),
-            };
+            let fctx = Self::fetch_context(pctx, opts);
 
             let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
                 stream::iter(deps)

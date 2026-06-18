@@ -3,8 +3,7 @@
 
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    DepScope, Dependency, Diagnostic, FetchContext, Release, ResolveKind, ResolveQuery, evaluate,
-    resolve,
+    DepScope, Dependency, Diagnostic, Release, ResolveKind, ResolveQuery, evaluate, resolve,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};
@@ -48,23 +47,14 @@ impl Workspace {
             };
             let project_label = pctx.rel_path.to_string();
 
-            let deps = match adapter.dependencies(&pctx.project, scope).await {
+            let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
                 Ok(d) => d,
                 Err(e) => {
                     errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
                     continue;
                 }
             };
-            let deps: Vec<Dependency> = deps
-                .into_iter()
-                .filter(|d| Self::package_in_scope(opts, &d.package.name))
-                .collect();
-
-            let fctx = FetchContext {
-                project: &pctx.project,
-                environments: &[],
-                artifacts: opts.artifact_scope(),
-            };
+            let fctx = Self::fetch_context(pctx, opts);
 
             let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> =
                 stream::iter(deps)

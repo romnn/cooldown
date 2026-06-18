@@ -115,17 +115,17 @@ tasks:
   test:
     desc: "test cargo workspace"
     cmds:
-      - cargo nextest run --workspace --all-targets {{.CLI_ARGS}}
+      - cargo nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:fc:
     desc: "test cargo workspace for all combinations of features"
     cmds:
-      - cargo fc nextest run --workspace --all-targets {{.CLI_ARGS}}
+      - cargo fc nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:doc:
     desc: "run doctests in cargo workspace"
     cmds:
-      - cargo test --doc {{.CLI_ARGS}}
+      - cargo test --doc --workspace {{.CLI_ARGS}}
 
   lint:ast-grep:
     desc: "lint with ast-grep rules"

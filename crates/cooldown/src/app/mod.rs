@@ -17,8 +17,8 @@ pub use baseline::Baseline;
 
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, Diagnostic, Ecosystem, EcosystemId, PatternGlob, PolicyStack,
-    Project, ResolveContext, ResolvedWindow,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, Ecosystem, EcosystemId,
+    FetchContext, PatternGlob, PolicyStack, Project, ResolveContext, ResolvedWindow,
 };
 use cooldown_render as render;
 use jiff::Timestamp;
@@ -198,6 +198,28 @@ impl Workspace {
 
     fn package_in_scope(opts: &RunOpts, name: &str) -> bool {
         opts.package.is_empty() || opts.package.iter().any(|g| g.is_match(name))
+    }
+
+    fn fetch_context<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> FetchContext<'a> {
+        FetchContext {
+            project: &pctx.project,
+            environments: &[],
+            artifacts: opts.artifact_scope(),
+        }
+    }
+
+    async fn dependencies_in_scope(
+        &self,
+        adapter: &dyn Ecosystem,
+        pctx: &ProjectCtx,
+        scope: DepScope,
+        opts: &RunOpts,
+    ) -> cooldown_core::Result<Vec<Dependency>> {
+        let deps = adapter.dependencies(&pctx.project, scope).await?;
+        Ok(deps
+            .into_iter()
+            .filter(|d| Self::package_in_scope(opts, &d.package.name))
+            .collect())
     }
 
     fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {

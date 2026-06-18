@@ -8,8 +8,8 @@
 use super::lock::ProjectLock;
 use super::{Exit, RunOpts, Workspace, diag_from_error};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext, MajorKey, PackageId,
-    Plan, Release, SkipReason, Status, check_pin, evaluate,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan, Release,
+    SkipReason, Status, check_pin, evaluate,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};
@@ -32,10 +32,10 @@ pub struct UpgradeOutcome {
     pub exit: Exit,
 }
 
-/// The evolving lock state during one project's one-change-at-a-time apply loop: the snapshot to
-/// restore to, and the violation set as of that snapshot.
+/// The evolving rollback state during one project's one-change-at-a-time apply loop: the snapshot
+/// to restore to, and the violation set as of that snapshot.
 struct LockState {
-    snapshot: cooldown_core::LockSnapshot,
+    snapshot: cooldown_core::ProjectSnapshot,
     /// In-cooldown, non-baselined pins present at `snapshot` — the ones we are NOT introducing.
     baseline_violations: HashSet<(String, String)>,
 }
@@ -77,14 +77,6 @@ impl<'a> UpgradeCtx<'a> {
     fn ecosystem_name(&self) -> &'static str {
         self.pctx.ecosystem.as_str()
     }
-
-    fn fetch_context(&self) -> FetchContext<'_> {
-        FetchContext {
-            project: &self.pctx.project,
-            environments: &[],
-            artifacts: self.opts.artifact_scope(),
-        }
-    }
 }
 
 /// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
@@ -100,9 +92,9 @@ impl Workspace {
     /// Move direct deps to the newest version older than the cooldown, applying changes one at a
     /// time and re-locking after each.
     ///
-    /// If a re-lock drags in a too-fresh, non-baselined transitive, the lock snapshot is restored
-    /// and that change is reported as skipped — never committing a lock a subsequent `check` would
-    /// reject. With `--dry-run` the plan is reported without mutation.
+    /// If a re-lock drags in a too-fresh, non-baselined transitive, the project snapshot is
+    /// restored and that change is reported as skipped — never committing a state a subsequent
+    /// `check` would reject. With `--dry-run` the plan is reported without mutation.
     pub async fn upgrade(&self, opts: &RunOpts) -> UpgradeOutcome {
         let mut acc = UpgradeAccum {
             build_requested: opts.build,
@@ -202,7 +194,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
-        let snapshot = match self.ctx.adapter.snapshot_lock(&self.ctx.pctx.project).await {
+        let snapshot = match self
+            .ctx
+            .adapter
+            .snapshot_state(&self.ctx.pctx.project)
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 self.record_project_error(&e, None);
@@ -225,16 +222,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     async fn direct_deps(&mut self) -> Option<Vec<Dependency>> {
         match self
-            .ctx
-            .adapter
-            .dependencies(&self.ctx.pctx.project, DepScope::Direct)
+            .ws
+            .dependencies_in_scope(
+                self.ctx.adapter,
+                self.ctx.pctx,
+                DepScope::Direct,
+                self.ctx.opts,
+            )
             .await
         {
-            Ok(deps) => Some(
-                deps.into_iter()
-                    .filter(|d| Workspace::package_in_scope(self.ctx.opts, &d.package.name))
-                    .collect(),
-            ),
+            Ok(deps) => Some(deps),
             Err(e) => {
                 self.record_project_error(&e, None);
                 None
@@ -249,7 +246,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut planned: Vec<Change> = Vec::new();
         for dep in deps {
             let releases = {
-                let fctx = self.ctx.fetch_context();
+                let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
                 self.ctx
                     .adapter
                     .releases(dep, &fctx, self.ctx.opts.candidate_scope())
@@ -375,11 +372,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.accept_change(lock, change, after).await
     }
 
-    async fn restore_snapshot(&mut self, snapshot: &cooldown_core::LockSnapshot) -> bool {
+    async fn restore_snapshot(&mut self, snapshot: &cooldown_core::ProjectSnapshot) -> bool {
         match self
             .ctx
             .adapter
-            .restore_lock(&self.ctx.pctx.project, snapshot)
+            .restore_state(&self.ctx.pctx.project, snapshot)
             .await
         {
             Ok(()) => true,
@@ -392,7 +389,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     async fn restore_with_change_error(
         &mut self,
-        snapshot: &cooldown_core::LockSnapshot,
+        snapshot: &cooldown_core::ProjectSnapshot,
         change: &Change,
         error: &cooldown_core::CoreError,
     ) -> bool {
@@ -413,7 +410,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         change: Change,
         after: HashSet<(String, String)>,
     ) -> bool {
-        let snapshot = match self.ctx.adapter.snapshot_lock(&self.ctx.pctx.project).await {
+        let snapshot = match self
+            .ctx
+            .adapter
+            .snapshot_state(&self.ctx.pctx.project)
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 self.record_project_error(&e, Some(&change.package.name));
@@ -478,12 +480,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// The set of `(package, version)` pins currently in cooldown (non-exempt, non-acknowledged).
     async fn graph_violations(&self) -> cooldown_core::Result<HashSet<(String, String)>> {
         let deps = self
-            .ctx
-            .adapter
-            .dependencies(&self.ctx.pctx.project, DepScope::Graph)
+            .ws
+            .dependencies_in_scope(
+                self.ctx.adapter,
+                self.ctx.pctx,
+                DepScope::Graph,
+                self.ctx.opts,
+            )
             .await?;
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
-        let fctx = self.ctx.fetch_context();
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let adapter = self.ctx.adapter;
         let fctx_ref = &fctx;
         let fetched: Vec<(Dependency, cooldown_core::Result<Release>)> = stream::iter(deps)

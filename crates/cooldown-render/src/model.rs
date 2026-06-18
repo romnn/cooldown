@@ -408,3 +408,68 @@ pub struct ExplainMeta {
 /// The `summary` for `explain`. The command has no aggregate counts.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplainSummary {}
+
+/// One row in a `config` report: the resolved default policy for one project.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigItem {
+    /// The project root relative to the repo root.
+    pub project: String,
+    /// The ecosystem the project belongs to.
+    pub ecosystem: String,
+    /// The resolved default cooldown window in fractional days.
+    pub effective_default_min_age_days: f64,
+    /// Which layer/field decided the resolved default window.
+    pub source: String,
+    /// Whether `strict-native` is enabled for this project's policy stack.
+    pub strict_native: bool,
+    /// The project policy layers, lowest authority first.
+    pub layers: Vec<String>,
+}
+
+/// The aggregate counts for a `config` report.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSummary {
+    /// The number of projects included in the resolved config report.
+    pub projects: usize,
+}
+
+/// The flattened top-level `meta` for `config`. The command has no extra top-level fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigMeta {}
+
+/// One acknowledged baseline entry written by `cooldown baseline`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineItem {
+    /// The ecosystem token.
+    pub ecosystem: String,
+    /// The project path relative to the repo root.
+    pub project: String,
+    /// The package name.
+    pub package: String,
+    /// The acknowledged version.
+    pub version: String,
+    /// The registry the package resolves to, omitted when not applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+}
+
+/// The aggregate counts for a `baseline` report.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineSummary {
+    /// The number of acknowledged entries after the write.
+    pub acknowledged: usize,
+    /// The number of stale entries pruned by this run.
+    pub pruned: usize,
+}
+
+/// The flattened top-level `meta` for `baseline`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineMeta {
+    /// The path of the written baseline file.
+    pub path: String,
+}

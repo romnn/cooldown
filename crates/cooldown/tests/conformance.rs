@@ -172,10 +172,10 @@ impl Ecosystem for FakeEco {
             detail: if stale { "stale".into() } else { "tidy".into() },
         })
     }
-    async fn snapshot_lock(&self, _p: &Project) -> Result<LockSnapshot> {
-        Ok(LockSnapshot::default())
+    async fn snapshot_state(&self, _p: &Project) -> Result<ProjectSnapshot> {
+        Ok(ProjectSnapshot::default())
     }
-    async fn restore_lock(&self, _p: &Project, _s: &LockSnapshot) -> Result<()> {
+    async fn restore_state(&self, _p: &Project, _s: &ProjectSnapshot) -> Result<()> {
         if self.restore_fails {
             return Err(CoreError::Io("restore failed".into()));
         }

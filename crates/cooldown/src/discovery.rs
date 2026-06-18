@@ -70,12 +70,14 @@ pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`] if `path` does not exist or cannot be read, or [`CoreError::Config`]
-/// if its contents do not parse as a valid config.
+/// Returns [`CoreError::Config`] if `path` does not exist, [`CoreError::Io`] if it exists but
+/// cannot be read, or [`CoreError::Config`] if its contents do not parse as a valid config.
 pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> {
     match read_layer(path, Origin::Config(path.to_owned()))? {
         Some(layer) => Ok(layer),
-        None => Err(CoreError::Io(format!("--config file not found: {path}"))),
+        None => Err(CoreError::Config(format!(
+            "--config file not found: {path}"
+        ))),
     }
 }
 
@@ -182,5 +184,13 @@ mod tests {
         // Root first (lower authority), project last (higher).
         assert_eq!(layers[0].origin, Origin::Repo(root.join(CONFIG_FILE)));
         assert_eq!(layers[1].origin, Origin::Repo(proj.join(CONFIG_FILE)));
+    }
+
+    #[test]
+    fn explicit_config_missing_is_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        let err = explicit_config_layer(&root.join("missing.toml")).expect_err("missing config");
+        assert!(matches!(err, CoreError::Config(_)));
     }
 }

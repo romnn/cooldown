@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, Ecosystem,
-    EcosystemId, FetchContext, LockSnapshot, MajorKey, NativePolicyLayer, PackageRegistry, Plan,
-    Project, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped, VerifyReport,
-    Version,
+    EcosystemId, FetchContext, MajorKey, NativePolicyLayer, PackageRegistry, Plan, Project,
+    ProjectSnapshot, ProjectSnapshotFile, Release, ReleaseOrder, ReleaseQuality, Result,
+    SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -218,38 +218,87 @@ impl GoEcosystem {
         Ok(found)
     }
 
-    /// Rewrite import paths `old` → `new` across `.go` files (best-effort `/vN` migration).
-    fn rewrite_imports(root: &Utf8Path, old: &str, new: &str) -> usize {
-        fn walk(dir: &Utf8Path, old: &str, new: &str, count: &mut usize) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    let name = e.file_name();
+    fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectSnapshotFile> {
+        let path = root.join(rel);
+        let contents = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(ProjectSnapshotFile {
+            path: rel.to_owned(),
+            contents,
+        })
+    }
+
+    fn capture_go_sources(
+        root: &Utf8Path,
+        dir: &Utf8Path,
+        out: &mut Vec<ProjectSnapshotFile>,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if matches!(name.as_ref(), "vendor" | ".git" | "testdata") {
+                    continue;
+                }
+                let child = Utf8PathBuf::from_path_buf(path)
+                    .map_err(|_| cooldown_core::CoreError::Io("non-utf8 Go source path".into()))?;
+                Self::capture_go_sources(root, &child, out)?;
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("go") {
+                continue;
+            }
+            let utf8 = Utf8PathBuf::from_path_buf(path)
+                .map_err(|_| cooldown_core::CoreError::Io("non-utf8 Go source path".into()))?;
+            let rel = utf8
+                .strip_prefix(root)
+                .map_err(|e| cooldown_core::CoreError::Io(format!("{utf8}: {e}")))?;
+            out.push(Self::capture_file(root, rel)?);
+        }
+        Ok(())
+    }
+
+    /// Rewrite import paths `old` → `new` across `.go` files for a `/vN` major-path migration.
+    fn rewrite_imports(root: &Utf8Path, old: &str, new: &str) -> Result<usize> {
+        fn walk(dir: &Utf8Path, old: &str, new: &str, count: &mut usize) -> Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = entry.file_name();
                     let name = name.to_string_lossy();
                     if matches!(name.as_ref(), "vendor" | ".git" | "testdata") {
                         continue;
                     }
-                    if let Some(up) = Utf8Path::from_path(&p) {
-                        walk(up, old, new, count);
-                    }
-                } else if p.extension().and_then(|s| s.to_str()) == Some("go")
-                    && let Ok(src) = std::fs::read_to_string(&p)
-                {
-                    let replaced = src
-                        .replace(&format!("\"{old}\""), &format!("\"{new}\""))
-                        .replace(&format!("\"{old}/"), &format!("\"{new}/"));
-                    if replaced != src && std::fs::write(&p, replaced).is_ok() {
-                        *count += 1;
-                    }
+                    let child = Utf8PathBuf::from_path_buf(path).map_err(|_| {
+                        cooldown_core::CoreError::Io("non-utf8 Go source path".into())
+                    })?;
+                    walk(&child, old, new, count)?;
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("go") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path)?;
+                let replaced = src
+                    .replace(&format!("\"{old}\""), &format!("\"{new}\""))
+                    .replace(&format!("\"{old}/"), &format!("\"{new}/"));
+                if replaced != src {
+                    std::fs::write(&path, replaced)?;
+                    *count += 1;
                 }
             }
+            Ok(())
         }
+
         let mut count = 0;
-        walk(root, old, new, &mut count);
-        count
+        walk(root, old, new, &mut count)?;
+        Ok(count)
     }
 }
 
@@ -381,11 +430,11 @@ impl Ecosystem for GoEcosystem {
                 .await
             {
                 Ok(()) => {
-                    // Cross-major path change → rewrite imports old→new (best-effort).
+                    // Cross-major path change → rewrite imports old→new before accepting the trial.
                     if let Some(old_path) = old_import_path(change)
                         && old_path != *target_path
                     {
-                        GoEcosystem::rewrite_imports(&project.root, &old_path, target_path);
+                        GoEcosystem::rewrite_imports(&project.root, &old_path, target_path)?;
                     }
                     report.applied.push(change.clone());
                 }
@@ -420,20 +469,26 @@ impl Ecosystem for GoEcosystem {
         }
     }
 
-    async fn snapshot_lock(&self, project: &Project) -> Result<LockSnapshot> {
+    async fn snapshot_state(&self, project: &Project) -> Result<ProjectSnapshot> {
         let mut files = Vec::new();
         for name in ["go.mod", "go.sum"] {
-            let path = project.root.join(name);
-            if let Ok(bytes) = std::fs::read(&path) {
-                files.push((Utf8PathBuf::from(name), bytes));
-            }
+            files.push(Self::capture_file(&project.root, Utf8Path::new(name))?);
         }
-        Ok(LockSnapshot { files })
+        Self::capture_go_sources(&project.root, &project.root, &mut files)?;
+        Ok(ProjectSnapshot { files })
     }
 
-    async fn restore_lock(&self, project: &Project, snapshot: &LockSnapshot) -> Result<()> {
-        for (rel, bytes) in &snapshot.files {
-            std::fs::write(project.root.join(rel), bytes)?;
+    async fn restore_state(&self, project: &Project, snapshot: &ProjectSnapshot) -> Result<()> {
+        for file in &snapshot.files {
+            let path = project.root.join(&file.path);
+            match &file.contents {
+                Some(bytes) => std::fs::write(path, bytes)?,
+                None => match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
         }
         Ok(())
     }
@@ -694,6 +749,39 @@ mod tests {
             result,
             Err(cooldown_core::CoreError::ToolSpawn { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn restore_state_reverts_import_rewrites_and_removes_created_go_sum() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+        let manifest = root.join("go.mod");
+        let source = root.join("main.go");
+        std::fs::write(&manifest, "module example.com/demo\n\ngo 1.24\n").expect("write go.mod");
+        std::fs::write(&source, "package main\n\nimport \"example.com/foo\"\n")
+            .expect("write source");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let http = SharedHttp::new(cache_dir.path(), HttpOptions::default()).expect("http");
+        let eco = GoEcosystem::new(GoProxy::new(http, Vec::new()));
+        let project = Project {
+            root: root.clone(),
+            kind: GO_ID,
+            manifest,
+        };
+
+        let snapshot = eco.snapshot_state(&project).await.expect("snapshot");
+        std::fs::write(&source, "package main\n\nimport \"example.com/foo/v2\"\n")
+            .expect("rewrite source");
+        std::fs::write(root.join("go.sum"), "generated").expect("write go.sum");
+
+        eco.restore_state(&project, &snapshot)
+            .await
+            .expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("read restored source"),
+            "package main\n\nimport \"example.com/foo\"\n"
+        );
+        assert!(!root.join("go.sum").exists());
     }
 
     #[tokio::test]

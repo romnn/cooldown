@@ -1,6 +1,8 @@
 //! The CLI composition root: clap parsing, config discovery, adapter wiring, and dispatch. This is
 //! the only place that knows the full cast of ecosystems.
 
+mod commands;
+
 use crate::app::{Baseline, Exit, ProjectCtx, RunOpts, Workspace};
 use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -184,9 +186,9 @@ pub async fn run(cli: Cli) -> Exit {
 
 fn exit_for_error(e: &CoreError) -> Exit {
     match e {
-        // Bad user input (config/CLI/duration/glob) is a usage error; everything else — a stale or
-        // unreadable lock, a malformed registry payload, a tool failure — is an environment fault.
-        CoreError::Config(_) | CoreError::Io(_) => Exit::Usage,
+        // Bad user input (config/CLI/duration/glob) is a usage error; everything else — including
+        // filesystem/runtime I/O — is an environment fault.
+        CoreError::Config(_) => Exit::Usage,
         _ => Exit::Environment,
     }
 }
@@ -244,7 +246,10 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     }
     if projects.is_empty() {
         if g.json {
-            println!("{}", no_ecosystem_json(command_name(&cli.command)));
+            println!(
+                "{}",
+                commands::no_ecosystem_json(command_name(&cli.command))
+            );
         } else {
             eprintln!("no supported ecosystem detected under {workdir}");
         }
@@ -294,7 +299,7 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     }
 
     let generated_at = generated_at(now);
-    dispatch(cli.command, &ws, &opts, &repo_root, g, color, &generated_at).await
+    commands::dispatch(cli.command, &ws, &opts, &repo_root, g, color, &generated_at).await
 }
 
 /// The shared, project-independent policy layers, assembled once per run.
@@ -400,223 +405,6 @@ async fn assemble_ctx(
     })
 }
 
-/// Run the chosen workspace command and emit its output (JSON or TTY), returning its [`Exit`].
-///
-/// The workspace-free commands (`schema`/`init`/`sync`) are handled before a workspace exists, so
-/// they never reach here.
-async fn dispatch(
-    command: Command,
-    ws: &Workspace,
-    opts: &RunOpts,
-    repo_root: &Utf8Path,
-    g: &GlobalArgs,
-    color: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    let exit = match command {
-        Command::Outdated => run_outdated(ws, opts, g, color, generated_at).await?,
-        Command::Check => run_check(ws, opts, g, color, generated_at).await?,
-        Command::Upgrade => run_upgrade(ws, opts, g, color, generated_at).await?,
-        Command::Explain { package } => {
-            run_explain(ws, opts, &package, g, color, generated_at).await?
-        }
-        Command::Config => run_config(ws, opts, g, generated_at),
-        Command::Baseline { prune } => {
-            cmd_baseline(ws, opts, repo_root, prune, g.json, generated_at).await?
-        }
-        // `run_workspace_free` returns `Some` for exactly these, so `run_inner` returns before a
-        // workspace is built; they can never reach `dispatch`.
-        #[allow(
-            clippy::unreachable,
-            reason = "schema/init/sync are dispatched by run_workspace_free before any workspace exists"
-        )]
-        Command::Schema | Command::Init | Command::Sync => unreachable!("handled earlier"),
-    };
-
-    Ok(exit)
-}
-
-async fn run_outdated(
-    ws: &Workspace,
-    opts: &RunOpts,
-    g: &GlobalArgs,
-    color: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    let out = ws.outdated(opts).await;
-    let env = render::Envelope::new(
-        "outdated",
-        out.exit.is_ok(),
-        generated_at.to_owned(),
-        render::OutdatedMeta {},
-        out.summary.clone(),
-        out.items.clone(),
-    );
-    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-    if g.json {
-        let json = render::to_json(&env)
-            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
-        println!("{json}");
-    } else {
-        print!(
-            "{}",
-            render::tty::render_outdated(
-                &out.summary,
-                &out.items,
-                &out.warnings,
-                &out.errors,
-                color
-            )
-        );
-    }
-    Ok(out.exit)
-}
-
-async fn run_check(
-    ws: &Workspace,
-    opts: &RunOpts,
-    g: &GlobalArgs,
-    color: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    let out = ws.check(opts).await;
-    let env = render::Envelope::new(
-        "check",
-        out.exit.is_ok(),
-        generated_at.to_owned(),
-        out.meta.clone(),
-        out.summary.clone(),
-        out.items.clone(),
-    );
-    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-    if g.json {
-        let json = render::to_json(&env)
-            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
-        println!("{json}");
-    } else {
-        print!(
-            "{}",
-            render::tty::render_check(
-                &out.meta,
-                &out.summary,
-                &out.items,
-                &out.warnings,
-                &out.errors,
-                color
-            )
-        );
-    }
-    Ok(out.exit)
-}
-
-/// Validate the `upgrade`-specific flag combinations before running, then render the result.
-///
-/// # Errors
-///
-/// Returns [`CoreError::Config`] for `--include-indirect` (a non-goal) or for `--major` without a
-/// scoping `--package`/`--major-all`.
-async fn run_upgrade(
-    ws: &Workspace,
-    opts: &RunOpts,
-    g: &GlobalArgs,
-    color: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    if g.include_indirect {
-        return Err(CoreError::Config(
-            "`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal"
-                .into(),
-        ));
-    }
-    if g.major && g.package.is_empty() && !g.major_all {
-        return Err(CoreError::Config(
-            "`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all"
-                .into(),
-        ));
-    }
-    let out = ws.upgrade(opts).await;
-    let env = render::Envelope::new(
-        "upgrade",
-        out.exit.is_ok(),
-        generated_at.to_owned(),
-        out.meta.clone(),
-        out.summary.clone(),
-        out.items.clone(),
-    );
-    let env = with_diags(env, out.warnings.clone(), out.errors.clone());
-    if g.json {
-        let json = render::to_json(&env)
-            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
-        println!("{json}");
-    } else {
-        print!(
-            "{}",
-            render::tty::render_upgrade(
-                &out.meta,
-                &out.summary,
-                &out.items,
-                &out.warnings,
-                &out.errors,
-                color
-            )
-        );
-    }
-    Ok(out.exit)
-}
-
-async fn run_explain(
-    ws: &Workspace,
-    opts: &RunOpts,
-    package: &str,
-    g: &GlobalArgs,
-    color: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    let out = ws.explain(package, opts).await;
-    let env = render::Envelope::new(
-        "explain",
-        out.exit.is_ok(),
-        generated_at.to_owned(),
-        out.meta.clone(),
-        render::ExplainSummary {},
-        out.steps.clone(),
-    );
-    if g.json {
-        let json = render::to_json(&env)
-            .map_err(|e| CoreError::Io(format!("serialize JSON output: {e}")))?;
-        println!("{json}");
-    } else {
-        print!(
-            "{}",
-            render::tty::render_explain(&out.meta, &out.steps, color)
-        );
-    }
-    Ok(out.exit)
-}
-
-fn run_config(ws: &Workspace, opts: &RunOpts, g: &GlobalArgs, generated_at: &str) -> Exit {
-    let out = ws.config(opts, generated_at);
-    if g.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out.json).unwrap_or_default()
-        );
-    } else {
-        print!("{}", out.text);
-    }
-    out.exit
-}
-
-fn with_diags<M: serde::Serialize, S: serde::Serialize, I: serde::Serialize>(
-    mut env: render::Envelope<M, S, I>,
-    warnings: Vec<cooldown_core::Diagnostic>,
-    errors: Vec<cooldown_core::Diagnostic>,
-) -> render::Envelope<M, S, I> {
-    env.warnings = warnings;
-    env.errors = errors;
-    env
-}
-
 fn generated_at(now: jiff::Timestamp) -> String {
     jiff::Timestamp::from_second(now.as_second())
         .map_or_else(|_| now.to_string(), |t| t.to_string())
@@ -698,20 +486,6 @@ fn command_name(c: &Command) -> &'static str {
     }
 }
 
-fn no_ecosystem_json(command: &str) -> String {
-    serde_json::json!({
-        "schemaVersion": render::SCHEMA_VERSION,
-        "command": command,
-        "ok": false,
-        "generatedAt": generated_at(jiff::Timestamp::now()),
-        "summary": {},
-        "items": [],
-        "warnings": [],
-        "errors": [{ "kind": "not_found", "message": "no supported ecosystem detected" }],
-    })
-    .to_string()
-}
-
 fn cmd_init(g: &GlobalArgs) -> Result<Exit, CoreError> {
     let dir = g.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
     let path = dir.join(discovery::CONFIG_FILE);
@@ -747,109 +521,3 @@ min-age = "7d"
 # A hard minimum no nearer config can weaken:
 # floor = "3d"
 "#;
-
-async fn cmd_baseline(
-    ws: &Workspace,
-    opts: &RunOpts,
-    repo_root: &Utf8Path,
-    prune: bool,
-    json: bool,
-    generated_at: &str,
-) -> Result<Exit, CoreError> {
-    let path = repo_root.join(crate::app::baseline::BASELINE_FILE);
-    let existing = Baseline::load(&path)?;
-    let young = ws.baseline_entries(opts).await?;
-
-    let key = |e: &crate::app::baseline::AckEntry| {
-        (
-            e.ecosystem.clone(),
-            e.project.clone(),
-            e.package.clone(),
-            e.version.clone(),
-            e.registry.clone(),
-        )
-    };
-    let young_keys: std::collections::HashSet<_> = young.iter().map(key).collect();
-
-    let merged = if prune {
-        // Keep only entries that are still young; preserve existing metadata (reason/until).
-        young
-            .into_iter()
-            .map(|y| {
-                existing
-                    .entries
-                    .iter()
-                    .find(|e| key(e) == key(&y))
-                    .map(|e| crate::app::baseline::AckEntry {
-                        reason: e.reason.clone(),
-                        until: e.until.clone(),
-                        ..y.clone()
-                    })
-                    .unwrap_or(y)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        // Additive: keep all existing, add newly-young entries not already present.
-        let mut out = existing.entries.clone();
-        for y in young {
-            if !out.iter().any(|e| key(e) == key(&y)) {
-                out.push(y);
-            }
-        }
-        out
-    };
-
-    let count = merged.len();
-    let new_baseline = Baseline { entries: merged };
-    new_baseline.save(&path)?;
-
-    let removed = existing.entries.len().saturating_sub(
-        existing
-            .entries
-            .iter()
-            .filter(|e| young_keys.contains(&key(e)) || !prune)
-            .count(),
-    );
-
-    if json {
-        let items: Vec<_> = new_baseline
-            .entries
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "ecosystem": e.ecosystem,
-                    "project": e.project,
-                    "package": e.package,
-                    "version": e.version,
-                    "registry": e.registry,
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "schemaVersion": render::SCHEMA_VERSION,
-                "command": "baseline",
-                "ok": true,
-                "generatedAt": generated_at,
-                "path": path.to_string(),
-                "summary": { "acknowledged": count, "pruned": removed },
-                "items": items,
-                "warnings": [],
-                "errors": [],
-            })
-        );
-    } else {
-        println!(
-            "wrote {path}: {count} acknowledged entr{}",
-            if count == 1 { "y" } else { "ies" }
-        );
-        if prune && removed > 0 {
-            println!(
-                "pruned {removed} stale entr{}",
-                if removed == 1 { "y" } else { "ies" }
-            );
-        }
-    }
-    Ok(Exit::Ok)
-}
