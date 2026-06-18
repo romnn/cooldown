@@ -24,6 +24,7 @@ async-trait.workspace = true
 camino.workspace = true
 futures.workspace = true
 semver.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

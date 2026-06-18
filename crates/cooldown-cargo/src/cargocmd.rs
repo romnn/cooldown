@@ -116,7 +116,9 @@ impl Cargo {
         dir: &Utf8Path,
         args: &[&str],
     ) -> Result<std::process::Output, CoreError> {
-        Command::new(&self.bin)
+        tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn cargo");
+        let started = std::time::Instant::now();
+        let result = Command::new(&self.bin)
             .args(args)
             .current_dir(dir.as_std_path())
             .output()
@@ -124,7 +126,15 @@ impl Cargo {
             .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
                 detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            })
+            });
+        tracing::debug!(
+            bin = self.bin,
+            args = ?args,
+            elapsed_ms = started.elapsed().as_millis(),
+            ok = result.is_ok(),
+            "cargo finished"
+        );
+        result
     }
 
     async fn run(&self, dir: &Utf8Path, args: &[&str]) -> Result<String, CoreError> {

@@ -37,6 +37,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(deps) = self.direct_deps().await else {
             return;
         };
+        self.ctx.opts.progress.say(&format!(
+            "Planning upgrades for {} direct dependencies in {} ({})…",
+            deps.len(),
+            self.project_label(),
+            self.ctx.pctx.ecosystem
+        ));
         let planned = self.plan_changes(&deps).await;
 
         if self.ctx.opts.dry_run {

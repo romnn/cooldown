@@ -115,6 +115,12 @@ impl Workspace {
             };
             let fctx = Self::fetch_context(pctx, opts);
 
+            opts.progress.say(&format!(
+                "Checking {} dependencies in {} ({})…",
+                deps.len(),
+                project_label,
+                pctx.ecosystem
+            ));
             let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
                 stream::iter(deps)
                     .map(|dep| {

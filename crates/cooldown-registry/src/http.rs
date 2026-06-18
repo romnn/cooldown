@@ -187,6 +187,7 @@ impl SharedHttp {
             && e.status < 400
             && cache_is_fresh(e, ttl)
         {
+            tracing::trace!(url, status = e.status, "cache hit");
             return Ok(HttpResponse {
                 status: e.status,
                 body: e.body.clone(),
@@ -210,8 +211,12 @@ impl SharedHttp {
         let mut attempt = 0;
         loop {
             attempt += 1;
+            tracing::debug!(url, host, attempt, "http request");
             match self.fetch_once(url, etag.as_deref(), cached.as_ref()).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    tracing::trace!(url, status = resp.status, "http response");
+                    return Ok(resp);
+                }
                 Err(FetchError::Backoff(delay)) if attempt <= self.inner.opts.max_retries => {
                     tokio::time::sleep(delay).await;
                 }

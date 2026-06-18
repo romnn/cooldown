@@ -47,28 +47,26 @@ impl Workspace {
             };
             let project_label = pctx.rel_path.to_string();
 
+            opts.progress.say(&format!(
+                "Resolving {} dependencies ({})…",
+                project_label, pctx.ecosystem
+            ));
             let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
                 Ok(d) => d,
                 Err(e) => {
+                    tracing::warn!(
+                        project = project_label,
+                        ecosystem = pctx.ecosystem.as_str(),
+                        error = %e,
+                        "could not enumerate dependencies"
+                    );
                     errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
                     continue;
                 }
             };
             let fctx = Self::fetch_context(pctx, opts);
-
-            let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> =
-                stream::iter(deps)
-                    .map(|dep| {
-                        let fctx = &fctx;
-                        let candidate_scope = opts.candidate_scope();
-                        async move {
-                            let r = adapter.releases(&dep, fctx, candidate_scope).await;
-                            (dep, r)
-                        }
-                    })
-                    .buffer_unordered(opts.fanout())
-                    .collect()
-                    .await;
+            let fetched =
+                Self::fetch_releases(adapter, pctx, &project_label, deps, &fctx, opts).await;
 
             let rctx = Self::resolve_ctx(pctx, opts);
             for (dep, result) in fetched {
@@ -106,6 +104,64 @@ impl Workspace {
             errors,
             exit: Exit::Ok,
         }
+    }
+
+    /// Fetch release metadata for every in-scope dependency of one project, bounded by the
+    /// registry fan-out. Each release fetch is independent, so a single slow or failing dependency
+    /// never blocks the others. The surrounding `info!`/per-dependency `debug!`/`trace!` spans make
+    /// a stalled network call visible under `--log-level debug`.
+    async fn fetch_releases(
+        adapter: &dyn cooldown_core::EcosystemRead,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+        deps: Vec<Dependency>,
+        fctx: &cooldown_core::FetchContext<'_>,
+        opts: &RunOpts,
+    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+        tracing::info!(
+            project = project_label,
+            ecosystem = pctx.ecosystem.as_str(),
+            deps = deps.len(),
+            fanout = opts.fanout(),
+            "fetching release metadata"
+        );
+        opts.progress.say(&format!(
+            "Fetching release metadata for {} dependencies…",
+            deps.len()
+        ));
+        let started = std::time::Instant::now();
+        let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> = stream::iter(deps)
+            .map(|dep| {
+                let candidate_scope = opts.candidate_scope();
+                async move {
+                    tracing::debug!(package = dep.package.name, "fetch releases");
+                    let r = adapter.releases(&dep, fctx, candidate_scope).await;
+                    match &r {
+                        Ok(releases) => tracing::trace!(
+                            package = dep.package.name,
+                            releases = releases.len(),
+                            "fetched releases"
+                        ),
+                        Err(e) => tracing::debug!(
+                            package = dep.package.name,
+                            error = %e,
+                            "release fetch failed"
+                        ),
+                    }
+                    (dep, r)
+                }
+            })
+            .buffer_unordered(opts.fanout())
+            .collect()
+            .await;
+        tracing::info!(
+            project = project_label,
+            ecosystem = pctx.ecosystem.as_str(),
+            fetched = fetched.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "fetched release metadata"
+        );
+        fetched
     }
 
     /// Build the report item for a dependency whose releases were fetched successfully.
