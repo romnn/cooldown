@@ -1,9 +1,9 @@
-use super::{GlobalArgs, LogLevel};
+use super::{CliOverrides, GlobalArgs, LogLevel};
 use crate::app::{AdapterSet, Baseline, Progress, ProjectCtx, RunOpts, Workspace};
 use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::{CARGO_ID, CargoEcosystem};
-use cooldown_core::config::{ScanConfig, WindowFields, builtin_default_layer, layer_from_fields};
+use cooldown_core::config::{CommandConfig, WindowFields, builtin_default_layer, layer_from_fields};
 use cooldown_core::{
     CoreError, EcosystemId, Origin, PatternGlob, PolicyLayer, PolicyStack, Project, ecosystem_id,
     normalize_native,
@@ -29,6 +29,7 @@ struct SharedLayers {
 
 pub(crate) async fn prepare_run(
     g: &GlobalArgs,
+    overrides: &CliOverrides,
     command_key: &str,
     default_major: bool,
 ) -> Result<PreparedRun, CoreError> {
@@ -39,28 +40,40 @@ pub(crate) async fn prepare_run(
     };
     let repo_root = discovery::find_repo_root(&workdir);
     let scan = discovery::scan_config(&repo_root, g.config.as_deref(), g.no_global)?;
-    let lang = resolve_langs(g)?;
-    let progress = progress_mode(g);
-    let respect_gitignore = resolve_gitignore(g, command_key, &scan);
+    // The resolved flag defaults for this command ([global] + [<command>]); each RunOpts field is
+    // then `explicit CLI flag ?? config ?? built-in default` (see `resolve_flag`).
+    let cfg = scan.resolved(command_key);
+
+    let json = resolve_flag(overrides.json, cfg.json, false);
+    let respect_gitignore = resolve_flag(overrides.gitignore, cfg.gitignore, true);
+    let lang = resolve_langs(g, &cfg)?;
     let opts = RunOpts {
         lang: lang.clone(),
-        package: parse_globs(&g.package)?,
-        allow_major: resolve_allow_major(g, command_key, default_major, &scan),
-        major_all: g.major_all,
-        direct_only: g.direct_only,
-        include_indirect: g.include_indirect,
-        all_artifacts: g.all_artifacts,
-        allow_stale_lock: g.allow_stale_lock,
-        fail_on_unknown_age: g.fail_on_unknown_age,
-        strict: g.strict,
-        build: g.build,
-        dry_run: g.dry_run,
-        outdated_exit_code: g.exit_code,
-        progress,
-        concurrency: 8,
+        package: resolve_globs(g, &cfg)?,
+        allow_major: resolve_flag(overrides.major, cfg.major, default_major),
+        major_all: resolve_flag(overrides.major_all, cfg.major_all, false),
+        direct_only: resolve_flag(overrides.direct_only, cfg.direct_only, false),
+        include_indirect: resolve_flag(overrides.include_indirect, cfg.include_indirect, false),
+        all_artifacts: resolve_flag(overrides.all_artifacts, cfg.all_artifacts, false),
+        allow_stale_lock: resolve_flag(overrides.allow_stale_lock, cfg.allow_stale_lock, false),
+        fail_on_unknown_age: resolve_flag(
+            overrides.fail_on_unknown_age,
+            cfg.fail_on_unknown_age,
+            false,
+        ),
+        strict: resolve_flag(overrides.strict, cfg.strict, false),
+        build: resolve_flag(overrides.build, cfg.build, false),
+        dry_run: resolve_flag(overrides.dry_run, cfg.dry_run, false),
+        outdated_exit_code: g.exit_code.or(cfg.exit_code),
+        show_all: resolve_flag(overrides.all, cfg.all, false),
+        json,
+        progress: progress_mode(json, g.log_level),
+        concurrency: cfg.concurrency.unwrap_or(8),
     };
 
-    let adapters = adapter_set(g)?;
+    let offline = resolve_flag(overrides.offline, cfg.offline, false);
+    let fresh = resolve_flag(overrides.fresh, cfg.fresh, false);
+    let adapters = adapter_set(offline, fresh)?;
     let mut projects: Vec<(EcosystemId, Project)> = Vec::new();
     for adapter in adapters.readers() {
         let id = adapter.id();
@@ -116,12 +129,17 @@ pub(crate) async fn prepare_run(
     })
 }
 
-fn adapter_set(g: &GlobalArgs) -> Result<AdapterSet, CoreError> {
+/// Resolve one flag: an explicit CLI value wins, else the config value, else the built-in default.
+fn resolve_flag(cli: Option<bool>, config: Option<bool>, default: bool) -> bool {
+    cli.or(config).unwrap_or(default)
+}
+
+fn adapter_set(offline: bool, fresh: bool) -> Result<AdapterSet, CoreError> {
     let http = SharedHttp::new(
         discovery::cache_dir().into_std_path_buf(),
         HttpOptions {
-            offline: g.offline,
-            fresh: g.fresh,
+            offline,
+            fresh,
             request_timeout: Duration::from_secs(30),
             ..Default::default()
         },
@@ -210,14 +228,15 @@ async fn assemble_ctx(
 
 /// The ecosystem set this run is restricted to (empty = all detected).
 ///
-/// `--cargo` is exact shorthand for `--lang rust` (clap rejects passing both); otherwise the
-/// `--lang` values are parsed, accepting the common tool-name aliases (`cargo` → rust, `uv`/`pip`
-/// → python, `golang` → go, `npm`/`pnpm`/`yarn` → node).
-fn resolve_langs(g: &GlobalArgs) -> Result<Vec<EcosystemId>, CoreError> {
+/// `--cargo` is exact shorthand for `--lang rust` (clap rejects passing both); otherwise an explicit
+/// `--lang` is used, falling back to the config `lang` list. Values accept the common tool-name
+/// aliases (`cargo` → rust, `uv`/`pip` → python, `golang` → go, `npm`/`pnpm`/`yarn` → node).
+fn resolve_langs(g: &GlobalArgs, cfg: &CommandConfig) -> Result<Vec<EcosystemId>, CoreError> {
     if g.cargo {
         return Ok(vec![CARGO_ID]);
     }
-    g.lang.iter().map(|lang| lang_id(lang)).collect()
+    let langs = if g.lang.is_empty() { &cfg.lang } else { &g.lang };
+    langs.iter().map(|lang| lang_id(lang)).collect()
 }
 
 fn lang_id(lang: &str) -> Result<EcosystemId, CoreError> {
@@ -235,43 +254,23 @@ fn lang_id(lang: &str) -> Result<EcosystemId, CoreError> {
     })
 }
 
-fn parse_globs(globs: &[String]) -> Result<Vec<PatternGlob>, CoreError> {
+/// The package globs this run is scoped to: an explicit `--package` is used, else the config
+/// `package` list.
+fn resolve_globs(g: &GlobalArgs, cfg: &CommandConfig) -> Result<Vec<PatternGlob>, CoreError> {
+    let globs = if g.package.is_empty() {
+        &cfg.package
+    } else {
+        &g.package
+    };
     globs.iter().map(|glob| PatternGlob::new(glob)).collect()
-}
-
-/// Resolve cross-major scope: an explicit `--major`/`--no-major` always wins; otherwise the
-/// `[<command>]`/`[global]` config value, falling back to the per-command built-in default
-/// (`outdated` → on, everything else → off).
-fn resolve_allow_major(
-    g: &GlobalArgs,
-    command_key: &str,
-    default_major: bool,
-    scan: &ScanConfig,
-) -> bool {
-    if g.no_major {
-        return false;
-    }
-    if g.major {
-        return true;
-    }
-    scan.major_for(command_key).unwrap_or(default_major)
-}
-
-/// Resolve `.gitignore` honoring: `--no-gitignore` forces it off; otherwise the
-/// `[<command>]`/`[global]` config value, defaulting to on.
-fn resolve_gitignore(g: &GlobalArgs, command_key: &str, scan: &ScanConfig) -> bool {
-    if g.no_gitignore {
-        return false;
-    }
-    scan.gitignore_for(command_key).unwrap_or(true)
 }
 
 /// Route coarse progress notes: silent when `--log-level` already narrates the run, to stderr under
 /// `--json` (keep stdout pure), to stdout otherwise (next to the pretty report).
-fn progress_mode(g: &GlobalArgs) -> Progress {
-    if g.log_level != LogLevel::Off {
+fn progress_mode(json: bool, log_level: LogLevel) -> Progress {
+    if log_level != LogLevel::Off {
         Progress::Silent
-    } else if g.json {
+    } else if json {
         Progress::Stderr
     } else {
         Progress::Stdout
@@ -324,93 +323,19 @@ fn compute_strict_native(layers: &[PolicyLayer], g: &GlobalArgs) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Cli;
-    use super::{lang_id, resolve_allow_major, resolve_gitignore};
-    use clap::Parser;
-    use cooldown_core::config::{CommandConfig, ScanConfig};
-
-    fn global(args: &[&str]) -> super::GlobalArgs {
-        Cli::try_parse_from(args).expect("parse").global
-    }
-
-    fn scan_with_outdated(major: Option<bool>, gitignore: Option<bool>) -> ScanConfig {
-        let mut scan = ScanConfig::default();
-        scan.commands.insert(
-            "outdated".to_string(),
-            CommandConfig {
-                major,
-                gitignore,
-                ..CommandConfig::default()
-            },
-        );
-        scan
-    }
+    use super::{lang_id, resolve_flag};
 
     #[test]
-    fn major_default_is_per_command_then_config_then_cli() {
-        let empty = ScanConfig::default();
-        // Built-in defaults: outdated on, others off.
-        assert!(resolve_allow_major(
-            &global(&["cooldown", "outdated"]),
-            "outdated",
-            true,
-            &empty
-        ));
-        assert!(!resolve_allow_major(
-            &global(&["cooldown", "upgrade"]),
-            "upgrade",
-            false,
-            &empty
-        ));
-        // `--no-major` / `--minor` opt out; explicit `--major` opts in.
-        assert!(!resolve_allow_major(
-            &global(&["cooldown", "outdated", "--minor"]),
-            "outdated",
-            true,
-            &empty
-        ));
-        assert!(resolve_allow_major(
-            &global(&["cooldown", "upgrade", "--major"]),
-            "upgrade",
-            false,
-            &empty
-        ));
-        // Config `[outdated].major` overrides the built-in default...
-        let cfg = scan_with_outdated(Some(false), None);
-        assert!(!resolve_allow_major(
-            &global(&["cooldown", "outdated"]),
-            "outdated",
-            true,
-            &cfg
-        ));
-        // ...but an explicit CLI flag still wins over config.
-        assert!(resolve_allow_major(
-            &global(&["cooldown", "outdated", "--major"]),
-            "outdated",
-            true,
-            &cfg
-        ));
-    }
-
-    #[test]
-    fn gitignore_default_is_on_unless_cli_or_config_disables() {
-        let empty = ScanConfig::default();
-        assert!(resolve_gitignore(
-            &global(&["cooldown", "outdated"]),
-            "outdated",
-            &empty
-        ));
-        assert!(!resolve_gitignore(
-            &global(&["cooldown", "outdated", "--no-gitignore"]),
-            "outdated",
-            &empty
-        ));
-        let cfg = scan_with_outdated(None, Some(false));
-        assert!(!resolve_gitignore(
-            &global(&["cooldown", "outdated"]),
-            "outdated",
-            &cfg
-        ));
+    fn resolve_flag_follows_cli_then_config_then_default() {
+        // No CLI, no config → the per-command built-in default (true for outdated --major, etc.).
+        assert!(resolve_flag(None, None, true));
+        assert!(!resolve_flag(None, None, false));
+        // Config overrides the built-in default...
+        assert!(resolve_flag(None, Some(true), false));
+        assert!(!resolve_flag(None, Some(false), true));
+        // ...and an explicit CLI flag overrides both.
+        assert!(resolve_flag(Some(true), Some(false), false));
+        assert!(!resolve_flag(Some(false), Some(true), true));
     }
 
     #[test]

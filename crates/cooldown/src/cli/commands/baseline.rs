@@ -83,7 +83,7 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
         items,
     );
 
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         let mut text = format!(
             "wrote {path}: {} acknowledged entr{}",
             summary.acknowledged,

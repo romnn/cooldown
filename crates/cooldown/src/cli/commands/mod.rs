@@ -2,7 +2,7 @@ mod baseline;
 mod common;
 mod report;
 
-use super::{Command, GlobalArgs, present};
+use super::{Command, present};
 use crate::app::{Exit, RunOpts, Workspace};
 use camino::Utf8Path;
 use cooldown_core::CoreError;
@@ -11,7 +11,6 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) ws: &'a Workspace,
     pub(crate) opts: &'a RunOpts,
     pub(crate) repo_root: &'a Utf8Path,
-    pub(crate) global: &'a GlobalArgs,
     pub(crate) color: bool,
     pub(crate) generated_at: &'a str,
 }

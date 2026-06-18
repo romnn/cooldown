@@ -155,6 +155,10 @@ pub struct RunOpts {
     /// `--exit-code N` (outdated): exit with `N` when adoptable updates exist (CI gate). `None`
     /// keeps `outdated` informational (always exit 0).
     pub outdated_exit_code: Option<u8>,
+    /// `--all` (outdated): also list up-to-date deps in the report.
+    pub show_all: bool,
+    /// `--json`: machine-readable output (never changes the exit code).
+    pub json: bool,
     /// Where coarse progress notes go while the command runs.
     pub progress: Progress,
     /// Concurrency for registry fan-out.

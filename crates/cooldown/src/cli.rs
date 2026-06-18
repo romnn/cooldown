@@ -8,7 +8,8 @@ mod setup;
 use crate::app::Exit;
 use crate::discovery;
 use camino::Utf8PathBuf;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, Args, Parser, Subcommand, ValueEnum};
 use cooldown_core::CoreError;
 use cooldown_render as render;
 use std::io::IsTerminal;
@@ -264,13 +265,87 @@ struct GlobalArgs {
     json: bool,
 }
 
+/// The flags the user set *explicitly* (on the command line or via an env var), captured once from
+/// the parsed [`ArgMatches`].
+///
+/// Resolution precedence is `explicit CLI flag > [<command>] config > [global] config > built-in
+/// default`; a `None` field here means "not set on the CLI", so the config or default is used. This
+/// is the one place that needs `ArgMatches`, because a clap `bool` flag can't otherwise distinguish
+/// "passed `--flag`" from "defaulted to false".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CliOverrides {
+    pub(crate) major: Option<bool>,
+    pub(crate) gitignore: Option<bool>,
+    pub(crate) all: Option<bool>,
+    pub(crate) major_all: Option<bool>,
+    pub(crate) direct_only: Option<bool>,
+    pub(crate) include_indirect: Option<bool>,
+    pub(crate) all_artifacts: Option<bool>,
+    pub(crate) allow_stale_lock: Option<bool>,
+    pub(crate) fail_on_unknown_age: Option<bool>,
+    pub(crate) strict: Option<bool>,
+    pub(crate) build: Option<bool>,
+    pub(crate) dry_run: Option<bool>,
+    pub(crate) offline: Option<bool>,
+    pub(crate) fresh: Option<bool>,
+    pub(crate) json: Option<bool>,
+}
+
+impl CliOverrides {
+    /// Capture which flags were given explicitly (on the CLI or via their env var).
+    #[must_use]
+    pub fn from_matches(matches: &ArgMatches) -> Self {
+        let on = |id: &str| set_on_cli(matches, id).then_some(true);
+        CliOverrides {
+            // `--major` forces cross-major on; `--no-major` (alias `--minor`) forces it off.
+            major: if set_on_cli(matches, "major") {
+                Some(true)
+            } else if set_on_cli(matches, "no_major") {
+                Some(false)
+            } else {
+                None
+            },
+            // `--no-gitignore` is the only CLI control; the default (on) lives in config/built-in.
+            gitignore: set_on_cli(matches, "no_gitignore").then_some(false),
+            all: on("all"),
+            major_all: on("major_all"),
+            direct_only: on("direct_only"),
+            include_indirect: on("include_indirect"),
+            all_artifacts: on("all_artifacts"),
+            allow_stale_lock: on("allow_stale_lock"),
+            fail_on_unknown_age: on("fail_on_unknown_age"),
+            strict: on("strict"),
+            build: on("build"),
+            dry_run: on("dry_run"),
+            offline: on("offline"),
+            fresh: on("fresh"),
+            json: on("json"),
+        }
+    }
+}
+
+/// Whether `id` was set on the command line or via its env var (not by a default). A global arg can
+/// land in either the root or the subcommand matches, so check both.
+fn set_on_cli(matches: &ArgMatches, id: &str) -> bool {
+    fn explicit(source: Option<ValueSource>) -> bool {
+        matches!(
+            source,
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        )
+    }
+    explicit(matches.value_source(id))
+        || matches
+            .subcommand()
+            .is_some_and(|(_, sub)| explicit(sub.value_source(id)))
+}
+
 /// Run a parsed [`Cli`], returning the process [`Exit`].
 ///
 /// Any [`CoreError`] that escapes the dispatch is printed to stderr and mapped to an exit by its
 /// kind, so this function itself is infallible.
-pub async fn run(cli: Cli) -> Exit {
+pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
     init_logging(cli.global.log_level);
-    match run_inner(cli).await {
+    match run_inner(cli, overrides).await {
         Ok(exit) => exit,
         Err(e) => {
             tracing::debug!(error = %e, "run failed");
@@ -312,9 +387,8 @@ fn run_workspace_free(command: &Command, g: &GlobalArgs) -> Option<Result<Exit, 
     }
 }
 
-async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
+async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError> {
     let g = &cli.global;
-    let color = std::io::stdout().is_terminal() && !g.json;
 
     if let Some(res) = run_workspace_free(&cli.command, g) {
         return res;
@@ -323,10 +397,18 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
     // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The
     // config (`[<command>]`/`[global]`) and `--major`/`--no-major` refine this inside `prepare_run`.
     let default_major = matches!(cli.command, Command::Outdated);
-    let prepared = setup::prepare_run(g, command_name(&cli.command), default_major).await?;
-    if prepared.ws.is_empty() {
+    let prepared =
+        setup::prepare_run(g, &overrides, command_name(&cli.command), default_major).await?;
+    let repo_root = prepared.repo_root;
+    let ws = prepared.ws;
+    let opts = prepared.opts;
+    // `--json` is itself config-resolvable, so color and the no-ecosystem output key off the
+    // resolved value rather than the raw flag.
+    let color = std::io::stdout().is_terminal() && !opts.json;
+
+    if ws.is_empty() {
         let workdir = g.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
-        if g.json {
+        if opts.json {
             println!(
                 "{}",
                 commands::no_ecosystem_json(command_name(&cli.command))?
@@ -336,10 +418,6 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         }
         return Ok(Exit::NoEcosystem);
     }
-
-    let repo_root = prepared.repo_root;
-    let ws = prepared.ws;
-    let opts = prepared.opts;
 
     // A no-match `--lang` on a mutating or `explain` command is a usage error (exit 2), distinct
     // from "no ecosystem detected" (exit 3, handled above where `projects` was non-empty).
@@ -364,7 +442,6 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
             ws: &ws,
             opts: &opts,
             repo_root: &repo_root,
-            global: g,
             color,
             generated_at: &generated_at,
         },
@@ -426,14 +503,57 @@ min-age = "7d"
 # A hard minimum no nearer config can weaken:
 # floor = "3d"
 
-# Scan & per-command flag defaults (a CLI flag always overrides these):
+# Flag defaults: [global] applies to every subcommand; a [<command>] section overrides it; an
+# explicit CLI flag overrides both. Keys are the kebab-case flag names. A few examples:
 # [global]
 # exclude = ["third_party"]   # directories never scanned (gitignore is honored by default)
 # gitignore = true            # set false to scan gitignored paths too
+# offline = false             # cache-only; concurrency = 8 tunes the registry fan-out
 #
 # [lang.rust]
 # exclude = ["vendor"]        # extra excludes for one ecosystem
 #
 # [outdated]
 # major = true                # outdated shows cross-major by default; set false for minor-only
+# all = false                 # also list up-to-date deps; exit-code = 1 gates CI
+#
+# [upgrade]
+# strict = true               # fail if any planned change was skipped; build = true to compile
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, CliOverrides};
+    use clap::CommandFactory;
+
+    fn overrides(args: &[&str]) -> CliOverrides {
+        let matches = Cli::command().get_matches_from(args);
+        CliOverrides::from_matches(&matches)
+    }
+
+    #[test]
+    fn unset_flags_have_no_override() {
+        let ov = overrides(&["cooldown", "outdated"]);
+        assert_eq!(ov.major, None);
+        assert_eq!(ov.gitignore, None);
+        assert_eq!(ov.all, None);
+        assert_eq!(ov.strict, None);
+    }
+
+    #[test]
+    fn major_and_no_major_map_to_explicit_true_and_false() {
+        assert_eq!(overrides(&["cooldown", "outdated", "--major"]).major, Some(true));
+        assert_eq!(overrides(&["cooldown", "outdated", "--no-major"]).major, Some(false));
+        assert_eq!(overrides(&["cooldown", "outdated", "--minor"]).major, Some(false));
+        assert_eq!(overrides(&["cooldown", "outdated", "--no-gitignore"]).gitignore, Some(false));
+    }
+
+    #[test]
+    fn global_flags_are_detected_before_or_after_the_subcommand() {
+        // After the subcommand (the common form)...
+        assert_eq!(overrides(&["cooldown", "outdated", "--all"]).all, Some(true));
+        assert_eq!(overrides(&["cooldown", "upgrade", "--strict"]).strict, Some(true));
+        // ...and before it (global args propagate either way).
+        assert_eq!(overrides(&["cooldown", "--strict", "upgrade"]).strict, Some(true));
+    }
+}

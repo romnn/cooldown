@@ -31,7 +31,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
     // The JSON envelope keeps every item (machine consumers filter themselves); the human table
     // hides up-to-date rows unless `--all`, so the common case is a short, actionable report. The
     // summary line below the table still reflects all dependencies.
-    let table_items: Vec<render::OutdatedItem> = if ctx.global.all {
+    let table_items: Vec<render::OutdatedItem> = if ctx.opts.show_all {
         items.clone()
     } else {
         items
@@ -40,7 +40,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
             .cloned()
             .collect()
     };
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         render::tty::render_outdated(
             &summary,
             &table_items,
@@ -69,7 +69,7 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
         out.warnings.clone(),
         out.errors.clone(),
     );
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         render::tty::render_check(
             &meta,
             &summary,
@@ -83,13 +83,13 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
 }
 
 pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
-    if ctx.global.include_indirect {
+    if ctx.opts.include_indirect {
         return Err(CoreError::Config(
             "`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal"
                 .into(),
         ));
     }
-    if ctx.global.major && ctx.global.package.is_empty() && !ctx.global.major_all {
+    if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
         return Err(CoreError::Config(
             "`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all"
                 .into(),
@@ -111,7 +111,7 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
         out.warnings.clone(),
         out.errors.clone(),
     );
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         render::tty::render_upgrade(
             &meta,
             &summary,
@@ -139,7 +139,7 @@ pub(super) async fn run_explain(
         render::ExplainSummary {},
         steps.clone(),
     );
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         render::tty::render_explain(&meta, &steps, ctx.color)
     })?;
     Ok(out.exit)
@@ -157,7 +157,7 @@ pub(super) fn run_config(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
         summary.clone(),
         items.clone(),
     );
-    emit_envelope(ctx.global.json, &env, || {
+    emit_envelope(ctx.opts.json, &env, || {
         present::render_config_text(&out.items)
     })?;
     Ok(out.exit)
