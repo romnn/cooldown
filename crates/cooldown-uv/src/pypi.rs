@@ -2,8 +2,11 @@
 //! (`upload_time_iso_8601`). A release has several files (wheels per platform + an sdist), each
 //! with its own time; the release time is the newest, but `None` if any file lacks one.
 
+use crate::artifact::{artifact_id_from_filename, newest_or_none, published_at_for_artifacts};
 use async_trait::async_trait;
-use cooldown_core::{ArtifactId, CoreError, PackageId, PackageRegistry, RawRelease, Version};
+use cooldown_core::{
+    ArtifactId, CoreError, PackageId, PackageRegistry, RawArtifact, RawRelease, Version,
+};
 use cooldown_registry::{SharedHttp, ttl};
 use jiff::Timestamp;
 use std::collections::HashMap;
@@ -29,6 +32,8 @@ pub struct PyPi {
 
 #[derive(serde::Deserialize)]
 struct PyFile {
+    #[serde(default)]
+    filename: Option<String>,
     #[serde(default, rename = "upload_time_iso_8601")]
     upload_time: Option<String>,
     #[serde(default)]
@@ -47,26 +52,33 @@ struct VersionJson {
     urls: Vec<PyFile>,
 }
 
-fn newest_or_none(files: &[PyFile]) -> Option<Timestamp> {
-    if files.is_empty() {
-        return None;
-    }
-    let mut newest: Option<Timestamp> = None;
-    for f in files {
-        match f
-            .upload_time
-            .as_deref()
-            .and_then(|s| s.parse::<Timestamp>().ok())
-        {
-            None => return None,
-            Some(t) => newest = Some(newest.map_or(t, |n| n.max(t))),
-        }
-    }
-    newest
-}
-
 fn all_yanked(files: &[PyFile]) -> bool {
     !files.is_empty() && files.iter().all(|f| f.yanked)
+}
+
+fn raw_artifacts(files: &[PyFile]) -> Vec<RawArtifact> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let id = file.filename.as_deref().map(artifact_id_from_filename)?;
+            Some(RawArtifact {
+                id,
+                published_at: file
+                    .upload_time
+                    .as_deref()
+                    .and_then(|value| value.parse::<Timestamp>().ok()),
+                markers: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn file_upload_times(files: &[PyFile]) -> impl Iterator<Item = Option<Timestamp>> + '_ {
+    files.iter().map(|file| {
+        file.upload_time
+            .as_deref()
+            .and_then(|value| value.parse::<Timestamp>().ok())
+    })
 }
 
 impl PyPi {
@@ -117,12 +129,21 @@ impl PackageRegistry for PyPi {
             .releases
             .into_iter()
             .map(|(vers, files)| {
-                let published_at = self.guard(&package.name, &vers, newest_or_none(&files));
+                let artifacts = raw_artifacts(&files);
+                let published_at = self.guard(
+                    &package.name,
+                    &vers,
+                    if artifacts.is_empty() {
+                        newest_or_none(file_upload_times(&files))
+                    } else {
+                        newest_or_none(artifacts.iter().map(|artifact| artifact.published_at))
+                    },
+                );
                 RawRelease {
                     version: Version::new(vers),
                     published_at,
                     yanked: all_yanked(&files),
-                    artifacts: Vec::new(),
+                    artifacts,
                 }
             })
             .collect())
@@ -132,7 +153,7 @@ impl PackageRegistry for PyPi {
         &self,
         pkg: &PackageId,
         version: &Version,
-        _artifacts: &[ArtifactId],
+        artifacts: &[ArtifactId],
     ) -> Result<Option<Timestamp>, CoreError> {
         let url = format!(
             "{}/pypi/{}/{}/json",
@@ -149,6 +170,12 @@ impl PackageRegistry for PyPi {
         }
         let parsed: VersionJson = serde_json::from_str(&resp.body)
             .map_err(|e| CoreError::Parse(format!("{}@{version}: {e}", pkg.name)))?;
-        Ok(self.guard(&pkg.name, version.as_str(), newest_or_none(&parsed.urls)))
+        let release_artifacts = raw_artifacts(&parsed.urls);
+        let published_at = if artifacts.is_empty() || release_artifacts.is_empty() {
+            newest_or_none(file_upload_times(&parsed.urls))
+        } else {
+            published_at_for_artifacts(&release_artifacts, artifacts)
+        };
+        Ok(self.guard(&pkg.name, version.as_str(), published_at))
     }
 }

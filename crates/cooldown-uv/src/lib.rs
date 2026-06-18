@@ -3,6 +3,7 @@
 //! re-resolve/apply a chosen window. `[tool.uv]` `exclude-newer`/`exclude-newer-package` is read as
 //! a native config layer.
 
+mod artifact;
 pub mod lock;
 mod native;
 pub mod pypi;

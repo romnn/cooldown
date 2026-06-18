@@ -1,3 +1,4 @@
+use super::document::ConfigDocument;
 use super::schema::{ConfigToml, MinAgeToml, SelectorToml, WindowFields};
 use crate::duration::{parse_duration, parse_freeze};
 use crate::error::CoreError;
@@ -135,9 +136,10 @@ fn selector_rule(
 /// let layer = parse_config("min-age = \"14d\"\n", Origin::Global).unwrap();
 /// assert_eq!(layer.rules.len(), 1);
 /// ```
-pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreError> {
-    let config: ConfigToml = toml::from_str(content)
-        .map_err(|error| CoreError::Config(format!("{}: {error}", origin.token())))?;
+pub(crate) fn policy_layer_from_config(
+    config: ConfigToml,
+    origin: Origin,
+) -> Result<PolicyLayer, CoreError> {
     let mut layer = PolicyLayer::new(origin);
 
     // Top-level default rule (only if it sets anything).
@@ -210,6 +212,16 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
 
     layer.strict_native = config.strict_native;
     Ok(layer)
+}
+
+/// Parse the policy view of one config document into a unified [`PolicyLayer`].
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if `content` is not valid config TOML or any selector/duration
+/// in the policy view fails validation.
+pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreError> {
+    ConfigDocument::parse(content, &origin)?.policy_layer(origin)
 }
 
 /// Builds a [`PolicyLayer`] from env/CLI [`WindowFields`], tagged with `origin`.

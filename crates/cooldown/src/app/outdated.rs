@@ -6,7 +6,6 @@ use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, Release, ResolveKind, ResolveQuery, evaluate, resolve,
 };
-use futures::stream::{self, StreamExt};
 
 /// The result of `outdated`: every reported dependency split by status, plus diagnostics.
 ///
@@ -77,59 +76,64 @@ impl<'a> OutdatedRunner<'a> {
     }
 
     async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
-        let Some(adapter) = self.ws.adapter(pctx.tool) else {
+        let Some(read) = self.ws.read_project_ctx(pctx, self.opts) else {
             return;
         };
-        let project_label = pctx.rel_path.to_string();
 
         self.opts.progress.say(&format!(
             "Resolving {} dependencies ({})…",
-            project_label, pctx.tool
+            read.project_label, pctx.tool
         ));
         let deps = match self
             .ws
-            .dependencies_in_scope(adapter, pctx, self.scope, self.opts)
+            .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
         {
             Ok(deps) => deps,
             Err(error) => {
                 tracing::warn!(
-                    project = project_label,
+                    project = read.project_label,
                     tool = pctx.tool.as_str(),
                     error = %error,
                     "could not enumerate dependencies"
                 );
-                self.errors
-                    .push(diag_from_error(&error, pctx.tool, &project_label, None));
+                self.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
                 return;
             }
         };
-        let fetch = Workspace::fetch_context(pctx, self.opts);
         let fetched = self
-            .fetch_releases(adapter, pctx, &project_label, deps, &fetch)
+            .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
 
-        let resolve = Workspace::resolve_ctx(pctx, self.opts);
         for (dep, result) in fetched {
             match result {
                 Ok(releases) => {
                     if is_yanked_locked(&releases, &dep) {
                         self.warnings
-                            .push(yanked_warning(pctx, &project_label, &dep));
+                            .push(yanked_warning(pctx, &read.project_label, &dep));
                     }
                     self.items.push(self.outdated_item(
                         pctx,
-                        &project_label,
+                        &read.project_label,
                         &dep,
                         &releases,
-                        &resolve,
+                        &read.resolve,
                     ));
                 }
                 Err(error) => {
-                    let diag =
-                        diag_from_error(&error, pctx.tool, &project_label, Some(&dep.package.name));
+                    let diag = diag_from_error(
+                        &error,
+                        pctx.tool,
+                        &read.project_label,
+                        Some(&dep.package.name),
+                    );
                     self.items
-                        .push(error_item(pctx, &project_label, &dep, diag));
+                        .push(error_item(pctx, &read.project_label, &dep, diag));
                 }
             }
         }
@@ -159,30 +163,30 @@ impl<'a> OutdatedRunner<'a> {
             deps.len()
         ));
         let started = std::time::Instant::now();
-        let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> = stream::iter(deps)
-            .map(|dep| {
-                let candidate_scope = self.opts.candidate_scope();
-                async move {
-                    tracing::debug!(package = dep.package.name, "fetch releases");
-                    let r = adapter.releases(&dep, fctx, candidate_scope).await;
-                    match &r {
-                        Ok(releases) => tracing::trace!(
-                            package = dep.package.name,
-                            releases = releases.len(),
-                            "fetched releases"
-                        ),
-                        Err(e) => tracing::debug!(
-                            package = dep.package.name,
-                            error = %e,
-                            "release fetch failed"
-                        ),
-                    }
-                    (dep, r)
-                }
-            })
-            .buffer_unordered(self.opts.fanout())
-            .collect()
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                adapter,
+                deps,
+                fctx,
+                self.opts.candidate_scope(),
+                self.opts.fanout(),
+            )
             .await;
+        for (dep, result) in &fetched {
+            match result {
+                Ok(releases) => tracing::trace!(
+                    package = dep.package.name.as_str(),
+                    releases = releases.len(),
+                    "fetched releases"
+                ),
+                Err(error) => tracing::debug!(
+                    package = dep.package.name.as_str(),
+                    error = %error,
+                    "release fetch failed"
+                ),
+            }
+        }
         tracing::info!(
             project = project_label,
             tool = pctx.tool.as_str(),

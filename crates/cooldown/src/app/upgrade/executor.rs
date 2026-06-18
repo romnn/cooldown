@@ -2,10 +2,9 @@ use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan, Release,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
     SkipReason, Status, check_pin, evaluate,
 };
-use futures::stream::{self, StreamExt};
 use std::collections::HashSet;
 
 /// The evolving per-project state during one-change upgrade trials.
@@ -99,15 +98,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     async fn plan_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                self.ctx.reader,
+                deps.to_vec(),
+                &fctx,
+                self.ctx.opts.candidate_scope(),
+                self.ctx.opts.fanout(),
+            )
+            .await;
         let mut planned = Vec::new();
-        for dep in deps {
-            let releases = {
-                let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
-                self.ctx
-                    .reader
-                    .releases(dep, &fctx, self.ctx.opts.candidate_scope())
-                    .await
-            };
+        for (dep, releases) in fetched {
             let releases = match releases {
                 Ok(releases) => releases,
                 Err(error) => {
@@ -116,7 +119,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
             };
             let verdict = evaluate(
-                dep,
+                &dep,
                 &releases,
                 &self.ctx.pctx.policy.layers,
                 &rctx,
@@ -142,7 +145,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|release| release.version == target)
                 .map(|release| release.major.clone())
                 .unwrap_or(current_major.clone());
-            let package = target_package(dep, &current_major, &target_major);
+            let package = target_package(&dep, &current_major, &target_major);
             planned.push(Change {
                 package,
                 from: dep.current.clone(),
@@ -317,15 +320,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await?;
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
-        let reader = self.ctx.reader;
-        let fctx_ref = &fctx;
-        let fetched: Vec<(Dependency, cooldown_core::Result<Release>)> = stream::iter(deps)
-            .map(|dep| async move {
-                let result = reader.locked_release(&dep, fctx_ref).await;
-                (dep, result)
-            })
-            .buffer_unordered(self.ctx.opts.fanout())
-            .collect()
+        let fetched = self
+            .ws
+            .fetch_locked_releases(self.ctx.reader, deps, &fctx, self.ctx.opts.fanout())
             .await;
 
         let mut violations = HashSet::new();

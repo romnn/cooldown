@@ -381,11 +381,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cooldown-adapter-util"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "cooldown-core",
+]
+
+[[package]]
 name = "cooldown-cargo"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
  "cooldown-toml-util",
@@ -488,6 +497,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
  "cooldown-toml-util",

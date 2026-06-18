@@ -22,20 +22,31 @@ pub(crate) async fn prepare_run(
 ) -> Result<PreparedRun, CoreError> {
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
-    let scan = discovery::scan_config(&repo_root, global.config.as_deref(), global.no_global)?;
+    let configs =
+        discovery::ConfigSources::load(&repo_root, global.config.as_deref(), global.no_global)?;
+    let scan = configs.scan_config()?;
     let cfg = scan.resolved(command_key);
-    let opts = options::resolve_run_opts(global, overrides, &cfg, default_major)?;
-    let adapters = detect::adapter_set(opts.offline(), opts.fresh())?;
+    let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
+    let adapters = detect::adapter_set(invocation.offline(), invocation.fresh())?;
     let projects = detect::detect_projects(
         &adapters,
         &workdir,
         &scan,
         command_key,
-        opts.tools(),
-        opts.respect_gitignore(),
+        invocation.tools(),
+        invocation.respect_gitignore(),
     )?;
-    let shared = policy::build_shared_layers(global)?;
-    let ctxs = policy::assemble_projects(&adapters, &repo_root, projects, &shared, global).await?;
+    let shared = policy::build_shared_layers(&configs, &invocation)?;
+    let ctxs = policy::assemble_projects(
+        &adapters,
+        &repo_root,
+        projects,
+        &configs,
+        &shared,
+        &invocation,
+        global.no_native,
+    )
+    .await?;
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
     let now = jiff::Timestamp::now();
@@ -43,6 +54,6 @@ pub(crate) async fn prepare_run(
     Ok(PreparedRun {
         repo_root,
         ws,
-        opts: opts.into_run_opts(),
+        opts: invocation.into_run_opts(),
     })
 }

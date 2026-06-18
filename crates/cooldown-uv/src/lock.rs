@@ -2,7 +2,8 @@
 //! the lock itself usually supplies the publish instant — `PyPI` is only a fallback for older locks,
 //! non-registry sources, and indexes that omit the field.
 
-use cooldown_core::CoreError;
+use crate::artifact::{artifact_id_from_url, newest_or_none, published_at_for_artifacts};
+use cooldown_core::{ArtifactId, CoreError, RawArtifact};
 use jiff::Timestamp;
 use std::collections::HashMap;
 
@@ -52,10 +53,13 @@ impl Source {
 
 /// A single distribution file (a wheel or sdist) recorded under a [`Package`].
 ///
-/// Only the publish instant is parsed; the URL and hash fields uv records are
-/// ignored because the adapter only needs the upload time for the cooldown check.
+/// The URL is parsed to derive a stable artifact identity, and the publish instant is parsed for
+/// cooldown evaluation. Other recorded file metadata remains ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct File {
+    /// The file URL recorded in the lock, used to derive a stable artifact identity.
+    #[serde(default)]
+    pub url: Option<String>,
     /// The `upload-time` field (RFC 3339), present in uv.lock revision ≥ 3.
     ///
     /// `None` for older locks or indexes that omit it; parsed lazily by
@@ -111,28 +115,70 @@ impl Package {
 }
 
 impl Package {
+    /// The locked artifact identities this package resolved to in the current environment.
+    ///
+    /// When uv records wheels, they represent the environment-specific install set, so they take
+    /// precedence over the sdist fallback. Only when no wheels are present do we fall back to the
+    /// sdist identity.
+    #[must_use]
+    pub fn artifact_ids(&self) -> Vec<ArtifactId> {
+        let mut ids = Vec::new();
+        for artifact in self.selected_raw_artifacts() {
+            if !ids.contains(&artifact.id) {
+                ids.push(artifact.id);
+            }
+        }
+        ids
+    }
+
+    /// The locked artifacts recorded for this package, each with its upload time when known.
+    #[must_use]
+    pub fn raw_artifacts(&self) -> Vec<RawArtifact> {
+        self.file_artifacts().collect()
+    }
+
     /// Newest upload time across this package's files, or `None` if any selected file lacks one
     /// (conservative — a partially-known release is never treated as mature).
     #[must_use]
     pub fn newest_upload_time(&self) -> Option<Timestamp> {
-        let mut times: Vec<Option<Timestamp>> = Vec::new();
-        if let Some(s) = &self.sdist {
-            times.push(parse_time(s.upload_time.as_deref()));
+        newest_or_none(self.file_artifacts().map(|artifact| artifact.published_at))
+    }
+
+    /// Newest upload time across the selected artifact identities, or across all files when
+    /// `artifacts` is empty.
+    #[must_use]
+    pub fn published_at_for_artifacts(&self, artifacts: &[ArtifactId]) -> Option<Timestamp> {
+        published_at_for_artifacts(&self.raw_artifacts(), artifacts)
+    }
+
+    fn selected_raw_artifacts(&self) -> impl Iterator<Item = RawArtifact> + '_ {
+        self.selected_files().filter_map(File::raw_artifact)
+    }
+
+    fn selected_files(&self) -> Box<dyn Iterator<Item = &File> + '_> {
+        if self.wheels.is_empty() {
+            Box::new(self.sdist.iter())
+        } else {
+            Box::new(self.wheels.iter())
         }
-        for w in &self.wheels {
-            times.push(parse_time(w.upload_time.as_deref()));
-        }
-        if times.is_empty() {
-            return None;
-        }
-        let mut newest: Option<Timestamp> = None;
-        for t in times {
-            match t {
-                None => return None,
-                Some(t) => newest = Some(newest.map_or(t, |n| n.max(t))),
-            }
-        }
-        newest
+    }
+
+    fn file_artifacts(&self) -> impl Iterator<Item = RawArtifact> + '_ {
+        self.sdist
+            .iter()
+            .chain(self.wheels.iter())
+            .filter_map(File::raw_artifact)
+    }
+}
+
+impl File {
+    fn raw_artifact(&self) -> Option<RawArtifact> {
+        let id = self.url.as_deref().and_then(artifact_id_from_url)?;
+        Some(RawArtifact {
+            id,
+            published_at: parse_time(self.upload_time.as_deref()),
+            markers: Vec::new(),
+        })
     }
 }
 
@@ -240,14 +286,14 @@ name = "requests"
 version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [{ name = "idna" }]
-sdist = { url = "https://x/requests.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
-wheels = [{ url = "https://x/requests.whl", upload-time = "2026-05-14T19:25:26.443Z" }]
+sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
+wheels = [{ url = "https://x/requests-2.34.2-py3-none-any.whl", upload-time = "2026-05-14T19:25:26.443Z" }]
 
 [[package]]
 name = "idna"
 version = "3.10"
 source = { registry = "https://pypi.org/simple" }
-wheels = [{ url = "https://x/idna.whl", upload-time = "2024-09-15T18:07:39.349Z" }]
+wheels = [{ url = "https://x/idna-3.10-py3-none-any.whl", upload-time = "2024-09-15T18:07:39.349Z" }]
 "#;
 
     #[test]
@@ -265,6 +311,49 @@ wheels = [{ url = "https://x/idna.whl", upload-time = "2024-09-15T18:07:39.349Z"
         assert_eq!(
             req.newest_upload_time().unwrap().to_string(),
             "2026-05-14T19:25:27.735Z"
+        );
+    }
+
+    #[test]
+    fn artifact_ids_normalize_wheels_and_sdist() {
+        let lock = UvLock::parse(SAMPLE).unwrap();
+        let req = lock.find("requests", "2.34.2").unwrap();
+        let mut artifacts = req.artifact_ids();
+        artifacts.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            artifacts
+                .into_iter()
+                .map(|artifact| artifact.0)
+                .collect::<Vec<_>>(),
+            vec!["wheel:py3-none-any".to_string()]
+        );
+    }
+
+    #[test]
+    fn artifact_ids_fall_back_to_sdist_when_no_wheels_are_recorded() {
+        let lock = UvLock::parse(
+            r#"
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "requests" }]
+
+[[package]]
+name = "requests"
+version = "2.34.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
+"#,
+        )
+        .unwrap();
+        let req = lock.find("requests", "2.34.2").unwrap();
+        assert_eq!(
+            req.artifact_ids()
+                .into_iter()
+                .map(|artifact| artifact.0)
+                .collect::<Vec<_>>(),
+            vec!["sdist".to_string()]
         );
     }
 

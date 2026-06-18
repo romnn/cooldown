@@ -279,7 +279,6 @@ impl Workspace {
     pub(crate) fn fetch_context<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> FetchContext<'a> {
         FetchContext {
             project: &pctx.project,
-            environments: &[],
             artifacts: opts.artifact_scope(),
         }
     }

@@ -12,6 +12,7 @@ mod explain;
 mod lock;
 mod model;
 mod outdated;
+mod read;
 mod upgrade;
 mod workspace;
 

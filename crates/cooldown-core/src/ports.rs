@@ -91,9 +91,9 @@ pub trait ToolRead: Send + Sync {
     /// Returns the classified candidate releases for `dep`, sorted ascending by release order.
     ///
     /// Each candidate carries its order, `kind_from_current`, and publish times, resolved via the
-    /// underlying [`PackageRegistry`]. `fetch` supplies the project, target environment, and
-    /// artifact scope so each candidate's publish instant follows the candidate invariant (for
-    /// artifact-granular tools, the instant reflects the artifacts selected by `fetch`).
+    /// underlying [`PackageRegistry`]. `fetch` supplies the project and artifact scope so each
+    /// candidate's publish instant follows the candidate invariant (for artifact-granular tools,
+    /// the instant reflects the artifacts selected by `fetch`).
     /// `candidates` communicates which candidate set the command actually cares about, so adapters
     /// such as Go can skip cross-major discovery unless it is in scope.
     ///

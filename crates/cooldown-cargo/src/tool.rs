@@ -8,11 +8,13 @@ use crate::native::parse_native;
 use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
+use cooldown_adapter_util::{
+    build_registry_releases, single_lock_journal, skipped_on_apply_error, verify_current_report,
+};
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped,
-    ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ApplyReport, Capabilities, DepScope, Dependency, FetchContext, NativePolicyLayer, PackageId,
+    PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseOrder,
+    ReleaseQuality, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -67,43 +69,15 @@ fn classify_quality(v: &str) -> ReleaseQuality {
 /// via [`version::classify_kind`].
 #[must_use]
 pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec<Release> {
-    let mut releases: Vec<Release> = raw
-        .into_iter()
-        .filter(|rr| version::parse(rr.version.as_str()).is_some())
-        .map(|rr| {
-            let v = rr.version.as_str();
-            Release {
-                version: rr.version.clone(),
-                order: ReleaseOrder(Vec::new()),
-                major: version::major_key(v),
-                kind_from_current: version::classify_kind(current, v),
-                published_at: rr.published_at,
-                yanked: rr.yanked,
-                quality: classify_quality(v),
-            }
-        })
-        .collect();
-    releases.sort_by(|a, b| version::compare(a.version.as_str(), b.version.as_str()));
-    releases.dedup_by(|a, b| a.version == b.version);
-    for (i, r) in releases.iter_mut().enumerate() {
-        // The release index is the ascending rank; a big-endian u32 token preserves that order
-        // lexicographically. Saturating at u32::MAX is purely defensive — no crate approaches it.
-        let rank = u32::try_from(i).unwrap_or(u32::MAX);
-        r.order = ReleaseOrder(rank.to_be_bytes().to_vec());
-    }
-    cooldown_core::debug_assert_sorted(&releases);
-    releases
-}
-
-fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> {
-    if error.is_tool_spawn_failure() {
-        return Err(error);
-    }
-    Ok(Skipped {
-        change: change.clone(),
-        reason: SkipReason::ResolverConflict,
-        offending: Some(change.package.clone()),
-    })
+    build_registry_releases(
+        current,
+        raw,
+        |value| version::parse(value).is_some(),
+        version::compare,
+        version::major_key,
+        version::classify_kind,
+        classify_quality,
+    )
 }
 
 #[async_trait]
@@ -192,15 +166,11 @@ impl ToolRead for CargoTool {
 
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
         match self.cargo.verify_locked(&project.root).await {
-            Ok(true) => Ok(VerifyReport {
-                ok: true,
-                detail: "Cargo.lock is current".into(),
-            }),
-            Ok(false) => Ok(VerifyReport {
-                ok: false,
-                detail: "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`"
-                    .into(),
-            }),
+            Ok(ok) => Ok(verify_current_report(
+                ok,
+                "Cargo.lock is current",
+                "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
+            )),
             Err(e) => Err(e),
         }
     }
@@ -213,12 +183,7 @@ impl ToolWrite for CargoTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new("Cargo.lock"),
-            )?],
-        })
+        single_lock_journal(&project.root, Utf8Path::new("Cargo.lock"))
     }
 
     async fn apply(
@@ -258,6 +223,7 @@ impl ToolWrite for CargoTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use cooldown_core::{Change, CoreError};
 
     #[test]
     fn apply_spawn_failure_is_not_downgraded_to_skip() {

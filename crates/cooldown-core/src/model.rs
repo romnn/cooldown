@@ -486,21 +486,11 @@ pub struct ProjectMarker {
     pub workspace_root: bool,
 }
 
-/// The platform/abi/python-version/markers a lock must satisfy. Version-granular tools leave
-/// this empty.
-#[derive(Debug, Clone, Default)]
-pub struct Environment {
-    /// The platform/abi/python-version/marker strings the lock must satisfy.
-    pub markers: Vec<String>,
-}
-
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.
 #[derive(Debug, Clone)]
 pub struct FetchContext<'a> {
     /// The project being evaluated.
     pub project: &'a Project,
-    /// The environments the lock must satisfy; empty for version-granular tools.
-    pub environments: &'a [Environment],
     /// Which artifacts to gate.
     pub artifacts: ArtifactScope,
 }

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 cooldown-core.workspace = true
+cooldown-adapter-util.workspace = true
 cooldown-toml-util.workspace = true
 cooldown-registry.workspace = true
 jiff.workspace = true

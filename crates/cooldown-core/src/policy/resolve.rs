@@ -53,7 +53,9 @@ fn pick_field(
 
 fn field_for_kind(kind: ResolveKind) -> fn(&ByKind) -> Option<&WindowSpec> {
     match kind {
-        ResolveKind::CurrentPin => |by_kind| by_kind.default.as_ref(),
+        ResolveKind::CurrentPin | ResolveKind::EffectiveDefault => {
+            |by_kind| by_kind.default.as_ref()
+        }
         ResolveKind::Candidate(crate::model::UpdateKind::Major) => |by_kind| by_kind.major.as_ref(),
         ResolveKind::Candidate(crate::model::UpdateKind::Minor) => |by_kind| by_kind.minor.as_ref(),
         ResolveKind::Candidate(crate::model::UpdateKind::Patch) => |by_kind| by_kind.patch.as_ref(),
@@ -62,7 +64,7 @@ fn field_for_kind(kind: ResolveKind) -> fn(&ByKind) -> Option<&WindowSpec> {
 
 fn field_name(kind: ResolveKind) -> &'static str {
     match kind {
-        ResolveKind::CurrentPin => "default",
+        ResolveKind::CurrentPin | ResolveKind::EffectiveDefault => "default",
         ResolveKind::Candidate(crate::model::UpdateKind::Major) => "major",
         ResolveKind::Candidate(crate::model::UpdateKind::Minor) => "minor",
         ResolveKind::Candidate(crate::model::UpdateKind::Patch) => "patch",
@@ -170,7 +172,11 @@ fn pick_window(
     trace: &mut Vec<TraceStep>,
 ) -> FieldPick {
     let kind_pick = pick_field(layers, query, field_for_kind(query.kind));
-    let used_fallthrough = kind_pick.is_none() && query.kind != ResolveKind::CurrentPin;
+    let used_fallthrough = kind_pick.is_none()
+        && !matches!(
+            query.kind,
+            ResolveKind::CurrentPin | ResolveKind::EffectiveDefault
+        );
     let pick = kind_pick
         .or_else(|| pick_field(layers, query, |by_kind| by_kind.default.as_ref()))
         .unwrap_or(FieldPick {

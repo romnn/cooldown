@@ -37,6 +37,8 @@ indexing_slicing = "deny"
 # Every `#[allow(...)]` must carry a `reason = "..."` justifying the escape hatch.
 allow_attributes_without_reason = "deny"
 
+struct_excessive_bools = "allow"
+
 [workspace.dependencies]
 # Internal crates
 cooldown-core = { path = "crates/cooldown-core", version = "0.1.0" }
@@ -44,6 +46,7 @@ cooldown-toml-util = { path = "crates/cooldown-toml-util", version = "0.1.0" }
 cooldown-scan = { path = "crates/cooldown-scan", version = "0.1.0" }
 cooldown-registry = { path = "crates/cooldown-registry", version = "0.1.0" }
 cooldown-render = { path = "crates/cooldown-render", version = "0.1.0" }
+cooldown-adapter-util = { path = "crates/cooldown-adapter-util", version = "0.1.0" }
 cooldown-go = { path = "crates/cooldown-go", version = "0.1.0" }
 cooldown-cargo = { path = "crates/cooldown-cargo", version = "0.1.0" }
 cooldown-uv = { path = "crates/cooldown-uv", version = "0.1.0" }

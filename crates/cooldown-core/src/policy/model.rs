@@ -146,7 +146,9 @@ impl Selector {
             Selector::Tool(tool) => *tool == query.tool,
             Selector::Registry(registry) => query.registry == Some(registry.as_str()),
             Selector::Project(glob) => glob.is_match(query.project.as_str()),
-            Selector::Package(glob) => glob.is_match(query.package),
+            Selector::Package(glob) => {
+                !matches!(query.kind, ResolveKind::EffectiveDefault) && glob.is_match(query.package)
+            }
         }
     }
 
@@ -309,12 +311,18 @@ pub struct PolicyStack {
     pub strict_native: bool,
 }
 
-/// Whether to resolve the bare window (the locked pin) or a per-kind candidate window.
+/// Whether to resolve the bare window (the locked pin), the effective project default, or a
+/// per-kind candidate window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveKind {
     /// The `check` gate: an already-locked version has no from→to kind, so it uses the bare
     /// `min-age`.
     CurrentPin,
+    /// The effective project default window, excluding package selectors.
+    ///
+    /// Used by `config` to report the policy a project defaults to before a package- or
+    /// registry-specific selector narrows it further.
+    EffectiveDefault,
     /// An `outdated`/`upgrade` candidate of the given kind.
     Candidate(UpdateKind),
 }

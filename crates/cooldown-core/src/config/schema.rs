@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub(crate) enum MinAgeToml {
     Scalar(String),
     Table(MinAgeTable),
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MinAgeTable {
     pub(crate) default: Option<String>,
@@ -16,7 +16,7 @@ pub(crate) struct MinAgeTable {
     pub(crate) patch: Option<String>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SelectorToml {
     #[serde(rename = "min-age")]
@@ -84,7 +84,70 @@ pub struct CommandConfig {
     pub concurrency: Option<usize>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+impl CommandConfig {
+    /// Merge a higher-precedence config-file layer over `self`.
+    ///
+    /// List-valued fields concatenate so lower-precedence defaults are preserved, while scalar
+    /// fields take the higher-precedence value when set.
+    #[must_use]
+    pub fn merge_layer(mut self, mut other: CommandConfig) -> CommandConfig {
+        self.exclude.append(&mut other.exclude);
+        self.tool.append(&mut other.tool);
+        self.package.append(&mut other.package);
+        self.gitignore = other.gitignore.or(self.gitignore);
+        self.major = other.major.or(self.major);
+        self.major_all = other.major_all.or(self.major_all);
+        self.all = other.all.or(self.all);
+        self.direct_only = other.direct_only.or(self.direct_only);
+        self.include_indirect = other.include_indirect.or(self.include_indirect);
+        self.all_artifacts = other.all_artifacts.or(self.all_artifacts);
+        self.allow_stale_lock = other.allow_stale_lock.or(self.allow_stale_lock);
+        self.fail_on_unknown_age = other.fail_on_unknown_age.or(self.fail_on_unknown_age);
+        self.strict = other.strict.or(self.strict);
+        self.build = other.build.or(self.build);
+        self.dry_run = other.dry_run.or(self.dry_run);
+        self.offline = other.offline.or(self.offline);
+        self.fresh = other.fresh.or(self.fresh);
+        self.json = other.json.or(self.json);
+        self.exit_code = other.exit_code.or(self.exit_code);
+        self.concurrency = other.concurrency.or(self.concurrency);
+        self
+    }
+
+    /// Apply explicit invocation overrides on top of `self`.
+    ///
+    /// Unlike config-file layering, explicit invocation lists replace lower-precedence defaults
+    /// rather than concatenating with them.
+    #[must_use]
+    pub fn apply_explicit(mut self, explicit: &CommandConfig) -> CommandConfig {
+        if !explicit.tool.is_empty() {
+            self.tool.clone_from(&explicit.tool);
+        }
+        if !explicit.package.is_empty() {
+            self.package.clone_from(&explicit.package);
+        }
+        self.gitignore = explicit.gitignore.or(self.gitignore);
+        self.major = explicit.major.or(self.major);
+        self.major_all = explicit.major_all.or(self.major_all);
+        self.all = explicit.all.or(self.all);
+        self.direct_only = explicit.direct_only.or(self.direct_only);
+        self.include_indirect = explicit.include_indirect.or(self.include_indirect);
+        self.all_artifacts = explicit.all_artifacts.or(self.all_artifacts);
+        self.allow_stale_lock = explicit.allow_stale_lock.or(self.allow_stale_lock);
+        self.fail_on_unknown_age = explicit.fail_on_unknown_age.or(self.fail_on_unknown_age);
+        self.strict = explicit.strict.or(self.strict);
+        self.build = explicit.build.or(self.build);
+        self.dry_run = explicit.dry_run.or(self.dry_run);
+        self.offline = explicit.offline.or(self.offline);
+        self.fresh = explicit.fresh.or(self.fresh);
+        self.json = explicit.json.or(self.json);
+        self.exit_code = explicit.exit_code.or(self.exit_code);
+        self.concurrency = explicit.concurrency.or(self.concurrency);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigToml {
     #[serde(rename = "min-age")]

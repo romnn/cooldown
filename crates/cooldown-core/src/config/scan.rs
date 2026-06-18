@@ -1,3 +1,4 @@
+use super::document::ConfigDocument;
 use super::schema::{CommandConfig, ConfigToml};
 use crate::error::CoreError;
 use crate::model::tool_id;
@@ -23,10 +24,10 @@ impl ScanConfig {
     /// overrides (`gitignore`/`major`) from `other` win when set.
     #[must_use]
     pub fn merge(mut self, other: ScanConfig) -> ScanConfig {
-        self.global = merge_command(self.global, other.global);
+        self.global = self.global.merge_layer(other.global);
         for (key, value) in other.commands {
             let slot = self.commands.entry(key).or_default();
-            *slot = merge_command(std::mem::take(slot), value);
+            *slot = std::mem::take(slot).merge_layer(value);
         }
         for (key, value) in other.tool_exclude {
             self.tool_exclude.entry(key).or_default().extend(value);
@@ -40,7 +41,7 @@ impl ScanConfig {
     pub fn resolved(&self, command: &str) -> CommandConfig {
         let mut config = self.global.clone();
         if let Some(section) = self.commands.get(command) {
-            config = merge_command(config, section.clone());
+            config = config.merge_layer(section.clone());
         }
         config
     }
@@ -57,32 +58,6 @@ impl ScanConfig {
     }
 }
 
-/// Merge `other` (higher precedence) over `base`: list fields concatenate; scalar `Option` fields
-/// take `other`'s value when it sets one.
-fn merge_command(mut base: CommandConfig, mut other: CommandConfig) -> CommandConfig {
-    base.exclude.append(&mut other.exclude);
-    base.tool.append(&mut other.tool);
-    base.package.append(&mut other.package);
-    base.gitignore = other.gitignore.or(base.gitignore);
-    base.major = other.major.or(base.major);
-    base.major_all = other.major_all.or(base.major_all);
-    base.all = other.all.or(base.all);
-    base.direct_only = other.direct_only.or(base.direct_only);
-    base.include_indirect = other.include_indirect.or(base.include_indirect);
-    base.all_artifacts = other.all_artifacts.or(base.all_artifacts);
-    base.allow_stale_lock = other.allow_stale_lock.or(base.allow_stale_lock);
-    base.fail_on_unknown_age = other.fail_on_unknown_age.or(base.fail_on_unknown_age);
-    base.strict = other.strict.or(base.strict);
-    base.build = other.build.or(base.build);
-    base.dry_run = other.dry_run.or(base.dry_run);
-    base.offline = other.offline.or(base.offline);
-    base.fresh = other.fresh.or(base.fresh);
-    base.json = other.json.or(base.json);
-    base.exit_code = other.exit_code.or(base.exit_code);
-    base.concurrency = other.concurrency.or(base.concurrency);
-    base
-}
-
 /// Parse the non-policy [`ScanConfig`] (the `[global]`/`[<command>]`/`[tool.*]` scan settings) from
 /// one config document. Returns an empty config when none of those sections are present.
 ///
@@ -90,9 +65,10 @@ fn merge_command(mut base: CommandConfig, mut other: CommandConfig) -> CommandCo
 ///
 /// Returns [`CoreError::Config`] if `content` is not valid config TOML, or if a `[tool.<name>]`
 /// carrying an `exclude` names an unknown tool.
-pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, CoreError> {
-    let config: ConfigToml = toml::from_str(content)
-        .map_err(|error| CoreError::Config(format!("{}: {error}", origin.token())))?;
+pub(crate) fn scan_config_from_config(
+    config: ConfigToml,
+    _origin: &Origin,
+) -> Result<ScanConfig, CoreError> {
     let mut scan = ScanConfig {
         global: config.global.unwrap_or_default(),
         ..ScanConfig::default()
@@ -122,6 +98,16 @@ pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, C
             .extend(exclude);
     }
     Ok(scan)
+}
+
+/// Parse the non-policy scan/runtime config view from one config document.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if `content` is not valid config TOML, or if a `[tool.<name>]`
+/// scan setting names an unknown tool.
+pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, CoreError> {
+    ConfigDocument::parse(content, origin)?.scan_config(origin)
 }
 
 #[cfg(test)]

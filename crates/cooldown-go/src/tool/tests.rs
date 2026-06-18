@@ -214,7 +214,6 @@ fn project(root: &Utf8Path) -> Project {
 fn fetch_ctx(project: &Project) -> FetchContext<'_> {
     FetchContext {
         project,
-        environments: &[],
         artifacts: ArtifactScope::Environment,
     }
 }

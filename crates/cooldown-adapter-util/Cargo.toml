@@ -1,0 +1,16 @@
+[package]
+name = "cooldown-adapter-util"
+description = "Shared helper utilities for registry-backed cooldown adapters."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cooldown-core.workspace = true
+camino.workspace = true

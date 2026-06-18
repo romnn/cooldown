@@ -109,13 +109,12 @@ impl<'a> ExplainService<'a> {
     fn config(&self) -> ConfigOutcome {
         let mut items: Vec<ConfigItem> = Vec::new();
         for pctx in self.ws.scoped_projects(self.opts) {
-            // Resolve the bare default for a sentinel name unlikely to match a package glob.
             let q = ResolveQuery {
                 tool: pctx.tool,
-                package: "\u{0}default",
+                package: "",
                 registry: None,
                 project: &pctx.rel_path,
-                kind: ResolveKind::CurrentPin,
+                kind: ResolveKind::EffectiveDefault,
             };
             let res = resolve(&pctx.policy.layers, &q, self.ws.now());
             let days = round2(res.window.effective_min_age_days(self.ws.now()));

@@ -6,7 +6,7 @@
 //! `cooldown.toml`, else `$HOME`.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::config::{ScanConfig, parse_config, parse_scan_config};
+use cooldown_core::config::{ConfigDocument, ScanConfig};
 use cooldown_core::{CoreError, Origin, PolicyLayer};
 
 /// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
@@ -48,136 +48,179 @@ pub fn global_config_path() -> Option<Utf8PathBuf> {
     Some(base.join("cooldown").join("config.toml"))
 }
 
-/// Load the global config as a layer, if it exists.
-///
-/// Returns `Ok(None)` when no global config path can be derived or the file is absent.
-///
-/// # Errors
-///
-/// Returns [`CoreError::Filesystem`] if the file exists but cannot be read, or
-/// [`CoreError::Config`] if its contents do not parse as a valid config.
-pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
-    let Some(path) = global_config_path() else {
-        return Ok(None);
-    };
-    read_layer(&path, Origin::Global)
+/// One config file parsed once and projected into policy/scan views as needed.
+#[derive(Debug, Clone)]
+pub struct LoadedConfigFile {
+    path: Utf8PathBuf,
+    document: ConfigDocument,
 }
 
-/// Load an explicit `--config` / `COOLDOWN_CONFIG` file as a shared top file layer.
-///
-/// Unlike [`global_layer`], an explicit path that names a missing file is an error rather than a
-/// silently-skipped layer: the user asked for this file by name.
-///
-/// # Errors
-///
-/// Returns [`CoreError::Config`] if `path` does not exist, [`CoreError::Filesystem`] if it exists
-/// but cannot be read, or [`CoreError::Config`] if its contents do not parse as a valid config.
-pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> {
-    match read_layer(path, Origin::Config(path.to_owned()))? {
-        Some(layer) => Ok(layer),
-        None => Err(CoreError::Config(format!(
-            "--config file not found: {path}"
-        ))),
+impl LoadedConfigFile {
+    fn policy_layer(&self, origin: Origin) -> Result<PolicyLayer, CoreError> {
+        self.document.policy_layer(origin)
+    }
+
+    fn scan_config(&self, origin: &Origin) -> Result<ScanConfig, CoreError> {
+        self.document.scan_config(origin)
     }
 }
 
-/// The repo cascade for a project: layers from the repo root down to the project dir, lowest
-/// authority first (root) → highest (the project's own `cooldown.toml`).
-///
-/// Directories without a `cooldown.toml` contribute no layer. Both `repo_root` and `project_dir`
-/// are expected to be absolute and to share a common root.
-///
-/// # Errors
-///
-/// Returns [`CoreError::Filesystem`] if a discovered `cooldown.toml` cannot be read, or
-/// [`CoreError::Config`] if one does not parse as a valid config.
-pub fn repo_cascade_layers(
-    repo_root: &Utf8Path,
-    project_dir: &Utf8Path,
-) -> Result<Vec<PolicyLayer>, CoreError> {
-    let mut dirs: Vec<Utf8PathBuf> = Vec::new();
-    // Collect project_dir and its ancestors up to (and including) repo_root.
-    let mut cur = Some(project_dir.to_owned());
-    while let Some(d) = cur {
-        dirs.push(d.clone());
-        if d == repo_root {
-            break;
-        }
-        match d.parent() {
-            Some(p) if p.starts_with(repo_root) || p == repo_root => cur = Some(p.to_owned()),
-            Some(p) if repo_root.starts_with(&d) => cur = Some(p.to_owned()),
-            _ => break,
-        }
-    }
-    // Ensure repo_root is included even if the chain broke early.
-    if !dirs.iter().any(|d| d == repo_root) {
-        dirs.push(repo_root.to_owned());
-    }
-    dirs.reverse(); // root first → project last
-    dirs.dedup();
-
-    let mut layers = Vec::new();
-    for d in dirs {
-        let path = d.join(CONFIG_FILE);
-        if let Some(layer) = read_layer(&path, Origin::Repo(path.clone()))? {
-            layers.push(layer);
-        }
-    }
-    Ok(layers)
+/// The config sources discovered for one run, each parsed at most once before being projected into
+/// policy or scan/runtime settings.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSources {
+    global: Option<LoadedConfigFile>,
+    repo_root: Option<LoadedConfigFile>,
+    explicit: Option<LoadedConfigFile>,
 }
 
-/// Load the merged non-policy scan config (`[global]`/`[<command>]`/`[tool.*]` settings) that
-/// controls detection: gitignore honoring, the exclude list, and per-command flag defaults.
-///
-/// Lowest precedence first: the global user config (unless `no_global`), then the repo-root
-/// `cooldown.toml`, then an explicit `--config` file (which, like the policy layer, must exist if
-/// named). Exclude lists concatenate; scalar overrides take the highest-precedence value.
-///
-/// # Errors
-///
-/// Returns [`CoreError::Filesystem`] if a present file cannot be read, [`CoreError::Config`] if one
-/// does not parse or names an unknown tool under `[tool.*]`, or if an explicit `--config` file
-/// is missing.
-pub fn scan_config(
-    repo_root: &Utf8Path,
-    explicit: Option<&Utf8Path>,
-    no_global: bool,
-) -> Result<ScanConfig, CoreError> {
-    let mut scan = ScanConfig::default();
-    if !no_global
-        && let Some(path) = global_config_path()
-        && let Some(layer) = read_scan(&path, &Origin::Global)?
-    {
-        scan = scan.merge(layer);
+impl ConfigSources {
+    /// Load the config sources relevant to one run: global, repo-root, and explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Filesystem`] if a present file cannot be read, or
+    /// [`CoreError::Config`] if an explicit path is missing or any file contains invalid config.
+    pub fn load(
+        repo_root: &Utf8Path,
+        explicit: Option<&Utf8Path>,
+        no_global: bool,
+    ) -> Result<Self, CoreError> {
+        let global = if no_global {
+            None
+        } else {
+            match global_config_path() {
+                Some(path) => read_document(&path, &Origin::Global)?,
+                None => None,
+            }
+        };
+        let repo_root_doc = read_document(
+            &repo_root.join(CONFIG_FILE),
+            &Origin::Repo(repo_root.join(CONFIG_FILE)),
+        )?;
+        let explicit = match explicit {
+            Some(path) => match read_document(path, &Origin::Config(path.to_owned()))? {
+                Some(document) => Some(document),
+                None => {
+                    return Err(CoreError::Config(format!(
+                        "--config file not found: {path}"
+                    )));
+                }
+            },
+            None => None,
+        };
+        Ok(ConfigSources {
+            global,
+            repo_root: repo_root_doc,
+            explicit,
+        })
     }
-    let repo = repo_root.join(CONFIG_FILE);
-    if let Some(layer) = read_scan(&repo, &Origin::Repo(repo.clone()))? {
-        scan = scan.merge(layer);
+
+    /// The merged non-policy scan config (`[global]`/`[<command>]`/`[tool.*]` settings) that
+    /// controls detection and runtime defaults.
+    ///
+    /// Lowest precedence first: global, repo-root, explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if a config names an unknown tool under `[tool.*]`.
+    pub fn scan_config(&self) -> Result<ScanConfig, CoreError> {
+        let mut scan = ScanConfig::default();
+        if let Some(global) = &self.global {
+            scan = scan.merge(global.scan_config(&Origin::Global)?);
+        }
+        if let Some(repo_root) = &self.repo_root {
+            let origin = Origin::Repo(repo_root.path.clone());
+            scan = scan.merge(repo_root.scan_config(&origin)?);
+        }
+        if let Some(explicit) = &self.explicit {
+            let origin = Origin::Config(explicit.path.clone());
+            scan = scan.merge(explicit.scan_config(&origin)?);
+        }
+        Ok(scan)
     }
-    if let Some(path) = explicit {
-        match read_scan(path, &Origin::Config(path.to_owned()))? {
-            Some(layer) => scan = scan.merge(layer),
-            None => {
-                return Err(CoreError::Config(format!(
-                    "--config file not found: {path}"
-                )));
+
+    /// The global policy layer, if a global config was loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if projecting the document into the policy model fails.
+    pub fn global_policy_layer(&self) -> Result<Option<PolicyLayer>, CoreError> {
+        self.global
+            .as_ref()
+            .map(|config| config.policy_layer(Origin::Global))
+            .transpose()
+    }
+
+    /// The explicit `--config` policy layer, if one was loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if projecting the document into the policy model fails.
+    pub fn explicit_policy_layer(&self) -> Result<Option<PolicyLayer>, CoreError> {
+        self.explicit
+            .as_ref()
+            .map(|config| config.policy_layer(Origin::Config(config.path.clone())))
+            .transpose()
+    }
+
+    /// The repo cascade for a project: layers from the repo root down to the project dir, lowest
+    /// authority first (root) → highest (the project's own `cooldown.toml`).
+    ///
+    /// Directories without a `cooldown.toml` contribute no layer. Both `repo_root` and
+    /// `project_dir` are expected to be absolute and to share a common root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Filesystem`] if a discovered `cooldown.toml` cannot be read, or
+    /// [`CoreError::Config`] if one does not parse as valid config.
+    pub fn repo_cascade_layers(
+        &self,
+        repo_root: &Utf8Path,
+        project_dir: &Utf8Path,
+    ) -> Result<Vec<PolicyLayer>, CoreError> {
+        let mut dirs: Vec<Utf8PathBuf> = Vec::new();
+        let mut cur = Some(project_dir.to_owned());
+        while let Some(d) = cur {
+            dirs.push(d.clone());
+            if d == repo_root {
+                break;
+            }
+            match d.parent() {
+                Some(p) if p.starts_with(repo_root) || p == repo_root => cur = Some(p.to_owned()),
+                Some(p) if repo_root.starts_with(&d) => cur = Some(p.to_owned()),
+                _ => break,
             }
         }
+        if !dirs.iter().any(|d| d == repo_root) {
+            dirs.push(repo_root.to_owned());
+        }
+        dirs.reverse();
+        dirs.dedup();
+
+        let mut layers = Vec::new();
+        let repo_root_config = repo_root.join(CONFIG_FILE);
+        for dir in dirs {
+            let path = dir.join(CONFIG_FILE);
+            let maybe_doc = if path == repo_root_config {
+                self.repo_root.clone()
+            } else {
+                read_document(&path, &Origin::Repo(path.clone()))?
+            };
+            if let Some(config) = maybe_doc {
+                layers.push(config.policy_layer(Origin::Repo(config.path.clone()))?);
+            }
+        }
+        Ok(layers)
     }
-    Ok(scan)
 }
 
-fn read_scan(path: &Utf8Path, origin: &Origin) -> Result<Option<ScanConfig>, CoreError> {
+fn read_document(path: &Utf8Path, origin: &Origin) -> Result<Option<LoadedConfigFile>, CoreError> {
     match std::fs::read_to_string(path) {
-        Ok(content) => Ok(Some(parse_scan_config(&content, origin)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CoreError::Filesystem(format!("{path}: {e}"))),
-    }
-}
-
-fn read_layer(path: &Utf8Path, origin: Origin) -> Result<Option<PolicyLayer>, CoreError> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(Some(parse_config(&content, origin)?)),
+        Ok(content) => Ok(Some(LoadedConfigFile {
+            path: path.to_owned(),
+            document: ConfigDocument::parse(&content, origin)?,
+        })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(CoreError::Filesystem(format!("{path}: {e}"))),
     }
@@ -228,7 +271,8 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join(CONFIG_FILE), "min-age = \"21d\"").unwrap();
 
-        let layers = repo_cascade_layers(root, &proj).unwrap();
+        let configs = ConfigSources::load(root, None, true).unwrap();
+        let layers = configs.repo_cascade_layers(root, &proj).unwrap();
         assert_eq!(layers.len(), 2);
         // Root first (lower authority), project last (higher).
         assert_eq!(layers[0].origin, Origin::Repo(root.join(CONFIG_FILE)));
@@ -239,7 +283,8 @@ mod tests {
     fn explicit_config_missing_is_usage_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap();
-        let err = explicit_config_layer(&root.join("missing.toml")).expect_err("missing config");
+        let err = ConfigSources::load(root, Some(&root.join("missing.toml")), true)
+            .expect_err("missing config");
         assert!(matches!(err, CoreError::Config(_)));
     }
 }

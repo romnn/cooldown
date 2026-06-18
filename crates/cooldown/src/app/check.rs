@@ -10,7 +10,6 @@ use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution, ResolveKind,
     ResolveQuery, Status, check_pin, resolve,
 };
-use futures::stream::{self, StreamExt};
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
 /// repo/global policy has weakened the project's stated intent. Returns the native window's days.
@@ -155,53 +154,47 @@ impl<'a> CheckRunner<'a> {
     }
 
     async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
-        let Some(adapter) = self.ws.adapter(pctx.tool) else {
+        let Some(read) = self.ws.read_project_ctx(pctx, self.opts) else {
             return;
         };
-        let project_label = pctx.rel_path.to_string();
 
-        match self.probe_lock(adapter, pctx, &project_label).await {
+        match self
+            .probe_lock(read.adapter, pctx, &read.project_label)
+            .await
+        {
             LockProbe::Continue => {}
             LockProbe::Skip => return,
         }
 
         let deps = match self
             .ws
-            .dependencies_in_scope(adapter, pctx, self.scope, self.opts)
+            .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
         {
             Ok(deps) => deps,
             Err(error) => {
-                self.acc
-                    .errors
-                    .push(diag_from_error(&error, pctx.tool, &project_label, None));
+                self.acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
                 return;
             }
         };
-        let fetch = Workspace::fetch_context(pctx, self.opts);
 
         self.opts.progress.say(&format!(
             "Checking {} dependencies in {} ({})…",
             deps.len(),
-            project_label,
+            read.project_label,
             pctx.tool
         ));
-        let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
-            stream::iter(deps)
-                .map(|dep| {
-                    let fetch = &fetch;
-                    async move {
-                        let result = adapter.locked_release(&dep, fetch).await;
-                        (dep, result)
-                    }
-                })
-                .buffer_unordered(self.opts.fanout())
-                .collect()
-                .await;
-
-        let resolve = Workspace::resolve_ctx(pctx, self.opts);
+        let fetched = self
+            .ws
+            .fetch_locked_releases(read.adapter, deps, &read.fetch, self.opts.fanout())
+            .await;
         for (dep, result) in fetched {
-            self.gate_pin(pctx, &project_label, &dep, result, &resolve);
+            self.gate_pin(pctx, &read.project_label, &dep, result, &read.resolve);
         }
     }
 

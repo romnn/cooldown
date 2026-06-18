@@ -5,10 +5,12 @@
 //! `latest`, `freeze`, and `min-age` are mutually exclusive (a config-validation error, exit 2),
 //! the same rule the CLI enforces for `--latest`/`--freeze`/`--min-age`.
 
+mod document;
 mod layers;
 mod scan;
 mod schema;
 
+pub use document::ConfigDocument;
 pub use layers::{builtin_default_layer, layer_from_fields, parse_config};
 pub use scan::{ScanConfig, parse_scan_config};
 pub use schema::{CommandConfig, WindowFields};

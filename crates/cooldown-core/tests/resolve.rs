@@ -40,6 +40,22 @@ fn win(layers: &[PolicyLayer], pkg: &str, kind: ResolveKind) -> ResolvedWindow {
     resolve(layers, &q(pkg, &proj, kind), now()).window
 }
 
+fn effective_default(layers: &[PolicyLayer]) -> ResolvedWindow {
+    let proj = Utf8PathBuf::from(".");
+    resolve(
+        layers,
+        &ResolveQuery {
+            tool: GO,
+            package: "",
+            registry: None,
+            project: Utf8Path::new(proj.as_str()),
+            kind: ResolveKind::EffectiveDefault,
+        },
+        now(),
+    )
+    .window
+}
+
 /// The plan's worked example: a global, *specific* `[package."left-pad"] = 30d` LOSES to a repo,
 /// *general* top-level `min-age = 14d`. Layer dominates selector.
 #[test]
@@ -201,6 +217,18 @@ fn min_age_source_string() {
     ];
     let w = win(&layers, "left-pad", ResolveKind::CurrentPin);
     assert_eq!(w.source(), "repo:cooldown.toml:package=left-pad");
+}
+
+/// The effective project default excludes package selectors, even broad ones.
+#[test]
+fn effective_default_ignores_package_selectors() {
+    let layers = vec![
+        config::builtin_default_layer(),
+        repo("min-age = \"14d\"\n[package.\"*\"]\nmin-age = \"30d\""),
+    ];
+    let window = effective_default(&layers);
+    assert_eq!(window.spec, WindowSpec::MinAge(days(14)));
+    assert_eq!(window.source(), "repo:cooldown.toml");
 }
 
 /// A `tool` selector applies only to its tool.
