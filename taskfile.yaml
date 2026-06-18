@@ -122,6 +122,11 @@ tasks:
     cmds:
       - cargo fc nextest run --workspace --all-targets {{.CLI_ARGS}}
 
+  test:doc:
+    desc: "run doctests in cargo workspace"
+    cmds:
+      - cargo test --doc {{.CLI_ARGS}}
+
   lint:ast-grep:
     desc: "lint with ast-grep rules"
     cmds:
