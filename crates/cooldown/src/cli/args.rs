@@ -39,6 +39,34 @@ cooldown_go={level},cooldown_uv={level},cooldown_registry={level},cooldown_toml_
     }
 }
 
+/// Whether the pretty (non-`--json`) report is colorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub(in crate::cli) enum ColorMode {
+    /// Colorize only when stdout is a terminal and `NO_COLOR` is unset (the default).
+    #[default]
+    Auto,
+    /// Always emit ANSI color — e.g. when piping into an image/screenshot tool.
+    Always,
+    /// Never emit color.
+    Never,
+}
+
+impl ColorMode {
+    /// Resolve to a concrete on/off. `--json` output is never colorized (the value is moot there,
+    /// since the colored TTY table isn't rendered); `Auto` honors the terminal and `NO_COLOR`.
+    pub(in crate::cli) fn resolve(self, json: bool) -> bool {
+        match self {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => {
+                use std::io::IsTerminal;
+                let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+                std::io::stdout().is_terminal() && !json && !no_color
+            }
+        }
+    }
+}
+
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
 /// Construct it with clap's [`Parser`] (`Cli::parse()`) and hand it to [`run`](crate::cli::run).
@@ -232,6 +260,16 @@ pub(in crate::cli) struct GlobalArgs {
     /// Machine-readable output (never changes the exit code).
     #[arg(long, global = true)]
     pub(in crate::cli) json: bool,
+    /// When to colorize the pretty report: auto (TTY + `NO_COLOR` unset), always, or never.
+    /// `--color always` forces ANSI even when piped (e.g. into a screenshot tool).
+    #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        value_enum,
+        default_value_t = ColorMode::Auto
+    )]
+    pub(in crate::cli) color: ColorMode,
 }
 
 /// The flags the user set *explicitly* (on the command line or via an env var), captured once from

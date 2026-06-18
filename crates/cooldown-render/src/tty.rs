@@ -13,7 +13,11 @@ fn base_table(use_color: bool) -> Table {
     let mut t = Table::new();
     t.load_preset(comfy_table::presets::UTF8_HORIZONTAL_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic);
-    if !use_color {
+    // The caller has already decided whether to colorize (TTY / `--color`); enforce it so comfy-
+    // table's own TTY check can't strip ANSI when the output is piped (e.g. into a screenshot tool).
+    if use_color {
+        t.enforce_styling();
+    } else {
         t.force_no_tty();
     }
     t
@@ -214,7 +218,7 @@ pub fn render_upgrade(
             } else if let Some(e) = &it.error {
                 (format!("error: {}", e.message), Color::Red)
             } else {
-                ("planned".to_string(), Color::Blue)
+                ("planned".to_string(), Color::Cyan)
             };
             t.add_row(vec![
                 Cell::new(&it.name),

@@ -3,7 +3,6 @@ use crate::app::Exit;
 use crate::cli::{Cli, CliOverrides};
 use camino::Utf8PathBuf;
 use cooldown_core::CoreError;
-use std::io::IsTerminal;
 
 /// Install the tracing subscriber that writes to stderr.
 ///
@@ -71,8 +70,8 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let ws = prepared.ws;
     let opts = prepared.opts;
     // `--json` is itself config-resolvable, so color and the no-tool output key off the
-    // resolved value rather than the raw flag.
-    let color = std::io::stdout().is_terminal() && !opts.json;
+    // resolved value rather than the raw flag. `--color` then forces/suppresses (default: auto).
+    let color = global.color.resolve(opts.json);
 
     if ws.is_empty() {
         let workdir = global.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
