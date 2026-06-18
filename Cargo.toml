@@ -40,6 +40,7 @@ allow_attributes_without_reason = "deny"
 [workspace.dependencies]
 # Internal crates
 cooldown-core = { path = "crates/cooldown-core", version = "0.1.0" }
+cooldown-toml-util = { path = "crates/cooldown-toml-util", version = "0.1.0" }
 cooldown-registry = { path = "crates/cooldown-registry", version = "0.1.0" }
 cooldown-render = { path = "crates/cooldown-render", version = "0.1.0" }
 cooldown-go = { path = "crates/cooldown-go", version = "0.1.0" }

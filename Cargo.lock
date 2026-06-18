@@ -383,6 +383,7 @@ dependencies = [
  "camino",
  "cooldown-core",
  "cooldown-registry",
+ "cooldown-toml-util",
  "futures",
  "jiff",
  "semver",
@@ -452,6 +453,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cooldown-toml-util"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "cooldown-core",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "cooldown-uv"
 version = "0.1.0"
 dependencies = [
@@ -459,6 +471,7 @@ dependencies = [
  "camino",
  "cooldown-core",
  "cooldown-registry",
+ "cooldown-toml-util",
  "futures",
  "jiff",
  "pep440_rs",

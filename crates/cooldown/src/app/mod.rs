@@ -17,8 +17,8 @@ pub use baseline::Baseline;
 
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    Diagnostic, Ecosystem, EcosystemId, PatternGlob, PolicyStack, Project, ResolveContext,
-    ResolvedWindow,
+    ArtifactScope, CandidateScope, Diagnostic, Ecosystem, EcosystemId, PatternGlob, PolicyStack,
+    Project, ResolveContext, ResolvedWindow,
 };
 use cooldown_render as render;
 use jiff::Timestamp;
@@ -119,6 +119,22 @@ pub struct RunOpts {
 impl RunOpts {
     fn fanout(&self) -> usize {
         self.concurrency.max(1)
+    }
+
+    fn artifact_scope(&self) -> ArtifactScope {
+        if self.all_artifacts {
+            ArtifactScope::All
+        } else {
+            ArtifactScope::Environment
+        }
+    }
+
+    fn candidate_scope(&self) -> CandidateScope {
+        if self.allow_major {
+            CandidateScope::AllowCrossMajor
+        } else {
+            CandidateScope::CurrentMajorOnly
+        }
     }
 }
 

@@ -8,12 +8,13 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    ApplyReport, Capabilities, DepScope, Dependency, Ecosystem, EcosystemId, LockSnapshot,
-    NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project, RawWindow, Release,
-    ReleaseOrder, ReleaseQuality, Result, Selector, SkipReason, Skipped, TargetContext,
-    VerifyReport, Version,
+    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, Ecosystem, EcosystemId,
+    FetchContext, LockSnapshot, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
+    Project, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector, SkipReason,
+    Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
+use cooldown_toml_util::read_toml_file;
 
 /// The [`EcosystemId`] identifying the Rust/Cargo ecosystem (`"rust"`).
 pub const CARGO_ID: EcosystemId = EcosystemId("rust");
@@ -93,6 +94,17 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
     releases
 }
 
+fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> {
+    if error.is_tool_spawn_failure() {
+        return Err(error);
+    }
+    Ok(Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(change.package.clone()),
+    })
+}
+
 fn find_cargo_locks(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
     if root.join("Cargo.lock").is_file() {
         out.push(root.to_owned());
@@ -117,9 +129,10 @@ fn find_cargo_locks(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
 }
 
 /// Parse `[package.metadata.cooldown]` / `[workspace.metadata.cooldown]` `min-age` into a native rule.
-fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
-    let content = std::fs::read_to_string(manifest).ok()?;
-    let value: toml::Value = content.parse().ok()?;
+fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
+    let Some(value) = read_toml_file::<toml::Value>(manifest, "Cargo.toml")? else {
+        return Ok(None);
+    };
     let cooldown = value
         .get("package")
         .and_then(|p| p.get("metadata"))
@@ -129,17 +142,27 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
                 .get("workspace")
                 .and_then(|w| w.get("metadata"))
                 .and_then(|m| m.get("cooldown"))
+        });
+    let Some(cooldown) = cooldown else {
+        return Ok(None);
+    };
+    let min_age = cooldown
+        .get("min-age")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            CoreError::Config(format!(
+                "{manifest}: [package.metadata.cooldown] min-age must be a string"
+            ))
         })?;
-    let min_age = cooldown.get("min-age")?.as_str()?;
     let window = cooldown_core::duration::parse_duration(min_age)
         .map(RawWindow::RelativeDuration)
-        .ok()?;
-    Some(NativePolicyLayer {
+        .map_err(|e| CoreError::Config(format!("{manifest}: invalid native min-age: {e}")))?;
+    Ok(Some(NativePolicyLayer {
         rules: vec![NativeRule {
             selector: Selector::Default,
             window,
         }],
-    })
+    }))
 }
 
 #[async_trait]
@@ -199,12 +222,17 @@ impl Ecosystem for CargoEcosystem {
         Ok(deps)
     }
 
-    async fn releases(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Vec<Release>> {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        _fetch: &FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
         let raw = self.index.releases(&dep.package).await?;
         Ok(build_releases(dep.current.as_str(), raw))
     }
 
-    async fn locked_release(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Release> {
+    async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
         let time = self
             .index
             .published_at(&dep.package, &dep.current, &[])
@@ -221,7 +249,7 @@ impl Ecosystem for CargoEcosystem {
     }
 
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(parse_native(&project.manifest))
+        parse_native(&project.manifest)
     }
 
     async fn apply(&self, project: &Project, plan: &Plan) -> Result<ApplyReport> {
@@ -238,13 +266,9 @@ impl Ecosystem for CargoEcosystem {
                 .await
             {
                 Ok(()) => report.applied.push(change.clone()),
-                Err(_) => {
+                Err(e) => {
                     // A `=`-pin or resolver conflict blocks `--precise`.
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(change.package.clone()),
-                    });
+                    report.skipped.push(skipped_on_apply_error(change, e)?);
                 }
             }
         }
@@ -283,5 +307,74 @@ impl Ecosystem for CargoEcosystem {
             std::fs::write(project.root.join(rel), bytes)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("Cargo.toml")).expect("utf8 path");
+        std::fs::write(&path, contents).expect("write manifest");
+        (dir, path)
+    }
+
+    #[test]
+    fn parse_native_errors_on_invalid_min_age() {
+        let (_dir, manifest) = write_manifest(
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+
+[package.metadata.cooldown]
+min-age = "not-a-duration"
+"#,
+        );
+
+        let err = parse_native(&manifest).expect_err("invalid native config must fail");
+        assert!(matches!(err, CoreError::Config(_)));
+    }
+
+    #[test]
+    fn parse_native_reads_valid_package_metadata() {
+        let (_dir, manifest) = write_manifest(
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+
+[package.metadata.cooldown]
+min-age = "14d"
+"#,
+        );
+
+        let layer = parse_native(&manifest)
+            .expect("valid native config")
+            .expect("native layer");
+        assert_eq!(layer.rules.len(), 1);
+        assert!(matches!(
+            layer.rules[0].window,
+            RawWindow::RelativeDuration(_)
+        ));
+    }
+
+    #[test]
+    fn apply_spawn_failure_is_not_downgraded_to_skip() {
+        let change = Change {
+            package: PackageId::new(CARGO_ID, "serde", Some(CRATES_IO.to_string())),
+            from: Version::new("1.0.0"),
+            to: Version::new("1.0.1"),
+            kind: cooldown_core::UpdateKind::Patch,
+        };
+        let err = CoreError::ToolSpawn {
+            tool: "cargo".into(),
+            detail: "spawn failed".into(),
+        };
+
+        let result = skipped_on_apply_error(&change, err);
+        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
     }
 }

@@ -39,10 +39,9 @@ impl Uv {
             .current_dir(dir.as_std_path())
             .output()
             .await
-            .map_err(|e| CoreError::Tool {
+            .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
-                status: -1,
-                stderr: format!("failed to spawn `{} {}`: {e}", self.bin, args.join(" ")),
+                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
             })
     }
 
@@ -66,9 +65,9 @@ impl Uv {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] if `uv` cannot be spawned, or if it exits
-    /// non-zero for a reason *other* than a stale lock (so a genuine failure is
-    /// never silently reported as "stale").
+    /// Returns [`CoreError::ToolSpawn`] if `uv` cannot be spawned, or [`CoreError::Tool`] if it
+    /// exits non-zero for a reason *other* than a stale lock (so a genuine failure is never
+    /// silently reported as "stale").
     pub async fn verify_check(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
         let out = self.output(dir, &["lock", "--check"]).await?;
         if out.status.success() {
@@ -96,8 +95,8 @@ impl Uv {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] if `uv` cannot be spawned or exits non-zero
-    /// (e.g. the pin is unsatisfiable — a resolver conflict).
+    /// Returns [`CoreError::ToolSpawn`] if `uv` cannot be spawned, or [`CoreError::Tool`] if it
+    /// exits non-zero (e.g. the pin is unsatisfiable — a resolver conflict).
     pub async fn upgrade_to(
         &self,
         dir: &Utf8Path,
@@ -119,8 +118,8 @@ impl Uv {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] only if `uv` cannot be spawned at all; a
-    /// non-zero `uv sync` exit is reported via the [`VerifyReport`] instead.
+    /// Returns [`CoreError::ToolSpawn`] only if `uv` cannot be spawned at all; a non-zero
+    /// `uv sync` exit is reported via the [`VerifyReport`] instead.
     pub async fn sync(&self, dir: &Utf8Path) -> Result<VerifyReport, CoreError> {
         let out = self.output(dir, &["sync"]).await?;
         Ok(VerifyReport {

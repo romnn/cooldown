@@ -356,12 +356,7 @@ async fn assemble_ctx(
         None
     } else {
         match adapters.iter().find(|a| a.id() == eco) {
-            Some(a) => a
-                .native_policy(&project)
-                .await
-                .ok()
-                .flatten()
-                .map(normalize_native),
+            Some(a) => a.native_policy(&project).await?.map(normalize_native),
             None => None,
         }
     };

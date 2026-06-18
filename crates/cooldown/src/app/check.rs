@@ -4,8 +4,8 @@
 
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    ArtifactScope, DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution,
-    ResolveKind, ResolveQuery, Status, TargetContext, check_pin, resolve,
+    DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext, Origin, Resolution,
+    ResolveKind, ResolveQuery, Status, check_pin, resolve,
 };
 use cooldown_render as render;
 use cooldown_render::tty::check_status_of;
@@ -117,22 +117,18 @@ impl Workspace {
                 .filter(|d| Self::package_in_scope(opts, &d.package.name))
                 .collect();
 
-            let tctx = TargetContext {
+            let fctx = FetchContext {
                 project: &pctx.project,
                 environments: &[],
-                artifacts: if opts.all_artifacts {
-                    ArtifactScope::All
-                } else {
-                    ArtifactScope::Environment
-                },
+                artifacts: opts.artifact_scope(),
             };
 
             let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
                 stream::iter(deps)
                     .map(|dep| {
-                        let tctx = &tctx;
+                        let fctx = &fctx;
                         async move {
-                            let r = adapter.locked_release(&dep, tctx).await;
+                            let r = adapter.locked_release(&dep, fctx).await;
                             (dep, r)
                         }
                     })

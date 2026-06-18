@@ -176,7 +176,7 @@ impl crate::app::Workspace {
         &self,
         opts: &super::RunOpts,
     ) -> Result<Vec<AckEntry>, CoreError> {
-        use cooldown_core::{ArtifactScope, DepScope, Status, TargetContext, check_pin};
+        use cooldown_core::{DepScope, FetchContext, Status, check_pin};
         use futures::stream::{self, StreamExt};
 
         let mut entries = Vec::new();
@@ -189,20 +189,16 @@ impl crate::app::Workspace {
                 .into_iter()
                 .filter(|d| Self::package_in_scope(opts, &d.package.name))
                 .collect();
-            let tctx = TargetContext {
+            let fctx = FetchContext {
                 project: &pctx.project,
                 environments: &[],
-                artifacts: if opts.all_artifacts {
-                    ArtifactScope::All
-                } else {
-                    ArtifactScope::Environment
-                },
+                artifacts: opts.artifact_scope(),
             };
             let rctx = Self::resolve_ctx(pctx, opts);
-            let tctx_ref = &tctx;
+            let fctx_ref = &fctx;
             let fetched: Vec<_> = stream::iter(deps)
                 .map(|dep| async move {
-                    let r = adapter.locked_release(&dep, tctx_ref).await;
+                    let r = adapter.locked_release(&dep, fctx_ref).await;
                     (dep, r)
                 })
                 .buffer_unordered(opts.fanout())

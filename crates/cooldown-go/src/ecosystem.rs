@@ -7,9 +7,10 @@ use crate::semver;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, DepScope, Dependency, Ecosystem, EcosystemId, LockSnapshot,
-    MajorKey, NativePolicyLayer, PackageRegistry, Plan, Project, Release, ReleaseOrder,
-    ReleaseQuality, Result, SkipReason, Skipped, TargetContext, VerifyReport, Version,
+    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, Ecosystem,
+    EcosystemId, FetchContext, LockSnapshot, MajorKey, NativePolicyLayer, PackageRegistry, Plan,
+    Project, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped, VerifyReport,
+    Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -124,6 +125,17 @@ pub fn build_releases(
     releases
 }
 
+fn skipped_on_apply_error(change: &Change, error: cooldown_core::CoreError) -> Result<Skipped> {
+    if error.is_tool_spawn_failure() {
+        return Err(error);
+    }
+    Ok(Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(change.package.clone()),
+    })
+}
+
 fn find_go_mods(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
     let manifest = root.join("go.mod");
     if manifest.is_file() {
@@ -175,10 +187,10 @@ impl GoEcosystem {
     }
 
     /// Discover higher major-version module paths (`prefix/v2`, `/v3`, …) for cross-major candidates.
-    async fn discover_major_paths(&self, module: &str) -> Vec<String> {
+    async fn discover_major_paths(&self, module: &str) -> Result<Vec<String>> {
         let (prefix, path_major, ok) = semver::split_path_version(module);
         if !ok {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let current_major: u32 = if path_major.is_empty() {
             1
@@ -194,16 +206,16 @@ impl GoEcosystem {
         let mut n = current_major + 1;
         while misses < 2 && n <= current_major + 8 {
             let p = semver::major_path(&prefix, n);
-            match self.proxy.list(&p).await {
-                Ok(list) if !list.is_empty() => {
-                    found.push(p);
-                    misses = 0;
-                }
-                _ => misses += 1,
+            let list = self.proxy.list(&p).await?;
+            if list.is_empty() {
+                misses += 1;
+            } else {
+                found.push(p);
+                misses = 0;
             }
             n += 1;
         }
-        found
+        Ok(found)
     }
 
     /// Rewrite import paths `old` → `new` across `.go` files (best-effort `/vN` migration).
@@ -279,11 +291,7 @@ impl Ecosystem for GoEcosystem {
             .find(|m| m.main)
             .map(|m| m.path.clone())
             .unwrap_or_default();
-        let floors = self
-            .go
-            .mod_graph_floors(&project.root, &main_path)
-            .await
-            .unwrap_or_default();
+        let floors = self.go.mod_graph_floors(&project.root, &main_path).await?;
 
         let mut deps = Vec::new();
         for m in &modules {
@@ -298,7 +306,12 @@ impl Ecosystem for GoEcosystem {
         Ok(deps)
     }
 
-    async fn releases(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Vec<Release>> {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        _fetch: &FetchContext<'_>,
+        candidates: CandidateScope,
+    ) -> Result<Vec<Release>> {
         let module = &dep.package.name;
 
         // (source_path, raw_release) across the module's own path and discovered higher majors.
@@ -306,9 +319,10 @@ impl Ecosystem for GoEcosystem {
         for rr in self.proxy.releases(&dep.package).await? {
             raw.push((module.clone(), rr));
         }
-        for path in self.discover_major_paths(module).await {
-            let pkg = cooldown_core::PackageId::new(GO_ID, path.clone(), self.registry());
-            if let Ok(list) = self.proxy.releases(&pkg).await {
+        if candidates == CandidateScope::AllowCrossMajor {
+            for path in self.discover_major_paths(module).await? {
+                let pkg = cooldown_core::PackageId::new(GO_ID, path.clone(), self.registry());
+                let list = self.proxy.releases(&pkg).await?;
                 for rr in list {
                     raw.push((path.clone(), rr));
                 }
@@ -337,7 +351,7 @@ impl Ecosystem for GoEcosystem {
         Ok(build_releases(current, raw))
     }
 
-    async fn locked_release(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Release> {
+    async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
         let time = self
             .proxy
             .published_at(&dep.package, &dep.current, &[])
@@ -377,12 +391,7 @@ impl Ecosystem for GoEcosystem {
                 }
                 Err(e) => {
                     // MVS/resolver rejection → a skip (Ok data), not a hard error.
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(change.package.clone()),
-                    });
-                    let _ = e;
+                    report.skipped.push(skipped_on_apply_error(change, e)?);
                 }
             }
         }
@@ -450,7 +459,87 @@ fn old_import_path(change: &Change) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cooldown_core::{PackageId, RawRelease, UpdateKind};
+    use crate::proxy::ProxyBase;
+    use cooldown_core::{
+        ArtifactScope, Dependency, FetchContext, PackageId, Project, RawRelease, UpdateKind,
+    };
+    use cooldown_registry::HttpOptions;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    struct TestServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn new(routes: HashMap<String, (u16, &'static str)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking");
+            let addr = listener.local_addr().expect("local addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let handle = thread::spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut request_line = String::new();
+                            let mut reader =
+                                BufReader::new(stream.try_clone().expect("clone stream"));
+                            let _ = reader.read_line(&mut request_line);
+                            let path = request_line
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("/")
+                                .to_string();
+                            let (status, body) =
+                                routes.get(&path).copied().unwrap_or((404, "not found"));
+                            let reason = match status {
+                                200 => "OK",
+                                500 => "Internal Server Error",
+                                _ => "Not Found",
+                            };
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.flush();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            TestServer {
+                base_url: format!("http://{addr}"),
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 
     fn rr(v: &str, t: Option<&str>) -> RawRelease {
         RawRelease {
@@ -558,5 +647,129 @@ mod tests {
             old_import_path(&change3),
             Some("example.com/foo/v2".to_string())
         );
+    }
+
+    fn dep(name: &str, current: &str) -> Dependency {
+        Dependency {
+            package: PackageId::new(GO_ID, name, None),
+            current: Version::new(current),
+            current_quality: classify_quality(current),
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+        }
+    }
+
+    fn project(root: &Utf8Path) -> Project {
+        Project {
+            root: root.to_owned(),
+            kind: GO_ID,
+            manifest: root.join("go.mod"),
+        }
+    }
+
+    fn fetch_ctx(project: &Project) -> FetchContext<'_> {
+        FetchContext {
+            project,
+            environments: &[],
+            artifacts: ArtifactScope::Environment,
+        }
+    }
+
+    #[test]
+    fn apply_spawn_failure_is_not_downgraded_to_skip() {
+        let change = Change {
+            package: PackageId::new(GO_ID, "example.com/foo", None),
+            from: Version::new("v1.0.0"),
+            to: Version::new("v1.0.1"),
+            kind: UpdateKind::Patch,
+        };
+        let err = cooldown_core::CoreError::ToolSpawn {
+            tool: "go".into(),
+            detail: "spawn failed".into(),
+        };
+
+        let result = skipped_on_apply_error(&change, err);
+        assert!(matches!(
+            result,
+            Err(cooldown_core::CoreError::ToolSpawn { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn releases_skip_cross_major_probe_when_scope_is_current_major_only() {
+        let routes = HashMap::from([
+            ("/example.com/mod/@v/list".to_string(), (200, "v1.0.0\n")),
+            (
+                "/example.com/mod/@v/v1.0.0.info".to_string(),
+                (200, r#"{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}"#),
+            ),
+            (
+                "/example.com/mod/v2/@v/list".to_string(),
+                (500, "cross-major probe should be skipped"),
+            ),
+        ]);
+        let server = TestServer::new(routes);
+        let cache = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
+        let eco = GoEcosystem::new(GoProxy::new(
+            http,
+            vec![ProxyBase {
+                url: server.base_url.clone(),
+                fallback_on_errors: false,
+            }],
+        ));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+        let project = project(&root);
+
+        let releases = eco
+            .releases(
+                &dep("example.com/mod", "v1.0.0"),
+                &fetch_ctx(&project),
+                CandidateScope::CurrentMajorOnly,
+            )
+            .await
+            .expect("same-major release fetch");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version.as_str(), "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn releases_fail_closed_on_cross_major_probe_error_when_enabled() {
+        let routes = HashMap::from([
+            ("/example.com/mod/@v/list".to_string(), (200, "v1.0.0\n")),
+            (
+                "/example.com/mod/@v/v1.0.0.info".to_string(),
+                (200, r#"{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}"#),
+            ),
+            (
+                "/example.com/mod/v2/@v/list".to_string(),
+                (500, "cross-major probe should fail"),
+            ),
+        ]);
+        let server = TestServer::new(routes);
+        let cache = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
+        let eco = GoEcosystem::new(GoProxy::new(
+            http,
+            vec![ProxyBase {
+                url: server.base_url.clone(),
+                fallback_on_errors: false,
+            }],
+        ));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+        let project = project(&root);
+
+        let err = eco
+            .releases(
+                &dep("example.com/mod", "v1.0.0"),
+                &fetch_ctx(&project),
+                CandidateScope::AllowCrossMajor,
+            )
+            .await
+            .expect_err("cross-major probe must fail closed");
+        assert!(err.is_transient());
     }
 }

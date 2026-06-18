@@ -3,8 +3,8 @@
 
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use cooldown_core::{
-    ArtifactScope, DepScope, Dependency, Diagnostic, Release, ResolveKind, ResolveQuery,
-    TargetContext, evaluate, resolve,
+    DepScope, Dependency, Diagnostic, FetchContext, Release, ResolveKind, ResolveQuery, evaluate,
+    resolve,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};
@@ -60,22 +60,19 @@ impl Workspace {
                 .filter(|d| Self::package_in_scope(opts, &d.package.name))
                 .collect();
 
-            let tctx = TargetContext {
+            let fctx = FetchContext {
                 project: &pctx.project,
                 environments: &[],
-                artifacts: if opts.all_artifacts {
-                    ArtifactScope::All
-                } else {
-                    ArtifactScope::Environment
-                },
+                artifacts: opts.artifact_scope(),
             };
 
             let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> =
                 stream::iter(deps)
                     .map(|dep| {
-                        let tctx = &tctx;
+                        let fctx = &fctx;
+                        let candidate_scope = opts.candidate_scope();
                         async move {
-                            let r = adapter.releases(&dep, tctx).await;
+                            let r = adapter.releases(&dep, fctx, candidate_scope).await;
                             (dep, r)
                         }
                     })

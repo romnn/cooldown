@@ -453,6 +453,16 @@ pub enum ArtifactScope {
     All,
 }
 
+/// Whether release discovery should stay within the current major line or also probe cross-major
+/// candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateScope {
+    /// Only same-major candidates are relevant (`--major` not set).
+    CurrentMajorOnly,
+    /// Cross-major candidates are relevant (`--major` set).
+    AllowCrossMajor,
+}
+
 /// The platform/abi/python-version/markers a lock must satisfy. Version-granular ecosystems leave
 /// this empty.
 #[derive(Debug, Clone, Default)]
@@ -463,7 +473,7 @@ pub struct Environment {
 
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.
 #[derive(Debug, Clone)]
-pub struct TargetContext<'a> {
+pub struct FetchContext<'a> {
     /// The project being evaluated.
     pub project: &'a Project,
     /// The environments the lock must satisfy; empty for version-granular ecosystems.

@@ -92,10 +92,9 @@ impl Go {
             .current_dir(dir.as_std_path())
             .output()
             .await
-            .map_err(|e| CoreError::Tool {
+            .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
-                status: -1,
-                stderr: format!("failed to spawn `{} {}`: {e}", self.bin, args.join(" ")),
+                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
             })
     }
 
@@ -117,8 +116,8 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] if the `go` command fails to spawn or exits
-    /// non-zero, or a [`CoreError::LockUnreadable`] if its JSON output cannot be parsed.
+    /// Returns [`CoreError::ToolSpawn`] if the `go` command fails to spawn, [`CoreError::Tool`] if
+    /// it exits non-zero, or [`CoreError::LockUnreadable`] if its JSON output cannot be parsed.
     pub async fn list_modules(&self, dir: &Utf8Path) -> Result<Vec<GoModule>, CoreError> {
         let stdout = self.run(dir, &["list", "-m", "-json", "all"]).await?;
         let mut out = Vec::new();
@@ -147,8 +146,8 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] if the `go mod graph` command fails to spawn or
-    /// exits non-zero.
+    /// Returns [`CoreError::ToolSpawn`] if `go mod graph` fails to spawn, or [`CoreError::Tool`]
+    /// if it exits non-zero.
     pub async fn mod_graph_floors(
         &self,
         dir: &Utf8Path,
@@ -185,9 +184,9 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] if `go mod tidy -diff` fails for a reason other than
-    /// reporting a diff (e.g. the binary is missing or the flag is unsupported on an
-    /// older Go).
+    /// Returns [`CoreError::ToolSpawn`] if `go mod tidy -diff` fails to spawn, or
+    /// [`CoreError::Tool`] if it fails for a reason other than reporting a diff (e.g. the flag is
+    /// unsupported on an older Go).
     pub async fn mod_tidy_is_clean(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
         let out = self.output(dir, &["mod", "tidy", "-diff"]).await?;
         if out.status.success() {
@@ -208,8 +207,8 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] if `go get` fails to spawn or exits non-zero (e.g.
-    /// the resolver rejects the requested version).
+    /// Returns [`CoreError::ToolSpawn`] if `go get` fails to spawn, or [`CoreError::Tool`] if it
+    /// exits non-zero (e.g. the resolver rejects the requested version).
     pub async fn get(&self, dir: &Utf8Path, module: &str, version: &str) -> Result<(), CoreError> {
         self.run(dir, &["get", &format!("{module}@{version}")])
             .await
@@ -220,7 +219,8 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] if `go mod tidy` fails to spawn or exits non-zero.
+    /// Returns [`CoreError::ToolSpawn`] if `go mod tidy` fails to spawn, or [`CoreError::Tool`] if
+    /// it exits non-zero.
     pub async fn mod_tidy(&self, dir: &Utf8Path) -> Result<(), CoreError> {
         self.run(dir, &["mod", "tidy"]).await.map(|_| ())
     }
@@ -232,7 +232,7 @@ impl Go {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError::Tool`] only if the `go` binary cannot be spawned at all.
+    /// Returns [`CoreError::ToolSpawn`] only if the `go` binary cannot be spawned at all.
     pub async fn build(&self, dir: &Utf8Path) -> Result<VerifyReport, CoreError> {
         let out = self.output(dir, &["build", "./..."]).await?;
         Ok(VerifyReport {

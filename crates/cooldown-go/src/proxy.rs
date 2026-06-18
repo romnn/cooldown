@@ -13,7 +13,16 @@ use jiff::Timestamp;
 pub struct GoProxy {
     http: SharedHttp,
     /// Proxy base URLs in order (from `GOPROXY`, minus `direct`/`off`).
-    bases: Vec<String>,
+    bases: Vec<ProxyBase>,
+}
+
+#[derive(Clone)]
+/// One parsed GOPROXY base entry, including whether errors should fall through to the next entry.
+pub struct ProxyBase {
+    /// The HTTP(S) base URL of this proxy entry.
+    pub url: String,
+    /// Whether errors other than 404/410 should fall through to the next entry (`|` semantics).
+    pub fallback_on_errors: bool,
 }
 
 /// The metadata for a single module version, parsed from a proxy `.info`/`@latest` response.
@@ -34,13 +43,9 @@ struct InfoJson {
 }
 
 impl GoProxy {
-    /// Creates a proxy client over `http` that tries each base URL in `bases` in order.
-    ///
-    /// `bases` should already be filtered to HTTP(S) endpoints (the `direct`/`off`
-    /// `GOPROXY` keywords are not valid base URLs); use [`GoProxy::from_env`] to derive
-    /// them from the environment.
+    /// Creates a proxy client over `http` that tries each parsed proxy base in order.
     #[must_use]
-    pub fn new(http: SharedHttp, bases: Vec<String>) -> Self {
+    pub fn new(http: SharedHttp, bases: Vec<ProxyBase>) -> Self {
         GoProxy { http, bases }
     }
 
@@ -59,7 +64,7 @@ impl GoProxy {
     /// The reporting registry name (the first proxy host), for the JSON `registry` field.
     #[must_use]
     pub fn registry_name(&self) -> Option<String> {
-        self.bases.first().and_then(|b| host_of(b))
+        self.bases.first().and_then(|b| host_of(&b.url))
     }
 
     /// Escape a module path or version per the `!`-lowercase rule.
@@ -83,15 +88,23 @@ impl GoProxy {
     ) -> Result<Option<String>, CoreError> {
         let mut last_err: Option<CoreError> = None;
         for base in &self.bases {
-            let url = format!("{}/{}", base.trim_end_matches('/'), suffix);
+            let url = format!("{}/{}", base.url.trim_end_matches('/'), suffix);
             match self.http.get(&url, ttl).await {
                 Ok(resp) if resp.is_not_found() => {} // advance to the next proxy on 404/410
                 Ok(resp) if resp.is_success() => return Ok(Some(resp.body)),
                 Ok(resp) => {
                     last_err = Some(CoreError::transient(format!("{url}: HTTP {}", resp.status)));
+                    if !base.fallback_on_errors {
+                        break;
+                    }
                 }
-                Err(CoreError::OfflineMiss(_)) => return Ok(None), // offline miss → unknown age
-                Err(e) => last_err = Some(e),
+                Err(CoreError::OfflineMiss(_)) => {} // try the next proxy's cache before giving up
+                Err(e) => {
+                    last_err = Some(e);
+                    if !base.fallback_on_errors {
+                        break;
+                    }
+                }
             }
         }
         match last_err {
@@ -236,13 +249,33 @@ impl PackageRegistry for GoProxy {
     }
 }
 
-/// Parse `GOPROXY` into ordered base URLs, dropping `direct`/`off` keywords.
-fn parse_goproxy(raw: &str) -> Vec<String> {
-    raw.split(['|', ','])
-        .map(str::trim)
-        .filter(|e| e.starts_with("http://") || e.starts_with("https://"))
-        .map(std::string::ToString::to_string)
-        .collect()
+/// Parse `GOPROXY` into ordered proxy bases, preserving the delimiter semantics:
+/// `,` falls through only on 404/410; `|` falls through on any error.
+#[must_use]
+pub fn parse_goproxy(raw: &str) -> Vec<ProxyBase> {
+    let mut bases = Vec::new();
+    let mut current = String::new();
+
+    for ch in raw.chars() {
+        if ch == ',' || ch == '|' {
+            push_proxy_base(&mut bases, &current, ch == '|');
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    push_proxy_base(&mut bases, &current, false);
+    bases
+}
+
+fn push_proxy_base(out: &mut Vec<ProxyBase>, entry: &str, fallback_on_errors: bool) {
+    let entry = entry.trim();
+    if entry.starts_with("http://") || entry.starts_with("https://") {
+        out.push(ProxyBase {
+            url: entry.to_string(),
+            fallback_on_errors,
+        });
+    }
 }
 
 /// Extract the host from a base URL without pulling in a URL-parsing dependency.
@@ -277,16 +310,64 @@ mod tests {
     #[test]
     fn parses_goproxy_list() {
         assert_eq!(
-            parse_goproxy("https://proxy.golang.org,direct"),
-            vec!["https://proxy.golang.org".to_string()]
+            parse_goproxy("https://proxy.golang.org,direct")
+                .into_iter()
+                .map(|b| (b.url, b.fallback_on_errors))
+                .collect::<Vec<_>>(),
+            vec![("https://proxy.golang.org".to_string(), false)]
         );
         assert_eq!(
-            parse_goproxy("https://a.example|https://b.example|off"),
+            parse_goproxy("https://a.example|https://b.example|off")
+                .into_iter()
+                .map(|b| (b.url, b.fallback_on_errors))
+                .collect::<Vec<_>>(),
             vec![
-                "https://a.example".to_string(),
-                "https://b.example".to_string()
+                ("https://a.example".to_string(), true),
+                ("https://b.example".to_string(), true)
             ]
         );
         assert!(parse_goproxy("off").is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_tries_later_proxy_cache_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(
+            dir.path(),
+            cooldown_registry::HttpOptions {
+                offline: true,
+                ..Default::default()
+            },
+        )
+        .expect("shared http");
+        let later_url = "https://b.example/example.com/mod/@v/list";
+        cooldown_registry::cache::write_entry(
+            dir.path(),
+            &cooldown_registry::cache::CacheEntry {
+                url: later_url.into(),
+                fetched_at: "2026-06-18T00:00:00Z".into(),
+                etag: None,
+                status: 200,
+                body: "v1.0.0\n".into(),
+            },
+        )
+        .expect("cache entry");
+
+        let proxy = GoProxy::new(
+            http,
+            vec![
+                ProxyBase {
+                    url: "https://a.example".into(),
+                    fallback_on_errors: false,
+                },
+                ProxyBase {
+                    url: "https://b.example".into(),
+                    fallback_on_errors: false,
+                },
+            ],
+        );
+
+        let versions = proxy.list("example.com/mod").await.expect("list");
+        assert_eq!(versions, vec!["v1.0.0".to_string()]);
     }
 }

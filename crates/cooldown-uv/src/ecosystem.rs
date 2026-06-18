@@ -9,12 +9,13 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    ApplyReport, Capabilities, DepScope, Dependency, Ecosystem, EcosystemId, LockSnapshot,
-    NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project, RawWindow, Release,
-    ReleaseOrder, ReleaseQuality, Result, Selector, SkipReason, Skipped, TargetContext,
-    VerifyReport, Version,
+    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, Ecosystem, EcosystemId,
+    FetchContext, LockSnapshot, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
+    Project, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector, SkipReason,
+    Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
+use cooldown_toml_util::read_toml_file;
 
 /// The [`EcosystemId`] for the Python/uv adapter.
 pub const UV_ID: EcosystemId = EcosystemId("python");
@@ -91,6 +92,17 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
     releases
 }
 
+fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> {
+    if error.is_tool_spawn_failure() {
+        return Err(error);
+    }
+    Ok(Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(change.package.clone()),
+    })
+}
+
 fn find_uv_locks(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
     if root.join("uv.lock").is_file() {
         out.push(root.to_owned());
@@ -123,10 +135,13 @@ fn read_lock(project: &Project) -> Result<UvLock> {
 }
 
 /// Parse `[tool.uv] exclude-newer` / `exclude-newer-package` into native rules.
-fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
-    let content = std::fs::read_to_string(manifest).ok()?;
-    let value: toml::Value = content.parse().ok()?;
-    let uv = value.get("tool").and_then(|t| t.get("uv"))?;
+fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
+    let Some(value) = read_toml_file::<toml::Value>(manifest, "pyproject.toml")? else {
+        return Ok(None);
+    };
+    let Some(uv) = value.get("tool").and_then(|t| t.get("uv")) else {
+        return Ok(None);
+    };
     let mut rules = Vec::new();
 
     if let Some(en) = uv.get("exclude-newer").and_then(|v| v.as_str())
@@ -136,13 +151,18 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
             selector: Selector::Default,
             window: w,
         });
+    } else if uv.get("exclude-newer").is_some() {
+        return Err(CoreError::Config(format!(
+            "{manifest}: [tool.uv].exclude-newer must be a valid date/datetime or duration string"
+        )));
     }
     if let Some(table) = uv.get("exclude-newer-package").and_then(|v| v.as_table()) {
         for (pkg, val) in table {
-            // One unparsable package pattern must not discard the entire native policy.
-            let Ok(glob) = cooldown_core::PatternGlob::new(pkg) else {
-                continue;
-            };
+            let glob = cooldown_core::PatternGlob::new(pkg).map_err(|e| {
+                CoreError::Config(format!(
+                    "{manifest}: invalid [tool.uv].exclude-newer-package pattern {pkg:?}: {e}"
+                ))
+            })?;
             let selector = Selector::Package(glob);
             if let Some(false) = val.as_bool() {
                 rules.push(NativeRule {
@@ -156,13 +176,21 @@ fn parse_native(manifest: &Utf8Path) -> Option<NativePolicyLayer> {
                     selector,
                     window: w,
                 });
+            } else {
+                return Err(CoreError::Config(format!(
+                    "{manifest}: [tool.uv].exclude-newer-package.{pkg:?} must be false or a valid date/datetime or duration string"
+                )));
             }
         }
+    } else if uv.get("exclude-newer-package").is_some() {
+        return Err(CoreError::Config(format!(
+            "{manifest}: [tool.uv].exclude-newer-package must be a table"
+        )));
     }
     if rules.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(NativePolicyLayer { rules })
+        Ok(Some(NativePolicyLayer { rules }))
     }
 }
 
@@ -235,14 +263,19 @@ impl Ecosystem for UvEcosystem {
         Ok(deps)
     }
 
-    async fn releases(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Vec<Release>> {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        _fetch: &FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
         let raw = self.pypi.releases(&dep.package).await?;
         Ok(build_releases(dep.current.as_str(), raw))
     }
 
-    async fn locked_release(&self, dep: &Dependency, ctx: &TargetContext<'_>) -> Result<Release> {
+    async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release> {
         // Prefer the lock's recorded per-file upload time; fall back to PyPI.
-        let from_lock = read_lock(ctx.project).ok().and_then(|lock| {
+        let from_lock = read_lock(fetch.project).ok().and_then(|lock| {
             lock.find(&dep.package.name, dep.current.as_str())
                 .and_then(super::lock::Package::newest_upload_time)
         });
@@ -266,7 +299,7 @@ impl Ecosystem for UvEcosystem {
     }
 
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(parse_native(&project.manifest))
+        parse_native(&project.manifest)
     }
 
     async fn apply(&self, project: &Project, plan: &Plan) -> Result<ApplyReport> {
@@ -278,11 +311,7 @@ impl Ecosystem for UvEcosystem {
                 .await
             {
                 Ok(()) => report.applied.push(change.clone()),
-                Err(_) => report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: Some(change.package.clone()),
-                }),
+                Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
             }
         }
         Ok(report)
@@ -319,5 +348,71 @@ impl Ecosystem for UvEcosystem {
             std::fs::write(project.root.join(rel), bytes)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&path, contents).expect("write manifest");
+        (dir, path)
+    }
+
+    #[test]
+    fn parse_native_errors_on_invalid_package_rule() {
+        let (_dir, manifest) = write_manifest(
+            r#"
+[tool.uv]
+exclude-newer = "2026-06-01"
+
+[tool.uv.exclude-newer-package]
+"[" = false
+"#,
+        );
+
+        let err = parse_native(&manifest).expect_err("invalid native config must fail");
+        assert!(matches!(err, CoreError::Config(_)));
+    }
+
+    #[test]
+    fn parse_native_reads_valid_rules() {
+        let (_dir, manifest) = write_manifest(
+            r#"
+[tool.uv]
+exclude-newer = "2026-06-01"
+
+[tool.uv.exclude-newer-package]
+requests = false
+"#,
+        );
+
+        let layer = parse_native(&manifest)
+            .expect("valid native config")
+            .expect("native layer");
+        assert_eq!(layer.rules.len(), 2);
+        assert!(matches!(layer.rules[0].window, RawWindow::AbsoluteDate(_)));
+        assert!(matches!(layer.rules[1].window, RawWindow::OptOut));
+    }
+
+    #[test]
+    fn apply_spawn_failure_is_not_downgraded_to_skip() {
+        let change = Change {
+            package: PackageId::new(UV_ID, "requests", Some(PYPI.to_string())),
+            from: Version::new("2.34.1"),
+            to: Version::new("2.34.2"),
+            kind: cooldown_core::UpdateKind::Patch,
+        };
+        let err = CoreError::ToolSpawn {
+            tool: "uv".into(),
+            detail: "spawn failed".into(),
+        };
+
+        let result = skipped_on_apply_error(&change, err);
+        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
     }
 }

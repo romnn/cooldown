@@ -8,8 +8,8 @@
 
 use crate::error::Result;
 use crate::model::{
-    ApplyReport, ArtifactId, DepScope, Dependency, EcosystemId, Plan, Project, Release,
-    TargetContext, VerifyReport, Version,
+    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, EcosystemId, FetchContext, Plan,
+    Project, Release, VerifyReport, Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -98,9 +98,11 @@ pub trait Ecosystem: Send + Sync {
     /// Returns the classified candidate releases for `dep`, sorted ascending by release order.
     ///
     /// Each candidate carries its order, `kind_from_current`, and publish times, resolved via the
-    /// underlying [`PackageRegistry`]. `ctx` supplies the project, target environment, and artifact
-    /// scope so each candidate's publish instant follows the candidate invariant (for
-    /// artifact-granular ecosystems, the instant reflects the artifacts selected by `ctx`).
+    /// underlying [`PackageRegistry`]. `fetch` supplies the project, target environment, and
+    /// artifact scope so each candidate's publish instant follows the candidate invariant (for
+    /// artifact-granular ecosystems, the instant reflects the artifacts selected by `fetch`).
+    /// `candidates` communicates which candidate set the command actually cares about, so adapters
+    /// such as Go can skip cross-major discovery unless it is in scope.
     ///
     /// Implementations must return the slice sorted ascending by order — see
     /// [`debug_assert_sorted`], which the core relies on.
@@ -108,7 +110,12 @@ pub trait Ecosystem: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the registry lookup fails.
-    async fn releases(&self, dep: &Dependency, ctx: &TargetContext<'_>) -> Result<Vec<Release>>;
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        fetch: &FetchContext<'_>,
+        candidates: CandidateScope,
+    ) -> Result<Vec<Release>>;
 
     /// Returns the currently-locked version of `dep` as a [`Release`].
     ///
@@ -119,7 +126,7 @@ pub trait Ecosystem: Send + Sync {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the locked version cannot be read or its
     /// publish instant cannot be resolved.
-    async fn locked_release(&self, dep: &Dependency, ctx: &TargetContext<'_>) -> Result<Release>;
+    async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release>;
 
     /// Returns the ecosystem's native cooldown config translated into the unified rule model.
     ///

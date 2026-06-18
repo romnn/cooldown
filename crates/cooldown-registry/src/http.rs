@@ -217,7 +217,8 @@ impl SharedHttp {
                 }
                 Err(FetchError::Transient(e)) => {
                     // Fall back to a stale cached copy if we have one; else propagate.
-                    if let Some(c) = &cached
+                    if !self.inner.opts.fresh
+                        && let Some(c) = &cached
                         && c.status < 400
                     {
                         return Ok(HttpResponse {
@@ -323,4 +324,58 @@ fn cache_is_fresh(entry: &CacheEntry, ttl: Duration) -> bool {
     // A negative age means the entry was fetched "in the future" (clock skew); treat it as not
     // fresh. `try_from` both drops that case and converts without a sign-loss cast.
     u64::try_from(age).is_ok_and(|secs| secs < ttl.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_entry(url: &str) -> CacheEntry {
+        CacheEntry {
+            url: url.to_string(),
+            fetched_at: "2026-06-18T00:00:00Z".into(),
+            etag: None,
+            status: 200,
+            body: "cached".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_mode_does_not_fallback_to_stale_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "http://127.0.0.1:1/test";
+        write_entry(dir.path(), &cache_entry(url)).expect("cache entry");
+        let http = SharedHttp::new(
+            dir.path(),
+            HttpOptions {
+                fresh: true,
+                request_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        )
+        .expect("shared http");
+
+        let result = http.get(url, Duration::ZERO).await;
+        assert!(matches!(result, Err(CoreError::Transient(_))));
+    }
+
+    #[tokio::test]
+    async fn non_fresh_mode_can_fallback_to_stale_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "http://127.0.0.1:1/test";
+        write_entry(dir.path(), &cache_entry(url)).expect("cache entry");
+        let http = SharedHttp::new(
+            dir.path(),
+            HttpOptions {
+                fresh: false,
+                request_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        )
+        .expect("shared http");
+
+        let response = http.get(url, Duration::ZERO).await.expect("stale fallback");
+        assert!(response.from_cache);
+        assert_eq!(response.body, "cached");
+    }
 }

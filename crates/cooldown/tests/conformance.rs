@@ -51,8 +51,14 @@ fn dep(name: &str, current: &str, direct: bool) -> Dependency {
 struct State {
     /// Simulates a re-lock having dragged in a fresh transitive.
     fresh_transitive_present: bool,
+    /// Whether `apply` has already mutated the project once.
+    apply_attempted: bool,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "test fixture toggles independent failure modes to exercise the workspace invariants"
+)]
 struct FakeEco {
     direct: Vec<Dependency>,
     transitive: Vec<Dependency>,
@@ -61,6 +67,10 @@ struct FakeEco {
     locked: HashMap<String, Release>,
     inject_fresh_on_apply: bool,
     stale_lock: bool,
+    fail_graph_after_apply: bool,
+    stale_lock_after_apply: bool,
+    build_fails_after_apply: bool,
+    restore_fails: bool,
     state: Mutex<State>,
     root: Utf8PathBuf,
 }
@@ -91,6 +101,12 @@ impl Ecosystem for FakeEco {
         Ok(vec![self.project()])
     }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        if scope == DepScope::Graph
+            && self.fail_graph_after_apply
+            && self.state.lock().unwrap().apply_attempted
+        {
+            return Err(CoreError::Transient("post-apply graph probe failed".into()));
+        }
         let mut out = self.direct.clone();
         if scope == DepScope::Graph {
             out.extend(self.transitive.clone());
@@ -102,14 +118,23 @@ impl Ecosystem for FakeEco {
         }
         Ok(out)
     }
-    async fn releases(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Vec<Release>> {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
         Ok(self
             .releases
             .get(&dep.package.name)
             .cloned()
             .unwrap_or_default())
     }
-    async fn locked_release(&self, dep: &Dependency, _ctx: &TargetContext<'_>) -> Result<Release> {
+    async fn locked_release(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+    ) -> Result<Release> {
         self.locked
             .get(&dep.package.name)
             .cloned()
@@ -119,8 +144,10 @@ impl Ecosystem for FakeEco {
         Ok(None)
     }
     async fn apply(&self, _p: &Project, plan: &Plan) -> Result<ApplyReport> {
+        let mut state = self.state.lock().unwrap();
+        state.apply_attempted = true;
         if self.inject_fresh_on_apply {
-            self.state.lock().unwrap().fresh_transitive_present = true;
+            state.fresh_transitive_present = true;
         }
         Ok(ApplyReport {
             applied: plan.changes.clone(),
@@ -129,25 +156,32 @@ impl Ecosystem for FakeEco {
     }
     async fn build(&self, _p: &Project) -> Result<VerifyReport> {
         Ok(VerifyReport {
-            ok: true,
-            detail: "ok".into(),
+            ok: !(self.build_fails_after_apply && self.state.lock().unwrap().apply_attempted),
+            detail: if self.build_fails_after_apply && self.state.lock().unwrap().apply_attempted {
+                "build failed".into()
+            } else {
+                "ok".into()
+            },
         })
     }
     async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        let stale = self.stale_lock
+            || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
         Ok(VerifyReport {
-            ok: !self.stale_lock,
-            detail: if self.stale_lock {
-                "stale".into()
-            } else {
-                "tidy".into()
-            },
+            ok: !stale,
+            detail: if stale { "stale".into() } else { "tidy".into() },
         })
     }
     async fn snapshot_lock(&self, _p: &Project) -> Result<LockSnapshot> {
         Ok(LockSnapshot::default())
     }
     async fn restore_lock(&self, _p: &Project, _s: &LockSnapshot) -> Result<()> {
-        self.state.lock().unwrap().fresh_transitive_present = false;
+        if self.restore_fails {
+            return Err(CoreError::Io("restore failed".into()));
+        }
+        let mut state = self.state.lock().unwrap();
+        state.fresh_transitive_present = false;
+        state.apply_attempted = false;
         Ok(())
     }
 }
@@ -209,6 +243,10 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -246,6 +284,10 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
         locked: locked.clone(),
         inject_fresh_on_apply: false,
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -292,6 +334,10 @@ async fn check_fails_closed_on_stale_lock() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         stale_lock: true,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -331,6 +377,10 @@ async fn upgrade_applies_clean_change() {
         locked,
         inject_fresh_on_apply: false,
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -377,6 +427,10 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
         locked,
         inject_fresh_on_apply: true, // applying the change drags in `t`
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -392,6 +446,107 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
 }
 
 #[tokio::test]
+async fn upgrade_fails_closed_when_post_apply_validation_errors() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: true,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.errors, 1);
+    assert!(out.items[0].error.is_some());
+}
+
+#[tokio::test]
+async fn upgrade_reports_final_lock_and_build_failures() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: true,
+        build_fails_after_apply: true,
+        restore_fails: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.build = true;
+    let out = ws.upgrade(&opts).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.errors, 2);
+    assert!(
+        out.errors
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::StaleLock)
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ToolFailed)
+    );
+}
+
+#[tokio::test]
 async fn explain_traces_the_default_window() {
     let (_g, root) = tmp_root();
     let fake = FakeEco {
@@ -402,6 +557,10 @@ async fn explain_traces_the_default_window() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -426,6 +585,10 @@ async fn explain_applies_registry_scoped_rule() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         stale_lock: false,
+        fail_graph_after_apply: false,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };

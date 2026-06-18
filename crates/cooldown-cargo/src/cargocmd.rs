@@ -121,10 +121,9 @@ impl Cargo {
             .current_dir(dir.as_std_path())
             .output()
             .await
-            .map_err(|e| CoreError::Tool {
+            .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
-                status: -1,
-                stderr: format!("failed to spawn `{} {}`: {e}", self.bin, args.join(" ")),
+                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
             })
     }
 
@@ -145,8 +144,9 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned or exits non-zero, and
-    /// [`CoreError::LockUnreadable`] if its JSON output cannot be parsed.
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned,
+    /// [`CoreError::Tool`] if it exits non-zero, and [`CoreError::LockUnreadable`] if its JSON
+    /// output cannot be parsed.
     pub async fn metadata(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
         let stdout = self
             .run(dir, &["metadata", "--format-version", "1"])
@@ -183,8 +183,8 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned, or if it fails for a reason other
-    /// than a stale lock (e.g. a missing offline index).
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if it
+    /// fails for a reason other than a stale lock (e.g. a missing offline index).
     pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
         let out = self
             .output(
@@ -215,8 +215,8 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] if `cargo` cannot be spawned or the update is rejected (e.g. a
-    /// `=`-pin or resolver conflict that blocks `--precise`).
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if
+    /// the update is rejected (e.g. a `=`-pin or resolver conflict that blocks `--precise`).
     pub async fn update_precise(
         &self,
         dir: &Utf8Path,
@@ -237,7 +237,7 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] only if the `cargo` process itself cannot be spawned.
+    /// Returns [`CoreError::ToolSpawn`] only if the `cargo` process itself cannot be spawned.
     pub async fn build(&self, dir: &Utf8Path) -> Result<VerifyReport, CoreError> {
         let out = self.output(dir, &["build"]).await?;
         Ok(VerifyReport {

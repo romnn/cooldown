@@ -8,8 +8,8 @@
 use super::lock::ProjectLock;
 use super::{Exit, RunOpts, Workspace, diag_from_error};
 use cooldown_core::{
-    ArtifactScope, Change, DepScope, Dependency, Diagnostic, MajorKey, PackageId, Plan, Release,
-    SkipReason, Status, TargetContext, check_pin, evaluate,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext, MajorKey, PackageId,
+    Plan, Release, SkipReason, Status, check_pin, evaluate,
 };
 use cooldown_render as render;
 use futures::stream::{self, StreamExt};
@@ -53,13 +53,47 @@ struct UpgradeAccum {
     lock_verified: Option<bool>,
 }
 
-/// The read-only per-project context shared by the upgrade helpers: the ecosystem adapter, the
-/// scoped project, the run options, and the artifact-target context.
+/// The read-only per-project context shared by the upgrade executor: the ecosystem adapter, the
+/// scoped project, and the run options.
 struct UpgradeCtx<'a> {
     adapter: &'a dyn cooldown_core::Ecosystem,
     pctx: &'a super::ProjectCtx,
     opts: &'a RunOpts,
-    tctx: &'a TargetContext<'a>,
+}
+
+impl<'a> UpgradeCtx<'a> {
+    fn new(
+        adapter: &'a dyn cooldown_core::Ecosystem,
+        pctx: &'a super::ProjectCtx,
+        opts: &'a RunOpts,
+    ) -> Self {
+        UpgradeCtx {
+            adapter,
+            pctx,
+            opts,
+        }
+    }
+
+    fn ecosystem_name(&self) -> &'static str {
+        self.pctx.ecosystem.as_str()
+    }
+
+    fn fetch_context(&self) -> FetchContext<'_> {
+        FetchContext {
+            project: &self.pctx.project,
+            environments: &[],
+            artifacts: self.opts.artifact_scope(),
+        }
+    }
+}
+
+/// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
+/// trials, rollback, and final verification.
+struct ProjectUpgradeExecutor<'a, 'b> {
+    ws: &'a Workspace,
+    ctx: UpgradeCtx<'b>,
+    project_label: String,
+    acc: &'a mut UpgradeAccum,
 }
 
 impl Workspace {
@@ -79,7 +113,9 @@ impl Workspace {
             let Some(adapter) = self.adapter(pctx.ecosystem) else {
                 continue;
             };
-            self.upgrade_project(adapter, pctx, opts, &mut acc).await;
+            ProjectUpgradeExecutor::new(self, adapter, pctx, opts, &mut acc)
+                .run()
+                .await;
         }
 
         let applied = acc.items.iter().filter(|i| i.applied).count();
@@ -122,85 +158,54 @@ impl Workspace {
             exit,
         }
     }
+}
 
-    /// Plan and apply the upgrade for one project, recording into `acc`.
-    async fn upgrade_project(
-        &self,
-        adapter: &dyn cooldown_core::Ecosystem,
-        pctx: &super::ProjectCtx,
-        opts: &RunOpts,
-        acc: &mut UpgradeAccum,
-    ) {
-        let project_label = pctx.rel_path.to_string();
-        let tctx = TargetContext {
-            project: &pctx.project,
-            environments: &[],
-            artifacts: if opts.all_artifacts {
-                ArtifactScope::All
-            } else {
-                ArtifactScope::Environment
-            },
+impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
+    fn new(
+        ws: &'a Workspace,
+        adapter: &'b dyn cooldown_core::Ecosystem,
+        pctx: &'b super::ProjectCtx,
+        opts: &'b RunOpts,
+        acc: &'a mut UpgradeAccum,
+    ) -> Self {
+        ProjectUpgradeExecutor {
+            ws,
+            ctx: UpgradeCtx::new(adapter, pctx, opts),
+            project_label: pctx.rel_path.to_string(),
+            acc,
+        }
+    }
+
+    async fn run(&mut self) {
+        let Some(deps) = self.direct_deps().await else {
+            return;
         };
-        let ctx = UpgradeCtx {
-            adapter,
-            pctx,
-            opts,
-            tctx: &tctx,
-        };
+        let planned = self.plan_changes(&deps).await;
 
-        // upgrade only changes DIRECT deps.
-        let deps = match adapter.dependencies(&pctx.project, DepScope::Direct).await {
-            Ok(d) => d
-                .into_iter()
-                .filter(|d| Self::package_in_scope(opts, &d.package.name))
-                .collect::<Vec<Dependency>>(),
-            Err(e) => {
-                acc.errors
-                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
-                return;
-            }
-        };
-
-        let planned = self.plan_changes(&ctx, &deps, &project_label, acc).await;
-
-        if opts.dry_run {
-            for c in planned {
-                acc.items.push(plan_item(
-                    &c,
-                    &project_label,
-                    pctx.ecosystem.as_str(),
-                    false,
-                    None,
-                ));
-            }
+        if self.ctx.opts.dry_run {
+            self.record_dry_run(&planned);
             return;
         }
 
-        // Acquire the advisory lock for the mutating run.
-        let _guard = match ProjectLock::acquire(&pctx.project.root) {
-            Ok(g) => g,
+        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
+            Ok(guard) => guard,
             Err(e) => {
-                acc.errors
-                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                self.record_project_error(&e, None);
                 return;
             }
         };
 
-        // The pre-existing violation set: in-cooldown pins we are NOT introducing.
-        let baseline_violations = match self.graph_violations(adapter, pctx, opts, &tctx).await {
-            Ok(v) => v,
+        let baseline_violations = match self.graph_violations().await {
+            Ok(violations) => violations,
             Err(e) => {
-                acc.errors
-                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                self.record_project_error(&e, None);
                 return;
             }
         };
-
-        let snapshot = match adapter.snapshot_lock(&pctx.project).await {
-            Ok(s) => s,
+        let snapshot = match self.ctx.adapter.snapshot_lock(&self.ctx.pctx.project).await {
+            Ok(snapshot) => snapshot,
             Err(e) => {
-                acc.errors
-                    .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                self.record_project_error(&e, None);
                 return;
             }
         };
@@ -210,44 +215,60 @@ impl Workspace {
             baseline_violations,
         };
         for change in planned {
-            self.apply_change(&ctx, change, &mut lock, acc).await;
+            if !self.apply_change(change, &mut lock).await {
+                break;
+            }
         }
 
-        self.finalize_project(adapter, pctx, opts, &project_label, acc)
-            .await;
+        self.finalize().await;
+    }
+
+    async fn direct_deps(&mut self) -> Option<Vec<Dependency>> {
+        match self
+            .ctx
+            .adapter
+            .dependencies(&self.ctx.pctx.project, DepScope::Direct)
+            .await
+        {
+            Ok(deps) => Some(
+                deps.into_iter()
+                    .filter(|d| Workspace::package_in_scope(self.ctx.opts, &d.package.name))
+                    .collect(),
+            ),
+            Err(e) => {
+                self.record_project_error(&e, None);
+                None
+            }
+        }
     }
 
     /// Build the candidate change list from each dep's adoptable target, recording any
     /// release-fetch error.
-    async fn plan_changes(
-        &self,
-        ctx: &UpgradeCtx<'_>,
-        deps: &[Dependency],
-        project_label: &str,
-        acc: &mut UpgradeAccum,
-    ) -> Vec<Change> {
-        let UpgradeCtx {
-            adapter,
-            pctx,
-            opts,
-            tctx,
-        } = *ctx;
-        let rctx = Self::resolve_ctx(pctx, opts);
+    async fn plan_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
+        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let mut planned: Vec<Change> = Vec::new();
         for dep in deps {
-            let releases = match adapter.releases(dep, tctx).await {
+            let releases = {
+                let fctx = self.ctx.fetch_context();
+                self.ctx
+                    .adapter
+                    .releases(dep, &fctx, self.ctx.opts.candidate_scope())
+                    .await
+            };
+            let releases = match releases {
                 Ok(r) => r,
                 Err(e) => {
-                    acc.errors.push(diag_from_error(
-                        &e,
-                        pctx.ecosystem,
-                        project_label,
-                        Some(&dep.package.name),
-                    ));
+                    self.record_project_error(&e, Some(&dep.package.name));
                     continue;
                 }
             };
-            let verdict = evaluate(dep, &releases, &pctx.policy.layers, &rctx, self.now);
+            let verdict = evaluate(
+                dep,
+                &releases,
+                &self.ctx.pctx.policy.layers,
+                &rctx,
+                self.ws.now,
+            );
             let Some(target) = verdict.adoptable_target else {
                 continue;
             };
@@ -279,161 +300,219 @@ impl Workspace {
         planned
     }
 
-    /// Apply a single planned change with restore-on-regression, updating `lock` on acceptance.
-    async fn apply_change(
-        &self,
-        ctx: &UpgradeCtx<'_>,
-        change: Change,
-        lock: &mut LockState,
-        acc: &mut UpgradeAccum,
-    ) {
-        let UpgradeCtx {
-            adapter,
-            pctx,
-            opts,
-            tctx,
-        } = *ctx;
-        let project_label = pctx.rel_path.to_string();
-        let project_label = project_label.as_str();
-        let single = Plan {
-            changes: vec![change.clone()],
-        };
-        let report = match adapter.apply(&pctx.project, &single).await {
-            Ok(r) => r,
-            Err(e) => {
-                // A hard apply error → restore and record an item error.
-                let _ = adapter.restore_lock(&pctx.project, &lock.snapshot).await;
-                let diag = diag_from_error(
-                    &e,
-                    pctx.ecosystem,
-                    project_label,
-                    Some(&change.package.name),
-                );
-                let mut it =
-                    plan_item(&change, project_label, pctx.ecosystem.as_str(), false, None);
-                it.error = Some(diag);
-                acc.items.push(it);
-                return;
-            }
-        };
-
-        if report.applied.is_empty() {
-            // The adapter itself skipped (MVS/resolver conflict).
-            acc.any_skipped = true;
-            let info = report
-                .skipped
-                .into_iter()
-                .next()
-                .map(|s| render::SkippedInfo {
-                    reason: s.reason,
-                    message: s.reason.message().to_string(),
-                    offending: s.offending.map(|p| p.name),
-                });
-            acc.items.push(plan_item(
-                &change,
-                project_label,
-                pctx.ecosystem.as_str(),
+    fn record_dry_run(&mut self, planned: &[Change]) {
+        for change in planned {
+            self.acc.items.push(plan_item(
+                change,
+                self.project_label(),
+                self.ctx.ecosystem_name(),
                 false,
-                info,
-            ));
-            return;
-        }
-
-        // Did the re-lock introduce a fresh, non-baselined transitive?
-        let after = self
-            .graph_violations(adapter, pctx, opts, tctx)
-            .await
-            .unwrap_or_default();
-        if let Some((offending_pkg, _)) = after.difference(&lock.baseline_violations).next() {
-            let _ = adapter.restore_lock(&pctx.project, &lock.snapshot).await;
-            acc.any_skipped = true;
-            acc.items.push(plan_item(
-                &change,
-                project_label,
-                pctx.ecosystem.as_str(),
-                false,
-                Some(render::SkippedInfo {
-                    reason: SkipReason::TransitiveInCooldown,
-                    message: SkipReason::TransitiveInCooldown.message().to_string(),
-                    offending: Some(offending_pkg.clone()),
-                }),
-            ));
-        } else {
-            // Accept: refresh the snapshot/baseline for subsequent changes.
-            if let Ok(s) = adapter.snapshot_lock(&pctx.project).await {
-                lock.snapshot = s;
-            }
-            lock.baseline_violations = after;
-            acc.items.push(plan_item(
-                &change,
-                project_label,
-                pctx.ecosystem.as_str(),
-                true,
                 None,
             ));
         }
     }
 
-    /// Re-verify the final lock and, when requested, build — folding both into `acc`.
-    async fn finalize_project(
-        &self,
-        adapter: &dyn cooldown_core::Ecosystem,
-        pctx: &super::ProjectCtx,
-        opts: &RunOpts,
-        project_label: &str,
-        acc: &mut UpgradeAccum,
-    ) {
-        // Re-verify the final lock is current. A failed probe is a non-`ok` lock, not silence.
-        match adapter.verify_lock_current(&pctx.project).await {
-            Ok(v) => acc.lock_verified = Some(acc.lock_verified.unwrap_or(true) && v.ok),
+    /// Apply a single planned change with restore-on-regression, updating `lock` on acceptance.
+    async fn apply_change(&mut self, change: Change, lock: &mut LockState) -> bool {
+        let single = Plan {
+            changes: vec![change.clone()],
+        };
+        let report = match self
+            .ctx
+            .adapter
+            .apply(&self.ctx.pctx.project, &single)
+            .await
+        {
+            Ok(r) => r,
             Err(e) => {
-                acc.lock_verified = Some(false);
-                acc.errors
-                    .push(diag_from_error(&e, pctx.ecosystem, project_label, None));
+                return self
+                    .restore_with_change_error(&lock.snapshot, &change, &e)
+                    .await;
+            }
+        };
+
+        if report.applied.is_empty() {
+            // The adapter itself skipped (MVS/resolver conflict).
+            self.acc.any_skipped = true;
+            self.record_change_skip(
+                &change,
+                report
+                    .skipped
+                    .into_iter()
+                    .next()
+                    .map(|s| render::SkippedInfo {
+                        reason: s.reason,
+                        message: s.reason.message().to_string(),
+                        offending: s.offending.map(|p| p.name),
+                    }),
+            );
+            return true;
+        }
+
+        // Did the re-lock introduce a fresh, non-baselined transitive?
+        let after = match self.graph_violations().await {
+            Ok(after) => after,
+            Err(e) => {
+                return self
+                    .restore_with_change_error(&lock.snapshot, &change, &e)
+                    .await;
+            }
+        };
+        if let Some((offending_pkg, _)) = after.difference(&lock.baseline_violations).next() {
+            let restored = self.restore_snapshot(&lock.snapshot).await;
+            self.acc.any_skipped = true;
+            self.record_change_skip(
+                &change,
+                Some(render::SkippedInfo {
+                    reason: SkipReason::TransitiveInCooldown,
+                    message: SkipReason::TransitiveInCooldown.message().to_string(),
+                    offending: Some(offending_pkg.clone()),
+                }),
+            );
+            return restored;
+        }
+
+        self.accept_change(lock, change, after).await
+    }
+
+    async fn restore_snapshot(&mut self, snapshot: &cooldown_core::LockSnapshot) -> bool {
+        match self
+            .ctx
+            .adapter
+            .restore_lock(&self.ctx.pctx.project, snapshot)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                self.record_project_error(&e, None);
+                false
+            }
+        }
+    }
+
+    async fn restore_with_change_error(
+        &mut self,
+        snapshot: &cooldown_core::LockSnapshot,
+        change: &Change,
+        error: &cooldown_core::CoreError,
+    ) -> bool {
+        let restored = self.restore_snapshot(snapshot).await;
+        let diag = diag_from_error(
+            error,
+            self.ctx.pctx.ecosystem,
+            self.project_label(),
+            Some(&change.package.name),
+        );
+        self.record_change_error(change, diag);
+        restored
+    }
+
+    async fn accept_change(
+        &mut self,
+        lock: &mut LockState,
+        change: Change,
+        after: HashSet<(String, String)>,
+    ) -> bool {
+        let snapshot = match self.ctx.adapter.snapshot_lock(&self.ctx.pctx.project).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.record_project_error(&e, Some(&change.package.name));
+                self.record_change_applied(&change);
+                return false;
+            }
+        };
+        lock.snapshot = snapshot;
+        lock.baseline_violations = after;
+        self.record_change_applied(&change);
+        true
+    }
+
+    /// Re-verify the final lock and, when requested, build — folding both into `acc`.
+    async fn finalize(&mut self) {
+        // Re-verify the final lock is current. A failed probe is a non-`ok` lock, not silence.
+        match self
+            .ctx
+            .adapter
+            .verify_lock_current(&self.ctx.pctx.project)
+            .await
+        {
+            Ok(v) => {
+                self.acc.lock_verified = Some(self.acc.lock_verified.unwrap_or(true) && v.ok);
+                if !v.ok {
+                    self.acc.errors.push(
+                        Diagnostic::new(DiagnosticKind::StaleLock, v.detail)
+                            .with_ecosystem(self.ctx.ecosystem_name())
+                            .with_project(self.project_label())
+                            .with_path(self.ctx.pctx.project.manifest.as_str()),
+                    );
+                }
+            }
+            Err(e) => {
+                self.acc.lock_verified = Some(false);
+                self.record_project_error(&e, None);
             }
         }
 
-        if opts.build {
-            acc.build_requested = true;
-            match adapter.build(&pctx.project).await {
-                Ok(v) => acc.build_ok = Some(acc.build_ok.unwrap_or(true) && v.ok),
-                Err(_) => acc.build_ok = Some(false),
+        if self.ctx.opts.build {
+            self.acc.build_requested = true;
+            match self.ctx.adapter.build(&self.ctx.pctx.project).await {
+                Ok(v) => {
+                    self.acc.build_ok = Some(self.acc.build_ok.unwrap_or(true) && v.ok);
+                    if !v.ok {
+                        self.acc.errors.push(
+                            Diagnostic::new(DiagnosticKind::ToolFailed, v.detail)
+                                .with_ecosystem(self.ctx.ecosystem_name())
+                                .with_project(self.project_label())
+                                .with_tool(build_tool_name(self.ctx.pctx.ecosystem)),
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.acc.build_ok = Some(false);
+                    self.record_project_error(&e, None);
+                }
             }
         }
     }
 
     /// The set of `(package, version)` pins currently in cooldown (non-exempt, non-acknowledged).
-    async fn graph_violations(
-        &self,
-        adapter: &dyn cooldown_core::Ecosystem,
-        pctx: &super::ProjectCtx,
-        opts: &RunOpts,
-        tctx: &TargetContext<'_>,
-    ) -> cooldown_core::Result<HashSet<(String, String)>> {
-        let deps = adapter.dependencies(&pctx.project, DepScope::Graph).await?;
-        let rctx = Self::resolve_ctx(pctx, opts);
+    async fn graph_violations(&self) -> cooldown_core::Result<HashSet<(String, String)>> {
+        let deps = self
+            .ctx
+            .adapter
+            .dependencies(&self.ctx.pctx.project, DepScope::Graph)
+            .await?;
+        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let fctx = self.ctx.fetch_context();
+        let adapter = self.ctx.adapter;
+        let fctx_ref = &fctx;
         let fetched: Vec<(Dependency, cooldown_core::Result<Release>)> = stream::iter(deps)
             .map(|dep| async move {
-                let r = adapter.locked_release(&dep, tctx).await;
+                let r = adapter.locked_release(&dep, fctx_ref).await;
                 (dep, r)
             })
-            .buffer_unordered(opts.fanout())
+            .buffer_unordered(self.ctx.opts.fanout())
             .collect()
             .await;
 
         let mut set = HashSet::new();
         for (dep, result) in fetched {
             let Ok(locked) = result else { continue };
-            let pv = check_pin(&dep, &locked, &pctx.policy.layers, &rctx, self.now);
+            let pv = check_pin(
+                &dep,
+                &locked,
+                &self.ctx.pctx.policy.layers,
+                &rctx,
+                self.ws.now,
+            );
             if pv.status == Status::CurrentInCooldown {
-                let project_label = pctx.rel_path.to_string();
-                let acked = self.baseline.is_acknowledged(
-                    pctx.ecosystem.as_str(),
-                    &project_label,
+                let acked = self.ws.baseline.is_acknowledged(
+                    self.ctx.ecosystem_name(),
+                    self.project_label(),
                     &dep.package.name,
                     dep.current.as_str(),
                     dep.package.registry.as_deref(),
-                    self.now,
+                    self.ws.now,
                 );
                 if !acked {
                     set.insert((dep.package.name.clone(), dep.current.to_string()));
@@ -441,6 +520,48 @@ impl Workspace {
             }
         }
         Ok(set)
+    }
+
+    fn project_label(&self) -> &str {
+        &self.project_label
+    }
+
+    fn record_project_error(&mut self, error: &cooldown_core::CoreError, package: Option<&str>) {
+        self.acc.errors.push(diag_from_error(
+            error,
+            self.ctx.pctx.ecosystem,
+            self.project_label(),
+            package,
+        ));
+    }
+
+    fn record_change_applied(&mut self, change: &Change) {
+        let project_label = self.project_label.clone();
+        let ecosystem = self.ctx.ecosystem_name();
+        self.acc
+            .items
+            .push(plan_item(change, &project_label, ecosystem, true, None));
+    }
+
+    fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {
+        let project_label = self.project_label.clone();
+        let ecosystem = self.ctx.ecosystem_name();
+        record_error_item(self.acc, change, &project_label, ecosystem, diag);
+    }
+
+    fn record_change_skip(&mut self, change: &Change, skipped: Option<render::SkippedInfo>) {
+        let project_label = self.project_label.clone();
+        let ecosystem = self.ctx.ecosystem_name();
+        record_skip_item(self.acc, change, &project_label, ecosystem, skipped);
+    }
+}
+
+fn build_tool_name(ecosystem: cooldown_core::EcosystemId) -> &'static str {
+    match ecosystem.as_str() {
+        "go" => "go",
+        "rust" => "cargo",
+        "python" => "uv",
+        _ => "tool",
     }
 }
 
@@ -486,4 +607,27 @@ fn plan_item(
         skipped,
         error: None,
     }
+}
+
+fn record_error_item(
+    acc: &mut UpgradeAccum,
+    change: &Change,
+    project: &str,
+    ecosystem: &str,
+    diag: Diagnostic,
+) {
+    let mut item = plan_item(change, project, ecosystem, false, None);
+    item.error = Some(diag);
+    acc.items.push(item);
+}
+
+fn record_skip_item(
+    acc: &mut UpgradeAccum,
+    change: &Change,
+    project: &str,
+    ecosystem: &str,
+    skipped: Option<render::SkippedInfo>,
+) {
+    acc.items
+        .push(plan_item(change, project, ecosystem, false, skipped));
 }

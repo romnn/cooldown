@@ -29,7 +29,7 @@ pub enum CoreError {
     #[error("transient error: {0}")]
     Transient(#[source] BoxError),
 
-    /// An external tool (`go`, `cargo`, `uv`) exited non-zero.
+    /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
     #[error("tool `{tool}` failed with status {status}: {stderr}")]
     Tool {
         /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
@@ -38,6 +38,15 @@ pub enum CoreError {
         status: i32,
         /// The captured standard-error output, used as the failure detail.
         stderr: String,
+    },
+
+    /// An external tool (`go`, `cargo`, `uv`) could not be spawned at all.
+    #[error("failed to spawn tool `{tool}`: {detail}")]
+    ToolSpawn {
+        /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
+        tool: String,
+        /// The attempted invocation and OS error text.
+        detail: String,
     },
 
     /// Invalid configuration or command input: a malformed `cooldown.toml`, a bad duration or
@@ -77,6 +86,12 @@ impl CoreError {
         matches!(self, CoreError::Transient(_))
     }
 
+    /// Whether this is a tool-spawn failure rather than a non-zero exit from a spawned tool.
+    #[must_use]
+    pub fn is_tool_spawn_failure(&self) -> bool {
+        matches!(self, CoreError::ToolSpawn { .. })
+    }
+
     /// Convenience constructor for a transient cause from any error type.
     pub fn transient(e: impl Into<BoxError>) -> Self {
         CoreError::Transient(e.into())
@@ -92,6 +107,7 @@ impl CoreError {
                 DiagnosticKind::Transient
             }
             CoreError::Tool { .. } => DiagnosticKind::ToolFailed,
+            CoreError::ToolSpawn { .. } => DiagnosticKind::ToolSpawnFailed,
             CoreError::Config(_) => DiagnosticKind::Config,
             CoreError::Parse(_) => DiagnosticKind::Parse,
             CoreError::LockUnreadable(_) => DiagnosticKind::LockfileUnreadable,
@@ -163,8 +179,10 @@ pub enum DiagnosticKind {
     Yanked,
     /// A lockfile or manifest is stale relative to its source, or absent.
     StaleLock,
-    /// An external tool (`go`, `cargo`, `uv`) exited non-zero.
+    /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
     ToolFailed,
+    /// An external tool (`go`, `cargo`, `uv`) could not be spawned at all.
+    ToolSpawnFailed,
     /// A local lockfile/manifest or resolved-graph dump could not be read.
     LockfileUnreadable,
     /// Invalid configuration or command input (the user must fix it).
@@ -183,6 +201,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::Yanked => "yanked",
             DiagnosticKind::StaleLock => "stale_lock",
             DiagnosticKind::ToolFailed => "tool_failed",
+            DiagnosticKind::ToolSpawnFailed => "tool_spawn_failed",
             DiagnosticKind::LockfileUnreadable => "lockfile_unreadable",
             DiagnosticKind::Config => "config",
             DiagnosticKind::Parse => "parse",
@@ -267,5 +286,31 @@ impl Diagnostic {
     pub fn with_path(mut self, p: impl Into<String>) -> Self {
         self.path = Some(p.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_exit_and_spawn_map_to_distinct_diagnostic_kinds() {
+        let exited = CoreError::Tool {
+            tool: "cargo".into(),
+            status: 101,
+            stderr: "failed".into(),
+        };
+        let spawn = CoreError::ToolSpawn {
+            tool: "cargo".into(),
+            detail: "spawn failed".into(),
+        };
+
+        assert_eq!(exited.diagnostic_kind(), DiagnosticKind::ToolFailed);
+        assert_eq!(spawn.diagnostic_kind(), DiagnosticKind::ToolSpawnFailed);
+        assert_eq!(DiagnosticKind::ToolFailed.to_string(), "tool_failed");
+        assert_eq!(
+            DiagnosticKind::ToolSpawnFailed.to_string(),
+            "tool_spawn_failed"
+        );
     }
 }
