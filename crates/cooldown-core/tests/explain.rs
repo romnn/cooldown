@@ -9,7 +9,7 @@ use cooldown_core::*;
 fn trace_for(layers: &[PolicyLayer], pkg: &str, kind: ResolveKind) -> Resolution {
     let proj = Utf8PathBuf::from(".");
     let q = ResolveQuery {
-        ecosystem: GO,
+        tool: GO,
         package: pkg,
         registry: None,
         project: Utf8Path::new(proj.as_str()),

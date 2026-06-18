@@ -31,6 +31,6 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
     }
 }
 
-pub(crate) fn no_ecosystem_json(command: &'static str) -> Result<String, CoreError> {
-    present::no_ecosystem_json(command)
+pub(crate) fn no_tool_json(command: &'static str) -> Result<String, CoreError> {
+    present::no_tool_json(command)
 }

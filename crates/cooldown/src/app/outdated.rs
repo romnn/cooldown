@@ -42,25 +42,25 @@ impl Workspace {
         };
 
         for pctx in self.scoped_projects(opts) {
-            let Some(adapter) = self.adapter(pctx.ecosystem) else {
+            let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
             let project_label = pctx.rel_path.to_string();
 
             opts.progress.say(&format!(
                 "Resolving {} dependencies ({})…",
-                project_label, pctx.ecosystem
+                project_label, pctx.tool
             ));
             let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         project = project_label,
-                        ecosystem = pctx.ecosystem.as_str(),
+                        tool = pctx.tool.as_str(),
                         error = %e,
                         "could not enumerate dependencies"
                     );
-                    errors.push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                    errors.push(diag_from_error(&e, pctx.tool, &project_label, None));
                     continue;
                 }
             };
@@ -84,12 +84,8 @@ impl Workspace {
                         ));
                     }
                     Err(e) => {
-                        let diag = diag_from_error(
-                            &e,
-                            pctx.ecosystem,
-                            &project_label,
-                            Some(&dep.package.name),
-                        );
+                        let diag =
+                            diag_from_error(&e, pctx.tool, &project_label, Some(&dep.package.name));
                         items.push(error_item(pctx, &project_label, &dep, diag));
                     }
                 }
@@ -111,7 +107,7 @@ impl Workspace {
     /// never blocks the others. The surrounding `info!`/per-dependency `debug!`/`trace!` spans make
     /// a stalled network call visible under `--log-level debug`.
     async fn fetch_releases(
-        adapter: &dyn cooldown_core::EcosystemRead,
+        adapter: &dyn cooldown_core::ToolRead,
         pctx: &super::ProjectCtx,
         project_label: &str,
         deps: Vec<Dependency>,
@@ -120,7 +116,7 @@ impl Workspace {
     ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
         tracing::info!(
             project = project_label,
-            ecosystem = pctx.ecosystem.as_str(),
+            tool = pctx.tool.as_str(),
             deps = deps.len(),
             fanout = opts.fanout(),
             "fetching release metadata"
@@ -156,7 +152,7 @@ impl Workspace {
             .await;
         tracing::info!(
             project = project_label,
-            ecosystem = pctx.ecosystem.as_str(),
+            tool = pctx.tool.as_str(),
             fetched = fetched.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "fetched release metadata"
@@ -180,7 +176,7 @@ impl Workspace {
             render_window(&c.window, self.now)
         } else {
             let q = ResolveQuery {
-                ecosystem: pctx.ecosystem,
+                tool: pctx.tool,
                 package: &dep.package.name,
                 registry: dep.package.registry.as_deref(),
                 project: &pctx.rel_path,
@@ -203,7 +199,7 @@ impl Workspace {
 
         OutdatedItem {
             name: dep.package.name.clone(),
-            ecosystem: pctx.ecosystem.as_str().to_string(),
+            tool: pctx.tool.as_str().to_string(),
             project: project_label.to_string(),
             registry: dep.package.registry.clone(),
             direct: dep.direct,
@@ -229,7 +225,7 @@ fn yanked_warning(pctx: &super::ProjectCtx, project_label: &str, dep: &Dependenc
         cooldown_core::DiagnosticKind::Yanked,
         "locked version is yanked",
     )
-    .with_ecosystem(pctx.ecosystem.as_str())
+    .with_tool(pctx.tool.as_str())
     .with_project(project_label)
     .with_package(&dep.package.name)
     .with_version(dep.current.as_str())
@@ -243,7 +239,7 @@ fn error_item(
 ) -> OutdatedItem {
     OutdatedItem {
         name: dep.package.name.clone(),
-        ecosystem: pctx.ecosystem.as_str().to_string(),
+        tool: pctx.tool.as_str().to_string(),
         project: project_label.to_string(),
         registry: dep.package.registry.clone(),
         direct: dep.direct,

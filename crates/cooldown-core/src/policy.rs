@@ -14,7 +14,7 @@
 //! - `strict-native` — **security-monotone** OR across layers (handled on [`PolicyStack`]).
 
 use crate::duration::{duration_as_days, since};
-use crate::model::{EcosystemId, UpdateKind};
+use crate::model::{ToolId, UpdateKind};
 use camino::Utf8Path;
 use jiff::{SignedDuration, Timestamp};
 use std::fmt;
@@ -124,13 +124,13 @@ impl PartialEq for PatternGlob {
 }
 impl Eq for PatternGlob {}
 
-/// What a rule applies to. Specificity: `Package` > `Registry` > `Project` > `Lang` > `Default`.
+/// What a rule applies to. Specificity: `Package` > `Registry` > `Project` > `Tool` > `Default`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     /// Matches every package; the catch-all with the lowest specificity.
     Default,
-    /// Matches every package in one ecosystem (e.g. all Cargo dependencies).
-    Lang(EcosystemId),
+    /// Matches every package managed by one tool/tool (e.g. all Cargo dependencies).
+    Tool(ToolId),
     /// Matches packages served by a specific registry, by registry identifier.
     Registry(String),
     /// Matches packages whose project path matches the [`PatternGlob`].
@@ -147,7 +147,7 @@ impl Selector {
             Selector::Package(_) => 4,
             Selector::Registry(_) => 3,
             Selector::Project(_) => 2,
-            Selector::Lang(_) => 1,
+            Selector::Tool(_) => 1,
             Selector::Default => 0,
         }
     }
@@ -157,7 +157,7 @@ impl Selector {
     pub fn matches(&self, q: &ResolveQuery<'_>) -> bool {
         match self {
             Selector::Default => true,
-            Selector::Lang(e) => *e == q.ecosystem,
+            Selector::Tool(e) => *e == q.tool,
             Selector::Registry(r) => q.registry == Some(r.as_str()),
             Selector::Project(g) => g.is_match(q.project.as_str()),
             Selector::Package(g) => g.is_match(q.package),
@@ -169,7 +169,7 @@ impl Selector {
     pub fn token(&self) -> Option<String> {
         match self {
             Selector::Default => None,
-            Selector::Lang(e) => Some(format!("lang={e}")),
+            Selector::Tool(e) => Some(format!("tool={e}")),
             Selector::Registry(r) => Some(format!("registry={r}")),
             Selector::Project(g) => Some(format!("project={}", g.raw())),
             Selector::Package(g) => Some(format!("package={}", g.raw())),
@@ -333,11 +333,11 @@ pub enum ResolveKind {
     Candidate(UpdateKind),
 }
 
-/// A resolution query: which package, in which ecosystem/registry/project, for which kind.
+/// A resolution query: which package, in which tool/registry/project, for which kind.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveQuery<'a> {
-    /// The ecosystem the package belongs to.
-    pub ecosystem: EcosystemId,
+    /// The tool the package belongs to.
+    pub tool: ToolId,
     /// The package name, matched against [`Selector::Package`] globs.
     pub package: &'a str,
     /// The registry serving the package, if known; matched against [`Selector::Registry`].
@@ -523,7 +523,7 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 ///
 /// ```
 /// use cooldown_core::{
-///     ByKind, EcosystemId, Origin, PolicyLayer, ResolveKind, ResolveQuery, Rule, Selector,
+///     ByKind, ToolId, Origin, PolicyLayer, ResolveKind, ResolveQuery, Rule, Selector,
 ///     WindowSpec, resolve,
 /// };
 /// use camino::Utf8Path;
@@ -536,7 +536,7 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 ///
 /// let now: Timestamp = "2026-01-15T00:00:00Z".parse()?;
 /// let query = ResolveQuery {
-///     ecosystem: EcosystemId("rust"),
+///     tool: ToolId("cargo"),
 ///     package: "serde",
 ///     registry: None,
 ///     project: Utf8Path::new("."),

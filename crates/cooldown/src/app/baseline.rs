@@ -1,7 +1,7 @@
 //! The committed `.cooldown-baseline.toml`: currently-young deps recorded as **acknowledged**, so a
 //! full-graph `check` can be adopted in an existing repo without a wall of pre-existing violations.
 //!
-//! Each entry is fully scoped — `(ecosystem, project, package, version, registry)` — so the same
+//! Each entry is fully scoped — `(tool, project, package, version, registry)` — so the same
 //! young version reintroduced in another project later is not silently grandfathered. A clean
 //! ratchet: baseline once, then the set only shrinks.
 
@@ -15,19 +15,19 @@ pub const BASELINE_FILE: &str = ".cooldown-baseline.toml";
 
 /// One acknowledged entry: a currently-young pin recorded so `check` does not flag it.
 ///
-/// The acknowledgement is keyed on the full scope `(ecosystem, project, package, version,
+/// The acknowledgement is keyed on the full scope `(tool, project, package, version,
 /// registry)`; the remaining fields are advisory metadata for human review.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AckEntry {
-    /// The ecosystem token (e.g. `"go"`, `"rust"`, `"python"`).
-    pub ecosystem: String,
+    /// The tool token (e.g. `"go"`, `"cargo"`, `"uv"`).
+    pub tool: String,
     /// The project path relative to the repo root.
     pub project: String,
-    /// The package name as the ecosystem reports it.
+    /// The package name as the tool reports it.
     pub package: String,
     /// The acknowledged version; a version change drops the acknowledgement (the ratchet).
     pub version: String,
-    /// The registry the package resolves to, when the ecosystem distinguishes registries.
+    /// The registry the package resolves to, when the tool distinguishes registries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
     /// The version's publish time at the moment it was recorded (advisory).
@@ -57,13 +57,13 @@ impl AckEntry {
     /// Does this entry match a pin's full scope?
     fn matches(
         &self,
-        ecosystem: &str,
+        tool: &str,
         project: &str,
         package: &str,
         version: &str,
         registry: Option<&str>,
     ) -> bool {
-        self.ecosystem == ecosystem
+        self.tool == tool
             && self.project == project
             && self.package == package
             && self.version == version
@@ -115,12 +115,12 @@ impl Baseline {
         })
     }
 
-    /// Whether a pin is acknowledged: an exact `(ecosystem, project, package, version, registry)`
+    /// Whether a pin is acknowledged: an exact `(tool, project, package, version, registry)`
     /// match that is still in force.
     #[must_use]
     pub fn is_acknowledged(
         &self,
-        ecosystem: &str,
+        tool: &str,
         project: &str,
         package: &str,
         version: &str,
@@ -129,7 +129,7 @@ impl Baseline {
     ) -> bool {
         self.entries
             .iter()
-            .any(|e| e.matches(ecosystem, project, package, version, registry) && e.in_force(now))
+            .any(|e| e.matches(tool, project, package, version, registry) && e.in_force(now))
     }
 
     /// Serialize to the committed TOML format, with a generated header comment.
@@ -168,7 +168,7 @@ impl crate::app::Workspace {
     ///
     /// # Errors
     ///
-    /// Returns the [`CoreError`] from an ecosystem adapter if a project's dependency graph cannot
+    /// Returns the [`CoreError`] from an tool adapter if a project's dependency graph cannot
     /// be enumerated.
     pub async fn baseline_entries(
         &self,
@@ -179,7 +179,7 @@ impl crate::app::Workspace {
 
         let mut entries = Vec::new();
         for pctx in self.scoped_projects(opts) {
-            let Some(adapter) = self.adapter(pctx.ecosystem) else {
+            let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
             let deps = self
@@ -202,7 +202,7 @@ impl crate::app::Workspace {
                 let pv = check_pin(&dep, &locked, &pctx.policy.layers, &rctx, self.now());
                 if pv.status == Status::CurrentInCooldown {
                     entries.push(AckEntry {
-                        ecosystem: pctx.ecosystem.as_str().to_string(),
+                        tool: pctx.tool.as_str().to_string(),
                         project: pctx.rel_path.to_string(),
                         package: dep.package.name.clone(),
                         version: dep.current.to_string(),
@@ -231,7 +231,7 @@ mod tests {
 
     fn entry() -> AckEntry {
         AckEntry {
-            ecosystem: "go".into(),
+            tool: "go".into(),
             project: "services/api".into(),
             package: "k8s.io/api".into(),
             version: "0.36.2".into(),

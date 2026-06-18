@@ -11,7 +11,7 @@
 use cooldown_core::*;
 use jiff::Timestamp;
 
-pub const GO: EcosystemId = EcosystemId("go");
+pub const GO: ToolId = ToolId("go");
 
 /// A fixed `now` for deterministic boundary maths. The default 7d window cuts off at
 /// `2026-06-10T00:00:00Z`.
@@ -84,7 +84,7 @@ impl CtxHolder {
     }
     pub fn get(&self) -> ResolveContext<'_> {
         ResolveContext {
-            ecosystem: GO,
+            tool: GO,
             project: &self.project,
             allow_major: self.allow_major,
         }

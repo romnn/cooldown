@@ -92,7 +92,7 @@ impl Workspace {
         };
 
         for pctx in self.scoped_projects(opts) {
-            let Some(adapter) = self.adapter(pctx.ecosystem) else {
+            let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
             let project_label = pctx.rel_path.to_string();
@@ -109,7 +109,7 @@ impl Workspace {
                 Ok(d) => d,
                 Err(e) => {
                     acc.errors
-                        .push(diag_from_error(&e, pctx.ecosystem, &project_label, None));
+                        .push(diag_from_error(&e, pctx.tool, &project_label, None));
                     continue;
                 }
             };
@@ -119,7 +119,7 @@ impl Workspace {
                 "Checking {} dependencies in {} ({})…",
                 deps.len(),
                 project_label,
-                pctx.ecosystem
+                pctx.tool
             ));
             let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
                 stream::iter(deps)
@@ -180,7 +180,7 @@ impl Workspace {
     /// tool/transient failure stays fail-closed.
     async fn probe_lock(
         &self,
-        adapter: &dyn cooldown_core::EcosystemRead,
+        adapter: &dyn cooldown_core::ToolRead,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         project_label: &str,
@@ -190,7 +190,7 @@ impl Workspace {
             Ok(v) if v.ok => LockProbe::Continue,
             Ok(v) => {
                 let diag = Diagnostic::new(DiagnosticKind::StaleLock, v.detail)
-                    .with_ecosystem(pctx.ecosystem.as_str())
+                    .with_tool(pctx.tool.as_str())
                     .with_project(project_label)
                     .with_path(pctx.project.manifest.as_str());
                 if opts.allow_stale_lock {
@@ -202,7 +202,7 @@ impl Workspace {
                 }
             }
             Err(e) => {
-                let diag = diag_from_error(&e, pctx.ecosystem, project_label, None)
+                let diag = diag_from_error(&e, pctx.tool, project_label, None)
                     .with_path(pctx.project.manifest.as_str());
                 let downgradable = matches!(
                     diag.kind,
@@ -238,21 +238,16 @@ impl Workspace {
             Ok(l) => l,
             Err(e) => {
                 // A failure attributable to one dependency → an item with status:"error".
-                let diag =
-                    diag_from_error(&e, pctx.ecosystem, project_label, Some(&dep.package.name));
-                acc.items.push(error_item(
-                    dep,
-                    project_label,
-                    pctx.ecosystem.as_str(),
-                    diag,
-                ));
+                let diag = diag_from_error(&e, pctx.tool, project_label, Some(&dep.package.name));
+                acc.items
+                    .push(error_item(dep, project_label, pctx.tool.as_str(), diag));
                 return;
             }
         };
         if locked.yanked {
             acc.warnings.push(
                 Diagnostic::new(DiagnosticKind::Yanked, "locked version is yanked")
-                    .with_ecosystem(pctx.ecosystem.as_str())
+                    .with_tool(pctx.tool.as_str())
                     .with_project(project_label)
                     .with_package(&dep.package.name)
                     .with_version(dep.current.as_str()),
@@ -274,7 +269,7 @@ impl Workspace {
 
         let is_ack = pv.status == Status::CurrentInCooldown
             && self.baseline.is_acknowledged(
-                pctx.ecosystem.as_str(),
+                pctx.tool.as_str(),
                 project_label,
                 &dep.package.name,
                 dep.current.as_str(),
@@ -295,7 +290,7 @@ impl Workspace {
 
         acc.items.push(CheckItem {
             name: dep.package.name.clone(),
-            ecosystem: pctx.ecosystem.as_str().to_string(),
+            tool: pctx.tool.as_str().to_string(),
             project: project_label.to_string(),
             registry: dep.package.registry.clone(),
             direct: dep.direct,
@@ -319,7 +314,7 @@ impl Workspace {
         dep: &Dependency,
     ) -> Option<Diagnostic> {
         let q = ResolveQuery {
-            ecosystem: pctx.ecosystem,
+            tool: pctx.tool,
             package: &dep.package.name,
             registry: dep.package.registry.as_deref(),
             project: &pctx.rel_path,
@@ -336,7 +331,7 @@ impl Workspace {
                     native_days
                 ),
             )
-            .with_ecosystem(pctx.ecosystem.as_str())
+            .with_tool(pctx.tool.as_str())
             .with_project(project_label)
             .with_package(&dep.package.name),
         )
@@ -358,10 +353,10 @@ fn check_exit(acc: &CheckAccum, err_count: usize, opts: &RunOpts) -> Exit {
     }
 }
 
-fn error_item(dep: &Dependency, project: &str, ecosystem: &str, diag: Diagnostic) -> CheckItem {
+fn error_item(dep: &Dependency, project: &str, tool: &str, diag: Diagnostic) -> CheckItem {
     CheckItem {
         name: dep.package.name.clone(),
-        ecosystem: ecosystem.to_string(),
+        tool: tool.to_string(),
         project: project.to_string(),
         registry: dep.package.registry.clone(),
         direct: dep.direct,

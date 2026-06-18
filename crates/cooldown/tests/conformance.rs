@@ -1,4 +1,4 @@
-//! Network-free conformance tests: drive the `Workspace` use cases against a fake `Ecosystem` with
+//! Network-free conformance tests: drive the `Workspace` use cases against a fake `Tool` with
 //! canned data, asserting the universal invariants and the cross-cutting behaviours (the check
 //! gate, baseline acknowledgement, and the upgrade trial-rollback that never commits a violating
 //! lock).
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-const GO: EcosystemId = EcosystemId("go");
+const GO: ToolId = ToolId("go");
 
 fn ts(s: &str) -> jiff::Timestamp {
     s.parse().unwrap()
@@ -89,8 +89,8 @@ impl FakeEco {
 }
 
 #[async_trait]
-impl EcosystemRead for FakeEco {
-    fn id(&self) -> EcosystemId {
+impl ToolRead for FakeEco {
+    fn id(&self) -> ToolId {
         GO
     }
     fn capabilities(&self) -> Capabilities {
@@ -175,7 +175,7 @@ impl EcosystemRead for FakeEco {
 }
 
 #[async_trait]
-impl EcosystemWrite for FakeEco {
+impl ToolWrite for FakeEco {
     async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         Ok(ProjectMutationJournal::default())
     }
@@ -211,7 +211,7 @@ impl EcosystemWrite for FakeEco {
 fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
     let project = fake.project();
     let ctx = ProjectCtx {
-        ecosystem: GO,
+        tool: GO,
         project,
         rel_path: Utf8PathBuf::from("."),
         policy: PolicyStack {
@@ -329,7 +329,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
     // With an exact-scope baseline entry → acknowledged, exit 0.
     let baseline = Baseline {
         entries: vec![cooldown::app::baseline::AckEntry {
-            ecosystem: "go".into(),
+            tool: "go".into(),
             project: ".".into(),
             package: "t".into(),
             version: "v0.5.0".into(),
@@ -726,7 +726,7 @@ async fn explain_applies_registry_scoped_rule() {
 
     let project = fake.project();
     let ctx = ProjectCtx {
-        ecosystem: GO,
+        tool: GO,
         project,
         rel_path: Utf8PathBuf::from("."),
         policy: PolicyStack {

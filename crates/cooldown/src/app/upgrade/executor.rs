@@ -1,4 +1,4 @@
-use super::{UpgradeAccum, UpgradeCtx, build_tool_name};
+use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
@@ -41,7 +41,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             "Planning upgrades for {} direct dependencies in {} ({})…",
             deps.len(),
             self.project_label(),
-            self.ctx.pctx.ecosystem
+            self.ctx.pctx.tool
         ));
         let planned = self.plan_changes(&deps).await;
 
@@ -158,7 +158,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.acc.items.push(plan_item(
                 change,
                 self.project_label(),
-                self.ctx.ecosystem_name(),
+                self.ctx.tool_name(),
                 false,
                 None,
             ));
@@ -256,7 +256,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let restored = self.restore_journal(journal);
         let diag = diag_from_error(
             error,
-            self.ctx.pctx.ecosystem,
+            self.ctx.pctx.tool,
             self.project_label(),
             Some(&change.package.name),
         );
@@ -276,7 +276,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 if !report.ok {
                     self.acc.errors.push(
                         Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
-                            .with_ecosystem(self.ctx.ecosystem_name())
+                            .with_tool(self.ctx.tool_name())
                             .with_project(self.project_label())
                             .with_path(self.ctx.pctx.project.manifest.as_str()),
                     );
@@ -296,9 +296,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     if !report.ok {
                         self.acc.errors.push(
                             Diagnostic::new(DiagnosticKind::ToolFailed, report.detail)
-                                .with_ecosystem(self.ctx.ecosystem_name())
-                                .with_project(self.project_label())
-                                .with_tool(build_tool_name(self.ctx.pctx.ecosystem)),
+                                .with_tool(self.ctx.tool_name())
+                                .with_project(self.project_label()),
                         );
                     }
                 }
@@ -341,7 +340,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             );
             if pin.status == Status::CurrentInCooldown {
                 let acknowledged = self.ws.baseline.is_acknowledged(
-                    self.ctx.ecosystem_name(),
+                    self.ctx.tool_name(),
                     self.project_label(),
                     &dep.package.name,
                     dep.current.as_str(),
@@ -363,7 +362,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn record_project_error(&mut self, error: &cooldown_core::CoreError, package: Option<&str>) {
         self.acc.errors.push(diag_from_error(
             error,
-            self.ctx.pctx.ecosystem,
+            self.ctx.pctx.tool,
             self.project_label(),
             package,
         ));
@@ -371,27 +370,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     fn record_change_applied(&mut self, change: &Change) {
         let project_label = self.project_label.clone();
-        let ecosystem = self.ctx.ecosystem_name();
+        let tool = self.ctx.tool_name();
         self.acc
             .items
-            .push(plan_item(change, &project_label, ecosystem, true, None));
+            .push(plan_item(change, &project_label, tool, true, None));
     }
 
     fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {
         let project_label = self.project_label.clone();
-        let ecosystem = self.ctx.ecosystem_name();
-        record_error_item(self.acc, change, &project_label, ecosystem, diag);
+        let tool = self.ctx.tool_name();
+        record_error_item(self.acc, change, &project_label, tool, diag);
     }
 
     fn record_change_skip(&mut self, change: &Change, skipped: Option<SkippedInfo>) {
         let project_label = self.project_label.clone();
-        let ecosystem = self.ctx.ecosystem_name();
-        record_skip_item(self.acc, change, &project_label, ecosystem, skipped);
+        let tool = self.ctx.tool_name();
+        record_skip_item(self.acc, change, &project_label, tool, skipped);
     }
 }
 
 /// Reconstruct the target `PackageId`, handling Go-style `/vN` path-major changes (the `MajorKey`
-/// is a path suffix). For ecosystems where the package name is stable across majors, the name is kept.
+/// is a path suffix). For tools where the package name is stable across majors, the name is kept.
 fn target_package(
     dep: &Dependency,
     current_major: &MajorKey,
@@ -410,19 +409,19 @@ fn target_package(
     } else {
         dep.package.name.clone()
     };
-    PackageId::new(dep.package.ecosystem, name, dep.package.registry.clone())
+    PackageId::new(dep.package.tool, name, dep.package.registry.clone())
 }
 
 fn plan_item(
     change: &Change,
     project: &str,
-    ecosystem: &str,
+    tool: &str,
     applied: bool,
     skipped: Option<SkippedInfo>,
 ) -> UpgradeItem {
     UpgradeItem {
         name: change.package.name.clone(),
-        ecosystem: ecosystem.to_string(),
+        tool: tool.to_string(),
         project: project.to_string(),
         registry: change.package.registry.clone(),
         from: change.from.to_string(),
@@ -438,10 +437,10 @@ fn record_error_item(
     acc: &mut UpgradeAccum,
     change: &Change,
     project: &str,
-    ecosystem: &str,
+    tool: &str,
     diag: Diagnostic,
 ) {
-    let mut item = plan_item(change, project, ecosystem, false, None);
+    let mut item = plan_item(change, project, tool, false, None);
     item.error = Some(diag);
     acc.items.push(item);
 }
@@ -450,9 +449,9 @@ fn record_skip_item(
     acc: &mut UpgradeAccum,
     change: &Change,
     project: &str,
-    ecosystem: &str,
+    tool: &str,
     skipped: Option<SkippedInfo>,
 ) {
     acc.items
-        .push(plan_item(change, project, ecosystem, false, skipped));
+        .push(plan_item(change, project, tool, false, skipped));
 }

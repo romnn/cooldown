@@ -1,15 +1,15 @@
 //! The ports (traits) and the I/O-facing types that cross them.
 //!
-//! [`EcosystemRead`] is the read-side port the informational and gating use cases speak to:
+//! [`ToolRead`] is the read-side port the informational and gating use cases speak to:
 //! discovery, dependency graphs, classified releases, locked-release metadata, native policy, and
-//! lock-currency verification. [`EcosystemWrite`] is the mutation-side port used only by commands
+//! lock-currency verification. [`ToolWrite`] is the mutation-side port used only by commands
 //! that rewrite project state. [`PackageRegistry`] is the finer-grained port each adapter is built
 //! from (constructor-injected, reusable and fakeable in unit tests).
 
 use crate::error::Result;
 use crate::model::{
-    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, EcosystemId, FetchContext, Plan,
-    Project, ProjectMarker, Release, VerifyReport, Version,
+    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, FetchContext, Plan, Project,
+    ProjectMarker, Release, ToolId, VerifyReport, Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -18,21 +18,21 @@ use jiff::{SignedDuration, Timestamp};
 
 /// What an adapter can express, so the conformance suite can capability-gate the right invariants.
 ///
-/// Each field is an independent capability flag describing a feature an ecosystem adapter
-/// supports. The conformance suite reads these to decide which invariants apply: an ecosystem
+/// Each field is an independent capability flag describing a feature an tool adapter
+/// supports. The conformance suite reads these to decide which invariants apply: an tool
 /// without pseudo-versions, for example, is never asked to classify one. The flags describe what
 /// the adapter *can* do, never what policy *should* do — they carry no opinions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "independent ecosystem capability flags; a bitflags/enum would obscure each named capability"
+    reason = "independent tool capability flags; a bitflags/enum would obscure each named capability"
 )]
 pub struct Capabilities {
-    /// The ecosystem has commit-pinned pseudo-versions (Go).
+    /// The tool has commit-pinned pseudo-versions (Go).
     pub has_pseudo: bool,
-    /// The ecosystem has `+incompatible`-style adoptable-but-untagged releases (Go).
+    /// The tool has `+incompatible`-style adoptable-but-untagged releases (Go).
     pub has_incompatible: bool,
-    /// The ecosystem has mutable dist-tags (npm `latest`).
+    /// The tool has mutable dist-tags (npm `latest`).
     pub has_dist_tags: bool,
     /// `sync` can write the resolved policy back into native config.
     pub can_sync: bool,
@@ -40,29 +40,29 @@ pub struct Capabilities {
     pub artifact_granular: bool,
 }
 
-/// The read-side port the use cases speak to, implemented once per ecosystem adapter.
+/// The read-side port the use cases speak to, implemented once per tool adapter.
 ///
-/// An `EcosystemRead` reads native project state, yields classified [`Release`]s, and verifies
+/// An `ToolRead` reads native project state, yields classified [`Release`]s, and verifies
 /// that native lock state is current. It is deliberately mechanism-only: it never decides the
 /// cooldown (the core does) and never builds a [`Rule`]/[`WindowSpec`] (window normalisation
 /// happens once, in [`normalize_native`]). Adapters are typically assembled on top of the
 /// finer-grained [`PackageRegistry`] port.
 ///
 /// The trait is made object-safe via [`macro@async_trait`] so the use cases can hold a
-/// `dyn EcosystemRead` and drive any ecosystem uniformly. Implementations must be `Send + Sync`.
+/// `dyn ToolRead` and drive any tool uniformly. Implementations must be `Send + Sync`.
 ///
 /// # Contract
 ///
 /// Implementors must uphold the invariants documented on each method. In particular, [`releases`]
 /// must return candidates sorted ascending by release order (see [`debug_assert_sorted`]).
 ///
-/// [`releases`]: EcosystemRead::releases
+/// [`releases`]: ToolRead::releases
 #[async_trait]
-pub trait EcosystemRead: Send + Sync {
-    /// Returns the stable identifier of this ecosystem (e.g. Go, Cargo, uv).
+pub trait ToolRead: Send + Sync {
+    /// Returns the stable identifier of this tool (e.g. Go, Cargo, uv).
     ///
     /// Used to label diagnostics and to route projects to the adapter that detected them.
-    fn id(&self) -> EcosystemId;
+    fn id(&self) -> ToolId;
 
     /// Returns the adapter's [`Capabilities`] — what it can express, not opinions.
     ///
@@ -70,9 +70,9 @@ pub trait EcosystemRead: Send + Sync {
     /// returned value must accurately reflect the features this adapter actually supports.
     fn capabilities(&self) -> Capabilities;
 
-    /// Detects the projects of this ecosystem rooted under `root`.
+    /// Detects the projects of this tool rooted under `root`.
     ///
-    /// Declares the filesystem [marker](ProjectMarker) that identifies this ecosystem's project
+    /// Declares the filesystem [marker](ProjectMarker) that identifies this tool's project
     /// roots. The orchestrator performs a single gitignore-aware, exclude-aware scan from it, so an
     /// adapter neither walks the tree nor decides `.gitignore`/exclude policy itself — that concern
     /// lives in one agnostic place and is enforced by this interface.
@@ -93,7 +93,7 @@ pub trait EcosystemRead: Send + Sync {
     /// Each candidate carries its order, `kind_from_current`, and publish times, resolved via the
     /// underlying [`PackageRegistry`]. `fetch` supplies the project, target environment, and
     /// artifact scope so each candidate's publish instant follows the candidate invariant (for
-    /// artifact-granular ecosystems, the instant reflects the artifacts selected by `fetch`).
+    /// artifact-granular tools, the instant reflects the artifacts selected by `fetch`).
     /// `candidates` communicates which candidate set the command actually cares about, so adapters
     /// such as Go can skip cross-major discovery unless it is in scope.
     ///
@@ -121,10 +121,10 @@ pub trait EcosystemRead: Send + Sync {
     /// publish instant cannot be resolved.
     async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release>;
 
-    /// Returns the ecosystem's native cooldown config translated into the unified rule model.
+    /// Returns the tool's native cooldown config translated into the unified rule model.
     ///
     /// Each window is left RAW (see [`RawWindow`]) so the core normalises absolute-vs-rolling
-    /// exactly once via [`normalize_native`]. Ecosystems without a native cooldown concept (Go)
+    /// exactly once via [`normalize_native`]. Tools without a native cooldown concept (Go)
     /// return `None`.
     ///
     /// # Errors
@@ -141,19 +141,19 @@ pub trait EcosystemRead: Send + Sync {
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
 }
 
-/// The mutation-side port for ecosystems that can rewrite project state.
+/// The mutation-side port for tools that can rewrite project state.
 ///
-/// Read-only commands depend only on [`EcosystemRead`]. Commands such as `upgrade` and `sync` opt
+/// Read-only commands depend only on [`ToolRead`]. Commands such as `upgrade` and `sync` opt
 /// into this narrower side explicitly so they are the only call sites coupled to rollback/build
 /// mechanics.
 #[async_trait]
-pub trait EcosystemWrite: Send + Sync {
+pub trait ToolWrite: Send + Sync {
     /// Captures the current contents of only the files `plan` may mutate.
     ///
     /// The returned [`ProjectMutationJournal`] is the rollback token the application layer restores
     /// if the trial is rejected or if `apply` fails after mutating files. The journal is scoped to
     /// this exact `plan`, so adapters should capture the smallest file set they may rewrite. The
-    /// same journal is then handed back to [`apply`](EcosystemWrite::apply), so adapters may also
+    /// same journal is then handed back to [`apply`](ToolWrite::apply), so adapters may also
     /// treat it as the precomputed write-set for the trial.
     ///
     /// # Errors
@@ -185,7 +185,7 @@ pub trait EcosystemWrite: Send + Sync {
 
     /// Opt-in compile/sync after re-locking (the `--build` step).
     ///
-    /// [`apply`](EcosystemWrite::apply) already guarantees a consistent, resolvable lock; this is the
+    /// [`apply`](ToolWrite::apply) already guarantees a consistent, resolvable lock; this is the
     /// expensive extra confidence step that actually builds or syncs the project.
     ///
     /// # Errors
@@ -212,9 +212,9 @@ pub trait EcosystemWrite: Send + Sync {
 }
 
 /// Convenience bound for concrete adapters that implement both the read-side and write-side ports.
-pub trait Ecosystem: EcosystemRead + EcosystemWrite {}
+pub trait Tool: ToolRead + ToolWrite {}
 
-impl<T> Ecosystem for T where T: EcosystemRead + EcosystemWrite {}
+impl<T> Tool for T where T: ToolRead + ToolWrite {}
 
 /// The pre-change contents of the files a planned mutation may rewrite.
 #[derive(Debug, Clone, Default)]
@@ -285,7 +285,7 @@ impl ProjectMutationJournal {
 
 /// Native cooldown config, in the adapter's own structural terms.
 ///
-/// Produced by [`EcosystemRead::native_policy`] and consumed by [`normalize_native`], which converts
+/// Produced by [`ToolRead::native_policy`] and consumed by [`normalize_native`], which converts
 /// it into a unified [`PolicyLayer`] at [`Origin::Native`].
 #[derive(Debug, Clone)]
 pub struct NativePolicyLayer {
@@ -318,7 +318,7 @@ pub enum RawWindow {
 /// This is where the absolute-vs-rolling decision is made — exactly once, per rule, by selector —
 /// so that the rest of the core sees only normalised [`WindowSpec`]s. A [`RawWindow::OptOut`]
 /// becomes an allowing rule rather than a window. Performing this conversion here keeps every
-/// [`Ecosystem`] adapter free of window-normalisation logic.
+/// [`Tool`] adapter free of window-normalisation logic.
 #[must_use]
 pub fn normalize_native(native: NativePolicyLayer) -> PolicyLayer {
     let mut layer = PolicyLayer::new(Origin::Native);
@@ -334,9 +334,9 @@ pub fn normalize_native(native: NativePolicyLayer) -> PolicyLayer {
     layer
 }
 
-/// The finer-grained registry port each [`Ecosystem`] adapter is built from.
+/// The finer-grained registry port each [`Tool`] adapter is built from.
 ///
-/// Where [`Ecosystem`] speaks in terms of projects and classified releases, a `PackageRegistry`
+/// Where [`Tool`] speaks in terms of projects and classified releases, a `PackageRegistry`
 /// answers raw questions about a single package: what versions exist and when each was published.
 /// It is constructor-injected into adapters, which makes it reusable across adapters and easy to
 /// fake in unit tests. Implementations must be `Send + Sync`.
@@ -355,9 +355,9 @@ pub trait PackageRegistry: Send + Sync {
 
     /// Returns the publish instant of the locked pin, or `None` if it is unknown.
     ///
-    /// For artifact-granular ecosystems this is the NEWEST upload time among the given `artifacts`,
+    /// For artifact-granular tools this is the NEWEST upload time among the given `artifacts`,
     /// but `None` if ANY of them has an unknown time — a conservative choice that the core maps to
-    /// `UnknownAge`. For version-granular ecosystems it is the version-level publish instant and
+    /// `UnknownAge`. For version-granular tools it is the version-level publish instant and
     /// `artifacts` is ignored.
     ///
     /// # Errors
@@ -380,7 +380,7 @@ pub struct RawRelease {
     pub published_at: Option<Timestamp>,
     /// Whether the registry has yanked/retracted this release.
     pub yanked: bool,
-    /// The per-artifact breakdown: empty for version-granular ecosystems; populated (`PyPI`) for
+    /// The per-artifact breakdown: empty for version-granular tools; populated (`PyPI`) for
     /// artifact-granular ones.
     pub artifacts: Vec<RawArtifact>,
 }
@@ -397,14 +397,14 @@ pub struct RawArtifact {
     pub markers: Vec<String>,
 }
 
-/// The resolved policy handed to [`EcosystemWrite::write_native`] for `sync` (post-MVP; minimal for now).
+/// The resolved policy handed to [`ToolWrite::write_native`] for `sync` (post-MVP; minimal for now).
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     /// The default cooldown window to write into native config, if any.
     pub default_window: Option<WindowSpec>,
 }
 
-/// The outcome of a `sync`/[`EcosystemWrite::write_native`] (post-MVP).
+/// The outcome of a `sync`/[`ToolWrite::write_native`] (post-MVP).
 #[derive(Debug, Clone)]
 pub enum SyncReport {
     /// The adapter cannot sync; nothing was written. This is the default `write_native` result.
@@ -421,7 +421,7 @@ pub enum SyncReport {
     },
 }
 
-/// Asserts, in debug builds, that an adapter's [`releases`](EcosystemRead::releases) output is sorted
+/// Asserts, in debug builds, that an adapter's [`releases`](ToolRead::releases) output is sorted
 /// ascending by release order.
 ///
 /// The core relies on this ordering invariant, so adapters should call this on the slice they are

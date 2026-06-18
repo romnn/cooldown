@@ -1,4 +1,4 @@
-//! The Go [`Ecosystem`]: detection, the resolved module graph, classified releases (GOPROXY +
+//! The Go [`Tool`]: detection, the resolved module graph, classified releases (GOPROXY +
 //! `x/mod` semantics), the locked-pin metadata `check` evaluates, and `go`-driven apply/build.
 
 use crate::gocmd::{Go, GoModule};
@@ -7,27 +7,27 @@ use crate::proxy::GoProxy;
 use crate::semver;
 use async_trait::async_trait;
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, EcosystemId,
-    EcosystemRead, EcosystemWrite, FetchContext, MajorKey, NativePolicyLayer, PackageRegistry,
-    Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality,
-    Result, SkipReason, Skipped, VerifyReport, Version,
+    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
+    MajorKey, NativePolicyLayer, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped,
+    ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
-/// The [`EcosystemId`] for the Go adapter.
-pub const GO_ID: EcosystemId = EcosystemId("go");
+/// The [`ToolId`] for the Go adapter.
+pub const GO_ID: ToolId = ToolId("go");
 
 /// The Go adapter, constructed from a [`GoProxy`] (itself built over the shared HTTP layer).
-pub struct GoEcosystem {
+pub struct GoTool {
     proxy: GoProxy,
     go: Go,
 }
 
-impl GoEcosystem {
+impl GoTool {
     /// Creates the adapter over `proxy`, using a default [`Go`] driver for resolution/apply.
     #[must_use]
     pub fn new(proxy: GoProxy) -> Self {
-        GoEcosystem {
+        GoTool {
             proxy,
             go: Go::new(),
         }
@@ -36,7 +36,7 @@ impl GoEcosystem {
     /// Convenience: build the proxy from `GOPROXY` over the shared HTTP client.
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
-        GoEcosystem::new(GoProxy::from_env(http))
+        GoTool::new(GoProxy::from_env(http))
     }
 
     fn registry(&self) -> Option<String> {
@@ -136,7 +136,7 @@ fn skipped_on_apply_error(change: &Change, error: cooldown_core::CoreError) -> R
     })
 }
 
-impl GoEcosystem {
+impl GoTool {
     /// Build a `Dependency` from a resolved module + the MVS-floor map.
     fn dependency_of(
         &self,
@@ -193,8 +193,8 @@ impl GoEcosystem {
 }
 
 #[async_trait]
-impl EcosystemRead for GoEcosystem {
-    fn id(&self) -> EcosystemId {
+impl ToolRead for GoTool {
+    fn id(&self) -> ToolId {
         GO_ID
     }
 
@@ -321,7 +321,7 @@ impl EcosystemRead for GoEcosystem {
 }
 
 #[async_trait]
-impl EcosystemWrite for GoEcosystem {
+impl ToolWrite for GoTool {
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -623,7 +623,7 @@ mod tests {
             .expect("write source");
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
         let http = SharedHttp::new(cache_dir.path(), HttpOptions::default()).expect("http");
-        let eco = GoEcosystem::new(GoProxy::new(http, Vec::new()));
+        let eco = GoTool::new(GoProxy::new(http, Vec::new()));
         let project = Project {
             root: root.clone(),
             kind: GO_ID,
@@ -672,7 +672,7 @@ mod tests {
         let server = TestServer::new(routes);
         let cache = tempfile::tempdir().expect("tempdir");
         let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
-        let eco = GoEcosystem::new(GoProxy::new(
+        let eco = GoTool::new(GoProxy::new(
             http,
             vec![ProxyBase {
                 url: server.base_url.clone(),
@@ -711,7 +711,7 @@ mod tests {
         let server = TestServer::new(routes);
         let cache = tempfile::tempdir().expect("tempdir");
         let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
-        let eco = GoEcosystem::new(GoProxy::new(
+        let eco = GoTool::new(GoProxy::new(
             http,
             vec![ProxyBase {
                 url: server.base_url.clone(),

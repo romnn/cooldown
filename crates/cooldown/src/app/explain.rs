@@ -14,7 +14,7 @@ pub struct ExplainOutcome {
     pub meta: ExplainMeta,
     /// Each layer-and-rule step that contributed to (or was shadowed in) the derivation.
     pub steps: Vec<ExplainStep>,
-    /// The process exit (`Ok`, or `NoEcosystem` when no project is in scope).
+    /// The process exit (`Ok`, or `NoTool` when no project is in scope).
     pub exit: Exit,
 }
 
@@ -39,13 +39,13 @@ impl Workspace {
             return ExplainOutcome {
                 meta: empty_meta(),
                 steps: Vec::new(),
-                exit: Exit::NoEcosystem,
+                exit: Exit::NoTool,
             };
         };
 
         let registry = self.registry_of(pctx, pkg).await;
         let q = ResolveQuery {
-            ecosystem: pctx.ecosystem,
+            tool: pctx.tool,
             package: pkg,
             registry: registry.as_deref(),
             project: &pctx.rel_path,
@@ -86,7 +86,7 @@ impl Workspace {
     /// resolved graph (which may invoke the toolchain but never the registry network); any error or
     /// a no-match yields `None` so callers degrade to a registry-less resolution.
     async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
-        let adapter = self.adapter(pctx.ecosystem)?;
+        let adapter = self.adapter(pctx.tool)?;
         let deps = adapter
             .dependencies(&pctx.project, DepScope::Graph)
             .await
@@ -103,7 +103,7 @@ impl Workspace {
         for pctx in self.scoped_projects(opts) {
             // Resolve the bare default for a sentinel name unlikely to match a package glob.
             let q = ResolveQuery {
-                ecosystem: pctx.ecosystem,
+                tool: pctx.tool,
                 package: "\u{0}default",
                 registry: None,
                 project: &pctx.rel_path,
@@ -120,7 +120,7 @@ impl Workspace {
 
             items.push(ConfigItem {
                 project: pctx.rel_path.to_string(),
-                ecosystem: pctx.ecosystem.as_str().to_string(),
+                tool: pctx.tool.as_str().to_string(),
                 effective_default_min_age_days: days,
                 source: res.window.source(),
                 strict_native: pctx.policy.strict_native,

@@ -1,4 +1,4 @@
-//! Gitignore-aware project-root discovery shared by the ecosystem adapters' `detect`.
+//! Gitignore-aware project-root discovery shared by the tool adapters' `detect`.
 //!
 //! Each adapter looks for its own marker file (`Cargo.lock`, `go.mod`, `uv.lock`), but the walk is
 //! identical: descend from a root, skip what shouldn't be scanned, and collect the directories that

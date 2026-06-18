@@ -1,6 +1,6 @@
 //! The core domain model. Versions are **opaque to the core**: Go pseudo-versions, `/vN` majors,
 //! `+incompatible`, PEP 440 and semver share no parse rules, so the core never parses a version —
-//! the ecosystem hands back releases already classified, carrying an opaque ordering token and the
+//! the tool hands back releases already classified, carrying an opaque ordering token and the
 //! update-kind relative to the current pin.
 
 use crate::policy::ResolvedWindow;
@@ -10,13 +10,13 @@ use std::fmt;
 /// Canonical display form of a version. The core treats this as opaque; it never parses it.
 ///
 /// Go pseudo-versions, `/vN` majors, `+incompatible`, PEP 440 and semver share no parse
-/// rules, so a `Version` is just the string an ecosystem chose to display. Ordering and
+/// rules, so a `Version` is just the string an tool chose to display. Ordering and
 /// same-major comparisons go through the opaque [`ReleaseOrder`] and [`MajorKey`] tokens
 /// instead, never through this string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct Version(
-    /// The verbatim display string, exactly as the ecosystem produced it.
+    /// The verbatim display string, exactly as the tool produced it.
     pub String,
 );
 
@@ -63,7 +63,7 @@ impl fmt::Display for Version {
 /// [`Release::kind_from_current`].
 ///
 /// Two releases share a major when their `MajorKey`s are equal. Because the token is only
-/// ever tested for equality, the ecosystem is free to encode the major however it likes
+/// ever tested for equality, the tool is free to encode the major however it likes
 /// (e.g. `"1"`, `"v2"`, the module path for a Go `/vN` major).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MajorKey(
@@ -75,7 +75,7 @@ pub struct MajorKey(
 /// releases with this; it carries a `debug_assert` of sortedness at the port boundary.
 ///
 /// Ordering follows the natural lexicographic ordering of the byte vector, which the
-/// ecosystem constructs so that "newer" sorts greater. Tokens from different packages are
+/// tool constructs so that "newer" sorts greater. Tokens from different packages are
 /// not comparable in any meaningful way.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReleaseOrder(
@@ -83,25 +83,26 @@ pub struct ReleaseOrder(
     pub Vec<u8>,
 );
 
-/// An ecosystem identifier, registered by its adapter. `Copy + 'static` so it threads cheaply.
+/// An tool identifier, registered by its adapter. `Copy + 'static` so it threads cheaply.
 ///
-/// The wrapped string is the stable language name used in config (`[lang.<name>]`) and on
-/// the `--lang` flag; see [`RECOGNIZED_ECOSYSTEMS`] and [`ecosystem_id`].
+/// The wrapped string is the stable tool name used in config (`[tool.<name>]`) and on the `--tool`
+/// flag — cooldown is organized by the dependency tool it drives (`cargo`, `go`, `uv`), not the
+/// language. See [`RECOGNIZED_TOOLS`] and [`tool_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EcosystemId(
-    /// The stable language name, e.g. `"rust"` or `"go"`.
+pub struct ToolId(
+    /// The stable tool name, e.g. `"cargo"` or `"go"`.
     pub &'static str,
 );
 
-impl EcosystemId {
-    /// Returns the ecosystem's stable language name.
+impl ToolId {
+    /// Returns the tool's stable tool name.
     ///
     /// # Examples
     ///
     /// ```
-    /// use cooldown_core::EcosystemId;
+    /// use cooldown_core::ToolId;
     ///
-    /// assert_eq!(EcosystemId("rust").as_str(), "rust");
+    /// assert_eq!(ToolId("cargo").as_str(), "cargo");
     /// ```
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -109,63 +110,68 @@ impl EcosystemId {
     }
 }
 
-/// The ecosystems `cooldown` recognises in config (`[lang.<name>]`) and `--lang`, by their stable
-/// language name. Pre-registering not-yet-implemented ones lets a shared org config mention them
-/// without erroring, while a genuine typo (`[lang.golang]`) is still rejected.
-pub const RECOGNIZED_ECOSYSTEMS: &[EcosystemId] = &[
-    EcosystemId("go"),
-    EcosystemId("rust"),
-    EcosystemId("python"),
-    EcosystemId("node"),
-];
+/// The tools `cooldown` recognises in config (`[tool.<name>]`) and `--tool`, by the stable name
+/// of the tool it drives. Pre-registering the not-yet-implemented `node` lets a shared org config
+/// mention it without erroring, while a genuine typo (`[tool.carg]`) is still rejected.
+pub const RECOGNIZED_TOOLS: &[ToolId] =
+    &[ToolId("cargo"), ToolId("go"), ToolId("uv"), ToolId("node")];
 
-/// Resolve a language name to its canonical [`EcosystemId`], or `None` if unrecognised.
+/// Resolve a tool name (or a common alias) to its canonical [`ToolId`], or `None` if
+/// unrecognised. Accepts the language name and sibling tools as aliases: `rust`/`crates` → cargo,
+/// `python`/`pip`/`pypi` → uv, `golang` → go, `npm`/`pnpm`/`yarn` → node.
 #[must_use]
-pub fn ecosystem_id(name: &str) -> Option<EcosystemId> {
-    RECOGNIZED_ECOSYSTEMS.iter().copied().find(|e| e.0 == name)
+pub fn tool_id(name: &str) -> Option<ToolId> {
+    let canonical = match name {
+        "cargo" | "crates" | "rust" => "cargo",
+        "go" | "golang" => "go",
+        "uv" | "pip" | "pypi" | "python" => "uv",
+        "node" | "npm" | "pnpm" | "yarn" => "node",
+        _ => return None,
+    };
+    RECOGNIZED_TOOLS.iter().copied().find(|e| e.0 == canonical)
 }
 
-impl fmt::Display for EcosystemId {
+impl fmt::Display for ToolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0)
     }
 }
 
-impl serde::Serialize for EcosystemId {
+impl serde::Serialize for ToolId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.0)
     }
 }
 
-/// A fully-qualified package identity: which ecosystem, the package name, and (optionally) the
+/// A fully-qualified package identity: which tool, the package name, and (optionally) the
 /// registry/index it resolves from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageId {
-    /// The ecosystem the package belongs to.
-    pub ecosystem: EcosystemId,
-    /// The package name as it appears in the ecosystem's index.
+    /// The tool the package belongs to.
+    pub tool: ToolId,
+    /// The package name as it appears in the tool's index.
     pub name: String,
     /// The registry/index the package resolves from (e.g. `crates.io`), or `None` for the
-    /// ecosystem's default.
+    /// tool's default.
     pub registry: Option<String>,
 }
 
 impl PackageId {
-    /// Assembles a [`PackageId`] from its ecosystem, name, and optional registry.
+    /// Assembles a [`PackageId`] from its tool, name, and optional registry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use cooldown_core::{EcosystemId, PackageId};
+    /// use cooldown_core::{ToolId, PackageId};
     ///
-    /// let id = PackageId::new(EcosystemId("rust"), "serde", None);
+    /// let id = PackageId::new(ToolId("cargo"), "serde", None);
     /// assert_eq!(id.name, "serde");
-    /// assert_eq!(id.ecosystem.as_str(), "rust");
+    /// assert_eq!(id.tool.as_str(), "cargo");
     /// assert!(id.registry.is_none());
     /// ```
-    pub fn new(ecosystem: EcosystemId, name: impl Into<String>, registry: Option<String>) -> Self {
+    pub fn new(tool: ToolId, name: impl Into<String>, registry: Option<String>) -> Self {
         PackageId {
-            ecosystem,
+            tool,
             name: name.into(),
             registry,
         }
@@ -223,7 +229,7 @@ pub enum UpdateKind {
     Patch,
 }
 
-/// A non-empty id for one locked artifact (e.g. a uv wheel/sdist). Version-granular ecosystems (Go,
+/// A non-empty id for one locked artifact (e.g. a uv wheel/sdist). Version-granular tools (Go,
 /// crates.io) leave `Dependency::artifacts` empty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
@@ -269,7 +275,7 @@ pub struct Dependency {
     pub current_quality: ReleaseQuality,
     /// Whether this is a direct dependency (as opposed to transitive).
     pub direct: bool,
-    /// The locked artifacts for this dependency; empty for version-granular ecosystems.
+    /// The locked artifacts for this dependency; empty for version-granular tools.
     pub artifacts: Vec<ArtifactId>,
     /// The lowest version the resolved graph permits (MVS floor or a `=` pin), read from the
     /// lock; `None` when unconstrained.
@@ -343,13 +349,13 @@ pub struct PinVerdict {
     pub published_at: Option<jiff::Timestamp>,
 }
 
-/// A detected project rooted at a manifest within one ecosystem.
+/// A detected project rooted at a manifest within one tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     /// The project's root directory.
     pub root: Utf8PathBuf,
-    /// The ecosystem the project belongs to.
-    pub kind: EcosystemId,
+    /// The tool the project belongs to.
+    pub kind: ToolId,
     /// The path to the project's manifest (e.g. `Cargo.toml`, `go.mod`).
     pub manifest: Utf8PathBuf,
 }
@@ -463,10 +469,10 @@ pub enum CandidateScope {
     AllowCrossMajor,
 }
 
-/// How an ecosystem's project roots are recognized on disk.
+/// How an tool's project roots are recognized on disk.
 ///
 /// Adapters *declare* this rather than scanning themselves: the orchestrator runs one
-/// gitignore-aware, exclude-aware walk per ecosystem from these markers, so detection policy
+/// gitignore-aware, exclude-aware walk per tool from these markers, so detection policy
 /// (`.gitignore` honoring, the exclude list) is owned in one agnostic place and an adapter cannot
 /// bypass it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,7 +486,7 @@ pub struct ProjectMarker {
     pub workspace_root: bool,
 }
 
-/// The platform/abi/python-version/markers a lock must satisfy. Version-granular ecosystems leave
+/// The platform/abi/python-version/markers a lock must satisfy. Version-granular tools leave
 /// this empty.
 #[derive(Debug, Clone, Default)]
 pub struct Environment {
@@ -493,7 +499,7 @@ pub struct Environment {
 pub struct FetchContext<'a> {
     /// The project being evaluated.
     pub project: &'a Project,
-    /// The environments the lock must satisfy; empty for version-granular ecosystems.
+    /// The environments the lock must satisfy; empty for version-granular tools.
     pub environments: &'a [Environment],
     /// Which artifacts to gate.
     pub artifacts: ArtifactScope,
@@ -506,4 +512,33 @@ pub struct VerifyReport {
     pub ok: bool,
     /// Human-readable detail (e.g. the build output or failure reason).
     pub detail: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_id;
+
+    #[test]
+    fn tool_id_resolves_canonical_tools_and_aliases() {
+        for (input, canonical) in [
+            ("cargo", "cargo"),
+            ("rust", "cargo"),
+            ("crates", "cargo"),
+            ("go", "go"),
+            ("golang", "go"),
+            ("uv", "uv"),
+            ("python", "uv"),
+            ("pip", "uv"),
+            ("node", "node"),
+            ("pnpm", "node"),
+            ("npm", "node"),
+        ] {
+            assert_eq!(
+                tool_id(input).expect("known tool").as_str(),
+                canonical,
+                "tool `{input}`"
+            );
+        }
+        assert!(tool_id("carg").is_none(), "a typo is rejected");
+    }
 }

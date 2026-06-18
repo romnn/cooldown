@@ -1,4 +1,4 @@
-//! Shared TOML manifest helpers used by ecosystem adapters.
+//! Shared TOML manifest helpers used by tool adapters.
 
 use camino::Utf8Path;
 use cooldown_core::CoreError;

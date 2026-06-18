@@ -1,5 +1,5 @@
 //! The CLI composition root: clap parsing, config discovery, adapter wiring, and dispatch. This is
-//! the only place that knows the full cast of ecosystems.
+//! the only place that knows the full cast of tools.
 
 mod commands;
 mod present;
@@ -79,7 +79,7 @@ fn init_logging(level: LogLevel) {
     name = "cooldown",
     version,
     about = "A unified, language-agnostic dependency-cooldown CLI",
-    long_about = "Refuse to adopt any dependency version younger than a minimum release age, across ecosystems, from one policy core."
+    long_about = "Refuse to adopt any dependency version younger than a minimum release age, across tools, from one policy core."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -169,18 +169,19 @@ struct GlobalArgs {
     /// Scope the command to matching packages (repeatable).
     #[arg(long, short = 'p', global = true, value_name = "GLOB")]
     package: Vec<String>,
-    /// Restrict to ecosystem(s); repeatable / comma-separated (default: all detected).
+    /// Restrict to tool(s) — `cargo`, `go`, `uv`, … (aliases like `rust`/`pnpm` accepted);
+    /// repeatable / comma-separated (default: all detected).
     #[arg(
         long,
         global = true,
-        value_name = "LANG",
+        value_name = "TOOL",
         value_delimiter = ',',
-        env = "COOLDOWN_LANG"
+        env = "COOLDOWN_TOOL"
     )]
-    lang: Vec<String>,
-    /// Only the Rust/Cargo ecosystem — skip detecting/enumerating Go, Python, and Node entirely
-    /// (shorthand for `--lang rust`; the right default for a Cargo workspace in a polyglot monorepo).
-    #[arg(long, global = true, conflicts_with = "lang")]
+    tool: Vec<String>,
+    /// Only the Rust/Cargo tool — skip detecting/enumerating Go, Python, and Node entirely
+    /// (shorthand for `--tool cargo`; the right default for a Cargo workspace in a polyglot monorepo).
+    #[arg(long, global = true, conflicts_with = "tool")]
     cargo: bool,
     /// Don't honor `.gitignore` while detecting projects (the rare repo whose lockfiles are
     /// themselves ignored). By default detection skips gitignored paths — correct and faster.
@@ -402,36 +403,33 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let repo_root = prepared.repo_root;
     let ws = prepared.ws;
     let opts = prepared.opts;
-    // `--json` is itself config-resolvable, so color and the no-ecosystem output key off the
+    // `--json` is itself config-resolvable, so color and the no-tool output key off the
     // resolved value rather than the raw flag.
     let color = std::io::stdout().is_terminal() && !opts.json;
 
     if ws.is_empty() {
         let workdir = g.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
         if opts.json {
-            println!(
-                "{}",
-                commands::no_ecosystem_json(command_name(&cli.command))?
-            );
+            println!("{}", commands::no_tool_json(command_name(&cli.command))?);
         } else {
-            eprintln!("no supported ecosystem detected under {workdir}");
+            eprintln!("no supported tool detected under {workdir}");
         }
-        return Ok(Exit::NoEcosystem);
+        return Ok(Exit::NoTool);
     }
 
-    // A no-match `--lang` on a mutating or `explain` command is a usage error (exit 2), distinct
-    // from "no ecosystem detected" (exit 3, handled above where `projects` was non-empty).
+    // A no-match `--tool` on a mutating or `explain` command is a usage error (exit 2), distinct
+    // from "no tool detected" (exit 3, handled above where `projects` was non-empty).
     let mutating_or_explain = matches!(
         cli.command,
         Command::Upgrade | Command::Baseline { .. } | Command::Explain { .. }
     );
-    let lang_matches_a_project = ws
+    let tool_matches_a_project = ws
         .projects()
         .iter()
-        .any(|p| opts.lang.is_empty() || opts.lang.contains(&p.ecosystem));
-    if mutating_or_explain && !lang_matches_a_project {
+        .any(|p| opts.tool.is_empty() || opts.tool.contains(&p.tool));
+    if mutating_or_explain && !tool_matches_a_project {
         return Err(CoreError::Config(
-            "--lang matched no detected project in scope".to_string(),
+            "--tool matched no detected project in scope".to_string(),
         ));
     }
 
@@ -489,8 +487,8 @@ min-age = "7d"
 # Risk-tiered windows (use INSTEAD of the scalar above):
 # min-age = { default = "7d", patch = "3d", minor = "7d", major = "30d" }
 
-# Per ecosystem (npm is the most-attacked registry):
-# [lang.node]
+# Per tool (npm is the most-attacked registry):
+# [tool.node]
 # min-age = "21d"
 
 # First-party packages are trusted:
@@ -510,8 +508,8 @@ min-age = "7d"
 # gitignore = true            # set false to scan gitignored paths too
 # offline = false             # cache-only; concurrency = 8 tunes the registry fan-out
 #
-# [lang.rust]
-# exclude = ["vendor"]        # extra excludes for one ecosystem
+# [tool.cargo]
+# exclude = ["vendor"]        # extra excludes for one tool
 #
 # [outdated]
 # major = true                # outdated shows cross-major by default; set false for minor-only
@@ -542,18 +540,39 @@ mod tests {
 
     #[test]
     fn major_and_no_major_map_to_explicit_true_and_false() {
-        assert_eq!(overrides(&["cooldown", "outdated", "--major"]).major, Some(true));
-        assert_eq!(overrides(&["cooldown", "outdated", "--no-major"]).major, Some(false));
-        assert_eq!(overrides(&["cooldown", "outdated", "--minor"]).major, Some(false));
-        assert_eq!(overrides(&["cooldown", "outdated", "--no-gitignore"]).gitignore, Some(false));
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--major"]).major,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--no-major"]).major,
+            Some(false)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--minor"]).major,
+            Some(false)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--no-gitignore"]).gitignore,
+            Some(false)
+        );
     }
 
     #[test]
     fn global_flags_are_detected_before_or_after_the_subcommand() {
         // After the subcommand (the common form)...
-        assert_eq!(overrides(&["cooldown", "outdated", "--all"]).all, Some(true));
-        assert_eq!(overrides(&["cooldown", "upgrade", "--strict"]).strict, Some(true));
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--all"]).all,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--strict"]).strict,
+            Some(true)
+        );
         // ...and before it (global args propagate either way).
-        assert_eq!(overrides(&["cooldown", "--strict", "upgrade"]).strict, Some(true));
+        assert_eq!(
+            overrides(&["cooldown", "--strict", "upgrade"]).strict,
+            Some(true)
+        );
     }
 }

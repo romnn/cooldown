@@ -1,6 +1,6 @@
 [package]
 name = "cooldown-scan"
-description = "Gitignore-aware filesystem scanning for cooldown: find ecosystem project roots under a directory, honoring .gitignore and a configurable exclude list."
+description = "Gitignore-aware filesystem scanning for cooldown: find tool project roots under a directory, honoring .gitignore and a configurable exclude list."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "cooldown-cargo"
-description = "Rust/Cargo ecosystem adapter for cooldown: Cargo.lock + crates.io publish times, with cargo-driven resolution/apply."
+description = "Rust/Cargo tool adapter for cooldown: Cargo.lock + crates.io publish times, with cargo-driven resolution/apply."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

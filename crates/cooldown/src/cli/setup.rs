@@ -2,15 +2,17 @@ use super::{CliOverrides, GlobalArgs, LogLevel};
 use crate::app::{AdapterSet, Baseline, Progress, ProjectCtx, RunOpts, Workspace};
 use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_cargo::{CARGO_ID, CargoEcosystem};
-use cooldown_core::config::{CommandConfig, WindowFields, builtin_default_layer, layer_from_fields};
-use cooldown_core::{
-    CoreError, EcosystemId, Origin, PatternGlob, PolicyLayer, PolicyStack, Project, ecosystem_id,
-    normalize_native,
+use cooldown_cargo::{CARGO_ID, CargoTool};
+use cooldown_core::config::{
+    CommandConfig, WindowFields, builtin_default_layer, layer_from_fields,
 };
-use cooldown_go::GoEcosystem;
+use cooldown_core::{
+    CoreError, Origin, PatternGlob, PolicyLayer, PolicyStack, Project, ToolId, normalize_native,
+    tool_id,
+};
+use cooldown_go::GoTool;
 use cooldown_registry::{HttpOptions, SharedHttp};
-use cooldown_uv::UvEcosystem;
+use cooldown_uv::UvTool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,9 +48,9 @@ pub(crate) async fn prepare_run(
 
     let json = resolve_flag(overrides.json, cfg.json, false);
     let respect_gitignore = resolve_flag(overrides.gitignore, cfg.gitignore, true);
-    let lang = resolve_langs(g, &cfg)?;
+    let tools = resolve_tools(g, &cfg)?;
     let opts = RunOpts {
-        lang: lang.clone(),
+        tool: tools.clone(),
         package: resolve_globs(g, &cfg)?,
         allow_major: resolve_flag(overrides.major, cfg.major, default_major),
         major_all: resolve_flag(overrides.major_all, cfg.major_all, false),
@@ -74,13 +76,13 @@ pub(crate) async fn prepare_run(
     let offline = resolve_flag(overrides.offline, cfg.offline, false);
     let fresh = resolve_flag(overrides.fresh, cfg.fresh, false);
     let adapters = adapter_set(offline, fresh)?;
-    let mut projects: Vec<(EcosystemId, Project)> = Vec::new();
+    let mut projects: Vec<(ToolId, Project)> = Vec::new();
     for adapter in adapters.readers() {
         let id = adapter.id();
-        // `--lang`/`--cargo` restrict *detection itself*: an unselected ecosystem is never walked
+        // `--tool`/`--cargo` restrict *detection itself*: an unselected tool is never walked
         // or enumerated, so a polyglot monorepo doesn't pay for (or hang on) Go/Python discovery.
-        if !lang.is_empty() && !lang.contains(&id) {
-            tracing::debug!(ecosystem = id.as_str(), "skipping detection (filtered out)");
+        if !tools.is_empty() && !tools.contains(&id) {
+            tracing::debug!(tool = id.as_str(), "skipping detection (filtered out)");
             continue;
         }
         // The orchestrator owns the scan: the adapter only declares its marker, and we apply the
@@ -95,13 +97,13 @@ pub(crate) async fn prepare_run(
             marker.workspace_root,
         )?;
         tracing::info!(
-            ecosystem = id.as_str(),
+            tool = id.as_str(),
             projects = dirs.len(),
             gitignore = respect_gitignore,
             "detected projects"
         );
         for dir in dirs {
-            tracing::debug!(ecosystem = id.as_str(), root = %dir, "detected project");
+            tracing::debug!(tool = id.as_str(), root = %dir, "detected project");
             projects.push((
                 id,
                 Project {
@@ -115,8 +117,8 @@ pub(crate) async fn prepare_run(
 
     let shared = build_shared_layers(g)?;
     let mut ctxs = Vec::new();
-    for (ecosystem, project) in projects {
-        ctxs.push(assemble_ctx(&adapters, &repo_root, ecosystem, project, &shared, g).await?);
+    for (tool, project) in projects {
+        ctxs.push(assemble_ctx(&adapters, &repo_root, tool, project, &shared, g).await?);
     }
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
@@ -146,9 +148,9 @@ fn adapter_set(offline: bool, fresh: bool) -> Result<AdapterSet, CoreError> {
     )?;
 
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(GoEcosystem::from_http(http.clone())));
-    adapters.register(Arc::new(CargoEcosystem::from_http(http.clone())));
-    adapters.register(Arc::new(UvEcosystem::from_http(http.clone())));
+    adapters.register(Arc::new(GoTool::from_http(http.clone())));
+    adapters.register(Arc::new(CargoTool::from_http(http.clone())));
+    adapters.register(Arc::new(UvTool::from_http(http.clone())));
     Ok(adapters)
 }
 
@@ -173,7 +175,7 @@ fn build_shared_layers(g: &GlobalArgs) -> Result<SharedLayers, CoreError> {
 async fn assemble_ctx(
     adapters: &AdapterSet,
     repo_root: &Utf8Path,
-    ecosystem: EcosystemId,
+    tool: ToolId,
     project: Project,
     shared: &SharedLayers,
     g: &GlobalArgs,
@@ -181,7 +183,7 @@ async fn assemble_ctx(
     let native = if g.no_native {
         None
     } else {
-        match adapters.reader(ecosystem) {
+        match adapters.reader(tool) {
             Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
             None => None,
         }
@@ -216,7 +218,7 @@ async fn assemble_ctx(
     );
 
     Ok(ProjectCtx {
-        ecosystem,
+        tool,
         project,
         rel_path,
         policy: PolicyStack {
@@ -226,32 +228,30 @@ async fn assemble_ctx(
     })
 }
 
-/// The ecosystem set this run is restricted to (empty = all detected).
+/// The tool/tool set this run is restricted to (empty = all detected).
 ///
-/// `--cargo` is exact shorthand for `--lang rust` (clap rejects passing both); otherwise an explicit
-/// `--lang` is used, falling back to the config `lang` list. Values accept the common tool-name
-/// aliases (`cargo` → rust, `uv`/`pip` → python, `golang` → go, `npm`/`pnpm`/`yarn` → node).
-fn resolve_langs(g: &GlobalArgs, cfg: &CommandConfig) -> Result<Vec<EcosystemId>, CoreError> {
+/// `--cargo` is exact shorthand for `--tool cargo` (clap rejects passing both); otherwise an
+/// explicit `--tool` is used, falling back to the config `tool` list. Values accept the language
+/// name and sibling tools as aliases (see [`tool_id`]).
+fn resolve_tools(g: &GlobalArgs, cfg: &CommandConfig) -> Result<Vec<ToolId>, CoreError> {
     if g.cargo {
         return Ok(vec![CARGO_ID]);
     }
-    let langs = if g.lang.is_empty() { &cfg.lang } else { &g.lang };
-    langs.iter().map(|lang| lang_id(lang)).collect()
-}
-
-fn lang_id(lang: &str) -> Result<EcosystemId, CoreError> {
-    let canonical = match lang {
-        "cargo" | "crates" => "rust",
-        "uv" | "pip" | "pypi" => "python",
-        "golang" => "go",
-        "npm" | "pnpm" | "yarn" => "node",
-        other => other,
+    let tools = if g.tool.is_empty() {
+        &cfg.tool
+    } else {
+        &g.tool
     };
-    ecosystem_id(canonical).ok_or_else(|| {
-        CoreError::Config(format!(
-            "unknown --lang `{lang}`; recognised: go, rust, python, node"
-        ))
-    })
+    tools
+        .iter()
+        .map(|name| {
+            tool_id(name).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "unknown --tool `{name}`; recognised: cargo, go, uv, node"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// The package globs this run is scoped to: an explicit `--package` is used, else the config
@@ -323,7 +323,7 @@ fn compute_strict_native(layers: &[PolicyLayer], g: &GlobalArgs) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lang_id, resolve_flag};
+    use super::resolve_flag;
 
     #[test]
     fn resolve_flag_follows_cli_then_config_then_default() {
@@ -336,33 +336,5 @@ mod tests {
         // ...and an explicit CLI flag overrides both.
         assert!(resolve_flag(Some(true), Some(false), false));
         assert!(!resolve_flag(Some(false), Some(true), true));
-    }
-
-    #[test]
-    fn lang_aliases_map_to_canonical_ecosystems() {
-        for (input, canonical) in [
-            ("rust", "rust"),
-            ("cargo", "rust"),
-            ("crates", "rust"),
-            ("python", "python"),
-            ("uv", "python"),
-            ("pip", "python"),
-            ("go", "go"),
-            ("golang", "go"),
-            ("node", "node"),
-            ("npm", "node"),
-            ("pnpm", "node"),
-        ] {
-            assert_eq!(
-                lang_id(input).expect("known alias").as_str(),
-                canonical,
-                "alias `{input}`"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_lang_is_a_config_error() {
-        assert!(lang_id("ralang").is_err());
     }
 }

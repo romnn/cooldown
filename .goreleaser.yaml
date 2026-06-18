@@ -12,7 +12,7 @@ homebrew_casks:
   - name: &cooldown cooldown
     ids:
       - *cooldown
-    description: "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across ecosystems, from one policy core."
+    description: "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across tools, from one policy core."
     custom_block: |
       os macos: "darwin", linux: "linux"
     directory: Casks

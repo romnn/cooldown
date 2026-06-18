@@ -1,7 +1,7 @@
 # cooldown
 
 A unified, language-agnostic **dependency-cooldown** CLI: refuse to adopt any dependency version
-younger than a minimum release age, across ecosystems, from one policy core.
+younger than a minimum release age, across tools, from one policy core.
 
 Supply-chain attacks on package registries overwhelmingly follow a smash-and-grab pattern: a
 malicious version is published and is detected and yanked within hours to a few days. A **cooldown**
@@ -10,7 +10,7 @@ younger than _N_ days so the community's immune system runs before the code reac
 risk surface is the **resolved lockfile** (direct _and_ transitive), so the gate reasons over the
 whole graph.
 
-Cooldown support today is fragmented per ecosystem (uv `exclude-newer`, pnpm `minimumReleaseAge`,
+Cooldown support today is fragmented per tool (uv `exclude-newer`, pnpm `minimumReleaseAge`,
 yarn `npmMinimalAgeGate`, …), each with a different name, config surface, and UX. `cooldown`
 collapses them into **one tool, one mental model**: it auto-detects the language(s) in a directory
 and exposes the same subcommands, flags, config, and (pretty + JSON) output for all of them. The
@@ -65,8 +65,8 @@ min-age = "14d"
 | ---- | ------------------------------------------------------------------------------------ |
 | 0    | clean / nothing to do                                                                |
 | 1    | policy violation (`check`) or an unmovable planned change (`upgrade --strict`)       |
-| 2    | usage / config error (bad duration, unknown `--lang`, mutually-exclusive flags, …)   |
-| 3    | no ecosystem detected                                                                |
+| 2    | usage / config error (bad duration, unknown `--tool`, mutually-exclusive flags, …)   |
+| 3    | no tool detected                                                                |
 | 4    | stale/absent lock, registry unreachable, a tool failed, or unknown-age under a flag  |
 
 ## Configuration
@@ -78,7 +78,7 @@ min-age = "14d"                 # the one knob most repos ever set (scalar form)
 # per-kind windows (table form, instead of the scalar):
 # min-age = { default = "14d", major = "30d", minor = "14d", patch = "7d" }
 
-[lang.python]                   # per ecosystem
+[tool.uv]                       # per tool (cargo / go / uv / …; aliases like python accepted)
 min-age = "21d"
 
 [registry."internal.acme.io"]   # per registry / index — our own registry is trusted
@@ -98,7 +98,7 @@ Durations accept `"7d"`, `"2 weeks"`, ISO-8601 `"P7D"`.
 
 Two orthogonal axes. **Layers** (low → high authority): built-in default → global config → native
 manifest config → repo/project `cooldown.toml` cascade (nearer wins) → `--config` file → `COOLDOWN_*`
-env → CLI flags. **Selectors** (most → least specific): `package` > `registry` > `project` > `lang`
+env → CLI flags. **Selectors** (most → least specific): `package` > `registry` > `project` > `tool`
 > default.
 
 Resolution is per field: `min-age` is **authority-first** (highest layer wins; within a layer the
@@ -109,8 +109,8 @@ derivation.
 
 ## Architecture
 
-Ports-and-adapters (hexagonal): a pure policy core that does no concrete I/O, an
-`Ecosystem`/`PackageRegistry` port pair, per-ecosystem adapters, shared registry plumbing,
+Ports-and-adapters (hexagonal): a pure policy core that does no concrete I/O, a
+`Tool`/`PackageRegistry` port pair, per-tool adapters, shared registry plumbing,
 presentation, and a CLI composition root. Dependencies point inward at the core.
 
 ```
@@ -118,11 +118,11 @@ crates/
   cooldown-core/      domain model · evaluate() · check_pin() · resolve() · ports · config   (no I/O)
   cooldown-registry/  shared HTTP client · on-disk cache (monotonic publish-time floor) · concurrency
   cooldown-render/    TTY tables + the JSON envelope + schema
-  cooldown-go/        Go Ecosystem + GOPROXY registry
+  cooldown-go/        Go Tool + GOPROXY registry
   cooldown/           the binary: app use cases · clap · config discovery · wiring · dispatch
 ```
 
-Adding an ecosystem is one new crate implementing the ports, registered in one line — no change to
+Adding a tool is one new crate implementing the ports, registered in one line — no change to
 the core, render, the config schema, or any other adapter.
 
 ## Security model

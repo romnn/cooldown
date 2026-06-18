@@ -1,6 +1,6 @@
 [package]
 name = "cooldown"
-description = "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across ecosystems, from one policy core."
+description = "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across tools, from one policy core."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

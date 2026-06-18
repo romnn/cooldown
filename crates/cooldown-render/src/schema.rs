@@ -35,7 +35,7 @@ pub fn json_schema() -> Value {
                 ]
             },
             "message": { "type": "string" },
-            "ecosystem": { "type": "string" },
+            "tool": { "type": "string" },
             "project": { "type": "string" },
             "package": { "type": "string" },
             "version": { "type": "string" },
@@ -112,10 +112,10 @@ pub fn json_schema() -> Value {
         },
         "outdatedItem": {
             "type": "object",
-            "required": ["name", "ecosystem", "project", "direct", "current", "window", "status"],
+            "required": ["name", "tool", "project", "direct", "current", "window", "status"],
             "properties": {
                 "name": { "type": "string" },
-                "ecosystem": { "type": "string" },
+                "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "registry": { "type": "string" },
                 "direct": { "type": "boolean" },
@@ -155,10 +155,10 @@ pub fn json_schema() -> Value {
         },
         "checkItem": {
             "type": "object",
-            "required": ["name", "ecosystem", "project", "direct", "current", "window", "status", "graphHeld"],
+            "required": ["name", "tool", "project", "direct", "current", "window", "status", "graphHeld"],
             "properties": {
                 "name": { "type": "string" },
-                "ecosystem": { "type": "string" },
+                "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "registry": { "type": "string" },
                 "direct": { "type": "boolean" },
@@ -185,10 +185,10 @@ pub fn json_schema() -> Value {
         },
         "upgradeItem": {
             "type": "object",
-            "required": ["name", "ecosystem", "project", "from", "to", "kind", "applied"],
+            "required": ["name", "tool", "project", "from", "to", "kind", "applied"],
             "properties": {
                 "name": { "type": "string" },
-                "ecosystem": { "type": "string" },
+                "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "registry": { "type": "string" },
                 "from": { "type": "string" },
@@ -229,10 +229,10 @@ pub fn json_schema() -> Value {
         },
         "configItem": {
             "type": "object",
-            "required": ["project", "ecosystem", "effectiveDefaultMinAgeDays", "source", "strictNative", "layers"],
+            "required": ["project", "tool", "effectiveDefaultMinAgeDays", "source", "strictNative", "layers"],
             "properties": {
                 "project": { "type": "string" },
-                "ecosystem": { "type": "string" },
+                "tool": { "type": "string" },
                 "effectiveDefaultMinAgeDays": { "type": "number" },
                 "source": { "type": "string" },
                 "strictNative": { "type": "boolean" },
@@ -251,9 +251,9 @@ pub fn json_schema() -> Value {
         },
         "baselineItem": {
             "type": "object",
-            "required": ["ecosystem", "project", "package", "version"],
+            "required": ["tool", "project", "package", "version"],
             "properties": {
-                "ecosystem": { "type": "string" },
+                "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "package": { "type": "string" },
                 "version": { "type": "string" },

@@ -1,4 +1,4 @@
-//! The Rust/Cargo [`Ecosystem`]: detection, the resolved graph via `cargo metadata`, classified
+//! The Rust/Cargo [`Tool`]: detection, the resolved graph via `cargo metadata`, classified
 //! releases from the crates.io sparse index, and `cargo`-driven apply/build. `=`-pinned versions
 //! that `cargo update --precise` cannot move are reported as `GraphHeld`/`ResolverConflict` skips.
 
@@ -8,46 +8,46 @@ use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EcosystemId, EcosystemRead,
-    EcosystemWrite, FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
-    Project, ProjectMarker, ProjectMutationJournal, RawWindow, Release, ReleaseOrder,
-    ReleaseQuality, Result, Selector, SkipReason, Skipped, VerifyReport, Version,
+    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, FetchContext,
+    NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector,
+    SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_toml_util::read_toml_file;
 
-/// The [`EcosystemId`] identifying the Rust/Cargo ecosystem (`"rust"`).
-pub const CARGO_ID: EcosystemId = EcosystemId("rust");
+/// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
+pub const CARGO_ID: ToolId = ToolId("cargo");
 
-/// The Rust/Cargo implementation of the [`Ecosystem`] port.
+/// The Rust/Cargo implementation of the [`Tool`] port.
 ///
 /// Pairs the crates.io sparse-index client ([`CratesIoIndex`]) with a [`Cargo`]
 /// CLI wrapper: the index supplies publish times and the release set, while
 /// `cargo` resolves the dependency graph and applies precise version changes.
-pub struct CargoEcosystem {
+pub struct CargoTool {
     index: CratesIoIndex,
     cargo: Cargo,
 }
 
-impl CargoEcosystem {
-    /// Creates an ecosystem from an existing crates.io [`CratesIoIndex`] client.
+impl CargoTool {
+    /// Creates an tool from an existing crates.io [`CratesIoIndex`] client.
     ///
     /// The [`Cargo`] CLI wrapper is constructed with its defaults (honoring the
     /// `COOLDOWN_CARGO` environment override).
     #[must_use]
     pub fn new(index: CratesIoIndex) -> Self {
-        CargoEcosystem {
+        CargoTool {
             index,
             cargo: Cargo::new(),
         }
     }
 
-    /// Creates an ecosystem backed by the shared HTTP layer, building the index for you.
+    /// Creates an tool backed by the shared HTTP layer, building the index for you.
     ///
-    /// Convenience constructor equivalent to `CargoEcosystem::new(CratesIoIndex::new(http))`.
+    /// Convenience constructor equivalent to `CargoTool::new(CratesIoIndex::new(http))`.
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
-        CargoEcosystem::new(CratesIoIndex::new(http))
+        CargoTool::new(CratesIoIndex::new(http))
     }
 }
 
@@ -143,8 +143,8 @@ fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
 }
 
 #[async_trait]
-impl EcosystemRead for CargoEcosystem {
-    fn id(&self) -> EcosystemId {
+impl ToolRead for CargoTool {
+    fn id(&self) -> ToolId {
         CARGO_ID
     }
 
@@ -243,7 +243,7 @@ impl EcosystemRead for CargoEcosystem {
 }
 
 #[async_trait]
-impl EcosystemWrite for CargoEcosystem {
+impl ToolWrite for CargoTool {
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -370,7 +370,7 @@ min-age = "14d"
         )
         .expect("write manifest");
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = CargoEcosystem::from_http(
+        let eco = CargoTool::from_http(
             cooldown_registry::SharedHttp::new(
                 cache_dir.path(),
                 cooldown_registry::HttpOptions::default(),

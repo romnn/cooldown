@@ -98,7 +98,7 @@ pub fn classify_kind(current: &str, cand: &str) -> Option<UpdateKind> {
 /// Compares two version strings, yielding a total [`Ordering`].
 ///
 /// Total order over versions; invalid versions sort below valid ones (and equal to each other).
-/// This lets [`build_releases`](crate::ecosystem::build_releases) sort a mixed list without
+/// This lets [`build_releases`](crate::tool::build_releases) sort a mixed list without
 /// discarding unparsable entries up front.
 ///
 /// # Examples

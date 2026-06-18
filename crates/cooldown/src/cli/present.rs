@@ -4,25 +4,25 @@ use cooldown_render as render;
 use serde::Serialize;
 use std::fmt::Write as _;
 
-pub(super) fn no_ecosystem_json(command: &'static str) -> Result<String, CoreError> {
-    let error = Diagnostic::new(DiagnosticKind::NotFound, "no supported ecosystem detected");
+pub(super) fn no_tool_json(command: &'static str) -> Result<String, CoreError> {
+    let error = Diagnostic::new(DiagnosticKind::NotFound, "no supported tool detected");
     let generated_at = super::generated_at(jiff::Timestamp::now());
 
     match command {
-        "outdated" => no_ecosystem_outdated(generated_at, error),
-        "check" => no_ecosystem_check(generated_at, error),
-        "upgrade" => no_ecosystem_upgrade(generated_at, error),
-        "explain" => no_ecosystem_explain(generated_at, error),
-        "config" => no_ecosystem_config(generated_at, error),
-        "baseline" => no_ecosystem_baseline(generated_at, error),
+        "outdated" => no_tool_outdated(generated_at, error),
+        "check" => no_tool_check(generated_at, error),
+        "upgrade" => no_tool_upgrade(generated_at, error),
+        "explain" => no_tool_explain(generated_at, error),
+        "config" => no_tool_config(generated_at, error),
+        "baseline" => no_tool_baseline(generated_at, error),
         _ => Err(CoreError::Config(format!(
             "command `{command}` does not produce a workspace JSON envelope"
         ))),
     }
 }
 
-fn no_ecosystem_outdated(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_outdated(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "outdated",
             false,
@@ -44,8 +44,8 @@ fn no_ecosystem_outdated(generated_at: String, error: Diagnostic) -> Result<Stri
     ))
 }
 
-fn no_ecosystem_check(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_check(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "check",
             false,
@@ -69,8 +69,8 @@ fn no_ecosystem_check(generated_at: String, error: Diagnostic) -> Result<String,
     ))
 }
 
-fn no_ecosystem_upgrade(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_upgrade(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "upgrade",
             false,
@@ -94,8 +94,8 @@ fn no_ecosystem_upgrade(generated_at: String, error: Diagnostic) -> Result<Strin
     ))
 }
 
-fn no_ecosystem_explain(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_explain(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "explain",
             false,
@@ -115,8 +115,8 @@ fn no_ecosystem_explain(generated_at: String, error: Diagnostic) -> Result<Strin
     ))
 }
 
-fn no_ecosystem_config(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_config(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "config",
             false,
@@ -129,8 +129,8 @@ fn no_ecosystem_config(generated_at: String, error: Diagnostic) -> Result<String
     ))
 }
 
-fn no_ecosystem_baseline(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
-    serialize_no_ecosystem(&with_error(
+fn no_tool_baseline(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    serialize_no_tool(&with_error(
         render::Envelope::new(
             "baseline",
             false,
@@ -148,7 +148,7 @@ fn no_ecosystem_baseline(generated_at: String, error: Diagnostic) -> Result<Stri
     ))
 }
 
-fn serialize_no_ecosystem<M, S, I>(env: &render::Envelope<M, S, I>) -> Result<String, CoreError>
+fn serialize_no_tool<M, S, I>(env: &render::Envelope<M, S, I>) -> Result<String, CoreError>
 where
     M: Serialize,
     S: Serialize,
@@ -165,7 +165,7 @@ pub(super) fn render_config_text(items: &[app::ConfigItem]) -> String {
             text,
             "{} [{}]\n  effective default window: {}d (decided by {})\n  strict-native: {}\n  layers: {}",
             item.project,
-            item.ecosystem,
+            item.tool,
             item.effective_default_min_age_days,
             item.source,
             item.strict_native,
@@ -266,7 +266,7 @@ pub(super) fn config_items(items: &[app::ConfigItem]) -> Vec<render::ConfigItem>
 fn outdated_item(item: &app::OutdatedItem) -> render::OutdatedItem {
     render::OutdatedItem {
         name: item.name.clone(),
-        ecosystem: item.ecosystem.clone(),
+        tool: item.tool.clone(),
         project: item.project.clone(),
         registry: item.registry.clone(),
         direct: item.direct,
@@ -282,7 +282,7 @@ fn outdated_item(item: &app::OutdatedItem) -> render::OutdatedItem {
 fn check_item(item: &app::CheckItem) -> render::CheckItem {
     render::CheckItem {
         name: item.name.clone(),
-        ecosystem: item.ecosystem.clone(),
+        tool: item.tool.clone(),
         project: item.project.clone(),
         registry: item.registry.clone(),
         direct: item.direct,
@@ -300,7 +300,7 @@ fn check_item(item: &app::CheckItem) -> render::CheckItem {
 fn upgrade_item(item: &app::UpgradeItem) -> render::UpgradeItem {
     render::UpgradeItem {
         name: item.name.clone(),
-        ecosystem: item.ecosystem.clone(),
+        tool: item.tool.clone(),
         project: item.project.clone(),
         registry: item.registry.clone(),
         from: item.from.clone(),
@@ -326,7 +326,7 @@ fn explain_step(step: &app::ExplainStep) -> render::ExplainStep {
 fn config_item(item: &app::ConfigItem) -> render::ConfigItem {
     render::ConfigItem {
         project: item.project.clone(),
-        ecosystem: item.ecosystem.clone(),
+        tool: item.tool.clone(),
         effective_default_min_age_days: item.effective_default_min_age_days,
         source: item.source.clone(),
         strict_native: item.strict_native,

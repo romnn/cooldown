@@ -12,7 +12,7 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
 
     let key = |entry: &crate::app::baseline::AckEntry| {
         (
-            entry.ecosystem.clone(),
+            entry.tool.clone(),
             entry.project.clone(),
             entry.package.clone(),
             entry.version.clone(),
@@ -61,7 +61,7 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
         .entries
         .iter()
         .map(|entry| render::BaselineItem {
-            ecosystem: entry.ecosystem.clone(),
+            tool: entry.tool.clone(),
             project: entry.project.clone(),
             package: entry.package.clone(),
             version: entry.version.clone(),

@@ -48,7 +48,7 @@ impl From<Status> for OutdatedStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutdatedItem {
     pub name: String,
-    pub ecosystem: String,
+    pub tool: String,
     pub project: String,
     pub registry: Option<String>,
     pub direct: bool,
@@ -107,7 +107,7 @@ impl CheckStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckItem {
     pub name: String,
-    pub ecosystem: String,
+    pub tool: String,
     pub project: String,
     pub registry: Option<String>,
     pub direct: bool,
@@ -142,7 +142,7 @@ pub struct SkippedInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeItem {
     pub name: String,
-    pub ecosystem: String,
+    pub tool: String,
     pub project: String,
     pub registry: Option<String>,
     pub from: String,
@@ -199,7 +199,7 @@ pub struct ExplainMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigItem {
     pub project: String,
-    pub ecosystem: String,
+    pub tool: String,
     pub effective_default_min_age_days: f64,
     pub source: String,
     pub strict_native: bool,

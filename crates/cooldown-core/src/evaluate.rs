@@ -1,13 +1,12 @@
-//! The cooldown decision — the single source of truth for every ecosystem.
+//! The cooldown decision — the single source of truth for every tool.
 //!
 //! [`evaluate`] drives `outdated`/`upgrade` over a candidate set; [`check_pin`] is the gate over
 //! the currently-locked release. Both are pure: no concrete I/O, no clock (the `now` boundary is
-//! passed in), and no version parsing (the ecosystem hands back classified releases). "Unknown age
+//! passed in), and no version parsing (the tool hands back classified releases). "Unknown age
 //! is never mature" is enforced here, once.
 
 use crate::model::{
-    Candidate, Dependency, EcosystemId, MajorKey, PinVerdict, Release, ReleaseQuality, Status,
-    Verdict,
+    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseQuality, Status, ToolId, Verdict,
 };
 use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
@@ -16,14 +15,14 @@ use jiff::Timestamp;
 /// The context the core needs to build resolution queries and apply the candidate filter.
 ///
 /// Threaded into both [`evaluate`] and [`check_pin`], it carries the per-invocation knobs that
-/// are not properties of the [`Dependency`] itself: which ecosystem is being evaluated, which
+/// are not properties of the [`Dependency`] itself: which tool is being evaluated, which
 /// project the policy cascade resolves against, and whether cross-major jumps are admissible
 /// candidates. It is `Copy`, so it is cheap to pass by value or reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveContext<'a> {
-    /// The ecosystem being evaluated, used to build the [`ResolveQuery`](crate::ResolveQuery)
+    /// The tool being evaluated, used to build the [`ResolveQuery`](crate::ResolveQuery)
     /// for each candidate.
-    pub ecosystem: EcosystemId,
+    pub tool: ToolId,
     /// The project root the policy cascade resolves against (matches `project=` selectors).
     pub project: &'a Utf8Path,
     /// `--major`: allow cross-major jumps as candidates (default: within the current major).
@@ -36,7 +35,7 @@ fn query<'a>(
     kind: ResolveKind,
 ) -> ResolveQuery<'a> {
     ResolveQuery {
-        ecosystem: ctx.ecosystem,
+        tool: ctx.tool,
         package: &dep.package.name,
         registry: dep.package.registry.as_deref(),
         project: ctx.project,
@@ -98,7 +97,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 /// ```
 /// use camino::Utf8Path;
 /// use cooldown_core::{
-///     ByKind, Dependency, EcosystemId, MajorKey, Origin, PackageId, PolicyLayer, Release,
+///     ByKind, Dependency, ToolId, MajorKey, Origin, PackageId, PolicyLayer, Release,
 ///     ReleaseOrder, ReleaseQuality, ResolveContext, Rule, Selector, Status, UpdateKind, Version,
 ///     WindowSpec, evaluate,
 /// };
@@ -106,7 +105,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 ///
 /// // A package locked at 1.0.0 with a fresh 1.0.1 patch released "now".
 /// let dep = Dependency {
-///     package: PackageId::new(EcosystemId("rust"), "widget", None),
+///     package: PackageId::new(ToolId("cargo"), "widget", None),
 ///     current: Version::new("1.0.0"),
 ///     current_quality: ReleaseQuality::Stable,
 ///     direct: true,
@@ -143,7 +142,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 /// layer.rules.push(rule);
 ///
 /// let ctx = ResolveContext {
-///     ecosystem: EcosystemId("rust"),
+///     tool: ToolId("cargo"),
 ///     project: Utf8Path::new("/repo"),
 ///     allow_major: false,
 /// };

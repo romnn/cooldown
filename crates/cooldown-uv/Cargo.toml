@@ -1,6 +1,6 @@
 [package]
 name = "cooldown-uv"
-description = "Python/uv ecosystem adapter for cooldown: uv.lock + PyPI (PEP 700) publish times, with uv-driven resolution/apply."
+description = "Python/uv tool adapter for cooldown: uv.lock + PyPI (PEP 700) publish times, with uv-driven resolution/apply."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-//! The Python/uv [`Ecosystem`]: detection, the resolved graph + per-file upload times from
+//! The Python/uv [`Tool`]: detection, the resolved graph + per-file upload times from
 //! `uv.lock`, `PyPI` as the publish-time fallback, native `[tool.uv]` cooldown config, and
 //! `uv`-driven resolution/apply. The core owns the verdict; uv only resolves/applies a window.
 
@@ -9,34 +9,34 @@ use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EcosystemId, EcosystemRead,
-    EcosystemWrite, FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
-    Project, ProjectMarker, ProjectMutationJournal, RawWindow, Release, ReleaseOrder,
-    ReleaseQuality, Result, Selector, SkipReason, Skipped, VerifyReport, Version,
+    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, FetchContext,
+    NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector,
+    SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_toml_util::read_toml_file;
 
-/// The [`EcosystemId`] for the Python/uv adapter.
-pub const UV_ID: EcosystemId = EcosystemId("python");
+/// The [`ToolId`] for the Python/uv adapter (`"uv"`).
+pub const UV_ID: ToolId = ToolId("uv");
 
-/// The Python/uv implementation of the [`Ecosystem`] port.
+/// The Python/uv implementation of the [`Tool`] port.
 ///
 /// It detects `uv.lock` projects, reads the resolved graph and per-file upload
 /// times from the lock (falling back to [`PyPi`] for the publish instant), parses
 /// `[tool.uv]` cooldown config as a native policy layer, and drives the `uv` CLI
 /// to re-resolve and apply a chosen window. The verdict itself is the core's;
 /// uv only resolves and applies.
-pub struct UvEcosystem {
+pub struct UvTool {
     pypi: PyPi,
     uv: Uv,
 }
 
-impl UvEcosystem {
+impl UvTool {
     /// Creates the adapter from a configured [`PyPi`] client.
     #[must_use]
     pub fn new(pypi: PyPi) -> Self {
-        UvEcosystem {
+        UvTool {
             pypi,
             uv: Uv::new(),
         }
@@ -45,7 +45,7 @@ impl UvEcosystem {
     /// Creates the adapter from a shared HTTP client, building the [`PyPi`] client.
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
-        UvEcosystem::new(PyPi::new(http))
+        UvTool::new(PyPi::new(http))
     }
 }
 
@@ -179,8 +179,8 @@ fn parse_raw_window(s: &str) -> Option<RawWindow> {
 }
 
 #[async_trait]
-impl EcosystemRead for UvEcosystem {
-    fn id(&self) -> EcosystemId {
+impl ToolRead for UvTool {
+    fn id(&self) -> ToolId {
         UV_ID
     }
 
@@ -288,7 +288,7 @@ impl EcosystemRead for UvEcosystem {
 }
 
 #[async_trait]
-impl EcosystemWrite for UvEcosystem {
+impl ToolWrite for UvTool {
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -404,7 +404,7 @@ requests = false
         )
         .expect("write manifest");
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = UvEcosystem::from_http(
+        let eco = UvTool::from_http(
             cooldown_registry::SharedHttp::new(
                 cache_dir.path(),
                 cooldown_registry::HttpOptions::default(),

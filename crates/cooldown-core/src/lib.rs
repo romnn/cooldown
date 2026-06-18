@@ -2,7 +2,7 @@
 //! ([`evaluate`](evaluate::evaluate) and [`check_pin`](evaluate::check_pin)), the policy
 //! [`resolve`](policy::resolve)r, the ports, and config parsing. No concrete I/O, no clock, no
 //! version parsing — everything that decides "is this version too fresh?" lives here, once, for
-//! every ecosystem.
+//! every tool.
 
 pub mod config;
 pub mod duration;
@@ -20,7 +20,7 @@ pub use policy::{
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve,
 };
 pub use ports::{
-    Capabilities, Ecosystem, EcosystemRead, EcosystemWrite, NativePolicyLayer, NativeRule,
-    PackageRegistry, ProjectMutationFile, ProjectMutationJournal, RawArtifact, RawRelease,
-    RawWindow, ResolvedPolicy, SyncReport, debug_assert_sorted, normalize_native,
+    Capabilities, NativePolicyLayer, NativeRule, PackageRegistry, ProjectMutationFile,
+    ProjectMutationJournal, RawArtifact, RawRelease, RawWindow, ResolvedPolicy, SyncReport, Tool,
+    ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
 };

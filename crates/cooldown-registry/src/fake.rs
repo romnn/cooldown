@@ -148,7 +148,7 @@ impl PackageRegistry for FakeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cooldown_core::EcosystemId;
+    use cooldown_core::ToolId;
 
     #[tokio::test]
     async fn artifact_granular_unknown_poisons_release() {
@@ -157,7 +157,7 @@ mod tests {
             "1.0.0",
             &[("a.whl", Some("2026-06-01T00:00:00Z")), ("b.whl", None)],
         );
-        let pkg = PackageId::new(EcosystemId("python"), "pkg", None);
+        let pkg = PackageId::new(ToolId("uv"), "pkg", None);
         let got = reg
             .published_at(
                 &pkg,

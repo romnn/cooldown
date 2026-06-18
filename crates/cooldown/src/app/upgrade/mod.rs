@@ -9,7 +9,7 @@ mod executor;
 
 use self::executor::ProjectUpgradeExecutor;
 use super::{BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace};
-use cooldown_core::{Diagnostic, EcosystemId, EcosystemRead, EcosystemWrite};
+use cooldown_core::{Diagnostic, ToolRead, ToolWrite};
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
 /// be), plus the re-lock/build status and the exit it implies.
@@ -43,16 +43,16 @@ pub(super) struct UpgradeAccum {
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
 pub(super) struct UpgradeCtx<'a> {
-    pub(super) reader: &'a dyn EcosystemRead,
-    pub(super) writer: &'a dyn EcosystemWrite,
+    pub(super) reader: &'a dyn ToolRead,
+    pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
 }
 
 impl<'a> UpgradeCtx<'a> {
     fn new(
-        reader: &'a dyn EcosystemRead,
-        writer: &'a dyn EcosystemWrite,
+        reader: &'a dyn ToolRead,
+        writer: &'a dyn ToolWrite,
         pctx: &'a super::ProjectCtx,
         opts: &'a RunOpts,
     ) -> Self {
@@ -64,8 +64,8 @@ impl<'a> UpgradeCtx<'a> {
         }
     }
 
-    pub(super) fn ecosystem_name(&self) -> &'static str {
-        self.pctx.ecosystem.as_str()
+    pub(super) fn tool_name(&self) -> &'static str {
+        self.pctx.tool.as_str()
     }
 }
 
@@ -83,10 +83,10 @@ impl Workspace {
         };
 
         for pctx in self.scoped_projects(opts) {
-            let Some(reader) = self.adapter(pctx.ecosystem) else {
+            let Some(reader) = self.adapter(pctx.tool) else {
                 continue;
             };
-            let Some(writer) = self.mutator(pctx.ecosystem) else {
+            let Some(writer) = self.mutator(pctx.tool) else {
                 continue;
             };
             ProjectUpgradeExecutor::new(
@@ -141,14 +141,5 @@ impl Workspace {
             errors: acc.errors,
             exit,
         }
-    }
-}
-
-pub(super) fn build_tool_name(ecosystem: EcosystemId) -> &'static str {
-    match ecosystem.as_str() {
-        "go" => "go",
-        "rust" => "cargo",
-        "python" => "uv",
-        _ => "tool",
     }
 }

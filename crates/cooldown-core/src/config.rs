@@ -7,7 +7,7 @@
 
 use crate::duration::{parse_duration, parse_freeze};
 use crate::error::CoreError;
-use crate::model::ecosystem_id;
+use crate::model::tool_id;
 use crate::policy::{ByKind, Origin, PatternGlob, PolicyLayer, Rule, Selector, WindowSpec};
 use jiff::SignedDuration;
 use std::collections::BTreeMap;
@@ -62,8 +62,8 @@ struct SelectorToml {
     latest: Option<bool>,
     freeze: Option<String>,
     floor: Option<String>,
-    /// Scan-exclude globs. Meaningful only under `[lang.<name>]` (added to the scan exclude list
-    /// for that ecosystem); ignored on registry/package/project selectors, which are policy-only.
+    /// Scan-exclude globs. Meaningful only under `[tool.<name>]` (added to the scan exclude list
+    /// for that tool); ignored on registry/package/project selectors, which are policy-only.
     exclude: Option<Vec<String>>,
 }
 
@@ -76,13 +76,13 @@ struct SelectorToml {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandConfig {
-    /// Extra scan-exclude globs (added to `[global]` and `[lang.*]` excludes). `--exclude` has no
+    /// Extra scan-exclude globs (added to `[global]` and `[tool.*]` excludes). `--exclude` has no
     /// CLI form; this is the only way to set it.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Restrict to these ecosystems (`--lang`); empty means "all detected".
+    /// Restrict to these tools (`--tool`); empty means "all detected".
     #[serde(default)]
-    pub lang: Vec<String>,
+    pub tool: Vec<String>,
     /// Scope to packages matching these globs (`--package`); empty means "all".
     #[serde(default)]
     pub package: Vec<String>,
@@ -133,7 +133,7 @@ struct ConfigToml {
     allow: Option<Vec<String>>,
     #[serde(rename = "strict-native")]
     strict_native: Option<bool>,
-    lang: Option<BTreeMap<String, SelectorToml>>,
+    tool: Option<BTreeMap<String, SelectorToml>>,
     registry: Option<BTreeMap<String, SelectorToml>>,
     package: Option<BTreeMap<String, SelectorToml>>,
     project: Option<BTreeMap<String, SelectorToml>>,
@@ -149,7 +149,7 @@ struct ConfigToml {
 /// Builds the [`ByKind`] window for one selector, enforcing the `latest`/`freeze`/`min-age`
 /// exclusivity.
 ///
-/// `ctx` is a human-readable label (e.g. `"top-level"` or `"[lang.rust]"`) interpolated into any
+/// `ctx` is a human-readable label (e.g. `"top-level"` or `"[tool.cargo]"`) interpolated into any
 /// error message so the user can locate the offending selector.
 ///
 /// # Errors
@@ -218,14 +218,14 @@ fn selector_rule(selector: Selector, s: &SelectorToml, ctx: &str) -> Result<Rule
 /// Parses a `cooldown.toml`'s `content` into a [`PolicyLayer`] tagged with `origin`.
 ///
 /// The top-level `min-age`/`latest`/`freeze`/`floor` keys become a [`Selector::Default`] rule, each
-/// `allow` glob becomes an exempt [`Selector::Package`] rule, and every `[lang.*]`, `[registry.*]`,
+/// `allow` glob becomes an exempt [`Selector::Package`] rule, and every `[tool.*]`, `[registry.*]`,
 /// `[package.*]`, and `[project.*]` table becomes its own selector rule. `strict-native` is carried
 /// onto the layer as-is.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::Config`] when `content` is not valid TOML or has unknown fields, when a
-/// `[lang.*]` key is not a recognised ecosystem (`go`, `rust`, `python`, `node`), when a `min-age`
+/// `[tool.*]` key is not a recognised tool (`go`, `rust`, `python`, `node`), when a `min-age`
 /// duration, `freeze` timestamp, or `floor` duration fails to parse, when a `package`/`project`
 /// glob is invalid, or when a selector sets more than one of `min-age`, `latest`, and `freeze`.
 ///
@@ -266,17 +266,17 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
         layer.rules.push(rule);
     }
 
-    if let Some(langs) = cfg.lang {
-        for (name, s) in langs {
-            let eco = ecosystem_id(&name).ok_or_else(|| {
+    if let Some(tools) = cfg.tool {
+        for (name, s) in tools {
+            let eco = tool_id(&name).ok_or_else(|| {
                 CoreError::Config(format!(
-                    "unknown ecosystem `{name}` in [lang.{name}]; recognised: go, rust, python, node"
+                    "unknown tool `{name}` in [tool.{name}]; recognised: cargo, go, uv, node"
                 ))
             })?;
             layer.rules.push(selector_rule(
-                Selector::Lang(eco),
+                Selector::Tool(eco),
                 &s,
-                &format!("[lang.{name}]"),
+                &format!("[tool.{name}]"),
             )?);
         }
     }
@@ -313,7 +313,7 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
 }
 
 /// The non-policy, CLI-flag-shaped config: `[global]` defaults, per-subcommand overrides, and
-/// per-language scan excludes. Separate from the policy [`PolicyLayer`] because these settings tune
+/// per-tool scan excludes. Separate from the policy [`PolicyLayer`] because these settings tune
 /// *how* a command runs (scanning, scope) rather than the cooldown window itself.
 #[derive(Debug, Clone, Default)]
 pub struct ScanConfig {
@@ -321,8 +321,8 @@ pub struct ScanConfig {
     pub global: CommandConfig,
     /// Per-subcommand sections, keyed by command name (`"outdated"`, `"upgrade"`, …).
     pub commands: BTreeMap<String, CommandConfig>,
-    /// `[lang.<name>].exclude` lists, keyed by ecosystem name.
-    pub lang_exclude: BTreeMap<String, Vec<String>>,
+    /// `[tool.<name>].exclude` lists, keyed by tool name.
+    pub tool_exclude: BTreeMap<String, Vec<String>>,
 }
 
 impl ScanConfig {
@@ -335,8 +335,8 @@ impl ScanConfig {
             let slot = self.commands.entry(key).or_default();
             *slot = merge_command(std::mem::take(slot), value);
         }
-        for (key, value) in other.lang_exclude {
-            self.lang_exclude.entry(key).or_default().extend(value);
+        for (key, value) in other.tool_exclude {
+            self.tool_exclude.entry(key).or_default().extend(value);
         }
         self
     }
@@ -352,13 +352,13 @@ impl ScanConfig {
         cfg
     }
 
-    /// Scan-exclude globs for `command` + `ecosystem`: `[global]` + `[<command>]` (via
-    /// [`resolved`](Self::resolved)) plus the `[lang.<eco>].exclude` list.
+    /// Scan-exclude globs for `command` + `tool`: `[global]` + `[<command>]` (via
+    /// [`resolved`](Self::resolved)) plus the `[tool.<eco>].exclude` list.
     #[must_use]
-    pub fn exclude_for(&self, command: &str, ecosystem: &str) -> Vec<String> {
+    pub fn exclude_for(&self, command: &str, tool: &str) -> Vec<String> {
         let mut out = self.resolved(command).exclude;
-        if let Some(lang) = self.lang_exclude.get(ecosystem) {
-            out.extend(lang.iter().cloned());
+        if let Some(per_tool) = self.tool_exclude.get(tool) {
+            out.extend(per_tool.iter().cloned());
         }
         out
     }
@@ -368,7 +368,7 @@ impl ScanConfig {
 /// take `other`'s value when it sets one.
 fn merge_command(mut base: CommandConfig, mut other: CommandConfig) -> CommandConfig {
     base.exclude.append(&mut other.exclude);
-    base.lang.append(&mut other.lang);
+    base.tool.append(&mut other.tool);
     base.package.append(&mut other.package);
     base.gitignore = other.gitignore.or(base.gitignore);
     base.major = other.major.or(base.major);
@@ -390,13 +390,13 @@ fn merge_command(mut base: CommandConfig, mut other: CommandConfig) -> CommandCo
     base
 }
 
-/// Parse the non-policy [`ScanConfig`] (the `[global]`/`[<command>]`/`[lang.*]` scan settings) from
+/// Parse the non-policy [`ScanConfig`] (the `[global]`/`[<command>]`/`[tool.*]` scan settings) from
 /// one config document. Returns an empty config when none of those sections are present.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Config`] if `content` is not valid config TOML, or if a `[lang.<name>]`
-/// carrying an `exclude` names an unknown ecosystem.
+/// Returns [`CoreError::Config`] if `content` is not valid config TOML, or if a `[tool.<name>]`
+/// carrying an `exclude` names an unknown tool.
 pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, CoreError> {
     let cfg: ConfigToml = toml::from_str(content)
         .map_err(|e| CoreError::Config(format!("{}: {e}", origin.token())))?;
@@ -414,16 +414,16 @@ pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, C
             scan.commands.insert(name.to_string(), section);
         }
     }
-    for (name, selector) in cfg.lang.unwrap_or_default() {
+    for (name, selector) in cfg.tool.unwrap_or_default() {
         let Some(exclude) = selector.exclude.filter(|e| !e.is_empty()) else {
             continue;
         };
-        let eco = ecosystem_id(&name).ok_or_else(|| {
+        let eco = tool_id(&name).ok_or_else(|| {
             CoreError::Config(format!(
-                "unknown ecosystem `{name}` in [lang.{name}]; recognised: go, rust, python, node"
+                "unknown tool `{name}` in [tool.{name}]; recognised: cargo, go, uv, node"
             ))
         })?;
-        scan.lang_exclude
+        scan.tool_exclude
             .entry(eco.as_str().to_string())
             .or_default()
             .extend(exclude);
@@ -549,28 +549,28 @@ mod tests {
     }
 
     #[test]
-    fn exclude_combines_global_lang_and_command() {
+    fn exclude_combines_global_tool_and_command() {
         let cfg = scan(
             r#"
 [global]
 exclude = ["build"]
 
-[lang.rust]
+[tool.cargo]
 exclude = ["vendor"]
 
 [outdated]
 exclude = ["fixtures"]
 "#,
         );
-        // The scan exclude list combines [global] + [<command>] + [lang.<eco>] (order is
+        // The scan exclude list combines [global] + [<command>] + [tool.<eco>] (order is
         // irrelevant — it is a prune set).
         assert_eq!(
-            cfg.exclude_for("outdated", "rust"),
+            cfg.exclude_for("outdated", "cargo"),
             vec!["build", "fixtures", "vendor"]
         );
-        // Another command gets [global] + [lang] but not the [outdated] entry.
-        assert_eq!(cfg.exclude_for("upgrade", "rust"), vec!["build", "vendor"]);
-        // A different ecosystem doesn't pick up rust's per-language excludes.
+        // Another command gets [global] + [tool] but not the [outdated] entry.
+        assert_eq!(cfg.exclude_for("upgrade", "cargo"), vec!["build", "vendor"]);
+        // A different tool doesn't pick up cargo's per-tool excludes.
         assert_eq!(cfg.exclude_for("outdated", "go"), vec!["build", "fixtures"]);
     }
 
@@ -609,7 +609,7 @@ gitignore = false
         let base = scan("[global]\nexclude = [\"a\"]\ngitignore = true\n");
         let over = scan("[global]\nexclude = [\"b\"]\ngitignore = false\n");
         let merged = base.merge(over);
-        assert_eq!(merged.exclude_for("outdated", "rust"), vec!["a", "b"]);
+        assert_eq!(merged.exclude_for("outdated", "cargo"), vec!["a", "b"]);
         assert_eq!(merged.resolved("outdated").gitignore, Some(false));
     }
 
@@ -632,13 +632,17 @@ build = true
         assert_eq!(up.build, Some(true));
         assert_eq!(up.offline, Some(true), "inherited from global");
         assert_eq!(up.concurrency, Some(4));
-        assert_eq!(cfg.resolved("check").strict, Some(true), "other commands see global");
+        assert_eq!(
+            cfg.resolved("check").strict,
+            Some(true),
+            "other commands see global"
+        );
     }
 
     #[test]
     fn empty_config_is_inert() {
         let cfg = scan("min-age = \"7d\"\n");
-        assert!(cfg.exclude_for("outdated", "rust").is_empty());
+        assert!(cfg.exclude_for("outdated", "cargo").is_empty());
         assert_eq!(cfg.resolved("outdated").gitignore, None);
         assert_eq!(cfg.resolved("outdated").major, None);
         assert_eq!(cfg.resolved("outdated").strict, None);

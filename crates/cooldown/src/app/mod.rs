@@ -23,19 +23,18 @@ pub use model::{
 
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, EcosystemId, EcosystemRead,
-    EcosystemWrite, FetchContext, PatternGlob, PolicyStack, Project, ResolveContext,
-    ResolvedWindow,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext, PatternGlob,
+    PolicyStack, Project, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
 };
 use jiff::Timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Per-project context: which ecosystem, the detected project, its path relative to the repo root
+/// Per-project context: which tool, the detected project, its path relative to the repo root
 /// (for `project` selectors), and its fully-assembled policy stack.
 pub struct ProjectCtx {
-    /// The ecosystem the project belongs to.
-    pub ecosystem: EcosystemId,
+    /// The tool the project belongs to.
+    pub tool: ToolId,
     /// The detected project (manifest, lock, root).
     pub project: Project,
     /// The project root relative to the repo root, used by `project` policy selectors.
@@ -53,8 +52,8 @@ pub enum Exit {
     Policy,
     /// usage / config error
     Usage,
-    /// no ecosystem detected
-    NoEcosystem,
+    /// no tool detected
+    NoTool,
     /// stale/absent lock, registry unreachable, tool failed, or unknown-age under the flag
     Environment,
     /// `outdated --exit-code N` gate tripped (adoptable updates exist); the process exits with the
@@ -79,7 +78,7 @@ impl Exit {
             Exit::Ok => 0,
             Exit::Policy => 1,
             Exit::Usage => 2,
-            Exit::NoEcosystem => 3,
+            Exit::NoTool => 3,
             Exit::Environment => 4,
             Exit::Gated(n) => i32::from(n),
         }
@@ -128,8 +127,8 @@ impl Progress {
     reason = "independent run-option flags; grouping into enums would obscure them"
 )]
 pub struct RunOpts {
-    /// Restrict to these ecosystems (empty = all detected).
-    pub lang: Vec<EcosystemId>,
+    /// Restrict to these tools (empty = all detected).
+    pub tool: Vec<ToolId>,
     /// Scope to packages matching any of these globs (empty = all).
     pub package: Vec<PatternGlob>,
     /// `--major`: allow cross-major candidates.
@@ -195,11 +194,11 @@ pub struct Workspace {
     baseline: Baseline,
 }
 
-/// The registered ecosystem adapters, split into read-side and mutation-side ports.
+/// The registered tool adapters, split into read-side and mutation-side ports.
 #[derive(Default)]
 pub struct AdapterSet {
-    readers: Vec<Arc<dyn EcosystemRead>>,
-    writers: HashMap<EcosystemId, Arc<dyn EcosystemWrite>>,
+    readers: Vec<Arc<dyn ToolRead>>,
+    writers: HashMap<ToolId, Arc<dyn ToolWrite>>,
 }
 
 impl AdapterSet {
@@ -212,30 +211,30 @@ impl AdapterSet {
     /// Register one concrete adapter as both a read-side and a mutation-side port.
     pub fn register<T>(&mut self, adapter: Arc<T>)
     where
-        T: cooldown_core::Ecosystem + 'static,
+        T: cooldown_core::Tool + 'static,
     {
         let id = adapter.id();
-        let reader: Arc<dyn EcosystemRead> = adapter.clone();
-        let writer: Arc<dyn EcosystemWrite> = adapter;
+        let reader: Arc<dyn ToolRead> = adapter.clone();
+        let writer: Arc<dyn ToolWrite> = adapter;
         self.readers.push(reader);
         self.writers.insert(id, writer);
     }
 
     /// Iterate the read-side adapters in registration order.
-    pub fn readers(&self) -> impl Iterator<Item = &Arc<dyn EcosystemRead>> {
+    pub fn readers(&self) -> impl Iterator<Item = &Arc<dyn ToolRead>> {
         self.readers.iter()
     }
 
-    /// Look up the read-side port for one ecosystem.
-    pub fn reader(&self, id: EcosystemId) -> Option<&dyn EcosystemRead> {
+    /// Look up the read-side port for one tool.
+    pub fn reader(&self, id: ToolId) -> Option<&dyn ToolRead> {
         self.readers
             .iter()
             .find(|adapter| adapter.id() == id)
             .map(std::convert::AsRef::as_ref)
     }
 
-    /// Look up the mutation-side port for one ecosystem.
-    pub fn writer(&self, id: EcosystemId) -> Option<&dyn EcosystemWrite> {
+    /// Look up the mutation-side port for one tool.
+    pub fn writer(&self, id: ToolId) -> Option<&dyn ToolWrite> {
         self.writers.get(&id).map(std::convert::AsRef::as_ref)
     }
 }
@@ -276,19 +275,19 @@ impl Workspace {
         self.projects.is_empty()
     }
 
-    fn adapter(&self, id: EcosystemId) -> Option<&dyn EcosystemRead> {
+    fn adapter(&self, id: ToolId) -> Option<&dyn ToolRead> {
         self.adapters.reader(id)
     }
 
-    fn mutator(&self, id: EcosystemId) -> Option<&dyn EcosystemWrite> {
+    fn mutator(&self, id: ToolId) -> Option<&dyn ToolWrite> {
         self.adapters.writer(id)
     }
 
-    /// Projects in scope for this run (filtered by `--lang`).
+    /// Projects in scope for this run (filtered by `--tool`).
     fn scoped_projects<'a>(&'a self, opts: &'a RunOpts) -> impl Iterator<Item = &'a ProjectCtx> {
         self.projects
             .iter()
-            .filter(move |p| opts.lang.is_empty() || opts.lang.contains(&p.ecosystem))
+            .filter(move |p| opts.tool.is_empty() || opts.tool.contains(&p.tool))
     }
 
     fn package_in_scope(opts: &RunOpts, name: &str) -> bool {
@@ -305,7 +304,7 @@ impl Workspace {
 
     async fn dependencies_in_scope(
         &self,
-        adapter: &dyn EcosystemRead,
+        adapter: &dyn ToolRead,
         pctx: &ProjectCtx,
         scope: DepScope,
         opts: &RunOpts,
@@ -319,7 +318,7 @@ impl Workspace {
 
     fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
         ResolveContext {
-            ecosystem: pctx.ecosystem,
+            tool: pctx.tool,
             project: &pctx.rel_path,
             allow_major: opts.allow_major,
         }
@@ -349,12 +348,12 @@ pub(crate) fn round2(x: f64) -> f64 {
 /// A diagnostic built from a `CoreError`, scoped to a package where possible.
 pub(crate) fn diag_from_error(
     err: &cooldown_core::CoreError,
-    ecosystem: EcosystemId,
+    tool: ToolId,
     project: &str,
     package: Option<&str>,
 ) -> Diagnostic {
     let mut d = Diagnostic::new(err.diagnostic_kind(), err.to_string())
-        .with_ecosystem(ecosystem.as_str())
+        .with_tool(tool.as_str())
         .with_project(project);
     if let Some(p) = package {
         d = d.with_package(p);

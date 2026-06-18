@@ -11,7 +11,7 @@ use serde::Serialize;
 /// The JSON schema version. Bumped only on a removal/retype/semantic change.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The one common envelope, identical in shape across ecosystems and commands.
+/// The one common envelope, identical in shape across tools and commands.
 ///
 /// Every `--json` document is an `Envelope`. The three type parameters carry the
 /// command-specific parts: `M` the flattened top-level [`meta`](Envelope::meta),
@@ -142,10 +142,10 @@ impl From<Status> for OutdatedStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutdatedItem {
-    /// The package name (ecosystem-native identifier).
+    /// The package name (tool-native identifier).
     pub name: String,
-    /// The ecosystem the package belongs to, e.g. `"go"`, `"cargo"`, or `"pypi"`.
-    pub ecosystem: String,
+    /// The tool the package belongs to, e.g. `"go"`, `"cargo"`, or `"uv"`.
+    pub tool: String,
     /// The project (manifest/workspace member) the dependency was found in.
     pub project: String,
     /// The registry the version data came from, omitted when not applicable.
@@ -219,10 +219,10 @@ pub enum CheckStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckItem {
-    /// The package name (ecosystem-native identifier).
+    /// The package name (tool-native identifier).
     pub name: String,
-    /// The ecosystem the package belongs to, e.g. `"go"`, `"cargo"`, or `"pypi"`.
-    pub ecosystem: String,
+    /// The tool the package belongs to, e.g. `"go"`, `"cargo"`, or `"uv"`.
+    pub tool: String,
     /// The project (manifest/workspace member) the dependency was found in.
     pub project: String,
     /// The registry the version data came from, omitted when not applicable.
@@ -299,10 +299,10 @@ pub struct SkippedInfo {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeItem {
-    /// The package name (ecosystem-native identifier).
+    /// The package name (tool-native identifier).
     pub name: String,
-    /// The ecosystem the package belongs to, e.g. `"go"`, `"cargo"`, or `"pypi"`.
-    pub ecosystem: String,
+    /// The tool the package belongs to, e.g. `"go"`, `"cargo"`, or `"uv"`.
+    pub tool: String,
     /// The project (manifest/workspace member) the dependency was found in.
     pub project: String,
     /// The registry the version data came from, omitted when not applicable.
@@ -415,8 +415,8 @@ pub struct ExplainSummary {}
 pub struct ConfigItem {
     /// The project root relative to the repo root.
     pub project: String,
-    /// The ecosystem the project belongs to.
-    pub ecosystem: String,
+    /// The tool the project belongs to.
+    pub tool: String,
     /// The resolved default cooldown window in fractional days.
     pub effective_default_min_age_days: f64,
     /// Which layer/field decided the resolved default window.
@@ -443,8 +443,8 @@ pub struct ConfigMeta {}
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineItem {
-    /// The ecosystem token.
-    pub ecosystem: String,
+    /// The tool token.
+    pub tool: String,
     /// The project path relative to the repo root.
     pub project: String,
     /// The package name.

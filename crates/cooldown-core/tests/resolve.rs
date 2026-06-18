@@ -27,7 +27,7 @@ fn cli(toml: &str) -> PolicyLayer {
 
 fn q<'a>(pkg: &'a str, project: &'a Utf8Path, kind: ResolveKind) -> ResolveQuery<'a> {
     ResolveQuery {
-        ecosystem: GO,
+        tool: GO,
         package: pkg,
         registry: None,
         project,
@@ -203,14 +203,14 @@ fn min_age_source_string() {
     assert_eq!(w.source(), "repo:cooldown.toml:package=left-pad");
 }
 
-/// A `lang` selector applies only to its ecosystem.
+/// A `tool` selector applies only to its tool.
 #[test]
-fn lang_selector_scopes_by_ecosystem() {
+fn tool_selector_scopes_by_tool() {
     let layers = vec![
         config::builtin_default_layer(),
-        repo("[lang.go]\nmin-age = \"21d\"\n[lang.python]\nmin-age = \"30d\""),
+        repo("[tool.go]\nmin-age = \"21d\"\n[tool.uv]\nmin-age = \"30d\""),
     ];
-    // GO query picks the go lang rule (21d), not python's.
+    // GO query picks the go tool rule (21d), not uv's.
     let w = win(&layers, "x", ResolveKind::CurrentPin);
     assert_eq!(w.spec, WindowSpec::MinAge(days(21)));
 }

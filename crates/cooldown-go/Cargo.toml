@@ -1,6 +1,6 @@
 [package]
 name = "cooldown-go"
-description = "Go ecosystem adapter for cooldown: GOPROXY publish-time reads, x/mod semver/pseudo-version semantics, and go-driven resolution/apply."
+description = "Go tool adapter for cooldown: GOPROXY publish-time reads, x/mod semver/pseudo-version semantics, and go-driven resolution/apply."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

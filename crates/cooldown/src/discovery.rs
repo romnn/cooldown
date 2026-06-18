@@ -126,7 +126,7 @@ pub fn repo_cascade_layers(
     Ok(layers)
 }
 
-/// Load the merged non-policy scan config (`[global]`/`[<command>]`/`[lang.*]` settings) that
+/// Load the merged non-policy scan config (`[global]`/`[<command>]`/`[tool.*]` settings) that
 /// controls detection: gitignore honoring, the exclude list, and per-command flag defaults.
 ///
 /// Lowest precedence first: the global user config (unless `no_global`), then the repo-root
@@ -136,7 +136,7 @@ pub fn repo_cascade_layers(
 /// # Errors
 ///
 /// Returns [`CoreError::Filesystem`] if a present file cannot be read, [`CoreError::Config`] if one
-/// does not parse or names an unknown ecosystem under `[lang.*]`, or if an explicit `--config` file
+/// does not parse or names an unknown tool under `[tool.*]`, or if an explicit `--config` file
 /// is missing.
 pub fn scan_config(
     repo_root: &Utf8Path,

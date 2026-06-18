@@ -1,5 +1,5 @@
 //! Presentation for the cooldown CLI: the stable, versioned `--json` envelope (one shape across
-//! ecosystems and commands) and the colorful TTY tables. `--json` never changes the exit code; it
+//! tools and commands) and the colorful TTY tables. `--json` never changes the exit code; it
 //! only swaps the renderer.
 
 pub mod model;
@@ -15,7 +15,7 @@ use serde::Serialize;
 ///
 /// This is the entry point for `--json` output: it renders the stable, versioned
 /// envelope as a multi-line JSON document. The shape is identical across
-/// ecosystems and commands; see [`model`] for the contract.
+/// tools and commands; see [`model`] for the contract.
 ///
 /// # Errors
 ///
@@ -79,7 +79,7 @@ mod tests {
             },
             vec![OutdatedItem {
                 name: "golang.org/x/mod".into(),
-                ecosystem: "go".into(),
+                tool: "go".into(),
                 project: ".".into(),
                 registry: Some("proxy.golang.org".into()),
                 direct: true,

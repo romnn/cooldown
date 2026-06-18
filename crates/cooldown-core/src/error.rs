@@ -152,10 +152,11 @@ pub struct Diagnostic {
     /// The human-readable description shown on the TTY and serialized in the
     /// JSON envelope. Always set.
     pub message: String,
-    /// The ecosystem the diagnostic originates from (for example `go`, `cargo`,
-    /// or `uv`), when it is package-specific.
+    /// The tool the diagnostic originates from (for example `go`, `cargo`, or
+    /// `uv`) — both the ecosystem it is package-specific to and the external
+    /// binary it stems from, which are one and the same.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ecosystem: Option<String>,
+    pub tool: Option<String>,
     /// The project (workspace member or manifest) the diagnostic applies to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -169,10 +170,6 @@ pub struct Diagnostic {
     /// endpoint), when relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
-    /// The external tool involved (for example `go`, `cargo`, or `uv`), when the
-    /// diagnostic stems from a tool invocation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
     /// The filesystem path involved (for example a lockfile or manifest), when
     /// relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,8 +188,8 @@ pub enum DiagnosticKind {
     /// The release age of a version could not be determined, so the cooldown
     /// policy could not be evaluated for it.
     UnknownAge,
-    /// A native ecosystem constraint is stricter than the configured cooldown,
-    /// so the ecosystem's own rule governs instead.
+    /// A native tool constraint is stricter than the configured cooldown,
+    /// so the tool's own rule governs instead.
     StricterNative,
     /// The version under consideration has been yanked upstream.
     Yanked,
@@ -258,7 +255,7 @@ impl Diagnostic {
     /// use cooldown_core::{Diagnostic, DiagnosticKind};
     ///
     /// let diag = Diagnostic::new(DiagnosticKind::Yanked, "version was yanked")
-    ///     .with_ecosystem("cargo")
+    ///     .with_tool("cargo")
     ///     .with_package("serde")
     ///     .with_version("1.0.0");
     ///
@@ -269,20 +266,19 @@ impl Diagnostic {
         Diagnostic {
             kind,
             message: message.into(),
-            ecosystem: None,
+            tool: None,
             project: None,
             package: None,
             version: None,
             registry: None,
-            tool: None,
             path: None,
         }
     }
 
-    /// Sets the [`ecosystem`](Diagnostic::ecosystem) field and returns `self` for chaining.
+    /// Sets the [`tool`](Diagnostic::tool) field and returns `self` for chaining.
     #[must_use]
-    pub fn with_ecosystem(mut self, e: impl Into<String>) -> Self {
-        self.ecosystem = Some(e.into());
+    pub fn with_tool(mut self, e: impl Into<String>) -> Self {
+        self.tool = Some(e.into());
         self
     }
     /// Sets the [`project`](Diagnostic::project) field and returns `self` for chaining.
@@ -307,12 +303,6 @@ impl Diagnostic {
     #[must_use]
     pub fn with_registry(mut self, r: impl Into<String>) -> Self {
         self.registry = Some(r.into());
-        self
-    }
-    /// Sets the [`tool`](Diagnostic::tool) field and returns `self` for chaining.
-    #[must_use]
-    pub fn with_tool(mut self, t: impl Into<String>) -> Self {
-        self.tool = Some(t.into());
         self
     }
     /// Sets the [`path`](Diagnostic::path) field and returns `self` for chaining.
