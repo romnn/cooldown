@@ -463,6 +463,23 @@ pub enum CandidateScope {
     AllowCrossMajor,
 }
 
+/// How an ecosystem's project roots are recognized on disk.
+///
+/// Adapters *declare* this rather than scanning themselves: the orchestrator runs one
+/// gitignore-aware, exclude-aware walk per ecosystem from these markers, so detection policy
+/// (`.gitignore` honoring, the exclude list) is owned in one agnostic place and an adapter cannot
+/// bypass it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectMarker {
+    /// The lock/manifest filename whose presence marks a project root (e.g. `"Cargo.lock"`).
+    pub lockfile: &'static str,
+    /// The manifest filename recorded on the detected [`Project`] (e.g. `"Cargo.toml"`).
+    pub manifest: &'static str,
+    /// When `true`, a marked root's descendants are not also reported — a workspace root already
+    /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
+    pub workspace_root: bool,
+}
+
 /// The platform/abi/python-version/markers a lock must satisfy. Version-granular ecosystems leave
 /// this empty.
 #[derive(Debug, Clone, Default)]

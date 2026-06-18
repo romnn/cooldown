@@ -7,12 +7,12 @@ use crate::pypi::{PYPI, PyPi};
 use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use cooldown_core::{
     ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EcosystemId, EcosystemRead,
     EcosystemWrite, FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
-    Project, ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result,
-    Selector, SkipReason, Skipped, VerifyReport, Version,
+    Project, ProjectMarker, ProjectMutationJournal, RawWindow, Release, ReleaseOrder,
+    ReleaseQuality, Result, Selector, SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_toml_util::read_toml_file;
@@ -101,32 +101,6 @@ fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> 
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
     })
-}
-
-fn find_uv_locks(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
-    if root.join("uv.lock").is_file() {
-        out.push(root.to_owned());
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            ".git" | ".venv" | "node_modules" | "target" | "__pycache__"
-        ) {
-            continue;
-        }
-        if let Ok(child) = Utf8PathBuf::from_path_buf(p) {
-            find_uv_locks(&child, out);
-        }
-    }
 }
 
 fn read_lock(project: &Project) -> Result<UvLock> {
@@ -220,17 +194,13 @@ impl EcosystemRead for UvEcosystem {
         }
     }
 
-    async fn detect(&self, root: &Utf8Path) -> Result<Vec<Project>> {
-        let mut roots = Vec::new();
-        find_uv_locks(root, &mut roots);
-        Ok(roots
-            .into_iter()
-            .map(|dir| Project {
-                manifest: dir.join("pyproject.toml"),
-                root: dir,
-                kind: UV_ID,
-            })
-            .collect())
+    fn project_marker(&self) -> ProjectMarker {
+        // A `uv.lock` marks a workspace root; nested locks below it belong to the same uv workspace.
+        ProjectMarker {
+            lockfile: "uv.lock",
+            manifest: "pyproject.toml",
+            workspace_root: true,
+        }
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -360,6 +330,7 @@ impl EcosystemWrite for UvEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
 
     fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");

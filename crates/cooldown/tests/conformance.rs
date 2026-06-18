@@ -8,7 +8,7 @@
 )]
 
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use cooldown::app::{
     AdapterSet, Baseline, CheckStatus, Exit, OutdatedStatus, ProjectCtx, RunOpts, Workspace,
 };
@@ -100,8 +100,12 @@ impl EcosystemRead for FakeEco {
             ..Default::default()
         }
     }
-    async fn detect(&self, _root: &Utf8Path) -> Result<Vec<Project>> {
-        Ok(vec![self.project()])
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        cooldown_core::ProjectMarker {
+            lockfile: "fake.lock",
+            manifest: "fake.toml",
+            workspace_root: true,
+        }
     }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         if scope == DepScope::Graph

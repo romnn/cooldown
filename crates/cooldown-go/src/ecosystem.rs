@@ -6,12 +6,11 @@ use crate::mutation;
 use crate::proxy::GoProxy;
 use crate::semver;
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, EcosystemId,
     EcosystemRead, EcosystemWrite, FetchContext, MajorKey, NativePolicyLayer, PackageRegistry,
-    Plan, Project, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, Result,
-    SkipReason, Skipped, VerifyReport, Version,
+    Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality,
+    Result, SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -137,33 +136,6 @@ fn skipped_on_apply_error(change: &Change, error: cooldown_core::CoreError) -> R
     })
 }
 
-fn find_go_mods(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
-    let manifest = root.join("go.mod");
-    if manifest.is_file() {
-        out.push(manifest);
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            "vendor" | ".git" | "node_modules" | "testdata" | "target"
-        ) {
-            continue;
-        }
-        if let Ok(child) = Utf8PathBuf::from_path_buf(path) {
-            find_go_mods(&child, out);
-        }
-    }
-}
-
 impl GoEcosystem {
     /// Build a `Dependency` from a resolved module + the MVS-floor map.
     fn dependency_of(
@@ -236,19 +208,14 @@ impl EcosystemRead for GoEcosystem {
         }
     }
 
-    async fn detect(&self, root: &Utf8Path) -> Result<Vec<Project>> {
-        let mut manifests = Vec::new();
-        find_go_mods(root, &mut manifests);
-        Ok(manifests
-            .into_iter()
-            .map(|manifest| Project {
-                root: manifest
-                    .parent()
-                    .map_or_else(|| root.to_owned(), std::borrow::ToOwned::to_owned),
-                kind: GO_ID,
-                manifest,
-            })
-            .collect())
+    fn project_marker(&self) -> ProjectMarker {
+        // Go multi-module repos nest independent modules, so every `go.mod` is its own project
+        // (not a workspace root).
+        ProjectMarker {
+            lockfile: "go.mod",
+            manifest: "go.mod",
+            workspace_root: false,
+        }
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -408,6 +375,7 @@ impl EcosystemWrite for GoEcosystem {
 mod tests {
     use super::*;
     use crate::proxy::ProxyBase;
+    use camino::{Utf8Path, Utf8PathBuf};
     use cooldown_core::{
         ArtifactScope, Dependency, FetchContext, PackageId, Project, RawRelease, UpdateKind,
     };

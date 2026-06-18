@@ -41,6 +41,7 @@ allow_attributes_without_reason = "deny"
 # Internal crates
 cooldown-core = { path = "crates/cooldown-core", version = "0.1.0" }
 cooldown-toml-util = { path = "crates/cooldown-toml-util", version = "0.1.0" }
+cooldown-scan = { path = "crates/cooldown-scan", version = "0.1.0" }
 cooldown-registry = { path = "crates/cooldown-registry", version = "0.1.0" }
 cooldown-render = { path = "crates/cooldown-render", version = "0.1.0" }
 cooldown-go = { path = "crates/cooldown-go", version = "0.1.0" }
@@ -60,12 +61,15 @@ thiserror = "2"
 color-eyre = "0.6"
 camino = { version = "1", features = ["serde1"] }
 globset = "0.4"
+ignore = "0.4"
 regex = "1"
 semver = "1"
 pep440_rs = "0.7"
 futures = "0.3"
 comfy-table = "7"
 fs4 = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Dev
 insta = { version = "1", features = ["json", "redactions"] }

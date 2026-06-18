@@ -6,12 +6,12 @@ use crate::cargocmd::Cargo;
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::version;
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use cooldown_core::{
     ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EcosystemId, EcosystemRead,
     EcosystemWrite, FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
-    Project, ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result,
-    Selector, SkipReason, Skipped, VerifyReport, Version,
+    Project, ProjectMarker, ProjectMutationJournal, RawWindow, Release, ReleaseOrder,
+    ReleaseQuality, Result, Selector, SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_toml_util::read_toml_file;
@@ -105,29 +105,6 @@ fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> 
     })
 }
 
-fn find_cargo_locks(root: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
-    if root.join("Cargo.lock").is_file() {
-        out.push(root.to_owned());
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if matches!(name.as_ref(), "target" | ".git" | "node_modules" | "vendor") {
-            continue;
-        }
-        if let Ok(child) = Utf8PathBuf::from_path_buf(p) {
-            find_cargo_locks(&child, out);
-        }
-    }
-}
-
 /// Parse `[package.metadata.cooldown]` / `[workspace.metadata.cooldown]` `min-age` into a native rule.
 fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
     let Some(value) = read_toml_file::<toml::Value>(manifest, "Cargo.toml")? else {
@@ -181,17 +158,14 @@ impl EcosystemRead for CargoEcosystem {
         }
     }
 
-    async fn detect(&self, root: &Utf8Path) -> Result<Vec<Project>> {
-        let mut roots = Vec::new();
-        find_cargo_locks(root, &mut roots);
-        Ok(roots
-            .into_iter()
-            .map(|dir| Project {
-                manifest: dir.join("Cargo.toml"),
-                root: dir,
-                kind: CARGO_ID,
-            })
-            .collect())
+    fn project_marker(&self) -> ProjectMarker {
+        // A `Cargo.lock` marks a workspace root: `cargo metadata` there already covers every
+        // member, so nested lockfiles below it are not separate projects.
+        ProjectMarker {
+            lockfile: "Cargo.lock",
+            manifest: "Cargo.toml",
+            workspace_root: true,
+        }
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -319,6 +293,7 @@ impl EcosystemWrite for CargoEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
 
     fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");

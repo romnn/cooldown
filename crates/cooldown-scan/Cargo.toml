@@ -1,0 +1,22 @@
+[package]
+name = "cooldown-scan"
+description = "Gitignore-aware filesystem scanning for cooldown: find ecosystem project roots under a directory, honoring .gitignore and a configurable exclude list."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cooldown-core.workspace = true
+camino.workspace = true
+globset.workspace = true
+ignore.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

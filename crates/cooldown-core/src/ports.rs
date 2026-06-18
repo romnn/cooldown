@@ -9,7 +9,7 @@
 use crate::error::Result;
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, EcosystemId, FetchContext, Plan,
-    Project, Release, VerifyReport, Version,
+    Project, ProjectMarker, Release, VerifyReport, Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -72,14 +72,11 @@ pub trait EcosystemRead: Send + Sync {
 
     /// Detects the projects of this ecosystem rooted under `root`.
     ///
-    /// Returns one [`Project`] per discovered manifest/lock pair under `root`, or an empty vector
-    /// if this ecosystem is not present. Must not fail merely because no projects are found.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if the filesystem cannot be walked or a manifest
-    /// is present but malformed.
-    async fn detect(&self, root: &Utf8Path) -> Result<Vec<Project>>;
+    /// Declares the filesystem [marker](ProjectMarker) that identifies this ecosystem's project
+    /// roots. The orchestrator performs a single gitignore-aware, exclude-aware scan from it, so an
+    /// adapter neither walks the tree nor decides `.gitignore`/exclude policy itself — that concern
+    /// lives in one agnostic place and is enforced by this interface.
+    fn project_marker(&self) -> ProjectMarker;
 
     /// Returns the dependencies in scope for `project`.
     ///
