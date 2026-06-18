@@ -40,7 +40,6 @@ pub fn json_schema() -> Value {
             "package": { "type": "string" },
             "version": { "type": "string" },
             "registry": { "type": "string" },
-            "tool": { "type": "string" },
             "path": { "type": "string" }
         },
         "additionalProperties": false

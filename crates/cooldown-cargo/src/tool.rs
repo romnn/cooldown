@@ -91,6 +91,7 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
         let rank = u32::try_from(i).unwrap_or(u32::MAX);
         r.order = ReleaseOrder(rank.to_be_bytes().to_vec());
     }
+    cooldown_core::debug_assert_sorted(&releases);
     releases
 }
 
