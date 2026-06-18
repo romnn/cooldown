@@ -6,7 +6,7 @@
 //! `cooldown.toml`, else `$HOME`.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::config::parse_config;
+use cooldown_core::config::{ScanConfig, parse_config, parse_scan_config};
 use cooldown_core::{CoreError, Origin, PolicyLayer};
 
 /// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
@@ -124,6 +124,55 @@ pub fn repo_cascade_layers(
         }
     }
     Ok(layers)
+}
+
+/// Load the merged non-policy scan config (`[global]`/`[<command>]`/`[lang.*]` settings) that
+/// controls detection: gitignore honoring, the exclude list, and per-command flag defaults.
+///
+/// Lowest precedence first: the global user config (unless `no_global`), then the repo-root
+/// `cooldown.toml`, then an explicit `--config` file (which, like the policy layer, must exist if
+/// named). Exclude lists concatenate; scalar overrides take the highest-precedence value.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`] if a present file cannot be read, [`CoreError::Config`] if one
+/// does not parse or names an unknown ecosystem under `[lang.*]`, or if an explicit `--config` file
+/// is missing.
+pub fn scan_config(
+    repo_root: &Utf8Path,
+    explicit: Option<&Utf8Path>,
+    no_global: bool,
+) -> Result<ScanConfig, CoreError> {
+    let mut scan = ScanConfig::default();
+    if !no_global
+        && let Some(path) = global_config_path()
+        && let Some(layer) = read_scan(&path, &Origin::Global)?
+    {
+        scan = scan.merge(layer);
+    }
+    let repo = repo_root.join(CONFIG_FILE);
+    if let Some(layer) = read_scan(&repo, &Origin::Repo(repo.clone()))? {
+        scan = scan.merge(layer);
+    }
+    if let Some(path) = explicit {
+        match read_scan(path, &Origin::Config(path.to_owned()))? {
+            Some(layer) => scan = scan.merge(layer),
+            None => {
+                return Err(CoreError::Config(format!(
+                    "--config file not found: {path}"
+                )));
+            }
+        }
+    }
+    Ok(scan)
+}
+
+fn read_scan(path: &Utf8Path, origin: &Origin) -> Result<Option<ScanConfig>, CoreError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(parse_scan_config(&content, origin)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    }
 }
 
 fn read_layer(path: &Utf8Path, origin: Origin) -> Result<Option<PolicyLayer>, CoreError> {
