@@ -57,6 +57,9 @@ pub enum Exit {
     NoEcosystem,
     /// stale/absent lock, registry unreachable, tool failed, or unknown-age under the flag
     Environment,
+    /// `outdated --exit-code N` gate tripped (adoptable updates exist); the process exits with the
+    /// caller-supplied code `N`. Distinct from the fixed taxonomy so CI can pick its own code.
+    Gated(u8),
 }
 
 impl Exit {
@@ -78,6 +81,7 @@ impl Exit {
             Exit::Usage => 2,
             Exit::NoEcosystem => 3,
             Exit::Environment => 4,
+            Exit::Gated(n) => i32::from(n),
         }
     }
 
@@ -85,6 +89,34 @@ impl Exit {
     #[must_use]
     pub fn is_ok(self) -> bool {
         self == Exit::Ok
+    }
+}
+
+/// Where human-facing progress notes go while a slow command runs (detection, registry fan-out).
+///
+/// These are coarse "still working" lines, not the structured `tracing` log: they exist so a plain
+/// `cooldown outdated` isn't silent for ten seconds. They are suppressed entirely when `--log-level`
+/// is on (the log already narrates progress), routed to stderr under `--json` (so stdout stays pure
+/// JSON), and to stdout otherwise (alongside the pretty report).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Progress {
+    /// Emit to stdout (default human/pretty mode).
+    Stdout,
+    /// Emit to stderr (`--json` mode, to keep stdout machine-readable).
+    Stderr,
+    /// Emit nothing (`--log-level` is on, so `tracing` covers it).
+    #[default]
+    Silent,
+}
+
+impl Progress {
+    /// Print one progress note to the configured stream (a no-op when [`Progress::Silent`]).
+    pub fn say(self, message: &str) {
+        match self {
+            Progress::Stdout => println!("{message}"),
+            Progress::Stderr => eprintln!("{message}"),
+            Progress::Silent => {}
+        }
     }
 }
 
@@ -120,6 +152,11 @@ pub struct RunOpts {
     pub build: bool,
     /// `--dry-run`: resolve and print the plan; never mutate.
     pub dry_run: bool,
+    /// `--exit-code N` (outdated): exit with `N` when adoptable updates exist (CI gate). `None`
+    /// keeps `outdated` informational (always exit 0).
+    pub outdated_exit_code: Option<u8>,
+    /// Where coarse progress notes go while the command runs.
+    pub progress: Progress,
     /// Concurrency for registry fan-out.
     pub concurrency: usize,
 }

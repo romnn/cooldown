@@ -26,6 +26,7 @@ path = "src/main.rs"
 cooldown-core.workspace = true
 cooldown-toml-util.workspace = true
 cooldown-registry.workspace = true
+cooldown-scan.workspace = true
 cooldown-render.workspace = true
 cooldown-go.workspace = true
 cooldown-cargo.workspace = true
@@ -40,6 +41,8 @@ serde_json.workspace = true
 toml.workspace = true
 futures.workspace = true
 fs4.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

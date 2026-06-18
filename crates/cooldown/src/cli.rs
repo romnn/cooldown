@@ -8,10 +8,67 @@ mod setup;
 use crate::app::Exit;
 use crate::discovery;
 use camino::Utf8PathBuf;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cooldown_core::CoreError;
 use cooldown_render as render;
 use std::io::IsTerminal;
+
+/// Verbosity for the diagnostic log written to stderr (independent of `--json`/report output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum LogLevel {
+    /// No logging (the default).
+    #[default]
+    Off,
+    /// Fatal-ish conditions only.
+    Error,
+    /// Recoverable problems and fallbacks.
+    Warn,
+    /// High-level progress (detection, per-project evaluation).
+    Info,
+    /// Per-dependency and per-request detail.
+    Debug,
+    /// Everything, including cache hits and subprocess argv.
+    Trace,
+}
+
+impl LogLevel {
+    /// The `EnvFilter` directive for this level: verbose levels are scoped to cooldown's own crates
+    /// so noisy transitive deps (`reqwest`, `hyper`, `rustls`) stay at `warn`.
+    fn directive(self) -> String {
+        let level = match self {
+            LogLevel::Off => return "off".to_string(),
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        };
+        format!(
+            "warn,cooldown={level},cooldown_core={level},cooldown_cargo={level},\
+cooldown_go={level},cooldown_uv={level},cooldown_registry={level},cooldown_toml_util={level}"
+        )
+    }
+}
+
+/// Install the tracing subscriber that writes to stderr.
+///
+/// `RUST_LOG`, when set and non-empty, is honored verbatim as a full `EnvFilter` directive (the
+/// standard Rust escape hatch); otherwise the `--log-level` / `COOLDOWN_LOG` selection drives it.
+/// Idempotent: a second call is a no-op (so tests that build a CLI can't double-install).
+fn init_logging(level: LogLevel) {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let directive = match std::env::var("RUST_LOG") {
+        Ok(value) if !value.is_empty() => value,
+        _ => level.directive(),
+    };
+    let filter = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("off"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
+}
 
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
@@ -87,12 +144,26 @@ struct GlobalArgs {
     /// Exempt matching packages from the cooldown (repeatable, audited).
     #[arg(long, global = true, value_name = "GLOB")]
     allow: Vec<String>,
-    /// Allow major version changes (default: within the current major).
+    /// Allow major version changes. Default: ON for `outdated` (so a new major is discoverable),
+    /// OFF for `upgrade`/`check`/etc. (a major bump is usually breaking work you opt into).
     #[arg(long, global = true)]
     major: bool,
+    /// Stay within the current major (the inverse of `--major`; alias `--minor`). Useful for
+    /// clean `outdated` output in CI, where `outdated` otherwise shows cross-major candidates.
+    #[arg(
+        long = "no-major",
+        visible_alias = "minor",
+        global = true,
+        conflicts_with = "major"
+    )]
+    no_major: bool,
     /// With --major, apply cross-major to ALL eligible deps (else --package is required).
     #[arg(long = "major-all", global = true)]
     major_all: bool,
+    /// (outdated) Also list up-to-date deps. Hidden by default so the report shows only deps with
+    /// something to act on; the summary line still counts every dependency.
+    #[arg(long, global = true)]
+    all: bool,
 
     /// Scope the command to matching packages (repeatable).
     #[arg(long, short = 'p', global = true, value_name = "GLOB")]
@@ -106,6 +177,36 @@ struct GlobalArgs {
         env = "COOLDOWN_LANG"
     )]
     lang: Vec<String>,
+    /// Only the Rust/Cargo ecosystem — skip detecting/enumerating Go, Python, and Node entirely
+    /// (shorthand for `--lang rust`; the right default for a Cargo workspace in a polyglot monorepo).
+    #[arg(long, global = true, conflicts_with = "lang")]
+    cargo: bool,
+    /// Don't honor `.gitignore` while detecting projects (the rare repo whose lockfiles are
+    /// themselves ignored). By default detection skips gitignored paths — correct and faster.
+    #[arg(long = "no-gitignore", global = true)]
+    no_gitignore: bool,
+    /// (outdated) Exit with this code when adoptable updates exist, for CI gating. Bare `--exit-code`
+    /// means 1, or pass `--exit-code=N`; omitting it keeps `outdated` informational (always exit 0).
+    #[arg(
+        long = "exit-code",
+        global = true,
+        value_name = "CODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1"
+    )]
+    exit_code: Option<u8>,
+    /// Diagnostic log verbosity on stderr (`RUST_LOG` overrides). One of: off, error, warn, info,
+    /// debug, trace.
+    #[arg(
+        long = "log-level",
+        global = true,
+        value_name = "LEVEL",
+        value_enum,
+        default_value_t = LogLevel::Off,
+        env = "COOLDOWN_LOG"
+    )]
+    log_level: LogLevel,
     /// Evaluate only direct deps.
     #[arg(long = "direct-only", global = true)]
     direct_only: bool,
@@ -168,9 +269,11 @@ struct GlobalArgs {
 /// Any [`CoreError`] that escapes the dispatch is printed to stderr and mapped to an exit by its
 /// kind, so this function itself is infallible.
 pub async fn run(cli: Cli) -> Exit {
+    init_logging(cli.global.log_level);
     match run_inner(cli).await {
         Ok(exit) => exit,
         Err(e) => {
+            tracing::debug!(error = %e, "run failed");
             eprintln!("error: {e}");
             exit_for_error(&e)
         }
@@ -217,7 +320,10 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         return res;
     }
 
-    let prepared = setup::prepare_run(g).await?;
+    // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The
+    // config (`[<command>]`/`[global]`) and `--major`/`--no-major` refine this inside `prepare_run`.
+    let default_major = matches!(cli.command, Command::Outdated);
+    let prepared = setup::prepare_run(g, command_name(&cli.command), default_major).await?;
     if prepared.ws.is_empty() {
         let workdir = g.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
         if g.json {
@@ -319,4 +425,15 @@ min-age = "7d"
 
 # A hard minimum no nearer config can weaken:
 # floor = "3d"
+
+# Scan & per-command flag defaults (a CLI flag always overrides these):
+# [global]
+# exclude = ["third_party"]   # directories never scanned (gitignore is honored by default)
+# gitignore = true            # set false to scan gitignored paths too
+#
+# [lang.rust]
+# exclude = ["vendor"]        # extra excludes for one ecosystem
+#
+# [outdated]
+# major = true                # outdated shows cross-major by default; set false for minor-only
 "#;
