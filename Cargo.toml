@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Standalone example projects used only to generate README screenshots; not part of the build.
+exclude = ["examples"]
 
 [workspace.package]
 version = "0.1.0"

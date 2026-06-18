@@ -91,6 +91,11 @@ tasks:
     cmds:
       - cargo +nightly watchdoc --all-features {{.CLI_ARGS}}
 
+  screenshots:
+    desc: "regenerate the README screenshots (needs charmbracelet/freeze)"
+    cmds:
+      - bash scripts/screenshots.sh
+
   outdated:
     desc: "check for outdated cargo workspace dependencies"
     cmds:

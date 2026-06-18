@@ -1,5 +1,9 @@
 # cooldown
 
+<p align="center">
+  <img src="docs/outdated.png" alt="cooldown outdated — adoptable updates (green) vs. those still in their cooldown window (yellow)" width="760">
+</p>
+
 A unified, language-agnostic **dependency-cooldown** CLI: refuse to adopt any dependency version
 younger than a minimum release age, across tools, from one policy core.
 
@@ -37,6 +41,9 @@ cooldown outdated      # what could update — "adoptable now" vs "in cooldown"
 cooldown upgrade       # move to the newest version older than the cooldown, then re-lock
 cooldown check         # CI gate: exit non-zero if anything resolved is younger than the cooldown
 ```
+
+`cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
+already cleared their cooldown window are proposed.
 
 The happy path is zero config. Raising the whole repo to 14 days is one line of `cooldown.toml`:
 

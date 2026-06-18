@@ -7,3 +7,4 @@
 goreleaser-dist/
 .intentionally-empty-file.o
 *_compiler_family.o
+examples/*/target/
