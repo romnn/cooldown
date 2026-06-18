@@ -10,18 +10,26 @@ pub mod baseline;
 mod check;
 mod explain;
 mod lock;
+mod model;
 mod outdated;
 mod upgrade;
 
 pub use baseline::Baseline;
+pub use model::{
+    BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
+    EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
+    OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+};
 
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, Ecosystem, EcosystemId,
-    FetchContext, PatternGlob, PolicyStack, Project, ResolveContext, ResolvedWindow,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, EcosystemId, EcosystemRead,
+    EcosystemWrite, FetchContext, PatternGlob, PolicyStack, Project, ResolveContext,
+    ResolvedWindow,
 };
-use cooldown_render as render;
 use jiff::Timestamp;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Per-project context: which ecosystem, the detected project, its path relative to the repo root
 /// (for `project` selectors), and its fully-assembled policy stack.
@@ -140,10 +148,55 @@ impl RunOpts {
 
 /// The detected adapters, per-project policy, and the run's single `now`.
 pub struct Workspace {
-    ecosystems: Vec<Box<dyn Ecosystem>>,
+    adapters: AdapterSet,
     projects: Vec<ProjectCtx>,
     now: Timestamp,
     baseline: Baseline,
+}
+
+/// The registered ecosystem adapters, split into read-side and mutation-side ports.
+#[derive(Default)]
+pub struct AdapterSet {
+    readers: Vec<Arc<dyn EcosystemRead>>,
+    writers: HashMap<EcosystemId, Arc<dyn EcosystemWrite>>,
+}
+
+impl AdapterSet {
+    /// Create an empty adapter registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one concrete adapter as both a read-side and a mutation-side port.
+    pub fn register<T>(&mut self, adapter: Arc<T>)
+    where
+        T: cooldown_core::Ecosystem + 'static,
+    {
+        let id = adapter.id();
+        let reader: Arc<dyn EcosystemRead> = adapter.clone();
+        let writer: Arc<dyn EcosystemWrite> = adapter;
+        self.readers.push(reader);
+        self.writers.insert(id, writer);
+    }
+
+    /// Iterate the read-side adapters in registration order.
+    pub fn readers(&self) -> impl Iterator<Item = &Arc<dyn EcosystemRead>> {
+        self.readers.iter()
+    }
+
+    /// Look up the read-side port for one ecosystem.
+    pub fn reader(&self, id: EcosystemId) -> Option<&dyn EcosystemRead> {
+        self.readers
+            .iter()
+            .find(|adapter| adapter.id() == id)
+            .map(std::convert::AsRef::as_ref)
+    }
+
+    /// Look up the mutation-side port for one ecosystem.
+    pub fn writer(&self, id: EcosystemId) -> Option<&dyn EcosystemWrite> {
+        self.writers.get(&id).map(std::convert::AsRef::as_ref)
+    }
 }
 
 impl Workspace {
@@ -151,13 +204,13 @@ impl Workspace {
     /// `now`, and the loaded baseline.
     #[must_use]
     pub fn new(
-        ecosystems: Vec<Box<dyn Ecosystem>>,
+        adapters: AdapterSet,
         projects: Vec<ProjectCtx>,
         now: Timestamp,
         baseline: Baseline,
     ) -> Self {
         Workspace {
-            ecosystems,
+            adapters,
             projects,
             now,
             baseline,
@@ -182,11 +235,12 @@ impl Workspace {
         self.projects.is_empty()
     }
 
-    fn adapter(&self, id: EcosystemId) -> Option<&dyn Ecosystem> {
-        self.ecosystems
-            .iter()
-            .find(|e| e.id() == id)
-            .map(std::convert::AsRef::as_ref)
+    fn adapter(&self, id: EcosystemId) -> Option<&dyn EcosystemRead> {
+        self.adapters.reader(id)
+    }
+
+    fn mutator(&self, id: EcosystemId) -> Option<&dyn EcosystemWrite> {
+        self.adapters.writer(id)
     }
 
     /// Projects in scope for this run (filtered by `--lang`).
@@ -210,7 +264,7 @@ impl Workspace {
 
     async fn dependencies_in_scope(
         &self,
-        adapter: &dyn Ecosystem,
+        adapter: &dyn EcosystemRead,
         pctx: &ProjectCtx,
         scope: DepScope,
         opts: &RunOpts,
@@ -232,8 +286,8 @@ impl Workspace {
 }
 
 /// Map a resolved window to its JSON view at `now`.
-pub(crate) fn render_window(w: &ResolvedWindow, now: Timestamp) -> render::Window {
-    render::Window {
+pub(crate) fn render_window(w: &ResolvedWindow, now: Timestamp) -> Window {
+    Window {
         min_age_days: round2(w.effective_min_age_days(now)),
         source: w.source(),
         clamped_by: w.clamped_by(now).map(cooldown_core::Origin::token),

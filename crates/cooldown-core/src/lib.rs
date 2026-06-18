@@ -20,7 +20,7 @@ pub use policy::{
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve,
 };
 pub use ports::{
-    Capabilities, Ecosystem, NativePolicyLayer, NativeRule, PackageRegistry, ProjectSnapshot,
-    ProjectSnapshotFile, RawArtifact, RawRelease, RawWindow, ResolvedPolicy, SyncReport,
-    debug_assert_sorted, normalize_native,
+    Capabilities, Ecosystem, EcosystemRead, EcosystemWrite, NativePolicyLayer, NativeRule,
+    PackageRegistry, ProjectMutationFile, ProjectMutationJournal, RawArtifact, RawRelease,
+    RawWindow, ResolvedPolicy, SyncReport, debug_assert_sorted, normalize_native,
 };

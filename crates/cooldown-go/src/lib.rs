@@ -4,6 +4,7 @@
 
 pub mod ecosystem;
 pub mod gocmd;
+mod mutation;
 pub mod proxy;
 pub mod semver;
 

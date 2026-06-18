@@ -1,10 +1,10 @@
 //! The ports (traits) and the I/O-facing types that cross them.
 //!
-//! [`Ecosystem`] is the one port the use cases speak to: it reads state, yields classified
-//! releases, and executes changes — it never decides the cooldown (the core does) and never builds
-//! a `Rule`/`WindowSpec` (window normalisation happens once, in [`normalize_native`]).
-//! [`PackageRegistry`] is the finer-grained port each adapter is built from (constructor-injected,
-//! reusable and fakeable in unit tests).
+//! [`EcosystemRead`] is the read-side port the informational and gating use cases speak to:
+//! discovery, dependency graphs, classified releases, locked-release metadata, native policy, and
+//! lock-currency verification. [`EcosystemWrite`] is the mutation-side port used only by commands
+//! that rewrite project state. [`PackageRegistry`] is the finer-grained port each adapter is built
+//! from (constructor-injected, reusable and fakeable in unit tests).
 
 use crate::error::Result;
 use crate::model::{
@@ -13,12 +13,12 @@ use crate::model::{
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use jiff::{SignedDuration, Timestamp};
 
 /// What an adapter can express, so the conformance suite can capability-gate the right invariants.
 ///
-/// Each field is an independent capability flag describing a feature an [`Ecosystem`] adapter
+/// Each field is an independent capability flag describing a feature an ecosystem adapter
 /// supports. The conformance suite reads these to decide which invariants apply: an ecosystem
 /// without pseudo-versions, for example, is never asked to classify one. The flags describe what
 /// the adapter *can* do, never what policy *should* do — they carry no opinions.
@@ -40,29 +40,25 @@ pub struct Capabilities {
     pub artifact_granular: bool,
 }
 
-/// The single port the use cases speak to, implemented once per ecosystem adapter.
+/// The read-side port the use cases speak to, implemented once per ecosystem adapter.
 ///
-/// An `Ecosystem` reads native project state, yields classified [`Release`]s, and executes plans.
-/// It is deliberately mechanism-only: it never decides the cooldown (the core does) and never
-/// builds a [`Rule`]/[`WindowSpec`] (window normalisation happens once, in [`normalize_native`]).
-/// Adapters are typically assembled on top of the finer-grained [`PackageRegistry`] port.
+/// An `EcosystemRead` reads native project state, yields classified [`Release`]s, and verifies
+/// that native lock state is current. It is deliberately mechanism-only: it never decides the
+/// cooldown (the core does) and never builds a [`Rule`]/[`WindowSpec`] (window normalisation
+/// happens once, in [`normalize_native`]). Adapters are typically assembled on top of the
+/// finer-grained [`PackageRegistry`] port.
 ///
 /// The trait is made object-safe via [`macro@async_trait`] so the use cases can hold a
-/// `Box<dyn Ecosystem>` and drive any ecosystem uniformly. Implementations must be `Send + Sync`.
+/// `dyn EcosystemRead` and drive any ecosystem uniformly. Implementations must be `Send + Sync`.
 ///
 /// # Contract
 ///
 /// Implementors must uphold the invariants documented on each method. In particular, [`releases`]
-/// must return candidates sorted ascending by release order (see [`debug_assert_sorted`]), and
-/// [`apply`] must perform no intra-plan rollback — the application layer drives trials and
-/// rollback using [`snapshot_state`]/[`restore_state`].
+/// must return candidates sorted ascending by release order (see [`debug_assert_sorted`]).
 ///
-/// [`releases`]: Ecosystem::releases
-/// [`apply`]: Ecosystem::apply
-/// [`snapshot_state`]: Ecosystem::snapshot_state
-/// [`restore_state`]: Ecosystem::restore_state
+/// [`releases`]: EcosystemRead::releases
 #[async_trait]
-pub trait Ecosystem: Send + Sync {
+pub trait EcosystemRead: Send + Sync {
     /// Returns the stable identifier of this ecosystem (e.g. Go, Cargo, uv).
     ///
     /// Used to label diagnostics and to route projects to the adapter that detected them.
@@ -139,30 +135,6 @@ pub trait Ecosystem: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the native config exists but cannot be parsed.
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>>;
 
-    /// Applies `plan` to `project` and reports what was applied or skipped.
-    ///
-    /// Mechanics only (manifest rewrites, MVS, resolver runs); there is **no intra-plan rollback** —
-    /// the application layer drives trials and rollback via [`snapshot_state`](Ecosystem::snapshot_state)
-    /// and [`restore_state`](Ecosystem::restore_state). Skips are reported as `Ok` data in the
-    /// [`ApplyReport`], not errors.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if the manifest cannot be rewritten or re-locking
-    /// fails.
-    async fn apply(&self, project: &Project, plan: &Plan) -> Result<ApplyReport>;
-
-    /// Opt-in compile/sync after re-locking (the `--build` step).
-    ///
-    /// [`apply`](Ecosystem::apply) already guarantees a consistent, resolvable lock; this is the
-    /// expensive extra confidence step that actually builds or syncs the project.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if the build/sync invocation itself fails to run;
-    /// a failed build is reported in the [`VerifyReport`].
-    async fn build(&self, project: &Project) -> Result<VerifyReport>;
-
     /// Verifies the lock is current relative to its manifest — the fail-closed `check` precondition.
     ///
     /// # Errors
@@ -170,28 +142,60 @@ pub trait Ecosystem: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if currency cannot be determined; a stale lock is
     /// reported in the [`VerifyReport`].
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
+}
 
-    /// Captures an opaque [`ProjectSnapshot`] of the project's trial-relevant state.
+/// The mutation-side port for ecosystems that can rewrite project state.
+///
+/// Read-only commands depend only on [`EcosystemRead`]. Commands such as `upgrade` and `sync` opt
+/// into this narrower side explicitly so they are the only call sites coupled to rollback/build
+/// mechanics.
+#[async_trait]
+pub trait EcosystemWrite: Send + Sync {
+    /// Captures the current contents of only the files `plan` may mutate.
     ///
-    /// Used by `upgrade` to restore the project after a rejected trial via
-    /// [`restore_state`](Ecosystem::restore_state). Adapters include whatever files they mutate
-    /// during `apply`: lockfiles for Cargo/uv, and source files as well when a Go major upgrade
-    /// rewrites imports.
+    /// The returned [`ProjectMutationJournal`] is the rollback token the application layer restores
+    /// if the trial is rejected or if `apply` fails after mutating files. The journal is scoped to
+    /// this exact `plan`, so adapters should capture the smallest file set they may rewrite. The
+    /// same journal is then handed back to [`apply`](EcosystemWrite::apply), so adapters may also
+    /// treat it as the precomputed write-set for the trial.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the snapshot-relevant files cannot be read.
-    async fn snapshot_state(&self, project: &Project) -> Result<ProjectSnapshot>;
+    /// Returns a [`CoreError`](crate::CoreError) if the relevant local files cannot be read.
+    async fn mutation_journal(
+        &self,
+        project: &Project,
+        plan: &Plan,
+    ) -> Result<ProjectMutationJournal>;
 
-    /// Restores a previously-taken [`ProjectSnapshot`], returning the project to that state.
+    /// Applies `plan` to `project` and reports what was applied or skipped.
     ///
-    /// Snapshot entries with no captured bytes represent files that were absent when the snapshot
-    /// was taken and must therefore be removed if `apply` created them.
+    /// Mechanics only (manifest rewrites, MVS, resolver runs); there is **no intra-plan rollback** —
+    /// the application layer captures a [`ProjectMutationJournal`] before calling `apply` and
+    /// restores it if the trial is rejected. Skips are reported as `Ok` data in the
+    /// [`ApplyReport`], not errors.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the snapshotted files cannot be written back.
-    async fn restore_state(&self, project: &Project, snapshot: &ProjectSnapshot) -> Result<()>;
+    /// Returns a [`CoreError`](crate::CoreError) if the manifest cannot be rewritten or re-locking
+    /// fails.
+    async fn apply(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport>;
+
+    /// Opt-in compile/sync after re-locking (the `--build` step).
+    ///
+    /// [`apply`](EcosystemWrite::apply) already guarantees a consistent, resolvable lock; this is the
+    /// expensive extra confidence step that actually builds or syncs the project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the build/sync invocation itself fails to run;
+    /// a failed build is reported in the [`VerifyReport`].
+    async fn build(&self, project: &Project) -> Result<VerifyReport>;
 
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
@@ -210,26 +214,81 @@ pub trait Ecosystem: Send + Sync {
     }
 }
 
-/// An opaque snapshot of the project state an adapter may mutate during an `upgrade` trial.
+/// Convenience bound for concrete adapters that implement both the read-side and write-side ports.
+pub trait Ecosystem: EcosystemRead + EcosystemWrite {}
+
+impl<T> Ecosystem for T where T: EcosystemRead + EcosystemWrite {}
+
+/// The pre-change contents of the files a planned mutation may rewrite.
 #[derive(Debug, Clone, Default)]
-pub struct ProjectSnapshot {
-    /// The per-file snapshot entries the adapter needs in order to roll back a rejected trial.
-    pub files: Vec<ProjectSnapshotFile>,
+pub struct ProjectMutationJournal {
+    /// The captured file entries the application layer can restore on rollback.
+    pub files: Vec<ProjectMutationFile>,
 }
 
-/// One trial-relevant file recorded in a [`ProjectSnapshot`].
+/// One file entry recorded in a [`ProjectMutationJournal`].
 #[derive(Debug, Clone)]
-pub struct ProjectSnapshotFile {
+pub struct ProjectMutationFile {
     /// The path relative to the project root.
-    pub path: camino::Utf8PathBuf,
+    pub path: Utf8PathBuf,
     /// The captured bytes when the file existed, or `None` when it was absent and must be removed
     /// on restore.
     pub contents: Option<Vec<u8>>,
 }
 
+impl ProjectMutationJournal {
+    /// Capture the current contents of one project-relative file.
+    ///
+    /// Missing files are recorded as `None`, which tells [`restore`](Self::restore) to remove them
+    /// if a trial created them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the file exists but cannot be read.
+    pub fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
+        let path = root.join(rel);
+        let contents = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(ProjectMutationFile {
+            path: rel.to_owned(),
+            contents,
+        })
+    }
+
+    /// Restore every captured file entry under `root`.
+    ///
+    /// Entries whose captured contents are `None` are removed if they now exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if a file cannot be written back or removed.
+    pub fn restore(&self, root: &Utf8Path) -> Result<()> {
+        for file in &self.files {
+            let path = root.join(&file.path);
+            match &file.contents {
+                Some(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, bytes)?;
+                }
+                None => match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Native cooldown config, in the adapter's own structural terms.
 ///
-/// Produced by [`Ecosystem::native_policy`] and consumed by [`normalize_native`], which converts
+/// Produced by [`EcosystemRead::native_policy`] and consumed by [`normalize_native`], which converts
 /// it into a unified [`PolicyLayer`] at [`Origin::Native`].
 #[derive(Debug, Clone)]
 pub struct NativePolicyLayer {
@@ -341,14 +400,14 @@ pub struct RawArtifact {
     pub markers: Vec<String>,
 }
 
-/// The resolved policy handed to [`Ecosystem::write_native`] for `sync` (post-MVP; minimal for now).
+/// The resolved policy handed to [`EcosystemWrite::write_native`] for `sync` (post-MVP; minimal for now).
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     /// The default cooldown window to write into native config, if any.
     pub default_window: Option<WindowSpec>,
 }
 
-/// The outcome of a `sync`/[`Ecosystem::write_native`] (post-MVP).
+/// The outcome of a `sync`/[`EcosystemWrite::write_native`] (post-MVP).
 #[derive(Debug, Clone)]
 pub enum SyncReport {
     /// The adapter cannot sync; nothing was written. This is the default `write_native` result.
@@ -365,7 +424,7 @@ pub enum SyncReport {
     },
 }
 
-/// Asserts, in debug builds, that an adapter's [`releases`](Ecosystem::releases) output is sorted
+/// Asserts, in debug builds, that an adapter's [`releases`](EcosystemRead::releases) output is sorted
 /// ascending by release order.
 ///
 /// The core relies on this ordering invariant, so adapters should call this on the slice they are

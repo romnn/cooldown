@@ -103,8 +103,8 @@ impl SharedHttp {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Io`] if the underlying `reqwest::Client` cannot be built (for example,
-    /// the platform TLS backend fails to initialize).
+    /// Returns [`CoreError::System`] if the underlying `reqwest::Client` cannot be built (for
+    /// example, the platform TLS backend fails to initialize).
     pub fn new(cache_dir: impl Into<PathBuf>, opts: HttpOptions) -> Result<Self, CoreError> {
         let cache_dir = cache_dir.into();
         let client = reqwest::Client::builder()
@@ -112,7 +112,7 @@ impl SharedHttp {
             .gzip(true)
             .timeout(opts.request_timeout)
             .build()
-            .map_err(|e| CoreError::Io(format!("build http client: {e}")))?;
+            .map_err(|e| CoreError::System(format!("build http client: {e}")))?;
         let publish = Arc::new(PublishStore::load(&cache_dir));
         Ok(SharedHttp {
             inner: Arc::new(Inner {

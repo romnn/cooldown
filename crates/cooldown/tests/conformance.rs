@@ -9,10 +9,13 @@
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown::app::{Baseline, Exit, ProjectCtx, RunOpts, Workspace};
+use cooldown::app::{
+    AdapterSet, Baseline, CheckStatus, Exit, OutdatedStatus, ProjectCtx, RunOpts, Workspace,
+};
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 const GO: EcosystemId = EcosystemId("go");
@@ -68,9 +71,9 @@ struct FakeEco {
     inject_fresh_on_apply: bool,
     stale_lock: bool,
     fail_graph_after_apply: bool,
+    fail_locked_release_after_apply_for: Option<String>,
     stale_lock_after_apply: bool,
     build_fails_after_apply: bool,
-    restore_fails: bool,
     state: Mutex<State>,
     root: Utf8PathBuf,
 }
@@ -86,7 +89,7 @@ impl FakeEco {
 }
 
 #[async_trait]
-impl Ecosystem for FakeEco {
+impl EcosystemRead for FakeEco {
     fn id(&self) -> EcosystemId {
         GO
     }
@@ -135,6 +138,20 @@ impl Ecosystem for FakeEco {
         dep: &Dependency,
         _fetch: &cooldown_core::FetchContext<'_>,
     ) -> Result<Release> {
+        if self.state.lock().unwrap().apply_attempted
+            && self
+                .fail_locked_release_after_apply_for
+                .as_deref()
+                .is_some_and(|name| name == dep.package.name)
+        {
+            return Err(CoreError::Transient(
+                format!(
+                    "post-apply locked release probe failed for {}",
+                    dep.package.name
+                )
+                .into(),
+            ));
+        }
         self.locked
             .get(&dep.package.name)
             .cloned()
@@ -143,7 +160,28 @@ impl Ecosystem for FakeEco {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn apply(&self, _p: &Project, plan: &Plan) -> Result<ApplyReport> {
+    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        let stale = self.stale_lock
+            || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
+        Ok(VerifyReport {
+            ok: !stale,
+            detail: if stale { "stale".into() } else { "tidy".into() },
+        })
+    }
+}
+
+#[async_trait]
+impl EcosystemWrite for FakeEco {
+    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::default())
+    }
+
+    async fn apply(
+        &self,
+        _p: &Project,
+        plan: &Plan,
+        _journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
         if self.inject_fresh_on_apply {
@@ -164,26 +202,6 @@ impl Ecosystem for FakeEco {
             },
         })
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
-        let stale = self.stale_lock
-            || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
-        Ok(VerifyReport {
-            ok: !stale,
-            detail: if stale { "stale".into() } else { "tidy".into() },
-        })
-    }
-    async fn snapshot_state(&self, _p: &Project) -> Result<ProjectSnapshot> {
-        Ok(ProjectSnapshot::default())
-    }
-    async fn restore_state(&self, _p: &Project, _s: &ProjectSnapshot) -> Result<()> {
-        if self.restore_fails {
-            return Err(CoreError::Io("restore failed".into()));
-        }
-        let mut state = self.state.lock().unwrap();
-        state.fresh_transitive_present = false;
-        state.apply_attempted = false;
-        Ok(())
-    }
 }
 
 fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
@@ -197,7 +215,9 @@ fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
             strict_native: false,
         },
     };
-    Workspace::new(vec![Box::new(fake)], vec![ctx], now(), baseline)
+    let mut adapters = AdapterSet::new();
+    adapters.register(Arc::new(fake));
+    Workspace::new(adapters, vec![ctx], now(), baseline)
 }
 
 fn opts() -> RunOpts {
@@ -244,9 +264,9 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -257,7 +277,7 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
     assert_eq!(out.items.len(), 1);
     let it = &out.items[0];
     // Newest candidate (v1.2.0) is still cooling, but v1.1.0 is adoptable now.
-    assert_eq!(it.status, cooldown_render::OutdatedStatus::InCooldown);
+    assert_eq!(it.status, OutdatedStatus::InCooldown);
     assert_eq!(it.adoptable_target.as_deref(), Some("v1.1.0"));
     assert_eq!(it.latest.as_ref().unwrap().version, "v1.2.0");
     assert_eq!(out.summary.in_cooldown, 1);
@@ -285,9 +305,9 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -300,7 +320,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
     assert_eq!(out.summary.checked, 2);
     assert_eq!(out.summary.direct, 1);
     assert_eq!(out.items[0].name, "t");
-    assert_eq!(out.items[0].status, cooldown_render::CheckStatus::Violation);
+    assert_eq!(out.items[0].status, CheckStatus::Violation);
 
     // With an exact-scope baseline entry → acknowledged, exit 0.
     let baseline = Baseline {
@@ -335,9 +355,9 @@ async fn check_fails_closed_on_stale_lock() {
         inject_fresh_on_apply: false,
         stale_lock: true,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -378,9 +398,9 @@ async fn upgrade_applies_clean_change() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -428,9 +448,9 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
         inject_fresh_on_apply: true, // applying the change drags in `t`
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -443,6 +463,60 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
     let sk = out.items[0].skipped.as_ref().expect("a skip");
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(sk.offending.as_deref(), Some("t"));
+}
+
+#[tokio::test]
+async fn upgrade_checks_full_graph_even_when_package_filtered() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v0.5.0", 0, Some("2026-06-16T00:00:00Z"), None),
+    );
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: Some(dep("t", "v0.5.0", false)),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.package = vec![PatternGlob::new("a").expect("valid glob")];
+
+    let out = ws.upgrade(&opts).await;
+
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    let skipped = out.items[0].skipped.as_ref().expect("skip recorded");
+    assert_eq!(skipped.reason, SkipReason::TransitiveInCooldown);
+    assert_eq!(skipped.offending.as_deref(), Some("t"));
 }
 
 #[tokio::test]
@@ -475,9 +549,54 @@ async fn upgrade_fails_closed_when_post_apply_validation_errors() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: true,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.errors, 1);
+    assert!(out.items[0].error.is_some());
+}
+
+#[tokio::test]
+async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: Some("a".into()),
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -520,9 +639,9 @@ async fn upgrade_reports_final_lock_and_build_failures() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: true,
         build_fails_after_apply: true,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -558,9 +677,9 @@ async fn explain_traces_the_default_window() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -586,9 +705,9 @@ async fn explain_applies_registry_scoped_rule() {
         inject_fresh_on_apply: false,
         stale_lock: false,
         fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
-        restore_fails: false,
         state: Mutex::new(State::default()),
         root,
     };
@@ -611,7 +730,9 @@ async fn explain_applies_registry_scoped_rule() {
             strict_native: false,
         },
     };
-    let ws = Workspace::new(vec![Box::new(fake)], vec![ctx], now(), Baseline::default());
+    let mut adapters = AdapterSet::new();
+    adapters.register(Arc::new(fake));
+    let ws = Workspace::new(adapters, vec![ctx], now(), Baseline::default());
 
     let out = ws.explain("a", &opts()).await;
     assert_eq!(out.exit, Exit::Ok);

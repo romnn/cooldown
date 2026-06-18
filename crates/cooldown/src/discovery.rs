@@ -54,8 +54,8 @@ pub fn global_config_path() -> Option<Utf8PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`] if the file exists but cannot be read, or [`CoreError::Config`] if its
-/// contents do not parse as a valid config.
+/// Returns [`CoreError::Filesystem`] if the file exists but cannot be read, or
+/// [`CoreError::Config`] if its contents do not parse as a valid config.
 pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
     let Some(path) = global_config_path() else {
         return Ok(None);
@@ -70,8 +70,8 @@ pub fn global_layer() -> Result<Option<PolicyLayer>, CoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Config`] if `path` does not exist, [`CoreError::Io`] if it exists but
-/// cannot be read, or [`CoreError::Config`] if its contents do not parse as a valid config.
+/// Returns [`CoreError::Config`] if `path` does not exist, [`CoreError::Filesystem`] if it exists
+/// but cannot be read, or [`CoreError::Config`] if its contents do not parse as a valid config.
 pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> {
     match read_layer(path, Origin::Config(path.to_owned()))? {
         Some(layer) => Ok(layer),
@@ -89,7 +89,7 @@ pub fn explicit_config_layer(path: &Utf8Path) -> Result<PolicyLayer, CoreError> 
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`] if a discovered `cooldown.toml` cannot be read, or
+/// Returns [`CoreError::Filesystem`] if a discovered `cooldown.toml` cannot be read, or
 /// [`CoreError::Config`] if one does not parse as a valid config.
 pub fn repo_cascade_layers(
     repo_root: &Utf8Path,
@@ -130,7 +130,7 @@ fn read_layer(path: &Utf8Path, origin: Origin) -> Result<Option<PolicyLayer>, Co
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(Some(parse_config(&content, origin)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CoreError::Io(format!("{path}: {e}"))),
+        Err(e) => Err(CoreError::Filesystem(format!("{path}: {e}"))),
     }
 }
 

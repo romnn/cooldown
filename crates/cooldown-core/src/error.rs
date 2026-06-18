@@ -69,9 +69,25 @@ pub enum CoreError {
     #[error("stale or absent lock: {0}")]
     StaleLock(String),
 
-    /// An I/O failure not attributable to a single dependency.
-    #[error("io error: {0}")]
-    Io(String),
+    /// A local filesystem read/write/create/remove failure.
+    #[error("filesystem error: {0}")]
+    Filesystem(String),
+
+    /// A local path could not be represented in cooldown's UTF-8/path model.
+    #[error("path encoding error: {0}")]
+    PathEncoding(String),
+
+    /// A local JSON/TOML serialization step failed.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    /// A project-level filesystem lock is already held by another cooldown process.
+    #[error("lock conflict: {0}")]
+    LockConflict(String),
+
+    /// A non-transient local runtime/environment setup step failed.
+    #[error("system error: {0}")]
+    System(String),
 
     /// The cache or registry was consulted in `--offline` mode and missed.
     #[error("offline cache miss: {0}")]
@@ -103,22 +119,25 @@ impl CoreError {
     pub fn diagnostic_kind(&self) -> DiagnosticKind {
         match self {
             CoreError::NotFound(_) => DiagnosticKind::NotFound,
-            CoreError::Transient(_) | CoreError::OfflineMiss(_) | CoreError::Io(_) => {
-                DiagnosticKind::Transient
-            }
+            CoreError::Transient(_) | CoreError::OfflineMiss(_) => DiagnosticKind::Transient,
             CoreError::Tool { .. } => DiagnosticKind::ToolFailed,
             CoreError::ToolSpawn { .. } => DiagnosticKind::ToolSpawnFailed,
             CoreError::Config(_) => DiagnosticKind::Config,
             CoreError::Parse(_) => DiagnosticKind::Parse,
             CoreError::LockUnreadable(_) => DiagnosticKind::LockfileUnreadable,
             CoreError::StaleLock(_) => DiagnosticKind::StaleLock,
+            CoreError::Filesystem(_) => DiagnosticKind::Filesystem,
+            CoreError::PathEncoding(_) => DiagnosticKind::PathEncoding,
+            CoreError::Serialization(_) => DiagnosticKind::Serialization,
+            CoreError::LockConflict(_) => DiagnosticKind::LockConflict,
+            CoreError::System(_) => DiagnosticKind::System,
         }
     }
 }
 
 impl From<std::io::Error> for CoreError {
     fn from(e: std::io::Error) -> Self {
-        CoreError::Io(e.to_string())
+        CoreError::Filesystem(e.to_string())
     }
 }
 
@@ -164,7 +183,7 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticKind {
-    /// A transient failure (network blip, 5xx, 429, or an incidental I/O error)
+    /// A transient failure (network blip, 5xx, 429, or an offline cache miss)
     /// that a retry might resolve.
     Transient,
     /// The requested package, version, or module was not found upstream.
@@ -185,6 +204,16 @@ pub enum DiagnosticKind {
     ToolSpawnFailed,
     /// A local lockfile/manifest or resolved-graph dump could not be read.
     LockfileUnreadable,
+    /// A local filesystem operation failed.
+    Filesystem,
+    /// A local path could not be represented in cooldown's UTF-8/path model.
+    PathEncoding,
+    /// A local JSON/TOML serialization step failed.
+    Serialization,
+    /// Another cooldown process already holds the project mutation lock.
+    LockConflict,
+    /// A non-transient local runtime/environment setup step failed.
+    System,
     /// Invalid configuration or command input (the user must fix it).
     Config,
     /// An upstream registry payload could not be parsed.
@@ -203,6 +232,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ToolFailed => "tool_failed",
             DiagnosticKind::ToolSpawnFailed => "tool_spawn_failed",
             DiagnosticKind::LockfileUnreadable => "lockfile_unreadable",
+            DiagnosticKind::Filesystem => "filesystem",
+            DiagnosticKind::PathEncoding => "path_encoding",
+            DiagnosticKind::Serialization => "serialization",
+            DiagnosticKind::LockConflict => "lock_conflict",
+            DiagnosticKind::System => "system",
             DiagnosticKind::Config => "config",
             DiagnosticKind::Parse => "parse",
         };
@@ -311,6 +345,30 @@ mod tests {
         assert_eq!(
             DiagnosticKind::ToolSpawnFailed.to_string(),
             "tool_spawn_failed"
+        );
+    }
+
+    #[test]
+    fn local_failures_map_to_distinct_diagnostic_kinds() {
+        assert_eq!(
+            CoreError::Filesystem("disk full".into()).diagnostic_kind(),
+            DiagnosticKind::Filesystem
+        );
+        assert_eq!(
+            CoreError::PathEncoding("bad path".into()).diagnostic_kind(),
+            DiagnosticKind::PathEncoding
+        );
+        assert_eq!(
+            CoreError::Serialization("bad json".into()).diagnostic_kind(),
+            DiagnosticKind::Serialization
+        );
+        assert_eq!(
+            CoreError::LockConflict("locked".into()).diagnostic_kind(),
+            DiagnosticKind::LockConflict
+        );
+        assert_eq!(
+            CoreError::System("bad env".into()).diagnostic_kind(),
+            DiagnosticKind::System
         );
     }
 }

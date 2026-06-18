@@ -2,23 +2,16 @@
 //! the only place that knows the full cast of ecosystems.
 
 mod commands;
+mod present;
+mod setup;
 
-use crate::app::{Baseline, Exit, ProjectCtx, RunOpts, Workspace};
+use crate::app::Exit;
 use crate::discovery;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand};
-use cooldown_cargo::CargoEcosystem;
-use cooldown_core::config::{WindowFields, builtin_default_layer, layer_from_fields};
-use cooldown_core::{
-    CoreError, Ecosystem, EcosystemId, Origin, PatternGlob, PolicyLayer, PolicyStack, Project,
-    ecosystem_id, normalize_native,
-};
-use cooldown_go::GoEcosystem;
-use cooldown_registry::{HttpOptions, SharedHttp};
+use cooldown_core::CoreError;
 use cooldown_render as render;
-use cooldown_uv::UvEcosystem;
 use std::io::IsTerminal;
-use std::time::Duration;
 
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
@@ -201,7 +194,7 @@ fn run_workspace_free(command: &Command, g: &GlobalArgs) -> Option<Result<Exit, 
     match command {
         Command::Schema => Some(
             render::json_schema_string()
-                .map_err(|e| CoreError::Io(format!("serialize schema: {e}")))
+                .map_err(|e| CoreError::Serialization(format!("serialize schema: {e}")))
                 .map(|schema| {
                     println!("{schema}");
                     Exit::Ok
@@ -224,31 +217,13 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         return res;
     }
 
-    let workdir = match &g.dir {
-        Some(d) => d.clone(),
-        None => Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(CoreError::from)?)
-            .map_err(|_| CoreError::Io("current dir is not valid UTF-8".into()))?,
-    };
-    let repo_root = discovery::find_repo_root(&workdir);
-
-    // Resolve the requested ecosystems (a typo is exit 2).
-    let lang_ids = parse_langs(&g.lang)?;
-    let package_globs = parse_globs(&g.package)?;
-
-    let adapters = adapter_set(g)?;
-
-    // Detect projects under the working dir.
-    let mut projects: Vec<(EcosystemId, Project)> = Vec::new();
-    for adapter in &adapters {
-        for p in adapter.detect(&workdir).await? {
-            projects.push((adapter.id(), p));
-        }
-    }
-    if projects.is_empty() {
+    let prepared = setup::prepare_run(g).await?;
+    if prepared.ws.is_empty() {
+        let workdir = g.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
         if g.json {
             println!(
                 "{}",
-                commands::no_ecosystem_json(command_name(&cli.command))
+                commands::no_ecosystem_json(command_name(&cli.command))?
             );
         } else {
             eprintln!("no supported ecosystem detected under {workdir}");
@@ -256,31 +231,9 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         return Ok(Exit::NoEcosystem);
     }
 
-    let shared = build_shared_layers(g)?;
-    let mut ctxs: Vec<ProjectCtx> = Vec::new();
-    for (eco, project) in projects {
-        ctxs.push(assemble_ctx(&adapters, &repo_root, eco, project, &shared, g).await?);
-    }
-
-    let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
-    let now = jiff::Timestamp::now();
-    let ws = Workspace::new(adapters, ctxs, now, baseline);
-
-    let opts = RunOpts {
-        lang: lang_ids,
-        package: package_globs,
-        allow_major: g.major,
-        major_all: g.major_all,
-        direct_only: g.direct_only,
-        include_indirect: g.include_indirect,
-        all_artifacts: g.all_artifacts,
-        allow_stale_lock: g.allow_stale_lock,
-        fail_on_unknown_age: g.fail_on_unknown_age,
-        strict: g.strict,
-        build: g.build,
-        dry_run: g.dry_run,
-        concurrency: 8,
-    };
+    let repo_root = prepared.repo_root;
+    let ws = prepared.ws;
+    let opts = prepared.opts;
 
     // A no-match `--lang` on a mutating or `explain` command is a usage error (exit 2), distinct
     // from "no ecosystem detected" (exit 3, handled above where `projects` was non-empty).
@@ -298,178 +251,24 @@ async fn run_inner(cli: Cli) -> Result<Exit, CoreError> {
         ));
     }
 
-    let generated_at = generated_at(now);
-    commands::dispatch(cli.command, &ws, &opts, &repo_root, g, color, &generated_at).await
-}
-
-/// The shared, project-independent policy layers, assembled once per run.
-struct SharedLayers {
-    global: Option<PolicyLayer>,
-    explicit: Option<PolicyLayer>,
-    env: Option<PolicyLayer>,
-    cli: Option<PolicyLayer>,
-}
-
-/// Build the ecosystem adapter set (one per supported ecosystem) over a shared HTTP cache.
-fn adapter_set(g: &GlobalArgs) -> Result<Vec<Box<dyn Ecosystem>>, CoreError> {
-    let http = SharedHttp::new(
-        discovery::cache_dir().into_std_path_buf(),
-        HttpOptions {
-            offline: g.offline,
-            fresh: g.fresh,
-            request_timeout: Duration::from_secs(30),
-            ..Default::default()
+    let generated_at = generated_at(ws.now());
+    commands::dispatch(
+        cli.command,
+        commands::CommandContext {
+            ws: &ws,
+            opts: &opts,
+            repo_root: &repo_root,
+            global: g,
+            color,
+            generated_at: &generated_at,
         },
-    )?;
-    Ok(vec![
-        Box::new(GoEcosystem::from_http(http.clone())),
-        Box::new(CargoEcosystem::from_http(http.clone())),
-        Box::new(UvEcosystem::from_http(http.clone())),
-    ])
-}
-
-/// Build the project-independent layers (global file, explicit `--config`, env, CLI) once per run.
-fn build_shared_layers(g: &GlobalArgs) -> Result<SharedLayers, CoreError> {
-    let global = if g.no_global {
-        None
-    } else {
-        discovery::global_layer()?
-    };
-    let explicit = match &g.config {
-        Some(p) => Some(discovery::explicit_config_layer(p)?),
-        None => None,
-    };
-    Ok(SharedLayers {
-        global,
-        explicit,
-        env: layer_from_fields(Origin::Env, &env_window_fields())?,
-        cli: layer_from_fields(Origin::Cli, &cli_window_fields(g))?,
-    })
-}
-
-/// Assemble one project's [`ProjectCtx`]: its native layer, the repo cascade, the shared layers,
-/// and the relative path used by `project` selectors.
-async fn assemble_ctx(
-    adapters: &[Box<dyn Ecosystem>],
-    repo_root: &Utf8Path,
-    eco: EcosystemId,
-    project: Project,
-    shared: &SharedLayers,
-    g: &GlobalArgs,
-) -> Result<ProjectCtx, CoreError> {
-    let native = if g.no_native {
-        None
-    } else {
-        match adapters.iter().find(|a| a.id() == eco) {
-            Some(a) => a.native_policy(&project).await?.map(normalize_native),
-            None => None,
-        }
-    };
-    let cascade = discovery::repo_cascade_layers(repo_root, &project.root)?;
-
-    let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
-    if let Some(l) = &shared.global {
-        layers.push(l.clone());
-    }
-    if let Some(n) = native {
-        layers.push(n);
-    }
-    layers.extend(cascade);
-    for l in [&shared.explicit, &shared.env, &shared.cli]
-        .into_iter()
-        .flatten()
-    {
-        layers.push(l.clone());
-    }
-
-    let strict_native = compute_strict_native(&layers, g);
-    let rel_path = project.root.strip_prefix(repo_root).ok().map_or_else(
-        || project.root.clone(),
-        |p| {
-            if p.as_str().is_empty() {
-                Utf8PathBuf::from(".")
-            } else {
-                p.to_owned()
-            }
-        },
-    );
-
-    Ok(ProjectCtx {
-        ecosystem: eco,
-        project,
-        rel_path,
-        policy: PolicyStack {
-            layers,
-            strict_native,
-        },
-    })
+    )
+    .await
 }
 
 fn generated_at(now: jiff::Timestamp) -> String {
     jiff::Timestamp::from_second(now.as_second())
         .map_or_else(|_| now.to_string(), |t| t.to_string())
-}
-
-fn parse_langs(langs: &[String]) -> Result<Vec<EcosystemId>, CoreError> {
-    langs
-        .iter()
-        .map(|l| {
-            ecosystem_id(l).ok_or_else(|| {
-                CoreError::Config(format!(
-                    "unknown --lang `{l}`; recognised: go, rust, python, node"
-                ))
-            })
-        })
-        .collect()
-}
-
-fn parse_globs(globs: &[String]) -> Result<Vec<PatternGlob>, CoreError> {
-    globs.iter().map(|g| PatternGlob::new(g)).collect()
-}
-
-fn cli_window_fields(g: &GlobalArgs) -> WindowFields {
-    WindowFields {
-        min_age: g.min_age.clone(),
-        min_age_major: g.min_age_major.clone(),
-        min_age_minor: g.min_age_minor.clone(),
-        min_age_patch: g.min_age_patch.clone(),
-        latest: g.latest,
-        freeze: g.freeze.clone(),
-        allow: g.allow.clone(),
-    }
-}
-
-fn env_window_fields() -> WindowFields {
-    let var = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let truthy = |k: &str| matches!(var(k).as_deref(), Some("1" | "true" | "yes" | "on"));
-    WindowFields {
-        min_age: var("COOLDOWN_MIN_AGE"),
-        min_age_major: var("COOLDOWN_MIN_AGE_MAJOR"),
-        min_age_minor: var("COOLDOWN_MIN_AGE_MINOR"),
-        min_age_patch: var("COOLDOWN_MIN_AGE_PATCH"),
-        latest: truthy("COOLDOWN_LATEST"),
-        freeze: var("COOLDOWN_FREEZE"),
-        allow: var("COOLDOWN_ALLOW")
-            .map(|s| {
-                s.split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
-}
-
-/// `strict-native` is security-monotone (any config layer that sets it turns it on); the CLI flags
-/// force it on/off.
-fn compute_strict_native(layers: &[PolicyLayer], g: &GlobalArgs) -> bool {
-    if g.no_fail_on_stricter_native {
-        return false;
-    }
-    if g.fail_on_stricter_native {
-        return true;
-    }
-    layers.iter().any(|l| l.strict_native == Some(true))
 }
 
 fn command_name(c: &Command) -> &'static str {

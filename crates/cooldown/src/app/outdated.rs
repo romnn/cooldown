@@ -2,10 +2,10 @@
 //! candidate set; informational, so per-dep failures never change the exit code.
 
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
+use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, Release, ResolveKind, ResolveQuery, evaluate, resolve,
 };
-use cooldown_render as render;
 use futures::stream::{self, StreamExt};
 
 /// The result of `outdated`: every reported dependency split by status, plus diagnostics.
@@ -14,9 +14,9 @@ use futures::stream::{self, StreamExt};
 /// changing the exit code; [`exit`](Self::exit) is therefore always [`Exit::Ok`].
 pub struct OutdatedOutcome {
     /// Per-status counts across all reported items.
-    pub summary: render::OutdatedSummary,
+    pub summary: OutdatedSummary,
     /// One entry per in-scope dependency (including any that failed to evaluate).
-    pub items: Vec<render::OutdatedItem>,
+    pub items: Vec<OutdatedItem>,
     /// Non-fatal diagnostics not attributable to a single dependency.
     pub warnings: Vec<Diagnostic>,
     /// Project-level errors (e.g. a dependency graph that could not be enumerated).
@@ -31,7 +31,7 @@ impl Workspace {
     /// Scopes to direct deps unless `--include-indirect` is set (and `--direct-only` is not), and
     /// to packages matching `--package`. Surfaces a yanked locked version as a warning.
     pub async fn outdated(&self, opts: &RunOpts) -> OutdatedOutcome {
-        let mut items: Vec<render::OutdatedItem> = Vec::new();
+        let mut items: Vec<OutdatedItem> = Vec::new();
         let mut warnings: Vec<Diagnostic> = Vec::new();
         let mut errors: Vec<Diagnostic> = Vec::new();
 
@@ -116,7 +116,7 @@ impl Workspace {
         dep: &Dependency,
         releases: &[Release],
         rctx: &cooldown_core::ResolveContext<'_>,
-    ) -> render::OutdatedItem {
+    ) -> OutdatedItem {
         let verdict = evaluate(dep, releases, &pctx.policy.layers, rctx, self.now);
 
         // Prefer a candidate's window; fall back to a current-pin resolution when there is none.
@@ -138,14 +138,14 @@ impl Workspace {
                 .iter()
                 .find(|r| &r.version == lv)
                 .and_then(|r| r.published_at);
-            render::LatestInfo {
+            LatestInfo {
                 version: lv.to_string(),
                 published_at: published.map(|p| p.to_string()),
                 age_days: published.map(|p| age_days(p, self.now)),
             }
         });
 
-        render::OutdatedItem {
+        OutdatedItem {
             name: dep.package.name.clone(),
             ecosystem: pctx.ecosystem.as_str().to_string(),
             project: project_label.to_string(),
@@ -184,28 +184,28 @@ fn error_item(
     project_label: &str,
     dep: &Dependency,
     diag: Diagnostic,
-) -> render::OutdatedItem {
-    render::OutdatedItem {
+) -> OutdatedItem {
+    OutdatedItem {
         name: dep.package.name.clone(),
         ecosystem: pctx.ecosystem.as_str().to_string(),
         project: project_label.to_string(),
         registry: dep.package.registry.clone(),
         direct: dep.direct,
         current: dep.current.to_string(),
-        window: render::Window {
+        window: Window {
             min_age_days: 0.0,
             source: "n/a".into(),
             clamped_by: None,
         },
-        status: render::OutdatedStatus::Error,
+        status: OutdatedStatus::Error,
         adoptable_target: None,
         latest: None,
         error: Some(diag),
     }
 }
 
-fn summarize(items: &[render::OutdatedItem]) -> render::OutdatedSummary {
-    let mut s = render::OutdatedSummary {
+fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
+    let mut s = OutdatedSummary {
         total: items.len(),
         adoptable: 0,
         in_cooldown: 0,
@@ -217,15 +217,15 @@ fn summarize(items: &[render::OutdatedItem]) -> render::OutdatedSummary {
     };
     for it in items {
         match it.status {
-            render::OutdatedStatus::Adoptable => s.adoptable += 1,
-            render::OutdatedStatus::InCooldown | render::OutdatedStatus::CurrentInCooldown => {
+            OutdatedStatus::Adoptable => s.adoptable += 1,
+            OutdatedStatus::InCooldown | OutdatedStatus::CurrentInCooldown => {
                 s.in_cooldown += 1;
             }
-            render::OutdatedStatus::UpToDate => s.up_to_date += 1,
-            render::OutdatedStatus::Exempt => s.exempt += 1,
-            render::OutdatedStatus::Held => s.held += 1,
-            render::OutdatedStatus::UnknownAge => s.unknown_age += 1,
-            render::OutdatedStatus::Error => s.errors += 1,
+            OutdatedStatus::UpToDate => s.up_to_date += 1,
+            OutdatedStatus::Exempt => s.exempt += 1,
+            OutdatedStatus::Held => s.held += 1,
+            OutdatedStatus::UnknownAge => s.unknown_age += 1,
+            OutdatedStatus::Error => s.errors += 1,
         }
     }
     s

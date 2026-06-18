@@ -25,11 +25,11 @@ impl ProjectLock {
         match file.try_lock_exclusive() {
             Ok(true) => {}
             Ok(false) => {
-                return Err(CoreError::Io(format!(
+                return Err(CoreError::LockConflict(format!(
                     "{path} is locked by another mutating cooldown run"
                 )));
             }
-            Err(e) => return Err(CoreError::Io(format!("{path}: {e}"))),
+            Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
         }
 
         file.set_len(0)?;
@@ -57,7 +57,7 @@ mod tests {
         let _first = ProjectLock::acquire(root).expect("first lock");
 
         let err = ProjectLock::acquire(root).expect_err("second lock must fail");
-        assert!(matches!(err, CoreError::Io(_)));
+        assert!(matches!(err, CoreError::LockConflict(_)));
     }
 
     #[test]

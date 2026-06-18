@@ -8,9 +8,9 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, Ecosystem, EcosystemId,
-    FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project,
-    ProjectSnapshot, ProjectSnapshotFile, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result,
+    ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EcosystemId, EcosystemRead,
+    EcosystemWrite, FetchContext, NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan,
+    Project, ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result,
     Selector, SkipReason, Skipped, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
@@ -166,7 +166,7 @@ fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
 }
 
 #[async_trait]
-impl Ecosystem for CargoEcosystem {
+impl EcosystemRead for CargoEcosystem {
     fn id(&self) -> EcosystemId {
         CARGO_ID
     }
@@ -252,7 +252,43 @@ impl Ecosystem for CargoEcosystem {
         parse_native(&project.manifest)
     }
 
-    async fn apply(&self, project: &Project, plan: &Plan) -> Result<ApplyReport> {
+    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+        match self.cargo.verify_locked(&project.root).await {
+            Ok(true) => Ok(VerifyReport {
+                ok: true,
+                detail: "Cargo.lock is current".into(),
+            }),
+            Ok(false) => Ok(VerifyReport {
+                ok: false,
+                detail: "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`"
+                    .into(),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+impl EcosystemWrite for CargoEcosystem {
+    async fn mutation_journal(
+        &self,
+        project: &Project,
+        _plan: &Plan,
+    ) -> Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(
+                &project.root,
+                Utf8Path::new("Cargo.lock"),
+            )?],
+        })
+    }
+
+    async fn apply(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        _journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             match self
@@ -277,51 +313,6 @@ impl Ecosystem for CargoEcosystem {
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         self.cargo.build(&project.root).await
-    }
-
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        match self.cargo.verify_locked(&project.root).await {
-            Ok(true) => Ok(VerifyReport {
-                ok: true,
-                detail: "Cargo.lock is current".into(),
-            }),
-            Ok(false) => Ok(VerifyReport {
-                ok: false,
-                detail: "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`"
-                    .into(),
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn snapshot_state(&self, project: &Project) -> Result<ProjectSnapshot> {
-        let path = project.root.join("Cargo.lock");
-        let contents = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        Ok(ProjectSnapshot {
-            files: vec![ProjectSnapshotFile {
-                path: Utf8PathBuf::from("Cargo.lock"),
-                contents,
-            }],
-        })
-    }
-
-    async fn restore_state(&self, project: &Project, snapshot: &ProjectSnapshot) -> Result<()> {
-        for file in &snapshot.files {
-            let path = project.root.join(&file.path);
-            match &file.contents {
-                Some(bytes) => std::fs::write(path, bytes)?,
-                None => match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                },
-            }
-        }
-        Ok(())
     }
 }
 
@@ -394,7 +385,7 @@ min-age = "14d"
     }
 
     #[tokio::test]
-    async fn restore_state_removes_lock_created_after_snapshot() {
+    async fn mutation_journal_restore_removes_lock_created_after_capture() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         let manifest = root.join("Cargo.toml");
@@ -417,13 +408,14 @@ min-age = "14d"
             manifest,
         };
 
-        let snapshot = eco.snapshot_state(&project).await.expect("snapshot");
+        let journal = eco
+            .mutation_journal(&project, &Plan::default())
+            .await
+            .expect("journal");
         let lock = root.join("Cargo.lock");
         std::fs::write(&lock, "generated").expect("write lock");
 
-        eco.restore_state(&project, &snapshot)
-            .await
-            .expect("restore");
+        journal.restore(&project.root).expect("restore");
         assert!(!lock.exists());
     }
 }

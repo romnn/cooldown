@@ -70,15 +70,15 @@ pub fn read_entry(cache_dir: &Path, url: &str) -> Option<CacheEntry> {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`] if the cache directory cannot be created, the entry cannot be
-/// serialized, or the file cannot be written.
+/// Returns [`CoreError::Filesystem`] if the cache directory cannot be created or the file cannot
+/// be written, or [`CoreError::Serialization`] if the entry cannot be serialized.
 pub fn write_entry(cache_dir: &Path, entry: &CacheEntry) -> Result<(), CoreError> {
     let path = entry_path(cache_dir, &entry.url);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(entry)
-        .map_err(|e| CoreError::Io(format!("serialize cache entry: {e}")))?;
+        .map_err(|e| CoreError::Serialization(format!("serialize cache entry: {e}")))?;
     std::fs::write(&path, bytes)?;
     Ok(())
 }
@@ -180,8 +180,8 @@ impl PublishStore {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Io`] if the cache directory cannot be created, the store cannot be
-    /// serialized, or the file cannot be written.
+    /// Returns [`CoreError::Filesystem`] if the cache directory cannot be created or the file
+    /// cannot be written, or [`CoreError::Serialization`] if the store cannot be serialized.
     pub fn save(&self) -> Result<(), CoreError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -191,7 +191,7 @@ impl PublishStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = serde_json::to_vec_pretty(&*map)
-            .map_err(|e| CoreError::Io(format!("serialize publish store: {e}")))?;
+            .map_err(|e| CoreError::Serialization(format!("serialize publish store: {e}")))?;
         std::fs::write(&self.path, bytes)?;
         Ok(())
     }

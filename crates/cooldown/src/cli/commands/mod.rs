@@ -1,0 +1,37 @@
+mod baseline;
+mod common;
+mod report;
+
+use super::{Command, GlobalArgs, present};
+use crate::app::{Exit, RunOpts, Workspace};
+use camino::Utf8Path;
+use cooldown_core::CoreError;
+
+pub(crate) struct CommandContext<'a> {
+    pub(crate) ws: &'a Workspace,
+    pub(crate) opts: &'a RunOpts,
+    pub(crate) repo_root: &'a Utf8Path,
+    pub(crate) global: &'a GlobalArgs,
+    pub(crate) color: bool,
+    pub(crate) generated_at: &'a str,
+}
+
+pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Result<Exit, CoreError> {
+    match command {
+        Command::Outdated => report::run_outdated(&ctx).await,
+        Command::Check => report::run_check(&ctx).await,
+        Command::Upgrade => report::run_upgrade(&ctx).await,
+        Command::Explain { package } => report::run_explain(&ctx, &package).await,
+        Command::Config => report::run_config(&ctx),
+        Command::Baseline { prune } => baseline::run_baseline(&ctx, prune).await,
+        #[allow(
+            clippy::unreachable,
+            reason = "schema/init/sync are dispatched before any workspace exists"
+        )]
+        Command::Schema | Command::Init | Command::Sync => unreachable!("handled earlier"),
+    }
+}
+
+pub(crate) fn no_ecosystem_json(command: &'static str) -> Result<String, CoreError> {
+    present::no_ecosystem_json(command)
+}

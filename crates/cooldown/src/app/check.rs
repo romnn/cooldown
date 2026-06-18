@@ -2,13 +2,14 @@
 //! attributable to a dependency you couldn't evaluate forces a non-zero exit. Evaluates the
 //! resolved graph (direct + transitive) by default.
 
-use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
+use super::{
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, RunOpts, Window, Workspace, age_days,
+    diag_from_error, render_window,
+};
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution, ResolveKind,
     ResolveQuery, Status, check_pin, resolve,
 };
-use cooldown_render as render;
-use cooldown_render::tty::check_status_of;
 use futures::stream::{self, StreamExt};
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
@@ -36,11 +37,11 @@ fn stricter_native_days(res: &Resolution) -> Option<f64> {
 /// The result of `check`: the gate verdict, the findings, and the exit code that encodes it.
 pub struct CheckOutcome {
     /// The scope of the evaluation (graph vs direct-only, environment vs all artifacts).
-    pub meta: render::CheckMeta,
+    pub meta: CheckMeta,
     /// Per-status counts across all evaluated pins.
-    pub summary: render::CheckSummary,
+    pub summary: CheckSummary,
     /// The findings: violations, acknowledged pins, unknown-age pins, and per-dependency errors.
-    pub items: Vec<render::CheckItem>,
+    pub items: Vec<CheckItem>,
     /// Non-fatal diagnostics (stale lock under `--allow-stale-lock`, yanked pins, stricter-native).
     pub warnings: Vec<Diagnostic>,
     /// Project-level errors that abort evaluation of that project.
@@ -61,7 +62,7 @@ struct CheckAccum {
     violations: usize,
     /// Set when a stricter-native override tripped under `strict-native`.
     stricter_native_tripped: bool,
-    items: Vec<render::CheckItem>,
+    items: Vec<CheckItem>,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
 }
@@ -134,7 +135,7 @@ impl Workspace {
         }
 
         let err_count = acc.items.iter().filter(|i| i.error.is_some()).count() + acc.errors.len();
-        let summary = render::CheckSummary {
+        let summary = CheckSummary {
             checked: acc.checked,
             direct: acc.direct,
             exempt: acc.exempt,
@@ -143,7 +144,7 @@ impl Workspace {
             errors: err_count,
             violations: acc.violations,
         };
-        let meta = render::CheckMeta {
+        let meta = CheckMeta {
             scope: if scope == DepScope::Graph {
                 "lockfile-graph".into()
             } else {
@@ -173,7 +174,7 @@ impl Workspace {
     /// tool/transient failure stays fail-closed.
     async fn probe_lock(
         &self,
-        adapter: &dyn cooldown_core::Ecosystem,
+        adapter: &dyn cooldown_core::EcosystemRead,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         project_label: &str,
@@ -275,18 +276,18 @@ impl Workspace {
                 self.now,
             );
 
-        let Some(status) = check_status_of(pv.status, is_ack) else {
+        let Some(status) = CheckStatus::from_pin_status(pv.status, is_ack) else {
             return; // mature pass → counted in `checked`, not a finding
         };
 
         match status {
-            render::CheckStatus::Violation => acc.violations += 1,
-            render::CheckStatus::Acknowledged => acc.acknowledged += 1,
-            render::CheckStatus::UnknownAge => acc.unknown_age += 1,
-            render::CheckStatus::Error => {}
+            CheckStatus::Violation => acc.violations += 1,
+            CheckStatus::Acknowledged => acc.acknowledged += 1,
+            CheckStatus::UnknownAge => acc.unknown_age += 1,
+            CheckStatus::Error => {}
         }
 
-        acc.items.push(render::CheckItem {
+        acc.items.push(CheckItem {
             name: dep.package.name.clone(),
             ecosystem: pctx.ecosystem.as_str().to_string(),
             project: project_label.to_string(),
@@ -351,13 +352,8 @@ fn check_exit(acc: &CheckAccum, err_count: usize, opts: &RunOpts) -> Exit {
     }
 }
 
-fn error_item(
-    dep: &Dependency,
-    project: &str,
-    ecosystem: &str,
-    diag: Diagnostic,
-) -> render::CheckItem {
-    render::CheckItem {
+fn error_item(dep: &Dependency, project: &str, ecosystem: &str, diag: Diagnostic) -> CheckItem {
+    CheckItem {
         name: dep.package.name.clone(),
         ecosystem: ecosystem.to_string(),
         project: project.to_string(),
@@ -366,12 +362,12 @@ fn error_item(
         current: dep.current.to_string(),
         published_at: None,
         age_days: None,
-        window: render::Window {
+        window: Window {
             min_age_days: 0.0,
             source: "n/a".into(),
             clamped_by: None,
         },
-        status: render::CheckStatus::Error,
+        status: CheckStatus::Error,
         graph_held: false,
         graph_floor: None,
         error: Some(diag),

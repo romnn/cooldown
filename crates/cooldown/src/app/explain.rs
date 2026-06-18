@@ -2,29 +2,28 @@
 //! that applied), and `config` — the fully-resolved policy with the origin of each value. Together
 //! they keep the override system from being a black box.
 
-use super::{Exit, ProjectCtx, RunOpts, Workspace, round2};
+use super::{
+    ConfigItem, ConfigSummary, EffectiveInfo, Exit, ExplainMeta, ExplainStep, ProjectCtx, RunOpts,
+    Workspace, round2,
+};
 use cooldown_core::{DepScope, ResolveKind, ResolveQuery, resolve};
-use cooldown_render as render;
-use std::fmt::Write as _;
 
 /// The result of `explain <pkg>`: the package's effective window plus the ordered derivation steps.
 pub struct ExplainOutcome {
     /// The resolved window and the project/registry it was derived for.
-    pub meta: render::ExplainMeta,
+    pub meta: ExplainMeta,
     /// Each layer-and-rule step that contributed to (or was shadowed in) the derivation.
-    pub steps: Vec<render::ExplainStep>,
+    pub steps: Vec<ExplainStep>,
     /// The process exit (`Ok`, or `NoEcosystem` when no project is in scope).
     pub exit: Exit,
 }
 
-/// The result of `config`: the fully-resolved policy per project in both JSON and text form.
+/// The result of `config`: the fully-resolved policy per project as typed data.
 pub struct ConfigOutcome {
     /// The aggregate project count.
-    pub summary: render::ConfigSummary,
+    pub summary: ConfigSummary,
     /// One resolved policy row per project.
-    pub items: Vec<render::ConfigItem>,
-    /// The human-readable rendering.
-    pub text: String,
+    pub items: Vec<ConfigItem>,
     /// The process exit (always `Ok`).
     pub exit: Exit,
 }
@@ -57,7 +56,7 @@ impl Workspace {
         let steps = res
             .trace
             .iter()
-            .map(|s| render::ExplainStep {
+            .map(|s| ExplainStep {
                 layer: s.layer.token(),
                 field: s.field.clone(),
                 selector: s.selector.as_ref().and_then(cooldown_core::Selector::token),
@@ -67,10 +66,10 @@ impl Workspace {
             })
             .collect();
 
-        let meta = render::ExplainMeta {
+        let meta = ExplainMeta {
             project: pctx.rel_path.to_string(),
             registry,
-            effective: render::EffectiveInfo {
+            effective: EffectiveInfo {
                 min_age_days: round2(res.window.effective_min_age_days(self.now)),
                 decided_by: res.window.source(),
             },
@@ -100,8 +99,7 @@ impl Workspace {
     /// The fully-resolved config per project (effective default window + provenance + strict-native).
     #[must_use]
     pub fn config(&self, opts: &RunOpts) -> ConfigOutcome {
-        let mut items: Vec<render::ConfigItem> = Vec::new();
-        let mut text = String::new();
+        let mut items: Vec<ConfigItem> = Vec::new();
         for pctx in self.scoped_projects(opts) {
             // Resolve the bare default for a sentinel name unlikely to match a package glob.
             let q = ResolveQuery {
@@ -120,19 +118,7 @@ impl Workspace {
                 .map(|l| l.origin.token())
                 .collect();
 
-            // Infallible: writing to a String never errors.
-            let _ = writeln!(
-                text,
-                "{} [{}]\n  effective default window: {}d (decided by {})\n  strict-native: {}\n  layers: {}",
-                pctx.rel_path,
-                pctx.ecosystem,
-                days,
-                res.window.source(),
-                pctx.policy.strict_native,
-                layers.join(" < "),
-            );
-
-            items.push(render::ConfigItem {
+            items.push(ConfigItem {
                 project: pctx.rel_path.to_string(),
                 ecosystem: pctx.ecosystem.as_str().to_string(),
                 effective_default_min_age_days: days,
@@ -143,21 +129,20 @@ impl Workspace {
         }
 
         ConfigOutcome {
-            summary: render::ConfigSummary {
+            summary: ConfigSummary {
                 projects: items.len(),
             },
             items,
-            text,
             exit: Exit::Ok,
         }
     }
 }
 
-fn empty_meta() -> render::ExplainMeta {
-    render::ExplainMeta {
+fn empty_meta() -> ExplainMeta {
+    ExplainMeta {
         project: String::new(),
         registry: None,
-        effective: render::EffectiveInfo {
+        effective: EffectiveInfo {
             min_age_days: 0.0,
             decided_by: "default".into(),
         },

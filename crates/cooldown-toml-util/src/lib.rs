@@ -11,9 +11,9 @@ use serde::de::DeserializeOwned;
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`](cooldown_core::CoreError::Io) when the file exists but cannot be
-/// read, or [`CoreError::Config`](cooldown_core::CoreError::Config) when its contents are not valid
-/// TOML for `T`.
+/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) when the file exists
+/// but cannot be read, or [`CoreError::Config`](cooldown_core::CoreError::Config) when its
+/// contents are not valid TOML for `T`.
 pub fn read_toml_file<T>(path: &Utf8Path, doc_name: &str) -> Result<Option<T>, CoreError>
 where
     T: DeserializeOwned,
@@ -21,7 +21,7 @@ where
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(CoreError::Io(format!("{path}: {e}"))),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
     };
     toml::from_str(&content)
         .map(Some)
