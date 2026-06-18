@@ -99,10 +99,12 @@ impl Workspace {
         }
 
         // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
-        // items explicitly so the output is stable regardless of how they were accumulated.
+        // items explicitly so the output is stable, status-first (errored/skipped lead, applied
+        // last; a `--dry-run` is all `planned`, so it stays in name order).
         acc.items.sort_by(|a, b| {
             a.project
                 .cmp(&b.project)
+                .then_with(|| a.sort_rank().cmp(&b.sort_rank()))
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.from.cmp(&b.from))
         });

@@ -120,6 +120,17 @@ impl CheckStatus {
             | Status::Held => None,
         }
     }
+
+    /// Ordering key for the report: gate failures first, the acknowledged (benign) rows last.
+    #[must_use]
+    pub(crate) fn sort_rank(self) -> u8 {
+        match self {
+            CheckStatus::Violation => 0,
+            CheckStatus::Error => 1,
+            CheckStatus::UnknownAge => 2,
+            CheckStatus::Acknowledged => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +180,24 @@ pub struct UpgradeItem {
     pub applied: bool,
     pub skipped: Option<SkippedInfo>,
     pub error: Option<Diagnostic>,
+}
+
+impl UpgradeItem {
+    /// Ordering key for the report — errored/skipped changes first, the applied (succeeded) ones
+    /// last; `--dry-run` items are all `planned`, so they fall back to name order. Mirrors the
+    /// status precedence the renderer uses (applied > skipped > error > planned).
+    #[must_use]
+    pub(crate) fn sort_rank(&self) -> u8 {
+        if self.applied {
+            3
+        } else if self.skipped.is_some() {
+            1
+        } else if self.error.is_some() {
+            0
+        } else {
+            2
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
