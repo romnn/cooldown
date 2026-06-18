@@ -66,10 +66,12 @@ impl<'a> OutdatedRunner<'a> {
         }
 
         // Releases are fetched concurrently (`buffer_unordered`), so the items arrive in a
-        // non-deterministic order; sort for a stable report (and stable `--json`).
+        // non-deterministic order. Sort by (project, status, name, version) for a stable report
+        // (and stable `--json`); the status rank puts ready-to-adopt updates last.
         self.items.sort_by(|a, b| {
             a.project
                 .cmp(&b.project)
+                .then_with(|| a.status.sort_rank().cmp(&b.status.sort_rank()))
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.current.cmp(&b.current))
         });

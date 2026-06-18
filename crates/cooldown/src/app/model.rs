@@ -45,6 +45,24 @@ impl From<Status> for OutdatedStatus {
     }
 }
 
+impl OutdatedStatus {
+    /// Ordering key for the report: things needing attention first, the ready-to-adopt updates
+    /// last (so the actionable "what's still cooling / stuck" rows lead).
+    #[must_use]
+    pub(crate) fn sort_rank(self) -> u8 {
+        match self {
+            OutdatedStatus::Error => 0,
+            OutdatedStatus::UnknownAge => 1,
+            OutdatedStatus::Held => 2,
+            OutdatedStatus::CurrentInCooldown => 3,
+            OutdatedStatus::InCooldown => 4,
+            OutdatedStatus::Exempt => 5,
+            OutdatedStatus::UpToDate => 6,
+            OutdatedStatus::Adoptable => 7,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutdatedItem {
     pub name: String,
