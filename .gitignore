@@ -1,3 +1,9 @@
+.DS_Store
 /target
 **/*.rs.bk
 .cooldown.lock
+
+# goreleaser + zig files
+goreleaser-dist/
+.intentionally-empty-file.o
+*_compiler_family.o

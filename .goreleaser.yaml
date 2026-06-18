@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+dist: goreleaser-dist
+
+before:
+  hooks:
+    - rustup default stable
+    - cargo install --locked --force cargo-zigbuild
+
+homebrew_casks:
+  - name: &cooldown cooldown
+    ids:
+      - *cooldown
+    description: "A unified, language-agnostic dependency-cooldown CLI: refuse to adopt any version younger than a minimum release age, across ecosystems, from one policy core."
+    custom_block: |
+      os macos: "darwin", linux: "linux"
+    directory: Casks
+    commit_author:
+      name: romnn
+      email: contact@romnn.com
+    repository:
+      owner: romnn
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: false
+    hooks:
+      post:
+        install: |
+          if OS.mac? && File.exist?("/usr/bin/xattr")
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/cooldown"]
+          end
+
+builds:
+  - id: *cooldown
+    builder: rust
+    binary: *cooldown
+    targets:
+      # linux
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      # apple
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+      # windows
+      - x86_64-pc-windows-gnu
+      - aarch64-pc-windows-gnullvm
+    dir: ./
+    tool: cargo
+    command: zigbuild
+    flags:
+      - "--release"
+      - "--package=cooldown"
+
+archives:
+  - id: *cooldown
+    formats: ["tar.gz"]
+    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    ids:
+      - *cooldown
+    files:
+      - LICENSE
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^ci:"
+      - "^docs:"
+      - "^test:"
+
+release:
+  draft: false
