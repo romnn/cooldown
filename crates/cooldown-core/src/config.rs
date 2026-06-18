@@ -67,18 +67,59 @@ struct SelectorToml {
     exclude: Option<Vec<String>>,
 }
 
-/// A per-subcommand (or `[global]`) settings section: CLI-flag defaults that live in the config.
-/// A CLI flag, when given, always overrides the value here; a per-command section overrides
-/// `[global]`. New fields are added here as more flags become config-driven.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CommandToml {
-    /// Extra scan-exclude globs for this command (added to `[global]` and `[lang.*]` excludes).
-    exclude: Option<Vec<String>>,
-    /// Whether `.gitignore` is honored during detection (overridable by `--no-gitignore`).
-    gitignore: Option<bool>,
-    /// Whether cross-major candidates are in scope (overridable by `--major` / `--no-major`).
-    major: Option<bool>,
+/// CLI-flag defaults from one config section: `[global]` (shared) or a `[<command>]` section.
+///
+/// Every field mirrors a CLI flag. Resolution is uniform: an explicit CLI flag always wins, then a
+/// `[<command>]` value, then `[global]`, then the built-in default. `None`/empty means "unset", so a
+/// section only overrides what it names. Keys are kebab-case (`major-all`, `direct-only`, …), the
+/// same spelling as the flags. New config-driven flags are added here and nowhere else.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CommandConfig {
+    /// Extra scan-exclude globs (added to `[global]` and `[lang.*]` excludes). `--exclude` has no
+    /// CLI form; this is the only way to set it.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Restrict to these ecosystems (`--lang`); empty means "all detected".
+    #[serde(default)]
+    pub lang: Vec<String>,
+    /// Scope to packages matching these globs (`--package`); empty means "all".
+    #[serde(default)]
+    pub package: Vec<String>,
+    /// `.gitignore` honoring during detection (`--no-gitignore` forces off).
+    pub gitignore: Option<bool>,
+    /// Cross-major candidate scope (`--major` / `--no-major`).
+    pub major: Option<bool>,
+    /// Apply cross-major to all eligible deps (`--major-all`).
+    pub major_all: Option<bool>,
+    /// List up-to-date deps in `outdated` (`--all`).
+    pub all: Option<bool>,
+    /// Evaluate only direct deps (`--direct-only`).
+    pub direct_only: Option<bool>,
+    /// Include transitive deps in `outdated` (`--include-indirect`).
+    pub include_indirect: Option<bool>,
+    /// Gate every recorded artifact in `check` (`--all-artifacts`).
+    pub all_artifacts: Option<bool>,
+    /// Downgrade a stale/absent lock to a warning (`--allow-stale-lock`).
+    pub allow_stale_lock: Option<bool>,
+    /// Make `check` fail on deps with no publish time (`--fail-on-unknown-age`).
+    pub fail_on_unknown_age: Option<bool>,
+    /// Fail `upgrade` if any planned change was skipped (`--strict`).
+    pub strict: Option<bool>,
+    /// Compile/sync after re-locking in `upgrade` (`--build`).
+    pub build: Option<bool>,
+    /// Resolve and print the plan; never mutate (`--dry-run`).
+    pub dry_run: Option<bool>,
+    /// Cache only; a miss becomes `UnknownAge` (`--offline`).
+    pub offline: Option<bool>,
+    /// Ignore the local cache; always hit the registry (`--fresh`).
+    pub fresh: Option<bool>,
+    /// Machine-readable output (`--json`).
+    pub json: Option<bool>,
+    /// `outdated` CI gate exit code (`--exit-code`).
+    pub exit_code: Option<u8>,
+    /// Concurrency for the registry fan-out (no CLI flag; defaults to 8).
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -97,12 +138,12 @@ struct ConfigToml {
     package: Option<BTreeMap<String, SelectorToml>>,
     project: Option<BTreeMap<String, SelectorToml>>,
     /// Shared CLI-flag defaults across all subcommands.
-    global: Option<CommandToml>,
+    global: Option<CommandConfig>,
     /// Per-subcommand CLI-flag defaults; each overrides `[global]`.
-    outdated: Option<CommandToml>,
-    upgrade: Option<CommandToml>,
-    check: Option<CommandToml>,
-    baseline: Option<CommandToml>,
+    outdated: Option<CommandConfig>,
+    upgrade: Option<CommandConfig>,
+    check: Option<CommandConfig>,
+    baseline: Option<CommandConfig>,
 }
 
 /// Builds the [`ByKind`] window for one selector, enforcing the `latest`/`freeze`/`min-age`
@@ -271,17 +312,6 @@ pub fn parse_config(content: &str, origin: Origin) -> Result<PolicyLayer, CoreEr
     Ok(layer)
 }
 
-/// Resolved CLI-flag defaults from one config section (`[global]` or a `[<command>]` section).
-#[derive(Debug, Clone, Default)]
-pub struct CommandConfig {
-    /// Scan-exclude globs contributed by this section.
-    pub exclude: Vec<String>,
-    /// `.gitignore` honoring, when the section sets it.
-    pub gitignore: Option<bool>,
-    /// Cross-major scope, when the section sets it.
-    pub major: Option<bool>,
-}
-
 /// The non-policy, CLI-flag-shaped config: `[global]` defaults, per-subcommand overrides, and
 /// per-language scan excludes. Separate from the policy [`PolicyLayer`] because these settings tune
 /// *how* a command runs (scanning, scope) rather than the cooldown window itself.
@@ -311,56 +341,53 @@ impl ScanConfig {
         self
     }
 
-    /// Scan-exclude globs for `command` + `ecosystem`: `[global]` + `[lang.<eco>]` + `[<command>]`.
+    /// The resolved flag defaults for `command`: `[global]` with the `[<command>]` section merged
+    /// over it. The caller layers an explicit CLI flag on top of this.
+    #[must_use]
+    pub fn resolved(&self, command: &str) -> CommandConfig {
+        let mut cfg = self.global.clone();
+        if let Some(section) = self.commands.get(command) {
+            cfg = merge_command(cfg, section.clone());
+        }
+        cfg
+    }
+
+    /// Scan-exclude globs for `command` + `ecosystem`: `[global]` + `[<command>]` (via
+    /// [`resolved`](Self::resolved)) plus the `[lang.<eco>].exclude` list.
     #[must_use]
     pub fn exclude_for(&self, command: &str, ecosystem: &str) -> Vec<String> {
-        let mut out = self.global.exclude.clone();
+        let mut out = self.resolved(command).exclude;
         if let Some(lang) = self.lang_exclude.get(ecosystem) {
             out.extend(lang.iter().cloned());
         }
-        if let Some(cmd) = self.commands.get(command) {
-            out.extend(cmd.exclude.iter().cloned());
-        }
         out
     }
-
-    /// Whether `.gitignore` is honored for `command` (a `[<command>]` value overrides `[global]`).
-    #[must_use]
-    pub fn gitignore_for(&self, command: &str) -> Option<bool> {
-        self.commands
-            .get(command)
-            .and_then(|c| c.gitignore)
-            .or(self.global.gitignore)
-    }
-
-    /// The configured cross-major default for `command` (a `[<command>]` value overrides `[global]`).
-    #[must_use]
-    pub fn major_for(&self, command: &str) -> Option<bool> {
-        self.commands
-            .get(command)
-            .and_then(|c| c.major)
-            .or(self.global.major)
-    }
 }
 
-fn merge_command(mut base: CommandConfig, other: CommandConfig) -> CommandConfig {
-    base.exclude.extend(other.exclude);
-    if other.gitignore.is_some() {
-        base.gitignore = other.gitignore;
-    }
-    if other.major.is_some() {
-        base.major = other.major;
-    }
+/// Merge `other` (higher precedence) over `base`: list fields concatenate; scalar `Option` fields
+/// take `other`'s value when it sets one.
+fn merge_command(mut base: CommandConfig, mut other: CommandConfig) -> CommandConfig {
+    base.exclude.append(&mut other.exclude);
+    base.lang.append(&mut other.lang);
+    base.package.append(&mut other.package);
+    base.gitignore = other.gitignore.or(base.gitignore);
+    base.major = other.major.or(base.major);
+    base.major_all = other.major_all.or(base.major_all);
+    base.all = other.all.or(base.all);
+    base.direct_only = other.direct_only.or(base.direct_only);
+    base.include_indirect = other.include_indirect.or(base.include_indirect);
+    base.all_artifacts = other.all_artifacts.or(base.all_artifacts);
+    base.allow_stale_lock = other.allow_stale_lock.or(base.allow_stale_lock);
+    base.fail_on_unknown_age = other.fail_on_unknown_age.or(base.fail_on_unknown_age);
+    base.strict = other.strict.or(base.strict);
+    base.build = other.build.or(base.build);
+    base.dry_run = other.dry_run.or(base.dry_run);
+    base.offline = other.offline.or(base.offline);
+    base.fresh = other.fresh.or(base.fresh);
+    base.json = other.json.or(base.json);
+    base.exit_code = other.exit_code.or(base.exit_code);
+    base.concurrency = other.concurrency.or(base.concurrency);
     base
-}
-
-fn command_config(section: Option<CommandToml>) -> CommandConfig {
-    let section = section.unwrap_or_default();
-    CommandConfig {
-        exclude: section.exclude.unwrap_or_default(),
-        gitignore: section.gitignore,
-        major: section.major,
-    }
 }
 
 /// Parse the non-policy [`ScanConfig`] (the `[global]`/`[<command>]`/`[lang.*]` scan settings) from
@@ -374,7 +401,7 @@ pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, C
     let cfg: ConfigToml = toml::from_str(content)
         .map_err(|e| CoreError::Config(format!("{}: {e}", origin.token())))?;
     let mut scan = ScanConfig {
-        global: command_config(cfg.global),
+        global: cfg.global.unwrap_or_default(),
         ..ScanConfig::default()
     };
     for (name, section) in [
@@ -383,9 +410,8 @@ pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, C
         ("check", cfg.check),
         ("baseline", cfg.baseline),
     ] {
-        if section.is_some() {
-            scan.commands
-                .insert(name.to_string(), command_config(section));
+        if let Some(section) = section {
+            scan.commands.insert(name.to_string(), section);
         }
     }
     for (name, selector) in cfg.lang.unwrap_or_default() {
@@ -536,10 +562,11 @@ exclude = ["vendor"]
 exclude = ["fixtures"]
 "#,
         );
-        // The scan exclude list comes from [global] + [lang.<eco>] + [<command>], in that order.
+        // The scan exclude list combines [global] + [<command>] + [lang.<eco>] (order is
+        // irrelevant — it is a prune set).
         assert_eq!(
             cfg.exclude_for("outdated", "rust"),
-            vec!["build", "vendor", "fixtures"]
+            vec!["build", "fixtures", "vendor"]
         );
         // Another command gets [global] + [lang] but not the [outdated] entry.
         assert_eq!(cfg.exclude_for("upgrade", "rust"), vec!["build", "vendor"]);
@@ -560,21 +587,21 @@ gitignore = false
 ",
         );
         assert_eq!(
-            cfg.gitignore_for("outdated"),
+            cfg.resolved("outdated").gitignore,
             Some(false),
             "command overrides global"
         );
         assert_eq!(
-            cfg.gitignore_for("upgrade"),
+            cfg.resolved("upgrade").gitignore,
             Some(true),
             "falls back to global"
         );
         assert_eq!(
-            cfg.major_for("outdated"),
+            cfg.resolved("outdated").major,
             Some(true),
             "inherited from global"
         );
-        assert_eq!(cfg.major_for("check"), Some(true));
+        assert_eq!(cfg.resolved("check").major, Some(true));
     }
 
     #[test]
@@ -583,14 +610,37 @@ gitignore = false
         let over = scan("[global]\nexclude = [\"b\"]\ngitignore = false\n");
         let merged = base.merge(over);
         assert_eq!(merged.exclude_for("outdated", "rust"), vec!["a", "b"]);
-        assert_eq!(merged.gitignore_for("outdated"), Some(false));
+        assert_eq!(merged.resolved("outdated").gitignore, Some(false));
+    }
+
+    #[test]
+    fn all_flags_resolve_with_command_over_global() {
+        let cfg = scan(
+            r"
+[global]
+strict = true
+offline = true
+concurrency = 4
+
+[upgrade]
+strict = false
+build = true
+",
+        );
+        let up = cfg.resolved("upgrade");
+        assert_eq!(up.strict, Some(false), "command overrides global");
+        assert_eq!(up.build, Some(true));
+        assert_eq!(up.offline, Some(true), "inherited from global");
+        assert_eq!(up.concurrency, Some(4));
+        assert_eq!(cfg.resolved("check").strict, Some(true), "other commands see global");
     }
 
     #[test]
     fn empty_config_is_inert() {
         let cfg = scan("min-age = \"7d\"\n");
         assert!(cfg.exclude_for("outdated", "rust").is_empty());
-        assert_eq!(cfg.gitignore_for("outdated"), None);
-        assert_eq!(cfg.major_for("outdated"), None);
+        assert_eq!(cfg.resolved("outdated").gitignore, None);
+        assert_eq!(cfg.resolved("outdated").major, None);
+        assert_eq!(cfg.resolved("outdated").strict, None);
     }
 }
