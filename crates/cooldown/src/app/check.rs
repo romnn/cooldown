@@ -113,6 +113,14 @@ impl<'a> CheckRunner<'a> {
             self.run_project(pctx).await;
         }
 
+        // Locked-release metadata is fetched concurrently (`buffer_unordered`); sort for a stable
+        // report and `--json`.
+        self.acc.items.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.current.cmp(&b.current))
+        });
         let err_count = self
             .acc
             .items

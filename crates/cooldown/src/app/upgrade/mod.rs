@@ -98,6 +98,14 @@ impl Workspace {
             .await;
         }
 
+        // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
+        // items explicitly so the output is stable regardless of how they were accumulated.
+        acc.items.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.from.cmp(&b.from))
+        });
         let applied = acc.items.iter().filter(|item| item.applied).count();
         let skipped = acc
             .items

@@ -291,10 +291,19 @@ impl Workspace {
         opts: &RunOpts,
     ) -> cooldown_core::Result<Vec<Dependency>> {
         let deps = adapter.dependencies(&pctx.project, scope).await?;
-        Ok(deps
+        let mut deps: Vec<Dependency> = deps
             .into_iter()
             .filter(|dep| Self::package_in_scope(opts, &dep.package.name))
-            .collect())
+            .collect();
+        // Adapters yield deps in registry/HashMap order; sort so every command — most importantly
+        // `upgrade`, which applies one change at a time — is deterministic when re-run back to back.
+        deps.sort_by(|a, b| {
+            a.package
+                .name
+                .cmp(&b.package.name)
+                .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
+        });
+        Ok(deps)
     }
 
     pub(crate) fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {

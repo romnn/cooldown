@@ -217,6 +217,14 @@ impl crate::app::Workspace {
                 }
             }
         }
+        // Pins are fetched concurrently (`buffer_unordered`); sort so the written baseline file is
+        // stable (no spurious diffs when re-running `cooldown baseline`).
+        entries.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.package.cmp(&b.package))
+                .then_with(|| a.version.cmp(&b.version))
+        });
         Ok(entries)
     }
 }

@@ -65,6 +65,14 @@ impl<'a> OutdatedRunner<'a> {
             self.run_project(pctx).await;
         }
 
+        // Releases are fetched concurrently (`buffer_unordered`), so the items arrive in a
+        // non-deterministic order; sort for a stable report (and stable `--json`).
+        self.items.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.current.cmp(&b.current))
+        });
         let summary = summarize(&self.items);
         OutdatedOutcome {
             summary,
