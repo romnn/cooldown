@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `uv` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, VerifyReport};
+use cooldown_core::{CoreError, ToolTermination, VerifyReport};
 use tokio::process::Command;
 
 /// A handle to the project's own `uv` binary, used only as the resolution/apply engine.
@@ -52,7 +52,7 @@ impl Uv {
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
-                status: out.status.code().unwrap_or(-1),
+                termination: ToolTermination::from_exit_status(out.status),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             })
         }
@@ -82,7 +82,7 @@ impl Uv {
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
-                status: out.status.code().unwrap_or(-1),
+                termination: ToolTermination::from_exit_status(out.status),
                 stderr: stderr.into_owned(),
             })
         }

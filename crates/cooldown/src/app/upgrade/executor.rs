@@ -120,7 +120,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &releases,
                 &self.ctx.pctx.policy.layers,
                 &rctx,
-                self.ws.now,
+                self.ws.now(),
             );
             let Some(target) = verdict.adoptable_target else {
                 continue;
@@ -336,7 +336,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &locked,
                 &self.ctx.pctx.policy.layers,
                 &rctx,
-                self.ws.now,
+                self.ws.now(),
             );
             if pin.status == Status::CurrentInCooldown {
                 let acknowledged = self.ws.baseline.is_acknowledged(
@@ -345,7 +345,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     &dep.package.name,
                     dep.current.as_str(),
                     dep.package.registry.as_deref(),
-                    self.ws.now,
+                    self.ws.now(),
                 );
                 if !acknowledged {
                     violations.insert((dep.package.name.clone(), dep.current.to_string()));

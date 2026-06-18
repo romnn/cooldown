@@ -12,7 +12,7 @@ pub mod model;
 pub mod policy;
 pub mod ports;
 
-pub use error::{CoreError, Diagnostic, DiagnosticKind, Result};
+pub use error::{CoreError, Diagnostic, DiagnosticKind, Result, ToolTermination};
 pub use evaluate::{ResolveContext, check_pin, evaluate};
 pub use model::*;
 pub use policy::{

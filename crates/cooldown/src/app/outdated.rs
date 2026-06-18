@@ -25,80 +25,113 @@ pub struct OutdatedOutcome {
     pub exit: Exit,
 }
 
+struct OutdatedRunner<'a> {
+    ws: &'a Workspace,
+    opts: &'a RunOpts,
+    scope: DepScope,
+    items: Vec<OutdatedItem>,
+    warnings: Vec<Diagnostic>,
+    errors: Vec<Diagnostic>,
+}
+
 impl Workspace {
     /// Report what could update, split into "adoptable now" vs "in cooldown".
     ///
     /// Scopes to direct deps unless `--include-indirect` is set (and `--direct-only` is not), and
     /// to packages matching `--package`. Surfaces a yanked locked version as a warning.
     pub async fn outdated(&self, opts: &RunOpts) -> OutdatedOutcome {
-        let mut items: Vec<OutdatedItem> = Vec::new();
-        let mut warnings: Vec<Diagnostic> = Vec::new();
-        let mut errors: Vec<Diagnostic> = Vec::new();
+        OutdatedRunner::new(self, opts).run().await
+    }
+}
 
+impl<'a> OutdatedRunner<'a> {
+    fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
         let scope = if opts.include_indirect && !opts.direct_only {
             DepScope::Graph
         } else {
             DepScope::Direct
         };
+        OutdatedRunner {
+            ws,
+            opts,
+            scope,
+            items: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 
-        for pctx in self.scoped_projects(opts) {
-            let Some(adapter) = self.adapter(pctx.tool) else {
-                continue;
-            };
-            let project_label = pctx.rel_path.to_string();
-
-            opts.progress.say(&format!(
-                "Resolving {} dependencies ({})…",
-                project_label, pctx.tool
-            ));
-            let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        project = project_label,
-                        tool = pctx.tool.as_str(),
-                        error = %e,
-                        "could not enumerate dependencies"
-                    );
-                    errors.push(diag_from_error(&e, pctx.tool, &project_label, None));
-                    continue;
-                }
-            };
-            let fctx = Self::fetch_context(pctx, opts);
-            let fetched =
-                Self::fetch_releases(adapter, pctx, &project_label, deps, &fctx, opts).await;
-
-            let rctx = Self::resolve_ctx(pctx, opts);
-            for (dep, result) in fetched {
-                match result {
-                    Ok(releases) => {
-                        if is_yanked_locked(&releases, &dep) {
-                            warnings.push(yanked_warning(pctx, &project_label, &dep));
-                        }
-                        items.push(self.outdated_item(
-                            pctx,
-                            &project_label,
-                            &dep,
-                            &releases,
-                            &rctx,
-                        ));
-                    }
-                    Err(e) => {
-                        let diag =
-                            diag_from_error(&e, pctx.tool, &project_label, Some(&dep.package.name));
-                        items.push(error_item(pctx, &project_label, &dep, diag));
-                    }
-                }
-            }
+    async fn run(mut self) -> OutdatedOutcome {
+        for pctx in self.ws.scoped_projects(self.opts) {
+            self.run_project(pctx).await;
         }
 
-        let summary = summarize(&items);
+        let summary = summarize(&self.items);
         OutdatedOutcome {
             summary,
-            items,
-            warnings,
-            errors,
+            items: self.items,
+            warnings: self.warnings,
+            errors: self.errors,
             exit: Exit::Ok,
+        }
+    }
+
+    async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
+        let Some(adapter) = self.ws.adapter(pctx.tool) else {
+            return;
+        };
+        let project_label = pctx.rel_path.to_string();
+
+        self.opts.progress.say(&format!(
+            "Resolving {} dependencies ({})…",
+            project_label, pctx.tool
+        ));
+        let deps = match self
+            .ws
+            .dependencies_in_scope(adapter, pctx, self.scope, self.opts)
+            .await
+        {
+            Ok(deps) => deps,
+            Err(error) => {
+                tracing::warn!(
+                    project = project_label,
+                    tool = pctx.tool.as_str(),
+                    error = %error,
+                    "could not enumerate dependencies"
+                );
+                self.errors
+                    .push(diag_from_error(&error, pctx.tool, &project_label, None));
+                return;
+            }
+        };
+        let fetch = Workspace::fetch_context(pctx, self.opts);
+        let fetched = self
+            .fetch_releases(adapter, pctx, &project_label, deps, &fetch)
+            .await;
+
+        let resolve = Workspace::resolve_ctx(pctx, self.opts);
+        for (dep, result) in fetched {
+            match result {
+                Ok(releases) => {
+                    if is_yanked_locked(&releases, &dep) {
+                        self.warnings
+                            .push(yanked_warning(pctx, &project_label, &dep));
+                    }
+                    self.items.push(self.outdated_item(
+                        pctx,
+                        &project_label,
+                        &dep,
+                        &releases,
+                        &resolve,
+                    ));
+                }
+                Err(error) => {
+                    let diag =
+                        diag_from_error(&error, pctx.tool, &project_label, Some(&dep.package.name));
+                    self.items
+                        .push(error_item(pctx, &project_label, &dep, diag));
+                }
+            }
         }
     }
 
@@ -107,28 +140,28 @@ impl Workspace {
     /// never blocks the others. The surrounding `info!`/per-dependency `debug!`/`trace!` spans make
     /// a stalled network call visible under `--log-level debug`.
     async fn fetch_releases(
+        &self,
         adapter: &dyn cooldown_core::ToolRead,
         pctx: &super::ProjectCtx,
         project_label: &str,
         deps: Vec<Dependency>,
         fctx: &cooldown_core::FetchContext<'_>,
-        opts: &RunOpts,
     ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
         tracing::info!(
             project = project_label,
             tool = pctx.tool.as_str(),
             deps = deps.len(),
-            fanout = opts.fanout(),
+            fanout = self.opts.fanout(),
             "fetching release metadata"
         );
-        opts.progress.say(&format!(
+        self.opts.progress.say(&format!(
             "Fetching release metadata for {} dependencies…",
             deps.len()
         ));
         let started = std::time::Instant::now();
         let fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> = stream::iter(deps)
             .map(|dep| {
-                let candidate_scope = opts.candidate_scope();
+                let candidate_scope = self.opts.candidate_scope();
                 async move {
                     tracing::debug!(package = dep.package.name, "fetch releases");
                     let r = adapter.releases(&dep, fctx, candidate_scope).await;
@@ -147,7 +180,7 @@ impl Workspace {
                     (dep, r)
                 }
             })
-            .buffer_unordered(opts.fanout())
+            .buffer_unordered(self.opts.fanout())
             .collect()
             .await;
         tracing::info!(
@@ -169,11 +202,11 @@ impl Workspace {
         releases: &[Release],
         rctx: &cooldown_core::ResolveContext<'_>,
     ) -> OutdatedItem {
-        let verdict = evaluate(dep, releases, &pctx.policy.layers, rctx, self.now);
+        let verdict = evaluate(dep, releases, &pctx.policy.layers, rctx, self.ws.now());
 
         // Prefer a candidate's window; fall back to a current-pin resolution when there is none.
         let window = if let Some(c) = verdict.candidates.last() {
-            render_window(&c.window, self.now)
+            render_window(&c.window, self.ws.now())
         } else {
             let q = ResolveQuery {
                 tool: pctx.tool,
@@ -182,7 +215,10 @@ impl Workspace {
                 project: &pctx.rel_path,
                 kind: ResolveKind::CurrentPin,
             };
-            render_window(&resolve(&pctx.policy.layers, &q, self.now).window, self.now)
+            render_window(
+                &resolve(&pctx.policy.layers, &q, self.ws.now()).window,
+                self.ws.now(),
+            )
         };
 
         let latest = verdict.latest.as_ref().map(|lv| {
@@ -193,7 +229,7 @@ impl Workspace {
             LatestInfo {
                 version: lv.to_string(),
                 published_at: published.map(|p| p.to_string()),
-                age_days: published.map(|p| age_days(p, self.now)),
+                age_days: published.map(|p| age_days(p, self.ws.now())),
             }
         });
 

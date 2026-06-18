@@ -75,6 +75,13 @@ enum LockProbe {
     Skip,
 }
 
+struct CheckRunner<'a> {
+    ws: &'a Workspace,
+    opts: &'a RunOpts,
+    scope: DepScope,
+    acc: CheckAccum,
+}
+
 impl Workspace {
     /// Gate the resolved graph: exit non-zero if anything is younger than its cooldown (the CI
     /// gate).
@@ -83,94 +90,118 @@ impl Workspace {
     /// `--fail-on-unknown-age`) an unknown publish time forces a non-zero [`Exit`]. Evaluates the
     /// full graph by default, or direct deps under `--direct-only`.
     pub async fn check(&self, opts: &RunOpts) -> CheckOutcome {
-        let mut acc = CheckAccum::default();
+        CheckRunner::new(self, opts).run().await
+    }
+}
 
+impl<'a> CheckRunner<'a> {
+    fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
         let scope = if opts.direct_only {
             DepScope::Direct
         } else {
             DepScope::Graph
         };
+        CheckRunner {
+            ws,
+            opts,
+            scope,
+            acc: CheckAccum::default(),
+        }
+    }
 
-        for pctx in self.scoped_projects(opts) {
-            let Some(adapter) = self.adapter(pctx.tool) else {
-                continue;
-            };
-            let project_label = pctx.rel_path.to_string();
-
-            match self
-                .probe_lock(adapter, pctx, opts, &project_label, &mut acc)
-                .await
-            {
-                LockProbe::Continue => {}
-                LockProbe::Skip => continue,
-            }
-
-            let deps = match self.dependencies_in_scope(adapter, pctx, scope, opts).await {
-                Ok(d) => d,
-                Err(e) => {
-                    acc.errors
-                        .push(diag_from_error(&e, pctx.tool, &project_label, None));
-                    continue;
-                }
-            };
-            let fctx = Self::fetch_context(pctx, opts);
-
-            opts.progress.say(&format!(
-                "Checking {} dependencies in {} ({})…",
-                deps.len(),
-                project_label,
-                pctx.tool
-            ));
-            let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
-                stream::iter(deps)
-                    .map(|dep| {
-                        let fctx = &fctx;
-                        async move {
-                            let r = adapter.locked_release(&dep, fctx).await;
-                            (dep, r)
-                        }
-                    })
-                    .buffer_unordered(opts.fanout())
-                    .collect()
-                    .await;
-
-            let rctx = Self::resolve_ctx(pctx, opts);
-            for (dep, result) in fetched {
-                self.gate_pin(pctx, &project_label, &dep, result, &rctx, &mut acc);
-            }
+    async fn run(mut self) -> CheckOutcome {
+        for pctx in self.ws.scoped_projects(self.opts) {
+            self.run_project(pctx).await;
         }
 
-        let err_count = acc.items.iter().filter(|i| i.error.is_some()).count() + acc.errors.len();
+        let err_count = self
+            .acc
+            .items
+            .iter()
+            .filter(|item| item.error.is_some())
+            .count()
+            + self.acc.errors.len();
         let summary = CheckSummary {
-            checked: acc.checked,
-            direct: acc.direct,
-            exempt: acc.exempt,
-            acknowledged: acc.acknowledged,
-            unknown_age: acc.unknown_age,
+            checked: self.acc.checked,
+            direct: self.acc.direct,
+            exempt: self.acc.exempt,
+            acknowledged: self.acc.acknowledged,
+            unknown_age: self.acc.unknown_age,
             errors: err_count,
-            violations: acc.violations,
+            violations: self.acc.violations,
         };
         let meta = CheckMeta {
-            scope: if scope == DepScope::Graph {
+            scope: if self.scope == DepScope::Graph {
                 "lockfile-graph".into()
             } else {
                 "direct-only".into()
             },
-            artifact_scope: if opts.all_artifacts {
+            artifact_scope: if self.opts.all_artifacts {
                 "all".into()
             } else {
                 "environment".into()
             },
         };
-        let exit = check_exit(&acc, err_count, opts);
+        let exit = check_exit(&self.acc, err_count, self.opts);
 
         CheckOutcome {
             meta,
             summary,
-            items: acc.items,
-            warnings: acc.warnings,
-            errors: acc.errors,
+            items: self.acc.items,
+            warnings: self.acc.warnings,
+            errors: self.acc.errors,
             exit,
+        }
+    }
+
+    async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
+        let Some(adapter) = self.ws.adapter(pctx.tool) else {
+            return;
+        };
+        let project_label = pctx.rel_path.to_string();
+
+        match self.probe_lock(adapter, pctx, &project_label).await {
+            LockProbe::Continue => {}
+            LockProbe::Skip => return,
+        }
+
+        let deps = match self
+            .ws
+            .dependencies_in_scope(adapter, pctx, self.scope, self.opts)
+            .await
+        {
+            Ok(deps) => deps,
+            Err(error) => {
+                self.acc
+                    .errors
+                    .push(diag_from_error(&error, pctx.tool, &project_label, None));
+                return;
+            }
+        };
+        let fetch = Workspace::fetch_context(pctx, self.opts);
+
+        self.opts.progress.say(&format!(
+            "Checking {} dependencies in {} ({})…",
+            deps.len(),
+            project_label,
+            pctx.tool
+        ));
+        let fetched: Vec<(Dependency, cooldown_core::Result<cooldown_core::Release>)> =
+            stream::iter(deps)
+                .map(|dep| {
+                    let fetch = &fetch;
+                    async move {
+                        let result = adapter.locked_release(&dep, fetch).await;
+                        (dep, result)
+                    }
+                })
+                .buffer_unordered(self.opts.fanout())
+                .collect()
+                .await;
+
+        let resolve = Workspace::resolve_ctx(pctx, self.opts);
+        for (dep, result) in fetched {
+            self.gate_pin(pctx, &project_label, &dep, result, &resolve);
         }
     }
 
@@ -179,12 +210,10 @@ impl Workspace {
     /// `--allow-stale-lock` downgrades a genuine stale/absent-lock result to a warning; a
     /// tool/transient failure stays fail-closed.
     async fn probe_lock(
-        &self,
+        &mut self,
         adapter: &dyn cooldown_core::ToolRead,
         pctx: &super::ProjectCtx,
-        opts: &RunOpts,
         project_label: &str,
-        acc: &mut CheckAccum,
     ) -> LockProbe {
         match adapter.verify_lock_current(&pctx.project).await {
             Ok(v) if v.ok => LockProbe::Continue,
@@ -193,11 +222,11 @@ impl Workspace {
                     .with_tool(pctx.tool.as_str())
                     .with_project(project_label)
                     .with_path(pctx.project.manifest.as_str());
-                if opts.allow_stale_lock {
-                    acc.warnings.push(diag);
+                if self.opts.allow_stale_lock {
+                    self.acc.warnings.push(diag);
                     LockProbe::Continue
                 } else {
-                    acc.errors.push(diag);
+                    self.acc.errors.push(diag);
                     LockProbe::Skip // cannot soundly evaluate a stale lock
                 }
             }
@@ -208,11 +237,11 @@ impl Workspace {
                     diag.kind,
                     DiagnosticKind::StaleLock | DiagnosticKind::NotFound
                 );
-                if opts.allow_stale_lock && downgradable {
-                    acc.warnings.push(diag);
+                if self.opts.allow_stale_lock && downgradable {
+                    self.acc.warnings.push(diag);
                     LockProbe::Continue
                 } else {
-                    acc.errors.push(diag);
+                    self.acc.errors.push(diag);
                     LockProbe::Skip
                 }
             }
@@ -222,30 +251,30 @@ impl Workspace {
     /// Evaluate one fetched pin: tally it, emit any finding, and surface yanked/stricter-native
     /// warnings.
     fn gate_pin(
-        &self,
+        &mut self,
         pctx: &super::ProjectCtx,
         project_label: &str,
         dep: &Dependency,
         result: cooldown_core::Result<cooldown_core::Release>,
         rctx: &cooldown_core::ResolveContext<'_>,
-        acc: &mut CheckAccum,
     ) {
-        acc.checked += 1;
+        self.acc.checked += 1;
         if dep.direct {
-            acc.direct += 1;
+            self.acc.direct += 1;
         }
         let locked = match result {
             Ok(l) => l,
             Err(e) => {
                 // A failure attributable to one dependency → an item with status:"error".
                 let diag = diag_from_error(&e, pctx.tool, project_label, Some(&dep.package.name));
-                acc.items
+                self.acc
+                    .items
                     .push(error_item(dep, project_label, pctx.tool.as_str(), diag));
                 return;
             }
         };
         if locked.yanked {
-            acc.warnings.push(
+            self.acc.warnings.push(
                 Diagnostic::new(DiagnosticKind::Yanked, "locked version is yanked")
                     .with_tool(pctx.tool.as_str())
                     .with_project(project_label)
@@ -254,27 +283,27 @@ impl Workspace {
             );
         }
 
-        let pv = check_pin(dep, &locked, &pctx.policy.layers, rctx, self.now);
+        let pv = check_pin(dep, &locked, &pctx.policy.layers, rctx, self.ws.now());
         if let Some(diag) = self.stricter_native_warning(pctx, project_label, dep) {
-            acc.warnings.push(diag);
+            self.acc.warnings.push(diag);
             if pctx.policy.strict_native {
-                acc.stricter_native_tripped = true;
+                self.acc.stricter_native_tripped = true;
             }
         }
 
         if pv.status == Status::Exempt {
-            acc.exempt += 1;
+            self.acc.exempt += 1;
             return;
         }
 
         let is_ack = pv.status == Status::CurrentInCooldown
-            && self.baseline.is_acknowledged(
+            && self.ws.baseline.is_acknowledged(
                 pctx.tool.as_str(),
                 project_label,
                 &dep.package.name,
                 dep.current.as_str(),
                 dep.package.registry.as_deref(),
-                self.now,
+                self.ws.now(),
             );
 
         let Some(status) = CheckStatus::from_pin_status(pv.status, is_ack) else {
@@ -282,13 +311,13 @@ impl Workspace {
         };
 
         match status {
-            CheckStatus::Violation => acc.violations += 1,
-            CheckStatus::Acknowledged => acc.acknowledged += 1,
-            CheckStatus::UnknownAge => acc.unknown_age += 1,
+            CheckStatus::Violation => self.acc.violations += 1,
+            CheckStatus::Acknowledged => self.acc.acknowledged += 1,
+            CheckStatus::UnknownAge => self.acc.unknown_age += 1,
             CheckStatus::Error => {}
         }
 
-        acc.items.push(CheckItem {
+        self.acc.items.push(CheckItem {
             name: dep.package.name.clone(),
             tool: pctx.tool.as_str().to_string(),
             project: project_label.to_string(),
@@ -296,8 +325,8 @@ impl Workspace {
             direct: dep.direct,
             current: dep.current.to_string(),
             published_at: pv.published_at.map(|p| p.to_string()),
-            age_days: pv.published_at.map(|p| age_days(p, self.now)),
-            window: render_window(&pv.window, self.now),
+            age_days: pv.published_at.map(|p| age_days(p, self.ws.now())),
+            window: render_window(&pv.window, self.ws.now()),
             status,
             graph_held: pv.graph_held,
             graph_floor: pv.graph_floor.map(|v| v.to_string()),
@@ -320,14 +349,14 @@ impl Workspace {
             project: &pctx.rel_path,
             kind: ResolveKind::CurrentPin,
         };
-        let res = resolve(&pctx.policy.layers, &q, self.now);
+        let res = resolve(&pctx.policy.layers, &q, self.ws.now());
         let native_days = stricter_native_days(&res)?;
         Some(
             Diagnostic::new(
                 DiagnosticKind::StricterNative,
                 format!(
                     "repo/global policy ({:.0}d) overrides a stricter native min-age ({:.0}d)",
-                    res.window.effective_min_age_days(self.now),
+                    res.window.effective_min_age_days(self.ws.now()),
                     native_days
                 ),
             )

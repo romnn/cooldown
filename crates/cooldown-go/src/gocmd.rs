@@ -2,7 +2,7 @@
 //! never as the source of cooldown policy.
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, VerifyReport};
+use cooldown_core::{CoreError, ToolTermination, VerifyReport};
 use std::collections::HashMap;
 use tokio::process::Command;
 
@@ -106,7 +106,7 @@ impl Go {
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
-                status: out.status.code().unwrap_or(-1),
+                termination: ToolTermination::from_exit_status(out.status),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             })
         }
@@ -198,7 +198,7 @@ impl Go {
         }
         Err(CoreError::Tool {
             tool: self.bin.clone(),
-            status: out.status.code().unwrap_or(-1),
+            termination: ToolTermination::from_exit_status(out.status),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }

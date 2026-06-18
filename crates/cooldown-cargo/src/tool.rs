@@ -4,17 +4,17 @@
 
 use crate::cargocmd::Cargo;
 use crate::index::{CRATES_IO, CratesIoIndex};
+use crate::native::parse_native;
 use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_core::{
     ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, NativeRule, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawWindow, Release, ReleaseOrder, ReleaseQuality, Result, Selector,
-    SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped,
+    ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
-use cooldown_toml_util::read_toml_file;
 
 /// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
 pub const CARGO_ID: ToolId = ToolId("cargo");
@@ -104,43 +104,6 @@ fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> 
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
     })
-}
-
-/// Parse `[package.metadata.cooldown]` / `[workspace.metadata.cooldown]` `min-age` into a native rule.
-fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
-    let Some(value) = read_toml_file::<toml::Value>(manifest, "Cargo.toml")? else {
-        return Ok(None);
-    };
-    let cooldown = value
-        .get("package")
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("cooldown"))
-        .or_else(|| {
-            value
-                .get("workspace")
-                .and_then(|w| w.get("metadata"))
-                .and_then(|m| m.get("cooldown"))
-        });
-    let Some(cooldown) = cooldown else {
-        return Ok(None);
-    };
-    let min_age = cooldown
-        .get("min-age")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| {
-            CoreError::Config(format!(
-                "{manifest}: [package.metadata.cooldown] min-age must be a string"
-            ))
-        })?;
-    let window = cooldown_core::duration::parse_duration(min_age)
-        .map(RawWindow::RelativeDuration)
-        .map_err(|e| CoreError::Config(format!("{manifest}: invalid native min-age: {e}")))?;
-    Ok(Some(NativePolicyLayer {
-        rules: vec![NativeRule {
-            selector: Selector::Default,
-            window,
-        }],
-    }))
 }
 
 #[async_trait]
@@ -295,53 +258,6 @@ impl ToolWrite for CargoTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-
-    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("Cargo.toml")).expect("utf8 path");
-        std::fs::write(&path, contents).expect("write manifest");
-        (dir, path)
-    }
-
-    #[test]
-    fn parse_native_errors_on_invalid_min_age() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[package]
-name = "demo"
-version = "0.1.0"
-
-[package.metadata.cooldown]
-min-age = "not-a-duration"
-"#,
-        );
-
-        let err = parse_native(&manifest).expect_err("invalid native config must fail");
-        assert!(matches!(err, CoreError::Config(_)));
-    }
-
-    #[test]
-    fn parse_native_reads_valid_package_metadata() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[package]
-name = "demo"
-version = "0.1.0"
-
-[package.metadata.cooldown]
-min-age = "14d"
-"#,
-        );
-
-        let layer = parse_native(&manifest)
-            .expect("valid native config")
-            .expect("native layer");
-        assert_eq!(layer.rules.len(), 1);
-        assert!(matches!(
-            layer.rules[0].window,
-            RawWindow::RelativeDuration(_)
-        ));
-    }
 
     #[test]
     fn apply_spawn_failure_is_not_downgraded_to_skip() {

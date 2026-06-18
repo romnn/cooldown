@@ -2,6 +2,7 @@
 //! [`CoreError`] at the port boundary via `From`; non-fatal apply skips are `Ok` data, never `Err`.
 
 use std::fmt;
+use std::process::ExitStatus;
 
 /// A [`Result`](std::result::Result) specialized to [`CoreError`].
 ///
@@ -12,6 +13,46 @@ pub type Result<T, E = CoreError> = std::result::Result<T, E>;
 
 /// A boxed, thread-safe error used to carry an opaque transient cause.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// How an external tool process terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolTermination {
+    /// The process exited with a numeric exit code.
+    ExitCode(i32),
+    /// The process was terminated by a signal.
+    Signal(i32),
+    /// The process terminated without an exit code or signal detail.
+    Unknown,
+}
+
+impl ToolTermination {
+    /// Convert an OS [`ExitStatus`] into the typed termination state cooldown reports.
+    #[must_use]
+    pub fn from_exit_status(status: ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            return ToolTermination::ExitCode(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            if let Some(signal) = status.signal() {
+                return ToolTermination::Signal(signal);
+            }
+        }
+        ToolTermination::Unknown
+    }
+}
+
+impl fmt::Display for ToolTermination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ToolTermination::ExitCode(code) => write!(f, "exit code {code}"),
+            ToolTermination::Signal(signal) => write!(f, "signal {signal}"),
+            ToolTermination::Unknown => f.write_str("unknown termination"),
+        }
+    }
+}
 
 /// Errors raised at or below the port boundary.
 ///
@@ -30,12 +71,12 @@ pub enum CoreError {
     Transient(#[source] BoxError),
 
     /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
-    #[error("tool `{tool}` failed with status {status}: {stderr}")]
+    #[error("tool `{tool}` failed with {termination}: {stderr}")]
     Tool {
         /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
         tool: String,
-        /// The process exit status reported by the tool.
-        status: i32,
+        /// The way the process terminated.
+        termination: ToolTermination,
         /// The captured standard-error output, used as the failure detail.
         stderr: String,
     },
@@ -321,7 +362,7 @@ mod tests {
     fn tool_exit_and_spawn_map_to_distinct_diagnostic_kinds() {
         let exited = CoreError::Tool {
             tool: "cargo".into(),
-            status: 101,
+            termination: ToolTermination::ExitCode(101),
             stderr: "failed".into(),
         };
         let spawn = CoreError::ToolSpawn {

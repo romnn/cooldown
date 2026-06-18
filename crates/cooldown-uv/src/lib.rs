@@ -4,6 +4,7 @@
 //! a native config layer.
 
 pub mod lock;
+mod native;
 pub mod pypi;
 pub mod tool;
 pub mod uvcmd;

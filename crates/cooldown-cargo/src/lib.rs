@@ -5,6 +5,7 @@
 
 pub mod cargocmd;
 pub mod index;
+mod native;
 pub mod tool;
 pub mod version;
 

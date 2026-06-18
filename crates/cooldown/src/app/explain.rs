@@ -28,6 +28,11 @@ pub struct ConfigOutcome {
     pub exit: Exit,
 }
 
+struct ExplainService<'a> {
+    ws: &'a Workspace,
+    opts: &'a RunOpts,
+}
+
 impl Workspace {
     /// Explain the window for `pkg` in the first in-scope project. If `pkg` is a resolved
     /// dependency, its registry is looked up from the dependency graph so that registry-scoped
@@ -35,7 +40,23 @@ impl Workspace {
     /// lock or a tool failure falls back to a registry-less resolution, so `explain` still answers
     /// for a package that is not (yet) a dependency.
     pub async fn explain(&self, pkg: &str, opts: &RunOpts) -> ExplainOutcome {
-        let Some(pctx) = self.scoped_projects(opts).next() else {
+        ExplainService::new(self, opts).explain(pkg).await
+    }
+
+    /// The fully-resolved config per project (effective default window + provenance + strict-native).
+    #[must_use]
+    pub fn config(&self, opts: &RunOpts) -> ConfigOutcome {
+        ExplainService::new(self, opts).config()
+    }
+}
+
+impl<'a> ExplainService<'a> {
+    fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
+        ExplainService { ws, opts }
+    }
+
+    async fn explain(&self, pkg: &str) -> ExplainOutcome {
+        let Some(pctx) = self.ws.scoped_projects(self.opts).next() else {
             return ExplainOutcome {
                 meta: empty_meta(),
                 steps: Vec::new(),
@@ -51,18 +72,21 @@ impl Workspace {
             project: &pctx.rel_path,
             kind: ResolveKind::CurrentPin,
         };
-        let res = resolve(&pctx.policy.layers, &q, self.now);
+        let res = resolve(&pctx.policy.layers, &q, self.ws.now());
 
         let steps = res
             .trace
             .iter()
-            .map(|s| ExplainStep {
-                layer: s.layer.token(),
-                field: s.field.clone(),
-                selector: s.selector.as_ref().and_then(cooldown_core::Selector::token),
-                min_age_days: s.min_age_days.map(round2),
-                applied: s.applied,
-                note: s.note.clone(),
+            .map(|step| ExplainStep {
+                layer: step.layer.token(),
+                field: step.field.clone(),
+                selector: step
+                    .selector
+                    .as_ref()
+                    .and_then(cooldown_core::Selector::token),
+                min_age_days: step.min_age_days.map(round2),
+                applied: step.applied,
+                note: step.note.clone(),
             })
             .collect();
 
@@ -70,7 +94,7 @@ impl Workspace {
             project: pctx.rel_path.to_string(),
             registry,
             effective: EffectiveInfo {
-                min_age_days: round2(res.window.effective_min_age_days(self.now)),
+                min_age_days: round2(res.window.effective_min_age_days(self.ws.now())),
                 decided_by: res.window.source(),
             },
         };
@@ -82,25 +106,9 @@ impl Workspace {
         }
     }
 
-    /// The registry a package resolves to within a project, if it is a known dependency. Reads the
-    /// resolved graph (which may invoke the toolchain but never the registry network); any error or
-    /// a no-match yields `None` so callers degrade to a registry-less resolution.
-    async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
-        let adapter = self.adapter(pctx.tool)?;
-        let deps = adapter
-            .dependencies(&pctx.project, DepScope::Graph)
-            .await
-            .ok()?;
-        deps.into_iter()
-            .find(|d| d.package.name == pkg)
-            .and_then(|d| d.package.registry)
-    }
-
-    /// The fully-resolved config per project (effective default window + provenance + strict-native).
-    #[must_use]
-    pub fn config(&self, opts: &RunOpts) -> ConfigOutcome {
+    fn config(&self) -> ConfigOutcome {
         let mut items: Vec<ConfigItem> = Vec::new();
-        for pctx in self.scoped_projects(opts) {
+        for pctx in self.ws.scoped_projects(self.opts) {
             // Resolve the bare default for a sentinel name unlikely to match a package glob.
             let q = ResolveQuery {
                 tool: pctx.tool,
@@ -109,13 +117,13 @@ impl Workspace {
                 project: &pctx.rel_path,
                 kind: ResolveKind::CurrentPin,
             };
-            let res = resolve(&pctx.policy.layers, &q, self.now);
-            let days = round2(res.window.effective_min_age_days(self.now));
+            let res = resolve(&pctx.policy.layers, &q, self.ws.now());
+            let days = round2(res.window.effective_min_age_days(self.ws.now()));
             let layers: Vec<String> = pctx
                 .policy
                 .layers
                 .iter()
-                .map(|l| l.origin.token())
+                .map(|layer| layer.origin.token())
                 .collect();
 
             items.push(ConfigItem {
@@ -135,6 +143,20 @@ impl Workspace {
             items,
             exit: Exit::Ok,
         }
+    }
+
+    /// The registry a package resolves to within a project, if it is a known dependency. Reads the
+    /// resolved graph (which may invoke the toolchain but never the registry network); any error or
+    /// a no-match yields `None` so callers degrade to a registry-less resolution.
+    async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
+        let adapter = self.ws.adapter(pctx.tool)?;
+        let deps = adapter
+            .dependencies(&pctx.project, DepScope::Graph)
+            .await
+            .ok()?;
+        deps.into_iter()
+            .find(|dep| dep.package.name == pkg)
+            .and_then(|dep| dep.package.registry)
     }
 }
 
