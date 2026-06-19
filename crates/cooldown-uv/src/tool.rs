@@ -119,11 +119,15 @@ impl ToolRead for UvTool {
     }
 
     fn project_marker(&self) -> ProjectMarker {
-        // A `uv.lock` marks a workspace root; nested locks below it belong to the same uv workspace.
+        // Each `uv.lock` marks an independent project. A uv *workspace* keeps a single lock at its
+        // root and its members carry only a `pyproject.toml` (no nested lock), so a `uv.lock` found
+        // below another is never a workspace member — it is a separate project that resolves on its
+        // own and must be synced/checked in its own right. Hence `workspace_root: false`: nested
+        // locks are not collapsed into the topmost one.
         ProjectMarker {
             lockfile: "uv.lock",
             manifest: "pyproject.toml",
-            workspace_root: true,
+            workspace_root: false,
         }
     }
 
