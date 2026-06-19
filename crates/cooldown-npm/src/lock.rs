@@ -3,12 +3,13 @@
 //! per-manager differences (lockfile name, driver binary, parse, and apply args) so a single
 //! generic adapter can serve all of them.
 //!
-//! Every parser returns the flat list of resolved `(name, version)` pairs the lock pins. The
-//! adapter intersects that list with the manifest's directly-declared names to recover the
-//! direct/transitive split.
+//! Every parser returns the flat list of resolved `(name, version)` pairs the lock pins. Where the
+//! lock records importer/member declarations (npm v2/v3, pnpm), the adapter uses that same data for
+//! both direct/transitive classification and source attribution; older formats fall back to the root
+//! manifest's declared dependency names.
 
 use cooldown_core::{CoreError, Result, ToolId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to ask it to re-pin a dependency.
@@ -31,16 +32,12 @@ pub trait NodeLock: Send + Sync + 'static {
     /// Returns a [`CoreError`] if the lockfile cannot be parsed.
     fn parse(content: &str) -> Result<Vec<(String, String)>>;
 
-    /// The direct-dependency names declared across the whole workspace, recovered from the lock's
-    /// importer/workspace section (every member, not just the root project).
-    ///
-    /// Returns `None` for lock formats that don't record per-importer direct deps (yarn classic,
-    /// bun); the adapter then falls back to reading the root `package.json` alone. A single-package
-    /// repo is just a one-member workspace, so the lock-based answer also covers the non-workspace
-    /// case.
+    /// The workspace member package(s) that declare each dependency, for attributing a dependency to
+    /// its source package(s) in reports. Default: empty (yarn classic and bun record no per-member
+    /// data in their locks, so their `members` column stays blank).
     #[must_use]
-    fn workspace_direct_names(_content: &str) -> Option<HashSet<String>> {
-        None
+    fn member_sources(_content: &str) -> MemberIndex {
+        MemberIndex::default()
     }
 
     /// The driver args that re-pin `name` to `version`, re-resolving the lock.
@@ -50,12 +47,80 @@ pub trait NodeLock: Send + Sync + 'static {
     fn build_args() -> Vec<String>;
 }
 
+/// Maps a resolved dependency to the workspace member packages that declare it.
+///
+/// pnpm records the resolved version per importer, so its entries are keyed exactly by
+/// `(name, version)`. npm records only version ranges per member, not the resolved version, so its
+/// entries are keyed by name and apply to every resolved version of that name.
+#[derive(Debug, Default)]
+pub struct MemberIndex {
+    by_version: HashMap<(String, String), Vec<String>>,
+    by_name: HashMap<String, Vec<String>>,
+    authoritative: bool,
+}
+
+impl MemberIndex {
+    fn version_exact(by_version: HashMap<(String, String), Vec<String>>) -> Self {
+        Self {
+            by_version,
+            by_name: HashMap::new(),
+            authoritative: true,
+        }
+    }
+
+    fn name_only(by_name: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            by_version: HashMap::new(),
+            by_name,
+            authoritative: true,
+        }
+    }
+
+    /// Whether this lock carries authoritative importer/member data for classifying direct deps.
+    #[must_use]
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
+    }
+
+    /// Every distinct member path recorded in the index, for resolving paths to package names once.
+    #[must_use]
+    pub fn all_paths(&self) -> HashSet<String> {
+        self.by_version
+            .values()
+            .flatten()
+            .chain(self.by_name.values().flatten())
+            .cloned()
+            .collect()
+    }
+
+    /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
+    /// lock carries no per-member attribution for this dependency.
+    #[must_use]
+    pub fn members_for(&self, name: &str, version: &str) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .by_version
+            .get(&(name.to_string(), version.to_string()))
+            .into_iter()
+            .flatten()
+            .chain(self.by_name.get(name).into_iter().flatten())
+            .cloned()
+            .collect();
+        members.sort();
+        members.dedup();
+        members
+    }
+}
+
 /// Splits a `name@version` (or scoped `@scope/name@version`) specifier into its parts. The version
 /// is taken after the last `@`, so the leading `@` of a scope is preserved in the name.
 pub(crate) fn split_name_version(spec: &str) -> Option<(String, String)> {
     let at = spec.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = spec.split_at(at);
     Some((name.to_string(), version[1..].to_string()))
+}
+
+fn unquote_yaml_scalar(value: &str) -> &str {
+    value.trim().trim_matches('\'').trim_matches('"')
 }
 
 /// The npm package manager: `package-lock.json` (lockfile v2/v3) backed by the npm registry.
@@ -76,8 +141,10 @@ impl NodeLock for Npm {
         parse_npm(content)
     }
 
-    fn workspace_direct_names(content: &str) -> Option<HashSet<String>> {
-        parse_npm_direct(content)
+    fn member_sources(content: &str) -> MemberIndex {
+        parse_npm_member_sources(content)
+            .map(MemberIndex::name_only)
+            .unwrap_or_default()
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -107,8 +174,8 @@ impl NodeLock for Pnpm {
         Ok(parse_pnpm(content))
     }
 
-    fn workspace_direct_names(content: &str) -> Option<HashSet<String>> {
-        Some(parse_pnpm_importers(content))
+    fn member_sources(content: &str) -> MemberIndex {
+        MemberIndex::version_exact(parse_pnpm_importer_members(content))
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -201,11 +268,7 @@ fn parse_pnpm(content: &str) -> Vec<(String, String)> {
             if !in_packages || stripped.starts_with(' ') {
                 continue; // outside the section, or a nested field of a package entry
             }
-            let key = stripped
-                .trim_end()
-                .trim_end_matches(':')
-                .trim_matches('\'')
-                .trim_matches('"');
+            let key = unquote_yaml_scalar(stripped.trim_end().trim_end_matches(':'));
             // Drop the `(peer@x)` suffix pnpm appends to disambiguate peer resolutions.
             let key = key.split('(').next().unwrap_or(key);
             if let Some((name, version)) = split_name_version(key) {
@@ -227,20 +290,17 @@ const DIRECT_GROUPS: [&str; 4] = [
     "peerDependencies",
 ];
 
-/// Collects the direct-dependency names every workspace importer declares in `pnpm-lock.yaml` (v9).
-///
-/// The `importers:` section maps each workspace package — the root `.` and every member path — to
-/// its dependency groups, each a map of `name: {specifier, version}`. The union of those names is
-/// the workspace-wide direct set; the resolved versions still come from `packages:`. Internal
-/// `workspace:*` deps resolve to `link:`/`file:` and never appear among the registry packages, so
-/// their names drop out when the adapter intersects this set with the resolved graph.
-///
-/// Parsed line-by-line (like [`parse_pnpm`]) by indentation, avoiding a YAML dependency: importer
-/// paths sit at 2 spaces, group keys at 4, dependency names at 6, and their fields at 8.
-fn parse_pnpm_importers(content: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
+/// Maps each resolved `(name, version)` dependency to the workspace member importers that declare it,
+/// read from `pnpm-lock.yaml`'s `importers:` section. The resolved `version:` line under each
+/// dependency gives the exact version (its `(peer)` suffix stripped to match the `packages:` keys);
+/// internal `link:`/`file:`/`workspace:` versions are skipped — they are not registry packages.
+/// Importer paths (the workspace root is `.`) name the source packages.
+fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<String>> {
+    let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut in_importers = false;
+    let mut member: Option<String> = None;
     let mut in_group = false;
+    let mut dep_name: Option<String> = None;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -250,45 +310,73 @@ fn parse_pnpm_importers(content: &str) -> HashSet<String> {
         match indent {
             0 => {
                 in_importers = trimmed == "importers:";
+                member = None;
                 in_group = false;
+                dep_name = None;
             }
-            2 if in_importers => in_group = false, // a new importer (member path)
-            4 if in_importers => in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':')),
+            2 if in_importers => {
+                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')).to_string());
+                in_group = false;
+                dep_name = None;
+            }
+            4 if in_importers => {
+                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
+                dep_name = None;
+            }
             6 if in_importers && in_group => {
-                let name = trimmed
-                    .trim_end_matches(':')
-                    .trim_matches('\'')
-                    .trim_matches('"');
-                if !name.is_empty() {
-                    names.insert(name.to_string());
+                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
+                dep_name = (!name.is_empty()).then(|| name.to_string());
+            }
+            8 if in_importers && in_group => {
+                if let (Some(member), Some(name)) = (member.as_ref(), dep_name.as_ref())
+                    && let Some(raw) = trimmed.strip_prefix("version:")
+                {
+                    let value = unquote_yaml_scalar(raw);
+                    if !value.starts_with("link:")
+                        && !value.starts_with("file:")
+                        && !value.starts_with("workspace:")
+                    {
+                        // Strip the `(peer@x)` suffix so the version matches the `packages:` keys.
+                        let version = unquote_yaml_scalar(value.split('(').next().unwrap_or(value));
+                        if !version.is_empty() {
+                            map.entry((name.clone(), version.to_string()))
+                                .or_default()
+                                .push(member.clone());
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
-    names
+    map
 }
 
-/// Collects direct-dependency names from `package-lock.json` (v2/v3). The flat `packages` map keys
-/// the root project by `""` and each workspace member by its path; installed dependencies live under
-/// `node_modules/`. Every non-`node_modules` entry declares its direct deps in the dependency-group
-/// fields, so their union is the workspace-wide direct set. Returns `None` for a v1 lock (no
-/// `packages` map) so the caller falls back to the root manifest.
-fn parse_npm_direct(content: &str) -> Option<HashSet<String>> {
-    let doc: serde_json::Value = serde_json::from_str(content).ok()?;
+/// Maps each dependency name to the workspace member packages that declare it, read from
+/// `package-lock.json`'s `packages` map. Member entries — the root `""` and any key not under
+/// `node_modules/` — list their direct deps as ranges, not resolved versions, so attribution is by
+/// name (applied to every resolved version of that name). Members are keyed by their workspace path
+/// (the root as `.`), matching pnpm's importer paths.
+fn parse_npm_member_sources(content: &str) -> Option<HashMap<String, Vec<String>>> {
+    let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let packages = doc.get("packages")?.as_object()?;
-    let mut names = HashSet::new();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (key, entry) in packages {
         if key.contains("node_modules/") {
-            continue; // an installed (transitive or hoisted) package, not a workspace member
+            continue;
         }
+        let member = if key.is_empty() { "." } else { key.as_str() };
         for field in DIRECT_GROUPS {
             if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
-                names.extend(obj.keys().cloned());
+                for name in obj.keys() {
+                    map.entry(name.clone())
+                        .or_default()
+                        .push(member.to_string());
+                }
             }
         }
     }
-    Some(names)
+    Some(map)
 }
 
 /// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
@@ -497,114 +585,101 @@ mod tests {
         );
     }
 
-    fn sorted_names(set: HashSet<String>) -> Vec<String> {
-        let mut v: Vec<String> = set.into_iter().collect();
-        v.sort();
-        v
-    }
-
     #[test]
-    fn pnpm_importers_collect_every_member_direct_dep() {
-        // A workspace: root `.` plus two members, mixing dependency groups, a `workspace:*` internal
-        // link, and a `dependenciesMeta` table (not a dependency group — must be ignored).
+    fn pnpm_importer_members_attributes_by_resolved_version() {
+        // The same dep at different versions across importers must attribute to the right members;
+        // a `(peer)` suffix is stripped, and an internal `workspace:*` link is excluded.
         let lock = "\
-lockfileVersion: '9.0'
-
 importers:
 
-  .:
-    devDependencies:
-      prettier:
-        specifier: 3.8.0
-        version: 3.8.0
-      turbo:
-        specifier: 2.9.16
-        version: 2.9.16
-
-  apps/admin:
+  apps/a:
     dependencies:
-      '@airtype/api':
-        specifier: workspace:*
-        version: link:../../packages/ts/airtype/api
-      solid-js:
-        specifier: 1.9.5
-        version: 1.9.5
-    devDependencies:
       vite:
         specifier: 6.0.0
         version: 6.0.0
-    dependenciesMeta:
-      '@airtype/api':
-        injected: true
 
-  packages/ts/api:
-    optionalDependencies:
-      fsevents:
-        specifier: 2.3.3
-        version: 2.3.3
+  apps/b:
+    dependencies:
+      vite:
+        specifier: 7.0.0
+        version: 7.0.0(typescript@5.4.5)
+
+  packages/x:
+    dependencies:
+      vite:
+        specifier: 6.0.0
+        version: 6.0.0
+      '@airtype/api':
+        specifier: workspace:*
+        version: link:../api
 
 packages:
 
-  prettier@3.8.0:
+  vite@6.0.0:
     resolution: {integrity: sha512-x}
 ";
-        // Every member's direct deps are collected (the internal `@airtype/api` link is included by
-        // name; it falls away later when intersected with the resolved registry packages). Group
-        // keys, the `specifier`/`version` fields, and `dependenciesMeta` never leak in as names.
+        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
         assert_eq!(
-            sorted_names(parse_pnpm_importers(lock)),
-            vec![
-                "@airtype/api",
-                "fsevents",
-                "prettier",
-                "solid-js",
-                "turbo",
-                "vite",
-            ]
+            index.members_for("vite", "6.0.0"),
+            vec!["apps/a", "packages/x"]
         );
+        assert_eq!(index.members_for("vite", "7.0.0"), vec!["apps/b"]);
+        // The internal workspace link is not a registry package, so it is never attributed.
+        assert!(index.members_for("@airtype/api", "0.0.0").is_empty());
     }
 
     #[test]
-    fn pnpm_single_package_importer_is_a_one_member_workspace() {
+    fn pnpm_importer_members_unquotes_yaml_scalars() {
         let lock = "\
 importers:
 
-  .:
+  'apps/a':
     dependencies:
-      lodash:
-        specifier: 4.17.15
-        version: 4.17.15
+      '@scope/pkg':
+        specifier: '^1.2.3'
+        version: '1.2.3(react@19.0.0)'
 
 packages:
 
-  lodash@4.17.15:
+  '@scope/pkg@1.2.3':
     resolution: {integrity: sha512-x}
 ";
-        assert_eq!(sorted_names(parse_pnpm_importers(lock)), vec!["lodash"]);
+        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
+
+        assert_eq!(index.members_for("@scope/pkg", "1.2.3"), vec!["apps/a"]);
     }
 
     #[test]
-    fn npm_direct_collects_root_and_member_deps() {
+    fn npm_member_sources_attributes_by_name() {
         let lock = r#"{
             "lockfileVersion": 3,
             "packages": {
-                "": { "name": "root", "devDependencies": { "turbo": "^2" } },
-                "packages/api": { "name": "@x/api", "dependencies": { "zod": "^3" } },
-                "node_modules/zod": { "version": "3.22.0" },
-                "node_modules/turbo": { "version": "2.9.16" }
+                "": { "devDependencies": { "turbo": "^2" } },
+                "packages/api": { "dependencies": { "zod": "^3" } },
+                "node_modules/zod": { "version": "3.22.0" }
             }
         }"#;
-        assert_eq!(
-            sorted_names(parse_npm_direct(lock).expect("v3 lock has a packages map")),
-            vec!["turbo", "zod"]
-        );
+        let index =
+            MemberIndex::name_only(parse_npm_member_sources(lock).expect("v3 lock has members"));
+        // The root is keyed as `.`; a member by its workspace path. Range-only locks attribute by
+        // name, so any resolved version of `zod` maps to its declaring member.
+        assert_eq!(index.members_for("turbo", "2.9.16"), vec!["."]);
+        assert_eq!(index.members_for("zod", "3.22.0"), vec!["packages/api"]);
     }
 
     #[test]
-    fn npm_direct_is_none_for_v1_lock() {
-        // A v1 lock has no `packages` map, so there is no workspace direct set to read; the adapter
-        // falls back to the root manifest.
-        let lock = r#"{ "lockfileVersion": 1, "dependencies": { "lodash": { "version": "4.17.15" } } }"#;
-        assert!(parse_npm_direct(lock).is_none());
+    fn npm_member_sources_are_absent_for_v1_lock() {
+        // A v1 lock has no `packages` map, so direct-ness falls back to the root manifest.
+        let lock =
+            r#"{ "lockfileVersion": 1, "dependencies": { "lodash": { "version": "4.17.15" } } }"#;
+        assert!(parse_npm_member_sources(lock).is_none());
+        assert!(!Npm::member_sources(lock).is_authoritative());
+    }
+
+    #[test]
+    fn member_index_is_empty_by_default() {
+        // yarn/bun and the unparsable case: no attribution, so the column stays blank.
+        let index = MemberIndex::default();
+        assert!(index.members_for("anything", "1.0.0").is_empty());
     }
 }

@@ -177,6 +177,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
                 direct: true,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                members: Vec::new(),
             });
         }
         Ok(deps)

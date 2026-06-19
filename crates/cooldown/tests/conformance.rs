@@ -47,6 +47,7 @@ fn dep(name: &str, current: &str, direct: bool) -> Dependency {
         direct,
         artifacts: Vec::new(),
         graph_floor: None,
+        members: Vec::new(),
     }
 }
 

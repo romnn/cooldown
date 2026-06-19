@@ -118,6 +118,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 ///     direct: true,
 ///     artifacts: Vec::new(),
 ///     graph_floor: None,
+///     members: Vec::new(),
 /// };
 /// let now: Timestamp = "2026-01-08T00:00:00Z".parse()?;
 /// let mature: Timestamp = "2026-01-01T00:00:00Z".parse()?;

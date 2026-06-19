@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `cargo` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, ToolTermination, VerifyReport};
+use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
@@ -23,6 +23,9 @@ pub struct PkgInfo {
     pub version: String,
     /// The source registry/path URL, or [`None`] for path/workspace members.
     pub source: Option<String>,
+    /// The crate's directory relative to the workspace root (`.` for a crate at the root); used to
+    /// attribute a dependency to its source member by path.
+    pub path: String,
 }
 
 impl PkgInfo {
@@ -53,13 +56,55 @@ impl ResolvedGraph {
             .filter(|(node, _)| !self.roots.contains(*node))
             .any(|(_, deps)| deps.iter().any(|d| d == id))
     }
+
+    /// The workspace member crates that directly depend on `id` — the source packages a dependency
+    /// is attributed to in reports. Sorted by name and deduplicated for stable output.
+    #[must_use]
+    pub fn direct_members(&self, id: &str) -> Vec<MemberRef> {
+        let mut members: Vec<MemberRef> = self
+            .roots
+            .iter()
+            .filter(|root| {
+                self.edges
+                    .get(*root)
+                    .is_some_and(|deps| deps.iter().any(|dep| dep == id))
+            })
+            .filter_map(|root| {
+                self.packages.get(root).map(|info| MemberRef {
+                    name: info.name.clone(),
+                    path: info.path.clone(),
+                })
+            })
+            .collect();
+        members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        members.dedup();
+        members
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct RawMeta {
     packages: Vec<RawPkg>,
     workspace_members: Vec<String>,
+    #[serde(default)]
+    workspace_root: String,
     resolve: Option<RawResolve>,
+}
+
+/// The crate's directory relative to the workspace root (`.` for a crate at the root). Cargo reports
+/// absolute manifest paths; relativizing keeps member paths short and workspace-portable.
+fn member_path(manifest_path: &str, workspace_root: &str) -> String {
+    if manifest_path.is_empty() || workspace_root.is_empty() {
+        return ".".to_string();
+    }
+    let dir = Utf8Path::new(manifest_path)
+        .parent()
+        .unwrap_or_else(|| Utf8Path::new(""));
+    let root = Utf8Path::new(workspace_root);
+    match dir.strip_prefix(root) {
+        Ok(rel) if !rel.as_str().is_empty() => rel.to_string(),
+        _ => ".".to_string(),
+    }
 }
 #[derive(serde::Deserialize)]
 struct RawPkg {
@@ -68,6 +113,10 @@ struct RawPkg {
     version: String,
     #[serde(default)]
     source: Option<String>,
+    /// Absolute path to the crate's `Cargo.toml`; relativized to the workspace root for the member
+    /// path. Defaults to empty when absent (older cargo), yielding a `.` path.
+    #[serde(default)]
+    manifest_path: String,
 }
 #[derive(serde::Deserialize)]
 struct RawResolve {
@@ -163,6 +212,7 @@ impl Cargo {
             .await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
             .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
+        let workspace_root = raw.workspace_root.clone();
         let mut packages = HashMap::new();
         for p in raw.packages {
             packages.insert(
@@ -171,6 +221,7 @@ impl Cargo {
                     name: p.name,
                     version: p.version,
                     source: p.source,
+                    path: member_path(&p.manifest_path, &workspace_root),
                 },
             );
         }
@@ -258,5 +309,76 @@ impl Cargo {
                 String::from_utf8_lossy(&out.stderr).into_owned()
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_path_relativizes_workspace_members() {
+        assert_eq!(
+            member_path("/repo/crates/app/Cargo.toml", "/repo"),
+            "crates/app"
+        );
+        assert_eq!(member_path("/repo/Cargo.toml", "/repo"), ".");
+    }
+
+    #[test]
+    fn member_path_defaults_to_root_when_metadata_is_missing() {
+        assert_eq!(member_path("", "/repo"), ".");
+        assert_eq!(member_path("/repo/crates/app/Cargo.toml", ""), ".");
+    }
+
+    #[test]
+    fn direct_members_returns_roots_that_declare_dependency() {
+        let graph = ResolvedGraph {
+            packages: HashMap::from([
+                (
+                    "root-a".to_string(),
+                    PkgInfo {
+                        name: "app-a".to_string(),
+                        version: "0.1.0".to_string(),
+                        source: None,
+                        path: "apps/a".to_string(),
+                    },
+                ),
+                (
+                    "root-b".to_string(),
+                    PkgInfo {
+                        name: "app-b".to_string(),
+                        version: "0.1.0".to_string(),
+                        source: None,
+                        path: "apps/b".to_string(),
+                    },
+                ),
+                (
+                    "dep".to_string(),
+                    PkgInfo {
+                        name: "serde".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some(
+                            "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+                        ),
+                        path: ".".to_string(),
+                    },
+                ),
+            ]),
+            roots: HashSet::from(["root-a".to_string(), "root-b".to_string()]),
+            edges: HashMap::from([
+                ("root-a".to_string(), vec!["dep".to_string()]),
+                ("root-b".to_string(), Vec::new()),
+            ]),
+        };
+
+        assert_eq!(
+            graph
+                .direct_members("dep")
+                .iter()
+                .map(|member| (member.name.as_str(), member.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("app-a", "apps/a")]
+        );
     }
 }

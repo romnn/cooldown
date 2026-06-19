@@ -80,5 +80,6 @@ fn dependency_of(
         direct: !module.indirect,
         artifacts: Vec::new(),
         graph_floor,
+        members: Vec::new(),
     })
 }

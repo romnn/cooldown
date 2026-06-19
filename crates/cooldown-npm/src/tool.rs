@@ -16,19 +16,45 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, CoreError, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
     Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+
+/// Resolve each member path to its `package.json` "name", read once per `dependencies()` call. A
+/// path with no readable name is omitted, so the caller falls back to showing the path itself.
+fn member_names(root: &Utf8Path, paths: &HashSet<String>) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for path in paths {
+        let manifest = if path == "." {
+            root.join("package.json")
+        } else {
+            root.join(path).join("package.json")
+        };
+        let name = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|doc| {
+                doc.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        if let Some(name) = name {
+            names.insert(path.clone(), name);
+        }
+    }
+    names
+}
 
 /// The JavaScript/TypeScript implementation of the [`Tool`] port, generic over a [`NodeLock`].
 ///
-/// It detects projects by their lockfile, reads the resolved graph from that lock, intersects it
-/// with `package.json` to recover the direct/transitive split, and resolves publish times from the
-/// shared [`NpmRegistry`]. npm has no native cooldown config, so [`native_policy`] is always empty.
+/// It detects projects by their lockfile, reads the resolved graph from that lock, recovers
+/// direct/transitive classification from lock importer data or the root `package.json`, and resolves
+/// publish times from the shared [`NpmRegistry`]. npm has no native cooldown config, so
+/// [`native_policy`] is always empty.
 ///
 /// [`native_policy`]: ToolRead::native_policy
 pub struct NpmTool<L> {
@@ -117,24 +143,46 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let resolved = L::parse(&content)?;
-        // Prefer the lock's workspace-wide direct set (every importer/member), so a pnpm/npm
-        // workspace reports the dependencies declared by its members, not only the root manifest.
-        // Lock formats without per-importer data fall back to the root `package.json`.
-        let direct = match L::workspace_direct_names(&content) {
-            Some(names) => names,
-            None => manifest::direct_names(&project.manifest)?,
+        // Which workspace member(s) declare each dependency, for source attribution; empty for lock
+        // formats without per-member data (yarn classic, bun). Member paths are resolved to package
+        // names once, by reading each member's `package.json`.
+        let member_index = L::member_sources(&content);
+        let member_names = member_names(&project.root, &member_index.all_paths());
+        // Direct-ness comes from the same importer data as attribution: a dependency is direct iff an
+        // importer declares it. For pnpm this is version-exact, so a name declared at one version but
+        // only pulled in transitively at another (a second copy in the graph) is split correctly —
+        // the transitive copy is not reported as a direct dependency with a blank source. Lock
+        // formats without importer data fall back to the root `package.json`'s declared names.
+        let manifest_direct = if member_index.is_authoritative() {
+            None
+        } else {
+            Some(manifest::direct_names(&project.manifest)?)
         };
 
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
         for (name, version) in resolved {
-            let is_direct = direct.contains(&name);
+            let member_paths = member_index.members_for(&name, &version);
+            let is_direct = match &manifest_direct {
+                Some(names) => names.contains(&name),
+                None => !member_paths.is_empty(),
+            };
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
             if !seen.insert((name.clone(), version.clone())) {
                 continue; // a name can resolve to the same version via several paths
             }
+            let members = member_paths
+                .into_iter()
+                .map(|path| MemberRef {
+                    name: member_names
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| path.clone()),
+                    path,
+                })
+                .collect();
             deps.push(Dependency {
                 package: PackageId::new(L::ID, name, Some(NPM.to_string())),
                 current: Version::new(version.clone()),
@@ -142,6 +190,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                members,
             });
         }
         Ok(deps)
@@ -409,6 +458,114 @@ mod tests {
             .expect("graph deps");
         assert_eq!(graph.len(), 2); // lodash (direct) + ms (transitive)
         assert!(graph.iter().any(|d| d.package.name == "ms" && !d.direct));
+    }
+
+    #[tokio::test]
+    async fn npm_v1_lock_falls_back_to_root_manifest_directness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "lodash": "4.17.15" } }"#,
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "lodash": { "version": "4.17.15" },
+                    "ms": { "version": "2.1.3" }
+                }
+            }"#,
+        )
+        .expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+        };
+
+        let direct = tool()
+            .dependencies(&project, DepScope::Direct)
+            .await
+            .expect("direct deps");
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].package.name, "lodash");
+        assert!(
+            direct[0].members.is_empty(),
+            "v1 locks have no member attribution"
+        );
+    }
+
+    fn pnpm_tool() -> NpmTool<crate::lock::Pnpm> {
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        NpmTool::from_http(
+            SharedHttp::new(cache_dir.path(), cooldown_registry::HttpOptions::default())
+                .expect("http"),
+        )
+    }
+
+    #[tokio::test]
+    async fn pnpm_directness_is_version_exact() {
+        // An importer declares `foo@2.0.0`; `foo@1.0.0` is only a transitive copy in the graph.
+        // Direct-ness must be version-exact: only the declared 2.0.0 is direct (and attributed),
+        // and the transitive 1.0.0 is never reported as a direct dependency with a blank source.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("apps/a")).expect("mkdir");
+        std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#).expect("root manifest");
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "name": "@x/a", "dependencies": { "foo": "2.0.0" } }"#,
+        )
+        .expect("member manifest");
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  apps/a:\n    dependencies:\n      foo:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  foo@1.0.0:\n    resolution: {integrity: sha512-x}\n\n  foo@2.0.0:\n    resolution: {integrity: sha512-y}\n",
+        )
+        .expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: crate::lock::Pnpm::ID,
+            manifest: root.join("package.json"),
+        };
+
+        let direct = pnpm_tool()
+            .dependencies(&project, DepScope::Direct)
+            .await
+            .expect("direct deps");
+        assert_eq!(
+            direct.len(),
+            1,
+            "only the importer-declared version is direct"
+        );
+        assert_eq!(direct[0].current.as_str(), "2.0.0");
+        assert_eq!(
+            direct[0]
+                .members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["@x/a"],
+            "the declared version is attributed to its importer by package name"
+        );
+
+        // In graph scope both copies appear, but only 2.0.0 is marked direct.
+        let graph = pnpm_tool()
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("graph deps");
+        assert_eq!(graph.len(), 2);
+        let transitive = graph
+            .iter()
+            .find(|d| d.current.as_str() == "1.0.0")
+            .expect("1.0.0 present in graph");
+        assert!(!transitive.direct, "the transitive copy is not direct");
+        assert!(
+            transitive.members.is_empty(),
+            "and has no source attribution"
+        );
     }
 
     #[tokio::test]

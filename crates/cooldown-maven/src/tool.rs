@@ -189,6 +189,7 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                members: Vec::new(),
             });
         }
         Ok(deps)

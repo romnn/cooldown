@@ -14,7 +14,7 @@ use cooldown_adapter_util::{
     build_registry_releases, single_lock_journal, skipped_on_apply_error, verify_current_report,
 };
 use cooldown_core::{
-    ApplyReport, ArtifactScope, Capabilities, DepScope, Dependency, FetchContext,
+    ApplyReport, ArtifactScope, Capabilities, DepScope, Dependency, FetchContext, MemberRef,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
     Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
@@ -135,6 +135,23 @@ impl ToolRead for UvTool {
         let lock = read_lock(project)?;
         let direct: std::collections::HashSet<String> = lock.direct_names().into_iter().collect();
         let floors = lock.graph_floors();
+        // A uv project is a single package, so it is the source for every dependency it declares.
+        // The lock's root package carries the project's package name.
+        let project_member: Vec<MemberRef> = lock
+            .packages
+            .iter()
+            .find(|pkg| {
+                pkg.source
+                    .as_ref()
+                    .is_some_and(crate::lock::Source::is_project_root)
+            })
+            .map(|pkg| {
+                vec![MemberRef {
+                    name: pkg.name.clone(),
+                    path: ".".to_string(),
+                }]
+            })
+            .unwrap_or_default();
 
         let mut deps = Vec::new();
         for pkg in &lock.packages {
@@ -156,6 +173,11 @@ impl ToolRead for UvTool {
                 direct: is_direct,
                 artifacts: pkg.artifact_ids(),
                 graph_floor: floors.get(&pkg.name).map(|v| Version::new(v.clone())),
+                members: if is_direct {
+                    project_member.clone()
+                } else {
+                    Vec::new()
+                },
             });
         }
         Ok(deps)
@@ -283,6 +305,7 @@ mod tests {
             from: Version::new("2.34.1"),
             to: Version::new("2.34.2"),
             kind: cooldown_core::UpdateKind::Patch,
+            members: Vec::new(),
         };
         let err = CoreError::ToolSpawn {
             tool: "uv".into(),
@@ -307,6 +330,7 @@ mod tests {
             direct: true,
             artifacts: vec![ArtifactId("wheel:py3-none-any".into())],
             graph_floor: None,
+            members: Vec::new(),
         };
         let raw = vec![RawRelease {
             version: Version::new("2.32.1"),
@@ -345,6 +369,83 @@ mod tests {
         assert_eq!(
             all_releases[0].published_at.unwrap().to_string(),
             "2026-06-05T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn dependencies_attribute_only_direct_declarations_to_project_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("uv.lock"),
+            r#"
+version = 1
+revision = 3
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "requests" }]
+
+[[package]]
+name = "requests"
+version = "2.34.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "idna" }]
+
+[[package]]
+name = "idna"
+version = "3.10"
+source = { registry = "https://pypi.org/simple" }
+"#,
+        )
+        .expect("write lock");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let tool = UvTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest,
+        };
+
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        let direct = graph
+            .iter()
+            .find(|dep| dep.package.name == "requests")
+            .expect("direct dep");
+        assert_eq!(
+            direct
+                .members
+                .iter()
+                .map(|member| (member.name.as_str(), member.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("demo", ".")]
+        );
+
+        let transitive = graph
+            .iter()
+            .find(|dep| dep.package.name == "idna")
+            .expect("transitive dep");
+        assert!(!transitive.direct);
+        assert!(
+            transitive.members.is_empty(),
+            "transitive dependencies are not declared by the project member"
         );
     }
 

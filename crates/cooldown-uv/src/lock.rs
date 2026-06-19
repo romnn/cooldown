@@ -49,6 +49,18 @@ impl Source {
     pub fn is_root(&self) -> bool {
         self.r#virtual.is_some() || self.editable.is_some()
     }
+
+    /// Returns `true` if this source is the *project's own* package — its `virtual`/`editable` path
+    /// points at `.`. Distinguishes the project from local path dependencies, which are also
+    /// `editable` but point at sibling directories (`../other`). Used to name the project package.
+    #[must_use]
+    pub fn is_project_root(&self) -> bool {
+        let at_dot = |path: &Option<String>| {
+            path.as_deref()
+                .is_some_and(|value| value == "." || value.is_empty())
+        };
+        at_dot(&self.r#virtual) || at_dot(&self.editable)
+    }
 }
 
 /// A single distribution file (a wheel or sdist) recorded under a [`Package`].
@@ -269,6 +281,30 @@ impl UvLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_project_root_distinguishes_self_from_path_deps() {
+        // The project's own package points at `.`; a local path dependency is also `editable` but
+        // points at a sibling directory — it must not be mistaken for the project package.
+        let own = Source {
+            registry: None,
+            r#virtual: None,
+            editable: Some(".".to_string()),
+            directory: None,
+            git: None,
+        };
+        let path_dep = Source {
+            registry: None,
+            r#virtual: None,
+            editable: Some("../airtype-common".to_string()),
+            directory: None,
+            git: None,
+        };
+        assert!(own.is_project_root());
+        assert!(!path_dep.is_project_root());
+        // Both still count as "root-ish" for the direct-set computation.
+        assert!(own.is_root() && path_dep.is_root());
+    }
 
     const SAMPLE: &str = r#"
 version = 1

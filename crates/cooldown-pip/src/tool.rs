@@ -181,6 +181,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                members: Vec::new(),
             });
         }
         Ok(deps)

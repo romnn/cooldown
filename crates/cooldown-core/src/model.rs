@@ -321,6 +321,23 @@ pub struct Dependency {
     /// The lowest version the resolved graph permits (MVS floor or a `=` pin), read from the
     /// lock; `None` when unconstrained.
     pub graph_floor: Option<Version>,
+    /// The workspace member package(s) that declare this dependency at this resolved version — e.g.
+    /// cargo member crates, pnpm/npm workspace packages, the uv project itself. Reports attribute the
+    /// dependency to these packages (by name, or by path under `--paths`). Empty when the adapter
+    /// cannot attribute a source (a transitive dep, or a tool without per-member data); the
+    /// presentation then leaves the column blank.
+    pub members: Vec<MemberRef>,
+}
+
+/// A workspace member that declares a dependency: its package `name` and its `path` relative to the
+/// project/workspace root. Reports show `name` by default and `path` under `--paths`. The root is
+/// recorded as `.` (rendered `./`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemberRef {
+    /// The package/crate name (e.g. `@airtype/admin`, `airtype-acl-api`).
+    pub name: String,
+    /// The member's directory relative to the workspace root (the root is `.`).
+    pub path: String,
 }
 
 /// The status of a dependency or pin. Note **graph-held is not a status**: it is a `graph_held`
@@ -421,6 +438,9 @@ pub struct Change {
     pub to: Version,
     /// The update kind of the change.
     pub kind: UpdateKind,
+    /// The workspace member package(s) that declare this dependency, for source attribution in
+    /// reports (see [`Dependency::members`]).
+    pub members: Vec<MemberRef>,
 }
 
 /// A set of planned changes handed to an adapter's `apply`.

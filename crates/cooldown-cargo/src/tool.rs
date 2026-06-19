@@ -129,6 +129,7 @@ impl ToolRead for CargoTool {
                 direct,
                 artifacts: Vec::new(),
                 graph_floor,
+                members: graph.direct_members(id),
             });
         }
         Ok(deps)
@@ -232,6 +233,7 @@ mod tests {
             from: Version::new("1.0.0"),
             to: Version::new("1.0.1"),
             kind: cooldown_core::UpdateKind::Patch,
+            members: Vec::new(),
         };
         let err = CoreError::ToolSpawn {
             tool: "cargo".into(),

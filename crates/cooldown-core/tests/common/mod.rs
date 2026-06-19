@@ -60,6 +60,7 @@ pub fn dep(name: &str, current: &str, quality: ReleaseQuality) -> Dependency {
         direct: true,
         artifacts: Vec::new(),
         graph_floor: None,
+        members: Vec::new(),
     }
 }
 
