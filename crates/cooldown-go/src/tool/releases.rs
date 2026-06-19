@@ -32,9 +32,22 @@ pub(super) fn major_key_for_path(path: &str) -> MajorKey {
 /// the adapter's classification logic is unit-testable without network.
 #[must_use]
 pub(super) fn build_releases(current: &str, raw: Vec<(String, RawRelease)>) -> Vec<Release> {
+    // Mirror Go's `go get -u`/`@latest` rule for `+incompatible` versions (major ≥ 2 tagged on a
+    // path with no `/vN` suffix and no `go.mod`). The raw GOPROXY `@v/list` returns every such tag,
+    // but Go only *selects* one when the module has not adopted module-style versioning on the line
+    // you are on: a pin already on the `+incompatible` line (github.com/docker/cli
+    // v29.5.2+incompatible) keeps moving within it, while a pin on a compatible, go.mod-bearing
+    // version (k8s.io/client-go v0.36.1) never jumps to a bare `+incompatible` tag (its ancient
+    // v11.0.0+incompatible). This matches what `go list -m -versions` reports, so cooldown only ever
+    // suggests what Go would. The current pin is itself never dropped (a compatible pin is not
+    // `+incompatible`; an incompatible pin keeps the whole line).
+    let current_is_incompatible = semver::is_incompatible(current);
     let mut releases: Vec<Release> = raw
         .into_iter()
-        .filter(|(_, release)| semver::is_valid(release.version.as_str()))
+        .filter(|(_, release)| {
+            semver::is_valid(release.version.as_str())
+                && (current_is_incompatible || !semver::is_incompatible(release.version.as_str()))
+        })
         .map(|(path, release)| {
             let version = release.version.as_str();
             Release {
@@ -75,13 +88,23 @@ pub(super) async fn releases(
     dep: &Dependency,
     candidates: CandidateScope,
     registry: Option<String>,
+    go_versions: Option<&[String]>,
 ) -> Result<Vec<Release>> {
     let module = &dep.package.name;
 
+    // The module's own-path releases: prefer the version set Go itself reports
+    // (`go list -m -versions`), which already omits the ancient pre-module and `+incompatible` tags
+    // a module-aware module would never resolve to (k8s.io/client-go lists only its `v0.x` line, not
+    // `v1.5.2` or `v11.0.0+incompatible`). Fall back to the proxy's raw `@v/list` when Go reports no
+    // versions for this module (or its probe failed) so discovery still works.
+    let own_path = match go_versions {
+        Some(versions) if !versions.is_empty() => {
+            proxy.releases_for(module, versions.to_vec()).await?
+        }
+        _ => proxy.releases(&dep.package).await?,
+    };
     // (source_path, raw_release) across the module's own path and discovered higher majors.
-    let mut raw: Vec<(String, RawRelease)> = proxy
-        .releases(&dep.package)
-        .await?
+    let mut raw: Vec<(String, RawRelease)> = own_path
         .into_iter()
         .map(|release| (module.clone(), release))
         .collect();

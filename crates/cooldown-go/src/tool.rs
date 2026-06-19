@@ -11,20 +11,33 @@ use crate::gocmd::Go;
 use crate::mutation;
 use crate::proxy::GoProxy;
 use async_trait::async_trait;
+use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal, Release, Result,
     ToolId, ToolRead, ToolWrite, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// The [`ToolId`] for the Go adapter.
 pub const GO_ID: ToolId = ToolId("go");
+
+/// Go's authoritative available-version lists for one project: module path → the versions Go
+/// itself would consider (`go list -m -versions`).
+type GoVersions = HashMap<String, Vec<String>>;
 
 /// The Go adapter, constructed from a [`GoProxy`] (itself built over the shared HTTP layer).
 pub struct GoTool {
     proxy: GoProxy,
     go: Go,
+    /// Go's authoritative per-module version lists (`go list -m -versions`), cached per project
+    /// root. A module's version list does not depend on which project queries it, but the `all`
+    /// query that seeds the cache is per-project — so the cache is keyed by project root and
+    /// populated once, on the first release lookup for that project.
+    version_lists: Mutex<HashMap<Utf8PathBuf, Arc<GoVersions>>>,
 }
 
 impl GoTool {
@@ -34,6 +47,7 @@ impl GoTool {
         GoTool {
             proxy,
             go: Go::new(),
+            version_lists: Mutex::new(HashMap::new()),
         }
     }
 
@@ -45,6 +59,25 @@ impl GoTool {
 
     fn registry(&self) -> Option<String> {
         self.proxy.registry_name()
+    }
+
+    /// Go's authoritative version list for every module in `project`, fetched once via
+    /// `go list -m -versions` and cached. If that probe fails (e.g. an incomplete module context),
+    /// returns an empty map so release discovery degrades to the proxy's own `@v/list` rather than
+    /// failing the command; the core's no-major guard still prevents major jumps in that case.
+    async fn project_version_lists(&self, project: &Project) -> Arc<GoVersions> {
+        let mut cache = self.version_lists.lock().await;
+        if let Some(map) = cache.get(&project.root) {
+            return Arc::clone(map);
+        }
+        let map = Arc::new(
+            self.go
+                .list_versions(&project.root)
+                .await
+                .unwrap_or_default(),
+        );
+        cache.insert(project.root.clone(), Arc::clone(&map));
+        map
     }
 }
 
@@ -81,10 +114,12 @@ impl ToolRead for GoTool {
     async fn releases(
         &self,
         dep: &Dependency,
-        _fetch: &FetchContext<'_>,
+        fetch: &FetchContext<'_>,
         candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
-        releases::releases(&self.proxy, dep, candidates, self.registry()).await
+        let version_lists = self.project_version_lists(fetch.project).await;
+        let go_versions = version_lists.get(&dep.package.name).map(Vec::as_slice);
+        releases::releases(&self.proxy, dep, candidates, self.registry(), go_versions).await
     }
 
     async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {

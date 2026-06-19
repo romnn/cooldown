@@ -193,20 +193,22 @@ impl GoProxy {
         let key = format!("go|{module}@{version}");
         Some(self.http.publish_store().guard(&key, observed).effective)
     }
-}
 
-#[async_trait]
-impl PackageRegistry for GoProxy {
-    async fn releases(&self, package: &PackageId) -> Result<Vec<RawRelease>, CoreError> {
-        let module = &package.name;
-        let mut versions = self.list(module).await?;
-        if versions.is_empty()
-            && let Some(latest) = self.latest(module).await?
-        {
-            versions.push(latest.version);
-        }
-
-        // Fetch .info for every listed version concurrently; the per-host semaphore bounds load.
+    /// Attach publish times (passed through the monotonic floor) to an explicit version list,
+    /// producing [`RawRelease`]s. The Go adapter uses this to time the version set Go itself
+    /// reports (`go list -m -versions`) rather than the raw `@v/list`, so cooldown reasons over the
+    /// versions Go would actually select.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transient [`CoreError`] if any `.info` fetch fails transiently; a 404 or a single
+    /// non-transient per-version failure degrades that version to an unknown publish time.
+    pub async fn releases_for(
+        &self,
+        module: &str,
+        versions: Vec<String>,
+    ) -> Result<Vec<RawRelease>, CoreError> {
+        // Fetch .info for every version concurrently; the per-host semaphore bounds load.
         let futs = versions.iter().map(|v| async move {
             let info = self.info(module, v).await;
             (v.clone(), info)
@@ -229,6 +231,20 @@ impl PackageRegistry for GoProxy {
             });
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl PackageRegistry for GoProxy {
+    async fn releases(&self, package: &PackageId) -> Result<Vec<RawRelease>, CoreError> {
+        let module = &package.name;
+        let mut versions = self.list(module).await?;
+        if versions.is_empty()
+            && let Some(latest) = self.latest(module).await?
+        {
+            versions.push(latest.version);
+        }
+        self.releases_for(module, versions).await
     }
 
     async fn published_at(

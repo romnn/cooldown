@@ -168,6 +168,60 @@ fn build_releases_orders_dedupes_and_tags() {
 }
 
 #[test]
+fn build_releases_applies_go_incompatible_rule() {
+    // A module-aware pin (a compatible, go.mod-bearing v0.x version like k8s.io/client-go) must
+    // never see a bare `+incompatible` tag as a candidate: `go list -m -versions` hides the ancient
+    // v11.0.0+incompatible because client-go adopted go.mod, so cooldown must too.
+    let compatible = vec![
+        (
+            "k8s.io/client-go".to_string(),
+            rr("v0.36.1", Some("2026-01-01T00:00:00Z")),
+        ),
+        (
+            "k8s.io/client-go".to_string(),
+            rr("v0.36.2", Some("2026-02-01T00:00:00Z")),
+        ),
+        (
+            "k8s.io/client-go".to_string(),
+            rr("v11.0.0+incompatible", Some("2018-01-01T00:00:00Z")),
+        ),
+    ];
+    let compatible = build_releases("v0.36.1", compatible);
+    let versions: Vec<&str> = compatible
+        .iter()
+        .map(|release| release.version.as_str())
+        .collect();
+    assert_eq!(
+        versions,
+        vec!["v0.36.1", "v0.36.2"],
+        "a compatible pin drops the bare +incompatible tag"
+    );
+
+    // A pin already on the `+incompatible` line (github.com/docker/cli has no go.mod) keeps moving
+    // within it — Go lists and selects the higher `+incompatible` patch.
+    let incompatible = vec![
+        (
+            "github.com/docker/cli".to_string(),
+            rr("v29.5.2+incompatible", Some("2026-01-01T00:00:00Z")),
+        ),
+        (
+            "github.com/docker/cli".to_string(),
+            rr("v29.5.3+incompatible", Some("2026-02-01T00:00:00Z")),
+        ),
+    ];
+    let incompatible = build_releases("v29.5.2+incompatible", incompatible);
+    let versions: Vec<&str> = incompatible
+        .iter()
+        .map(|release| release.version.as_str())
+        .collect();
+    assert_eq!(
+        versions,
+        vec!["v29.5.2+incompatible", "v29.5.3+incompatible"],
+        "an +incompatible pin keeps the +incompatible line"
+    );
+}
+
+#[test]
 fn old_import_path_for_cross_major() {
     let change = Change {
         package: PackageId::new(GO_ID, "example.com/foo/v2", None),
