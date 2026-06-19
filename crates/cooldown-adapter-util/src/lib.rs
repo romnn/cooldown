@@ -1,6 +1,9 @@
 //! Shared utilities for registry-backed adapters that classify releases and translate common
 //! resolver/apply outcomes.
 
+mod driver;
+pub use driver::Driver;
+
 use camino::Utf8Path;
 use cooldown_core::{
     Change, CoreError, MajorKey, ProjectMutationJournal, RawRelease, Release, ReleaseOrder,
