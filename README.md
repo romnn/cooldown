@@ -25,7 +25,15 @@ resolution/apply engines, never as the source of policy.
 
 - **Go** — fully implemented (GOPROXY publish times, `x/mod` semver/pseudo-version semantics,
   `go`-driven resolution/apply).
-- **Rust (cargo) / Python (uv)** — adapter crates landing against the same proven core contract.
+- **Rust** — `cargo` (crates.io). **Python** — `uv`, `pip` (`requirements.txt`), and `poetry`
+  (all PyPI / PEP 440), plus `conda` and `pixi` (anaconda.org, mixed with PyPI).
+- **JavaScript / TypeScript** — `npm`, `pnpm`, `yarn`, and `bun` (npm registry) plus `deno`
+  (mixing `npm:` and `jsr:` dependencies).
+- **Ruby** — `bundler` (rubygems.org). **Elixir** — `hex`/`mix` (hex.pm). **Java** — `maven`
+  (`pom.xml`) and `gradle` (`gradle.lockfile`), both Maven Central. **Swift** — SwiftPM
+  (`Package.resolved`, backed by GitHub Releases publish times).
+- Every package manager is its own `--tool`; one generic adapter is specialised per lockfile
+  format, and adapters mixing registries (deno, conda, pixi) route each dependency to its source.
 - Default window is **7 days**; opting out is explicit (`--latest`).
 
 ## Install
@@ -85,7 +93,8 @@ min-age = "14d"                 # the one knob most repos ever set (scalar form)
 # per-kind windows (table form, instead of the scalar):
 # min-age = { default = "14d", major = "30d", minor = "14d", patch = "7d" }
 
-[tool.uv]                       # per tool (cargo / go / uv / …; aliases like python accepted)
+[tool.uv]                       # per tool (cargo/go/uv/pip/poetry/conda/pixi/npm/pnpm/yarn/bun/
+                                #   deno/bundler/hex/maven/gradle/swift; aliases like python accepted)
 min-age = "21d"
 
 [registry."internal.acme.io"]   # per registry / index — our own registry is trusted
@@ -126,6 +135,16 @@ crates/
   cooldown-registry/  shared HTTP client · on-disk cache (monotonic publish-time floor) · concurrency
   cooldown-render/    TTY tables + the JSON envelope + schema
   cooldown-go/        Go Tool + GOPROXY registry
+  cooldown-cargo/     Cargo Tool + crates.io registry
+  cooldown-uv/        uv Tool + PyPI registry + PEP 440 version model (shared by pip/poetry/conda)
+  cooldown-npm/       npm/pnpm/yarn/bun/deno Tools + npm & JSR registries (one adapter per lockfile)
+  cooldown-pip/       pip + Poetry Tools (reuse the PyPI client)
+  cooldown-conda/     conda + pixi Tools + anaconda.org registry (mixed with PyPI)
+  cooldown-rubygems/  Bundler Tool + rubygems.org registry
+  cooldown-hex/       Elixir/Hex Tool + hex.pm registry
+  cooldown-maven/     Maven + Gradle Tools + Maven Central registry
+  cooldown-swift/     SwiftPM Tool + GitHub Releases registry
+  cooldown-adapter-util/  shared release classification + the package-manager CLI driver
   cooldown/           the binary: app use cases · clap · config discovery · wiring · dispatch
 ```
 

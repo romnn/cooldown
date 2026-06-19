@@ -8,3 +8,8 @@ goreleaser-dist/
 .intentionally-empty-file.o
 *_compiler_family.o
 examples/*/target/
+
+# Node/Deno install trees — the example projects commit only their manifest + lockfile.
+node_modules/
+.deno/
+vendor/
