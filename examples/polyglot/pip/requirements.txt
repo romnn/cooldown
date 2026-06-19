@@ -1,0 +1,6 @@
+# Pinned application dependencies (old on purpose so cooldown has updates to show).
+requests==2.28.0
+click==8.0.0
+flask==2.2.0
+rich==12.0.0
+urllib3==1.26.0
