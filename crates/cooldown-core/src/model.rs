@@ -110,22 +110,63 @@ impl ToolId {
     }
 }
 
-/// The tools `cooldown` recognises in config (`[tool.<name>]`) and `--tool`, by the stable name
-/// of the tool it drives. Pre-registering the not-yet-implemented `node` lets a shared org config
-/// mention it without erroring, while a genuine typo (`[tool.carg]`) is still rejected.
-pub const RECOGNIZED_TOOLS: &[ToolId] =
-    &[ToolId("cargo"), ToolId("go"), ToolId("uv"), ToolId("node")];
+/// The tools `cooldown` recognises in config (`[tool.<name>]`) and `--tool`, by the stable name of
+/// the tool it drives. Each JavaScript package manager is its own tool (they pin different lockfile
+/// formats), so `npm`, `pnpm`, `yarn`, and `bun` are all first-class, while a genuine typo
+/// (`[tool.carg]`) is still rejected.
+pub const RECOGNIZED_TOOLS: &[ToolId] = &[
+    ToolId("cargo"),
+    ToolId("go"),
+    ToolId("uv"),
+    ToolId("npm"),
+    ToolId("pnpm"),
+    ToolId("yarn"),
+    ToolId("bun"),
+    ToolId("deno"),
+    ToolId("bundler"),
+    ToolId("hex"),
+    ToolId("maven"),
+    ToolId("gradle"),
+    ToolId("pip"),
+    ToolId("poetry"),
+    ToolId("conda"),
+    ToolId("pixi"),
+    ToolId("swift"),
+];
 
-/// Resolve a tool name (or a common alias) to its canonical [`ToolId`], or `None` if
-/// unrecognised. Accepts the language name and sibling tools as aliases: `rust`/`crates` → cargo,
-/// `python`/`pip`/`pypi` → uv, `golang` → go, `npm`/`pnpm`/`yarn` → node.
+/// Returns the canonical tool names as a comma-separated string for diagnostics.
+#[must_use]
+pub fn recognized_tool_names() -> String {
+    RECOGNIZED_TOOLS
+        .iter()
+        .map(ToolId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a tool name (or a common alias) to its canonical [`ToolId`], or `None` if unrecognised.
+/// Accepts the language name and sibling tools as aliases: `rust`/`crates` → cargo,
+/// `python`/`pip`/`pypi` → uv, `golang` → go, and `node`/`js` → npm (the default JS manager).
 #[must_use]
 pub fn tool_id(name: &str) -> Option<ToolId> {
     let canonical = match name {
         "cargo" | "crates" | "rust" => "cargo",
         "go" | "golang" => "go",
-        "uv" | "pip" | "pypi" | "python" => "uv",
-        "node" | "npm" | "pnpm" | "yarn" => "node",
+        "uv" | "pypi" | "python" => "uv",
+        "pip" => "pip",
+        "poetry" => "poetry",
+        "conda" | "mamba" | "micromamba" => "conda",
+        "pixi" => "pixi",
+        "swift" | "spm" | "swiftpm" => "swift",
+        "npm" | "node" | "js" | "javascript" | "typescript" => "npm",
+        "pnpm" => "pnpm",
+        "yarn" => "yarn",
+        "bun" => "bun",
+        "deno" => "deno",
+        "bundler" | "bundle" | "ruby" | "gem" | "rubygems" => "bundler",
+        "hex" | "mix" | "elixir" => "hex",
+        "maven" | "mvn" => "maven",
+        "gradle" => "gradle",
         _ => return None,
     };
     RECOGNIZED_TOOLS.iter().copied().find(|e| e.0 == canonical)
@@ -516,12 +557,32 @@ mod tests {
             ("crates", "cargo"),
             ("go", "go"),
             ("golang", "go"),
+            // Python: uv, pip, and Poetry are each their own tool; `python` defaults to uv.
             ("uv", "uv"),
             ("python", "uv"),
-            ("pip", "uv"),
-            ("node", "node"),
-            ("pnpm", "node"),
-            ("npm", "node"),
+            ("pip", "pip"),
+            ("poetry", "poetry"),
+            ("conda", "conda"),
+            ("mamba", "conda"),
+            ("pixi", "pixi"),
+            // Each JS package manager is its own canonical tool; `node`/`js` alias to npm.
+            ("npm", "npm"),
+            ("node", "npm"),
+            ("js", "npm"),
+            ("pnpm", "pnpm"),
+            ("yarn", "yarn"),
+            ("bun", "bun"),
+            ("deno", "deno"),
+            // Ruby, Elixir, Java, and Swift.
+            ("bundler", "bundler"),
+            ("ruby", "bundler"),
+            ("hex", "hex"),
+            ("mix", "hex"),
+            ("maven", "maven"),
+            ("mvn", "maven"),
+            ("gradle", "gradle"),
+            ("swift", "swift"),
+            ("spm", "swift"),
         ] {
             assert_eq!(
                 tool_id(input).expect("known tool").as_str(),

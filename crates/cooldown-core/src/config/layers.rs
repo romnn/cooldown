@@ -2,7 +2,7 @@ use super::document::ConfigDocument;
 use super::schema::{ConfigToml, MinAgeToml, SelectorToml, WindowFields};
 use crate::duration::{parse_duration, parse_freeze};
 use crate::error::CoreError;
-use crate::model::tool_id;
+use crate::model::{recognized_tool_names, tool_id};
 use crate::policy::{ByKind, Origin, PatternGlob, PolicyLayer, Rule, Selector, WindowSpec};
 use jiff::SignedDuration;
 
@@ -123,9 +123,9 @@ fn selector_rule(
 /// # Errors
 ///
 /// Returns [`CoreError::Config`] when `content` is not valid TOML or has unknown fields, when a
-/// `[tool.*]` key is not a recognised tool (`go`, `rust`, `python`, `node`), when a `min-age`
-/// duration, `freeze` timestamp, or `floor` duration fails to parse, when a `package`/`project`
-/// glob is invalid, or when a selector sets more than one of `min-age`, `latest`, and `freeze`.
+/// `[tool.*]` key is not a recognised tool, when a `min-age` duration, `freeze` timestamp, or
+/// `floor` duration fails to parse, when a `package`/`project` glob is invalid, or when a selector
+/// sets more than one of `min-age`, `latest`, and `freeze`.
 ///
 /// # Examples
 ///
@@ -172,7 +172,8 @@ pub(crate) fn policy_layer_from_config(
         for (name, selector) in tools {
             let tool = tool_id(&name).ok_or_else(|| {
                 CoreError::Config(format!(
-                    "unknown tool `{name}` in [tool.{name}]; recognised: cargo, go, uv, node"
+                    "unknown tool `{name}` in [tool.{name}]; recognised: {}",
+                    recognized_tool_names()
                 ))
             })?;
             layer.rules.push(selector_rule(

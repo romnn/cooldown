@@ -2,7 +2,7 @@ use crate::app::{Progress, RunOpts};
 use crate::cli::{CliOverrides, GlobalArgs, LogLevel};
 use cooldown_cargo::CARGO_ID;
 use cooldown_core::config::{CommandConfig, WindowFields};
-use cooldown_core::{CoreError, PatternGlob, ToolId, tool_id};
+use cooldown_core::{CoreError, PatternGlob, ToolId, recognized_tool_names, tool_id};
 
 pub(super) struct ResolvedInvocation {
     run: RunOpts,
@@ -168,7 +168,8 @@ fn resolve_tools(cfg: &CommandConfig) -> Result<Vec<ToolId>, CoreError> {
         .map(|name| {
             tool_id(name).ok_or_else(|| {
                 CoreError::Config(format!(
-                    "unknown --tool `{name}`; recognised: cargo, go, uv, node"
+                    "unknown --tool `{name}`; recognised: {}",
+                    recognized_tool_names()
                 ))
             })
         })

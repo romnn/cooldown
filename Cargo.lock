@@ -359,10 +359,17 @@ dependencies = [
  "clap",
  "color-eyre",
  "cooldown-cargo",
+ "cooldown-conda",
  "cooldown-core",
  "cooldown-go",
+ "cooldown-hex",
+ "cooldown-maven",
+ "cooldown-npm",
+ "cooldown-pip",
  "cooldown-registry",
  "cooldown-render",
+ "cooldown-rubygems",
+ "cooldown-swift",
  "cooldown-toml-util",
  "cooldown-uv",
  "fs4",
@@ -387,6 +394,7 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "cooldown-core",
+ "tokio",
 ]
 
 [[package]]
@@ -408,6 +416,23 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "cooldown-conda"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "cooldown-uv",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -442,6 +467,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "cooldown-hex"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cooldown-maven"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cooldown-npm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cooldown-pip"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "cooldown-uv",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "cooldown-registry"
 version = "0.1.0"
 dependencies = [
@@ -467,6 +558,39 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cooldown-rubygems"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cooldown-swift"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "cooldown-adapter-util",
+ "cooldown-core",
+ "cooldown-registry",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

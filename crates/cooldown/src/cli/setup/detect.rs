@@ -4,10 +4,17 @@ use crate::discovery;
 use crate::scan::find_marker_dirs;
 use camino::Utf8PathBuf;
 use cooldown_cargo::CargoTool;
+use cooldown_conda::{CondaTool, PixiTool};
 use cooldown_core::config::ScanConfig;
 use cooldown_core::{CoreError, Project, ToolId};
 use cooldown_go::GoTool;
+use cooldown_hex::HexTool;
+use cooldown_maven::{GradleTool, MavenTool};
+use cooldown_npm::{BunTool, DenoTool, NpmCliTool, PnpmTool, YarnTool};
+use cooldown_pip::{PipTool, PoetryTool};
 use cooldown_registry::{HttpOptions, SharedHttp};
+use cooldown_rubygems::BundlerTool;
+use cooldown_swift::SwiftTool;
 use cooldown_uv::UvTool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +42,20 @@ pub(super) fn adapter_set(offline: bool, fresh: bool) -> Result<AdapterSet, Core
     adapters.register(Arc::new(GoTool::from_http(http.clone())));
     adapters.register(Arc::new(CargoTool::from_http(http.clone())));
     adapters.register(Arc::new(UvTool::from_http(http.clone())));
+    adapters.register(Arc::new(NpmCliTool::from_http(http.clone())));
+    adapters.register(Arc::new(PnpmTool::from_http(http.clone())));
+    adapters.register(Arc::new(YarnTool::from_http(http.clone())));
+    adapters.register(Arc::new(BunTool::from_http(http.clone())));
+    adapters.register(Arc::new(DenoTool::from_http(http.clone())));
+    adapters.register(Arc::new(BundlerTool::from_http(http.clone())));
+    adapters.register(Arc::new(HexTool::from_http(http.clone())));
+    adapters.register(Arc::new(MavenTool::from_http(http.clone())));
+    adapters.register(Arc::new(GradleTool::from_http(http.clone())));
+    adapters.register(Arc::new(PipTool::from_http(http.clone())));
+    adapters.register(Arc::new(PoetryTool::from_http(http.clone())));
+    adapters.register(Arc::new(CondaTool::from_http(http.clone())));
+    adapters.register(Arc::new(PixiTool::from_http(http.clone())));
+    adapters.register(Arc::new(SwiftTool::from_http(http.clone())));
     Ok(adapters)
 }
 

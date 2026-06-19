@@ -1,7 +1,7 @@
 use super::document::ConfigDocument;
 use super::schema::{CommandConfig, ConfigToml};
 use crate::error::CoreError;
-use crate::model::tool_id;
+use crate::model::{recognized_tool_names, tool_id};
 use crate::policy::Origin;
 use std::collections::BTreeMap;
 
@@ -89,7 +89,8 @@ pub(crate) fn scan_config_from_config(
         };
         let tool = tool_id(&name).ok_or_else(|| {
             CoreError::Config(format!(
-                "unknown tool `{name}` in [tool.{name}]; recognised: cargo, go, uv, node"
+                "unknown tool `{name}` in [tool.{name}]; recognised: {}",
+                recognized_tool_names()
             ))
         })?;
         scan.tool_exclude

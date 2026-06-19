@@ -52,8 +52,8 @@ min-age = "7d"
 # Risk-tiered windows (use INSTEAD of the scalar above):
 # min-age = { default = "7d", patch = "3d", minor = "7d", major = "30d" }
 
-# Per tool (npm is the most-attacked registry):
-# [tool.node]
+# Per tool (npm is the most-attacked registry; pnpm/yarn/bun/deno are separate tools):
+# [tool.npm]
 # min-age = "21d"
 
 # First-party packages are trusted:
