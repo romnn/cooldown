@@ -67,6 +67,21 @@ pub fn json_schema() -> Value {
         "additionalProperties": false
     });
 
+    let member_ref = json!({
+        "type": "object",
+        "required": ["name", "path"],
+        "properties": {
+            "name": { "type": "string" },
+            "path": { "type": "string" }
+        },
+        "additionalProperties": false
+    });
+
+    let members = json!({
+        "type": "array",
+        "items": { "$ref": "#/$defs/memberRef" }
+    });
+
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -92,6 +107,7 @@ pub fn json_schema() -> Value {
         "diagnostic": diagnostic,
         "window": window,
         "latestInfo": latest,
+        "memberRef": member_ref,
         "skippedInfo": skipped,
         "effectiveInfo": effective,
         "outdatedSummary": {
@@ -119,6 +135,7 @@ pub fn json_schema() -> Value {
                 "registry": { "type": "string" },
                 "direct": { "type": "boolean" },
                 "current": { "type": "string" },
+                "members": members,
                 "window": { "$ref": "#/$defs/window" },
                 "status": {
                     "enum": [
@@ -160,6 +177,7 @@ pub fn json_schema() -> Value {
                 "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "registry": { "type": "string" },
+                "members": members,
                 "direct": { "type": "boolean" },
                 "current": { "type": "string" },
                 "publishedAt": { "type": "string", "format": "date-time" },
@@ -190,6 +208,7 @@ pub fn json_schema() -> Value {
                 "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "registry": { "type": "string" },
+                "members": members,
                 "from": { "type": "string" },
                 "to": { "type": "string" },
                 "kind": { "enum": ["patch", "minor", "major"] },

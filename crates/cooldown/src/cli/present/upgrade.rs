@@ -30,6 +30,7 @@ fn upgrade_item(item: &app::UpgradeItem) -> render::UpgradeItem {
         name: item.name.clone(),
         tool: item.tool.clone(),
         project: item.project.clone(),
+        members: item.members.clone(),
         registry: item.registry.clone(),
         from: item.from.clone(),
         to: item.to.clone(),

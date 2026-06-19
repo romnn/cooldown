@@ -30,6 +30,7 @@ fn check_item(item: &app::CheckItem) -> render::CheckItem {
         name: item.name.clone(),
         tool: item.tool.clone(),
         project: item.project.clone(),
+        members: item.members.clone(),
         registry: item.registry.clone(),
         direct: item.direct,
         current: item.current.clone(),

@@ -6,8 +6,46 @@ use crate::model::{
     OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
-use cooldown_core::{Diagnostic, Status};
+use cooldown_core::{Diagnostic, MemberRef, Status};
 use std::fmt::Write as _;
+
+/// The color of the package-name column (every listed dependency is actionable).
+const PACKAGE_COLOR: Color = Color::Cyan;
+
+/// Presentation flags shared by the dependency-table renderers (`outdated`/`check`/`upgrade`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderOptions {
+    /// Colorize output for the terminal.
+    pub use_color: bool,
+    /// List every source package on its own line instead of `first (+N others)`.
+    pub list_packages: bool,
+    /// Show the "Used by" column as workspace paths instead of package names.
+    pub paths: bool,
+}
+
+/// Whether the "Used by" column should appear: at least one row attributes a source package.
+fn has_attribution<T>(items: &[T], members: impl Fn(&T) -> &[MemberRef]) -> bool {
+    items.iter().any(|it| !members(it).is_empty())
+}
+
+/// Whether the "Project" column should appear: some row's project is not just the root. A repo whose
+/// only project is the root (`.`) gains no column; multi-project trees (uv packages) keep it.
+fn has_distinct_project<T>(items: &[T], project: impl Fn(&T) -> &str) -> bool {
+    items.iter().any(|it| !is_root_path(project(it)))
+}
+
+fn is_root_path(path: &str) -> bool {
+    matches!(path, "." | "./" | "")
+}
+
+/// Render a project/path label, showing the root as `./` so it reads clearly as a path.
+fn path_label(path: &str) -> String {
+    if path == "." {
+        "./".to_string()
+    } else {
+        path.to_string()
+    }
+}
 
 fn base_table(use_color: bool) -> Table {
     let mut t = Table::new();
@@ -21,6 +59,37 @@ fn base_table(use_color: bool) -> Table {
         t.force_no_tty();
     }
     t
+}
+
+/// A muted gray (256-color) for the table's rule lines, so the borders don't glare against the text.
+const BORDER_COLOR: &str = "\x1b[38;5;240m";
+const FG_RESET: &str = "\x1b[39m";
+
+/// Recolor the table's horizontal rule lines to a muted gray when coloring is on. comfy-table has no
+/// border-color API, so this post-processes the rendered string: a line made entirely of box-drawing
+/// characters is a separator and gets dimmed; content rows (which carry the only real text) are left
+/// untouched, so their own cell colors are never disturbed.
+fn dim_borders(table: &str, use_color: bool) -> String {
+    if !use_color {
+        return table.to_string();
+    }
+    let mut out = String::with_capacity(table.len());
+    for (index, line) in table.lines().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if !line.is_empty() && line.chars().all(is_rule_char) {
+            let _ = write!(out, "{BORDER_COLOR}{line}{FG_RESET}");
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// A box-drawing or spacing character — the only characters a separator rule is built from.
+fn is_rule_char(c: char) -> bool {
+    c == ' ' || ('\u{2500}'..='\u{257f}').contains(&c)
 }
 
 fn status_color(s: OutdatedStatus) -> Color {
@@ -63,6 +132,42 @@ fn fmt_days(d: f64) -> String {
     }
 }
 
+/// Render the "Used by" column for one dependency: the member packages by name (or by path under
+/// `paths`). Blank when unattributed; with `list_all`, every member on its own line (a multi-line
+/// cell, so the row's other columns stay on the first line); otherwise the shortest label plus a
+/// `(+N others)` count, keeping the summarized cell narrow.
+fn members_cell(members: &[MemberRef], list_all: bool, paths: bool) -> String {
+    let mut labels: Vec<String> = members
+        .iter()
+        .map(|member| {
+            if paths {
+                path_label(&member.path)
+            } else {
+                member.name.clone()
+            }
+        })
+        .collect();
+    labels.sort();
+    labels.dedup();
+    if labels.is_empty() {
+        return String::new();
+    }
+    if list_all {
+        return labels.join("\n");
+    }
+    // Show the shortest label first to keep the column narrow; alphabetical breaks length ties.
+    let first = labels
+        .iter()
+        .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .cloned()
+        .unwrap_or_default();
+    match labels.len() - 1 {
+        0 => first,
+        1 => format!("{first} (+1 other)"),
+        n => format!("{first} (+{n} others)"),
+    }
+}
+
 /// Render the `outdated` report.
 #[must_use]
 pub fn render_outdated(
@@ -70,22 +175,29 @@ pub fn render_outdated(
     items: &[OutdatedItem],
     warnings: &[Diagnostic],
     errors: &[Diagnostic],
-    use_color: bool,
+    opts: &RenderOptions,
 ) -> String {
+    let RenderOptions {
+        use_color,
+        list_packages,
+        paths,
+    } = *opts;
     let mut out = String::new();
     if items.is_empty() {
         out.push_str("All dependencies are up to date.\n");
     } else {
+        let used_by = has_attribution(items, |it| &it.members);
+        let project = has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
-        t.set_header(vec![
-            "Package",
-            "Project",
-            "Current",
-            "Adoptable",
-            "Latest",
-            "Window",
-            "Status",
-        ]);
+        let mut header = vec!["Package"];
+        if used_by {
+            header.push("Used by");
+        }
+        if project {
+            header.push("Project");
+        }
+        header.extend(["Current", "Adoptable", "Latest", "Window", "Status"]);
+        t.set_header(header);
         for it in items {
             let adoptable = it.adoptable_target.clone().unwrap_or_else(|| "—".into());
             let latest = it
@@ -96,17 +208,25 @@ pub fn render_outdated(
                 Some(by) => format!("{} (≥{by})", fmt_days(it.window.min_age_days)),
                 None => fmt_days(it.window.min_age_days),
             };
-            t.add_row(vec![
-                Cell::new(&it.name),
-                Cell::new(&it.project),
-                Cell::new(&it.current),
-                Cell::new(adoptable),
-                Cell::new(latest),
-                Cell::new(window),
-                cell_colored(status_label(it.status), status_color(it.status), use_color),
-            ]);
+            let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
+            if used_by {
+                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+            }
+            if project {
+                row.push(Cell::new(path_label(&it.project)));
+            }
+            row.push(Cell::new(&it.current));
+            row.push(Cell::new(adoptable));
+            row.push(Cell::new(latest));
+            row.push(Cell::new(window));
+            row.push(cell_colored(
+                status_label(it.status),
+                status_color(it.status),
+                use_color,
+            ));
+            t.add_row(row);
         }
-        out.push_str(&t.to_string());
+        out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
     let _ = write!(
@@ -134,8 +254,13 @@ pub fn render_check(
     items: &[CheckItem],
     warnings: &[Diagnostic],
     errors: &[Diagnostic],
-    use_color: bool,
+    opts: &RenderOptions,
 ) -> String {
+    let RenderOptions {
+        use_color,
+        list_packages,
+        paths,
+    } = *opts;
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() {
         let _ = writeln!(
@@ -144,10 +269,18 @@ pub fn render_check(
             summary.checked, meta.scope
         );
     } else {
+        let used_by = has_attribution(items, |it| &it.members);
+        let project = has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
-        t.set_header(vec![
-            "Package", "Project", "Version", "Age", "Window", "Status", "Notes",
-        ]);
+        let mut header = vec!["Package"];
+        if used_by {
+            header.push("Used by");
+        }
+        if project {
+            header.push("Project");
+        }
+        header.extend(["Version", "Age", "Window", "Status", "Notes"]);
+        t.set_header(header);
         for it in items {
             let (label, color) = match it.status {
                 CheckStatus::Violation => ("violation", Color::Red),
@@ -166,17 +299,21 @@ pub fn render_check(
             if let Some(e) = &it.error {
                 notes.push(e.message.clone());
             }
-            t.add_row(vec![
-                Cell::new(&it.name),
-                Cell::new(&it.project),
-                Cell::new(&it.current),
-                Cell::new(age),
-                Cell::new(fmt_days(it.window.min_age_days)),
-                cell_colored(label, color, use_color),
-                Cell::new(notes.join("; ")),
-            ]);
+            let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
+            if used_by {
+                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+            }
+            if project {
+                row.push(Cell::new(path_label(&it.project)));
+            }
+            row.push(Cell::new(&it.current));
+            row.push(Cell::new(age));
+            row.push(Cell::new(fmt_days(it.window.min_age_days)));
+            row.push(cell_colored(label, color, use_color));
+            row.push(Cell::new(notes.join("; ")));
+            t.add_row(row);
         }
-        out.push_str(&t.to_string());
+        out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
     let _ = writeln!(
@@ -202,14 +339,29 @@ pub fn render_upgrade(
     items: &[UpgradeItem],
     warnings: &[Diagnostic],
     errors: &[Diagnostic],
-    use_color: bool,
+    opts: &RenderOptions,
 ) -> String {
+    let RenderOptions {
+        use_color,
+        list_packages,
+        paths,
+    } = *opts;
     let mut out = String::new();
     if items.is_empty() {
         out.push_str("Nothing to upgrade.\n");
     } else {
+        let used_by = has_attribution(items, |it| &it.members);
+        let project = has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
-        t.set_header(vec!["Package", "Project", "From", "To", "Kind", "Result"]);
+        let mut header = vec!["Package"];
+        if used_by {
+            header.push("Used by");
+        }
+        if project {
+            header.push("Project");
+        }
+        header.extend(["From", "To", "Kind", "Result"]);
+        t.set_header(header);
         for it in items {
             let (label, color) = if it.applied {
                 ("applied".to_string(), Color::Green)
@@ -220,16 +372,20 @@ pub fn render_upgrade(
             } else {
                 ("planned".to_string(), Color::Cyan)
             };
-            t.add_row(vec![
-                Cell::new(&it.name),
-                Cell::new(&it.project),
-                Cell::new(&it.from),
-                Cell::new(&it.to),
-                Cell::new(format!("{:?}", it.kind).to_lowercase()),
-                cell_colored(label, color, use_color),
-            ]);
+            let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
+            if used_by {
+                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+            }
+            if project {
+                row.push(Cell::new(path_label(&it.project)));
+            }
+            row.push(Cell::new(&it.from));
+            row.push(Cell::new(&it.to));
+            row.push(Cell::new(format!("{:?}", it.kind).to_lowercase()));
+            row.push(cell_colored(label, color, use_color));
+            t.add_row(row);
         }
-        out.push_str(&t.to_string());
+        out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
     let lock = match meta.lock_verified {
@@ -291,7 +447,7 @@ pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool
             Cell::new(&s.note),
         ]);
     }
-    out.push_str(&t.to_string());
+    out.push_str(&dim_borders(&t.to_string(), use_color));
     out.push('\n');
     out
 }
@@ -329,5 +485,67 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
         | Status::Adoptable
         | Status::InCooldown
         | Status::Held => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_distinct_project, members_cell, path_label};
+    use cooldown_core::MemberRef;
+
+    /// Members whose name is the given string and whose path is `path/<name>`.
+    fn members(names: &[&str]) -> Vec<MemberRef> {
+        names
+            .iter()
+            .map(|name| MemberRef {
+                name: (*name).to_string(),
+                path: format!("path/{name}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn members_cell_blank_when_unattributed() {
+        assert_eq!(members_cell(&[], false, false), "");
+        assert_eq!(members_cell(&[], true, true), "");
+    }
+
+    #[test]
+    fn members_cell_shows_shortest_name_first_then_count() {
+        // The shortest label leads (keeps the column narrow); alphabetical breaks length ties.
+        assert_eq!(members_cell(&members(&["solo"]), false, false), "solo");
+        assert_eq!(
+            members_cell(&members(&["bbb", "aa"]), false, false),
+            "aa (+1 other)"
+        );
+        assert_eq!(
+            members_cell(&members(&["apps/admin", "zz", "apps/web"]), false, false),
+            "zz (+2 others)"
+        );
+    }
+
+    #[test]
+    fn members_cell_lists_all_sorted_on_separate_lines() {
+        assert_eq!(
+            members_cell(&members(&["b", "a", "c"]), true, false),
+            "a\nb\nc"
+        );
+    }
+
+    #[test]
+    fn members_cell_paths_mode_uses_path() {
+        assert_eq!(members_cell(&members(&["pkg"]), false, true), "path/pkg");
+    }
+
+    #[test]
+    fn path_label_renders_root_as_dot_slash() {
+        assert_eq!(path_label("."), "./");
+        assert_eq!(path_label("apps/admin"), "apps/admin");
+    }
+
+    #[test]
+    fn distinct_project_only_hides_actual_root_path() {
+        assert!(!has_distinct_project(&["."], |path| *path));
+        assert!(has_distinct_project(&["root"], |path| *path));
     }
 }

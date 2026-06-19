@@ -211,6 +211,12 @@ pub(in crate::cli) struct GlobalArgs {
     /// (outdated) include transitive deps in the report.
     #[arg(long = "include-indirect", global = true)]
     pub(in crate::cli) include_indirect: bool,
+    /// List every source package on its own line instead of `first (+N others)`.
+    #[arg(long = "list-packages", global = true)]
+    pub(in crate::cli) list_packages: bool,
+    /// Show the "Used by" column as workspace paths instead of package names.
+    #[arg(long = "paths", global = true)]
+    pub(in crate::cli) paths: bool,
     /// (check) gate every artifact in a universal lock, not just env-relevant ones.
     #[arg(long = "all-artifacts", global = true)]
     pub(in crate::cli) all_artifacts: bool,

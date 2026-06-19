@@ -85,6 +85,9 @@ pub(super) fn resolve_invocation(
             dry_run: merged.dry_run.unwrap_or(false),
             outdated_exit_code: merged.exit_code,
             show_all: merged.all.unwrap_or(false),
+            // Pure presentation flags, read straight from the CLI (not config-file backed).
+            list_packages: global.list_packages,
+            paths: global.paths,
             json,
             progress: progress_mode(json, global.log_level),
             concurrency: merged.concurrency.unwrap_or(8),

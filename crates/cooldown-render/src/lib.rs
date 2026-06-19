@@ -84,6 +84,7 @@ mod tests {
                 registry: Some("proxy.golang.org".into()),
                 direct: true,
                 current: "v0.17.0".into(),
+                members: Vec::new(),
                 window: Window {
                     min_age_days: 7.0,
                     source: "default".into(),
@@ -141,6 +142,10 @@ mod tests {
     #[test]
     fn schema_is_valid_json() {
         let s = json_schema_string().expect("schema serializes");
-        let _: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            schema["$defs"]["outdatedItem"]["properties"]["members"]["items"]["$ref"],
+            "#/$defs/memberRef"
+        );
     }
 }

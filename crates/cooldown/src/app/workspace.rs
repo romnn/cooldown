@@ -135,6 +135,11 @@ pub struct RunOpts {
     pub outdated_exit_code: Option<u8>,
     /// `--all` (outdated): also list up-to-date deps in the report.
     pub show_all: bool,
+    /// `--list-packages`: list every source package on its own line instead of
+    /// `first (+N others)`.
+    pub list_packages: bool,
+    /// `--paths`: render the "Used by" column as workspace paths instead of package names.
+    pub paths: bool,
     /// `--json`: machine-readable output (never changes the exit code).
     pub json: bool,
     /// Where coarse progress notes go while the command runs.

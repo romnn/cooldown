@@ -5,6 +5,15 @@ use crate::cli::present;
 use cooldown_core::CoreError;
 use cooldown_render as render;
 
+/// The shared presentation flags for the dependency-table renderers.
+fn render_options(ctx: &CommandContext<'_>) -> render::tty::RenderOptions {
+    render::tty::RenderOptions {
+        use_color: ctx.color,
+        list_packages: ctx.opts.list_packages,
+        paths: ctx.opts.paths,
+    }
+}
+
 pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.outdated(ctx.opts).await;
     // `--exit-code N` turns the informational report into a CI gate: a non-zero exit when there is
@@ -46,7 +55,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
             &table_items,
             &out.warnings,
             &out.errors,
-            ctx.color,
+            &render_options(ctx),
         )
     })?;
     Ok(exit)
@@ -76,7 +85,7 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
             &items,
             &out.warnings,
             &out.errors,
-            ctx.color,
+            &render_options(ctx),
         )
     })?;
     Ok(out.exit)
@@ -118,7 +127,7 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
             &items,
             &out.warnings,
             &out.errors,
-            ctx.color,
+            &render_options(ctx),
         )
     })?;
     Ok(out.exit)

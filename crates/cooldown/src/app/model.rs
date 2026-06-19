@@ -3,7 +3,7 @@
     reason = "application DTOs intentionally mirror cooldown-render; duplicating every field doc here would create a second divergent contract description"
 )]
 
-use cooldown_core::{Diagnostic, SkipReason, Status, UpdateKind};
+use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status, UpdateKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
@@ -71,6 +71,9 @@ pub struct OutdatedItem {
     pub registry: Option<String>,
     pub direct: bool,
     pub current: String,
+    /// The workspace member package(s) declaring this dependency (e.g. cargo member crates, pnpm
+    /// workspace packages); empty when the source cannot be attributed.
+    pub members: Vec<MemberRef>,
     pub window: Window,
     pub status: OutdatedStatus,
     pub adoptable_target: Option<String>,
@@ -138,6 +141,7 @@ pub struct CheckItem {
     pub name: String,
     pub tool: String,
     pub project: String,
+    pub members: Vec<MemberRef>,
     pub registry: Option<String>,
     pub direct: bool,
     pub current: String,
@@ -173,6 +177,7 @@ pub struct UpgradeItem {
     pub name: String,
     pub tool: String,
     pub project: String,
+    pub members: Vec<MemberRef>,
     pub registry: Option<String>,
     pub from: String,
     pub to: String,

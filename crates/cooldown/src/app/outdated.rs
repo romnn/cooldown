@@ -254,6 +254,7 @@ impl<'a> OutdatedRunner<'a> {
             registry: dep.package.registry.clone(),
             direct: dep.direct,
             current: dep.current.to_string(),
+            members: dep.members.clone(),
             window,
             status: verdict.status.into(),
             adoptable_target: verdict.adoptable_target.map(|v| v.to_string()),
@@ -294,6 +295,7 @@ fn error_item(
         registry: dep.package.registry.clone(),
         direct: dep.direct,
         current: dep.current.to_string(),
+        members: dep.members.clone(),
         window: Window {
             min_age_days: 0.0,
             source: "n/a".into(),

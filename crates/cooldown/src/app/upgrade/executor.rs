@@ -151,6 +151,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 from: dep.current.clone(),
                 to: target,
                 kind,
+                members: dep.members.clone(),
             });
         }
         planned
@@ -420,6 +421,7 @@ fn plan_item(
         name: change.package.name.clone(),
         tool: tool.to_string(),
         project: project.to_string(),
+        members: change.members.clone(),
         registry: change.package.registry.clone(),
         from: change.from.to_string(),
         to: change.to.to_string(),

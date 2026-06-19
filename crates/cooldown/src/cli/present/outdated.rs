@@ -27,6 +27,7 @@ fn outdated_item(item: &app::OutdatedItem) -> render::OutdatedItem {
         registry: item.registry.clone(),
         direct: item.direct,
         current: item.current.clone(),
+        members: item.members.clone(),
         window: window(&item.window),
         status: outdated_status(item.status),
         adoptable_target: item.adoptable_target.clone(),

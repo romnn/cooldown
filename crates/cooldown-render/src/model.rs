@@ -5,7 +5,7 @@
 //! removal/retype/semantic change does. Consumers ignore unknown fields. The `status` and
 //! `minAgeSource` enums are part of the contract.
 
-use cooldown_core::{Diagnostic, SkipReason, Status, UpdateKind};
+use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status, UpdateKind};
 use serde::Serialize;
 
 /// The JSON schema version. Bumped only on a removal/retype/semantic change.
@@ -155,6 +155,10 @@ pub struct OutdatedItem {
     pub direct: bool,
     /// The currently-locked version.
     pub current: String,
+    /// The workspace member package(s) that declare this dependency at this version (e.g. cargo
+    /// member crates, pnpm/npm workspace packages). Empty when the source cannot be attributed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<MemberRef>,
     /// The resolved cooldown [`Window`] applied to this dependency.
     pub window: Window,
     /// The verdict for this dependency.
@@ -225,6 +229,9 @@ pub struct CheckItem {
     pub tool: String,
     /// The project (manifest/workspace member) the dependency was found in.
     pub project: String,
+    /// The workspace member package(s) that declare this dependency. Empty when not attributable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<MemberRef>,
     /// The registry the version data came from, omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
@@ -305,6 +312,9 @@ pub struct UpgradeItem {
     pub tool: String,
     /// The project (manifest/workspace member) the dependency was found in.
     pub project: String,
+    /// The workspace member package(s) that declare this dependency. Empty when not attributable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<MemberRef>,
     /// The registry the version data came from, omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
