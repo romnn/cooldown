@@ -1,0 +1,21 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    json (2.6.0)
+    minitest (5.15.0)
+    nokogiri (1.13.0)
+    rack (2.2.0)
+    rake (13.0.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  json (~> 2.6)
+  minitest (~> 5.15)
+  nokogiri (~> 1.13)
+  rack (~> 2.2)
+  rake (~> 13.0)
+
+BUNDLED WITH
+   2.4.0
