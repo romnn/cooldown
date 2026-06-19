@@ -414,6 +414,11 @@ pub enum SyncReport {
         /// Path of the native config file that was written.
         path: camino::Utf8PathBuf,
     },
+    /// The native config at `path` already matched the policy; nothing was rewritten.
+    Unchanged {
+        /// Path of the native config file that was already in sync.
+        path: camino::Utf8PathBuf,
+    },
     /// Writing was deferred to an external `tool` rather than performed in-process.
     Deferred {
         /// Name of the external tool the write was deferred to.

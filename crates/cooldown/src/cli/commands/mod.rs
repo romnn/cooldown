@@ -22,12 +22,13 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
         Command::Upgrade => report::run_upgrade(&ctx).await,
         Command::Explain { package } => report::run_explain(&ctx, &package).await,
         Command::Config => report::run_config(&ctx),
+        Command::Sync => report::run_sync(&ctx).await,
         Command::Baseline { prune } => baseline::run_baseline(&ctx, prune).await,
         #[allow(
             clippy::unreachable,
-            reason = "schema/init/sync are dispatched before any workspace exists"
+            reason = "schema/init are dispatched before any workspace exists"
         )]
-        Command::Schema | Command::Init | Command::Sync => unreachable!("handled earlier"),
+        Command::Schema | Command::Init => unreachable!("handled earlier"),
     }
 }
 

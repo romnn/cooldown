@@ -5,10 +5,11 @@ use camino::Utf8PathBuf;
 use cooldown_core::CoreError;
 use cooldown_render as render;
 
-/// Handle the commands that need neither a workspace nor the network (`schema`, `init`, `sync`).
+/// Handle the commands that need neither a workspace nor the network (`schema`, `init`).
 ///
 /// Returns `Some` with the command's result when `command` is one of those; `None` otherwise, so
-/// the caller proceeds to build a workspace.
+/// the caller proceeds to build a workspace. `sync` is NOT here — it needs the detected projects to
+/// write each one's native config, so it runs as a normal workspace command.
 pub(in crate::cli) fn run_workspace_free(
     command: &Command,
     global: &GlobalArgs,
@@ -23,10 +24,6 @@ pub(in crate::cli) fn run_workspace_free(
                 }),
         ),
         Command::Init => Some(cmd_init(global)),
-        Command::Sync => {
-            eprintln!("`cooldown sync` is not implemented in this build (a later phase).");
-            Some(Ok(Exit::Usage))
-        }
         _ => None,
     }
 }

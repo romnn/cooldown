@@ -28,6 +28,53 @@ where
         .map_err(|e| CoreError::Config(format!("{path}: invalid {doc_name}: {e}")))
 }
 
+/// Set a nested string value in a TOML file, format-preserving.
+///
+/// Navigates (creating intermediate tables as needed) to `keys` and sets the leaf to `val`, leaving
+/// the rest of the document — comments, key order, spacing — untouched. The file is rewritten only
+/// when the value actually changes: returns `Ok(true)` if it was written, `Ok(false)` if the leaf
+/// already equalled `val` (so `sync` is idempotent and does not churn unchanged manifests).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
+/// read or written, or [`CoreError::Config`](cooldown_core::CoreError::Config) if it is not valid
+/// TOML, the key path is empty, or an intermediate key exists but is not a table.
+pub fn set_toml_string(path: &Utf8Path, keys: &[&str], val: &str) -> Result<bool, CoreError> {
+    let (last, parents) = keys
+        .split_last()
+        .ok_or_else(|| CoreError::Config("empty TOML key path".to_string()))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| CoreError::Config(format!("{path}: invalid TOML: {e}")))?;
+
+    let mut table = doc.as_table_mut();
+    for key in parents {
+        table = table
+            .entry(key)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| CoreError::Config(format!("{path}: [{key}] is not a table")))?;
+    }
+
+    if table.get(last).and_then(toml_edit::Item::as_str) == Some(val) {
+        return Ok(false);
+    }
+    // Replacing the value via the existing key keeps the key's prefix decor (a leading `#` comment),
+    // so a documented `exclude-newer` line keeps its comment; a missing key is inserted fresh.
+    match table.get_mut(last) {
+        Some(item) => *item = toml_edit::value(val),
+        None => {
+            table.insert(last, toml_edit::value(val));
+        }
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +111,54 @@ mod tests {
 
         let parsed = read_toml_file::<Doc>(&path, "doc.toml").expect("parse");
         assert_eq!(parsed.expect("document"), Doc { value: "ok".into() });
+    }
+
+    #[test]
+    fn set_toml_string_updates_value_keeps_comment_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            "[project]\nname = \"demo\"\n\n[tool.uv]\n# managed: edit the policy source instead\nexclude-newer = \"7 days\"\n",
+        )
+        .expect("write");
+
+        let changed =
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set");
+        assert!(changed);
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(after.contains("exclude-newer = \"14 days\""));
+        assert!(
+            after.contains("# managed: edit the policy source instead"),
+            "the key's leading comment must be preserved"
+        );
+        assert!(after.contains("name = \"demo\""), "other tables untouched");
+
+        // Idempotent: setting the same value again reports no change and rewrites nothing.
+        let again =
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set again");
+        assert!(!again);
+    }
+
+    #[test]
+    fn set_toml_string_creates_missing_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&path, "[project]\nname = \"demo\"\n").expect("write");
+
+        let changed =
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set");
+        assert!(changed);
+        let parsed = read_toml_file::<toml::Value>(&path, "pyproject.toml")
+            .expect("read")
+            .expect("doc");
+        assert_eq!(
+            parsed
+                .get("tool")
+                .and_then(|t| t.get("uv"))
+                .and_then(|u| u.get("exclude-newer"))
+                .and_then(toml::Value::as_str),
+            Some("14 days")
+        );
     }
 }

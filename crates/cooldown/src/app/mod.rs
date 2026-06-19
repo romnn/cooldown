@@ -13,10 +13,12 @@ mod lock;
 mod model;
 mod outdated;
 mod read;
+mod sync;
 mod upgrade;
 mod workspace;
 
 pub use baseline::Baseline;
+pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use model::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,

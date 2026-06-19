@@ -16,8 +16,8 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, Result, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version,
+    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
+    Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -253,6 +253,10 @@ impl ToolWrite for UvTool {
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         self.uv.sync(&project.root).await
+    }
+
+    async fn write_native(&self, project: &Project, policy: &ResolvedPolicy) -> Result<SyncReport> {
+        crate::native::write_native(&project.manifest, policy)
     }
 }
 

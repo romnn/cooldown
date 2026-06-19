@@ -145,6 +145,28 @@ pub(super) async fn run_explain(
     Ok(out.exit)
 }
 
+pub(super) async fn run_sync(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
+    let out = ctx.ws.sync(ctx.opts).await;
+    let summary = present::sync_summary(&out.summary);
+    let items = present::sync_items(&out.items);
+    let env = with_diags(
+        render::Envelope::new(
+            "sync",
+            out.exit.is_ok(),
+            ctx.generated_at.to_owned(),
+            present::SyncMeta {},
+            summary.clone(),
+            items.clone(),
+        ),
+        Vec::new(),
+        out.errors.clone(),
+    );
+    emit_envelope(ctx.opts.json, &env, || {
+        present::render_sync_text(&out.summary, &out.items)
+    })?;
+    Ok(out.exit)
+}
+
 pub(super) fn run_config(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.config(ctx.opts);
     let summary = present::config_summary(&out.summary);
