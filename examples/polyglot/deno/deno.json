@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "lodash": "npm:lodash@4.17.15",
+    "chalk": "npm:chalk@4.0.0",
+    "@std/path": "jsr:@std/path@1.0.0",
+    "@std/semver": "jsr:@std/semver@1.0.0"
+  }
+}
