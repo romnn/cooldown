@@ -84,18 +84,28 @@ const SECS_PER_DAY: i64 = 86_400;
 /// and per-package rules are not expressed. A `Latest`/zero window means "no cooldown", which leaves
 /// the manifest untouched (reported as [`SyncReport::Unchanged`]).
 ///
+/// Under `dry_run` the manifest is never written; the report still reflects what would change.
+///
 /// # Errors
 ///
 /// Returns a [`CoreError`] if the manifest cannot be parsed or written.
-pub(crate) fn write_native(manifest: &Utf8Path, policy: &ResolvedPolicy) -> Result<SyncReport> {
+pub(crate) fn write_native(
+    manifest: &Utf8Path,
+    policy: &ResolvedPolicy,
+    dry_run: bool,
+) -> Result<SyncReport> {
     let Some(value) = policy.default_window.as_ref().and_then(format_exclude_newer) else {
         // No default window, or an opt-out — nothing to bake into the native config.
         return Ok(SyncReport::Unchanged {
             path: manifest.to_owned(),
         });
     };
-    let changed =
-        cooldown_toml_util::set_toml_string(manifest, &["tool", "uv", "exclude-newer"], &value)?;
+    let changed = cooldown_toml_util::set_toml_string(
+        manifest,
+        &["tool", "uv", "exclude-newer"],
+        &value,
+        dry_run,
+    )?;
     let path = manifest.to_owned();
     Ok(if changed {
         SyncReport::Written { path }

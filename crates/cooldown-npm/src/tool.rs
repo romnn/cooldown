@@ -216,7 +216,12 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             .await
     }
 
-    async fn write_native(&self, project: &Project, policy: &ResolvedPolicy) -> Result<SyncReport> {
+    async fn write_native(
+        &self,
+        project: &Project,
+        policy: &ResolvedPolicy,
+        dry_run: bool,
+    ) -> Result<SyncReport> {
         let Some(file) = L::NATIVE_MIN_AGE_FILE else {
             return Ok(SyncReport::Unsupported); // npm/yarn/bun have no native cooldown knob
         };
@@ -226,7 +231,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             // expressed, so leave the file untouched.
             return Ok(SyncReport::Unchanged { path });
         };
-        let changed = set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string())?;
+        let changed = set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
         Ok(if changed {
             SyncReport::Written { path }
         } else {
@@ -250,7 +255,10 @@ fn window_minutes(spec: &WindowSpec) -> Option<i64> {
 /// Set a top-level scalar `key: value` in a YAML file, preserving comments and order, writing only
 /// when it changes (idempotent). pnpm settings are top-level scalars, so a line-level edit suffices
 /// and avoids a full YAML round-trip that would drop comments; a missing file is created.
-fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str) -> Result<bool> {
+///
+/// Under `dry_run` the file is never written (nor created); the return value still reports whether
+/// it would have changed.
+fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str, dry_run: bool) -> Result<bool> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -277,14 +285,16 @@ fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str) -> Result<bool> {
         }
     }
     if !found {
-        // Prepend the setting as a new top-level key, keeping the existing document below it.
-        let mut out = target;
-        out.push('\n');
-        out.push_str(&content);
-        std::fs::write(path, out).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+        if !dry_run {
+            // Prepend the setting as a new top-level key, keeping the existing document below it.
+            let mut out = target;
+            out.push('\n');
+            out.push_str(&content);
+            std::fs::write(path, out).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+        }
         return Ok(true);
     }
-    if changed {
+    if changed && !dry_run {
         let mut out = lines.join("\n");
         if content.ends_with('\n') {
             out.push('\n');
@@ -308,20 +318,39 @@ mod tests {
         std::fs::write(&path, "packages:\n  - \"a\"\n# keep me\n").expect("write");
 
         // Absent key → prepended, comments and existing content preserved.
-        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160").expect("set"));
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", false).expect("set"));
         let after = std::fs::read_to_string(&path).expect("read");
         assert!(after.contains("minimumReleaseAge: 20160"));
         assert!(after.contains("# keep me"), "comments preserved");
         assert!(after.contains("packages:"), "existing content preserved");
 
         // Idempotent.
-        assert!(!set_yaml_scalar(&path, "minimumReleaseAge", "20160").expect("again"));
+        assert!(!set_yaml_scalar(&path, "minimumReleaseAge", "20160", false).expect("again"));
 
         // Update in place.
-        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "30").expect("update"));
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "30", false).expect("update"));
         let updated = std::fs::read_to_string(&path).expect("read");
         assert!(updated.contains("minimumReleaseAge: 30"));
         assert!(!updated.contains("20160"));
+    }
+
+    #[test]
+    fn set_yaml_scalar_dry_run_reports_change_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml")).expect("utf8 path");
+        let before = "packages:\n  - \"a\"\n";
+        std::fs::write(&path, before).expect("write");
+
+        // Dry run on an absent key reports it would change but writes nothing.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", true).expect("dry add"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+
+        // Dry run on a missing file reports a change but does not create the file.
+        let missing =
+            Utf8PathBuf::from_path_buf(dir.path().join("absent.yaml")).expect("utf8 path");
+        assert!(set_yaml_scalar(&missing, "minimumReleaseAge", "20160", true).expect("dry new"));
+        assert!(!missing.exists(), "dry run must not create the file");
     }
 
     fn tool() -> NpmTool<Npm> {

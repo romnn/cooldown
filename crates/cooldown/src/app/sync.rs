@@ -119,7 +119,7 @@ impl Workspace {
                 default_window: Some(window.clone()),
             };
 
-            let item = match writer.write_native(&pctx.project, &policy).await {
+            let item = match writer.write_native(&pctx.project, &policy, opts.dry_run).await {
                 Ok(report) => {
                     let (status, path) = classify(&report);
                     match status {

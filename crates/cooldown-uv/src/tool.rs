@@ -255,8 +255,13 @@ impl ToolWrite for UvTool {
         self.uv.sync(&project.root).await
     }
 
-    async fn write_native(&self, project: &Project, policy: &ResolvedPolicy) -> Result<SyncReport> {
-        crate::native::write_native(&project.manifest, policy)
+    async fn write_native(
+        &self,
+        project: &Project,
+        policy: &ResolvedPolicy,
+        dry_run: bool,
+    ) -> Result<SyncReport> {
+        crate::native::write_native(&project.manifest, policy, dry_run)
     }
 }
 

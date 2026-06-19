@@ -199,6 +199,9 @@ pub trait ToolWrite: Send + Sync {
     /// The default implementation returns [`SyncReport::Unsupported`]; adapters that can sync
     /// override it to write the [`ResolvedPolicy`] into their native cooldown config.
     ///
+    /// When `dry_run` is set the adapter must compute and report what it *would* do
+    /// ([`SyncReport::Written`] vs [`SyncReport::Unchanged`]) without touching any file.
+    ///
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the native config cannot be written.
@@ -206,6 +209,7 @@ pub trait ToolWrite: Send + Sync {
         &self,
         _project: &Project,
         _policy: &ResolvedPolicy,
+        _dry_run: bool,
     ) -> Result<SyncReport> {
         Ok(SyncReport::Unsupported)
     }

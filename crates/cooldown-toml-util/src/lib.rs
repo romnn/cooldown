@@ -32,15 +32,24 @@ where
 ///
 /// Navigates (creating intermediate tables as needed) to `keys` and sets the leaf to `val`, leaving
 /// the rest of the document — comments, key order, spacing — untouched. The file is rewritten only
-/// when the value actually changes: returns `Ok(true)` if it was written, `Ok(false)` if the leaf
-/// already equalled `val` (so `sync` is idempotent and does not churn unchanged manifests).
+/// when the value actually changes: returns `Ok(true)` if it was (or, under `dry_run`, would be)
+/// written, `Ok(false)` if the leaf already equalled `val` (so `sync` is idempotent and does not
+/// churn unchanged manifests).
+///
+/// When `dry_run` is set the file is never written; the return value still reports whether it would
+/// have changed.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
 /// read or written, or [`CoreError::Config`](cooldown_core::CoreError::Config) if it is not valid
 /// TOML, the key path is empty, or an intermediate key exists but is not a table.
-pub fn set_toml_string(path: &Utf8Path, keys: &[&str], val: &str) -> Result<bool, CoreError> {
+pub fn set_toml_string(
+    path: &Utf8Path,
+    keys: &[&str],
+    val: &str,
+    dry_run: bool,
+) -> Result<bool, CoreError> {
     let (last, parents) = keys
         .split_last()
         .ok_or_else(|| CoreError::Config("empty TOML key path".to_string()))?;
@@ -61,6 +70,9 @@ pub fn set_toml_string(path: &Utf8Path, keys: &[&str], val: &str) -> Result<bool
 
     if table.get(last).and_then(toml_edit::Item::as_str) == Some(val) {
         return Ok(false);
+    }
+    if dry_run {
+        return Ok(true);
     }
     // Replacing the value via the existing key keeps the key's prefix decor (a leading `#` comment),
     // so a documented `exclude-newer` line keeps its comment; a missing key is inserted fresh.
@@ -124,7 +136,7 @@ mod tests {
         .expect("write");
 
         let changed =
-            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set");
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false).expect("set");
         assert!(changed);
         let after = std::fs::read_to_string(&path).expect("read");
         assert!(after.contains("exclude-newer = \"14 days\""));
@@ -135,9 +147,28 @@ mod tests {
         assert!(after.contains("name = \"demo\""), "other tables untouched");
 
         // Idempotent: setting the same value again reports no change and rewrites nothing.
-        let again =
-            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set again");
+        let again = set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false)
+            .expect("set again");
         assert!(!again);
+    }
+
+    #[test]
+    fn set_toml_string_dry_run_reports_change_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        let before = "[tool.uv]\nexclude-newer = \"7 days\"\n";
+        std::fs::write(&path, before).expect("write");
+
+        // Dry run reports it *would* change but leaves the file byte-for-byte identical.
+        let would_change =
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", true).expect("dry");
+        assert!(would_change);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+
+        // A dry run on an already-matching value reports no change either.
+        let no_change =
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "7 days", true).expect("dry");
+        assert!(!no_change);
     }
 
     #[test]
@@ -147,7 +178,7 @@ mod tests {
         std::fs::write(&path, "[project]\nname = \"demo\"\n").expect("write");
 
         let changed =
-            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days").expect("set");
+            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false).expect("set");
         assert!(changed);
         let parsed = read_toml_file::<toml::Value>(&path, "pyproject.toml")
             .expect("read")
