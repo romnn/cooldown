@@ -94,7 +94,11 @@ pub(crate) fn write_native(
     policy: &ResolvedPolicy,
     dry_run: bool,
 ) -> Result<SyncReport> {
-    let Some(value) = policy.default_window.as_ref().and_then(format_exclude_newer) else {
+    let Some(value) = policy
+        .default_window
+        .as_ref()
+        .and_then(format_exclude_newer)
+    else {
         // No default window, or an opt-out — nothing to bake into the native config.
         return Ok(SyncReport::Unchanged {
             path: manifest.to_owned(),

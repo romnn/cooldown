@@ -18,12 +18,12 @@ mod upgrade;
 mod workspace;
 
 pub use baseline::Baseline;
-pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use model::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
     OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
+pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{AdapterSet, Exit, Progress, ProjectCtx, RunOpts, Workspace};
 
 pub(crate) use workspace::{age_days, diag_from_error, render_window, round2};

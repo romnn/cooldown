@@ -128,15 +128,16 @@ mod tests {
     #[test]
     fn set_toml_string_updates_value_keeps_comment_and_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
         std::fs::write(
             &path,
             "[project]\nname = \"demo\"\n\n[tool.uv]\n# managed: edit the policy source instead\nexclude-newer = \"7 days\"\n",
         )
         .expect("write");
 
-        let changed =
-            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false).expect("set");
+        let changed = set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false)
+            .expect("set");
         assert!(changed);
         let after = std::fs::read_to_string(&path).expect("read");
         assert!(after.contains("exclude-newer = \"14 days\""));
@@ -155,7 +156,8 @@ mod tests {
     #[test]
     fn set_toml_string_dry_run_reports_change_without_writing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
         let before = "[tool.uv]\nexclude-newer = \"7 days\"\n";
         std::fs::write(&path, before).expect("write");
 
@@ -174,11 +176,12 @@ mod tests {
     #[test]
     fn set_toml_string_creates_missing_tables() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
         std::fs::write(&path, "[project]\nname = \"demo\"\n").expect("write");
 
-        let changed =
-            set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false).expect("set");
+        let changed = set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false)
+            .expect("set");
         assert!(changed);
         let parsed = read_toml_file::<toml::Value>(&path, "pyproject.toml")
             .expect("read")
