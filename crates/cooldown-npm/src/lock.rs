@@ -18,6 +18,10 @@ pub trait NodeLock: Send + Sync + 'static {
     const LOCKFILE: &'static str;
     /// The driver binary, shelled out to for apply/build (e.g. `npm`).
     const BIN: &'static str;
+    /// The native cooldown config `sync` writes for this manager: pnpm bakes a `minimumReleaseAge`
+    /// (minutes) into `pnpm-workspace.yaml`. `None` for managers with no native cooldown knob, whose
+    /// `sync` is then `unsupported`.
+    const NATIVE_MIN_AGE_FILE: Option<&'static str> = None;
 
     /// Parses the lockfile body into the flat list of resolved `(name, version)` pairs.
     ///
@@ -80,6 +84,7 @@ impl NodeLock for Pnpm {
     const ID: ToolId = ToolId("pnpm");
     const LOCKFILE: &'static str = "pnpm-lock.yaml";
     const BIN: &'static str = "pnpm";
+    const NATIVE_MIN_AGE_FILE: Option<&'static str> = Some("pnpm-workspace.yaml");
 
     fn parse(content: &str) -> Result<Vec<(String, String)>> {
         Ok(parse_pnpm(content))

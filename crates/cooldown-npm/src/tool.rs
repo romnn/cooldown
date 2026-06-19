@@ -15,10 +15,10 @@ use cooldown_adapter_util::{
     build_registry_releases, skipped_on_apply_error, verify_current_report,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
+    ApplyReport, CandidateScope, Capabilities, CoreError, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, Result, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version,
+    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
+    Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashSet;
@@ -215,6 +215,83 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             .verify(&project.root, &L::build_args(), "install succeeded")
             .await
     }
+
+    async fn write_native(&self, project: &Project, policy: &ResolvedPolicy) -> Result<SyncReport> {
+        let Some(file) = L::NATIVE_MIN_AGE_FILE else {
+            return Ok(SyncReport::Unsupported); // npm/yarn/bun have no native cooldown knob
+        };
+        let path = project.root.join(file);
+        let Some(minutes) = policy.default_window.as_ref().and_then(window_minutes) else {
+            // pnpm's minimumReleaseAge is a rolling minute count; a freeze date or opt-out can't be
+            // expressed, so leave the file untouched.
+            return Ok(SyncReport::Unchanged { path });
+        };
+        let changed = set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string())?;
+        Ok(if changed {
+            SyncReport::Written { path }
+        } else {
+            SyncReport::Unchanged { path }
+        })
+    }
+}
+
+/// The window as whole minutes for pnpm's `minimumReleaseAge`, or `None` for a window that can't be
+/// a rolling minute count (an absolute freeze, an opt-out, or zero).
+fn window_minutes(spec: &WindowSpec) -> Option<i64> {
+    match spec {
+        WindowSpec::MinAge(duration) => {
+            let minutes = duration.as_secs() / 60;
+            (minutes > 0).then_some(minutes)
+        }
+        WindowSpec::Freeze(_) | WindowSpec::Latest => None,
+    }
+}
+
+/// Set a top-level scalar `key: value` in a YAML file, preserving comments and order, writing only
+/// when it changes (idempotent). pnpm settings are top-level scalars, so a line-level edit suffices
+/// and avoids a full YAML round-trip that would drop comments; a missing file is created.
+fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str) -> Result<bool> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    };
+    let target = format!("{key}: {value}");
+    let prefix = format!("{key}:");
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    let mut changed = false;
+    for line in content.lines() {
+        // A top-level key has no leading indentation; the `:` in the prefix avoids matching a
+        // longer key with the same start (e.g. `minimumReleaseAgeExclude`).
+        if !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
+            found = true;
+            if line == target {
+                lines.push(line.to_string());
+            } else {
+                changed = true;
+                lines.push(target.clone());
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        // Prepend the setting as a new top-level key, keeping the existing document below it.
+        let mut out = target;
+        out.push('\n');
+        out.push_str(&content);
+        std::fs::write(path, out).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+        return Ok(true);
+    }
+    if changed {
+        let mut out = lines.join("\n");
+        if content.ends_with('\n') {
+            out.push('\n');
+        }
+        std::fs::write(path, out).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -222,6 +299,30 @@ mod tests {
     use super::*;
     use crate::lock::Npm;
     use camino::Utf8PathBuf;
+
+    #[test]
+    fn set_yaml_scalar_adds_updates_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml")).expect("utf8 path");
+        std::fs::write(&path, "packages:\n  - \"a\"\n# keep me\n").expect("write");
+
+        // Absent key → prepended, comments and existing content preserved.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160").expect("set"));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(after.contains("minimumReleaseAge: 20160"));
+        assert!(after.contains("# keep me"), "comments preserved");
+        assert!(after.contains("packages:"), "existing content preserved");
+
+        // Idempotent.
+        assert!(!set_yaml_scalar(&path, "minimumReleaseAge", "20160").expect("again"));
+
+        // Update in place.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "30").expect("update"));
+        let updated = std::fs::read_to_string(&path).expect("read");
+        assert!(updated.contains("minimumReleaseAge: 30"));
+        assert!(!updated.contains("20160"));
+    }
 
     fn tool() -> NpmTool<Npm> {
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
