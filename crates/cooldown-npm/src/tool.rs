@@ -117,7 +117,13 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let resolved = L::parse(&content)?;
-        let direct = manifest::direct_names(&project.manifest)?;
+        // Prefer the lock's workspace-wide direct set (every importer/member), so a pnpm/npm
+        // workspace reports the dependencies declared by its members, not only the root manifest.
+        // Lock formats without per-importer data fall back to the root `package.json`.
+        let direct = match L::workspace_direct_names(&content) {
+            Some(names) => names,
+            None => manifest::direct_names(&project.manifest)?,
+        };
 
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
@@ -375,7 +381,7 @@ mod tests {
             r#"{
                 "lockfileVersion": 3,
                 "packages": {
-                    "": { "version": "0.1.0" },
+                    "": { "version": "0.1.0", "dependencies": { "lodash": "4.17.15" } },
                     "node_modules/lodash": { "version": "4.17.15" },
                     "node_modules/ms": { "version": "2.1.3" }
                 }

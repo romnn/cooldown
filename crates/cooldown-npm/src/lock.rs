@@ -8,6 +8,7 @@
 //! direct/transitive split.
 
 use cooldown_core::{CoreError, Result, ToolId};
+use std::collections::HashSet;
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to ask it to re-pin a dependency.
@@ -29,6 +30,18 @@ pub trait NodeLock: Send + Sync + 'static {
     ///
     /// Returns a [`CoreError`] if the lockfile cannot be parsed.
     fn parse(content: &str) -> Result<Vec<(String, String)>>;
+
+    /// The direct-dependency names declared across the whole workspace, recovered from the lock's
+    /// importer/workspace section (every member, not just the root project).
+    ///
+    /// Returns `None` for lock formats that don't record per-importer direct deps (yarn classic,
+    /// bun); the adapter then falls back to reading the root `package.json` alone. A single-package
+    /// repo is just a one-member workspace, so the lock-based answer also covers the non-workspace
+    /// case.
+    #[must_use]
+    fn workspace_direct_names(_content: &str) -> Option<HashSet<String>> {
+        None
+    }
 
     /// The driver args that re-pin `name` to `version`, re-resolving the lock.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
@@ -63,6 +76,10 @@ impl NodeLock for Npm {
         parse_npm(content)
     }
 
+    fn workspace_direct_names(content: &str) -> Option<HashSet<String>> {
+        parse_npm_direct(content)
+    }
+
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
         // `--package-lock-only` re-resolves the lock (and manifest pin) without touching
         // node_modules, keeping apply fast and side-effect-light.
@@ -88,6 +105,10 @@ impl NodeLock for Pnpm {
 
     fn parse(content: &str) -> Result<Vec<(String, String)>> {
         Ok(parse_pnpm(content))
+    }
+
+    fn workspace_direct_names(content: &str) -> Option<HashSet<String>> {
+        Some(parse_pnpm_importers(content))
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -196,6 +217,78 @@ fn parse_pnpm(content: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The dependency-group keys a manifest/importer uses to declare a direct dependency.
+const DIRECT_GROUPS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+/// Collects the direct-dependency names every workspace importer declares in `pnpm-lock.yaml` (v9).
+///
+/// The `importers:` section maps each workspace package — the root `.` and every member path — to
+/// its dependency groups, each a map of `name: {specifier, version}`. The union of those names is
+/// the workspace-wide direct set; the resolved versions still come from `packages:`. Internal
+/// `workspace:*` deps resolve to `link:`/`file:` and never appear among the registry packages, so
+/// their names drop out when the adapter intersects this set with the resolved graph.
+///
+/// Parsed line-by-line (like [`parse_pnpm`]) by indentation, avoiding a YAML dependency: importer
+/// paths sit at 2 spaces, group keys at 4, dependency names at 6, and their fields at 8.
+fn parse_pnpm_importers(content: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut in_importers = false;
+    let mut in_group = false;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => {
+                in_importers = trimmed == "importers:";
+                in_group = false;
+            }
+            2 if in_importers => in_group = false, // a new importer (member path)
+            4 if in_importers => in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':')),
+            6 if in_importers && in_group => {
+                let name = trimmed
+                    .trim_end_matches(':')
+                    .trim_matches('\'')
+                    .trim_matches('"');
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Collects direct-dependency names from `package-lock.json` (v2/v3). The flat `packages` map keys
+/// the root project by `""` and each workspace member by its path; installed dependencies live under
+/// `node_modules/`. Every non-`node_modules` entry declares its direct deps in the dependency-group
+/// fields, so their union is the workspace-wide direct set. Returns `None` for a v1 lock (no
+/// `packages` map) so the caller falls back to the root manifest.
+fn parse_npm_direct(content: &str) -> Option<HashSet<String>> {
+    let doc: serde_json::Value = serde_json::from_str(content).ok()?;
+    let packages = doc.get("packages")?.as_object()?;
+    let mut names = HashSet::new();
+    for (key, entry) in packages {
+        if key.contains("node_modules/") {
+            continue; // an installed (transitive or hoisted) package, not a workspace member
+        }
+        for field in DIRECT_GROUPS {
+            if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
+                names.extend(obj.keys().cloned());
+            }
+        }
+    }
+    Some(names)
 }
 
 /// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
@@ -402,5 +495,116 @@ mod tests {
             strip_trailing_commas(input),
             r#"{ "a": "x,y", "b": [1, 2] }"#
         );
+    }
+
+    fn sorted_names(set: HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn pnpm_importers_collect_every_member_direct_dep() {
+        // A workspace: root `.` plus two members, mixing dependency groups, a `workspace:*` internal
+        // link, and a `dependenciesMeta` table (not a dependency group — must be ignored).
+        let lock = "\
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    devDependencies:
+      prettier:
+        specifier: 3.8.0
+        version: 3.8.0
+      turbo:
+        specifier: 2.9.16
+        version: 2.9.16
+
+  apps/admin:
+    dependencies:
+      '@airtype/api':
+        specifier: workspace:*
+        version: link:../../packages/ts/airtype/api
+      solid-js:
+        specifier: 1.9.5
+        version: 1.9.5
+    devDependencies:
+      vite:
+        specifier: 6.0.0
+        version: 6.0.0
+    dependenciesMeta:
+      '@airtype/api':
+        injected: true
+
+  packages/ts/api:
+    optionalDependencies:
+      fsevents:
+        specifier: 2.3.3
+        version: 2.3.3
+
+packages:
+
+  prettier@3.8.0:
+    resolution: {integrity: sha512-x}
+";
+        // Every member's direct deps are collected (the internal `@airtype/api` link is included by
+        // name; it falls away later when intersected with the resolved registry packages). Group
+        // keys, the `specifier`/`version` fields, and `dependenciesMeta` never leak in as names.
+        assert_eq!(
+            sorted_names(parse_pnpm_importers(lock)),
+            vec![
+                "@airtype/api",
+                "fsevents",
+                "prettier",
+                "solid-js",
+                "turbo",
+                "vite",
+            ]
+        );
+    }
+
+    #[test]
+    fn pnpm_single_package_importer_is_a_one_member_workspace() {
+        let lock = "\
+importers:
+
+  .:
+    dependencies:
+      lodash:
+        specifier: 4.17.15
+        version: 4.17.15
+
+packages:
+
+  lodash@4.17.15:
+    resolution: {integrity: sha512-x}
+";
+        assert_eq!(sorted_names(parse_pnpm_importers(lock)), vec!["lodash"]);
+    }
+
+    #[test]
+    fn npm_direct_collects_root_and_member_deps() {
+        let lock = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root", "devDependencies": { "turbo": "^2" } },
+                "packages/api": { "name": "@x/api", "dependencies": { "zod": "^3" } },
+                "node_modules/zod": { "version": "3.22.0" },
+                "node_modules/turbo": { "version": "2.9.16" }
+            }
+        }"#;
+        assert_eq!(
+            sorted_names(parse_npm_direct(lock).expect("v3 lock has a packages map")),
+            vec!["turbo", "zod"]
+        );
+    }
+
+    #[test]
+    fn npm_direct_is_none_for_v1_lock() {
+        // A v1 lock has no `packages` map, so there is no workspace direct set to read; the adapter
+        // falls back to the root manifest.
+        let lock = r#"{ "lockfileVersion": 1, "dependencies": { "lodash": { "version": "4.17.15" } } }"#;
+        assert!(parse_npm_direct(lock).is_none());
     }
 }
