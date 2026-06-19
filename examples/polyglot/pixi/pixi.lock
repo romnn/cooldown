@@ -1,0 +1,18 @@
+version: 6
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.24.0-py311h64a7726_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.9.0-py311h_0.conda
+      - pypi: https://files.pythonhosted.org/x/rich-12.0.0-py3-none-any.whl
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.24.0-py311h64a7726_0.conda
+  sha256: aaa
+- conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.9.0-py311h_0.conda
+  sha256: bbb
+- pypi: https://files.pythonhosted.org/x/rich-12.0.0-py3-none-any.whl
+  name: rich
+  version: 12.0.0
