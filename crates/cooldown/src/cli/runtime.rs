@@ -89,6 +89,23 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
         ));
     }
 
+    // `--sync` (opt-in) writes the policy into native config first, so the command runs against an
+    // up-to-date lock and cooldown.toml stays the source of truth. Skipped under `--dry-run` (a dry
+    // run must not mutate). Only the dependency commands pre-sync; `sync`/`config`/etc. do not.
+    if global.sync && !opts.dry_run && pre_syncs(&cli.command) {
+        let synced = ws.sync(&opts).await;
+        if !synced.exit.is_ok() {
+            eprintln!("sync failed before {}", command_name(&cli.command));
+            return Ok(synced.exit);
+        }
+        if synced.summary.written > 0 {
+            opts.progress.say(&format!(
+                "synced policy into {} native config(s)",
+                synced.summary.written
+            ));
+        }
+    }
+
     let generated_at = generated_at(ws.now());
     commands::dispatch(
         cli.command,
@@ -101,6 +118,14 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
         },
     )
     .await
+}
+
+/// Whether `--sync` pre-syncs native config before this command (the dependency commands only).
+fn pre_syncs(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Outdated | Command::Upgrade | Command::Check
+    )
 }
 
 fn requires_tool_match(command: &Command) -> bool {

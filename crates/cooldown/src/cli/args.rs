@@ -236,6 +236,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// (upgrade) also compile/sync after re-locking.
     #[arg(long, global = true)]
     pub(in crate::cli) build: bool,
+    /// Sync the policy into native config (e.g. uv `exclude-newer`) before running this command, so
+    /// cooldown.toml stays the source of truth. No-op under `--dry-run`.
+    #[arg(long, global = true)]
+    pub(in crate::cli) sync: bool,
     /// Resolve and print the plan; never mutate.
     #[arg(long = "dry-run", short = 'n', global = true, env = "COOLDOWN_DRY_RUN")]
     pub(in crate::cli) dry_run: bool,
