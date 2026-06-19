@@ -6,7 +6,8 @@
 //! is never mature" is enforced here, once.
 
 use crate::model::{
-    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseQuality, Status, ToolId, Verdict,
+    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseQuality, Status, ToolId,
+    UpdateKind, Verdict,
 };
 use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
@@ -54,9 +55,15 @@ fn quality_eligible(r: &Release, current_quality: ReleaseQuality) -> bool {
 }
 
 /// Whether a candidate's major makes it eligible: cross-major jumps are admitted only under
-/// `--major` (`allow_major`); otherwise a candidate must share the current pin's [`MajorKey`].
+/// `--major` (`allow_major`); otherwise a candidate must stay within the current pin's major.
+///
+/// "Within the current major" requires both that the candidate shares the current pin's
+/// [`MajorKey`] *and* that it is not a semver-major jump ([`UpdateKind::Major`]). The `MajorKey`
+/// alone is insufficient for Go's `+incompatible` versions: they keep the base module path (so they
+/// share the empty `MajorKey`) yet bump the semver major (`v0.36.1` → `v11.0.0+incompatible`).
+/// `kind_from_current` is the semver-accurate guard, so `--no-major`/`--minor` never plans a major.
 fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> bool {
-    allow_major || r.major == *current_major
+    allow_major || (r.major == *current_major && r.kind_from_current != Some(UpdateKind::Major))
 }
 
 /// Evaluates a dependency against its classified releases, producing a per-candidate [`Verdict`].
@@ -318,5 +325,43 @@ pub fn check_pin(
         graph_held,
         graph_floor: dep.graph_floor.clone(),
         published_at: locked.published_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ReleaseOrder, Version};
+
+    fn release(version: &str, major: &str, kind: Option<UpdateKind>) -> Release {
+        Release {
+            version: Version::new(version),
+            order: ReleaseOrder(Vec::new()),
+            major: MajorKey(major.to_string()),
+            kind_from_current: kind,
+            published_at: None,
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
+    }
+
+    #[test]
+    fn no_major_rejects_semver_major_jump_sharing_the_base_path() {
+        // v0.36.1 → v11.0.0+incompatible shares the empty base-path MajorKey, but it is a semver
+        // major jump. `--no-major` must reject it; `--major` admits it. Guards against a `+incompatible`
+        // major slipping past the path-only `MajorKey` check.
+        let candidate = release("v11.0.0+incompatible", "", Some(UpdateKind::Major));
+        let base = MajorKey(String::new());
+        assert!(!major_eligible(&candidate, &base, false));
+        assert!(major_eligible(&candidate, &base, true));
+    }
+
+    #[test]
+    fn no_major_admits_same_major_minor_and_patch() {
+        let base = MajorKey(String::new());
+        let minor = release("v0.37.0", "", Some(UpdateKind::Minor));
+        let patch = release("v0.36.2", "", Some(UpdateKind::Patch));
+        assert!(major_eligible(&minor, &base, false));
+        assert!(major_eligible(&patch, &base, false));
     }
 }
