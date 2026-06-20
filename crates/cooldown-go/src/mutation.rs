@@ -78,7 +78,15 @@ fn capture_import_targets(
         if path.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if matches!(name.as_ref(), "vendor" | ".git" | "testdata") {
+            // Skip exactly what the `go` tool itself ignores: directories whose names begin with `.`
+            // or `_` (so `.git`, `_data` container volumes, `_cache`, … are never descended into),
+            // plus `vendor` and `testdata`. Beyond matching Go's own package discovery, this keeps
+            // the scan off non-source trees that may be large or unreadable (e.g. a Docker volume
+            // owned by another user), which would otherwise fail the whole upgrade.
+            if name.starts_with('.')
+                || name.starts_with('_')
+                || matches!(name.as_ref(), "vendor" | "testdata")
+            {
                 continue;
             }
             let child = utf8_path(path)?;
@@ -159,6 +167,28 @@ mod tests {
             )),
             None,
         );
+    }
+
+    #[test]
+    fn import_scan_skips_dot_underscore_vendor_and_testdata_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8 root");
+        let src = "package x\nimport \"example.com/foo/v2\"\n";
+        std::fs::write(root.join("main.go"), src).expect("write main.go");
+        // Each of these directories would match the import too, but `go` (and so cooldown) ignores
+        // them — `_data` stands in for an unreadable Docker volume that must not break the scan.
+        for skip in ["_data", ".git", "vendor", "testdata"] {
+            std::fs::create_dir_all(root.join(skip)).expect("mkdir");
+            std::fs::write(root.join(skip).join("x.go"), src).expect("write skipped .go");
+        }
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        capture_import_targets(root, root, "example.com/foo/v2", &mut seen, &mut out)
+            .expect("scan succeeds");
+
+        let captured: Vec<&str> = out.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(captured, vec!["main.go"], "only top-level source is captured");
     }
 
     #[test]
