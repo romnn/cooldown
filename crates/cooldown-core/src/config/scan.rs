@@ -76,6 +76,7 @@ pub(crate) fn scan_config_from_config(
     for (name, section) in [
         ("outdated", config.outdated),
         ("upgrade", config.upgrade),
+        ("fix", config.fix),
         ("check", config.check),
         ("baseline", config.baseline),
     ] {
@@ -197,6 +198,12 @@ concurrency = 4
 [upgrade]
 strict = false
 build = true
+
+[fix]
+strict = false
+transitive = true
+downgrade-pinned = true
+dry-run = true
 ",
         );
         let upgrade = cfg.resolved("upgrade");
@@ -209,6 +216,28 @@ build = true
             Some(true),
             "other commands see global"
         );
+        let fix = cfg.resolved("fix");
+        assert_eq!(fix.strict, Some(false), "fix overrides global");
+        assert_eq!(fix.transitive, Some(true));
+        assert_eq!(fix.downgrade_pinned, Some(true));
+        assert_eq!(fix.dry_run, Some(true));
+        assert_eq!(fix.offline, Some(true), "fix inherits global");
+    }
+
+    #[test]
+    fn fix_section_contributes_to_scan_excludes() {
+        let cfg = scan(
+            r#"
+[global]
+exclude = ["dist"]
+
+[fix]
+exclude = ["fixtures"]
+"#,
+        );
+
+        assert_eq!(cfg.exclude_for("fix", "cargo"), vec!["dist", "fixtures"]);
+        assert_eq!(cfg.exclude_for("upgrade", "cargo"), vec!["dist"]);
     }
 
     #[test]

@@ -242,7 +242,7 @@ pub(in crate::cli) struct GlobalArgs {
     /// Override a config-set `strict-native` (the only way to turn it off).
     #[arg(long = "no-fail-on-stricter-native", global = true)]
     pub(in crate::cli) no_fail_on_stricter_native: bool,
-    /// (upgrade) fail (exit 1) if any planned change was skipped.
+    /// (upgrade/fix) fail (exit 1) if the mutation cannot complete cleanly.
     #[arg(long, global = true)]
     pub(in crate::cli) strict: bool,
     /// (upgrade) also compile/sync after re-locking.
@@ -322,6 +322,8 @@ pub struct CliOverrides {
     pub(crate) fail_on_unknown_age: Option<bool>,
     pub(crate) strict: Option<bool>,
     pub(crate) build: Option<bool>,
+    pub(crate) transitive: Option<bool>,
+    pub(crate) downgrade_pinned: Option<bool>,
     pub(crate) dry_run: Option<bool>,
     pub(crate) offline: Option<bool>,
     pub(crate) fresh: Option<bool>,
@@ -353,6 +355,8 @@ impl CliOverrides {
             fail_on_unknown_age: on("fail_on_unknown_age"),
             strict: on("strict"),
             build: on("build"),
+            transitive: on("transitive"),
+            downgrade_pinned: on("downgrade_pinned"),
             dry_run: on("dry_run"),
             offline: on("offline"),
             fresh: on("fresh"),
@@ -431,6 +435,13 @@ mod tests {
             overrides(&["cooldown", "--strict", "upgrade"]).strict,
             Some(true)
         );
+    }
+
+    #[test]
+    fn fix_flags_are_explicit_overrides() {
+        let ov = overrides(&["cooldown", "fix", "--transitive", "--downgrade-pinned"]);
+        assert_eq!(ov.transitive, Some(true));
+        assert_eq!(ov.downgrade_pinned, Some(true));
     }
 
     #[test]

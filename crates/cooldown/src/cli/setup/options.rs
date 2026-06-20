@@ -86,8 +86,8 @@ pub(super) fn resolve_invocation(
             } else {
                 cooldown_core::RewriteMode::Auto
             },
-            transitive: global.transitive,
-            downgrade_pinned: global.downgrade_pinned,
+            transitive: merged.transitive.unwrap_or(false),
+            downgrade_pinned: merged.downgrade_pinned.unwrap_or(false),
             major_all: merged.major_all.unwrap_or(false),
             direct_only: merged.direct_only.unwrap_or(false),
             include_indirect: merged.include_indirect.unwrap_or(false),
@@ -128,6 +128,8 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         fail_on_unknown_age: Some(false),
         strict: Some(false),
         build: Some(false),
+        transitive: Some(false),
+        downgrade_pinned: Some(false),
         dry_run: Some(false),
         offline: Some(false),
         fresh: Some(false),
@@ -157,6 +159,8 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         fail_on_unknown_age: overrides.fail_on_unknown_age,
         strict: overrides.strict,
         build: overrides.build,
+        transitive: overrides.transitive,
+        downgrade_pinned: overrides.downgrade_pinned,
         dry_run: overrides.dry_run,
         offline: overrides.offline,
         fresh: overrides.fresh,
@@ -266,17 +270,20 @@ mod tests {
             tool: vec!["go".into()],
             package: vec!["left-*".into()],
             major: Some(false),
+            transitive: Some(false),
             ..CommandConfig::default()
         };
         let explicit = CommandConfig {
             tool: vec!["cargo".into()],
             package: vec!["serde".into()],
             major: Some(true),
+            transitive: Some(true),
             ..CommandConfig::default()
         };
         let resolved = base.apply_explicit(&explicit);
         assert_eq!(resolved.tool, vec!["cargo"]);
         assert_eq!(resolved.package, vec!["serde"]);
         assert_eq!(resolved.major, Some(true));
+        assert_eq!(resolved.transitive, Some(true));
     }
 }

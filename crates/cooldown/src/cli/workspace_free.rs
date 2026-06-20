@@ -78,5 +78,9 @@ min-age = "7d"
 # all = false                 # also list up-to-date deps; exit-code = 1 gates CI
 #
 # [upgrade]
-# strict = true               # fail if any planned change was skipped; build = true to compile
+# strict = true               # fail if a mutation cannot complete cleanly; build = true to compile
+#
+# [fix]
+# transitive = false          # true also downgrades too-fresh transitive deps
+# downgrade-pinned = false    # true also rewrites exact-pinned deps
 "#;

@@ -66,10 +66,14 @@ pub struct CommandConfig {
     pub allow_stale_lock: Option<bool>,
     /// Make `check` fail on deps with no publish time (`--fail-on-unknown-age`).
     pub fail_on_unknown_age: Option<bool>,
-    /// Fail `upgrade` if any planned change was skipped (`--strict`).
+    /// Fail `upgrade`/`fix` if a mutation cannot complete cleanly (`--strict`).
     pub strict: Option<bool>,
     /// Compile/sync after re-locking in `upgrade` (`--build`).
     pub build: Option<bool>,
+    /// Include transitive deps in `fix` (`--transitive`).
+    pub transitive: Option<bool>,
+    /// Allow `fix` to downgrade exact-pinned deps too (`--downgrade-pinned`).
+    pub downgrade_pinned: Option<bool>,
     /// Resolve and print the plan; never mutate (`--dry-run`).
     pub dry_run: Option<bool>,
     /// Cache only; a miss becomes `UnknownAge` (`--offline`).
@@ -105,6 +109,8 @@ impl CommandConfig {
         self.fail_on_unknown_age = other.fail_on_unknown_age.or(self.fail_on_unknown_age);
         self.strict = other.strict.or(self.strict);
         self.build = other.build.or(self.build);
+        self.transitive = other.transitive.or(self.transitive);
+        self.downgrade_pinned = other.downgrade_pinned.or(self.downgrade_pinned);
         self.dry_run = other.dry_run.or(self.dry_run);
         self.offline = other.offline.or(self.offline);
         self.fresh = other.fresh.or(self.fresh);
@@ -137,6 +143,8 @@ impl CommandConfig {
         self.fail_on_unknown_age = explicit.fail_on_unknown_age.or(self.fail_on_unknown_age);
         self.strict = explicit.strict.or(self.strict);
         self.build = explicit.build.or(self.build);
+        self.transitive = explicit.transitive.or(self.transitive);
+        self.downgrade_pinned = explicit.downgrade_pinned.or(self.downgrade_pinned);
         self.dry_run = explicit.dry_run.or(self.dry_run);
         self.offline = explicit.offline.or(self.offline);
         self.fresh = explicit.fresh.or(self.fresh);
@@ -167,6 +175,7 @@ pub(crate) struct ConfigToml {
     /// Per-subcommand CLI-flag defaults; each overrides `[global]`.
     pub(crate) outdated: Option<CommandConfig>,
     pub(crate) upgrade: Option<CommandConfig>,
+    pub(crate) fix: Option<CommandConfig>,
     pub(crate) check: Option<CommandConfig>,
     pub(crate) baseline: Option<CommandConfig>,
 }
