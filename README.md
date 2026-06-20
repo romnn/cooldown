@@ -53,6 +53,21 @@ cooldown check         # CI gate: exit non-zero if anything resolved is younger 
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
 
+#### Manifest constraints
+
+By default `upgrade` moves the **lock** within your declared version constraint and leaves the
+manifest alone, so a `^1.4` stays `^1.4` while the lock advances to the newest matured `1.x`. When
+the target falls **outside** the constraint — most commonly a cross-major bump (`--major`) past a
+caret range, or a capped Python range like `>=1,<2` — cooldown rewrites the one owning manifest
+entry so the version can be adopted at all, then re-locks. Edits are format-preserving (comments,
+key order, and spacing are kept) and, for a Cargo workspace, an inherited `dep = { workspace = true }`
+is widened in the root `[workspace.dependencies]`.
+
+Pass `--rewrite` to always rewrite the declared constraint to the adopted version, even for an
+in-range move (so `^1.4` becomes `^1.5`). Tools whose package manager couples version selection to
+the manifest — npm/pnpm (`add`/`install`) and Go (`go.mod` is the version source) — always rewrite
+the manifest; they have no lock-only equivalent of cargo's `--precise`.
+
 The happy path is zero config. Raising the whole repo to 14 days is one line of `cooldown.toml`:
 
 ```toml

@@ -11,6 +11,10 @@ pub(super) async fn apply(
     plan: &Plan,
     journal: &ProjectMutationJournal,
 ) -> Result<ApplyReport> {
+    // Go's `go.mod` *is* the version source (the MVS minimum), so `go get <path>@<version>` always
+    // rewrites it — there is no separate lock to move within an unchanged constraint. The
+    // `plan.rewrite` mode is therefore not consulted: both modes rewrite `go.mod`. A cross-major bump
+    // additionally rewrites the `/vN` import paths below.
     let mut report = ApplyReport::default();
     for change in &plan.changes {
         let target_path = &change.package.name;

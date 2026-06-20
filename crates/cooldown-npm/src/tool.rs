@@ -256,6 +256,12 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         plan: &Plan,
         _journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
+        // The npm-family CLIs select a version through the manifest: `add`/`install <name>@<version>`
+        // rewrites the `package.json` range and re-pins the lock together — there is no lock-only way
+        // to pin an exact in-range version (no equivalent of cargo's `--precise`). So a `package.json`
+        // rewrite is inherent to adopting any version here, and the `plan.rewrite` mode is not
+        // consulted: both modes rewrite. A cross-major bump works the same way, so `upgrade` already
+        // crosses majors for these tools without special handling.
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             let args = L::upgrade_args(&change.package.name, change.to.as_str());
