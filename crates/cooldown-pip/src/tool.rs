@@ -182,6 +182,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 members: Vec::new(),
+                pinned: false,
             });
         }
         Ok(deps)

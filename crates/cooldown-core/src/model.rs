@@ -327,6 +327,13 @@ pub struct Dependency {
     /// cannot attribute a source (a transitive dep, or a tool without per-member data); the
     /// presentation then leaves the column blank.
     pub members: Vec<MemberRef>,
+    /// The dependency is exact-pinned in the manifest (`==x.y.z`, cargo `=x.y.z`, a bare npm
+    /// version), so it will not move without editing the manifest. Such a pin is still evaluated for
+    /// context when newer candidates exist (so `adoptable_target` can show the newest matured
+    /// version), but then its headline status is [`Status::Held`] and `upgrade` will not mutate it.
+    /// The `outdated --hide-pinned` flag only filters these rows from the human table; `check` gates
+    /// a pinned dep's age like any other pin.
+    pub pinned: bool,
 }
 
 /// A workspace member that declares a dependency: its package `name` and its `path` relative to the
@@ -353,7 +360,8 @@ pub enum Status {
     InCooldown,
     /// Exempted by an `allow` rule (or, in `check`, a pseudo/commit pin).
     Exempt,
-    /// Commit-pinned (a pseudo-version): no tagged version to compare against.
+    /// Pinned, so it will not move on its own: a commit pin (pseudo-version, no tagged version to
+    /// compare against) or an exact `==`/`=` manifest pin.
     Held,
     /// The currently-locked version is itself younger than its window (the `check` violation).
     CurrentInCooldown,

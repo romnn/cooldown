@@ -112,6 +112,10 @@ pub struct RunOpts {
     pub package: Vec<PatternGlob>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
+    /// `--hide-pinned` (outdated): omit held rows (exact `==`/`=` pins and commit pins) from the
+    /// table, leaving only deps with an actionable update. The `latest` column on a held row still
+    /// shows what is available, so this is purely a display filter.
+    pub hide_pinned: bool,
     /// `--major-all`: apply cross-major to all eligible deps (else `--package` is required).
     pub major_all: bool,
     /// `--direct-only`: evaluate only direct deps.
@@ -288,6 +292,11 @@ impl Workspace {
         }
     }
 
+    /// The scoped dependency list for reporting: the adapter's raw deps with `--package` scoping and
+    /// the `exclude` policy applied (excluded members dropped, then deps with no member left removed).
+    /// This is the single chokepoint every list/report command (`outdated`/`check`/`upgrade`/
+    /// `baseline`) reads through, so excluded packages never reach a report. Whole-graph reads that
+    /// must see everything (the upgrade graph-violation check, `explain`) call the adapter directly.
     pub(crate) async fn dependencies_in_scope(
         &self,
         adapter: &dyn ToolRead,

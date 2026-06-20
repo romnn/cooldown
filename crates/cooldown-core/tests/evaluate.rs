@@ -35,6 +35,103 @@ fn fresh_stable_is_in_cooldown() {
     assert_eq!(verdict.latest, Some(Version::new("v1.1.0")));
 }
 
+/// An exact-pinned dependency is `Held` even when a matured upgrade exists — it won't move without a
+/// manifest edit — but `adoptable_target` still reports the newest matured version, so the report
+/// shows which version could be manually pinned to without failing the cooldown gate.
+#[test]
+fn exact_pin_is_held() {
+    let d = Dependency {
+        pinned: true,
+        ..dep("ex", "v1.0.0", ReleaseQuality::Stable)
+    };
+    let releases = vec![
+        rel(
+            "v1.0.0",
+            &[1, 0, 0],
+            "v1",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        rel(
+            "v1.1.0",
+            &[1, 1, 0],
+            "v1",
+            Some(UpdateKind::Minor),
+            Some("2026-06-01T00:00:00Z"), // matured (16 days)
+            ReleaseQuality::Stable,
+        ),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx();
+
+    let held = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(held.status, Status::Held);
+    // The matured upgrade is surfaced as the manual-pin target, even though the dep stays Held.
+    assert_eq!(held.adoptable_target, Some(Version::new("v1.1.0")));
+    assert_eq!(held.latest, Some(Version::new("v1.1.0")));
+}
+
+/// An exact pin with no newer candidate is still up to date; `Held` is reserved for pins where a
+/// newer candidate exists but cannot be applied automatically.
+#[test]
+fn exact_pin_without_newer_candidate_is_up_to_date() {
+    let d = Dependency {
+        pinned: true,
+        ..dep("ex", "v1.0.0", ReleaseQuality::Stable)
+    };
+    let releases = vec![rel(
+        "v1.0.0",
+        &[1, 0, 0],
+        "v1",
+        None,
+        Some("2026-01-01T00:00:00Z"),
+        ReleaseQuality::Stable,
+    )];
+    let layers = layers_from(vec![]);
+    let h = ctx();
+
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::UpToDate);
+    assert_eq!(verdict.adoptable_target, None);
+    assert_eq!(verdict.latest, Some(Version::new("v1.0.0")));
+}
+
+/// A pinned dep whose only newer version is still in cooldown stays `Held` with no manual-pin target
+/// yet — there is nothing matured to safely pin to.
+#[test]
+fn pinned_with_only_fresh_upgrade_has_no_target() {
+    let d = Dependency {
+        pinned: true,
+        ..dep("ex", "v1.0.0", ReleaseQuality::Stable)
+    };
+    let releases = vec![
+        rel(
+            "v1.0.0",
+            &[1, 0, 0],
+            "v1",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        rel(
+            "v1.1.0",
+            &[1, 1, 0],
+            "v1",
+            Some(UpdateKind::Minor),
+            Some("2026-06-15T00:00:00Z"), // fresh (2 days), still in cooldown
+            ReleaseQuality::Stable,
+        ),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx();
+
+    let held = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(held.status, Status::Held);
+    assert_eq!(held.adoptable_target, None);
+    assert_eq!(held.latest, Some(Version::new("v1.1.0")));
+}
+
 /// A matured stable upgrade (16 days old) is `Adoptable`.
 #[test]
 fn matured_stable_is_adoptable() {
@@ -62,6 +159,46 @@ fn matured_stable_is_adoptable() {
     let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
     assert_eq!(verdict.status, Status::Adoptable);
     assert_eq!(verdict.adoptable_target, Some(Version::new("v1.1.0")));
+}
+
+/// When the newest version is still cooling but an older one has matured, the row is `Adoptable` (you
+/// can update to the matured one) — not `InCooldown`, which would wrongly read as "cannot update yet".
+/// `latest` still reports the newest (cooling) version.
+#[test]
+fn matured_older_with_fresh_newest_is_adoptable() {
+    let d = dep("ex", "v1.0.0", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "v1.0.0",
+            &[1, 0, 0],
+            "v1",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        rel(
+            "v1.1.0",
+            &[1, 1, 0],
+            "v1",
+            Some(UpdateKind::Minor),
+            Some("2026-06-01T00:00:00Z"), // matured (16 days)
+            ReleaseQuality::Stable,
+        ),
+        rel(
+            "v1.2.0",
+            &[1, 2, 0],
+            "v1",
+            Some(UpdateKind::Minor),
+            Some("2026-06-15T00:00:00Z"), // fresh (2 days), still in cooldown
+            ReleaseQuality::Stable,
+        ),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx();
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Adoptable);
+    assert_eq!(verdict.adoptable_target, Some(Version::new("v1.1.0")));
+    assert_eq!(verdict.latest, Some(Version::new("v1.2.0")));
 }
 
 /// An unknown publish time is never treated as mature → `UnknownAge`.
@@ -300,9 +437,9 @@ fn per_kind_windows_decide_per_candidate() {
     let h = ctx().major();
     let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
 
-    // Headline is the newest candidate (v2.0.0), still cooling at 30d.
-    assert_eq!(verdict.status, Status::InCooldown);
-    // But the patch matured at 3d → adoptable now.
+    // The row is `Adoptable` because the patch has matured (at 3d), even though the newest candidate
+    // (v2.0.0) still cools at 30d — you can update to the patch now.
+    assert_eq!(verdict.status, Status::Adoptable);
     assert_eq!(verdict.adoptable_target, Some(Version::new("v1.0.1")));
 
     let patch = verdict

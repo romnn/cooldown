@@ -12,6 +12,11 @@ use std::fmt::Write as _;
 /// The color of the package-name column (every listed dependency is actionable).
 const PACKAGE_COLOR: Color = Color::Cyan;
 
+/// The color of the "Adoptable" version — the version takeable now. Deliberately *not* the green of
+/// the adoptable *status*: held rows can show a matured manual-pin target too, so this must read as
+/// "this version is takeable" independent of the row's status.
+const ADOPTABLE_COLOR: Color = Color::Magenta;
+
 /// Presentation flags shared by the dependency-table renderers (`outdated`/`check`/`upgrade`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
@@ -184,7 +189,13 @@ pub fn render_outdated(
     } = *opts;
     let mut out = String::new();
     if items.is_empty() {
-        out.push_str("All dependencies are up to date.\n");
+        if summary.total == 0 && !errors.is_empty() {
+            out.push_str("No dependencies could be evaluated.\n");
+        } else if summary.total == 0 || summary.total == summary.up_to_date {
+            out.push_str("All dependencies are up to date.\n");
+        } else {
+            out.push_str("No dependencies match the current display filters.\n");
+        }
     } else {
         let used_by = has_attribution(items, |it| &it.members);
         let project = has_distinct_project(items, |it| it.project.as_str());
@@ -199,7 +210,12 @@ pub fn render_outdated(
         header.extend(["Current", "Adoptable", "Latest", "Window", "Status"]);
         t.set_header(header);
         for it in items {
-            let adoptable = it.adoptable_target.clone().unwrap_or_else(|| "—".into());
+            // Draw the eye to the version that can be taken now — including on a held row, where it
+            // is the newest version safe to manually pin to.
+            let adoptable = match &it.adoptable_target {
+                Some(version) => cell_colored(version.clone(), ADOPTABLE_COLOR, use_color),
+                None => Cell::new("—"),
+            };
             let latest = it
                 .latest
                 .as_ref()
@@ -216,7 +232,7 @@ pub fn render_outdated(
                 row.push(Cell::new(path_label(&it.project)));
             }
             row.push(Cell::new(&it.current));
-            row.push(Cell::new(adoptable));
+            row.push(adoptable);
             row.push(Cell::new(latest));
             row.push(Cell::new(window));
             row.push(cell_colored(
@@ -490,8 +506,9 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 
 #[cfg(test)]
 mod tests {
-    use super::{has_distinct_project, members_cell, path_label};
-    use cooldown_core::MemberRef;
+    use super::{RenderOptions, has_distinct_project, members_cell, path_label, render_outdated};
+    use crate::OutdatedSummary;
+    use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
 
     /// Members whose name is the given string and whose path is `path/<name>`.
     fn members(names: &[&str]) -> Vec<MemberRef> {
@@ -547,5 +564,65 @@ mod tests {
     fn distinct_project_only_hides_actual_root_path() {
         assert!(!has_distinct_project(&["."], |path| *path));
         assert!(has_distinct_project(&["root"], |path| *path));
+    }
+
+    #[test]
+    fn empty_filtered_outdated_table_does_not_claim_up_to_date() {
+        let summary = OutdatedSummary {
+            total: 6,
+            adoptable: 0,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 6,
+            unknown_age: 0,
+            errors: 0,
+        };
+
+        let out = render_outdated(
+            &summary,
+            &[],
+            &[],
+            &[],
+            &RenderOptions {
+                use_color: false,
+                list_packages: false,
+                paths: false,
+            },
+        );
+
+        assert!(out.starts_with("No dependencies match the current display filters."));
+    }
+
+    #[test]
+    fn empty_outdated_table_with_errors_does_not_claim_up_to_date() {
+        let summary = OutdatedSummary {
+            total: 0,
+            adoptable: 0,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        };
+        let errors = [Diagnostic::new(
+            DiagnosticKind::LockfileUnreadable,
+            "lock unreadable",
+        )];
+
+        let out = render_outdated(
+            &summary,
+            &[],
+            &[],
+            &errors,
+            &RenderOptions {
+                use_color: false,
+                list_packages: false,
+                paths: false,
+            },
+        );
+
+        assert!(out.starts_with("No dependencies could be evaluated."));
     }
 }

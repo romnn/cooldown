@@ -13,6 +13,10 @@ pub struct ResolvedGraph {
     pub roots: HashSet<String>,
     /// node id → its resolved dependency package ids.
     pub edges: HashMap<String, Vec<String>>,
+    /// `(crate, version)` pairs a workspace member pins exactly (`serde = "=1.0.197"`). A single
+    /// `=` requirement forces that resolved version, so it is held: it cannot move without editing a
+    /// `Cargo.toml`.
+    pub exact_pins: HashSet<(String, String)>,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -48,6 +52,13 @@ impl ResolvedGraph {
             .filter_map(|r| self.edges.get(r))
             .any(|deps| deps.iter().any(|d| d == id))
     }
+    /// Is `crate_name` at `version` exact-pinned (`=x.y.z`) by a workspace member?
+    #[must_use]
+    pub fn is_exact_pinned(&self, crate_name: &str, version: &str) -> bool {
+        self.exact_pins
+            .contains(&(crate_name.to_string(), version.to_string()))
+    }
+
     /// Is `id` required by a non-root node (held by the graph)?
     #[must_use]
     pub fn is_graph_held(&self, id: &str) -> bool {
@@ -91,6 +102,17 @@ struct RawMeta {
     resolve: Option<RawResolve>,
 }
 
+/// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
+/// default bare `"1.2.3"` is `^1.2.3`, a range, not a pin.
+fn exact_req_version(req: &str) -> Option<String> {
+    let req = req.trim();
+    req.strip_prefix('=')
+        .filter(|version| !version.starts_with('='))
+        .map(str::trim)
+        .filter(|version| semver::Version::parse(version).is_ok())
+        .map(str::to_string)
+}
+
 /// The crate's directory relative to the workspace root (`.` for a crate at the root). Cargo reports
 /// absolute manifest paths; relativizing keeps member paths short and workspace-portable.
 fn member_path(manifest_path: &str, workspace_root: &str) -> String {
@@ -117,6 +139,17 @@ struct RawPkg {
     /// path. Defaults to empty when absent (older cargo), yielding a `.` path.
     #[serde(default)]
     manifest_path: String,
+    /// The crate's declared dependencies (with their version requirements), used to detect exact
+    /// `=x.y.z` pins on workspace-member crates.
+    #[serde(default)]
+    dependencies: Vec<RawDep>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawDep {
+    name: String,
+    /// The semver requirement string, e.g. `^1.0.197` (default caret) or `=1.0.197` (exact pin).
+    req: String,
 }
 #[derive(serde::Deserialize)]
 struct RawResolve {
@@ -213,8 +246,19 @@ impl Cargo {
         let raw: RawMeta = serde_json::from_str(&stdout)
             .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
         let workspace_root = raw.workspace_root.clone();
+        let roots: HashSet<String> = raw.workspace_members.iter().cloned().collect();
         let mut packages = HashMap::new();
+        let mut exact_pins = HashSet::new();
         for p in raw.packages {
+            // Exact pins are declared by workspace members; a transitive crate's own `=` reqs are
+            // not the workspace's choice and are left to the graph-held logic.
+            if roots.contains(&p.id) {
+                for dep in &p.dependencies {
+                    if let Some(version) = exact_req_version(&dep.req) {
+                        exact_pins.insert((dep.name.clone(), version));
+                    }
+                }
+            }
             packages.insert(
                 p.id.clone(),
                 PkgInfo {
@@ -233,8 +277,9 @@ impl Cargo {
         }
         Ok(ResolvedGraph {
             packages,
-            roots: raw.workspace_members.into_iter().collect(),
+            roots,
             edges,
+            exact_pins,
         })
     }
 
@@ -332,6 +377,30 @@ mod tests {
     }
 
     #[test]
+    fn exact_req_version_accepts_only_single_equals_pins() {
+        assert_eq!(exact_req_version("=1.0.197").as_deref(), Some("1.0.197"));
+        assert_eq!(exact_req_version(" = 1.0.197 ").as_deref(), Some("1.0.197"));
+        assert_eq!(exact_req_version("^1.0.197"), None);
+        assert_eq!(exact_req_version("1.0.197"), None);
+        assert_eq!(exact_req_version("==1.0.197"), None);
+        assert_eq!(exact_req_version("=1"), None);
+        assert_eq!(exact_req_version("=1.0.197, <2.0.0"), None);
+    }
+
+    #[test]
+    fn exact_pin_is_version_specific() {
+        let graph = ResolvedGraph {
+            packages: HashMap::new(),
+            roots: HashSet::new(),
+            edges: HashMap::new(),
+            exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
+        };
+
+        assert!(graph.is_exact_pinned("serde", "1.0.197"));
+        assert!(!graph.is_exact_pinned("serde", "0.9.0"));
+    }
+
+    #[test]
     fn direct_members_returns_roots_that_declare_dependency() {
         let graph = ResolvedGraph {
             packages: HashMap::from([
@@ -370,6 +439,7 @@ mod tests {
                 ("root-a".to_string(), vec!["dep".to_string()]),
                 ("root-b".to_string(), Vec::new()),
             ]),
+            exact_pins: HashSet::new(),
         };
 
         assert_eq!(

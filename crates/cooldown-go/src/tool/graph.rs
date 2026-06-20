@@ -81,5 +81,6 @@ fn dependency_of(
         artifacts: Vec::new(),
         graph_floor,
         members: Vec::new(),
+        pinned: false,
     })
 }

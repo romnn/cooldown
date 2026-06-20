@@ -125,6 +125,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &rctx,
                 self.ws.now(),
             );
+            // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
+            // version a human could manually pin to — but `upgrade` must never move it on its own.
+            if verdict.status == cooldown_core::Status::Held {
+                continue;
+            }
             let Some(target) = verdict.adoptable_target else {
                 continue;
             };
@@ -314,6 +319,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn graph_violations(&self) -> cooldown_core::Result<HashSet<(String, String)>> {
+        // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
+        // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
+        // must not narrow it. Only pin ages are read here — never `members` — so nothing leaks.
         let deps = self
             .ctx
             .reader

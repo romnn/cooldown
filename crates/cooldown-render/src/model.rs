@@ -114,7 +114,7 @@ pub enum OutdatedStatus {
     InCooldown,
     /// Exempted by an `allow` rule (or a pseudo/commit pin).
     Exempt,
-    /// Commit-pinned (a pseudo-version): no tagged version to compare against.
+    /// Pinned, so it will not move on its own: a commit pin or an exact manifest pin.
     Held,
     /// The currently-locked version is itself younger than its window.
     CurrentInCooldown,

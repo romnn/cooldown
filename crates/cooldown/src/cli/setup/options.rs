@@ -74,6 +74,8 @@ pub(super) fn resolve_invocation(
             tool: tools,
             package,
             allow_major: merged.major.unwrap_or(default_major),
+            // A display filter, read straight from the CLI (not config-file backed).
+            hide_pinned: global.hide_pinned,
             major_all: merged.major_all.unwrap_or(false),
             direct_only: merged.direct_only.unwrap_or(false),
             include_indirect: merged.include_indirect.unwrap_or(false),

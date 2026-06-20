@@ -130,6 +130,7 @@ impl ToolRead for CargoTool {
                 artifacts: Vec::new(),
                 graph_floor,
                 members: graph.direct_members(id),
+                pinned: graph.is_exact_pinned(&info.name, &info.version),
             });
         }
         Ok(deps)

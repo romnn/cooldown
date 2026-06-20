@@ -107,6 +107,7 @@ impl ToolRead for HexTool {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 members: Vec::new(),
+                pinned: false,
             });
         }
         Ok(deps)

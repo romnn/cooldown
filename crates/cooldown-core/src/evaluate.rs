@@ -93,11 +93,13 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 /// The [`Verdict`] carries the per-candidate breakdown plus three rollups: `candidates` (ascending
 /// by release order), `latest` (the newest eligible version, for context), and `adoptable_target`
 /// (the newest candidate that is [`Adoptable`](Status::Adoptable) or [`Exempt`](Status::Exempt), or
-/// `None`). The headline `status` is the newest candidate's status, or [`Status::UpToDate`] when no
-/// newer candidate exists. Two special cases short-circuit: a commit pin (pseudo-version) has no
-/// tagged version to compare and yields [`Status::Held`]; if the current pin is absent from
-/// `releases` the result is conservatively [`Status::UpToDate`] (`check`, via [`check_pin`], is the
-/// real gate and does not rely on this).
+/// `None`). The headline `status` is [`Status::Adoptable`] whenever any candidate has matured;
+/// otherwise it is the newest candidate's status, or [`Status::UpToDate`] when no newer candidate
+/// exists. Two special cases override that: exact manifest pins are [`Status::Held`] when there is a
+/// candidate to review, and a commit pin (pseudo-version) has no tagged version to compare and
+/// yields [`Status::Held`]. If the current pin is absent from `releases` the result is
+/// conservatively [`Status::UpToDate`] (`check`, via [`check_pin`], is the real gate and does not
+/// rely on this).
 ///
 /// # Examples
 ///
@@ -119,6 +121,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 ///     artifacts: Vec::new(),
 ///     graph_floor: None,
 ///     members: Vec::new(),
+///     pinned: false,
 /// };
 /// let now: Timestamp = "2026-01-08T00:00:00Z".parse()?;
 /// let mature: Timestamp = "2026-01-01T00:00:00Z".parse()?;
@@ -174,8 +177,11 @@ pub fn evaluate(
         "releases must be sorted ascending by ReleaseOrder"
     );
 
-    // A commit-pinned dependency has no tagged version to compare against → Held. We still surface
-    // the newest stable release as `latest` for context.
+    // A commit pin (pseudo-version) has no tagged version to compare against, so it short-circuits to
+    // Held with just the newest stable release as `latest` for context. An exact pin (`==`/`=`) is
+    // also Held, but it *is* a tagged version, so it flows through normal candidate evaluation below
+    // and is only relabelled `Held` at the end — that way its `adoptable_target` still reports the
+    // newest matured version, i.e. exactly which version could be manually pinned to.
     if dep.current_quality == ReleaseQuality::Pseudo {
         let latest = releases
             .iter()
@@ -256,13 +262,28 @@ pub fn evaluate(
             candidates,
         };
     };
-    let status = headline.status;
-
     let adoptable_target = candidates
         .iter()
         .rev()
         .find(|c| matches!(c.status, Status::Adoptable | Status::Exempt))
         .map(|c| c.version.clone());
+
+    // The status reflects whether you can act *now*, not just the newest candidate's freshness. If
+    // any candidate has matured past its window (`adoptable_target` is set), the row is `Adoptable`
+    // even when the very newest version is still cooling — `upgrade` would take the matured one. So
+    // `InCooldown` is reserved for "something newer exists but nothing has matured yet", the only case
+    // that truly means "cannot update yet". Two overrides: an exact pin is `Held` (it won't move on
+    // its own, though `adoptable_target` still shows what one could manually pin to); an `Exempt`
+    // headline keeps its label (the cooldown was explicitly waived for it).
+    let status = if dep.pinned {
+        Status::Held
+    } else if headline.status == Status::Exempt {
+        Status::Exempt
+    } else if adoptable_target.is_some() {
+        Status::Adoptable
+    } else {
+        headline.status
+    };
 
     Verdict {
         status,

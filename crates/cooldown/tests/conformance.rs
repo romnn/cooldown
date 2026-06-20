@@ -48,6 +48,7 @@ fn dep(name: &str, current: &str, direct: bool) -> Dependency {
         artifacts: Vec::new(),
         graph_floor: None,
         members: Vec::new(),
+        pinned: false,
     }
 }
 
@@ -242,6 +243,7 @@ fn tmp_root() -> (tempfile::TempDir, Utf8PathBuf) {
 async fn outdated_splits_adoptable_and_in_cooldown() {
     let (_g, root) = tmp_root();
     let mut releases = HashMap::new();
+    // `a`: the newest (v1.2.0) is still cooling, but v1.1.0 has matured → adoptable (you can update).
     releases.insert(
         "a".to_string(),
         vec![
@@ -260,8 +262,21 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
             ), // fresh
         ],
     );
+    // `b`: the only newer version is fresh and nothing has matured → in cooldown (cannot update yet).
+    releases.insert(
+        "b".to_string(),
+        vec![
+            rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v2.1.0",
+                1,
+                Some("2026-06-16T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ), // fresh
+        ],
+    );
     let fake = FakeEco {
-        direct: vec![dep("a", "v1.0.0", true)],
+        direct: vec![dep("a", "v1.0.0", true), dep("b", "v2.0.0", true)],
         transitive: vec![],
         fresh_transitive: None,
         releases,
@@ -279,12 +294,17 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
     let out = ws.outdated(&opts()).await;
 
     assert_eq!(out.exit, Exit::Ok);
-    assert_eq!(out.items.len(), 1);
-    let it = &out.items[0];
-    // Newest candidate (v1.2.0) is still cooling, but v1.1.0 is adoptable now.
-    assert_eq!(it.status, OutdatedStatus::InCooldown);
-    assert_eq!(it.adoptable_target.as_deref(), Some("v1.1.0"));
-    assert_eq!(it.latest.as_ref().unwrap().version, "v1.2.0");
+    assert_eq!(out.items.len(), 2);
+    let a = out.items.iter().find(|i| i.name == "a").expect("a");
+    let b = out.items.iter().find(|i| i.name == "b").expect("b");
+    // `a` has a matured version, so it is adoptable even though its newest is still cooling.
+    assert_eq!(a.status, OutdatedStatus::Adoptable);
+    assert_eq!(a.adoptable_target.as_deref(), Some("v1.1.0"));
+    assert_eq!(a.latest.as_ref().unwrap().version, "v1.2.0");
+    // `b` has nothing matured, so it genuinely cannot update yet.
+    assert_eq!(b.status, OutdatedStatus::InCooldown);
+    assert_eq!(b.adoptable_target, None);
+    assert_eq!(out.summary.adoptable, 1);
     assert_eq!(out.summary.in_cooldown, 1);
 }
 

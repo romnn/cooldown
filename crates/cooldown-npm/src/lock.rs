@@ -56,6 +56,10 @@ pub trait NodeLock: Send + Sync + 'static {
 pub struct MemberIndex {
     by_version: HashMap<(String, String), Vec<String>>,
     by_name: HashMap<String, Vec<String>>,
+    /// `(name, version)` pairs every declaring importer pins exactly (pnpm).
+    exact_version: HashSet<(String, String)>,
+    /// Names pinned exactly by every declaring member manifest (npm, which records ranges per name).
+    exact_name: HashSet<String>,
     authoritative: bool,
 }
 
@@ -63,17 +67,37 @@ impl MemberIndex {
     fn version_exact(by_version: HashMap<(String, String), Vec<String>>) -> Self {
         Self {
             by_version,
-            by_name: HashMap::new(),
             authoritative: true,
+            ..Default::default()
         }
     }
 
     fn name_only(by_name: HashMap<String, Vec<String>>) -> Self {
         Self {
-            by_version: HashMap::new(),
             by_name,
             authoritative: true,
+            ..Default::default()
         }
+    }
+
+    fn with_exact_versions(mut self, exact: HashSet<(String, String)>) -> Self {
+        self.exact_version = exact;
+        self
+    }
+
+    fn with_exact_names(mut self, exact: HashSet<String>) -> Self {
+        self.exact_name = exact;
+        self
+    }
+
+    /// Whether `name`@`version` is exact-pinned by every member that declares it, so it is held: it
+    /// cannot move without editing a manifest.
+    #[must_use]
+    pub fn is_exact_pinned(&self, name: &str, version: &str) -> bool {
+        self.exact_name.contains(name)
+            || self
+                .exact_version
+                .contains(&(name.to_string(), version.to_string()))
     }
 
     /// Whether this lock carries authoritative importer/member data for classifying direct deps.
@@ -143,7 +167,9 @@ impl NodeLock for Npm {
 
     fn member_sources(content: &str) -> MemberIndex {
         parse_npm_member_sources(content)
-            .map(MemberIndex::name_only)
+            .map(|by_name| {
+                MemberIndex::name_only(by_name).with_exact_names(parse_npm_exact_pins(content))
+            })
             .unwrap_or_default()
     }
 
@@ -176,6 +202,7 @@ impl NodeLock for Pnpm {
 
     fn member_sources(content: &str) -> MemberIndex {
         MemberIndex::version_exact(parse_pnpm_importer_members(content))
+            .with_exact_versions(parse_pnpm_exact_pins(content))
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -377,6 +404,123 @@ fn parse_npm_member_sources(content: &str) -> Option<HashMap<String, Vec<String>
         }
     }
     Some(map)
+}
+
+/// Whether an npm/pnpm specifier is an exact pin: a bare version (`2.11.0`, `1.0.0-rc.1`) or single
+/// equals range (`=2.11.0`) with no range operator, wildcard, or union. A pinned dependency cannot
+/// move without editing the manifest.
+fn is_exact_npm_specifier(specifier: &str) -> bool {
+    let specifier = specifier.trim();
+    let specifier = specifier
+        .strip_prefix('=')
+        .filter(|version| !version.starts_with('='))
+        .map_or(specifier, str::trim);
+    semver::Version::parse(specifier).is_ok()
+}
+
+/// The `(name, version)` pairs every declaring importer pins exactly in `pnpm-lock.yaml`. The
+/// importer records both the `specifier:` (the declared range) and the resolved `version:`; a
+/// `(name, version)` is exact-pinned only when *every* importer that declares it used an exact
+/// specifier (otherwise some importer's range could still move it).
+fn parse_pnpm_exact_pins(content: &str) -> HashSet<(String, String)> {
+    let mut total: HashMap<(String, String), usize> = HashMap::new();
+    let mut exact: HashMap<(String, String), usize> = HashMap::new();
+    let mut in_importers = false;
+    let mut in_group = false;
+    let mut dep_name: Option<String> = None;
+    let mut specifier: Option<String> = None;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => {
+                in_importers = trimmed == "importers:";
+                in_group = false;
+                dep_name = None;
+                specifier = None;
+            }
+            2 if in_importers => {
+                in_group = false;
+                dep_name = None;
+                specifier = None;
+            }
+            4 if in_importers => {
+                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
+                dep_name = None;
+                specifier = None;
+            }
+            6 if in_importers && in_group => {
+                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
+                dep_name = (!name.is_empty()).then(|| name.to_string());
+                specifier = None;
+            }
+            8 if in_importers && in_group => {
+                if let Some(raw) = trimmed.strip_prefix("specifier:") {
+                    specifier = Some(unquote_yaml_scalar(raw).to_string());
+                } else if let Some(raw) = trimmed.strip_prefix("version:")
+                    && let Some(name) = dep_name.as_ref()
+                {
+                    let value = unquote_yaml_scalar(raw);
+                    if !value.starts_with("link:")
+                        && !value.starts_with("file:")
+                        && !value.starts_with("workspace:")
+                    {
+                        let version = unquote_yaml_scalar(value.split('(').next().unwrap_or(value));
+                        if !version.is_empty() {
+                            let key = (name.clone(), version.to_string());
+                            *total.entry(key.clone()).or_insert(0) += 1;
+                            if specifier.as_deref().is_some_and(is_exact_npm_specifier) {
+                                *exact.entry(key).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+        .into_iter()
+        .filter(|(key, count)| exact.get(key) == Some(count))
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// The dependency names every declaring member pins exactly in `package-lock.json`. npm records a
+/// range (not a resolved version) per member, so this is name-keyed: a name is pinned only when
+/// every member entry that declares it used an exact specifier.
+fn parse_npm_exact_pins(content: &str) -> HashSet<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
+        return HashSet::new();
+    };
+    let Some(packages) = doc.get("packages").and_then(serde_json::Value::as_object) else {
+        return HashSet::new();
+    };
+    let mut total: HashMap<String, usize> = HashMap::new();
+    let mut exact: HashMap<String, usize> = HashMap::new();
+    for (key, entry) in packages {
+        if key.contains("node_modules/") {
+            continue;
+        }
+        for field in DIRECT_GROUPS {
+            if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
+                for (name, range) in obj {
+                    *total.entry(name.clone()).or_insert(0) += 1;
+                    if range.as_str().is_some_and(is_exact_npm_specifier) {
+                        *exact.entry(name.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    total
+        .into_iter()
+        .filter(|(name, count)| exact.get(name) == Some(count))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
@@ -681,5 +825,76 @@ packages:
         // yarn/bun and the unparsable case: no attribution, so the column stays blank.
         let index = MemberIndex::default();
         assert!(index.members_for("anything", "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn exact_specifier_distinguishes_pins_from_ranges() {
+        assert!(is_exact_npm_specifier("2.11.0"));
+        assert!(is_exact_npm_specifier("=2.11.0"));
+        assert!(is_exact_npm_specifier("1.0.0-rc.1"));
+        assert!(!is_exact_npm_specifier("==2.11.0"));
+        assert!(!is_exact_npm_specifier("1"));
+        assert!(!is_exact_npm_specifier("1.2"));
+        assert!(!is_exact_npm_specifier("^2.11.0"));
+        assert!(!is_exact_npm_specifier("~2.11.0"));
+        assert!(!is_exact_npm_specifier(">=2.0.0"));
+        assert!(!is_exact_npm_specifier("2.x"));
+        assert!(!is_exact_npm_specifier("workspace:*"));
+    }
+
+    #[test]
+    fn pnpm_exact_pins_require_every_importer_to_pin() {
+        // `pinned` is pinned exactly by both importers; `loose` is exact in one and a range in the
+        // other, so it could still move — not a pin.
+        let lock = "\
+importers:
+
+  apps/a:
+    dependencies:
+      pinned:
+        specifier: 2.11.0
+        version: 2.11.0
+      loose:
+        specifier: 1.0.0
+        version: 1.0.0
+
+  apps/b:
+    dependencies:
+      pinned:
+        specifier: 2.11.0
+        version: 2.11.0
+      loose:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  pinned@2.11.0:
+    resolution: {integrity: sha512-x}
+";
+        let pins = parse_pnpm_exact_pins(lock);
+        assert!(pins.contains(&("pinned".to_string(), "2.11.0".to_string())));
+        assert!(!pins.contains(&("loose".to_string(), "1.0.0".to_string())));
+    }
+
+    #[test]
+    fn pnpm_exact_pins_unquote_yaml_scalars() {
+        let lock = "\
+importers:
+
+  'apps/a':
+    dependencies:
+      '@scope/pkg':
+        specifier: '2.11.0'
+        version: '2.11.0(react@19.0.0)'
+
+packages:
+
+  '@scope/pkg@2.11.0':
+    resolution: {integrity: sha512-x}
+";
+        let pins = parse_pnpm_exact_pins(lock);
+
+        assert!(pins.contains(&("@scope/pkg".to_string(), "2.11.0".to_string())));
     }
 }

@@ -38,17 +38,14 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
         out.errors.clone(),
     );
     // The JSON envelope keeps every item (machine consumers filter themselves); the human table
-    // hides up-to-date rows unless `--all`, so the common case is a short, actionable report. The
-    // summary line below the table still reflects all dependencies.
-    let table_items: Vec<render::OutdatedItem> = if ctx.opts.show_all {
-        items.clone()
-    } else {
-        items
-            .iter()
-            .filter(|i| i.status != render::OutdatedStatus::UpToDate)
-            .cloned()
-            .collect()
-    };
+    // hides up-to-date rows unless `--all`, and held (pinned) rows under `--hide-pinned`, so the
+    // common case is a short, actionable report. The summary line below still reflects every dep.
+    let table_items: Vec<render::OutdatedItem> = items
+        .iter()
+        .filter(|i| ctx.opts.show_all || i.status != render::OutdatedStatus::UpToDate)
+        .filter(|i| !(ctx.opts.hide_pinned && i.status == render::OutdatedStatus::Held))
+        .cloned()
+        .collect();
     emit_envelope(ctx.opts.json, &env, || {
         render::tty::render_outdated(
             &summary,

@@ -183,6 +183,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                     path,
                 })
                 .collect();
+            let pinned = member_index.is_exact_pinned(&name, &version);
             deps.push(Dependency {
                 package: PackageId::new(L::ID, name, Some(NPM.to_string())),
                 current: Version::new(version.clone()),
@@ -191,6 +192,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 members,
+                pinned,
             });
         }
         Ok(deps)

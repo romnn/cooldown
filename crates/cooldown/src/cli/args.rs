@@ -211,6 +211,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// (outdated) include transitive deps in the report.
     #[arg(long = "include-indirect", global = true)]
     pub(in crate::cli) include_indirect: bool,
+    /// (outdated) Hide held rows (exact `==`/`=` pins and commit pins) from the table, leaving only
+    /// deps with an actionable update. A held row's `Latest` column still shows what is available.
+    #[arg(long = "hide-pinned", global = true)]
+    pub(in crate::cli) hide_pinned: bool,
     /// List every source package on its own line instead of `first (+N others)`.
     #[arg(long = "list-packages", global = true)]
     pub(in crate::cli) list_packages: bool,

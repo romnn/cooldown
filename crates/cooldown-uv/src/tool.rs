@@ -135,6 +135,7 @@ impl ToolRead for UvTool {
         let lock = read_lock(project)?;
         let direct: std::collections::HashSet<String> = lock.direct_names().into_iter().collect();
         let floors = lock.graph_floors();
+        let exact_pins = crate::native::exact_pinned_names(&project.manifest);
         // A uv project is a single package, so it is the source for every dependency it declares.
         // The lock's root package carries the project's package name.
         let project_member: Vec<MemberRef> = lock
@@ -178,6 +179,7 @@ impl ToolRead for UvTool {
                 } else {
                     Vec::new()
                 },
+                pinned: exact_pins.contains(&pkg.name),
             });
         }
         Ok(deps)
@@ -331,6 +333,7 @@ mod tests {
             artifacts: vec![ArtifactId("wheel:py3-none-any".into())],
             graph_floor: None,
             members: Vec::new(),
+            pinned: false,
         };
         let raw = vec![RawRelease {
             version: Version::new("2.32.1"),
