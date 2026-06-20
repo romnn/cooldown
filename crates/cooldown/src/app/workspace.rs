@@ -127,6 +127,10 @@ pub struct RunOpts {
     pub hide_pinned: bool,
     /// `--major-all`: apply cross-major to all eligible deps (else `--package` is required).
     pub major_all: bool,
+    /// `--rewrite` (upgrade): how to treat the manifest's version constraint. Defaults to
+    /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
+    /// `--rewrite` selects [`RewriteMode::Always`].
+    pub rewrite: cooldown_core::RewriteMode,
     /// `--direct-only`: evaluate only direct deps.
     pub direct_only: bool,
     /// `--include-indirect` (outdated): include transitive deps in the report.

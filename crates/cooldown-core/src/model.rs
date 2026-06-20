@@ -451,11 +451,34 @@ pub struct Change {
     pub members: Vec<MemberRef>,
 }
 
+/// How `apply` should treat a manifest's declared version constraint when adopting a new version.
+///
+/// The two modes differ only when the new version already satisfies the existing constraint (an
+/// in-range minor/patch, or a major under an open `>=` bound): [`Auto`](RewriteMode::Auto) leaves
+/// the constraint untouched and moves only the lock, while [`Always`](RewriteMode::Always) rewrites
+/// the constraint to track the adopted version. When the target falls *outside* the constraint
+/// (e.g. a cross-major bump past a caret range), both modes must rewrite — it is the only way to
+/// adopt it — so the lock-only path is reserved for genuinely in-range moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteMode {
+    /// Move the lock within the existing constraint; rewrite the manifest constraint only when the
+    /// target version lies outside it. The default — it keeps declared ranges as loose as the
+    /// author left them.
+    #[default]
+    Auto,
+    /// Always rewrite the manifest constraint to the adopted version, even for an in-range move.
+    Always,
+}
+
 /// A set of planned changes handed to an adapter's `apply`.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     /// The planned version changes.
     pub changes: Vec<Change>,
+    /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
+    /// flag). Defaults to [`RewriteMode::Auto`].
+    pub rewrite: RewriteMode,
 }
 
 /// Why a planned change was not applied. Skips are `Ok` data, not `Err`.

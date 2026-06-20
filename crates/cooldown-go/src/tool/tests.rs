@@ -325,6 +325,7 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
                     kind: UpdateKind::Major,
                     members: Vec::new(),
                 }],
+                rewrite: cooldown_core::RewriteMode::default(),
             },
         )
         .await

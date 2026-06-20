@@ -246,6 +246,12 @@ pub(in crate::cli) struct GlobalArgs {
     /// (upgrade) also compile/sync after re-locking.
     #[arg(long, global = true)]
     pub(in crate::cli) build: bool,
+    /// (upgrade) Always rewrite the manifest's version constraint to the adopted version, even for
+    /// in-range moves. By default the constraint is left untouched and only the lock moves, unless
+    /// the target falls outside the current constraint (e.g. a cross-major bump), which always
+    /// rewrites the one owning manifest entry.
+    #[arg(long, global = true)]
+    pub(in crate::cli) rewrite: bool,
     /// Sync the policy into native config (e.g. uv `exclude-newer`) before running this command, so
     /// cooldown.toml stays the source of truth. No-op under `--dry-run`.
     #[arg(long, global = true)]

@@ -177,6 +177,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn apply_change(&mut self, change: Change, state: &mut TrialState) -> bool {
         let plan = Plan {
             changes: vec![change.clone()],
+            rewrite: self.ctx.opts.rewrite,
         };
         let journal = match self
             .ctx
