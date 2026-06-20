@@ -353,9 +353,10 @@ pub fn json_schema() -> Value {
             envelope(
                 "baseline",
                 map(&[
-                    ("path", json!({ "type": "string" }))
+                    ("path", json!({ "type": "string" })),
+                    ("dryRun", json!({ "type": "boolean" }))
                 ]),
-                vec!["path"],
+                vec!["path", "dryRun"],
                 "#/$defs/baselineSummary",
                 "#/$defs/baselineItem"
             )

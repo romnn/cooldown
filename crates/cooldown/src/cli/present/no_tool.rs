@@ -139,6 +139,7 @@ fn no_tool_baseline(generated_at: String, error: Diagnostic) -> Result<String, C
             generated_at,
             render::BaselineMeta {
                 path: String::new(),
+                dry_run: false,
             },
             render::BaselineSummary {
                 acknowledged: 0,

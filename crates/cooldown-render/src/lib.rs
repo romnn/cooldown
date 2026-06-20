@@ -163,5 +163,22 @@ mod tests {
                 .iter()
                 .any(|kind| kind == "held")
         );
+        let baseline = schema["oneOf"]
+            .as_array()
+            .expect("envelopes")
+            .iter()
+            .find(|envelope| envelope["properties"]["command"]["const"] == "baseline")
+            .expect("baseline envelope");
+        assert_eq!(
+            baseline["properties"]["dryRun"]["type"],
+            serde_json::Value::String("boolean".into())
+        );
+        assert!(
+            baseline["required"]
+                .as_array()
+                .expect("baseline required properties")
+                .iter()
+                .any(|field| field == "dryRun")
+        );
     }
 }

@@ -35,6 +35,11 @@ fn cmd_init(global: &GlobalArgs) -> Result<Exit, CoreError> {
         eprintln!("refusing to clobber existing {path}");
         return Ok(Exit::Usage);
     }
+    // `--dry-run`: report the file that would be scaffolded without creating it.
+    if global.dry_run {
+        println!("would write {path}");
+        return Ok(Exit::Ok);
+    }
     std::fs::write(&path, STARTER_CONFIG)?;
     println!("wrote {path}");
     Ok(Exit::Ok)

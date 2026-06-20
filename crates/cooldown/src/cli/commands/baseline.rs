@@ -56,7 +56,10 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
     );
 
     let new_baseline = Baseline { entries: merged };
-    new_baseline.save(&path)?;
+    // `--dry-run`: report the baseline that would be written without touching the file.
+    if !ctx.opts.dry_run {
+        new_baseline.save(&path)?;
+    }
     let items: Vec<render::BaselineItem> = new_baseline
         .entries
         .iter()
@@ -78,33 +81,88 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
         ctx.generated_at.to_owned(),
         render::BaselineMeta {
             path: path.to_string(),
+            dry_run: ctx.opts.dry_run,
         },
         summary.clone(),
         items,
     );
 
+    let dry_run = ctx.opts.dry_run;
     emit_envelope(ctx.opts.json, &env, || {
-        let mut text = format!(
-            "wrote {path}: {} acknowledged entr{}",
-            summary.acknowledged,
-            if summary.acknowledged == 1 {
-                "y"
-            } else {
-                "ies"
-            }
-        );
-        if prune && summary.pruned > 0 {
-            text.push('\n');
-            let _ = write!(
-                text,
-                "pruned {} stale entr{}",
-                summary.pruned,
-                if summary.pruned == 1 { "y" } else { "ies" }
-            );
-        }
-        text.push('\n');
-        text
+        baseline_text(&path, &summary, prune, dry_run)
     })?;
 
     Ok(Exit::Ok)
+}
+
+/// The human (non-`--json`) summary line(s). Under `dry_run` the verbs become "would write" /
+/// "would prune", since the file is left untouched.
+fn baseline_text(
+    path: &camino::Utf8Path,
+    summary: &render::BaselineSummary,
+    prune: bool,
+    dry_run: bool,
+) -> String {
+    let mut text = format!(
+        "{} {path}: {} acknowledged {}",
+        if dry_run { "would write" } else { "wrote" },
+        summary.acknowledged,
+        entry_word(summary.acknowledged),
+    );
+    if prune && summary.pruned > 0 {
+        let _ = write!(
+            text,
+            "\n{} {} stale {}",
+            if dry_run { "would prune" } else { "pruned" },
+            summary.pruned,
+            entry_word(summary.pruned),
+        );
+    }
+    text.push('\n');
+    text
+}
+
+fn entry_word(n: usize) -> &'static str {
+    if n == 1 { "entry" } else { "entries" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_text_uses_dry_run_verbs() {
+        let summary = render::BaselineSummary {
+            acknowledged: 2,
+            pruned: 1,
+        };
+
+        assert_eq!(
+            baseline_text(
+                camino::Utf8Path::new("cooldown.baseline.toml"),
+                &summary,
+                true,
+                true
+            ),
+            "would write cooldown.baseline.toml: 2 acknowledged entries\nwould prune 1 stale entry\n"
+        );
+    }
+
+    #[test]
+    fn baseline_text_uses_written_verbs() {
+        let summary = render::BaselineSummary {
+            acknowledged: 1,
+            pruned: 0,
+        };
+
+        assert_eq!(
+            baseline_text(
+                camino::Utf8Path::new("cooldown.baseline.toml"),
+                &summary,
+                false,
+                false
+            ),
+            "wrote cooldown.baseline.toml: 1 acknowledged entry\n"
+        );
+    }
 }
