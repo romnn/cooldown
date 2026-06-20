@@ -56,6 +56,21 @@ pub trait NodeLock: Send + Sync + 'static {
         None
     }
 
+    /// The driver args that refresh the lock pinned to an exact `version`, for the manifest-rewrite
+    /// path (so the lock lands on exactly the cooldown-approved target instead of re-resolving the
+    /// widened range to its newest member).
+    ///
+    /// Unlike [`lockonly_update_args`](NodeLock::lockonly_update_args) this *does* save the
+    /// `^version` range to the **root** manifest as a side effect — npm's `install <name>@<version>`
+    /// has no manifest-free exact pin (its `--no-save` is a no-op for the lock). The caller must
+    /// therefore only use it when the root manifest already declares the dependency (the entry the
+    /// rewrite just widened); for a member-only dependency it would add a spurious root dependency.
+    /// `None` (the default) means the manager has no exact-pin install, so the caller re-resolves.
+    #[must_use]
+    fn pinned_relock_args(_name: &str, _version: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// The driver args that install/verify the resolved graph (the opt-in `--build` step).
     fn build_args() -> Vec<String>;
 }
@@ -195,6 +210,18 @@ impl NodeLock for Npm {
             "--no-audit".into(),
             "--no-fund".into(),
         ]
+    }
+
+    fn pinned_relock_args(name: &str, version: &str) -> Option<Vec<String>> {
+        // `npm install <name>@<version>` pins the lock to exactly that version (and saves the range
+        // to the root `package.json` — the caller gates this on the root declaring the dependency).
+        Some(vec![
+            "install".into(),
+            format!("{name}@{version}"),
+            "--package-lock-only".into(),
+            "--no-audit".into(),
+            "--no-fund".into(),
+        ])
     }
 
     fn build_args() -> Vec<String> {

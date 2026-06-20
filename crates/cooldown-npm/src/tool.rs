@@ -285,14 +285,26 @@ fn lockonly_command<L: NodeLock>(
 /// The command that refreshes the lock after [`manifest::widen_constraints`] rewrote the declaring
 /// manifests for an out-of-range (or `--rewrite`) change.
 ///
-/// Prefer a per-version pin so the lock lands on exactly the cooldown-approved `version`: a bare
+/// Prefer a per-version pin so the lock lands on exactly the cooldown-approved target: a bare
 /// `relock_args` install re-resolves the just-widened range to its *newest* member, which can
-/// overshoot the planned target onto a newer-but-still-too-fresh release that the post-apply cooldown
-/// check then rolls back — silently failing a valid upgrade. The lock-only command pins the exact
-/// version without touching the manifest we just widened (`--no-save`); managers without one (npm,
-/// yarn, bun) re-resolve the whole range.
-fn rewrite_relock<L: NodeLock>(name: &str, version: &str) -> Vec<String> {
-    L::lockonly_update_args(name, version).unwrap_or_else(L::relock_args)
+/// overshoot onto a newer-but-still-too-fresh release that the post-apply cooldown check then rolls
+/// back — silently failing a valid upgrade. pnpm pins the exact version without touching any manifest
+/// (`update --no-save`). npm's exact pin (`install <name>@<version>`) also saves `^version` to the
+/// *root* manifest, so it is used only when the root declares the dependency (the entry we just
+/// widened); for a member-only dependency that would add a spurious root dependency, so we re-resolve
+/// instead (an overshoot is safely rolled back). yarn and bun have no exact pin and re-resolve too.
+fn rewrite_relock<L: NodeLock>(project: &Project, change: &Change) -> Result<Vec<String>> {
+    let name = &change.package.name;
+    let version = change.to.as_str();
+    if let Some(args) = L::lockonly_update_args(name, version) {
+        return Ok(args);
+    }
+    if let Some(args) = L::pinned_relock_args(name, version)
+        && manifest::declared_range(&project.manifest, name)?.is_some()
+    {
+        return Ok(args);
+    }
+    Ok(L::relock_args())
 }
 
 /// Whether the change's target satisfies every range declared for it in the manifests that could own
@@ -355,7 +367,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
                     });
                     continue;
                 }
-                rewrite_relock::<L>(&change.package.name, change.to.as_str())
+                rewrite_relock::<L>(project, change)?
             };
             match self.cmd.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
@@ -821,17 +833,50 @@ mod tests {
 
     #[test]
     fn rewrite_relock_pins_exact_target_where_supported() {
-        // pnpm can pin the exact target without touching the manifest, so the post-widen relock lands
-        // the lock on the cooldown-approved version instead of re-resolving the widened range to a
-        // newer (possibly too-fresh) member.
+        // Root declares `nanoid`, so the post-widen relock lands the lock on exactly the
+        // cooldown-approved version instead of re-resolving the widened range to a newer member.
+        let (_dir, project) = project_declaring("^3.0.0");
+        let change = change("nanoid", "3.1.0", "5.1.11");
+
+        // pnpm pins the exact target without touching the manifest.
         assert_eq!(
-            rewrite_relock::<crate::lock::Pnpm>("nanoid", "5.1.11"),
+            rewrite_relock::<crate::lock::Pnpm>(&project, &change).expect("cmd"),
             ["update", "nanoid@5.1.11", "--lockfile-only", "--no-save"]
         );
-        // npm has no such command, so it re-resolves the widened range (safe: an overshoot onto a
-        // too-fresh version is rolled back by the post-apply cooldown check).
+        // npm pins the exact target via `install <name>@<version>` (the root declares it).
         assert_eq!(
-            rewrite_relock::<Npm>("nanoid", "5.1.11"),
+            rewrite_relock::<Npm>(&project, &change).expect("cmd"),
+            [
+                "install",
+                "nanoid@5.1.11",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund"
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_re_resolves_when_root_does_not_declare_the_dependency() {
+        // A member-only dependency: npm's exact pin would save it to the root manifest, adding a
+        // spurious root dependency, so it re-resolves the widened range instead (safe — an overshoot
+        // is rolled back). The root here declares something else.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "lodash": "^4.0.0" } }"#,
+        )
+        .expect("write manifest");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+        };
+        let change = change("nanoid", "3.1.0", "5.1.11");
+
+        assert_eq!(
+            rewrite_relock::<Npm>(&project, &change).expect("cmd"),
             ["install", "--package-lock-only", "--no-audit", "--no-fund"]
         );
     }
