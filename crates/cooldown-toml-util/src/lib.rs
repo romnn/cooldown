@@ -28,6 +28,38 @@ where
         .map_err(|e| CoreError::Config(format!("{path}: invalid {doc_name}: {e}")))
 }
 
+/// Parse a TOML file into a format-preserving [`toml_edit::DocumentMut`], or `None` if it is absent.
+///
+/// Use this for in-place manifest edits that must preserve comments, key order, and spacing (e.g.
+/// rewriting a dependency's version requirement); pair it with [`write_document`].
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) when the file exists but
+/// cannot be read, or [`CoreError::Config`](cooldown_core::CoreError::Config) when it is not valid
+/// TOML.
+pub fn parse_document(path: &Utf8Path) -> Result<Option<toml_edit::DocumentMut>, CoreError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    };
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map(Some)
+        .map_err(|e| CoreError::Config(format!("{path}: invalid TOML: {e}")))
+}
+
+/// Write a format-preserving [`toml_edit::DocumentMut`] back to disk.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
+/// written.
+pub fn write_document(path: &Utf8Path, doc: &toml_edit::DocumentMut) -> Result<(), CoreError> {
+    std::fs::write(path, doc.to_string()).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))
+}
+
 /// Set a nested string value in a TOML file, format-preserving.
 ///
 /// Navigates (creating intermediate tables as needed) to `keys` and sets the leaf to `val`, leaving

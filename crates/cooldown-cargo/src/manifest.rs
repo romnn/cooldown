@@ -1,0 +1,306 @@
+//! Format-preserving version-constraint rewrites for Cargo manifests.
+//!
+//! `cargo update --precise` can only move the lock *within* a manifest's existing requirement, so a
+//! cross-major bump (past a caret range) or any move outside the declared constraint needs the
+//! `Cargo.toml` itself rewritten. This module finds the one manifest entry that owns a crate's
+//! requirement — a member's `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` entry (or
+//! the `[target.<cfg>.*]` variants), or, when the member inherits with `workspace = true`, the root
+//! `[workspace.dependencies]` entry — and rewrites just that requirement via `toml_edit`, leaving
+//! comments, key order, and every other field of the entry untouched.
+
+use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_core::{CoreError, MemberRef};
+use cooldown_toml_util::{parse_document, write_document};
+use std::collections::BTreeSet;
+use toml_edit::{DocumentMut, Item, TableLike};
+
+/// The manifests a single rewrite touched, relative to the workspace root — used to journal the
+/// write set for rollback and to tell the caller whether anything was actually editable.
+#[derive(Debug, Default)]
+pub struct ManifestRewrite {
+    /// Project-root-relative paths of the manifests that were modified.
+    pub modified: Vec<Utf8PathBuf>,
+}
+
+/// Widen the requirement on `crate_name` so it admits `target`, across every member manifest that
+/// declares it, redirecting an inherited (`workspace = true`) entry to the root
+/// `[workspace.dependencies]`. When attribution gave no members (or none declared it directly), the
+/// root manifest is the best-effort fallback.
+///
+/// Returns the modified manifest paths. An empty result means no editable requirement was found —
+/// the crate is pulled in only transitively, or via a path/git source with no version — so the
+/// caller should report the change as not-applied rather than re-locking.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] if a manifest exists but cannot be read, parsed, or written back.
+pub fn widen_constraint(
+    root: &Utf8Path,
+    members: &[MemberRef],
+    crate_name: &str,
+    target: &str,
+) -> Result<ManifestRewrite, CoreError> {
+    let mut rewrite = ManifestRewrite::default();
+    let mut needs_workspace = false;
+    let mut seen: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+
+    for member in members {
+        let rel = member_manifest_rel(&member.path);
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let abs = root.join(&rel);
+        let Some(mut doc) = parse_document(&abs)? else {
+            continue;
+        };
+        match rewrite_member(&mut doc, crate_name, target) {
+            Edit::Done => {
+                write_document(&abs, &doc)?;
+                rewrite.modified.push(rel);
+            }
+            Edit::Inherited => needs_workspace = true,
+            Edit::NoVersion | Edit::NotFound => {}
+        }
+    }
+
+    // An inherited entry lives in the root `[workspace.dependencies]`; the members-empty / nothing-
+    // found case falls back to the root manifest (workspace table first, then its own dep sections).
+    if needs_workspace || rewrite.modified.is_empty() {
+        let rel = Utf8PathBuf::from("Cargo.toml");
+        let abs = root.join(&rel);
+        if let Some(mut doc) = parse_document(&abs)? {
+            let changed = if needs_workspace {
+                rewrite_workspace(&mut doc, crate_name, target)
+            } else {
+                rewrite_workspace(&mut doc, crate_name, target)
+                    || matches!(rewrite_member(&mut doc, crate_name, target), Edit::Done)
+            };
+            if changed && !rewrite.modified.iter().any(|path| path == &rel) {
+                write_document(&abs, &doc)?;
+                rewrite.modified.push(rel);
+            }
+        }
+    }
+
+    Ok(rewrite)
+}
+
+/// The project-root-relative path of a member's `Cargo.toml` (`.` is the root crate).
+pub(crate) fn member_manifest_rel(member_path: &str) -> Utf8PathBuf {
+    if member_path.is_empty() || member_path == "." {
+        Utf8PathBuf::from("Cargo.toml")
+    } else {
+        Utf8Path::new(member_path).join("Cargo.toml")
+    }
+}
+
+/// What happened when looking for a crate's requirement in one manifest.
+enum Edit {
+    /// The crate is not declared in any of this manifest's dependency sections.
+    NotFound,
+    /// The crate inherits from the workspace (`crate = { workspace = true }`).
+    Inherited,
+    /// The crate is declared but carries no version requirement (a path/git source).
+    NoVersion,
+    /// The requirement was rewritten in place.
+    Done,
+}
+
+/// Try every dependency section of a member manifest, returning the first decisive outcome.
+fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Edit {
+    for section in dependency_section_paths(doc) {
+        let keys: Vec<&str> = section.iter().map(String::as_str).collect();
+        match rewrite_entry(doc, &keys, crate_name, target) {
+            Edit::NotFound => {}
+            decisive => return decisive,
+        }
+    }
+    Edit::NotFound
+}
+
+/// Rewrite a crate's requirement in the root `[workspace.dependencies]` table, if present.
+fn rewrite_workspace(doc: &mut DocumentMut, crate_name: &str, target: &str) -> bool {
+    matches!(
+        rewrite_entry(doc, &["workspace", "dependencies"], crate_name, target),
+        Edit::Done
+    )
+}
+
+/// The dotted key paths of every dependency table in a manifest, including per-target sections.
+fn dependency_section_paths(doc: &DocumentMut) -> Vec<Vec<String>> {
+    let kinds = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut paths: Vec<Vec<String>> = kinds.iter().map(|kind| vec![(*kind).to_string()]).collect();
+    if let Some(target) = doc.get("target").and_then(Item::as_table_like) {
+        for (cfg, _) in target.iter() {
+            for kind in kinds {
+                paths.push(vec!["target".to_string(), cfg.to_string(), kind.to_string()]);
+            }
+        }
+    }
+    paths
+}
+
+/// Rewrite `crate_name`'s requirement under the table at `section`, if it is declared there.
+fn rewrite_entry(doc: &mut DocumentMut, section: &[&str], crate_name: &str, target: &str) -> Edit {
+    let Some(table) = navigate_mut(doc, section) else {
+        return Edit::NotFound;
+    };
+    let Some(item) = table.get_mut(crate_name) else {
+        return Edit::NotFound;
+    };
+    rewrite_dep_item(item, target)
+}
+
+/// Rewrite one dependency entry, handling the bare-string form (`dep = "1"`) and the table form
+/// (`dep = { version = "1", … }` / `[deps.dep]`), preserving every other field.
+fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
+    if let Some(req) = item.as_str().map(str::to_owned) {
+        *item = toml_edit::value(bump_req(&req, target));
+        return Edit::Done;
+    }
+    let Some(table) = item.as_table_like_mut() else {
+        return Edit::NotFound;
+    };
+    if table.get("workspace").and_then(Item::as_bool) == Some(true) {
+        return Edit::Inherited;
+    }
+    if let Some(version) = table.get_mut("version")
+        && let Some(req) = version.as_str().map(str::to_owned)
+    {
+        *version = toml_edit::value(bump_req(&req, target));
+        return Edit::Done;
+    }
+    Edit::NoVersion
+}
+
+/// Descend `path` into a mutable table-like node, or `None` if any segment is missing or not a table.
+fn navigate_mut<'doc>(
+    doc: &'doc mut DocumentMut,
+    path: &[&str],
+) -> Option<&'doc mut dyn TableLike> {
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for key in path {
+        table = table.get_mut(key)?.as_table_like_mut()?;
+    }
+    Some(table)
+}
+
+/// Produce a requirement that admits `target`, preserving the old requirement's leading comparator.
+///
+/// A bare or caret requirement maps to the caret-equivalent on the target (`^1` → `^2.3.0`, `1` →
+/// `2.3.0`); other single comparators keep their operator (`>=1` → `>=2.3.0`, `~1.2` → `~2.3.0`).
+/// A multi-comparator or wildcard requirement is replaced with a caret on the target, the least
+/// surprising default. Exact `=` pins never reach here — they are held and skipped before apply.
+fn bump_req(old: &str, target: &str) -> String {
+    let trimmed = old.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(',')
+        || trimmed.contains('*')
+        || trimmed.contains('|')
+        || trimmed.contains(char::is_whitespace)
+    {
+        return format!("^{target}");
+    }
+    for op in ["<=", ">=", "^", "~", "=", "<", ">"] {
+        if trimmed.starts_with(op) {
+            return format!("{op}{target}");
+        }
+    }
+    target.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(name: &str, path: &str) -> MemberRef {
+        MemberRef {
+            name: name.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn bump_req_preserves_operator_family() {
+        assert_eq!(bump_req("1", "2.3.0"), "2.3.0");
+        assert_eq!(bump_req("^1.2", "2.3.0"), "^2.3.0");
+        assert_eq!(bump_req("~1.2", "2.3.0"), "~2.3.0");
+        assert_eq!(bump_req(">=1.0", "2.3.0"), ">=2.3.0");
+        assert_eq!(bump_req(">=1, <2", "2.3.0"), "^2.3.0");
+    }
+
+    #[test]
+    fn rewrites_bare_string_requirement_in_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\n# pinned for a reason\nserde = \"1\"\n",
+        )
+        .expect("write");
+
+        let rewrite =
+            widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
+
+        assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("crates/app/Cargo.toml")]);
+        let after = std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read");
+        assert!(after.contains("serde = \"2.3.0\""), "{after}");
+        assert!(after.contains("# pinned for a reason"), "comment kept: {after}");
+    }
+
+    #[test]
+    fn rewrites_table_version_and_keeps_features() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[dependencies]\nserde = { version = \"^1.0\", features = [\"derive\"] }\n",
+        )
+        .expect("write");
+
+        let rewrite =
+            widen_constraint(root, &[member("root", ".")], "serde", "2.3.0").expect("widen");
+
+        assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
+        let after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
+        assert!(after.contains("version = \"^2.3.0\""), "{after}");
+        assert!(after.contains("features = [\"derive\"]"), "features kept: {after}");
+    }
+
+    #[test]
+    fn inherited_member_rewrites_workspace_dependencies_not_the_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n\n[workspace.dependencies]\nserde = \"1\"\n",
+        )
+        .expect("write root");
+        let member_manifest = "[package]\nname = \"app\"\n\n[dependencies]\nserde = { workspace = true, features = [\"derive\"] }\n";
+        std::fs::write(root.join("crates/app/Cargo.toml"), member_manifest).expect("write member");
+
+        let rewrite =
+            widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
+
+        assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
+        let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
+        assert!(root_after.contains("serde = \"2.3.0\""), "{root_after}");
+        let member_after =
+            std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read member");
+        assert_eq!(member_after, member_manifest, "inherited member is untouched");
+    }
+
+    #[test]
+    fn transitive_only_dependency_is_not_editable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::write(root.join("Cargo.toml"), "[dependencies]\nserde = \"1\"\n").expect("write");
+
+        // `tokio` is declared nowhere — a transitive-only crate cannot be widened.
+        let rewrite =
+            widen_constraint(root, &[member("root", ".")], "tokio", "2.3.0").expect("widen");
+        assert!(rewrite.modified.is_empty());
+    }
+}

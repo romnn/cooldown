@@ -5,6 +5,7 @@
 
 mod artifact;
 pub mod lock;
+mod manifest;
 mod native;
 pub mod pypi;
 pub mod tool;

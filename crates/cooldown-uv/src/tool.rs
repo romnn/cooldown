@@ -4,20 +4,20 @@
 
 use crate::artifact::published_at_for_artifacts;
 use crate::lock::UvLock;
+use crate::manifest;
 use crate::native::parse_native;
 use crate::pypi::{PYPI, PyPi};
 use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
-use cooldown_adapter_util::{
-    build_registry_releases, single_lock_journal, skipped_on_apply_error, verify_current_report,
-};
+use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
-    ApplyReport, ArtifactScope, Capabilities, DepScope, Dependency, FetchContext, MemberRef,
+    ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext, MemberRef,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
-    Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport,
+    Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -249,6 +249,70 @@ impl ToolRead for UvTool {
     }
 }
 
+/// The result of applying one change: adopted, or skipped with a reason. Tool-spawn failures
+/// propagate as `Err` instead, so a broken `uv` aborts rather than masquerading as a per-change skip.
+enum ChangeOutcome {
+    Applied,
+    Skipped(SkipReason),
+}
+
+impl UvTool {
+    /// Apply one change, honoring the [`RewriteMode`]. `Auto` first tries to move the lock within the
+    /// declared requirement (`uv lock --upgrade-package name==version`) and only rewrites the
+    /// `pyproject.toml` constraint when that is rejected — typically because the target is past an
+    /// upper bound. `Always` rewrites the requirement up front (a no-op for an unconstrained dep).
+    async fn apply_change(
+        &self,
+        project: &Project,
+        change: &Change,
+        mode: RewriteMode,
+    ) -> Result<ChangeOutcome> {
+        match mode {
+            RewriteMode::Always => {
+                manifest::widen_constraint(
+                    &project.manifest,
+                    &change.package.name,
+                    change.to.as_str(),
+                )?;
+                self.relock(project, change).await
+            }
+            RewriteMode::Auto => match self.lock_to_target(project, change).await {
+                Ok(()) => Ok(ChangeOutcome::Applied),
+                Err(err) if err.is_tool_spawn_failure() => Err(err),
+                Err(_) => {
+                    // The lock-only move was rejected. If the requirement can be widened, do so and
+                    // retry; otherwise there is no constraint to relax, so it is a real conflict.
+                    let widened = manifest::widen_constraint(
+                        &project.manifest,
+                        &change.package.name,
+                        change.to.as_str(),
+                    )?;
+                    if !widened {
+                        return Ok(ChangeOutcome::Skipped(SkipReason::NotEligible));
+                    }
+                    self.relock(project, change).await
+                }
+            },
+        }
+    }
+
+    /// Re-lock to the target after a (possible) constraint rewrite, mapping a resolver rejection to a
+    /// skip and a spawn failure to a fatal error.
+    async fn relock(&self, project: &Project, change: &Change) -> Result<ChangeOutcome> {
+        match self.lock_to_target(project, change).await {
+            Ok(()) => Ok(ChangeOutcome::Applied),
+            Err(err) if err.is_tool_spawn_failure() => Err(err),
+            Err(_) => Ok(ChangeOutcome::Skipped(SkipReason::ResolverConflict)),
+        }
+    }
+
+    async fn lock_to_target(&self, project: &Project, change: &Change) -> Result<()> {
+        self.uv
+            .upgrade_to(&project.root, &change.package.name, change.to.as_str())
+            .await
+    }
+}
+
 #[async_trait]
 impl ToolWrite for UvTool {
     async fn mutation_journal(
@@ -256,7 +320,18 @@ impl ToolWrite for UvTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        single_lock_journal(&project.root, Utf8Path::new("uv.lock"))
+        // Capture the lock and the manifest: `apply` re-locks (uv.lock) and, when the target falls
+        // outside the declared requirement, rewrites the constraint (pyproject.toml). Capturing the
+        // manifest unconditionally is harmless — restore runs only on rollback.
+        Ok(ProjectMutationJournal {
+            files: vec![
+                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("uv.lock"))?,
+                ProjectMutationJournal::capture_file(
+                    &project.root,
+                    Utf8Path::new("pyproject.toml"),
+                )?,
+            ],
+        })
     }
 
     async fn apply(
@@ -267,13 +342,13 @@ impl ToolWrite for UvTool {
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            match self
-                .uv
-                .upgrade_to(&project.root, &change.package.name, change.to.as_str())
-                .await
-            {
-                Ok(()) => report.applied.push(change.clone()),
-                Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
+            match self.apply_change(project, change, plan.rewrite).await? {
+                ChangeOutcome::Applied => report.applied.push(change.clone()),
+                ChangeOutcome::Skipped(reason) => report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason,
+                    offending: Some(change.package.clone()),
+                }),
             }
         }
         Ok(report)
@@ -297,7 +372,8 @@ impl ToolWrite for UvTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use cooldown_core::{ArtifactId, Change, CoreError, FetchContext, RawArtifact, RawRelease};
+    use cooldown_adapter_util::skipped_on_apply_error;
+    use cooldown_core::{ArtifactId, CoreError, FetchContext, RawArtifact, RawRelease};
     use jiff::Timestamp;
 
     #[test]

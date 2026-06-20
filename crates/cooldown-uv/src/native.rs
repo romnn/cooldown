@@ -70,8 +70,20 @@ fn exact_pin(requirement: &str) -> Option<String> {
     (!version.is_empty() && !version.contains('*')).then(|| normalize_name(name))
 }
 
+/// The PEP 503-normalized package name of a PEP 508 requirement string (`httpx[http2]>=0.27 ; …` →
+/// `httpx`), or `None` when no name is present. Unlike [`exact_pin`], this ignores the specifier — it
+/// is used to match a requirement entry for rewriting, regardless of its constraint.
+pub(crate) fn requirement_name(requirement: &str) -> Option<String> {
+    let req = requirement.split(';').next().unwrap_or(requirement).trim();
+    let name_end = req
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(req.len());
+    let name = &req[..name_end];
+    (!name.is_empty()).then(|| normalize_name(name))
+}
+
 /// PEP 503 name normalization: lowercase, with each run of `-`, `_`, `.` collapsed to a single `-`.
-fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut at_separator = false;
     for ch in name.chars() {

@@ -4,19 +4,20 @@
 
 use crate::cargocmd::Cargo;
 use crate::index::{CRATES_IO, CratesIoIndex};
+use crate::manifest;
 use crate::native::parse_native;
 use crate::version;
 use async_trait::async_trait;
-use camino::Utf8Path;
-use cooldown_adapter_util::{
-    build_registry_releases, single_lock_journal, skipped_on_apply_error, verify_current_report,
-};
+use camino::Utf8PathBuf;
+use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
-    ApplyReport, Capabilities, DepScope, Dependency, FetchContext, NativePolicyLayer, PackageId,
-    PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseOrder,
-    ReleaseQuality, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext, NativePolicyLayer,
+    PackageId, PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
+    ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
+use std::collections::BTreeSet;
 
 /// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
 pub const CARGO_ID: ToolId = ToolId("cargo");
@@ -178,14 +179,98 @@ impl ToolRead for CargoTool {
     }
 }
 
+/// The result of applying one change: adopted, or skipped with a reason. Tool-spawn failures are
+/// not represented here — they propagate as `Err` so a broken `cargo` aborts rather than masquerading
+/// as a per-change skip.
+enum ChangeOutcome {
+    Applied,
+    Skipped(SkipReason),
+}
+
+impl CargoTool {
+    /// Apply one change, honoring the [`RewriteMode`]. `Auto` first tries to move the lock within the
+    /// existing requirement (`cargo update --precise`) and only rewrites the manifest when that is
+    /// rejected — typically because the target is past the declared range (a cross-major bump).
+    /// `Always` rewrites the owning manifest entry up front.
+    async fn apply_change(
+        &self,
+        project: &Project,
+        change: &Change,
+        mode: RewriteMode,
+    ) -> Result<ChangeOutcome> {
+        match mode {
+            RewriteMode::Always => self.rewrite_then_lock(project, change).await,
+            RewriteMode::Auto => match self.precise_lock(project, change).await {
+                Ok(()) => Ok(ChangeOutcome::Applied),
+                Err(err) if err.is_tool_spawn_failure() => Err(err),
+                // The lock-only move was rejected (the target is outside the manifest constraint, or
+                // a genuine resolver conflict). Widen the constraint and retry; if that also fails it
+                // is a real conflict, reported as a skip.
+                Err(_) => self.rewrite_then_lock(project, change).await,
+            },
+        }
+    }
+
+    /// Rewrite the owning manifest entry to admit the target, then re-pin the lock to it.
+    async fn rewrite_then_lock(
+        &self,
+        project: &Project,
+        change: &Change,
+    ) -> Result<ChangeOutcome> {
+        let rewrite = manifest::widen_constraint(
+            &project.root,
+            &change.members,
+            &change.package.name,
+            change.to.as_str(),
+        )?;
+        if rewrite.modified.is_empty() {
+            // No editable requirement: the crate is transitive-only or a path/git source. Nothing to
+            // widen, so it cannot be adopted by `upgrade`.
+            return Ok(ChangeOutcome::Skipped(SkipReason::NotEligible));
+        }
+        match self.precise_lock(project, change).await {
+            Ok(()) => Ok(ChangeOutcome::Applied),
+            Err(err) if err.is_tool_spawn_failure() => Err(err),
+            Err(_) => Ok(ChangeOutcome::Skipped(SkipReason::ResolverConflict)),
+        }
+    }
+
+    async fn precise_lock(&self, project: &Project, change: &Change) -> Result<()> {
+        self.cargo
+            .update_precise(
+                &project.root,
+                &change.package.name,
+                change.from.as_str(),
+                change.to.as_str(),
+            )
+            .await
+    }
+}
+
 #[async_trait]
 impl ToolWrite for CargoTool {
     async fn mutation_journal(
         &self,
         project: &Project,
-        _plan: &Plan,
+        plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        single_lock_journal(&project.root, Utf8Path::new("Cargo.lock"))
+        // Capture the lock and every manifest a rewrite could touch (the root, for
+        // `[workspace.dependencies]`, plus each declaring member) so a rejected trial rolls back
+        // both the re-lock and any constraint edit. Capturing an unmodified manifest is harmless —
+        // restore only runs on rollback and rewrites identical bytes.
+        let mut relative: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+        relative.insert(Utf8PathBuf::from("Cargo.lock"));
+        relative.insert(Utf8PathBuf::from("Cargo.toml"));
+        for change in &plan.changes {
+            for member in &change.members {
+                relative.insert(manifest::member_manifest_rel(&member.path));
+            }
+        }
+        let mut files = Vec::with_capacity(relative.len());
+        for rel in relative {
+            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
+        }
+        Ok(ProjectMutationJournal { files })
     }
 
     async fn apply(
@@ -196,21 +281,13 @@ impl ToolWrite for CargoTool {
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            match self
-                .cargo
-                .update_precise(
-                    &project.root,
-                    &change.package.name,
-                    change.from.as_str(),
-                    change.to.as_str(),
-                )
-                .await
-            {
-                Ok(()) => report.applied.push(change.clone()),
-                Err(e) => {
-                    // A `=`-pin or resolver conflict blocks `--precise`.
-                    report.skipped.push(skipped_on_apply_error(change, e)?);
-                }
+            match self.apply_change(project, change, plan.rewrite).await? {
+                ChangeOutcome::Applied => report.applied.push(change.clone()),
+                ChangeOutcome::Skipped(reason) => report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason,
+                    offending: Some(change.package.clone()),
+                }),
             }
         }
         Ok(report)
@@ -225,7 +302,8 @@ impl ToolWrite for CargoTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use cooldown_core::{Change, CoreError};
+    use cooldown_adapter_util::skipped_on_apply_error;
+    use cooldown_core::CoreError;
 
     #[test]
     fn apply_spawn_failure_is_not_downgraded_to_skip() {
