@@ -40,8 +40,22 @@ pub trait NodeLock: Send + Sync + 'static {
         MemberIndex::default()
     }
 
-    /// The driver args that re-pin `name` to `version`, re-resolving the lock.
+    /// The driver args that re-pin `name` to `version`, re-resolving the lock. This selects the
+    /// version *through the manifest*: it rewrites the `package.json` range (the floor) as well as
+    /// the lock, since `add`/`install <name>@<version>` is how these tools adopt a version.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
+
+    /// The driver args that move **only** the lock to an exact, already-in-range `version`, leaving
+    /// the declared `package.json` range untouched — the lock-only path for `RewriteMode::Auto`.
+    ///
+    /// `None` (the default) means the package manager has no such command, so it always rewrites the
+    /// manifest. The caller must only use this when `version` already satisfies the declared range:
+    /// these commands re-pin whatever version they are given without validating it against the range,
+    /// so an out-of-range version would leave the lock inconsistent with `package.json`.
+    #[must_use]
+    fn lockonly_update_args(_name: &str, _version: &str) -> Option<Vec<String>> {
+        None
+    }
 
     /// The driver args that install/verify the resolved graph (the opt-in `--build` step).
     fn build_args() -> Vec<String>;
@@ -211,6 +225,17 @@ impl NodeLock for Pnpm {
             format!("{name}@{version}"),
             "--lockfile-only".into(),
         ]
+    }
+
+    fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {
+        // `pnpm update <name>@<version>` re-pins the lock to exactly that version; `--no-save` keeps
+        // the `package.json` range as the author wrote it, and `--lockfile-only` skips node_modules.
+        Some(vec![
+            "update".into(),
+            format!("{name}@{version}"),
+            "--lockfile-only".into(),
+            "--no-save".into(),
+        ])
     }
 
     fn build_args() -> Vec<String> {

@@ -10,15 +10,16 @@ use crate::nodecmd::NodeCmd;
 use crate::registry::{NPM, NpmRegistry};
 use crate::version;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
     build_registry_releases, skipped_on_apply_error, verify_current_report,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, CoreError, DepScope, Dependency, FetchContext,
-    MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
-    Result, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
+    ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
+    FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
+    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality,
+    ResolvedPolicy, Result, RewriteMode, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport,
+    Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{HashMap, HashSet};
@@ -240,6 +241,60 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     }
 }
 
+/// Choose the driver command for one change.
+///
+/// In `Auto` mode, when the package manager offers a lock-only update (only pnpm does) and the target
+/// already satisfies the declared `package.json` range, move just the lock and leave the range as the
+/// author wrote it. Otherwise — `Always`, a manager without a lock-only path, an out-of-range target,
+/// or a range we cannot evaluate — fall back to `upgrade_args`, which rewrites the range. The
+/// in-range check happens up front because the lock-only commands re-pin whatever version they are
+/// given without validating it, so an out-of-range version would leave the lock inconsistent with
+/// `package.json`.
+fn upgrade_command<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    mode: RewriteMode,
+) -> Result<Vec<String>> {
+    let name = &change.package.name;
+    let version = change.to.as_str();
+    if mode == RewriteMode::Auto
+        && let Some(lockonly) = L::lockonly_update_args(name, version)
+        && target_in_declared_range(project, change)?
+    {
+        return Ok(lockonly);
+    }
+    Ok(L::upgrade_args(name, version))
+}
+
+/// Whether the change's target satisfies the range declared for it in any manifest that could own it
+/// (the project root, plus each declaring member). A dependency not found in any of them returns
+/// `false`, so the caller rewrites rather than risk an inconsistent lock.
+fn target_in_declared_range(project: &Project, change: &Change) -> Result<bool> {
+    for manifest in candidate_manifests(project, change) {
+        if let Some(range) = manifest::declared_range(&manifest, &change.package.name)? {
+            return Ok(version::version_in_range(&range, change.to.as_str()));
+        }
+    }
+    Ok(false)
+}
+
+/// The `package.json` manifests that might declare a change's dependency: the project root plus each
+/// declaring workspace member, root-relative paths resolved against the project root.
+fn candidate_manifests(project: &Project, change: &Change) -> Vec<Utf8PathBuf> {
+    let mut manifests = vec![project.manifest.clone()];
+    for member in &change.members {
+        let manifest = if member.path.is_empty() || member.path == "." {
+            project.root.join("package.json")
+        } else {
+            project.root.join(&member.path).join("package.json")
+        };
+        if !manifests.contains(&manifest) {
+            manifests.push(manifest);
+        }
+    }
+    manifests
+}
+
 #[async_trait]
 impl<L: NodeLock> ToolWrite for NpmTool<L> {
     async fn mutation_journal(
@@ -256,15 +311,9 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         plan: &Plan,
         _journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
-        // The npm-family CLIs select a version through the manifest: `add`/`install <name>@<version>`
-        // rewrites the `package.json` range and re-pins the lock together — there is no lock-only way
-        // to pin an exact in-range version (no equivalent of cargo's `--precise`). So a `package.json`
-        // rewrite is inherent to adopting any version here, and the `plan.rewrite` mode is not
-        // consulted: both modes rewrite. A cross-major bump works the same way, so `upgrade` already
-        // crosses majors for these tools without special handling.
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            let args = L::upgrade_args(&change.package.name, change.to.as_str());
+            let args = upgrade_command::<L>(project, change, plan.rewrite)?;
             match self.cmd.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
                 Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
@@ -597,5 +646,64 @@ mod tests {
 
         let restored = std::fs::read_to_string(root.join("package-lock.json")).expect("read lock");
         assert_eq!(restored, "{\"original\":true}");
+    }
+
+    fn change(name: &str, from: &str, to: &str) -> Change {
+        Change {
+            package: PackageId::new(Npm::ID, name, Some(NPM.to_string())),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: cooldown_core::UpdateKind::Minor,
+            members: Vec::new(),
+        }
+    }
+
+    fn project_declaring(spec: &str) -> (tempfile::TempDir, Project) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{ "dependencies": {{ "nanoid": "{spec}" }} }}"#),
+        )
+        .expect("write manifest");
+        let project = Project {
+            root: root.clone(),
+            kind: crate::lock::Pnpm::ID,
+            manifest: root.join("package.json"),
+        };
+        (dir, project)
+    }
+
+    #[test]
+    fn pnpm_uses_lock_only_in_range_and_rewrites_out_of_range_or_always() {
+        let (_dir, project) = project_declaring("^3.0.0");
+
+        // In-range minor under Auto → lock-only `pnpm update --no-save` (the declared range stands).
+        let in_range = change("nanoid", "3.1.0", "3.3.0");
+        let args = upgrade_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Auto)
+            .expect("command");
+        assert_eq!(args, ["update", "nanoid@3.3.0", "--lockfile-only", "--no-save"]);
+
+        // Out-of-range (cross-major) under Auto → rewrite via `pnpm add`.
+        let major = change("nanoid", "3.1.0", "5.0.0");
+        let args =
+            upgrade_command::<crate::lock::Pnpm>(&project, &major, RewriteMode::Auto).expect("cmd");
+        assert_eq!(args, ["add", "nanoid@5.0.0", "--lockfile-only"]);
+
+        // `--rewrite` (Always) rewrites even an in-range move.
+        let args = upgrade_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Always)
+            .expect("command");
+        assert_eq!(args, ["add", "nanoid@3.3.0", "--lockfile-only"]);
+    }
+
+    #[test]
+    fn npm_has_no_lock_only_path_so_always_rewrites() {
+        let (_dir, project) = project_declaring("^3.0.0");
+        let in_range = change("nanoid", "3.1.0", "3.3.0");
+        // Even Auto + in-range falls back to the rewriting `npm install` (no lock-only command).
+        let args =
+            upgrade_command::<Npm>(&project, &in_range, RewriteMode::Auto).expect("command");
+        assert_eq!(args.first().map(String::as_str), Some("install"));
+        assert!(args.iter().any(|arg| arg == "nanoid@3.3.0"));
     }
 }

@@ -64,9 +64,10 @@ key order, and spacing are kept) and, for a Cargo workspace, an inherited `dep =
 is widened in the root `[workspace.dependencies]`.
 
 Pass `--rewrite` to always rewrite the declared constraint to the adopted version, even for an
-in-range move (so `^1.4` becomes `^1.5`). Tools whose package manager couples version selection to
-the manifest — npm/pnpm (`add`/`install`) and Go (`go.mod` is the version source) — always rewrite
-the manifest; they have no lock-only equivalent of cargo's `--precise`.
+in-range move (so `^1.4` becomes `^1.5`). The lock-only default is honored where the tool can pin an
+exact in-range version without editing the manifest: cargo (`update --precise`), uv
+(`lock --upgrade-package`), and pnpm (`update --no-save`). npm, yarn, and bun have no such command,
+and Go's `go.mod` *is* the version source, so those always rewrite the manifest regardless of mode.
 
 The happy path is zero config. Raising the whole repo to 14 days is one line of `cooldown.toml`:
 

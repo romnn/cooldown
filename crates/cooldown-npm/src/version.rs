@@ -25,6 +25,34 @@ pub fn parse(v: &str) -> Option<Version> {
     Version::parse(v).ok()
 }
 
+/// Whether `target` satisfies the declared `package.json` range `spec` — used to decide whether a
+/// lock-only move (pnpm `update --no-save`) stays inside the author's constraint or needs a manifest
+/// rewrite instead.
+///
+/// Conservative by design: a range this `semver`-crate parser cannot represent (npm hyphen ranges,
+/// `||` unions, space-separated `AND`, `x`/`X` wildcards, `workspace:`/`catalog:` protocols) returns
+/// `false`, so the caller falls back to rewriting the manifest — always correct, just less minimal
+/// than a lock-only move would have been.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_npm::version::version_in_range;
+///
+/// assert!(version_in_range("^3.0.0", "3.4.1"));
+/// assert!(!version_in_range("^3.0.0", "4.0.0"));
+/// assert!(!version_in_range("workspace:*", "3.4.1")); // unrepresentable → rewrite
+/// ```
+#[must_use]
+pub fn version_in_range(spec: &str, target: &str) -> bool {
+    let (Ok(requirement), Ok(version)) =
+        (semver::VersionReq::parse(spec), Version::parse(target))
+    else {
+        return false;
+    };
+    requirement.matches(&version)
+}
+
 /// Returns `true` when `v` carries a prerelease segment (e.g. `1.0.0-rc.1`).
 ///
 /// A stable release ⟺ no prerelease segment. An unparsable version is treated as not a prerelease.
