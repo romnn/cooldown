@@ -18,11 +18,11 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
     ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality,
-    ResolvedPolicy, Result, RewriteMode, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport,
-    Version, WindowSpec,
+    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead,
+    ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 
 /// Resolve each member path to its `package.json` "name", read once per `dependencies()` call. A
@@ -105,15 +105,31 @@ pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release
     )
 }
 
-/// Captures `package.json` and the lockfile as the mutation journal: an apply re-pins the manifest
-/// *and* re-resolves the lock, so both must be restorable to undo a skipped change.
-fn journal<L: NodeLock>(project: &Project) -> Result<ProjectMutationJournal> {
-    Ok(ProjectMutationJournal {
-        files: vec![
-            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("package.json"))?,
-            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new(L::LOCKFILE))?,
-        ],
-    })
+/// Captures the lockfile and every package manifest this plan could rewrite.
+fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutationJournal> {
+    let mut seen = BTreeSet::new();
+    let mut rels = Vec::new();
+    push_journal_rel(&mut rels, &mut seen, Utf8PathBuf::from(L::LOCKFILE));
+    for change in &plan.changes {
+        for rel in manifest::manifest_rels(&change.members) {
+            push_journal_rel(&mut rels, &mut seen, rel);
+        }
+    }
+    let mut files = Vec::with_capacity(rels.len());
+    for rel in rels {
+        files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
+    }
+    Ok(ProjectMutationJournal { files })
+}
+
+fn push_journal_rel(
+    rels: &mut Vec<Utf8PathBuf>,
+    seen: &mut BTreeSet<Utf8PathBuf>,
+    rel: Utf8PathBuf,
+) {
+    if seen.insert(rel.clone()) {
+        rels.push(rel);
+    }
 }
 
 #[async_trait]
@@ -241,58 +257,67 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     }
 }
 
-/// Choose the driver command for one change.
+/// Choose the lock-only driver command for one change, when the package manager supports one.
 ///
 /// In `Auto` mode, when the package manager offers a lock-only update (only pnpm does) and the target
 /// already satisfies the declared `package.json` range, move just the lock and leave the range as the
-/// author wrote it. Otherwise — `Always`, a manager without a lock-only path, an out-of-range target,
-/// or a range we cannot evaluate — fall back to `upgrade_args`, which rewrites the range. The
-/// in-range check happens up front because the lock-only commands re-pin whatever version they are
-/// given without validating it, so an out-of-range version would leave the lock inconsistent with
-/// `package.json`.
-fn upgrade_command<L: NodeLock>(
+/// author wrote it. Otherwise — `Always`, a manager without a lock-only path, an out-of-range
+/// target, or a range we cannot evaluate — the caller rewrites the declaring package manifests and
+/// refreshes the lock. The in-range check happens up front because lock-only commands re-pin whatever
+/// version they are given without validating it, so an out-of-range version would leave the lock
+/// inconsistent with `package.json`.
+fn lockonly_command<L: NodeLock>(
     project: &Project,
     change: &Change,
     mode: RewriteMode,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let name = &change.package.name;
     let version = change.to.as_str();
     if mode == RewriteMode::Auto
         && let Some(lockonly) = L::lockonly_update_args(name, version)
         && target_in_declared_range(project, change)?
     {
-        return Ok(lockonly);
+        return Ok(Some(lockonly));
     }
-    Ok(L::upgrade_args(name, version))
+    Ok(None)
 }
 
-/// Whether the change's target satisfies the range declared for it in any manifest that could own it
-/// (the project root, plus each declaring member). A dependency not found in any of them returns
+/// The command that refreshes the lock after [`manifest::widen_constraints`] rewrote the declaring
+/// manifests for an out-of-range (or `--rewrite`) change.
+///
+/// Prefer a per-version pin so the lock lands on exactly the cooldown-approved `version`: a bare
+/// `relock_args` install re-resolves the just-widened range to its *newest* member, which can
+/// overshoot the planned target onto a newer-but-still-too-fresh release that the post-apply cooldown
+/// check then rolls back — silently failing a valid upgrade. The lock-only command pins the exact
+/// version without touching the manifest we just widened (`--no-save`); managers without one (npm,
+/// yarn, bun) re-resolve the whole range.
+fn rewrite_relock<L: NodeLock>(name: &str, version: &str) -> Vec<String> {
+    L::lockonly_update_args(name, version).unwrap_or_else(L::relock_args)
+}
+
+/// Whether the change's target satisfies every range declared for it in the manifests that could own
+/// it (the project root, plus each declaring member). A dependency not found in any of them returns
 /// `false`, so the caller rewrites rather than risk an inconsistent lock.
 fn target_in_declared_range(project: &Project, change: &Change) -> Result<bool> {
+    let mut found = false;
     for manifest in candidate_manifests(project, change) {
         if let Some(range) = manifest::declared_range(&manifest, &change.package.name)? {
-            return Ok(version::version_in_range(&range, change.to.as_str()));
+            found = true;
+            if !version::version_in_range(&range, change.to.as_str()) {
+                return Ok(false);
+            }
         }
     }
-    Ok(false)
+    Ok(found)
 }
 
 /// The `package.json` manifests that might declare a change's dependency: the project root plus each
 /// declaring workspace member, root-relative paths resolved against the project root.
 fn candidate_manifests(project: &Project, change: &Change) -> Vec<Utf8PathBuf> {
-    let mut manifests = vec![project.manifest.clone()];
-    for member in &change.members {
-        let manifest = if member.path.is_empty() || member.path == "." {
-            project.root.join("package.json")
-        } else {
-            project.root.join(&member.path).join("package.json")
-        };
-        if !manifests.contains(&manifest) {
-            manifests.push(manifest);
-        }
-    }
-    manifests
+    manifest::manifest_rels(&change.members)
+        .into_iter()
+        .map(|rel| project.root.join(rel))
+        .collect()
 }
 
 #[async_trait]
@@ -300,9 +325,9 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
     async fn mutation_journal(
         &self,
         project: &Project,
-        _plan: &Plan,
+        plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        journal::<L>(project)
+        journal::<L>(project, plan)
     }
 
     async fn apply(
@@ -313,7 +338,25 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            let args = upgrade_command::<L>(project, change, plan.rewrite)?;
+            let args = if let Some(args) = lockonly_command::<L>(project, change, plan.rewrite)? {
+                args
+            } else {
+                let rewrite = manifest::widen_constraints(
+                    &project.root,
+                    &change.members,
+                    &change.package.name,
+                    change.to.as_str(),
+                )?;
+                if rewrite.modified.is_empty() {
+                    report.skipped.push(Skipped {
+                        change: change.clone(),
+                        reason: SkipReason::NotEligible,
+                        offending: Some(change.package.clone()),
+                    });
+                    continue;
+                }
+                rewrite_relock::<L>(&change.package.name, change.to.as_str())
+            };
             match self.cmd.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
                 Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
@@ -638,14 +681,66 @@ mod tests {
         };
 
         let captured = tool()
-            .mutation_journal(&project, &Plan::default())
+            .mutation_journal(
+                &project,
+                &Plan {
+                    changes: vec![change("nanoid", "3.1.0", "3.3.0")],
+                    rewrite: RewriteMode::Auto,
+                },
+            )
             .await
             .expect("journal");
+        std::fs::write(root.join("package.json"), "{\"mutated\":true}").expect("mutate manifest");
         std::fs::write(root.join("package-lock.json"), "{\"mutated\":true}").expect("mutate lock");
         captured.restore(&project.root).expect("restore");
 
+        let restored_manifest =
+            std::fs::read_to_string(root.join("package.json")).expect("read manifest");
+        assert_eq!(restored_manifest, "{\"name\":\"demo\"}");
         let restored = std::fs::read_to_string(root.join("package-lock.json")).expect("read lock");
         assert_eq!(restored, "{\"original\":true}");
+    }
+
+    #[tokio::test]
+    async fn mutation_journal_restores_member_manifests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("apps/a")).expect("mkdir");
+        std::fs::write(root.join("package.json"), "{\"name\":\"root\"}").expect("root manifest");
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "dependencies": { "nanoid": "^3.0.0" } }"#,
+        )
+        .expect("member manifest");
+        std::fs::write(root.join("package-lock.json"), "{\"original\":true}").expect("lock");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+        };
+        let mut planned = change("nanoid", "3.1.0", "3.3.0");
+        planned.members = vec![MemberRef {
+            name: "a".into(),
+            path: "apps/a".into(),
+        }];
+
+        let captured = tool()
+            .mutation_journal(
+                &project,
+                &Plan {
+                    changes: vec![planned],
+                    rewrite: RewriteMode::Always,
+                },
+            )
+            .await
+            .expect("journal");
+        std::fs::write(root.join("apps/a/package.json"), "{\"mutated\":true}")
+            .expect("mutate member");
+        captured.restore(&project.root).expect("restore");
+
+        let restored =
+            std::fs::read_to_string(root.join("apps/a/package.json")).expect("read member");
+        assert_eq!(restored, r#"{ "dependencies": { "nanoid": "^3.0.0" } }"#);
     }
 
     fn change(name: &str, from: &str, to: &str) -> Change {
@@ -675,35 +770,147 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_uses_lock_only_in_range_and_rewrites_out_of_range_or_always() {
+    fn pnpm_uses_lock_only_only_for_in_range_auto() {
         let (_dir, project) = project_declaring("^3.0.0");
 
         // In-range minor under Auto → lock-only `pnpm update --no-save` (the declared range stands).
         let in_range = change("nanoid", "3.1.0", "3.3.0");
-        let args = upgrade_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Auto)
+        let args = lockonly_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Auto)
             .expect("command");
-        assert_eq!(args, ["update", "nanoid@3.3.0", "--lockfile-only", "--no-save"]);
+        assert_eq!(
+            args,
+            Some(vec![
+                "update".to_string(),
+                "nanoid@3.3.0".to_string(),
+                "--lockfile-only".to_string(),
+                "--no-save".to_string()
+            ])
+        );
 
-        // Out-of-range (cross-major) under Auto → rewrite via `pnpm add`.
+        // Out-of-range and `--rewrite` both take the manifest-rewrite + relock path.
         let major = change("nanoid", "3.1.0", "5.0.0");
-        let args =
-            upgrade_command::<crate::lock::Pnpm>(&project, &major, RewriteMode::Auto).expect("cmd");
-        assert_eq!(args, ["add", "nanoid@5.0.0", "--lockfile-only"]);
+        assert!(
+            lockonly_command::<crate::lock::Pnpm>(&project, &major, RewriteMode::Auto)
+                .expect("cmd")
+                .is_none()
+        );
+        assert!(
+            lockonly_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Always)
+                .expect("command")
+                .is_none()
+        );
+        assert_eq!(
+            crate::lock::Pnpm::relock_args(),
+            ["install", "--lockfile-only"]
+        );
+    }
 
-        // `--rewrite` (Always) rewrites even an in-range move.
-        let args = upgrade_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Always)
-            .expect("command");
-        assert_eq!(args, ["add", "nanoid@3.3.0", "--lockfile-only"]);
+    #[test]
+    fn relock_commands_refresh_locks_without_adding_dependencies() {
+        assert_eq!(
+            crate::lock::Npm::relock_args(),
+            ["install", "--package-lock-only", "--no-audit", "--no-fund"]
+        );
+        assert_eq!(
+            crate::lock::Pnpm::relock_args(),
+            ["install", "--lockfile-only"]
+        );
+        assert_eq!(crate::lock::Yarn::relock_args(), ["install"]);
+        assert_eq!(crate::lock::Bun::relock_args(), ["install"]);
+    }
+
+    #[test]
+    fn rewrite_relock_pins_exact_target_where_supported() {
+        // pnpm can pin the exact target without touching the manifest, so the post-widen relock lands
+        // the lock on the cooldown-approved version instead of re-resolving the widened range to a
+        // newer (possibly too-fresh) member.
+        assert_eq!(
+            rewrite_relock::<crate::lock::Pnpm>("nanoid", "5.1.11"),
+            ["update", "nanoid@5.1.11", "--lockfile-only", "--no-save"]
+        );
+        // npm has no such command, so it re-resolves the widened range (safe: an overshoot onto a
+        // too-fresh version is rolled back by the post-apply cooldown check).
+        assert_eq!(
+            rewrite_relock::<Npm>("nanoid", "5.1.11"),
+            ["install", "--package-lock-only", "--no-audit", "--no-fund"]
+        );
+    }
+
+    #[test]
+    fn pnpm_lock_only_requires_all_declaring_manifests_to_accept_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("apps/a")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("apps/b")).expect("mkdir b");
+        std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#).expect("root manifest");
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "dependencies": { "nanoid": "^3.0.0" } }"#,
+        )
+        .expect("manifest a");
+        std::fs::write(
+            root.join("apps/b/package.json"),
+            r#"{ "dependencies": { "nanoid": "^2.0.0" } }"#,
+        )
+        .expect("manifest b");
+        let project = Project {
+            root: root.clone(),
+            kind: crate::lock::Pnpm::ID,
+            manifest: root.join("package.json"),
+        };
+        let mut change = change("nanoid", "3.1.0", "3.3.0");
+        change.members = vec![
+            MemberRef {
+                name: "a".into(),
+                path: "apps/a".into(),
+            },
+            MemberRef {
+                name: "b".into(),
+                path: "apps/b".into(),
+            },
+        ];
+
+        let args = lockonly_command::<crate::lock::Pnpm>(&project, &change, RewriteMode::Auto)
+            .expect("cmd");
+
+        assert!(args.is_none());
     }
 
     #[test]
     fn npm_has_no_lock_only_path_so_always_rewrites() {
         let (_dir, project) = project_declaring("^3.0.0");
         let in_range = change("nanoid", "3.1.0", "3.3.0");
-        // Even Auto + in-range falls back to the rewriting `npm install` (no lock-only command).
-        let args =
-            upgrade_command::<Npm>(&project, &in_range, RewriteMode::Auto).expect("command");
-        assert_eq!(args.first().map(String::as_str), Some("install"));
-        assert!(args.iter().any(|arg| arg == "nanoid@3.3.0"));
+        assert!(
+            lockonly_command::<Npm>(&project, &in_range, RewriteMode::Auto)
+                .expect("command")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_skips_when_no_declaring_manifest_entry_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#).expect("manifest");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+        };
+        let plan = Plan {
+            changes: vec![change("nanoid", "3.1.0", "3.3.0")],
+            rewrite: RewriteMode::Always,
+        };
+
+        let report = tool()
+            .apply(&project, &plan, &ProjectMutationJournal::default())
+            .await
+            .expect("apply");
+
+        assert!(report.applied.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason, SkipReason::NotEligible);
+        let manifest = std::fs::read_to_string(root.join("package.json")).expect("read manifest");
+        assert_eq!(manifest, r#"{ "name": "root" }"#);
     }
 }

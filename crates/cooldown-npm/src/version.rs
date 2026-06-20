@@ -45,8 +45,7 @@ pub fn parse(v: &str) -> Option<Version> {
 /// ```
 #[must_use]
 pub fn version_in_range(spec: &str, target: &str) -> bool {
-    let (Ok(requirement), Ok(version)) =
-        (semver::VersionReq::parse(spec), Version::parse(target))
+    let (Ok(requirement), Ok(version)) = (semver::VersionReq::parse(spec), Version::parse(target))
     else {
         return false;
     };

@@ -1,6 +1,6 @@
 //! Lockfile parsers for the npm-compatible package managers. Each manager resolves from the same
 //! registry but records the resolved graph in its own format; the [`NodeLock`] trait abstracts the
-//! per-manager differences (lockfile name, driver binary, parse, and apply args) so a single
+//! per-manager differences (lockfile name, driver binary, parse, and lock refresh args) so a single
 //! generic adapter can serve all of them.
 //!
 //! Every parser returns the flat list of resolved `(name, version)` pairs the lock pins. Where the
@@ -12,7 +12,7 @@ use cooldown_core::{CoreError, Result, ToolId};
 use std::collections::{HashMap, HashSet};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
-/// and shells out to, how to parse its lock, and how to ask it to re-pin a dependency.
+/// and shells out to, how to parse its lock, and how to refresh the lock after a manifest edit.
 pub trait NodeLock: Send + Sync + 'static {
     /// The tool's canonical [`ToolId`] (e.g. `ToolId("npm")`).
     const ID: ToolId;
@@ -40,10 +40,9 @@ pub trait NodeLock: Send + Sync + 'static {
         MemberIndex::default()
     }
 
-    /// The driver args that re-pin `name` to `version`, re-resolving the lock. This selects the
-    /// version *through the manifest*: it rewrites the `package.json` range (the floor) as well as
-    /// the lock, since `add`/`install <name>@<version>` is how these tools adopt a version.
-    fn upgrade_args(name: &str, version: &str) -> Vec<String>;
+    /// The driver args that refresh the lock after cooldown has rewritten the declaring
+    /// `package.json` range itself.
+    fn relock_args() -> Vec<String>;
 
     /// The driver args that move **only** the lock to an exact, already-in-range `version`, leaving
     /// the declared `package.json` range untouched — the lock-only path for `RewriteMode::Auto`.
@@ -187,12 +186,11 @@ impl NodeLock for Npm {
             .unwrap_or_default()
     }
 
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        // `--package-lock-only` re-resolves the lock (and manifest pin) without touching
-        // node_modules, keeping apply fast and side-effect-light.
+    fn relock_args() -> Vec<String> {
+        // `--package-lock-only` re-resolves the lock without touching node_modules, keeping apply
+        // fast and side-effect-light.
         vec![
             "install".into(),
-            format!("{name}@{version}"),
             "--package-lock-only".into(),
             "--no-audit".into(),
             "--no-fund".into(),
@@ -219,12 +217,8 @@ impl NodeLock for Pnpm {
             .with_exact_versions(parse_pnpm_exact_pins(content))
     }
 
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        vec![
-            "add".into(),
-            format!("{name}@{version}"),
-            "--lockfile-only".into(),
-        ]
+    fn relock_args() -> Vec<String> {
+        vec!["install".into(), "--lockfile-only".into()]
     }
 
     fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {
@@ -252,8 +246,8 @@ impl NodeLock for Yarn {
         Ok(parse_yarn(content))
     }
 
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        vec!["add".into(), format!("{name}@{version}")]
+    fn relock_args() -> Vec<String> {
+        vec!["install".into()]
     }
 
     fn build_args() -> Vec<String> {
@@ -270,8 +264,8 @@ impl NodeLock for Bun {
         parse_bun(content)
     }
 
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        vec!["add".into(), format!("{name}@{version}")]
+    fn relock_args() -> Vec<String> {
+        vec!["install".into()]
     }
 
     fn build_args() -> Vec<String> {
