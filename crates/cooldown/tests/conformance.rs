@@ -309,6 +309,67 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
 }
 
 #[tokio::test]
+async fn per_tool_exclude_prunes_workspace_member_dependencies() {
+    let (_g, root) = tmp_root();
+    let mut kept = dep("kept", "v1.0.0", true);
+    kept.members = vec![MemberRef {
+        name: "kept-app".into(),
+        path: "apps/kept".into(),
+    }];
+    let mut dropped = dep("dropped", "v1.0.0", true);
+    dropped.members = vec![MemberRef {
+        name: "dropped-app".into(),
+        path: "apps/dropped".into(),
+    }];
+    let mut releases = HashMap::new();
+    for name in ["kept", "dropped"] {
+        releases.insert(
+            name.to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+    }
+    let fake = FakeEco {
+        direct: vec![kept, dropped],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked: HashMap::new(),
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::default(),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.exclude_by_tool
+        .insert(GO.as_str().to_string(), vec!["apps/dropped".to_string()]);
+
+    let out = ws.outdated(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(
+        out.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kept"]
+    );
+    assert_eq!(out.items[0].members[0].path, "apps/kept");
+}
+
+#[tokio::test]
 async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
     let (_g, root) = tmp_root();
     let mut locked = HashMap::new();

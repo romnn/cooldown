@@ -149,6 +149,8 @@ impl<'a> ExplainService<'a> {
     /// a no-match yields `None` so callers degrade to a registry-less resolution.
     async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
         let adapter = self.ws.adapter(pctx.tool)?;
+        // The raw graph on purpose: this finds one package's registry by name (never displayed and
+        // not list output), so `exclude`/`-p` scoping is irrelevant and would only hide the target.
         let deps = adapter
             .dependencies(&pctx.project, DepScope::Graph)
             .await

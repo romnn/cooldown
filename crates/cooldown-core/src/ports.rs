@@ -78,10 +78,18 @@ pub trait ToolRead: Send + Sync {
     /// lives in one agnostic place and is enforced by this interface.
     fn project_marker(&self) -> ProjectMarker;
 
-    /// Returns the dependencies in scope for `project`.
+    /// Returns the **raw, unscoped** resolved dependencies for `project`.
     ///
-    /// `scope` selects between direct-only dependencies and the full resolved graph. The returned
-    /// list is what the core evaluates against policy.
+    /// `scope` selects between direct-only dependencies and the full resolved graph, but this method
+    /// applies no `--package` scoping and no `exclude` policy — the orchestrator owns those (it knows
+    /// the run's config; an adapter must not). So the result still contains excluded/out-of-scope
+    /// packages and their full [`members`](Dependency::members).
+    ///
+    /// Reporting commands must therefore read deps through the orchestrator's scoped path (which
+    /// drops excluded members and out-of-scope packages), never this method directly. The only
+    /// legitimate direct callers are whole-graph reads that intentionally need every dependency — the
+    /// upgrade graph-violation check and the `explain` registry lookup — and they never surface
+    /// `members`.
     ///
     /// # Errors
     ///

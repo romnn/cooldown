@@ -3,6 +3,7 @@ use crate::cli::{CliOverrides, GlobalArgs, LogLevel};
 use cooldown_cargo::CARGO_ID;
 use cooldown_core::config::{CommandConfig, WindowFields};
 use cooldown_core::{CoreError, PatternGlob, ToolId, recognized_tool_names, tool_id};
+use std::collections::BTreeMap;
 
 pub(super) struct ResolvedInvocation {
     run: RunOpts,
@@ -73,6 +74,9 @@ pub(super) fn resolve_invocation(
         run: RunOpts {
             tool: tools,
             package,
+            // Populated in `setup` from the scan config, which owns the exclude globs.
+            exclude: Vec::new(),
+            exclude_by_tool: BTreeMap::default(),
             allow_major: merged.major.unwrap_or(default_major),
             // A display filter, read straight from the CLI (not config-file backed).
             hide_pinned: global.hide_pinned,

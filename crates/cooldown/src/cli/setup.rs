@@ -51,9 +51,14 @@ pub(crate) async fn prepare_run(
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
     let now = jiff::Timestamp::now();
     let ws = Workspace::new(adapters, ctxs, now, baseline);
+    let mut opts = invocation.into_run_opts();
+    // The scan-exclude globs also filter workspace-member dependencies (by member path or package
+    // name), so carry both global/command and per-tool excludes into the run.
+    opts.exclude = cfg.exclude;
+    opts.exclude_by_tool = scan.tool_exclude;
     Ok(PreparedRun {
         repo_root,
         ws,
-        opts: invocation.into_run_opts(),
+        opts,
     })
 }

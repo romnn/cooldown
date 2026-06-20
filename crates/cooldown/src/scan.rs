@@ -120,6 +120,35 @@ fn keep_topmost(dirs: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
     kept
 }
 
+/// A compiled set of exclude globs for filtering workspace-member dependencies. A member is excluded
+/// when its *path* (or any ancestor — so `packages/ts/luup` also excludes `packages/ts/luup/api`) or
+/// its *package name* matches an exclude glob. Matching the name lets a scoped glob like `@luup/*`
+/// exclude every `@luup/...` package regardless of where it lives in the tree.
+pub(crate) struct ExcludeSet(GlobSet);
+
+impl ExcludeSet {
+    /// Compile the exclude globs (an empty set matches nothing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if a glob is invalid.
+    pub(crate) fn compile(patterns: &[String]) -> Result<Self, CoreError> {
+        Ok(Self(build_globset(patterns)?))
+    }
+
+    /// Whether a member at `path` with package `name` is excluded.
+    #[must_use]
+    pub(crate) fn excludes_member(&self, path: &Utf8Path, name: &str) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        let path_excluded = path.ancestors().any(|ancestor| {
+            !ancestor.as_str().is_empty() && self.0.is_match(ancestor.as_std_path())
+        });
+        path_excluded || self.0.is_match(std::path::Path::new(name))
+    }
+}
+
 /// Build a [`GlobSet`] from the exclude patterns. A bare name also matches that directory at any
 /// depth (so `"target"` excludes every `target/`, not just one at the root).
 fn build_globset(patterns: &[String]) -> Result<GlobSet, CoreError> {
@@ -150,6 +179,26 @@ mod tests {
 
     fn utf8(p: &std::path::Path) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(p.to_path_buf()).expect("utf8 path")
+    }
+
+    #[test]
+    fn exclude_set_matches_member_by_path_prefix_or_name() {
+        let set = ExcludeSet::compile(&["packages/ts/luup".to_string(), "@luup/*".to_string()])
+            .expect("compile");
+        // A path under an excluded directory is excluded (ancestor match).
+        assert!(set.excludes_member(Utf8Path::new("packages/ts/luup/api"), "@luup/api"));
+        // Excluded by scoped package-name glob regardless of where it lives.
+        assert!(set.excludes_member(Utf8Path::new("apps/landingpage"), "@luup/landingpage"));
+        // A sibling path / unscoped name is kept.
+        assert!(!set.excludes_member(Utf8Path::new("apps/admin"), "@airtype/admin"));
+        // The root importer (`.`) is never matched by a sub-path exclude.
+        assert!(!set.excludes_member(Utf8Path::new("."), "root-pkg"));
+    }
+
+    #[test]
+    fn empty_exclude_set_matches_nothing() {
+        let set = ExcludeSet::compile(&[]).expect("compile");
+        assert!(!set.excludes_member(Utf8Path::new("apps/admin"), "@luup/api"));
     }
 
     fn touch(path: &Utf8Path) {

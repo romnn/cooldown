@@ -6,7 +6,7 @@ use cooldown_core::{
     PolicyStack, Project, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
 };
 use jiff::Timestamp;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Per-project context: which tool, the detected project, its path relative to the repo root
@@ -110,6 +110,15 @@ pub struct RunOpts {
     pub tool: Vec<ToolId>,
     /// Scope to packages matching any of these globs (empty = all).
     pub package: Vec<PatternGlob>,
+    /// Scan-exclude path globs (`[global]`/`[<command>]` `exclude`). Beyond pruning project
+    /// detection, these also drop a dependency whose declaring workspace members all sit under an
+    /// excluded path — so a pnpm/cargo workspace can exclude a member's deps even though one root
+    /// lock covers the whole workspace.
+    pub exclude: Vec<String>,
+    /// Additional `[tool.<name>] exclude` globs, keyed by canonical tool name. Kept separate from
+    /// [`exclude`](Self::exclude) so one tool's excludes do not over-filter another tool in a
+    /// polyglot run.
+    pub exclude_by_tool: BTreeMap<String, Vec<String>>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
     /// `--hide-pinned` (outdated): omit held rows (exact `==`/`=` pins and commit pins) from the
@@ -309,6 +318,26 @@ impl Workspace {
             .into_iter()
             .filter(|dep| Self::package_in_scope(opts, &dep.package.name))
             .collect();
+        // Drop excluded members from each dependency first, then drop a dependency whose *every*
+        // declaring member was excluded. Pruning the members before anything reads them means a kept
+        // dep is attributed only to non-excluded packages — so its "used by" representative is never
+        // an excluded package. A dep with no attributable members is left untouched.
+        let mut exclude = opts.exclude.clone();
+        if let Some(per_tool) = opts.exclude_by_tool.get(pctx.tool.as_str()) {
+            exclude.extend(per_tool.iter().cloned());
+        }
+        if !exclude.is_empty() {
+            let excludes = crate::scan::ExcludeSet::compile(&exclude)?;
+            deps.retain_mut(|dep| {
+                if dep.members.is_empty() {
+                    return true;
+                }
+                dep.members.retain(|member| {
+                    !excludes.excludes_member(camino::Utf8Path::new(&member.path), &member.name)
+                });
+                !dep.members.is_empty()
+            });
+        }
         // Adapters yield deps in registry/HashMap order; sort so every command — most importantly
         // `upgrade`, which applies one change at a time — is deterministic when re-run back to back.
         deps.sort_by(|a, b| {
