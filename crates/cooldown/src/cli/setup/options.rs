@@ -88,6 +88,12 @@ pub(super) fn resolve_invocation(
             },
             transitive: merged.transitive.unwrap_or(false),
             downgrade_pinned: merged.downgrade_pinned.unwrap_or(false),
+            // `check --transitive <mode>` is read straight from the CLI (per-command, not config).
+            check_transitive: match overrides.check_transitive {
+                Some(crate::cli::args::CheckTransitive::Allow) => crate::app::TransitiveGate::Allow,
+                Some(crate::cli::args::CheckTransitive::Hide) => crate::app::TransitiveGate::Hide,
+                None => crate::app::TransitiveGate::Fail,
+            },
             major_all: merged.major_all.unwrap_or(false),
             direct_only: merged.direct_only.unwrap_or(false),
             include_indirect: merged.include_indirect.unwrap_or(false),

@@ -84,6 +84,16 @@ pub struct Cli {
     pub(in crate::cli) global: GlobalArgs,
 }
 
+/// `check --transitive <mode>`: how the gate treats a too-fresh *transitive* dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CheckTransitive {
+    /// Evaluate transitive deps but never fail the gate on them; report them as allowed.
+    Allow,
+    /// Skip evaluating transitive deps entirely (equivalent to `--direct-only` for `check`).
+    Hide,
+}
+
 #[derive(Subcommand)]
 pub(in crate::cli) enum Command {
     /// What could update — split into "adoptable now" vs "in cooldown".
@@ -91,9 +101,23 @@ pub(in crate::cli) enum Command {
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade,
     /// Fix cooldown violations: downgrade too-fresh deps to a matured version (never upgrades).
-    Fix,
+    Fix {
+        /// Also downgrade too-fresh transitive deps, not just direct ones. Dangerous: downgrading a
+        /// transitive can break a direct dependency that relies on the newer version.
+        #[arg(long)]
+        transitive: bool,
+        /// Downgrade and rewrite exact-pinned deps too. By default a pinned cooldown violation is
+        /// left in place with a warning, since a pin is a deliberate choice.
+        #[arg(long = "downgrade-pinned")]
+        downgrade_pinned: bool,
+    },
     /// Exit non-zero if anything resolved is younger than the cooldown (the CI gate).
-    Check,
+    Check {
+        /// How to treat too-fresh *transitive* deps. Default: fail the gate on them. `allow` keeps
+        /// them visible but non-fatal; `hide` skips evaluating transitive deps entirely (direct-only).
+        #[arg(long, value_enum, value_name = "MODE")]
+        transitive: Option<CheckTransitive>,
+    },
     /// Record currently-young deps as acknowledged, so `check` can be adopted cleanly.
     Baseline {
         /// Drop entries whose version has aged past the resolved window or is no longer present.
@@ -254,14 +278,6 @@ pub(in crate::cli) struct GlobalArgs {
     /// rewrites the one owning manifest entry.
     #[arg(long, global = true)]
     pub(in crate::cli) rewrite: bool,
-    /// (fix) Also downgrade too-fresh transitive deps, not just direct ones. Dangerous: downgrading
-    /// a transitive can break a direct dependency that relies on the newer version.
-    #[arg(long, global = true)]
-    pub(in crate::cli) transitive: bool,
-    /// (fix) Downgrade and rewrite exact-pinned deps too. By default a pinned cooldown violation is
-    /// left in place with a warning, since a pin is a deliberate choice.
-    #[arg(long = "downgrade-pinned", global = true)]
-    pub(in crate::cli) downgrade_pinned: bool,
     /// Sync the policy into native config (e.g. uv `exclude-newer`) before running this command, so
     /// cooldown.toml stays the source of truth. No-op under `--dry-run`.
     #[arg(long, global = true)]
@@ -324,6 +340,8 @@ pub struct CliOverrides {
     pub(crate) build: Option<bool>,
     pub(crate) transitive: Option<bool>,
     pub(crate) downgrade_pinned: Option<bool>,
+    /// `check --transitive <allow|hide>` — the gate's transitive-handling mode, if set on the CLI.
+    pub(crate) check_transitive: Option<CheckTransitive>,
     pub(crate) dry_run: Option<bool>,
     pub(crate) offline: Option<bool>,
     pub(crate) fresh: Option<bool>,
@@ -355,8 +373,14 @@ impl CliOverrides {
             fail_on_unknown_age: on("fail_on_unknown_age"),
             strict: on("strict"),
             build: on("build"),
-            transitive: on("transitive"),
-            downgrade_pinned: on("downgrade_pinned"),
+            // `fix`'s booleans are per-command now, so probe the `fix` subcommand directly — the
+            // root command never registers them.
+            transitive: set_on_subcommand(matches, "fix", "transitive").then_some(true),
+            downgrade_pinned: set_on_subcommand(matches, "fix", "downgrade_pinned").then_some(true),
+            // `--transitive` carries a value only under `check`; read it from that subcommand.
+            check_transitive: matches
+                .subcommand_matches("check")
+                .and_then(|sub| sub.get_one::<CheckTransitive>("transitive").copied()),
             dry_run: on("dry_run"),
             offline: on("offline"),
             fresh: on("fresh"),
@@ -378,6 +402,18 @@ fn set_on_cli(matches: &ArgMatches, id: &str) -> bool {
         || matches
             .subcommand()
             .is_some_and(|(_, sub)| explicit(sub.value_source(id)))
+}
+
+/// Whether `id` was explicitly set under the `command` subcommand. Used for per-command flags (e.g.
+/// `fix --transitive`) that the *root* matches do not know — [`set_on_cli`]'s root `value_source`
+/// would panic on an id the root command never registered.
+fn set_on_subcommand(matches: &ArgMatches, command: &str, id: &str) -> bool {
+    matches.subcommand_matches(command).is_some_and(|sub| {
+        matches!(
+            sub.value_source(id),
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -447,7 +483,7 @@ mod tests {
     #[test]
     fn parser_accepts_full_command_shape() {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
-        assert!(matches!(cli.command, super::Command::Check));
+        assert!(matches!(cli.command, super::Command::Check { .. }));
         assert!(cli.global.json);
     }
 }

@@ -18,9 +18,11 @@ pub(crate) struct CommandContext<'a> {
 pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Result<Exit, CoreError> {
     match command {
         Command::Outdated => report::run_outdated(&ctx).await,
-        Command::Check => report::run_check(&ctx).await,
+        // The per-command `--transitive` / `--downgrade-pinned` values flow through `RunOpts` via the
+        // `CliOverrides` capture, so the variant fields are not read here.
+        Command::Check { .. } => report::run_check(&ctx).await,
         Command::Upgrade => report::run_upgrade(&ctx).await,
-        Command::Fix => report::run_fix(&ctx).await,
+        Command::Fix { .. } => report::run_fix(&ctx).await,
         Command::Explain { package } => report::run_explain(&ctx, &package).await,
         Command::Config => report::run_config(&ctx),
         Command::Sync => report::run_sync(&ctx).await,

@@ -24,6 +24,8 @@ pub use model::{
     OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
-pub use workspace::{AdapterSet, Exit, Progress, ProjectCtx, RunOpts, Workspace};
+pub use workspace::{
+    AdapterSet, Exit, Progress, ProjectCtx, RunOpts, TransitiveGate, Workspace,
+};
 
 pub(crate) use workspace::{age_days, diag_from_error, render_window, round2};

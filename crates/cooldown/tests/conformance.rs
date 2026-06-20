@@ -514,6 +514,55 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
 }
 
 #[tokio::test]
+async fn check_transitive_allow_and_hide_modes() {
+    let (_g, root) = tmp_root();
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    ); // direct, mature
+    locked.insert(
+        "t".to_string(),
+        rel("v0.5.0", 0, Some("2026-06-16T00:00:00Z"), None),
+    ); // transitive, fresh → would be a violation
+
+    let make = || FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![dep("t", "v0.5.0", false)],
+        fresh_transitive: None,
+        releases: HashMap::new(),
+        locked: locked.clone(),
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root: root.clone(),
+    };
+
+    // `--transitive allow`: the fresh transitive is still evaluated and reported, but as a non-fatal
+    // (acknowledged) finding, so the gate passes.
+    let mut allow = opts();
+    allow.check_transitive = cooldown::app::TransitiveGate::Allow;
+    let out = workspace(make(), Baseline::default()).check(&allow).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.violations, 0);
+    assert_eq!(out.summary.acknowledged, 1);
+    assert_eq!(out.summary.checked, 2, "the transitive is still evaluated");
+
+    // `--transitive hide`: the transitive is not evaluated at all (direct-only), gate passes.
+    let mut hide = opts();
+    hide.check_transitive = cooldown::app::TransitiveGate::Hide;
+    let out = workspace(make(), Baseline::default()).check(&hide).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.violations, 0);
+    assert_eq!(out.summary.acknowledged, 0);
+    assert_eq!(out.summary.checked, 1, "only the direct dep is evaluated");
+}
+
+#[tokio::test]
 async fn check_fails_closed_on_stale_lock() {
     let (_g, root) = tmp_root();
     let fake = FakeEco {

@@ -98,6 +98,18 @@ impl Progress {
     }
 }
 
+/// How `check` treats a too-fresh *transitive* dependency (`check --transitive <mode>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransitiveGate {
+    /// Fail the gate on a too-fresh transitive dep (the strict default; evaluates the full graph).
+    #[default]
+    Fail,
+    /// Evaluate transitive deps but never fail the gate on them — report them as allowed.
+    Allow,
+    /// Don't evaluate transitive deps at all (direct-only).
+    Hide,
+}
+
 /// Per-run invocation controls (the non-policy flags). Policy lives in each project's
 /// [`PolicyStack`].
 #[derive(Debug, Clone, Default)]
@@ -136,6 +148,9 @@ pub struct RunOpts {
     /// `--downgrade-pinned` (fix): downgrade and rewrite exact-pinned deps too; otherwise a pinned
     /// violation is left in place with a warning.
     pub downgrade_pinned: bool,
+    /// `--transitive <mode>` (check): how the gate treats a too-fresh transitive dep. Defaults to
+    /// [`TransitiveGate::Fail`].
+    pub check_transitive: TransitiveGate,
     /// `--direct-only`: evaluate only direct deps.
     pub direct_only: bool,
     /// `--include-indirect` (outdated): include transitive deps in the report.

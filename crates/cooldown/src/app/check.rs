@@ -3,8 +3,8 @@
 //! resolved graph (direct + transitive) by default.
 
 use super::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, RunOpts, Window, Workspace, age_days,
-    diag_from_error, render_window,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, RunOpts, TransitiveGate, Window,
+    Workspace, age_days, diag_from_error, render_window,
 };
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution, ResolveKind,
@@ -95,7 +95,9 @@ impl Workspace {
 
 impl<'a> CheckRunner<'a> {
     fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
-        let scope = if opts.direct_only {
+        // `--direct-only` and `check --transitive hide` both skip evaluating transitive deps; every
+        // other mode (including `allow`) gates the full resolved graph.
+        let scope = if opts.direct_only || opts.check_transitive == TransitiveGate::Hide {
             DepScope::Direct
         } else {
             DepScope::Graph
@@ -298,15 +300,20 @@ impl<'a> CheckRunner<'a> {
             return;
         }
 
+        // `check --transitive allow` permits a too-fresh *transitive* dep without failing the gate;
+        // it is reported (visible) but, like a baselined pin, does not count as a violation.
+        let allowed_transitive =
+            self.opts.check_transitive == TransitiveGate::Allow && !dep.direct;
         let is_ack = pv.status == Status::CurrentInCooldown
-            && self.ws.baseline.is_acknowledged(
-                pctx.tool.as_str(),
-                project_label,
-                &dep.package.name,
-                dep.current.as_str(),
-                dep.package.registry.as_deref(),
-                self.ws.now(),
-            );
+            && (allowed_transitive
+                || self.ws.baseline.is_acknowledged(
+                    pctx.tool.as_str(),
+                    project_label,
+                    &dep.package.name,
+                    dep.current.as_str(),
+                    dep.package.registry.as_deref(),
+                    self.ws.now(),
+                ));
 
         let Some(status) = CheckStatus::from_pin_status(pv.status, is_ack) else {
             return; // mature pass → counted in `checked`, not a finding

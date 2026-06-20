@@ -192,9 +192,12 @@ the core, render, the config schema, or any other adapter.
 - **Threat model:** the smash-and-grab window. The cooldown delays _adoption_; it is not a malware
   scanner and pairs with `govulncheck`/`cargo audit`/advisory feeds.
 - **Risk surface is the resolved graph.** `check` evaluates direct + transitive by default; the
-  floor applies to transitive too. `upgrade` and `fix` apply one change at a time and, if a re-lock
-  leaves a new too-fresh non-acknowledged dependency in the graph, restore the lock snapshot and
-  skip that change — a passing mutation never leaves a lock a subsequent `check` would reject.
+  floor applies to transitive too. For a too-fresh transitive you can't act on (a graph-held pin, or
+  one you'd rather not block CI on), `check --transitive allow` keeps it visible but non-fatal, and
+  `check --transitive hide` skips evaluating transitive deps entirely (= `--direct-only`); the strict
+  default stays opt-out, never opt-in. `upgrade` and `fix` apply one change at a time and, if a
+  re-lock leaves a new too-fresh non-acknowledged dependency in the graph, restore the lock snapshot
+  and skip that change — a passing mutation never leaves a lock a subsequent `check` would reject.
 - **Cache hardening:** a cached publish time may never move _earlier_ on refresh (monotonic floor);
   a backdated upstream timestamp is rejected, not trusted.
 - **Escape hatches are explicit and audited** (`--latest`/`--allow`/config `allow`, all in

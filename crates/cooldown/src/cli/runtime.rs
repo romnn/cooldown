@@ -124,14 +124,14 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
 fn pre_syncs(command: &Command) -> bool {
     matches!(
         command,
-        Command::Outdated | Command::Upgrade | Command::Fix | Command::Check
+        Command::Outdated | Command::Upgrade | Command::Fix { .. } | Command::Check { .. }
     )
 }
 
 fn requires_tool_match(command: &Command) -> bool {
     matches!(
         command,
-        Command::Upgrade | Command::Fix | Command::Baseline { .. } | Command::Explain { .. }
+        Command::Upgrade | Command::Fix { .. } | Command::Baseline { .. } | Command::Explain { .. }
     )
 }
 
@@ -150,8 +150,8 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Outdated => "outdated",
         Command::Upgrade => "upgrade",
-        Command::Fix => "fix",
-        Command::Check => "check",
+        Command::Fix { .. } => "fix",
+        Command::Check { .. } => "check",
         Command::Baseline { .. } => "baseline",
         Command::Explain { .. } => "explain",
         Command::Config => "config",
