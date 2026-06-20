@@ -29,6 +29,7 @@ fn outdated_item(item: &app::OutdatedItem) -> render::OutdatedItem {
         current: item.current.clone(),
         members: item.members.clone(),
         window: window(&item.window),
+        candidate_age_days: item.candidate_age_days,
         status: outdated_status(item.status),
         adoptable_target: item.adoptable_target.clone(),
         latest: item.latest.as_ref().map(latest_info),

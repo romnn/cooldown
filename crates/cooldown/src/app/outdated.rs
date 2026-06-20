@@ -235,6 +235,14 @@ impl<'a> OutdatedRunner<'a> {
             )
         };
 
+        // The age of the newest candidate — the version whose `window` is shown above — so the
+        // report can read its cooldown position as `age/window` (e.g. `13d/14d`, almost adoptable).
+        let candidate_age_days = verdict
+            .candidates
+            .last()
+            .and_then(|c| c.published_at)
+            .map(|published| age_days(published, self.ws.now()));
+
         let latest = verdict.latest.as_ref().map(|lv| {
             let published = releases
                 .iter()
@@ -256,6 +264,7 @@ impl<'a> OutdatedRunner<'a> {
             current: dep.current.to_string(),
             members: dep.members.clone(),
             window,
+            candidate_age_days,
             status: verdict.status.into(),
             adoptable_target: verdict.adoptable_target.map(|v| v.to_string()),
             latest,
@@ -301,6 +310,7 @@ fn error_item(
             source: "n/a".into(),
             clamped_by: None,
         },
+        candidate_age_days: None,
         status: OutdatedStatus::Error,
         adoptable_target: None,
         latest: None,

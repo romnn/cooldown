@@ -3,7 +3,7 @@
 
 use crate::model::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
-    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary,
+    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, MemberRef, Status};
@@ -137,6 +137,20 @@ fn fmt_days(d: f64) -> String {
     }
 }
 
+/// The `outdated` "Cooldown" cell: the newest candidate's `age/window` (e.g. `13d/14d`) when a
+/// newer version exists, or the bare window when there is no candidate. A stricter native /
+/// registry clamp is appended as `(≥<source>)`, matching the rest of the report.
+fn cooldown_cell(window: &Window, candidate_age_days: Option<f64>) -> String {
+    let mut cell = match candidate_age_days {
+        Some(age) => format!("{}/{}", fmt_days(age), fmt_days(window.min_age_days)),
+        None => fmt_days(window.min_age_days),
+    };
+    if let Some(by) = &window.clamped_by {
+        let _ = write!(cell, " (≥{by})");
+    }
+    cell
+}
+
 /// Render the "Used by" column for one dependency: the member packages by name (or by path under
 /// `paths`). Blank when unattributed; with `list_all`, every member on its own line (a multi-line
 /// cell, so the row's other columns stay on the first line); otherwise the shortest label plus a
@@ -207,7 +221,9 @@ pub fn render_outdated(
         if project {
             header.push("Project");
         }
-        header.extend(["Current", "Adoptable", "Latest", "Window", "Status"]);
+        // "Cooldown" shows the newest candidate's age against its window as `age/window`
+        // (e.g. `13d/14d` — almost adoptable); rows with no candidate show the bare window.
+        header.extend(["Current", "Adoptable", "Latest", "Cooldown", "Status"]);
         t.set_header(header);
         for it in items {
             // Draw the eye to the version that can be taken now — including on a held row, where it
@@ -220,10 +236,7 @@ pub fn render_outdated(
                 .latest
                 .as_ref()
                 .map_or_else(|| "—".into(), |l| l.version.clone());
-            let window = match &it.window.clamped_by {
-                Some(by) => format!("{} (≥{by})", fmt_days(it.window.min_age_days)),
-                None => fmt_days(it.window.min_age_days),
-            };
+            let cooldown = cooldown_cell(&it.window, it.candidate_age_days);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
@@ -234,7 +247,7 @@ pub fn render_outdated(
             row.push(Cell::new(&it.current));
             row.push(adoptable);
             row.push(Cell::new(latest));
-            row.push(Cell::new(window));
+            row.push(Cell::new(cooldown));
             row.push(cell_colored(
                 status_label(it.status),
                 status_color(it.status),
@@ -546,6 +559,32 @@ mod tests {
                 path: format!("path/{name}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn cooldown_cell_shows_age_over_window_then_falls_back_to_bare_window() {
+        use super::cooldown_cell;
+        use crate::Window;
+
+        let window = |clamped_by: Option<&str>| Window {
+            min_age_days: 14.0,
+            source: "default".into(),
+            clamped_by: clamped_by.map(str::to_string),
+        };
+
+        // A newer candidate reads as `age/window` — 13 days into a 14-day cooldown.
+        assert_eq!(cooldown_cell(&window(None), Some(13.0)), "13d/14d");
+        // No newer candidate (up to date, commit pin) → just the policy window.
+        assert_eq!(cooldown_cell(&window(None), None), "14d");
+        // A stricter native/registry clamp is appended either way.
+        assert_eq!(
+            cooldown_cell(&window(Some("native")), Some(2.0)),
+            "2d/14d (≥native)"
+        );
+        assert_eq!(
+            cooldown_cell(&window(Some("native")), None),
+            "14d (≥native)"
+        );
     }
 
     #[test]

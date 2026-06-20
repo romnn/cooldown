@@ -394,7 +394,7 @@ pub struct Verdict {
     pub adoptable_target: Option<Version>,
     /// The newest existing version, adoptable or not.
     pub latest: Option<Version>,
-    /// The per-candidate verdicts, newest first.
+    /// The per-candidate verdicts in ascending release order; the newest candidate is last.
     pub candidates: Vec<Candidate>,
 }
 

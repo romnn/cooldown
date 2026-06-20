@@ -90,6 +90,7 @@ mod tests {
                     source: "default".into(),
                     clamped_by: None,
                 },
+                candidate_age_days: Some(47.0),
                 status: OutdatedStatus::Adoptable,
                 adoptable_target: Some("v0.18.0".into()),
                 latest: Some(LatestInfo {
@@ -107,6 +108,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["items"][0]["adoptableTarget"], "v0.18.0");
         assert_eq!(v["items"][0]["window"]["minAgeDays"], 7.0);
+        assert_eq!(v["items"][0]["candidateAgeDays"], 47.0);
         assert!(v["warnings"].is_array());
         assert!(v["errors"].is_array());
     }

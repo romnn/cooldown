@@ -383,9 +383,11 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
     assert_eq!(a.status, OutdatedStatus::Adoptable);
     assert_eq!(a.adoptable_target.as_deref(), Some("v1.1.0"));
     assert_eq!(a.latest.as_ref().unwrap().version, "v1.2.0");
+    assert_eq!(a.candidate_age_days, Some(1.0));
     // `b` has nothing matured, so it genuinely cannot update yet.
     assert_eq!(b.status, OutdatedStatus::InCooldown);
     assert_eq!(b.adoptable_target, None);
+    assert_eq!(b.candidate_age_days, Some(1.0));
     assert_eq!(out.summary.adoptable, 1);
     assert_eq!(out.summary.in_cooldown, 1);
 }

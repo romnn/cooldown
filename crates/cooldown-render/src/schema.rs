@@ -138,6 +138,7 @@ pub fn json_schema() -> Value {
                 "current": { "type": "string" },
                 "members": members,
                 "window": { "$ref": "#/$defs/window" },
+                "candidateAgeDays": { "type": "number" },
                 "status": {
                     "enum": [
                         "up_to_date",
