@@ -47,8 +47,13 @@ pub(crate) fn rewrite_imports(
 
 pub(crate) fn old_import_path(change: &Change) -> Option<String> {
     let new_path = &change.package.name;
-    let (prefix, _, ok) = semver::split_path_version(new_path);
-    if !ok {
+    let (prefix, path_major, ok) = semver::split_path_version(new_path);
+    // `ok` only means the path is well-formed; `path_major` is empty when the new path carries no
+    // `/vN` suffix. A module with no suffix is not path-versioned — a `+incompatible` module like
+    // `github.com/docker/cli` stays on one import path across its v2+ majors — so there is nothing
+    // to rewrite. Without this guard the v2+ `from` major would synthesize a bogus `…/vN` old path
+    // and trigger a spurious import-tree scan.
+    if !ok || path_major.is_empty() {
         return None;
     }
     let from_major = semver::major(change.from.as_str());
@@ -123,4 +128,50 @@ fn rewrite_import_path(source: &str, old: &str, new: &str) -> String {
     source
         .replace(&format!("\"{old}\""), &format!("\"{new}\""))
         .replace(&format!("\"{old}/"), &format!("\"{new}/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cooldown_core::{PackageId, ToolId, UpdateKind, Version};
+
+    fn change(name: &str, from: &str, to: &str) -> Change {
+        Change {
+            package: PackageId::new(ToolId("go"), name, None),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: UpdateKind::Minor,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn incompatible_module_has_no_import_path_to_rewrite() {
+        // A `+incompatible` module (a v2+ major that never adopted `/vN` paths, e.g.
+        // github.com/docker/cli) stays on one import path across its majors, so a within-line bump
+        // must not synthesize a bogus `…/v29` old path — doing so would trigger a spurious,
+        // potentially failing import-tree scan.
+        assert_eq!(
+            old_import_path(&change(
+                "github.com/docker/cli",
+                "v29.2.1+incompatible",
+                "v29.5.2+incompatible",
+            )),
+            None,
+        );
+    }
+
+    #[test]
+    fn versioned_module_rewrites_from_the_old_major_path() {
+        // A real `/vN` module crossing majors: the old import path drops to the `from` major.
+        assert_eq!(
+            old_import_path(&change("example.com/foo/v3", "v2.4.0", "v3.0.0")).as_deref(),
+            Some("example.com/foo/v2"),
+        );
+        // From v1, the old path is the unversioned base.
+        assert_eq!(
+            old_import_path(&change("example.com/foo/v2", "v1.5.0", "v2.0.0")).as_deref(),
+            Some("example.com/foo"),
+        );
+    }
 }
