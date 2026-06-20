@@ -354,11 +354,13 @@ pub fn check_pin(
 /// the cooldown and, if so, the newest already-matured version to roll back to.
 #[derive(Debug, Clone)]
 pub struct FixVerdict {
-    /// The current pin's [`check_pin`] status. Only [`Status::CurrentInCooldown`] needs fixing.
-    pub current_status: Status,
+    /// The current pin's [`check_pin`] verdict. Only [`Status::CurrentInCooldown`] needs fixing;
+    /// [`PinVerdict::graph_held`] means the graph itself requires the too-fresh version, so `fix`
+    /// must leave it in place for a human to baseline or resolve upstream.
+    pub current: PinVerdict,
     /// The newest matured version older than the current pin — the downgrade target. `None` when the
-    /// pin is already compliant (no fix needed) or no older version has matured (unfixable: the
-    /// caller should report it, e.g. suggesting `baseline`).
+    /// pin is already compliant, no older version has matured, or the graph holds the pin at the
+    /// violating version.
     pub target: Option<Version>,
 }
 
@@ -382,14 +384,14 @@ pub fn evaluate_fix(
         // The adapter did not surface the locked version among the releases, so its age cannot be
         // judged here; `check` remains the real gate.
         return FixVerdict {
-            current_status: Status::UnknownAge,
+            current: unknown_pin_verdict(dep, layers, ctx, now),
             target: None,
         };
     };
     let pin = check_pin(dep, current, layers, ctx, now);
-    if pin.status != Status::CurrentInCooldown {
+    if pin.status != Status::CurrentInCooldown || pin.graph_held {
         return FixVerdict {
-            current_status: pin.status,
+            current: pin,
             target: None,
         };
     }
@@ -406,8 +408,24 @@ pub fn evaluate_fix(
         .max_by(|a, b| a.order.cmp(&b.order))
         .map(|r| r.version.clone());
     FixVerdict {
-        current_status: Status::CurrentInCooldown,
+        current: pin,
         target,
+    }
+}
+
+fn unknown_pin_verdict(
+    dep: &Dependency,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> PinVerdict {
+    let res = resolve(layers, &query(dep, ctx, ResolveKind::CurrentPin), now);
+    PinVerdict {
+        status: Status::UnknownAge,
+        window: res.window,
+        graph_held: matches!(&dep.graph_floor, Some(v) if *v == dep.current),
+        graph_floor: dep.graph_floor.clone(),
+        published_at: None,
     }
 }
 
@@ -476,10 +494,9 @@ mod tests {
     fn seven_day_layer() -> PolicyLayer {
         let mut layer = PolicyLayer::new(crate::Origin::Default);
         let mut rule = crate::Rule::new(crate::Selector::Default);
-        rule.window =
-            crate::ByKind::scalar(crate::WindowSpec::MinAge(jiff::SignedDuration::from_hours(
-                24 * 7,
-            )));
+        rule.window = crate::ByKind::scalar(crate::WindowSpec::MinAge(
+            jiff::SignedDuration::from_hours(24 * 7),
+        ));
         layer.rules.push(rule);
         layer
     }
@@ -501,8 +518,14 @@ mod tests {
             dated("1.0.1", 1, "2025-12-15T00:00:00Z"),
             dated("1.0.2", 2, "2026-01-07T00:00:00Z"),
         ];
-        let verdict = evaluate_fix(&fix_dep("1.0.2"), &releases, &[seven_day_layer()], &ctx(), now);
-        assert_eq!(verdict.current_status, Status::CurrentInCooldown);
+        let verdict = evaluate_fix(
+            &fix_dep("1.0.2"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
         assert_eq!(verdict.target, Some(Version::new("1.0.1")));
     }
 
@@ -514,8 +537,14 @@ mod tests {
             dated("1.0.1", 1, "2025-12-15T00:00:00Z"),
         ];
         // 1.0.1 matured on 2025-12-15, before the 2026-01-01 cutoff → already compliant.
-        let verdict = evaluate_fix(&fix_dep("1.0.1"), &releases, &[seven_day_layer()], &ctx(), now);
-        assert_eq!(verdict.current_status, Status::UpToDate);
+        let verdict = evaluate_fix(
+            &fix_dep("1.0.1"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+        assert_eq!(verdict.current.status, Status::UpToDate);
         assert_eq!(verdict.target, None);
     }
 
@@ -527,8 +556,29 @@ mod tests {
             dated("1.0.0", 0, "2026-01-05T00:00:00Z"),
             dated("1.0.1", 1, "2026-01-07T00:00:00Z"),
         ];
-        let verdict = evaluate_fix(&fix_dep("1.0.1"), &releases, &[seven_day_layer()], &ctx(), now);
-        assert_eq!(verdict.current_status, Status::CurrentInCooldown);
+        let verdict = evaluate_fix(
+            &fix_dep("1.0.1"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert_eq!(verdict.target, None);
+    }
+
+    #[test]
+    fn fix_does_not_target_graph_held_violation() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.0.1", 1, "2026-01-07T00:00:00Z"),
+        ];
+        let mut dep = fix_dep("1.0.1");
+        dep.graph_floor = Some(Version::new("1.0.1"));
+        let verdict = evaluate_fix(&dep, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert!(verdict.current.graph_held);
         assert_eq!(verdict.target, None);
     }
 }

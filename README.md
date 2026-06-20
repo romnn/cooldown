@@ -115,7 +115,7 @@ min-age = "14d"
 | Code | Meaning                                                                              |
 | ---- | ------------------------------------------------------------------------------------ |
 | 0    | clean / nothing to do                                                                |
-| 1    | policy violation (`check`) or an unmovable planned change (`upgrade --strict`)       |
+| 1    | policy violation (`check`) or an incomplete mutation under `upgrade`/`fix --strict`  |
 | 2    | usage / config error (bad duration, unknown `--tool`, mutually-exclusive flags, …)   |
 | 3    | no tool detected                                                                |
 | 4    | stale/absent lock, registry unreachable, a tool failed, or unknown-age under a flag  |
@@ -192,9 +192,9 @@ the core, render, the config schema, or any other adapter.
 - **Threat model:** the smash-and-grab window. The cooldown delays _adoption_; it is not a malware
   scanner and pairs with `govulncheck`/`cargo audit`/advisory feeds.
 - **Risk surface is the resolved graph.** `check` evaluates direct + transitive by default; the
-  floor applies to transitive too. `upgrade` applies one change at a time and, if a re-lock drags in
-  a too-fresh non-acknowledged transitive, restores the lock snapshot and skips that change — a
-  passing `upgrade` never leaves a lock a subsequent `check` would reject.
+  floor applies to transitive too. `upgrade` and `fix` apply one change at a time and, if a re-lock
+  leaves a new too-fresh non-acknowledged dependency in the graph, restore the lock snapshot and
+  skip that change — a passing mutation never leaves a lock a subsequent `check` would reject.
 - **Cache hardening:** a cached publish time may never move _earlier_ on refresh (monotonic floor);
   a backdated upstream timestamp is rejected, not trusted.
 - **Escape hatches are explicit and audited** (`--latest`/`--allow`/config `allow`, all in

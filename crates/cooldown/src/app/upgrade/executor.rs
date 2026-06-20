@@ -107,7 +107,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
         // `fix --transitive` acts on the whole resolved graph; everything else is direct-only.
         let scope = match self.mode {
-            PlanMode::Fix { transitive: true, .. } => DepScope::Graph,
+            PlanMode::Fix {
+                transitive: true, ..
+            } => DepScope::Graph,
             _ => DepScope::Direct,
         };
         match self
@@ -236,7 +238,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             );
             // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
             // alone, so `fix` only ever touches what `check` would reject.
-            if fix.current_status != Status::CurrentInCooldown {
+            if fix.current.status != Status::CurrentInCooldown {
+                continue;
+            }
+            if fix.current.graph_held {
+                self.record_fix_warning(&format!(
+                    "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
+                    dep.package.name, dep.current
+                ), &dep.package.name);
                 continue;
             }
             // An exact pin is a deliberate choice: warn and leave it unless `--downgrade-pinned`.
@@ -275,6 +284,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .with_tool(self.ctx.tool_name())
             .with_project(self.project_label.clone())
             .with_package(package);
+        self.acc.strict_incomplete = true;
         self.acc.warnings.push(diag);
     }
 
@@ -322,7 +332,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
         if report.applied.is_empty() {
             let restored = self.restore_journal(&journal);
-            self.acc.any_skipped = true;
+            self.acc.strict_incomplete = true;
             self.record_change_skip(
                 &change,
                 report
@@ -346,7 +356,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         };
         if let Some((offending_pkg, _)) = after.difference(&state.baseline_violations).next() {
             let restored = self.restore_journal(&journal);
-            self.acc.any_skipped = true;
+            self.acc.strict_incomplete = true;
             self.record_change_skip(
                 &change,
                 Some(SkippedInfo {

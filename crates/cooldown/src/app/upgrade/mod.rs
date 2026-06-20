@@ -1,9 +1,10 @@
-//! `upgrade` — move direct deps to the newest version older than the cooldown, then re-lock.
+//! Shared mutation flow for `upgrade` and `fix`: plan one version change, apply it, re-lock, verify,
+//! and roll back if the resulting graph would fail the cooldown gate.
 //!
-//! Acting on transitive deps is a non-goal, so the app applies changes **one at a time**: capture
-//! a narrow mutation journal for the pending change, apply the single-change plan, and if the
-//! re-lock drags in a too-fresh (non-baselined) transitive, restore that journal and skip the
-//! change as `TransitiveInCooldown` — never committing a lock a subsequent `check` would reject.
+//! The app applies changes **one at a time**: capture a narrow mutation journal for the pending
+//! change, apply the single-change plan, and if the re-lock leaves a new too-fresh
+//! (non-baselined) dependency in the graph, restore that journal and skip the change as
+//! `TransitiveInCooldown` — never committing a lock a subsequent `check` would reject.
 
 mod executor;
 
@@ -20,11 +21,12 @@ pub struct UpgradeOutcome {
     pub summary: UpgradeSummary,
     /// One entry per planned change, marked applied, skipped (with reason), or errored.
     pub items: Vec<UpgradeItem>,
-    /// Non-fatal diagnostics (currently unused; reserved for parity with other commands).
+    /// Non-fatal diagnostics.
     pub warnings: Vec<Diagnostic>,
     /// Project-level errors (a failed apply, a failed re-lock probe, etc.).
     pub errors: Vec<Diagnostic>,
-    /// The process exit; non-zero on any error, or under `--strict` when a change was skipped.
+    /// The process exit; non-zero on any error, or under `--strict` when the mutation could not
+    /// complete cleanly.
     pub exit: Exit,
 }
 
@@ -36,7 +38,7 @@ pub(super) struct UpgradeAccum {
     /// Non-fatal advisories — `fix` records a too-fresh pin it left in place, or a violation with no
     /// matured older version to downgrade to.
     pub(super) warnings: Vec<Diagnostic>,
-    pub(super) any_skipped: bool,
+    pub(super) strict_incomplete: bool,
     /// `None` until a build is attempted; `Some(false)` once any project's build fails.
     pub(super) build_ok: Option<bool>,
     pub(super) build_requested: bool,
@@ -143,7 +145,7 @@ impl Workspace {
         let lock_or_build_failed = acc.lock_verified == Some(false) || acc.build_ok == Some(false);
         let exit = if err_count > 0 || lock_or_build_failed {
             Exit::Environment
-        } else if opts.strict && acc.any_skipped {
+        } else if opts.strict && acc.strict_incomplete {
             Exit::Policy
         } else {
             Exit::Ok

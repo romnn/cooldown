@@ -27,7 +27,7 @@ pub struct ProjectCtx {
 pub enum Exit {
     /// clean / nothing to do
     Ok,
-    /// policy violation (check) or an unmovable planned change (upgrade --strict)
+    /// policy violation (`check`) or an incomplete mutation under `--strict`
     Policy,
     /// usage / config error
     Usage,
@@ -146,7 +146,7 @@ pub struct RunOpts {
     pub allow_stale_lock: bool,
     /// `--fail-on-unknown-age`: make `check` fail on deps with no publish time.
     pub fail_on_unknown_age: bool,
-    /// `--strict` (upgrade): fail if any planned change was skipped.
+    /// `--strict` (upgrade/fix): fail if the mutation could not complete cleanly.
     pub strict: bool,
     /// `--build` (upgrade): compile/sync after re-locking.
     pub build: bool,

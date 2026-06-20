@@ -58,6 +58,8 @@ struct State {
     fresh_transitive_present: bool,
     /// Whether `apply` has already mutated the project once.
     apply_attempted: bool,
+    /// Package versions pinned by a successful fake apply, surfaced by the next graph probe.
+    applied_versions: HashMap<String, Version>,
 }
 
 #[allow(
@@ -90,6 +92,18 @@ impl FakeEco {
     }
 }
 
+fn apply_versions(
+    mut deps: Vec<Dependency>,
+    versions: &HashMap<String, Version>,
+) -> Vec<Dependency> {
+    for dep in &mut deps {
+        if let Some(version) = versions.get(&dep.package.name) {
+            dep.current = version.clone();
+        }
+    }
+    deps
+}
+
 #[async_trait]
 impl ToolRead for FakeEco {
     fn id(&self) -> ToolId {
@@ -110,16 +124,17 @@ impl ToolRead for FakeEco {
         }
     }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
-        if scope == DepScope::Graph
-            && self.fail_graph_after_apply
-            && self.state.lock().unwrap().apply_attempted
-        {
+        let state = self.state.lock().unwrap();
+        if scope == DepScope::Graph && self.fail_graph_after_apply && state.apply_attempted {
             return Err(CoreError::Transient("post-apply graph probe failed".into()));
         }
-        let mut out = self.direct.clone();
+        let mut out = apply_versions(self.direct.clone(), &state.applied_versions);
         if scope == DepScope::Graph {
-            out.extend(self.transitive.clone());
-            if self.state.lock().unwrap().fresh_transitive_present
+            out.extend(apply_versions(
+                self.transitive.clone(),
+                &state.applied_versions,
+            ));
+            if state.fresh_transitive_present
                 && let Some(ft) = &self.fresh_transitive
             {
                 out.push(ft.clone());
@@ -144,19 +159,31 @@ impl ToolRead for FakeEco {
         dep: &Dependency,
         _fetch: &cooldown_core::FetchContext<'_>,
     ) -> Result<Release> {
-        if self.state.lock().unwrap().apply_attempted
-            && self
-                .fail_locked_release_after_apply_for
-                .as_deref()
-                .is_some_and(|name| name == dep.package.name)
-        {
-            return Err(CoreError::Transient(
-                format!(
-                    "post-apply locked release probe failed for {}",
-                    dep.package.name
-                )
-                .into(),
-            ));
+        let applied = {
+            let state = self.state.lock().unwrap();
+            if state.apply_attempted
+                && self
+                    .fail_locked_release_after_apply_for
+                    .as_deref()
+                    .is_some_and(|name| name == dep.package.name)
+            {
+                return Err(CoreError::Transient(
+                    format!(
+                        "post-apply locked release probe failed for {}",
+                        dep.package.name
+                    )
+                    .into(),
+                ));
+            }
+            state.applied_versions.get(&dep.package.name).cloned()
+        };
+        if let Some(version) = applied {
+            return self
+                .releases
+                .get(&dep.package.name)
+                .and_then(|releases| releases.iter().find(|release| release.version == version))
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound(dep.package.name.clone()));
         }
         self.locked
             .get(&dep.package.name)
@@ -192,6 +219,11 @@ impl ToolWrite for FakeEco {
         state.apply_attempted = true;
         if self.inject_fresh_on_apply {
             state.fresh_transitive_present = true;
+        }
+        for change in &plan.changes {
+            state
+                .applied_versions
+                .insert(change.package.name.clone(), change.to.clone());
         }
         Ok(ApplyReport {
             applied: plan.changes.clone(),
@@ -237,6 +269,56 @@ fn tmp_root() -> (tempfile::TempDir, Utf8PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     (dir, root)
+}
+
+fn fake(
+    root: Utf8PathBuf,
+    direct: Vec<Dependency>,
+    transitive: Vec<Dependency>,
+    releases: HashMap<String, Vec<Release>>,
+    locked: HashMap<String, Release>,
+) -> FakeEco {
+    FakeEco {
+        direct,
+        transitive,
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    }
+}
+
+fn too_fresh_fix_releases() -> Vec<Release> {
+    vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v1.0.1",
+            1,
+            Some("2026-06-01T00:00:00Z"),
+            Some(UpdateKind::Patch),
+        ),
+        rel(
+            "v1.0.2",
+            2,
+            Some("2026-06-16T00:00:00Z"),
+            Some(UpdateKind::Patch),
+        ),
+    ]
+}
+
+fn release_named(releases: &[Release], version: &str) -> Release {
+    releases
+        .iter()
+        .find(|release| release.version == Version::new(version))
+        .unwrap()
+        .clone()
 }
 
 #[tokio::test]
@@ -496,6 +578,187 @@ async fn upgrade_applies_clean_change() {
     assert_eq!(out.summary.applied, 1);
     assert!(out.items[0].applied);
     assert_eq!(out.items[0].to, "v1.1.0");
+}
+
+#[tokio::test]
+async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("a", "v1.0.2", true)],
+            Vec::new(),
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.skipped, 0);
+    assert!(out.warnings.is_empty());
+    assert_eq!(out.items[0].name, "a");
+    assert_eq!(out.items[0].from, "v1.0.2");
+    assert_eq!(out.items[0].to, "v1.0.1");
+    assert!(out.items[0].applied);
+}
+
+#[tokio::test]
+async fn fix_warns_and_leaves_exact_pin_unless_opted_in() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut pinned = dep("a", "v1.0.2", true);
+    pinned.pinned = true;
+    let ws = workspace(
+        fake(root, vec![pinned], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+    assert_eq!(out.warnings.len(), 1);
+    assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
+    assert!(out.warnings[0].message.contains("--downgrade-pinned"));
+}
+
+#[tokio::test]
+async fn fix_strict_fails_when_a_violation_is_left_unresolved() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut pinned = dep("a", "v1.0.2", true);
+    pinned.pinned = true;
+    let ws = workspace(
+        fake(root, vec![pinned], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+    let mut opts = opts();
+    opts.strict = true;
+
+    let out = ws.fix(&opts).await;
+
+    assert_eq!(out.exit, Exit::Policy);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+    assert_eq!(out.warnings.len(), 1);
+    assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
+}
+
+#[tokio::test]
+async fn fix_downgrades_exact_pin_when_opted_in() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut pinned = dep("a", "v1.0.2", true);
+    pinned.pinned = true;
+    let ws = workspace(
+        fake(root, vec![pinned], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+    let mut opts = opts();
+    opts.downgrade_pinned = true;
+
+    let out = ws.fix(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].to, "v1.0.1");
+}
+
+#[tokio::test]
+async fn fix_warns_and_leaves_graph_held_violation() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut held = dep("a", "v1.0.2", true);
+    held.graph_floor = Some(Version::new("v1.0.2"));
+    let ws = workspace(
+        fake(root, vec![held], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+    assert_eq!(out.warnings.len(), 1);
+    assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
+    assert!(out.warnings[0].message.contains("resolved graph requires"));
+}
+
+#[tokio::test]
+async fn fix_only_downgrades_transitive_deps_when_opted_in() {
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("t".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert(
+        "b".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&package_releases, "v1.0.2"));
+
+    let without_flag = workspace(
+        fake(
+            root.clone(),
+            vec![dep("b", "v1.0.0", true)],
+            vec![dep("t", "v1.0.2", false)],
+            releases.clone(),
+            locked.clone(),
+        ),
+        Baseline::default(),
+    )
+    .fix(&opts())
+    .await;
+    assert_eq!(without_flag.exit, Exit::Ok);
+    assert_eq!(without_flag.summary.applied, 0);
+    assert!(without_flag.items.is_empty());
+
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("b", "v1.0.0", true)],
+            vec![dep("t", "v1.0.2", false)],
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+    let mut opts = opts();
+    opts.transitive = true;
+
+    let out = ws.fix(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].name, "t");
+    assert_eq!(out.items[0].to, "v1.0.1");
 }
 
 #[tokio::test]
