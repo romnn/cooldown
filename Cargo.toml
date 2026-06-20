@@ -21,6 +21,7 @@ codegen-units = 1
 strip = true
 
 [workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
 unsafe_code = "deny"
 unused_must_use = "deny"
 # Warn-only: keep iteration fast during development; CI/review still adds the docs.
