@@ -58,7 +58,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
 
     // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The
     // config (`[<command>]`/`[global]`) and `--major`/`--no-major` refine this inside `prepare_run`.
-    let default_major = matches!(cli.command, Command::Outdated);
+    let default_major = matches!(cli.command, Command::Outdated { .. });
     let prepared = setup::prepare_run(
         global,
         &overrides,
@@ -124,7 +124,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
 fn pre_syncs(command: &Command) -> bool {
     matches!(
         command,
-        Command::Outdated | Command::Upgrade | Command::Fix { .. } | Command::Check { .. }
+        Command::Outdated { .. } | Command::Upgrade | Command::Fix { .. } | Command::Check { .. }
     )
 }
 
@@ -148,7 +148,7 @@ pub(in crate::cli) fn generated_at(now: jiff::Timestamp) -> String {
 
 fn command_name(command: &Command) -> &'static str {
     match command {
-        Command::Outdated => "outdated",
+        Command::Outdated { .. } => "outdated",
         Command::Upgrade => "upgrade",
         Command::Fix { .. } => "fix",
         Command::Check { .. } => "check",

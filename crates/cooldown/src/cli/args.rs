@@ -90,14 +90,19 @@ pub struct Cli {
 pub(crate) enum CheckTransitive {
     /// Evaluate transitive deps but never fail the gate on them; report them as allowed.
     Allow,
-    /// Skip evaluating transitive deps entirely (equivalent to `--direct-only` for `check`).
+    /// Skip evaluating transitive deps entirely (a direct-only gate).
     Hide,
 }
 
 #[derive(Subcommand)]
 pub(in crate::cli) enum Command {
     /// What could update — split into "adoptable now" vs "in cooldown".
-    Outdated,
+    Outdated {
+        /// Also list transitive (indirect) deps. By default the report shows only direct deps; the
+        /// summary line still counts the whole resolved graph.
+        #[arg(long)]
+        transitive: bool,
+    },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade,
     /// Fix cooldown violations: downgrade too-fresh deps to a matured version (never upgrades).
@@ -231,12 +236,6 @@ pub(in crate::cli) struct GlobalArgs {
         env = "COOLDOWN_LOG"
     )]
     pub(in crate::cli) log_level: LogLevel,
-    /// Evaluate only direct deps.
-    #[arg(long = "direct-only", global = true)]
-    pub(in crate::cli) direct_only: bool,
-    /// (outdated) include transitive deps in the report.
-    #[arg(long = "include-indirect", global = true)]
-    pub(in crate::cli) include_indirect: bool,
     /// (outdated) Hide held rows (exact `==`/`=` pins and commit pins) from the table, leaving only
     /// deps with an actionable update. A held row's `Latest` column still shows what is available.
     #[arg(long = "hide-pinned", global = true)]
@@ -331,8 +330,6 @@ pub struct CliOverrides {
     pub(crate) gitignore: Option<bool>,
     pub(crate) all: Option<bool>,
     pub(crate) major_all: Option<bool>,
-    pub(crate) direct_only: Option<bool>,
-    pub(crate) include_indirect: Option<bool>,
     pub(crate) all_artifacts: Option<bool>,
     pub(crate) allow_stale_lock: Option<bool>,
     pub(crate) fail_on_unknown_age: Option<bool>,
@@ -366,16 +363,16 @@ impl CliOverrides {
             gitignore: set_on_cli(matches, "no_gitignore").then_some(false),
             all: on("all"),
             major_all: on("major_all"),
-            direct_only: on("direct_only"),
-            include_indirect: on("include_indirect"),
             all_artifacts: on("all_artifacts"),
             allow_stale_lock: on("allow_stale_lock"),
             fail_on_unknown_age: on("fail_on_unknown_age"),
             strict: on("strict"),
             build: on("build"),
-            // `fix`'s booleans are per-command now, so probe the `fix` subcommand directly — the
-            // root command never registers them.
-            transitive: set_on_subcommand(matches, "fix", "transitive").then_some(true),
+            // `--transitive` is a per-command bool on both `outdated` (show transitives) and `fix`
+            // (downgrade them); probe each subcommand directly — the root never registers it.
+            transitive: (set_on_subcommand(matches, "outdated", "transitive")
+                || set_on_subcommand(matches, "fix", "transitive"))
+            .then_some(true),
             downgrade_pinned: set_on_subcommand(matches, "fix", "downgrade_pinned").then_some(true),
             // `--transitive` carries a value only under `check`; read it from that subcommand.
             check_transitive: matches
@@ -478,6 +475,15 @@ mod tests {
         let ov = overrides(&["cooldown", "fix", "--transitive", "--downgrade-pinned"]);
         assert_eq!(ov.transitive, Some(true));
         assert_eq!(ov.downgrade_pinned, Some(true));
+    }
+
+    #[test]
+    fn outdated_transitive_is_an_explicit_override() {
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--transitive"]).transitive,
+            Some(true)
+        );
+        assert_eq!(overrides(&["cooldown", "outdated"]).transitive, None);
     }
 
     #[test]

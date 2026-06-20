@@ -36,8 +36,8 @@ struct OutdatedRunner<'a> {
 impl Workspace {
     /// Report what could update, split into "adoptable now" vs "in cooldown".
     ///
-    /// Scopes to direct deps unless `--include-indirect` is set (and `--direct-only` is not), and
-    /// to packages matching `--package`. Surfaces a yanked locked version as a warning.
+    /// Scopes to direct deps unless `--transitive` is set, and to packages matching `--package`.
+    /// Surfaces a yanked locked version as a warning.
     pub async fn outdated(&self, opts: &RunOpts) -> OutdatedOutcome {
         OutdatedRunner::new(self, opts).run().await
     }
@@ -45,7 +45,7 @@ impl Workspace {
 
 impl<'a> OutdatedRunner<'a> {
     fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
-        let scope = if opts.include_indirect && !opts.direct_only {
+        let scope = if opts.transitive {
             DepScope::Graph
         } else {
             DepScope::Direct

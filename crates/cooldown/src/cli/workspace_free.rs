@@ -81,6 +81,7 @@ min-age = "7d"
 # [outdated]
 # major = true                # outdated shows cross-major by default; set false for minor-only
 # all = false                 # also list up-to-date deps; exit-code = 1 gates CI
+# transitive = false          # true also lists transitive (indirect) deps in the report
 #
 # [upgrade]
 # strict = true               # fail if a mutation cannot complete cleanly; build = true to compile

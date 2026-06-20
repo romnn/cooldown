@@ -88,7 +88,7 @@ impl Workspace {
     ///
     /// Fail-closed: a stale lock, a per-dependency evaluation error, or (under
     /// `--fail-on-unknown-age`) an unknown publish time forces a non-zero [`Exit`]. Evaluates the
-    /// full graph by default, or direct deps under `--direct-only`.
+    /// full graph by default, or direct deps under `--transitive hide`.
     pub async fn check(&self, opts: &RunOpts) -> CheckOutcome {
         CheckRunner::new(self, opts).run().await
     }
@@ -96,9 +96,9 @@ impl Workspace {
 
 impl<'a> CheckRunner<'a> {
     fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
-        // `--direct-only` and `check --transitive hide` both skip evaluating transitive deps; every
-        // other mode (including `allow`) gates the full resolved graph.
-        let scope = if opts.direct_only || opts.check_transitive == TransitiveGate::Hide {
+        // `check --transitive hide` skips evaluating transitive deps; every other mode (including
+        // `allow`) gates the full resolved graph.
+        let scope = if opts.check_transitive == TransitiveGate::Hide {
             DepScope::Direct
         } else {
             DepScope::Graph

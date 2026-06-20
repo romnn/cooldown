@@ -33,7 +33,7 @@ pub(crate) struct SelectorToml {
 ///
 /// Every field mirrors a CLI flag. Resolution is uniform: an explicit CLI flag always wins, then a
 /// `[<command>]` value, then `[global]`, then the built-in default. `None`/empty means "unset", so a
-/// section only overrides what it names. Keys are kebab-case (`major-all`, `direct-only`, …), the
+/// section only overrides what it names. Keys are kebab-case (`major-all`, `all-artifacts`, …), the
 /// same spelling as the flags. New config-driven flags are added here and nowhere else.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -56,10 +56,6 @@ pub struct CommandConfig {
     pub major_all: Option<bool>,
     /// List up-to-date deps in `outdated` (`--all`).
     pub all: Option<bool>,
-    /// Evaluate only direct deps (`--direct-only`).
-    pub direct_only: Option<bool>,
-    /// Include transitive deps in `outdated` (`--include-indirect`).
-    pub include_indirect: Option<bool>,
     /// Gate every recorded artifact in `check` (`--all-artifacts`).
     pub all_artifacts: Option<bool>,
     /// Downgrade a stale/absent lock to a warning (`--allow-stale-lock`).
@@ -70,7 +66,7 @@ pub struct CommandConfig {
     pub strict: Option<bool>,
     /// Compile/sync after re-locking in `upgrade` (`--build`).
     pub build: Option<bool>,
-    /// Include transitive deps in `fix` (`--transitive`).
+    /// Include transitive deps in `outdated`/`fix` (`--transitive`).
     pub transitive: Option<bool>,
     /// Allow `fix` to downgrade exact-pinned deps too (`--downgrade-pinned`).
     pub downgrade_pinned: Option<bool>,
@@ -102,8 +98,6 @@ impl CommandConfig {
         self.major = other.major.or(self.major);
         self.major_all = other.major_all.or(self.major_all);
         self.all = other.all.or(self.all);
-        self.direct_only = other.direct_only.or(self.direct_only);
-        self.include_indirect = other.include_indirect.or(self.include_indirect);
         self.all_artifacts = other.all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = other.allow_stale_lock.or(self.allow_stale_lock);
         self.fail_on_unknown_age = other.fail_on_unknown_age.or(self.fail_on_unknown_age);
@@ -136,8 +130,6 @@ impl CommandConfig {
         self.major = explicit.major.or(self.major);
         self.major_all = explicit.major_all.or(self.major_all);
         self.all = explicit.all.or(self.all);
-        self.direct_only = explicit.direct_only.or(self.direct_only);
-        self.include_indirect = explicit.include_indirect.or(self.include_indirect);
         self.all_artifacts = explicit.all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = explicit.allow_stale_lock.or(self.allow_stale_lock);
         self.fail_on_unknown_age = explicit.fail_on_unknown_age.or(self.fail_on_unknown_age);

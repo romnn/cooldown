@@ -89,12 +89,6 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
 }
 
 pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
-    if ctx.opts.include_indirect {
-        return Err(CoreError::Config(
-            "`upgrade --include-indirect` is not allowed: acting on transitive deps is a non-goal"
-                .into(),
-        ));
-    }
     if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
         return Err(CoreError::Config(
             "`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all"
@@ -131,12 +125,6 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
 }
 
 pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
-    if ctx.opts.include_indirect {
-        return Err(CoreError::Config(
-            "`fix --include-indirect` is not allowed: use `fix --transitive` to opt into transitive downgrades"
-                .into(),
-        ));
-    }
     if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
         return Err(CoreError::Config(
             "`fix --major` allows cross-major downgrades (very breaking); pass --package or --major-all"

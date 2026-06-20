@@ -143,7 +143,8 @@ pub struct RunOpts {
     /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
-    /// `--transitive` (fix): also downgrade too-fresh transitive deps, not just direct ones.
+    /// `--transitive`: include transitive deps in the operation. For `outdated` it adds them to the
+    /// report; for `fix` it also downgrades too-fresh transitive deps, not just direct ones.
     pub transitive: bool,
     /// `--downgrade-pinned` (fix): downgrade and rewrite exact-pinned deps too; otherwise a pinned
     /// violation is left in place with a warning.
@@ -151,10 +152,6 @@ pub struct RunOpts {
     /// `--transitive <mode>` (check): how the gate treats a too-fresh transitive dep. Defaults to
     /// [`TransitiveGate::Fail`].
     pub check_transitive: TransitiveGate,
-    /// `--direct-only`: evaluate only direct deps.
-    pub direct_only: bool,
-    /// `--include-indirect` (outdated): include transitive deps in the report.
-    pub include_indirect: bool,
     /// `--all-artifacts` (check): gate every recorded artifact.
     pub all_artifacts: bool,
     /// `--allow-stale-lock`: downgrade a stale/absent lock from failure to a warning.

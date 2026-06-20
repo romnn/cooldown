@@ -393,6 +393,57 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
 }
 
 #[tokio::test]
+async fn outdated_transitive_scopes_in_indirect_deps() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    // Both a direct and a transitive dep have a matured newer version → both are adoptable.
+    for name in ["a", "t"] {
+        releases.insert(
+            name.to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+    }
+    let make = || {
+        let fake = FakeEco {
+            direct: vec![dep("a", "v1.0.0", true)],
+            transitive: vec![dep("t", "v1.0.0", false)],
+            fresh_transitive: None,
+            releases: releases.clone(),
+            locked: HashMap::new(),
+            inject_fresh_on_apply: false,
+            stale_lock: false,
+            fail_graph_after_apply: false,
+            fail_locked_release_after_apply_for: None,
+            stale_lock_after_apply: false,
+            build_fails_after_apply: false,
+            state: Mutex::new(State::default()),
+            root: root.clone(),
+        };
+        workspace(fake, Baseline::default())
+    };
+
+    // Default: direct-only — the transitive dep is not in the report.
+    let out = make().outdated(&opts()).await;
+    assert_eq!(out.items.len(), 1);
+    assert_eq!(out.items[0].name, "a");
+
+    // `--transitive`: the indirect dep is scoped in too.
+    let mut transitive = opts();
+    transitive.transitive = true;
+    let out = make().outdated(&transitive).await;
+    assert_eq!(out.items.len(), 2);
+    assert!(out.items.iter().any(|item| item.name == "t"));
+}
+
+#[tokio::test]
 async fn per_tool_exclude_prunes_workspace_member_dependencies() {
     let (_g, root) = tmp_root();
     let mut kept = dep("kept", "v1.0.0", true);
