@@ -7,7 +7,7 @@
 
 use crate::model::{
     Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseQuality, Status, ToolId,
-    UpdateKind, Verdict,
+    UpdateKind, Verdict, Version,
 };
 use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
@@ -350,6 +350,67 @@ pub fn check_pin(
     }
 }
 
+/// The downgrade plan for one dependency under `fix`: whether its currently-locked version violates
+/// the cooldown and, if so, the newest already-matured version to roll back to.
+#[derive(Debug, Clone)]
+pub struct FixVerdict {
+    /// The current pin's [`check_pin`] status. Only [`Status::CurrentInCooldown`] needs fixing.
+    pub current_status: Status,
+    /// The newest matured version older than the current pin — the downgrade target. `None` when the
+    /// pin is already compliant (no fix needed) or no older version has matured (unfixable: the
+    /// caller should report it, e.g. suggesting `baseline`).
+    pub target: Option<Version>,
+}
+
+/// Decide whether `dep`'s locked version is too fresh and, if so, the newest matured version older
+/// than it to downgrade to — the dual of [`evaluate`].
+///
+/// Where [`evaluate`] searches *newer* releases for the newest one safe to adopt, this searches
+/// *older* releases for the newest one already past the cooldown: the minimal downgrade that makes
+/// [`check_pin`] pass for this dependency. The target stays within the current major unless
+/// [`ResolveContext::allow_major`] is set, is quality-eligible and not yanked, and is judged against
+/// the same current-pin window [`check_pin`] uses, so the chosen version is one `check` will accept.
+#[must_use]
+pub fn evaluate_fix(
+    dep: &Dependency,
+    releases: &[Release],
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> FixVerdict {
+    let Some(current) = releases.iter().find(|r| r.version == dep.current) else {
+        // The adapter did not surface the locked version among the releases, so its age cannot be
+        // judged here; `check` remains the real gate.
+        return FixVerdict {
+            current_status: Status::UnknownAge,
+            target: None,
+        };
+    };
+    let pin = check_pin(dep, current, layers, ctx, now);
+    if pin.status != Status::CurrentInCooldown {
+        return FixVerdict {
+            current_status: pin.status,
+            target: None,
+        };
+    }
+    let cutoff = pin.window.cutoff(now);
+    let target = releases
+        .iter()
+        .filter(|r| r.order < current.order)
+        .filter(|r| {
+            quality_eligible(r, dep.current_quality)
+                && major_eligible(r, &current.major, ctx.allow_major)
+                && !r.yanked
+        })
+        .filter(|r| matches!(r.published_at, Some(published) if published <= cutoff))
+        .max_by(|a, b| a.order.cmp(&b.order))
+        .map(|r| r.version.clone());
+    FixVerdict {
+        current_status: Status::CurrentInCooldown,
+        target,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +446,89 @@ mod tests {
         let patch = release("v0.36.2", "", Some(UpdateKind::Patch));
         assert!(major_eligible(&minor, &base, false));
         assert!(major_eligible(&patch, &base, false));
+    }
+
+    fn dated(version: &str, order: u8, published: &str) -> Release {
+        Release {
+            version: Version::new(version),
+            order: ReleaseOrder(vec![order]),
+            major: MajorKey("1".into()),
+            kind_from_current: Some(UpdateKind::Patch),
+            published_at: Some(published.parse().expect("timestamp")),
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
+    }
+
+    fn fix_dep(current: &str) -> Dependency {
+        Dependency {
+            package: crate::PackageId::new(ToolId("cargo"), "widget", None),
+            current: Version::new(current),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            members: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    fn seven_day_layer() -> PolicyLayer {
+        let mut layer = PolicyLayer::new(crate::Origin::Default);
+        let mut rule = crate::Rule::new(crate::Selector::Default);
+        rule.window =
+            crate::ByKind::scalar(crate::WindowSpec::MinAge(jiff::SignedDuration::from_hours(
+                24 * 7,
+            )));
+        layer.rules.push(rule);
+        layer
+    }
+
+    fn ctx() -> ResolveContext<'static> {
+        ResolveContext {
+            tool: ToolId("cargo"),
+            project: Utf8Path::new("/repo"),
+            allow_major: false,
+        }
+    }
+
+    #[test]
+    fn fix_targets_newest_matured_version_older_than_a_too_fresh_pin() {
+        // Window cutoff is 2026-01-01; 1.0.0 and 1.0.1 have matured, 1.0.2 (the pin) is too fresh.
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.0.1", 1, "2025-12-15T00:00:00Z"),
+            dated("1.0.2", 2, "2026-01-07T00:00:00Z"),
+        ];
+        let verdict = evaluate_fix(&fix_dep("1.0.2"), &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current_status, Status::CurrentInCooldown);
+        assert_eq!(verdict.target, Some(Version::new("1.0.1")));
+    }
+
+    #[test]
+    fn fix_leaves_a_compliant_pin_alone() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.0.1", 1, "2025-12-15T00:00:00Z"),
+        ];
+        // 1.0.1 matured on 2025-12-15, before the 2026-01-01 cutoff → already compliant.
+        let verdict = evaluate_fix(&fix_dep("1.0.1"), &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current_status, Status::UpToDate);
+        assert_eq!(verdict.target, None);
+    }
+
+    #[test]
+    fn fix_reports_no_target_when_no_older_version_has_matured() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        // Every release is younger than the cutoff, so there is nothing safe to downgrade to.
+        let releases = vec![
+            dated("1.0.0", 0, "2026-01-05T00:00:00Z"),
+            dated("1.0.1", 1, "2026-01-07T00:00:00Z"),
+        ];
+        let verdict = evaluate_fix(&fix_dep("1.0.1"), &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current_status, Status::CurrentInCooldown);
+        assert_eq!(verdict.target, None);
     }
 }

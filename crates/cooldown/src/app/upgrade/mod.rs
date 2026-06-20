@@ -7,7 +7,7 @@
 
 mod executor;
 
-use self::executor::ProjectUpgradeExecutor;
+use self::executor::{PlanMode, ProjectUpgradeExecutor};
 use super::{BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace};
 use cooldown_core::{Diagnostic, ToolRead, ToolWrite};
 
@@ -33,6 +33,9 @@ pub struct UpgradeOutcome {
 pub(super) struct UpgradeAccum {
     pub(super) items: Vec<UpgradeItem>,
     pub(super) errors: Vec<Diagnostic>,
+    /// Non-fatal advisories — `fix` records a too-fresh pin it left in place, or a violation with no
+    /// matured older version to downgrade to.
+    pub(super) warnings: Vec<Diagnostic>,
     pub(super) any_skipped: bool,
     /// `None` until a build is attempted; `Some(false)` once any project's build fails.
     pub(super) build_ok: Option<bool>,
@@ -77,6 +80,25 @@ impl Workspace {
     /// have touched are restored and that change is reported as skipped — never committing a state
     /// a subsequent `check` would reject. With `--dry-run` the plan is reported without mutation.
     pub async fn upgrade(&self, opts: &RunOpts) -> UpgradeOutcome {
+        self.run_plan(opts, PlanMode::Upgrade).await
+    }
+
+    /// Fix cooldown violations by downgrading every dependency whose locked version is younger than
+    /// the cooldown to the newest version that has already matured past it — the dual of `upgrade`,
+    /// which never moves a dependency forward.
+    ///
+    /// By default only direct deps are touched and exact pins are left in place with a warning;
+    /// `opts.transitive` extends it to too-fresh transitives, and `opts.downgrade_pinned` rewrites
+    /// pins down too. Each downgrade is applied one at a time with the same rollback/verify trial.
+    pub async fn fix(&self, opts: &RunOpts) -> UpgradeOutcome {
+        let mode = PlanMode::Fix {
+            transitive: opts.transitive,
+            downgrade_pinned: opts.downgrade_pinned,
+        };
+        self.run_plan(opts, mode).await
+    }
+
+    async fn run_plan(&self, opts: &RunOpts, mode: PlanMode) -> UpgradeOutcome {
         let mut acc = UpgradeAccum {
             build_requested: opts.build,
             ..UpgradeAccum::default()
@@ -92,6 +114,7 @@ impl Workspace {
             ProjectUpgradeExecutor::new(
                 self,
                 UpgradeCtx::new(reader, writer, pctx, opts),
+                mode,
                 &mut acc,
             )
             .run()
@@ -147,7 +170,7 @@ impl Workspace {
             meta,
             summary,
             items: acc.items,
-            warnings: Vec::new(),
+            warnings: acc.warnings,
             errors: acc.errors,
             exit,
         }

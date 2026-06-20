@@ -3,9 +3,25 @@ use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
     Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
-    SkipReason, Status, check_pin, evaluate,
+    SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
 };
 use std::collections::HashSet;
+
+/// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
+/// version (`fix`). The trial/rollback/verify machinery is shared; only planning differs.
+#[derive(Clone, Copy)]
+pub(super) enum PlanMode {
+    /// `upgrade`: move direct deps to the newest matured version.
+    Upgrade,
+    /// `fix`: downgrade deps whose locked version is too fresh to the newest matured older version.
+    Fix {
+        /// Also act on too-fresh transitive deps (`--transitive`), not just direct ones.
+        transitive: bool,
+        /// Downgrade and rewrite exact-pinned deps too (`--downgrade-pinned`); otherwise a pinned
+        /// violation is left in place with a warning.
+        downgrade_pinned: bool,
+    },
+}
 
 /// The evolving per-project state during one-change upgrade trials.
 struct TrialState {
@@ -19,25 +35,36 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     ws: &'a Workspace,
     ctx: UpgradeCtx<'b>,
     project_label: String,
+    mode: PlanMode,
     acc: &'a mut UpgradeAccum,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
-    pub(super) fn new(ws: &'a Workspace, ctx: UpgradeCtx<'b>, acc: &'a mut UpgradeAccum) -> Self {
+    pub(super) fn new(
+        ws: &'a Workspace,
+        ctx: UpgradeCtx<'b>,
+        mode: PlanMode,
+        acc: &'a mut UpgradeAccum,
+    ) -> Self {
         ProjectUpgradeExecutor {
             ws,
             project_label: ctx.pctx.rel_path.to_string(),
+            mode,
             ctx,
             acc,
         }
     }
 
     pub(super) async fn run(&mut self) {
-        let Some(deps) = self.direct_deps().await else {
+        let Some(deps) = self.scoped_deps().await else {
             return;
         };
+        let verb = match self.mode {
+            PlanMode::Upgrade => "upgrades",
+            PlanMode::Fix { .. } => "downgrades",
+        };
         self.ctx.opts.progress.say(&format!(
-            "Planning upgrades for {} direct dependencies in {} ({})…",
+            "Planning {verb} for {} dependencies in {} ({})…",
             deps.len(),
             self.project_label(),
             self.ctx.pctx.tool
@@ -77,15 +104,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.finalize().await;
     }
 
-    async fn direct_deps(&mut self) -> Option<Vec<Dependency>> {
+    async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
+        // `fix --transitive` acts on the whole resolved graph; everything else is direct-only.
+        let scope = match self.mode {
+            PlanMode::Fix { transitive: true, .. } => DepScope::Graph,
+            _ => DepScope::Direct,
+        };
         match self
             .ws
-            .dependencies_in_scope(
-                self.ctx.reader,
-                self.ctx.pctx,
-                DepScope::Direct,
-                self.ctx.opts,
-            )
+            .dependencies_in_scope(self.ctx.reader, self.ctx.pctx, scope, self.ctx.opts)
             .await
         {
             Ok(deps) => Some(deps),
@@ -97,6 +124,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn plan_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
+        match self.mode {
+            PlanMode::Upgrade => self.plan_upgrade_changes(deps).await,
+            PlanMode::Fix {
+                downgrade_pinned, ..
+            } => self.plan_fix_changes(deps, downgrade_pinned).await,
+        }
+    }
+
+    async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
@@ -160,6 +196,86 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             });
         }
         planned
+    }
+
+    /// Plan downgrades for `fix`: every dependency whose locked version is too fresh moves to the
+    /// newest matured version older than it. A pin is left in place with a warning unless
+    /// `downgrade_pinned`; a violation with no matured older version is reported as a warning too.
+    async fn plan_fix_changes(
+        &mut self,
+        deps: &[Dependency],
+        downgrade_pinned: bool,
+    ) -> Vec<Change> {
+        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                self.ctx.reader,
+                deps.to_vec(),
+                &fctx,
+                self.ctx.opts.candidate_scope(),
+                self.ctx.opts.fanout(),
+            )
+            .await;
+        let mut planned = Vec::new();
+        for (dep, releases) in fetched {
+            let releases = match releases {
+                Ok(releases) => releases,
+                Err(error) => {
+                    self.record_project_error(&error, Some(&dep.package.name));
+                    continue;
+                }
+            };
+            let fix = evaluate_fix(
+                &dep,
+                &releases,
+                &self.ctx.pctx.policy.layers,
+                &rctx,
+                self.ws.now(),
+            );
+            // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
+            // alone, so `fix` only ever touches what `check` would reject.
+            if fix.current_status != Status::CurrentInCooldown {
+                continue;
+            }
+            // An exact pin is a deliberate choice: warn and leave it unless `--downgrade-pinned`.
+            if dep.pinned && !downgrade_pinned {
+                self.record_fix_warning(&format!(
+                    "{}@{} is pinned and younger than its cooldown; downgrade it manually or rerun with --downgrade-pinned",
+                    dep.package.name, dep.current
+                ), &dep.package.name);
+                continue;
+            }
+            let Some(target) = fix.target else {
+                self.record_fix_warning(&format!(
+                    "{}@{} is younger than its cooldown and no older version has matured; `baseline` it or wait",
+                    dep.package.name, dep.current
+                ), &dep.package.name);
+                continue;
+            };
+            let kind = releases
+                .iter()
+                .find(|release| release.version == target)
+                .and_then(|release| release.kind_from_current)
+                .unwrap_or(UpdateKind::Minor);
+            planned.push(Change {
+                package: dep.package.clone(),
+                from: dep.current.clone(),
+                to: target,
+                kind,
+                members: dep.members.clone(),
+            });
+        }
+        planned
+    }
+
+    fn record_fix_warning(&mut self, message: &str, package: &str) {
+        let diag = Diagnostic::new(DiagnosticKind::Held, message.to_string())
+            .with_tool(self.ctx.tool_name())
+            .with_project(self.project_label.clone())
+            .with_package(package);
+        self.acc.warnings.push(diag);
     }
 
     fn record_dry_run(&mut self, planned: &[Change]) {

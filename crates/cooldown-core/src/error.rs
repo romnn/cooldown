@@ -256,6 +256,10 @@ pub enum DiagnosticKind {
     Config,
     /// An upstream registry payload could not be parsed.
     Parse,
+    /// A cooldown violation `fix` left in place: an exact pin (without `--downgrade-pinned`), or a
+    /// dependency with no older version matured enough to downgrade to. Informational — the user
+    /// chooses how to act (manual downgrade, `--downgrade-pinned`, `baseline`, or wait).
+    Held,
 }
 
 impl fmt::Display for DiagnosticKind {
@@ -277,6 +281,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::System => "system",
             DiagnosticKind::Config => "config",
             DiagnosticKind::Parse => "parse",
+            DiagnosticKind::Held => "held",
         };
         f.write_str(s)
     }

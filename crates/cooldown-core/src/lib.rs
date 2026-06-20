@@ -13,7 +13,7 @@ pub mod policy;
 pub mod ports;
 
 pub use error::{CoreError, Diagnostic, DiagnosticKind, Result, ToolTermination};
-pub use evaluate::{ResolveContext, check_pin, evaluate};
+pub use evaluate::{FixVerdict, ResolveContext, check_pin, evaluate, evaluate_fix};
 pub use model::*;
 pub use policy::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,

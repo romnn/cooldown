@@ -48,10 +48,29 @@ cargo install --path crates/cooldown   # or: cargo build --release
 cooldown outdated      # what could update — "adoptable now" vs "in cooldown"
 cooldown upgrade       # move to the newest version older than the cooldown, then re-lock
 cooldown check         # CI gate: exit non-zero if anything resolved is younger than the cooldown
+cooldown fix           # remediate: downgrade too-fresh deps to a matured version (never upgrades)
 ```
 
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
+
+#### Fixing violations
+
+When `check` goes red because a dependency is younger than its cooldown, you have three options:
+**wait** for it to mature, **`baseline`** it (acknowledge and accept the risk), or **`fix`** it.
+`fix` is the dual of `upgrade` — it downgrades each violating dependency to the newest version that
+has *already* matured past the cooldown, so `check` passes while the protection holds. It never
+moves a dependency forward, and it only touches deps that are actually in violation.
+
+By default `fix` acts on **direct deps only** and leaves **exact pins** in place with a warning
+(a pin is a deliberate choice). Two opt-in flags widen that:
+
+- `--downgrade-pinned` — downgrade and rewrite exact-pinned deps too (`=2.13.0` → `=2.3.1`).
+- `--transitive` — also downgrade too-fresh *transitive* deps. Dangerous: rolling a transitive back
+  can break a direct dependency that needs the newer version, so it is opt-in.
+
+A violation with no older matured version to fall back to is reported as a warning (`baseline` it or
+wait) rather than downgraded.
 
 #### Manifest constraints
 
@@ -81,6 +100,7 @@ min-age = "14d"
 | ------------------ | ---------------------------------------------------------------------------- |
 | `outdated`         | What could update, split into adoptable-now vs in-cooldown.                  |
 | `upgrade`          | Move direct deps to the newest version older than the cooldown; re-locks.    |
+| `fix`              | Downgrade too-fresh deps to a matured version to clear a `check` violation.  |
 | `check`            | The CI gate over the resolved lockfile graph (fail-closed).                  |
 | `baseline`         | Record currently-young deps as acknowledged so `check` adopts cleanly.       |
 | `explain <pkg>`    | Why `<pkg>` has the window it has — every layer and rule that applied.       |

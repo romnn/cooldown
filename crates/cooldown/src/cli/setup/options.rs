@@ -86,6 +86,8 @@ pub(super) fn resolve_invocation(
             } else {
                 cooldown_core::RewriteMode::Auto
             },
+            transitive: global.transitive,
+            downgrade_pinned: global.downgrade_pinned,
             major_all: merged.major_all.unwrap_or(false),
             direct_only: merged.direct_only.unwrap_or(false),
             include_indirect: merged.include_indirect.unwrap_or(false),

@@ -90,6 +90,8 @@ pub(in crate::cli) enum Command {
     Outdated,
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade,
+    /// Fix cooldown violations: downgrade too-fresh deps to a matured version (never upgrades).
+    Fix,
     /// Exit non-zero if anything resolved is younger than the cooldown (the CI gate).
     Check,
     /// Record currently-young deps as acknowledged, so `check` can be adopted cleanly.
@@ -252,6 +254,14 @@ pub(in crate::cli) struct GlobalArgs {
     /// rewrites the one owning manifest entry.
     #[arg(long, global = true)]
     pub(in crate::cli) rewrite: bool,
+    /// (fix) Also downgrade too-fresh transitive deps, not just direct ones. Dangerous: downgrading
+    /// a transitive can break a direct dependency that relies on the newer version.
+    #[arg(long, global = true)]
+    pub(in crate::cli) transitive: bool,
+    /// (fix) Downgrade and rewrite exact-pinned deps too. By default a pinned cooldown violation is
+    /// left in place with a warning, since a pin is a deliberate choice.
+    #[arg(long = "downgrade-pinned", global = true)]
+    pub(in crate::cli) downgrade_pinned: bool,
     /// Sync the policy into native config (e.g. uv `exclude-newer`) before running this command, so
     /// cooldown.toml stays the source of truth. No-op under `--dry-run`.
     #[arg(long, global = true)]

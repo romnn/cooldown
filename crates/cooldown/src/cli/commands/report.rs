@@ -130,6 +130,42 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
     Ok(out.exit)
 }
 
+pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
+    if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
+        return Err(CoreError::Config(
+            "`fix --major` allows cross-major downgrades (very breaking); pass --package or --major-all"
+                .into(),
+        ));
+    }
+    let out = ctx.ws.fix(ctx.opts).await;
+    let meta = present::upgrade_meta(&out.meta);
+    let summary = present::upgrade_summary(&out.summary);
+    let items = present::upgrade_items(&out.items);
+    let env = with_diags(
+        render::Envelope::new(
+            "fix",
+            out.exit.is_ok(),
+            ctx.generated_at.to_owned(),
+            meta.clone(),
+            summary.clone(),
+            items.clone(),
+        ),
+        out.warnings.clone(),
+        out.errors.clone(),
+    );
+    emit_envelope(ctx.opts.json, &env, || {
+        render::tty::render_upgrade(
+            &meta,
+            &summary,
+            &items,
+            &out.warnings,
+            &out.errors,
+            &render_options(ctx),
+        )
+    })?;
+    Ok(out.exit)
+}
+
 pub(super) async fn run_explain(
     ctx: &CommandContext<'_>,
     package: &str,

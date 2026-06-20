@@ -131,6 +131,11 @@ pub struct RunOpts {
     /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
+    /// `--transitive` (fix): also downgrade too-fresh transitive deps, not just direct ones.
+    pub transitive: bool,
+    /// `--downgrade-pinned` (fix): downgrade and rewrite exact-pinned deps too; otherwise a pinned
+    /// violation is left in place with a warning.
+    pub downgrade_pinned: bool,
     /// `--direct-only`: evaluate only direct deps.
     pub direct_only: bool,
     /// `--include-indirect` (outdated): include transitive deps in the report.
