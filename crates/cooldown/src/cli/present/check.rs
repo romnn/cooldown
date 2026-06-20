@@ -15,6 +15,7 @@ pub(in crate::cli) fn check_summary(summary: &app::CheckSummary) -> render::Chec
         direct: summary.direct,
         exempt: summary.exempt,
         acknowledged: summary.acknowledged,
+        allowed: summary.allowed,
         unknown_age: summary.unknown_age,
         errors: summary.errors,
         violations: summary.violations,

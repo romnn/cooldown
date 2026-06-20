@@ -57,6 +57,7 @@ struct CheckAccum {
     direct: usize,
     exempt: usize,
     acknowledged: usize,
+    allowed: usize,
     unknown_age: usize,
     violations: usize,
     /// Set when a stricter-native override tripped under `strict-native`.
@@ -136,6 +137,7 @@ impl<'a> CheckRunner<'a> {
             direct: self.acc.direct,
             exempt: self.acc.exempt,
             acknowledged: self.acc.acknowledged,
+            allowed: self.acc.allowed,
             unknown_age: self.acc.unknown_age,
             errors: err_count,
             violations: self.acc.violations,
@@ -300,28 +302,33 @@ impl<'a> CheckRunner<'a> {
             return;
         }
 
+        let baseline_acked = pv.status == Status::CurrentInCooldown
+            && self.ws.baseline.is_acknowledged(
+                pctx.tool.as_str(),
+                project_label,
+                &dep.package.name,
+                dep.current.as_str(),
+                dep.package.registry.as_deref(),
+                self.ws.now(),
+            );
         // `check --transitive allow` permits a too-fresh *transitive* dep without failing the gate;
-        // it is reported (visible) but, like a baselined pin, does not count as a violation.
-        let allowed_transitive =
-            self.opts.check_transitive == TransitiveGate::Allow && !dep.direct;
-        let is_ack = pv.status == Status::CurrentInCooldown
-            && (allowed_transitive
-                || self.ws.baseline.is_acknowledged(
-                    pctx.tool.as_str(),
-                    project_label,
-                    &dep.package.name,
-                    dep.current.as_str(),
-                    dep.package.registry.as_deref(),
-                    self.ws.now(),
-                ));
+        // it is reported but non-fatal, with the distinct `Allowed` status so it stays auditable
+        // apart from a baselined acknowledgment. A per-version baseline record wins over the blanket
+        // policy.
+        let allowed_transitive = self.opts.check_transitive == TransitiveGate::Allow && !dep.direct;
+        let status = match CheckStatus::from_pin_status(pv.status, baseline_acked) {
+            Some(CheckStatus::Violation) if allowed_transitive => Some(CheckStatus::Allowed),
+            other => other,
+        };
 
-        let Some(status) = CheckStatus::from_pin_status(pv.status, is_ack) else {
+        let Some(status) = status else {
             return; // mature pass → counted in `checked`, not a finding
         };
 
         match status {
             CheckStatus::Violation => self.acc.violations += 1,
             CheckStatus::Acknowledged => self.acc.acknowledged += 1,
+            CheckStatus::Allowed => self.acc.allowed += 1,
             CheckStatus::UnknownAge => self.acc.unknown_age += 1,
             CheckStatus::Error => {}
         }

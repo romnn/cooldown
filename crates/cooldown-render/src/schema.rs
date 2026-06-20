@@ -159,12 +159,13 @@ pub fn json_schema() -> Value {
         },
         "checkSummary": {
             "type": "object",
-            "required": ["checked", "direct", "exempt", "acknowledged", "unknownAge", "errors", "violations"],
+            "required": ["checked", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
             "properties": {
                 "checked": { "type": "integer", "minimum": 0 },
                 "direct": { "type": "integer", "minimum": 0 },
                 "exempt": { "type": "integer", "minimum": 0 },
                 "acknowledged": { "type": "integer", "minimum": 0 },
+                "allowed": { "type": "integer", "minimum": 0 },
                 "unknownAge": { "type": "integer", "minimum": 0 },
                 "errors": { "type": "integer", "minimum": 0 },
                 "violations": { "type": "integer", "minimum": 0 }
@@ -185,7 +186,7 @@ pub fn json_schema() -> Value {
                 "publishedAt": { "type": "string", "format": "date-time" },
                 "ageDays": { "type": "number" },
                 "window": { "$ref": "#/$defs/window" },
-                "status": { "enum": ["violation", "acknowledged", "unknown_age", "error"] },
+                "status": { "enum": ["violation", "acknowledged", "allowed", "unknown_age", "error"] },
                 "graphHeld": { "type": "boolean" },
                 "graphFloor": { "type": "string" },
                 "error": { "$ref": "#/$defs/diagnostic" }

@@ -106,7 +106,11 @@ pub struct CheckMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStatus {
     Violation,
+    /// A violation acknowledged in the baseline file, so it does not fail the gate.
     Acknowledged,
+    /// A too-fresh transitive dep permitted by `check --transitive allow` — reported but non-fatal,
+    /// and distinct from a baselined `Acknowledged` so the difference is auditable.
+    Allowed,
     UnknownAge,
     Error,
 }
@@ -136,6 +140,7 @@ impl CheckStatus {
             CheckStatus::Error => 1,
             CheckStatus::UnknownAge => 2,
             CheckStatus::Acknowledged => 3,
+            CheckStatus::Allowed => 4,
         }
     }
 }
@@ -164,6 +169,8 @@ pub struct CheckSummary {
     pub direct: usize,
     pub exempt: usize,
     pub acknowledged: usize,
+    /// Too-fresh transitive deps permitted by `check --transitive allow` (reported, non-fatal).
+    pub allowed: usize,
     pub unknown_age: usize,
     pub errors: usize,
     pub violations: usize,

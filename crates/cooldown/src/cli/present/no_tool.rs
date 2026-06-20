@@ -57,6 +57,7 @@ fn no_tool_check(generated_at: String, error: Diagnostic) -> Result<String, Core
                 direct: 0,
                 exempt: 0,
                 acknowledged: 0,
+                allowed: 0,
                 unknown_age: 0,
                 errors: 0,
                 violations: 0,

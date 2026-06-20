@@ -218,6 +218,9 @@ pub enum CheckStatus {
     Violation,
     /// A violation that has been acknowledged (baselined) and so does not fail the gate.
     Acknowledged,
+    /// A too-fresh transitive dependency permitted by `check --transitive allow`: reported but
+    /// non-fatal, and distinct from a baselined acknowledgment so the two stay auditable apart.
+    Allowed,
     /// The relevant release has no known publish time, so maturity could not be decided.
     UnknownAge,
     /// Evaluation of this dependency failed; see the item's [`error`](CheckItem::error).
@@ -276,6 +279,9 @@ pub struct CheckSummary {
     pub exempt: usize,
     /// The number of violations that were acknowledged (baselined).
     pub acknowledged: usize,
+    /// The number of too-fresh transitive deps permitted by `check --transitive allow`
+    /// (status [`CheckStatus::Allowed`]; reported, non-fatal).
+    pub allowed: usize,
     /// The number with status [`CheckStatus::UnknownAge`].
     pub unknown_age: usize,
     /// The number whose evaluation failed (status [`CheckStatus::Error`]).

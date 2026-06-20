@@ -128,6 +128,7 @@ mod tests {
                 direct: 3,
                 exempt: 1,
                 acknowledged: 0,
+                allowed: 0,
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,

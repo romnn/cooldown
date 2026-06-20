@@ -56,6 +56,7 @@ pub(super) fn check_status(status: app::CheckStatus) -> render::CheckStatus {
     match status {
         app::CheckStatus::Violation => render::CheckStatus::Violation,
         app::CheckStatus::Acknowledged => render::CheckStatus::Acknowledged,
+        app::CheckStatus::Allowed => render::CheckStatus::Allowed,
         app::CheckStatus::UnknownAge => render::CheckStatus::UnknownAge,
         app::CheckStatus::Error => render::CheckStatus::Error,
     }

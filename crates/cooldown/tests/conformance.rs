@@ -543,14 +543,21 @@ async fn check_transitive_allow_and_hide_modes() {
     };
 
     // `--transitive allow`: the fresh transitive is still evaluated and reported, but as a non-fatal
-    // (acknowledged) finding, so the gate passes.
+    // `allowed` finding (distinct from a baselined `acknowledged`), so the gate passes.
     let mut allow = opts();
     allow.check_transitive = cooldown::app::TransitiveGate::Allow;
     let out = workspace(make(), Baseline::default()).check(&allow).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.violations, 0);
-    assert_eq!(out.summary.acknowledged, 1);
+    assert_eq!(out.summary.allowed, 1);
+    assert_eq!(out.summary.acknowledged, 0);
     assert_eq!(out.summary.checked, 2, "the transitive is still evaluated");
+    let allowed_item = out
+        .items
+        .iter()
+        .find(|item| item.name == "t")
+        .expect("the fresh transitive is reported");
+    assert_eq!(allowed_item.status, CheckStatus::Allowed);
 
     // `--transitive hide`: the transitive is not evaluated at all (direct-only), gate passes.
     let mut hide = opts();
@@ -558,6 +565,7 @@ async fn check_transitive_allow_and_hide_modes() {
     let out = workspace(make(), Baseline::default()).check(&hide).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.violations, 0);
+    assert_eq!(out.summary.allowed, 0);
     assert_eq!(out.summary.acknowledged, 0);
     assert_eq!(out.summary.checked, 1, "only the direct dep is evaluated");
 }

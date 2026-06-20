@@ -314,6 +314,7 @@ pub fn render_check(
             let (label, color) = match it.status {
                 CheckStatus::Violation => ("violation", Color::Red),
                 CheckStatus::Acknowledged => ("acknowledged", Color::Cyan),
+                CheckStatus::Allowed => ("allowed", Color::Yellow),
                 CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
                 CheckStatus::Error => ("error", Color::Red),
             };
@@ -347,11 +348,12 @@ pub fn render_check(
     }
     let _ = writeln!(
         out,
-        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} exempt · {} unknown-age · {} errors",
+        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
         summary.checked,
         summary.direct,
         summary.violations,
         summary.acknowledged,
+        summary.allowed,
         summary.exempt,
         summary.unknown_age,
         summary.errors,
