@@ -131,6 +131,12 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
 }
 
 pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
+    if ctx.opts.include_indirect {
+        return Err(CoreError::Config(
+            "`fix --include-indirect` is not allowed: use `fix --transitive` to opt into transitive downgrades"
+                .into(),
+        ));
+    }
     if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
         return Err(CoreError::Config(
             "`fix --major` allows cross-major downgrades (very breaking); pass --package or --major-all"
@@ -154,7 +160,7 @@ pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError>
         out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
-        render::tty::render_upgrade(
+        render::tty::render_fix(
             &meta,
             &summary,
             &items,

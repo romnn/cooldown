@@ -9,7 +9,7 @@ pub(in crate::cli) fn no_tool_json(command: &'static str) -> Result<String, Core
     match command {
         "outdated" => no_tool_outdated(generated_at, error),
         "check" => no_tool_check(generated_at, error),
-        "upgrade" => no_tool_upgrade(generated_at, error),
+        "upgrade" | "fix" => no_tool_mutation(command, generated_at, error),
         "explain" => no_tool_explain(generated_at, error),
         "config" => no_tool_config(generated_at, error),
         "baseline" => no_tool_baseline(generated_at, error),
@@ -67,10 +67,14 @@ fn no_tool_check(generated_at: String, error: Diagnostic) -> Result<String, Core
     ))
 }
 
-fn no_tool_upgrade(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+fn no_tool_mutation(
+    command: &'static str,
+    generated_at: String,
+    error: Diagnostic,
+) -> Result<String, CoreError> {
     serialize_no_tool(&with_error(
         render::Envelope::new(
-            "upgrade",
+            command,
             false,
             generated_at,
             render::UpgradeMeta {

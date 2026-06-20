@@ -31,7 +31,8 @@ pub fn json_schema() -> Value {
                     "lock_conflict",
                     "system",
                     "config",
-                    "parse"
+                    "parse",
+                    "held"
                 ]
             },
             "message": { "type": "string" },
@@ -300,6 +301,25 @@ pub fn json_schema() -> Value {
             ),
             envelope(
                 "upgrade",
+                map(&[
+                    ("applied", json!({ "type": "boolean" })),
+                    ("lockVerified", json!({ "type": ["boolean", "null"] })),
+                    ("build", json!({
+                        "type": "object",
+                        "required": ["requested", "ok"],
+                        "properties": {
+                            "requested": { "type": "boolean" },
+                            "ok": { "type": ["boolean", "null"] }
+                        },
+                        "additionalProperties": false
+                    }))
+                ]),
+                vec!["applied", "lockVerified", "build"],
+                "#/$defs/upgradeSummary",
+                "#/$defs/upgradeItem"
+            ),
+            envelope(
+                "fix",
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
                     ("lockVerified", json!({ "type": ["boolean", "null"] })),

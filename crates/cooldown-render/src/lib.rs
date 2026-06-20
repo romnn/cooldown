@@ -147,5 +147,19 @@ mod tests {
             schema["$defs"]["outdatedItem"]["properties"]["members"]["items"]["$ref"],
             "#/$defs/memberRef"
         );
+        assert!(
+            schema["oneOf"]
+                .as_array()
+                .expect("envelopes")
+                .iter()
+                .any(|envelope| envelope["properties"]["command"]["const"] == "fix")
+        );
+        assert!(
+            schema["$defs"]["diagnostic"]["properties"]["kind"]["enum"]
+                .as_array()
+                .expect("diagnostic kinds")
+                .iter()
+                .any(|kind| kind == "held")
+        );
     }
 }

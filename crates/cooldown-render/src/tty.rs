@@ -17,7 +17,7 @@ const PACKAGE_COLOR: Color = Color::Cyan;
 /// "this version is takeable" independent of the row's status.
 const ADOPTABLE_COLOR: Color = Color::Magenta;
 
-/// Presentation flags shared by the dependency-table renderers (`outdated`/`check`/`upgrade`).
+/// Presentation flags shared by the dependency-table renderers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
     /// Colorize output for the terminal.
@@ -357,14 +357,39 @@ pub fn render_upgrade(
     errors: &[Diagnostic],
     opts: &RenderOptions,
 ) -> String {
+    render_mutation("upgrade", meta, summary, items, warnings, errors, *opts)
+}
+
+/// Render the `fix` report.
+#[must_use]
+pub fn render_fix(
+    meta: &UpgradeMeta,
+    summary: &UpgradeSummary,
+    items: &[UpgradeItem],
+    warnings: &[Diagnostic],
+    errors: &[Diagnostic],
+    opts: &RenderOptions,
+) -> String {
+    render_mutation("fix", meta, summary, items, warnings, errors, *opts)
+}
+
+fn render_mutation(
+    verb: &str,
+    meta: &UpgradeMeta,
+    summary: &UpgradeSummary,
+    items: &[UpgradeItem],
+    warnings: &[Diagnostic],
+    errors: &[Diagnostic],
+    opts: RenderOptions,
+) -> String {
     let RenderOptions {
         use_color,
         list_packages,
         paths,
-    } = *opts;
+    } = opts;
     let mut out = String::new();
     if items.is_empty() {
-        out.push_str("Nothing to upgrade.\n");
+        let _ = writeln!(out, "Nothing to {verb}.");
     } else {
         let used_by = has_attribution(items, |it| &it.members);
         let project = has_distinct_project(items, |it| it.project.as_str());
@@ -506,8 +531,10 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderOptions, has_distinct_project, members_cell, path_label, render_outdated};
-    use crate::OutdatedSummary;
+    use super::{
+        RenderOptions, has_distinct_project, members_cell, path_label, render_fix, render_outdated,
+    };
+    use crate::{BuildInfo, OutdatedSummary, UpgradeMeta, UpgradeSummary};
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
 
     /// Members whose name is the given string and whose path is `path/<name>`.
@@ -592,6 +619,31 @@ mod tests {
         );
 
         assert!(out.starts_with("No dependencies match the current display filters."));
+    }
+
+    #[test]
+    fn empty_fix_report_uses_fix_wording() {
+        let out = render_fix(
+            &UpgradeMeta {
+                applied: false,
+                lock_verified: Some(true),
+                build: BuildInfo {
+                    requested: false,
+                    ok: None,
+                },
+            },
+            &UpgradeSummary {
+                applied: 0,
+                skipped: 0,
+                errors: 0,
+            },
+            &[],
+            &[],
+            &[],
+            &RenderOptions::default(),
+        );
+
+        assert!(out.starts_with("Nothing to fix."));
     }
 
     #[test]

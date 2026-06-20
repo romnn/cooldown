@@ -289,7 +289,7 @@ pub struct CheckMeta {
     pub artifact_scope: String,
 }
 
-/// Why a planned upgrade was not applied. Mirrors a [`cooldown_core::SkipReason`].
+/// Why a planned mutation was not applied. Mirrors a [`cooldown_core::SkipReason`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedInfo {
@@ -302,7 +302,7 @@ pub struct SkippedInfo {
     pub offending: Option<String>,
 }
 
-/// One row in an `upgrade` report: a planned version change and its outcome.
+/// One row in an `upgrade` or `fix` report: a planned version change and its outcome.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeItem {
@@ -318,9 +318,9 @@ pub struct UpgradeItem {
     /// The registry the version data came from, omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<String>,
-    /// The version being upgraded from (the current pin).
+    /// The version being changed from (the current pin).
     pub from: String,
-    /// The version being upgraded to (the planned target).
+    /// The version being changed to (the planned target).
     pub to: String,
     /// The update kind of the change relative to the current pin.
     pub kind: UpdateKind,
@@ -334,7 +334,7 @@ pub struct UpgradeItem {
     pub error: Option<Diagnostic>,
 }
 
-/// The aggregate counts for an `upgrade` report.
+/// The aggregate counts for an `upgrade` or `fix` report.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeSummary {
@@ -346,7 +346,7 @@ pub struct UpgradeSummary {
     pub errors: usize,
 }
 
-/// The post-upgrade build result reported in [`UpgradeMeta`].
+/// The post-mutation build result reported in [`UpgradeMeta`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
@@ -356,7 +356,7 @@ pub struct BuildInfo {
     pub ok: Option<bool>,
 }
 
-/// The flattened top-level `meta` for `upgrade`: apply/lock/build outcomes.
+/// The flattened top-level `meta` for `upgrade` or `fix`: apply/lock/build outcomes.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeMeta {
@@ -364,7 +364,7 @@ pub struct UpgradeMeta {
     pub applied: bool,
     /// Re-lock result; `null` for `--dry-run` (which never mutates).
     pub lock_verified: Option<bool>,
-    /// The post-upgrade build result.
+    /// The post-mutation build result.
     pub build: BuildInfo,
 }
 
