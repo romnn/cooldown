@@ -418,3 +418,66 @@ async fn releases_fail_closed_on_cross_major_probe_error_when_enabled() {
         .expect_err("cross-major probe must fail closed");
     assert!(error.is_transient());
 }
+
+#[tokio::test]
+async fn releases_do_not_fetch_info_for_versions_older_than_the_current_pin() {
+    // The `.info` route for the below-current tag returns 500: if release fetching ever requested a
+    // publish time for a version older than the current pin, that stray request would surface as a
+    // transient error and fail the call. A clean result proves only the pin and newer versions are
+    // timed — the fix that keeps a many-versioned module (e.g. the Azure SDK) from bursting the proxy
+    // with one `.info` per historical tag.
+    let routes = HashMap::from([
+        (
+            "/example.com/mod/@v/list".to_string(),
+            (200, "v1.0.0\nv1.2.0\nv1.3.0\n"),
+        ),
+        (
+            "/example.com/mod/@v/v1.0.0.info".to_string(),
+            (500, "below-current version must not be timed"),
+        ),
+        (
+            "/example.com/mod/@v/v1.2.0.info".to_string(),
+            (200, r#"{"Version":"v1.2.0","Time":"2026-01-01T00:00:00Z"}"#),
+        ),
+        (
+            "/example.com/mod/@v/v1.3.0.info".to_string(),
+            (200, r#"{"Version":"v1.3.0","Time":"2026-02-01T00:00:00Z"}"#),
+        ),
+    ]);
+    let server = TestServer::new(routes);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
+    let tool = GoTool::new(crate::proxy::GoProxy::new(
+        http,
+        vec![ProxyBase {
+            url: server.base_url.clone(),
+            fallback_on_errors: false,
+        }],
+    ));
+    let repo = tempfile::tempdir().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+    let project = project(&root);
+
+    let releases = tool
+        .releases(
+            &dep("example.com/mod", "v1.2.0"),
+            &fetch_ctx(&project),
+            CandidateScope::CurrentMajorOnly,
+        )
+        .await
+        .expect("below-current versions must not be timed");
+
+    let versions: Vec<&str> = releases.iter().map(|r| r.version.as_str()).collect();
+    assert_eq!(versions, vec!["v1.0.0", "v1.2.0", "v1.3.0"]);
+    // The below-current tag is present (so ordering holds) but carries no publish time.
+    let older = releases
+        .iter()
+        .find(|r| r.version.as_str() == "v1.0.0")
+        .expect("older release present");
+    assert!(older.published_at.is_none());
+    let newer = releases
+        .iter()
+        .find(|r| r.version.as_str() == "v1.3.0")
+        .expect("newer release present");
+    assert!(newer.published_at.is_some());
+}

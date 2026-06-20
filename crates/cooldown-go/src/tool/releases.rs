@@ -2,8 +2,9 @@ use crate::proxy::GoProxy;
 use crate::semver;
 use cooldown_core::{
     CandidateScope, Dependency, MajorKey, PackageId, PackageRegistry, RawRelease, Release,
-    ReleaseOrder, ReleaseQuality, Result, UpdateKind,
+    ReleaseOrder, ReleaseQuality, Result, UpdateKind, Version,
 };
+use std::cmp::Ordering;
 
 /// Classify a version string into a [`ReleaseQuality`].
 #[must_use]
@@ -91,18 +92,26 @@ pub(super) async fn releases(
     go_versions: Option<&[String]>,
 ) -> Result<Vec<Release>> {
     let module = &dep.package.name;
+    let current = dep.current.as_str();
 
-    // The module's own-path releases: prefer the version set Go itself reports
-    // (`go list -m -versions`), which already omits the ancient pre-module and `+incompatible` tags
-    // a module-aware module would never resolve to (k8s.io/client-go lists only its `v0.x` line, not
-    // `v1.5.2` or `v11.0.0+incompatible`). Fall back to the proxy's raw `@v/list` when Go reports no
-    // versions for this module (or its probe failed) so discovery still works.
-    let own_path = match go_versions {
-        Some(versions) if !versions.is_empty() => {
-            proxy.releases_for(module, versions.to_vec()).await?
+    // The module's own-path version set: prefer what Go itself reports (`go list -m -versions`),
+    // which already omits the ancient pre-module and `+incompatible` tags a module-aware module would
+    // never resolve to (k8s.io/client-go lists only its `v0.x` line, not `v1.5.2` or
+    // `v11.0.0+incompatible`). Fall back to the proxy's raw `@v/list` (then `@latest`) when Go reports
+    // no versions for this module (or its probe failed) so discovery still works.
+    let own_versions = match go_versions {
+        Some(versions) if !versions.is_empty() => versions.to_vec(),
+        _ => {
+            let mut listed = proxy.list(module).await?;
+            if listed.is_empty()
+                && let Some(latest) = proxy.latest(module).await?
+            {
+                listed.push(latest.version);
+            }
+            listed
         }
-        _ => proxy.releases(&dep.package).await?,
     };
+    let own_path = own_path_releases(proxy, module, current, own_versions).await?;
     // (source_path, raw_release) across the module's own path and discovered higher majors.
     let mut raw: Vec<(String, RawRelease)> = own_path
         .into_iter()
@@ -118,7 +127,6 @@ pub(super) async fn releases(
     }
 
     // Ensure the current pin is present so the core can locate its order.
-    let current = dep.current.as_str();
     if !raw
         .iter()
         .any(|(_, release)| release.version.as_str() == current)
@@ -139,6 +147,37 @@ pub(super) async fn releases(
     }
 
     Ok(build_releases(current, raw))
+}
+
+/// Build the module's own-path [`RawRelease`]s, fetching publish times only for the current pin and
+/// versions newer than it.
+///
+/// A version older than the current pin can never be an upgrade candidate ([`evaluate`] only
+/// considers releases ordered above the current pin) nor the checked pin, so its publish time is
+/// never read. Fetching `.info` for every historical tag just to discard it is what turned a
+/// many-versioned module — the Azure SDK submodules carry ~100 tags each — into a ~100-request burst
+/// per module that tripped the proxy's rate limit on a cold cache and surfaced as spurious `error`
+/// rows. Older versions are still listed (untimed) so semver ordering and the current pin's position
+/// in the release set stay intact.
+///
+/// [`evaluate`]: cooldown_core::evaluate
+async fn own_path_releases(
+    proxy: &GoProxy,
+    module: &str,
+    current: &str,
+    versions: Vec<String>,
+) -> Result<Vec<RawRelease>> {
+    let (to_time, untimed): (Vec<String>, Vec<String>) = versions
+        .into_iter()
+        .partition(|version| semver::compare(version, current) != Ordering::Less);
+    let mut releases = proxy.releases_for(module, to_time).await?;
+    releases.extend(untimed.into_iter().map(|version| RawRelease {
+        version: Version::new(version),
+        published_at: None,
+        yanked: false,
+        artifacts: Vec::new(),
+    }));
+    Ok(releases)
 }
 
 pub(super) fn classify_kind(current: &str, candidate: &str) -> Option<UpdateKind> {
