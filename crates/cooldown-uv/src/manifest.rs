@@ -87,7 +87,10 @@ fn rewrite_array(array: &mut Array, name: &str, target: &str) -> bool {
     changed
 }
 
-fn navigate_mut<'doc>(doc: &'doc mut DocumentMut, path: &[&str]) -> Option<&'doc mut dyn TableLike> {
+fn navigate_mut<'doc>(
+    doc: &'doc mut DocumentMut,
+    path: &[&str],
+) -> Option<&'doc mut dyn TableLike> {
     let mut table: &mut dyn TableLike = doc.as_table_mut();
     for key in path {
         table = table.get_mut(key)?.as_table_like_mut()?;
@@ -147,15 +150,19 @@ fn bump_requirement(requirement: &str, target: &str) -> Option<String> {
     Some(rewritten)
 }
 
-/// Produce a PEP 440 specifier admitting `target`, preserving the old specifier's leading operator.
-/// A compound specifier (`>=1,<2`) widens to `>=target`, the least-surprising default; `==`/`===`
-/// pins never reach here (they are held and skipped before apply).
+/// Produce a PEP 440 specifier admitting `target`, preserving safe leading operators. A strict
+/// lower bound becomes inclusive (`>1` → `>=target`). A compound, upper-bound-only, or not-equal
+/// specifier widens to `>=target`, the least-surprising default that actually admits the target;
+/// `==`/`===` pins never reach here (they are held and skipped before apply).
 fn bump_specifier(specifier: &str, target: &str) -> String {
     let specifier = specifier.trim();
-    if specifier.contains(',') {
+    if specifier.contains(',') || specifier.starts_with('<') || specifier.starts_with("!=") {
         return format!(">={target}");
     }
-    for op in ["===", "<=", ">=", "==", "!=", "~=", "<", ">"] {
+    if specifier.starts_with('>') {
+        return format!(">={target}");
+    }
+    for op in ["===", "==", "~="] {
         if specifier.starts_with(op) {
             return format!("{op}{target}");
         }
@@ -178,7 +185,10 @@ mod tests {
 
     #[test]
     fn bump_requirement_preserves_name_extras_and_marker() {
-        assert_eq!(bump_requirement("httpx>=0.27", "0.30.0").as_deref(), Some("httpx>=0.30.0"));
+        assert_eq!(
+            bump_requirement("httpx>=0.27", "0.30.0").as_deref(),
+            Some("httpx>=0.30.0")
+        );
         assert_eq!(
             bump_requirement("httpx[http2]>=0.27", "0.30.0").as_deref(),
             Some("httpx[http2]>=0.30.0")
@@ -189,8 +199,26 @@ mod tests {
         );
         assert_eq!(bump_requirement(">=1,<2", "2.0.0"), None); // no name
         assert_eq!(bump_requirement("proto-shared", "1.0.0"), None); // bare, nothing to widen
-        assert_eq!(bump_requirement("httpx~=0.27", "0.30.0").as_deref(), Some("httpx~=0.30.0"));
-        assert_eq!(bump_requirement("httpx>=0.1,<0.3", "0.30.0").as_deref(), Some("httpx>=0.30.0"));
+        assert_eq!(
+            bump_requirement("httpx~=0.27", "0.30.0").as_deref(),
+            Some("httpx~=0.30.0")
+        );
+        assert_eq!(
+            bump_requirement("httpx>=0.1,<0.3", "0.30.0").as_deref(),
+            Some("httpx>=0.30.0")
+        );
+        assert_eq!(
+            bump_requirement("httpx<0.30.0", "0.30.0").as_deref(),
+            Some("httpx>=0.30.0")
+        );
+        assert_eq!(
+            bump_requirement("httpx!=0.30.0", "0.30.0").as_deref(),
+            Some("httpx>=0.30.0")
+        );
+        assert_eq!(
+            bump_requirement("httpx>0.27", "0.30.0").as_deref(),
+            Some("httpx>=0.30.0")
+        );
     }
 
     #[test]
@@ -202,9 +230,16 @@ mod tests {
         let changed = widen_constraint(&manifest, "httpx", "0.30.0").expect("widen");
         assert!(changed);
         let after = std::fs::read_to_string(&manifest).expect("read");
-        assert_eq!(after.matches("httpx>=0.30.0").count(), 3, "all three entries widened: {after}");
+        assert_eq!(
+            after.matches("httpx>=0.30.0").count(),
+            3,
+            "all three entries widened: {after}"
+        );
         assert!(after.contains("# keep me"), "array comment kept: {after}");
-        assert!(after.contains("protobuf==6.0"), "other deps untouched: {after}");
+        assert!(
+            after.contains("protobuf==6.0"),
+            "other deps untouched: {after}"
+        );
         assert!(after.contains("ruff>=0.1"), "other deps untouched: {after}");
     }
 

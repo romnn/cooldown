@@ -212,11 +212,7 @@ impl CargoTool {
     }
 
     /// Rewrite the owning manifest entry to admit the target, then re-pin the lock to it.
-    async fn rewrite_then_lock(
-        &self,
-        project: &Project,
-        change: &Change,
-    ) -> Result<ChangeOutcome> {
+    async fn rewrite_then_lock(&self, project: &Project, change: &Change) -> Result<ChangeOutcome> {
         let rewrite = manifest::widen_constraint(
             &project.root,
             &change.members,

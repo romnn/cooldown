@@ -133,7 +133,11 @@ fn dependency_section_paths(doc: &DocumentMut) -> Vec<Vec<String>> {
     if let Some(target) = doc.get("target").and_then(Item::as_table_like) {
         for (cfg, _) in target.iter() {
             for kind in kinds {
-                paths.push(vec!["target".to_string(), cfg.to_string(), kind.to_string()]);
+                paths.push(vec![
+                    "target".to_string(),
+                    cfg.to_string(),
+                    kind.to_string(),
+                ]);
             }
         }
     }
@@ -185,12 +189,14 @@ fn navigate_mut<'doc>(
     Some(table)
 }
 
-/// Produce a requirement that admits `target`, preserving the old requirement's leading comparator.
+/// Produce a requirement that admits `target`, preserving safe leading comparators.
 ///
 /// A bare or caret requirement maps to the caret-equivalent on the target (`^1` → `^2.3.0`, `1` →
-/// `2.3.0`); other single comparators keep their operator (`>=1` → `>=2.3.0`, `~1.2` → `~2.3.0`).
-/// A multi-comparator or wildcard requirement is replaced with a caret on the target, the least
-/// surprising default. Exact `=` pins never reach here — they are held and skipped before apply.
+/// `2.3.0`); safe single comparators keep their operator (`>=1` → `>=2.3.0`, `~1.2` → `~2.3.0`).
+/// A strict lower bound becomes inclusive (`>1` → `>=2.3.0`). A multi-comparator, wildcard,
+/// upper-bound-only, or not-equal requirement is replaced with a caret on the target, the least
+/// surprising default that actually admits the target. Exact `=` pins never reach here — they are
+/// held and skipped before apply.
 fn bump_req(old: &str, target: &str) -> String {
     let trimmed = old.trim();
     if trimmed.is_empty()
@@ -201,7 +207,13 @@ fn bump_req(old: &str, target: &str) -> String {
     {
         return format!("^{target}");
     }
-    for op in ["<=", ">=", "^", "~", "=", "<", ">"] {
+    if trimmed.starts_with('<') || trimmed.starts_with("!=") {
+        return format!("^{target}");
+    }
+    if trimmed.starts_with('>') {
+        return format!(">={target}");
+    }
+    for op in ["^", "~", "="] {
         if trimmed.starts_with(op) {
             return format!("{op}{target}");
         }
@@ -226,7 +238,10 @@ mod tests {
         assert_eq!(bump_req("^1.2", "2.3.0"), "^2.3.0");
         assert_eq!(bump_req("~1.2", "2.3.0"), "~2.3.0");
         assert_eq!(bump_req(">=1.0", "2.3.0"), ">=2.3.0");
+        assert_eq!(bump_req(">1.0", "2.3.0"), ">=2.3.0");
         assert_eq!(bump_req(">=1, <2", "2.3.0"), "^2.3.0");
+        assert_eq!(bump_req("<2", "2.3.0"), "^2.3.0");
+        assert_eq!(bump_req("<=2", "2.3.0"), "^2.3.0");
     }
 
     #[test]
@@ -240,13 +255,19 @@ mod tests {
         )
         .expect("write");
 
-        let rewrite =
-            widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
+        let rewrite = widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0")
+            .expect("widen");
 
-        assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("crates/app/Cargo.toml")]);
+        assert_eq!(
+            rewrite.modified,
+            vec![Utf8PathBuf::from("crates/app/Cargo.toml")]
+        );
         let after = std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read");
         assert!(after.contains("serde = \"2.3.0\""), "{after}");
-        assert!(after.contains("# pinned for a reason"), "comment kept: {after}");
+        assert!(
+            after.contains("# pinned for a reason"),
+            "comment kept: {after}"
+        );
     }
 
     #[test]
@@ -265,7 +286,10 @@ mod tests {
         assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
         let after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
         assert!(after.contains("version = \"^2.3.0\""), "{after}");
-        assert!(after.contains("features = [\"derive\"]"), "features kept: {after}");
+        assert!(
+            after.contains("features = [\"derive\"]"),
+            "features kept: {after}"
+        );
     }
 
     #[test]
@@ -281,15 +305,18 @@ mod tests {
         let member_manifest = "[package]\nname = \"app\"\n\n[dependencies]\nserde = { workspace = true, features = [\"derive\"] }\n";
         std::fs::write(root.join("crates/app/Cargo.toml"), member_manifest).expect("write member");
 
-        let rewrite =
-            widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
+        let rewrite = widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0")
+            .expect("widen");
 
         assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
         let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
         assert!(root_after.contains("serde = \"2.3.0\""), "{root_after}");
         let member_after =
             std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read member");
-        assert_eq!(member_after, member_manifest, "inherited member is untouched");
+        assert_eq!(
+            member_after, member_manifest,
+            "inherited member is untouched"
+        );
     }
 
     #[test]

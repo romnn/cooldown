@@ -13,11 +13,11 @@ use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
-    ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext, MemberRef,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
+    MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
-    Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead, ToolWrite, VerifyReport,
-    Version,
+    Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead, ToolWrite,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
