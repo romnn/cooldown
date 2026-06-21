@@ -5,7 +5,7 @@ use cooldown_core::{
     Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
     SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
 /// version (`fix`). The trial/rollback/verify machinery is shared; only planning differs.
@@ -86,7 +86,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         };
 
         let baseline_violations = match self.graph_violations().await {
-            Ok(violations) => violations,
+            Ok(violations) => violations.into_keys().collect(),
             Err(error) => {
                 self.record_project_error(&error, None);
                 return;
@@ -96,10 +96,26 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut state = TrialState {
             baseline_violations,
         };
+        let applied_before = self.applied_count();
+        let errored_before = self.errored_count();
         for change in planned {
             if !self.apply_change(change, &mut state).await {
                 break;
             }
+        }
+
+        // `upgrade` (default mode) reconciles the graph it just re-locked: downgrade any too-fresh
+        // transitive a forward move floated up, so the new lock is gate-clean in one pass — no
+        // separate `fix` needed. `--transitive allow`/`hide` opt out (the floated-up transitive was
+        // already kept-and-reported / ignored in `apply_change`). Skip it when the upgrade made no
+        // clean forward progress: nothing floated up, and a broken re-lock probe must not be re-hit.
+        let upgraded_cleanly =
+            self.applied_count() > applied_before && self.errored_count() == errored_before;
+        if matches!(self.mode, PlanMode::Upgrade)
+            && self.transitive_mode() == TransitiveGate::Enforce
+            && upgraded_cleanly
+        {
+            self.reconcile_graph(&mut state).await;
         }
 
         self.finalize().await;
@@ -370,23 +386,93 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return self.restore_with_change_error(&journal, &change, &error);
             }
         };
-        if let Some((offending_pkg, _)) = after.difference(&state.baseline_violations).next() {
-            let restored = self.restore_journal(&journal);
-            self.acc.strict_incomplete = true;
-            self.record_change_skip(
-                &change,
-                Some(SkippedInfo {
-                    reason: SkipReason::TransitiveInCooldown,
-                    message: SkipReason::TransitiveInCooldown.message().to_string(),
-                    offending: Some(offending_pkg.clone()),
-                }),
-            );
-            return restored;
+        let after_keys: HashSet<(String, String)> = after.keys().cloned().collect();
+        let new_violations: Vec<&(String, String)> =
+            after_keys.difference(&state.baseline_violations).collect();
+        // A change that drags a fresh transitive into the graph. How we react follows the transitive
+        // mode: `Hide` ignores transitives; `Allow` keeps the change and reports them; `Enforce`
+        // (default) keeps it only when every new violation is *reconcilable* (the reconcile pass can
+        // downgrade it later) and rolls back when the upgrade *forces* a fresh, irreducible dep —
+        // adopting a version that requires a too-fresh transitive defeats the cooldown.
+        if !new_violations.is_empty() {
+            match self.transitive_mode() {
+                TransitiveGate::Hide => {}
+                TransitiveGate::Allow => {
+                    for (package, version) in &new_violations {
+                        self.record_fix_warning(
+                            &format!(
+                                "{package}@{version} is younger than its cooldown; left in place by --transitive allow"
+                            ),
+                            package,
+                        );
+                    }
+                }
+                TransitiveGate::Enforce => {
+                    if let Some((forced_pkg, _)) = new_violations
+                        .iter()
+                        .find(|key| !after.get(**key).copied().unwrap_or(false))
+                    {
+                        let restored = self.restore_journal(&journal);
+                        self.acc.strict_incomplete = true;
+                        self.record_change_skip(
+                            &change,
+                            Some(SkippedInfo {
+                                reason: SkipReason::TransitiveInCooldown,
+                                message: SkipReason::TransitiveInCooldown.message().to_string(),
+                                offending: Some(forced_pkg.clone()),
+                            }),
+                        );
+                        return restored;
+                    }
+                    // Every new violation is reconcilable; keep the change and let `reconcile_graph`
+                    // (after the upgrade loop) downgrade the floated-up transitives.
+                }
+            }
         }
 
-        state.baseline_violations = after;
+        state.baseline_violations = after_keys;
         self.record_change_applied(&change);
         true
+    }
+
+    fn transitive_mode(&self) -> TransitiveGate {
+        self.ctx.opts.transitive_mode
+    }
+
+    /// Downgrade any too-fresh, reconcilable transitive the forward moves floated up, so `upgrade`
+    /// leaves the same gate-clean lock a follow-up `fix` would. Reuses the per-change trial
+    /// (`apply_change`), so each downgrade is applied, re-locked, and verified like any other.
+    async fn reconcile_graph(&mut self, state: &mut TrialState) {
+        let Some(deps) = self.reconcile_deps().await else {
+            return;
+        };
+        let downgrades = self
+            .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
+            .await;
+        for change in downgrades {
+            if !self.apply_change(change, state).await {
+                break;
+            }
+        }
+    }
+
+    async fn reconcile_deps(&mut self) -> Option<Vec<Dependency>> {
+        match self
+            .ws
+            .dependencies_in_scope(
+                self.ctx.reader,
+                self.ctx.pctx,
+                DepScope::Graph,
+                self.ctx.opts,
+            )
+            .await
+        {
+            Ok(deps) => Some(deps),
+            Err(error) => {
+                self.record_project_error(&error, None);
+                None
+            }
+        }
     }
 
     fn restore_journal(&mut self, journal: &cooldown_core::ProjectMutationJournal) -> bool {
@@ -461,7 +547,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    async fn graph_violations(&self) -> cooldown_core::Result<HashSet<(String, String)>> {
+    /// The graph's too-fresh, non-baselined violations, each mapped to whether it is *reconcilable* —
+    /// the graph floor sits below the locked version, so a `fix` downgrade could roll it back. A
+    /// violation the graph pins at the fresh version (floor equals current, or no floor is known) is
+    /// not reconcilable: nothing lower satisfies its requirers.
+    async fn graph_violations(&self) -> cooldown_core::Result<HashMap<(String, String), bool>> {
         // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
         // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
         // must not narrow it. Only pin ages are read here — never `members` — so nothing leaks.
@@ -477,7 +567,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .fetch_locked_releases(self.ctx.reader, deps, &fctx, self.ctx.opts.fanout())
             .await;
 
-        let mut violations = HashSet::new();
+        let mut violations = HashMap::new();
         for (dep, result) in fetched {
             let locked = result?;
             let pin = check_pin(
@@ -497,7 +587,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     self.ws.now(),
                 );
                 if !acknowledged {
-                    violations.insert((dep.package.name.clone(), dep.current.to_string()));
+                    let reconcilable = dep
+                        .graph_floor
+                        .as_ref()
+                        .is_some_and(|floor| *floor != dep.current);
+                    violations.insert(
+                        (dep.package.name.clone(), dep.current.to_string()),
+                        reconcilable,
+                    );
                 }
             }
         }
@@ -523,6 +620,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.acc
             .items
             .push(plan_item(change, &project_label, tool, true, None));
+    }
+
+    /// Changes applied so far this run (across projects) — used as a before/after delta to detect
+    /// whether the current project's upgrade loop made forward progress worth reconciling.
+    fn applied_count(&self) -> usize {
+        self.acc.items.iter().filter(|item| item.applied).count()
+    }
+
+    /// Errors recorded so far this run (project-level plus per-change) — the before/after delta tells
+    /// `reconcile_graph` whether the upgrade loop hit a failure it must not re-trigger.
+    fn errored_count(&self) -> usize {
+        self.acc.errors.len() + self.acc.items.iter().filter(|item| item.error.is_some()).count()
     }
 
     fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {

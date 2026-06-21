@@ -137,7 +137,9 @@ impl ToolRead for FakeEco {
             if state.fresh_transitive_present
                 && let Some(ft) = &self.fresh_transitive
             {
-                out.push(ft.clone());
+                // Reflect any applied downgrade so an `upgrade` reconcile pass that rolls the
+                // floated-up transitive back is visible on the next graph probe.
+                out.extend(apply_versions(vec![ft.clone()], &state.applied_versions));
             }
         }
         Ok(out)
@@ -1050,12 +1052,71 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
     let ws = workspace(fake, Baseline::default());
     let out = ws.upgrade(&opts()).await;
 
-    // The change is skipped (not committed) because it would introduce a too-fresh transitive.
+    // The change is skipped (not committed) because it would force in an irreducible too-fresh
+    // transitive (`t` has no graph floor below its fresh version, so it can't be rolled back).
     assert_eq!(out.summary.applied, 0);
     assert_eq!(out.summary.skipped, 1);
     let sk = out.items[0].skipped.as_ref().expect("a skip");
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(sk.offending.as_deref(), Some("t"));
+}
+
+#[tokio::test]
+async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_releases = too_fresh_fix_releases(); // v1.0.1 matured, v1.0.2 too fresh
+    releases.insert("t".to_string(), t_releases.clone());
+
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&t_releases, "v1.0.2"));
+
+    // Upgrading `a` floats `t` up to a too-fresh v1.0.2, but the graph still permits a lower version
+    // (floor v1.0.0), so the transitive is *reconcilable* rather than forced.
+    let mut floated = dep("t", "v1.0.2", false);
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true, // applying the `a` upgrade drags in `t`
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    // The forward move is kept (not rolled back) and the floated-up transitive is reconciled down to
+    // its newest matured version — one `upgrade` leaves a gate-clean lock, no separate `fix` needed.
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 2);
+    let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
+    assert_eq!(upgraded.to, "v1.1.0");
+    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
+    assert_eq!(reconciled.to, "v1.0.1");
 }
 
 #[tokio::test]
