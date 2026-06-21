@@ -128,27 +128,38 @@ fn cell_colored(text: impl Into<String>, color: Color, use_color: bool) -> Cell 
 }
 
 fn fmt_days(d: f64) -> String {
-    if d == 0.0 {
+    let days = d.round();
+    if days == 0.0 {
         "0d".to_string()
-    } else if d < 1.0 {
-        format!("{d:.1}d")
     } else {
-        format!("{d:.0}d")
+        format!("{days:.0}d")
     }
+}
+
+fn with_window_clamp(mut cell: String, window: &Window) -> String {
+    if let Some(by) = &window.clamped_by {
+        let _ = write!(cell, " (≥{by})");
+    }
+    cell
+}
+
+fn age_over_window_cell(window: &Window, age: &str) -> String {
+    with_window_clamp(format!("{age}/{}", fmt_days(window.min_age_days)), window)
 }
 
 /// The `outdated` "Cooldown" cell: the newest candidate's `age/window` (e.g. `13d/14d`) when a
 /// newer version exists, or the bare window when there is no candidate. A stricter native /
 /// registry clamp is appended as `(≥<source>)`, matching the rest of the report.
 fn cooldown_cell(window: &Window, candidate_age_days: Option<f64>) -> String {
-    let mut cell = match candidate_age_days {
-        Some(age) => format!("{}/{}", fmt_days(age), fmt_days(window.min_age_days)),
-        None => fmt_days(window.min_age_days),
-    };
-    if let Some(by) = &window.clamped_by {
-        let _ = write!(cell, " (≥{by})");
+    match candidate_age_days {
+        Some(age) => age_over_window_cell(window, &fmt_days(age)),
+        None => with_window_clamp(fmt_days(window.min_age_days), window),
     }
-    cell
+}
+
+fn check_cooldown_cell(window: &Window, age_days: Option<f64>) -> String {
+    let age = age_days.map_or_else(|| "?".to_string(), fmt_days);
+    age_over_window_cell(window, &age)
 }
 
 /// Render the "Used by" column for one dependency: the member packages by name (or by path under
@@ -277,6 +288,7 @@ pub fn render_outdated(
 }
 
 /// Render the `check` report.
+#[must_use]
 pub fn render_check(
     meta: &CheckMeta,
     summary: &CheckSummary,
@@ -308,7 +320,7 @@ pub fn render_check(
         if project {
             header.push("Project");
         }
-        header.extend(["Version", "Age", "Window", "Status", "Notes"]);
+        header.extend(["Version", "Cooldown", "Status", "Notes"]);
         t.set_header(header);
         for it in items {
             let (label, color) = match it.status {
@@ -318,7 +330,7 @@ pub fn render_check(
                 CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
                 CheckStatus::Error => ("error", Color::Red),
             };
-            let age = it.age_days.map_or_else(|| "?".to_string(), fmt_days);
+            let cooldown = check_cooldown_cell(&it.window, it.age_days);
             let mut notes = Vec::new();
             if it.graph_held {
                 notes.push("graph-held".to_string());
@@ -337,8 +349,7 @@ pub fn render_check(
                 row.push(Cell::new(path_label(&it.project)));
             }
             row.push(Cell::new(&it.current));
-            row.push(Cell::new(age));
-            row.push(Cell::new(fmt_days(it.window.min_age_days)));
+            row.push(Cell::new(cooldown));
             row.push(cell_colored(label, color, use_color));
             row.push(Cell::new(notes.join("; ")));
             t.add_row(row);
@@ -547,9 +558,13 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderOptions, has_distinct_project, members_cell, path_label, render_fix, render_outdated,
+        RenderOptions, check_cooldown_cell, has_distinct_project, members_cell, path_label,
+        render_check, render_fix, render_outdated,
     };
-    use crate::{BuildInfo, OutdatedSummary, UpgradeMeta, UpgradeSummary};
+    use crate::{
+        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, OutdatedSummary, UpgradeMeta,
+        UpgradeSummary, Window,
+    };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
 
     /// Members whose name is the given string and whose path is `path/<name>`.
@@ -576,6 +591,8 @@ mod tests {
 
         // A newer candidate reads as `age/window` — 13 days into a 14-day cooldown.
         assert_eq!(cooldown_cell(&window(None), Some(13.0)), "13d/14d");
+        assert_eq!(cooldown_cell(&window(None), Some(0.02)), "0d/14d");
+        assert_eq!(cooldown_cell(&window(None), Some(1.5)), "2d/14d");
         // No newer candidate (up to date, commit pin) → just the policy window.
         assert_eq!(cooldown_cell(&window(None), None), "14d");
         // A stricter native/registry clamp is appended either way.
@@ -586,6 +603,22 @@ mod tests {
         assert_eq!(
             cooldown_cell(&window(Some("native")), None),
             "14d (≥native)"
+        );
+    }
+
+    #[test]
+    fn check_cooldown_cell_always_shows_age_over_window() {
+        let window = |clamped_by: Option<&str>| Window {
+            min_age_days: 14.0,
+            source: "default".into(),
+            clamped_by: clamped_by.map(str::to_string),
+        };
+
+        assert_eq!(check_cooldown_cell(&window(None), Some(0.02)), "0d/14d");
+        assert_eq!(check_cooldown_cell(&window(None), None), "?/14d");
+        assert_eq!(
+            check_cooldown_cell(&window(Some("native")), Some(2.0)),
+            "2d/14d (≥native)"
         );
     }
 
@@ -632,6 +665,54 @@ mod tests {
     fn distinct_project_only_hides_actual_root_path() {
         assert!(!has_distinct_project(&["."], |path| *path));
         assert!(has_distinct_project(&["root"], |path| *path));
+    }
+
+    #[test]
+    fn check_table_uses_single_cooldown_column() {
+        let out = render_check(
+            &CheckMeta {
+                scope: "lockfile-graph".into(),
+                artifact_scope: "environment".into(),
+            },
+            &CheckSummary {
+                checked: 1,
+                direct: 1,
+                exempt: 0,
+                acknowledged: 0,
+                allowed: 0,
+                unknown_age: 0,
+                errors: 0,
+                violations: 1,
+            },
+            &[CheckItem {
+                name: "github.com/example/pkg".into(),
+                tool: "go".into(),
+                project: ".".into(),
+                members: Vec::new(),
+                registry: Some("proxy.golang.org".into()),
+                direct: true,
+                current: "v1.2.3".into(),
+                published_at: None,
+                age_days: Some(13.0),
+                window: Window {
+                    min_age_days: 14.0,
+                    source: "default".into(),
+                    clamped_by: None,
+                },
+                status: CheckStatus::Violation,
+                graph_held: false,
+                graph_floor: None,
+                error: None,
+            }],
+            &[],
+            &[],
+            &RenderOptions::default(),
+        );
+
+        assert!(out.contains("Cooldown"));
+        assert!(!out.contains(" Age "));
+        assert!(!out.contains(" Window "));
+        assert!(out.contains("13d/14d"));
     }
 
     #[test]
