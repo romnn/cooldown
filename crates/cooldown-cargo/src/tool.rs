@@ -1,6 +1,6 @@
 //! The Rust/Cargo [`Tool`]: detection, the resolved graph via `cargo metadata`, classified
 //! releases from the crates.io sparse index, and `cargo`-driven apply/build. `=`-pinned versions
-//! that `cargo update --precise` cannot move are reported as `GraphHeld`/`ResolverConflict` skips.
+//! that `cargo update --precise` cannot move are reported as `ResolverConflict` skips.
 
 use crate::cargocmd::Cargo;
 use crate::index::{CRATES_IO, CratesIoIndex};
@@ -199,20 +199,38 @@ impl CargoTool {
         mode: RewriteMode,
     ) -> Result<ChangeOutcome> {
         match mode {
-            RewriteMode::Always => self.rewrite_then_lock(project, change).await,
+            RewriteMode::Always => {
+                // No prior lock-only attempt: a missing requirement just means there is nothing to
+                // rewrite, so the dependency is not a `--rewrite` target.
+                self.rewrite_then_lock(project, change, SkipReason::NotEligible)
+                    .await
+            }
             RewriteMode::Auto => match self.precise_lock(project, change).await {
                 Ok(()) => Ok(ChangeOutcome::Applied),
                 Err(err) if err.is_tool_spawn_failure() => Err(err),
                 // The lock-only move was rejected (the target is outside the manifest constraint, or
-                // a genuine resolver conflict). Widen the constraint and retry; if that also fails it
-                // is a real conflict, reported as a skip.
-                Err(_) => self.rewrite_then_lock(project, change).await,
+                // a genuine resolver conflict). Widen the constraint and retry; if there is nothing to
+                // widen because the crate is transitive-only / `=`-pinned by the graph, the resolver
+                // is holding it where it is — a real conflict, not a filtered candidate.
+                Err(_) => {
+                    self.rewrite_then_lock(project, change, SkipReason::ResolverConflict)
+                        .await
+                }
             },
         }
     }
 
     /// Rewrite the owning manifest entry to admit the target, then re-pin the lock to it.
-    async fn rewrite_then_lock(&self, project: &Project, change: &Change) -> Result<ChangeOutcome> {
+    ///
+    /// `no_requirement` is the skip reason when the package has no editable requirement to widen:
+    /// `ResolverConflict` on the `Auto` fallback (the lock-only move was already rejected), or
+    /// `NotEligible` under `Always` (nothing to rewrite, no resolver attempt made).
+    async fn rewrite_then_lock(
+        &self,
+        project: &Project,
+        change: &Change,
+        no_requirement: SkipReason,
+    ) -> Result<ChangeOutcome> {
         let rewrite = manifest::widen_constraint(
             &project.root,
             &change.members,
@@ -222,7 +240,7 @@ impl CargoTool {
         if rewrite.modified.is_empty() {
             // No editable requirement: the crate is transitive-only or a path/git source. Nothing to
             // widen, so it cannot be adopted by `upgrade`.
-            return Ok(ChangeOutcome::Skipped(SkipReason::NotEligible));
+            return Ok(ChangeOutcome::Skipped(no_requirement));
         }
         match self.precise_lock(project, change).await {
             Ok(()) => Ok(ChangeOutcome::Applied),

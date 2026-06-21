@@ -281,14 +281,15 @@ impl UvTool {
                 Err(err) if err.is_tool_spawn_failure() => Err(err),
                 Err(_) => {
                     // The lock-only move was rejected. If the requirement can be widened, do so and
-                    // retry; otherwise there is no constraint to relax, so it is a real conflict.
+                    // retry; otherwise there is no constraint to relax (the dep is transitive-only or
+                    // pinned), so the resolver is holding it where it is — a real conflict.
                     let widened = manifest::widen_constraint(
                         &project.manifest,
                         &change.package.name,
                         change.to.as_str(),
                     )?;
                     if !widened {
-                        return Ok(ChangeOutcome::Skipped(SkipReason::NotEligible));
+                        return Ok(ChangeOutcome::Skipped(SkipReason::ResolverConflict));
                     }
                     self.relock(project, change).await
                 }
