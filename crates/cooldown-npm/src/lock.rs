@@ -683,6 +683,7 @@ fn strip_trailing_commas(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
         v.sort();
@@ -704,15 +705,16 @@ mod tests {
 
     #[test]
     fn npm_packages_map() {
-        let lock = r#"{
-            "lockfileVersion": 3,
-            "packages": {
-                "": { "name": "root", "version": "0.1.0" },
-                "node_modules/lodash": { "version": "4.17.15" },
-                "node_modules/@babel/core": { "version": "7.1.0" },
-                "node_modules/a/node_modules/b": { "version": "2.0.0" }
-            }
-        }"#;
+        let lock = indoc! {r#"
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "version": "0.1.0" },
+                    "node_modules/lodash": { "version": "4.17.15" },
+                    "node_modules/@babel/core": { "version": "7.1.0" },
+                    "node_modules/a/node_modules/b": { "version": "2.0.0" }
+                }
+            }"#};
         assert_eq!(
             sorted(parse_npm(lock).unwrap()),
             sorted(vec![
@@ -750,13 +752,14 @@ mod tests {
 
     #[test]
     fn bun_text_lock_with_trailing_commas() {
-        let lock = r#"{
-            "lockfileVersion": 1,
-            "packages": {
-                "lodash": ["lodash@4.17.15", "", {}, "sha512-x"],
-                "@babel/core": ["@babel/core@7.1.0", "", {}, "sha512-y"],
-            },
-        }"#;
+        let lock = indoc! {r#"
+            {
+                "lockfileVersion": 1,
+                "packages": {
+                    "lodash": ["lodash@4.17.15", "", {}, "sha512-x"],
+                    "@babel/core": ["@babel/core@7.1.0", "", {}, "sha512-y"],
+                },
+            }"#};
         assert_eq!(
             sorted(parse_bun(lock).unwrap()),
             sorted(vec![
@@ -841,14 +844,15 @@ packages:
 
     #[test]
     fn npm_member_sources_attributes_by_name() {
-        let lock = r#"{
-            "lockfileVersion": 3,
-            "packages": {
-                "": { "devDependencies": { "turbo": "^2" } },
-                "packages/api": { "dependencies": { "zod": "^3" } },
-                "node_modules/zod": { "version": "3.22.0" }
-            }
-        }"#;
+        let lock = indoc! {r#"
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "devDependencies": { "turbo": "^2" } },
+                    "packages/api": { "dependencies": { "zod": "^3" } },
+                    "node_modules/zod": { "version": "3.22.0" }
+                }
+            }"#};
         let index =
             MemberIndex::name_only(parse_npm_member_sources(lock).expect("v3 lock has members"));
         // The root is keyed as `.`; a member by its workspace path. Range-only locks attribute by

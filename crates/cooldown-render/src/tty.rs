@@ -444,7 +444,11 @@ pub fn render_fix(
 /// apply has an empty reason (Status says it).
 fn mutation_status(it: &UpgradeItem) -> (&'static str, String, Color) {
     if it.applied {
-        let word = if it.downgrade { "downgraded" } else { "upgraded" };
+        let word = if it.downgrade {
+            "downgraded"
+        } else {
+            "upgraded"
+        };
         (word, String::new(), Color::Green)
     } else if let Some(sk) = &it.skipped {
         let detail = if sk.reason == SkipReason::NeedsMajor {
@@ -1145,8 +1149,14 @@ mod tests {
             applied_item("insta", "1.48.0", "1.47.2", true),
         ];
         let out = render_upgrade_of(&items);
-        assert!(out.contains("upgraded"), "forward move says upgraded:\n{out}");
-        assert!(out.contains("downgraded"), "rollback says downgraded:\n{out}");
+        assert!(
+            out.contains("upgraded"),
+            "forward move says upgraded:\n{out}"
+        );
+        assert!(
+            out.contains("downgraded"),
+            "rollback says downgraded:\n{out}"
+        );
     }
 
     #[test]

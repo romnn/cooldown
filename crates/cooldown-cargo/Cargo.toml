@@ -29,5 +29,6 @@ semver.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -476,6 +476,7 @@ mod tests {
     use super::*;
     use crate::lock::Npm;
     use camino::Utf8PathBuf;
+    use indoc::indoc;
 
     #[test]
     fn set_yaml_scalar_adds_updates_and_is_idempotent() {
@@ -537,18 +538,16 @@ mod tests {
             r#"{ "dependencies": { "lodash": "4.17.15" } }"#,
         )
         .expect("write manifest");
-        std::fs::write(
-            root.join("package-lock.json"),
-            r#"{
+        let lock_json = indoc! {r#"
+            {
                 "lockfileVersion": 3,
                 "packages": {
                     "": { "version": "0.1.0", "dependencies": { "lodash": "4.17.15" } },
                     "node_modules/lodash": { "version": "4.17.15" },
                     "node_modules/ms": { "version": "2.1.3" }
                 }
-            }"#,
-        )
-        .expect("write lock");
+            }"#};
+        std::fs::write(root.join("package-lock.json"), lock_json).expect("write lock");
         let project = Project {
             root: root.clone(),
             kind: Npm::ID,
@@ -581,17 +580,15 @@ mod tests {
             r#"{ "dependencies": { "lodash": "4.17.15" } }"#,
         )
         .expect("write manifest");
-        std::fs::write(
-            root.join("package-lock.json"),
-            r#"{
+        let lock_json = indoc! {r#"
+            {
                 "lockfileVersion": 1,
                 "dependencies": {
                     "lodash": { "version": "4.17.15" },
                     "ms": { "version": "2.1.3" }
                 }
-            }"#,
-        )
-        .expect("write lock");
+            }"#};
+        std::fs::write(root.join("package-lock.json"), lock_json).expect("write lock");
         let project = Project {
             root: root.clone(),
             kind: Npm::ID,

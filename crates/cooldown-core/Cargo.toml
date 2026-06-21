@@ -26,3 +26,4 @@ camino.workspace = true
 pretty_assertions.workspace = true
 jiff.workspace = true
 camino.workspace = true
+indoc.workspace = true

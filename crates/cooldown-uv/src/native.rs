@@ -248,6 +248,7 @@ mod tests {
     use super::{exact_pin, exact_pinned_names, parse_native};
     use camino::Utf8PathBuf;
     use cooldown_core::{CoreError, RawWindow};
+    use indoc::indoc;
 
     #[test]
     fn exact_pin_recognizes_only_exact_specifiers() {
@@ -272,18 +273,16 @@ mod tests {
 
     #[test]
     fn exact_pinned_names_collects_across_dependency_tables() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[project]
-dependencies = ["protobuf==6.33.5", "httpx>=0.27"]
+        let (_dir, manifest) = write_manifest(indoc! {r#"
+            [project]
+            dependencies = ["protobuf==6.33.5", "httpx>=0.27"]
 
-[project.optional-dependencies]
-grpc = ["grpcio==1.81.0"]
+            [project.optional-dependencies]
+            grpc = ["grpcio==1.81.0"]
 
-[dependency-groups]
-dev = ["ruff>=0.14", "mypy==1.19.1"]
-"#,
-        );
+            [dependency-groups]
+            dev = ["ruff>=0.14", "mypy==1.19.1"]
+        "#});
         let pins = exact_pinned_names(&manifest);
         assert!(pins.contains("protobuf") && pins.contains("grpcio") && pins.contains("mypy"));
         assert!(!pins.contains("httpx") && !pins.contains("ruff"));
@@ -299,15 +298,13 @@ dev = ["ruff>=0.14", "mypy==1.19.1"]
 
     #[test]
     fn parse_native_errors_on_invalid_package_rule() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[tool.uv]
-exclude-newer = "2026-06-01"
+        let (_dir, manifest) = write_manifest(indoc! {r#"
+            [tool.uv]
+            exclude-newer = "2026-06-01"
 
-[tool.uv.exclude-newer-package]
-"[" = false
-"#,
-        );
+            [tool.uv.exclude-newer-package]
+            "[" = false
+        "#});
 
         let err = parse_native(&manifest).expect_err("invalid native config must fail");
         assert!(matches!(err, CoreError::Config(_)));
@@ -315,15 +312,13 @@ exclude-newer = "2026-06-01"
 
     #[test]
     fn parse_native_reads_valid_rules() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[tool.uv]
-exclude-newer = "2026-06-01"
+        let (_dir, manifest) = write_manifest(indoc! {r#"
+            [tool.uv]
+            exclude-newer = "2026-06-01"
 
-[tool.uv.exclude-newer-package]
-requests = false
-"#,
-        );
+            [tool.uv.exclude-newer-package]
+            requests = false
+        "#});
 
         let layer = parse_native(&manifest)
             .expect("valid native config")

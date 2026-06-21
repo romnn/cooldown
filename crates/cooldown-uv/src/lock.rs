@@ -281,6 +281,7 @@ impl UvLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn is_project_root_distinguishes_self_from_path_deps() {
@@ -306,31 +307,31 @@ mod tests {
         assert!(own.is_root() && path_dep.is_root());
     }
 
-    const SAMPLE: &str = r#"
-version = 1
-revision = 3
-requires-python = ">=3.12"
+    const SAMPLE: &str = indoc! {r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.12"
 
-[[package]]
-name = "demo"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [{ name = "requests" }]
+        [[package]]
+        name = "demo"
+        version = "0.1.0"
+        source = { virtual = "." }
+        dependencies = [{ name = "requests" }]
 
-[[package]]
-name = "requests"
-version = "2.34.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [{ name = "idna" }]
-sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
-wheels = [{ url = "https://x/requests-2.34.2-py3-none-any.whl", upload-time = "2026-05-14T19:25:26.443Z" }]
+        [[package]]
+        name = "requests"
+        version = "2.34.2"
+        source = { registry = "https://pypi.org/simple" }
+        dependencies = [{ name = "idna" }]
+        sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
+        wheels = [{ url = "https://x/requests-2.34.2-py3-none-any.whl", upload-time = "2026-05-14T19:25:26.443Z" }]
 
-[[package]]
-name = "idna"
-version = "3.10"
-source = { registry = "https://pypi.org/simple" }
-wheels = [{ url = "https://x/idna-3.10-py3-none-any.whl", upload-time = "2024-09-15T18:07:39.349Z" }]
-"#;
+        [[package]]
+        name = "idna"
+        version = "3.10"
+        source = { registry = "https://pypi.org/simple" }
+        wheels = [{ url = "https://x/idna-3.10-py3-none-any.whl", upload-time = "2024-09-15T18:07:39.349Z" }]
+    "#};
 
     #[test]
     fn parses_and_derives_direct() {
@@ -367,21 +368,19 @@ wheels = [{ url = "https://x/idna-3.10-py3-none-any.whl", upload-time = "2024-09
 
     #[test]
     fn artifact_ids_fall_back_to_sdist_when_no_wheels_are_recorded() {
-        let lock = UvLock::parse(
-            r#"
-[[package]]
-name = "demo"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [{ name = "requests" }]
+        let lock = UvLock::parse(indoc! {r#"
+            [[package]]
+            name = "demo"
+            version = "0.1.0"
+            source = { virtual = "." }
+            dependencies = [{ name = "requests" }]
 
-[[package]]
-name = "requests"
-version = "2.34.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
-"#,
-        )
+            [[package]]
+            name = "requests"
+            version = "2.34.2"
+            source = { registry = "https://pypi.org/simple" }
+            sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19:25:27.735Z" }
+        "#})
         .unwrap();
         let req = lock.find("requests", "2.34.2").unwrap();
         assert_eq!(
@@ -395,21 +394,19 @@ sdist = { url = "https://x/requests-2.34.2.tar.gz", upload-time = "2026-05-14T19
 
     #[test]
     fn direct_includes_dev_and_optional_groups() {
-        let lock = UvLock::parse(
-            r#"
-[[package]]
-name = "demo"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [{ name = "requests" }]
+        let lock = UvLock::parse(indoc! {r#"
+            [[package]]
+            name = "demo"
+            version = "0.1.0"
+            source = { virtual = "." }
+            dependencies = [{ name = "requests" }]
 
-[package.dev-dependencies]
-dev = [{ name = "pytest" }, { name = "ruff" }]
+            [package.dev-dependencies]
+            dev = [{ name = "pytest" }, { name = "ruff" }]
 
-[package.optional-dependencies]
-http2 = [{ name = "httpx" }]
-"#,
-        )
+            [package.optional-dependencies]
+            http2 = [{ name = "httpx" }]
+        "#})
         .unwrap();
         let mut direct = lock.direct_names();
         direct.sort();

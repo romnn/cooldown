@@ -45,22 +45,21 @@ impl ConfigDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn one_document_projects_to_policy_and_scan_views() {
-        let doc = ConfigDocument::parse(
-            r#"
-min-age = "14d"
+        let src = indoc! {r#"
 
-[global]
-major = true
+            min-age = "14d"
 
-[tool.cargo]
-exclude-folders = ["vendor"]
-"#,
-            &Origin::Global,
-        )
-        .expect("parse config document");
+            [global]
+            major = true
+
+            [tool.cargo]
+            exclude-folders = ["vendor"]
+        "#};
+        let doc = ConfigDocument::parse(src, &Origin::Global).expect("parse config document");
 
         let layer = doc.policy_layer(Origin::Global).expect("policy layer");
         let scan = doc.scan_config(&Origin::Global).expect("scan config");

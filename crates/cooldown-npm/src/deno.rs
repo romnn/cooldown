@@ -252,6 +252,7 @@ impl ToolWrite for DenoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn splits_npm_and_jsr_specifiers() {
@@ -270,9 +271,8 @@ mod tests {
     fn reads_direct_and_graph_from_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
-        std::fs::write(
-            root.join("deno.lock"),
-            r#"{
+        let lock_json = indoc! {r#"
+            {
                 "version": "5",
                 "specifiers": {
                     "npm:lodash@4.17.15": "4.17.15",
@@ -286,9 +286,8 @@ mod tests {
                 "workspace": {
                     "dependencies": ["npm:lodash@4.17.15", "jsr:@std/path@1.0.0"]
                 }
-            }"#,
-        )
-        .expect("write lock");
+            }"#};
+        std::fs::write(root.join("deno.lock"), lock_json).expect("write lock");
         let project = Project {
             root: root.clone(),
             kind: DENO_ID,

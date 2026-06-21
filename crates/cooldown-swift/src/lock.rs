@@ -107,32 +107,34 @@ pub fn direct_repos(package_swift: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn parses_v3_pins_and_skips_non_github() {
-        let resolved = r#"{
-            "pins": [
-                {
-                    "identity": "swift-argument-parser",
-                    "kind": "remoteSourceControl",
-                    "location": "https://github.com/apple/swift-argument-parser.git",
-                    "state": { "version": "1.2.0" }
-                },
-                {
-                    "identity": "internal",
-                    "kind": "remoteSourceControl",
-                    "location": "https://gitlab.example.com/team/internal.git",
-                    "state": { "version": "0.1.0" }
-                },
-                {
-                    "identity": "branchpin",
-                    "kind": "remoteSourceControl",
-                    "location": "https://github.com/apple/swift-nio.git",
-                    "state": { "branch": "main", "revision": "abc" }
-                }
-            ],
-            "version": 3
-        }"#;
+        let resolved = indoc! {r#"
+            {
+                "pins": [
+                    {
+                        "identity": "swift-argument-parser",
+                        "kind": "remoteSourceControl",
+                        "location": "https://github.com/apple/swift-argument-parser.git",
+                        "state": { "version": "1.2.0" }
+                    },
+                    {
+                        "identity": "internal",
+                        "kind": "remoteSourceControl",
+                        "location": "https://gitlab.example.com/team/internal.git",
+                        "state": { "version": "0.1.0" }
+                    },
+                    {
+                        "identity": "branchpin",
+                        "kind": "remoteSourceControl",
+                        "location": "https://github.com/apple/swift-nio.git",
+                        "state": { "branch": "main", "revision": "abc" }
+                    }
+                ],
+                "version": 3
+            }"#};
         assert_eq!(
             parse_resolved(resolved).unwrap(),
             vec![(
@@ -144,18 +146,19 @@ mod tests {
 
     #[test]
     fn parses_legacy_v1_object() {
-        let resolved = r#"{
-            "object": {
-                "pins": [
-                    {
-                        "package": "Alamofire",
-                        "repositoryURL": "https://github.com/Alamofire/Alamofire.git",
-                        "state": { "version": "5.6.0" }
-                    }
-                ]
-            },
-            "version": 1
-        }"#;
+        let resolved = indoc! {r#"
+            {
+                "object": {
+                    "pins": [
+                        {
+                            "package": "Alamofire",
+                            "repositoryURL": "https://github.com/Alamofire/Alamofire.git",
+                            "state": { "version": "5.6.0" }
+                        }
+                    ]
+                },
+                "version": 1
+            }"#};
         assert_eq!(
             parse_resolved(resolved).unwrap(),
             vec![("Alamofire/Alamofire".to_string(), "5.6.0".to_string())]
@@ -164,7 +167,7 @@ mod tests {
 
     #[test]
     fn direct_repos_extracts_declared_github_packages() {
-        let manifest = r#"
+        let manifest = indoc! {r#"
             // swift-tools-version:5.9
             let package = Package(
                 name: "App",
@@ -175,7 +178,7 @@ mod tests {
                     .package(url: "https://example.com/private/repo.git", from: "1.0.0"),
                 ]
             )
-        "#;
+        "#};
         let repos = direct_repos(manifest);
         // Lower-cased so a mixed-case manifest URL still matches the resolved file's identity.
         assert!(repos.contains("apple/swift-log"));

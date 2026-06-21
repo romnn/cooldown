@@ -28,5 +28,6 @@ futures.workspace = true
 pep440_rs.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

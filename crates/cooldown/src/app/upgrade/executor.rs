@@ -839,7 +839,12 @@ fn dep_resolve_ctx<'a>(rctx: &ResolveContext<'a>, dep: &Dependency) -> ResolveCo
 /// upgrade. Compares the releases' [`ReleaseOrder`] tokens (the canonical ordering the rest of the
 /// module uses), so it is independent of slice order. Unknown versions compare as not-a-downgrade.
 fn is_downgrade(releases: &[Release], from: &Version, to: &Version) -> bool {
-    let order = |v: &Version| releases.iter().find(|release| &release.version == v).map(|r| &r.order);
+    let order = |v: &Version| {
+        releases
+            .iter()
+            .find(|release| &release.version == v)
+            .map(|r| &r.order)
+    };
     matches!((order(to), order(from)), (Some(t), Some(f)) if t < f)
 }
 
@@ -955,11 +960,23 @@ mod tests {
     fn is_downgrade_compares_release_order() {
         let releases = [rel("1.0.0", 0), rel("1.0.1", 1), rel("1.0.2", 2)];
         // Rolling a too-fresh pin back to an older release is a downgrade.
-        assert!(is_downgrade(&releases, &Version::new("1.0.2"), &Version::new("1.0.1")));
+        assert!(is_downgrade(
+            &releases,
+            &Version::new("1.0.2"),
+            &Version::new("1.0.1")
+        ));
         // A forward move is not.
-        assert!(!is_downgrade(&releases, &Version::new("1.0.0"), &Version::new("1.0.2")));
+        assert!(!is_downgrade(
+            &releases,
+            &Version::new("1.0.0"),
+            &Version::new("1.0.2")
+        ));
         // A version not in the set is treated as not-a-downgrade.
-        assert!(!is_downgrade(&releases, &Version::new("1.0.0"), &Version::new("9.9.9")));
+        assert!(!is_downgrade(
+            &releases,
+            &Version::new("1.0.0"),
+            &Version::new("9.9.9")
+        ));
     }
 
     fn go(name: &str) -> PackageId {

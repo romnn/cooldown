@@ -167,6 +167,7 @@ pub fn parse_scan_config(content: &str, origin: &Origin) -> Result<ScanConfig, C
 mod tests {
     use super::{ScanConfig, parse_scan_config};
     use crate::policy::Origin;
+    use indoc::indoc;
 
     fn scan(content: &str) -> ScanConfig {
         parse_scan_config(content, &Origin::Default).expect("valid scan config")
@@ -174,18 +175,17 @@ mod tests {
 
     #[test]
     fn exclude_folders_combine_resolved_base_and_per_tool() {
-        let cfg = scan(
-            r#"
-[global]
-exclude-folders = ["build"]
+        let cfg = scan(indoc! {r#"
 
-[tool.cargo]
-exclude-folders = ["vendor"]
+            [global]
+            exclude-folders = ["build"]
 
-[outdated]
-exclude-folders = ["fixtures"]
-"#,
-        );
+            [tool.cargo]
+            exclude-folders = ["vendor"]
+
+            [outdated]
+            exclude-folders = ["fixtures"]
+        "#});
         // [global] + [<command>] resolve into the base; `exclude_folders_for` adds the per-tool list
         // (order is irrelevant — it is a prune set).
         let base = cfg.resolved("outdated").exclude_folders;
@@ -205,15 +205,14 @@ exclude-folders = ["fixtures"]
 
     #[test]
     fn exclude_packages_resolve_global_and_hold_per_tool() {
-        let cfg = scan(
-            r#"
-[global]
-exclude-packages = ["internal-*"]
+        let cfg = scan(indoc! {r#"
 
-[tool.npm]
-exclude-packages = ["@scope/*"]
-"#,
-        );
+            [global]
+            exclude-packages = ["internal-*"]
+
+            [tool.npm]
+            exclude-packages = ["@scope/*"]
+        "#});
         // A `[global]` `exclude-packages` resolves into every command's base; the per-tool list is
         // held separately and combined at the member-filter site (workspace::dependencies_in_scope).
         assert_eq!(
@@ -320,15 +319,14 @@ dry-run = true
 
     #[test]
     fn fix_section_contributes_to_scan_excludes() {
-        let cfg = scan(
-            r#"
-[global]
-exclude-folders = ["dist"]
+        let cfg = scan(indoc! {r#"
 
-[fix]
-exclude-folders = ["fixtures"]
-"#,
-        );
+            [global]
+            exclude-folders = ["dist"]
+
+            [fix]
+            exclude-folders = ["fixtures"]
+        "#});
 
         assert_eq!(
             cfg.resolved("fix").exclude_folders,

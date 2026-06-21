@@ -1147,7 +1147,11 @@ async fn upgrade_major_crosses_a_direct_but_not_a_transitive() {
         .await;
 
     // The direct dep crosses the major boundary.
-    let a = out.items.iter().find(|it| it.name == "a").expect("a planned");
+    let a = out
+        .items
+        .iter()
+        .find(|it| it.name == "a")
+        .expect("a planned");
     assert_eq!(a.to, "v2.0.0");
     assert!(a.applied);
     // The transitive dep is not carried across the major — it produces no item at all.

@@ -46,6 +46,7 @@ mod tests {
     use super::parse_native;
     use camino::Utf8PathBuf;
     use cooldown_core::{CoreError, RawWindow};
+    use indoc::indoc;
 
     fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -56,16 +57,15 @@ mod tests {
 
     #[test]
     fn parse_native_errors_on_invalid_min_age() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[package]
-name = "demo"
-version = "0.1.0"
+        let (_dir, manifest) = write_manifest(indoc! {r#"
 
-[package.metadata.cooldown]
-min-age = "not-a-duration"
-"#,
-        );
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [package.metadata.cooldown]
+            min-age = "not-a-duration"
+        "#});
 
         let err = parse_native(&manifest).expect_err("invalid native config must fail");
         assert!(matches!(err, CoreError::Config(_)));
@@ -73,16 +73,15 @@ min-age = "not-a-duration"
 
     #[test]
     fn parse_native_reads_valid_package_metadata() {
-        let (_dir, manifest) = write_manifest(
-            r#"
-[package]
-name = "demo"
-version = "0.1.0"
+        let (_dir, manifest) = write_manifest(indoc! {r#"
 
-[package.metadata.cooldown]
-min-age = "14d"
-"#,
-        );
+            [package]
+            name = "demo"
+            version = "0.1.0"
+
+            [package.metadata.cooldown]
+            min-age = "14d"
+        "#});
 
         let layer = parse_native(&manifest)
             .expect("valid native config")

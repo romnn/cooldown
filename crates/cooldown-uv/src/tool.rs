@@ -375,6 +375,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::{ArtifactId, CoreError, FetchContext, RawArtifact, RawRelease};
+    use indoc::indoc;
     use jiff::Timestamp;
 
     #[test]
@@ -464,31 +465,28 @@ mod tests {
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
         )
         .expect("write manifest");
-        std::fs::write(
-            root.join("uv.lock"),
-            r#"
-version = 1
-revision = 3
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
 
-[[package]]
-name = "demo"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [{ name = "requests" }]
+            [[package]]
+            name = "demo"
+            version = "0.1.0"
+            source = { virtual = "." }
+            dependencies = [{ name = "requests" }]
 
-[[package]]
-name = "requests"
-version = "2.34.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [{ name = "idna" }]
+            [[package]]
+            name = "requests"
+            version = "2.34.2"
+            source = { registry = "https://pypi.org/simple" }
+            dependencies = [{ name = "idna" }]
 
-[[package]]
-name = "idna"
-version = "3.10"
-source = { registry = "https://pypi.org/simple" }
-"#,
-        )
-        .expect("write lock");
+            [[package]]
+            name = "idna"
+            version = "3.10"
+            source = { registry = "https://pypi.org/simple" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
         let tool = UvTool::from_http(
             cooldown_registry::SharedHttp::new(
