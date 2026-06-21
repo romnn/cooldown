@@ -155,6 +155,9 @@ fn bump_requirement(requirement: &str, target: &str) -> Option<String> {
 /// specifier widens to `>=target`, the least-surprising default that actually admits the target;
 /// `==`/`===` pins never reach here (they are held and skipped before apply).
 fn bump_specifier(specifier: &str, target: &str) -> String {
+    // Unlike the cargo/npm rewriters, `target` is NOT stripped of a `+…` suffix: in PEP 440 a `+local`
+    // segment is a *local version identifier* (significant, unlike semver build metadata), and PyPI
+    // rejects local versions — so a registry-resolved target never carries one to begin with.
     let specifier = specifier.trim();
     if specifier.contains(',') || specifier.starts_with('<') || specifier.starts_with("!=") {
         return format!(">={target}");

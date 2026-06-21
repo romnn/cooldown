@@ -157,7 +157,13 @@ fn widen_manifest(manifest: &Utf8Path, name: &str, target: &str) -> Result<bool>
     Ok(changed)
 }
 
+/// Produce an npm range admitting `target`, preserving safe leading operators.
+///
+/// Build metadata on `target` (`1.2.3+build` → `1.2.3`) is stripped first: npm's semver ignores it in
+/// range matching, so carrying it into the declared range would be meaningless noise. A prerelease
+/// segment (`-rc1`) is kept — unlike build metadata, it is significant to a range.
 fn bump_range(old: &str, target: &str) -> String {
+    let target = target.split_once('+').map_or(target, |(base, _)| base);
     let trimmed = old.trim();
     if trimmed.is_empty()
         || trimmed.contains("||")
@@ -386,6 +392,19 @@ mod tests {
         assert_eq!(bump_range("3.0.0", "3.3.0"), "3.3.0");
         assert_eq!(bump_range("<4.0.0", "5.0.0"), "^5.0.0");
         assert_eq!(bump_range(">=3 <4", "5.0.0"), "^5.0.0");
+    }
+
+    #[test]
+    fn bump_range_strips_build_metadata_from_the_target() {
+        // npm's semver ignores build metadata in range matching, so a resolved `1.2.3+build` must not
+        // leak into the declared range — across every operator family. A prerelease is preserved.
+        assert_eq!(bump_range("^3.0.0", "5.0.0+build.7"), "^5.0.0");
+        assert_eq!(bump_range("~3.0.0", "3.3.0+build.7"), "~3.3.0");
+        assert_eq!(bump_range(">=3.0.0", "3.3.0+build.7"), ">=3.3.0");
+        assert_eq!(bump_range(">3.0.0", "3.3.0+build.7"), ">=3.3.0");
+        assert_eq!(bump_range("3.0.0", "3.3.0+build.7"), "3.3.0");
+        assert_eq!(bump_range("<4.0.0", "5.0.0+build.7"), "^5.0.0");
+        assert_eq!(bump_range("3.0.0", "2.0.0-rc1+build.5"), "2.0.0-rc1");
     }
 
     #[test]

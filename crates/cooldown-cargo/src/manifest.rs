@@ -191,6 +191,10 @@ fn navigate_mut<'doc>(
 
 /// Produce a requirement that admits `target`, preserving safe leading comparators.
 ///
+/// Build metadata on `target` (`0.25.12+spec-1.1.0` → `0.25.12`) is stripped first: cargo ignores it
+/// in a version requirement and warns on every invocation, so it must never reach the constraint. A
+/// prerelease segment (`-rc1`) is kept — unlike build metadata, it is significant to a requirement.
+///
 /// A bare or caret requirement maps to the caret-equivalent on the target (`^1` → `^2.3.0`, `1` →
 /// `2.3.0`); safe single comparators keep their operator (`>=1` → `>=2.3.0`, `~1.2` → `~2.3.0`).
 /// A strict lower bound becomes inclusive (`>1` → `>=2.3.0`). A multi-comparator, wildcard,
@@ -198,6 +202,7 @@ fn navigate_mut<'doc>(
 /// surprising default that actually admits the target. Exact `=` pins never reach here — they are
 /// held and skipped before apply.
 fn bump_req(old: &str, target: &str) -> String {
+    let target = target.split_once('+').map_or(target, |(base, _)| base);
     let trimmed = old.trim();
     if trimmed.is_empty()
         || trimmed.contains(',')
@@ -242,6 +247,21 @@ mod tests {
         assert_eq!(bump_req(">=1, <2", "2.3.0"), "^2.3.0");
         assert_eq!(bump_req("<2", "2.3.0"), "^2.3.0");
         assert_eq!(bump_req("<=2", "2.3.0"), "^2.3.0");
+    }
+
+    #[test]
+    fn bump_req_strips_build_metadata_from_the_target() {
+        // The toml ecosystem publishes versions like `0.25.12+spec-1.1.0`. Cargo ignores build
+        // metadata in a requirement and warns, so it must not leak from the resolved version into the
+        // rewritten constraint — across every comparator family. A prerelease segment is preserved.
+        assert_eq!(bump_req("0.23", "0.25.12+spec-1.1.0"), "0.25.12");
+        assert_eq!(bump_req("^0.23", "0.25.12+spec-1.1.0"), "^0.25.12");
+        assert_eq!(bump_req("~0.23", "0.25.12+spec-1.1.0"), "~0.25.12");
+        assert_eq!(bump_req(">=0.23", "0.25.12+spec-1.1.0"), ">=0.25.12");
+        assert_eq!(bump_req(">0.23", "0.25.12+spec-1.1.0"), ">=0.25.12");
+        assert_eq!(bump_req("<0.30", "0.25.12+spec-1.1.0"), "^0.25.12");
+        // Prerelease is significant to a requirement and must survive the strip.
+        assert_eq!(bump_req("1", "2.0.0-rc1+build.5"), "2.0.0-rc1");
     }
 
     #[test]
