@@ -279,8 +279,16 @@ mod tests {
 
         // Bad CLI globs fail fast, like the config ones.
         let mut bad_folder = CommandConfig::default();
-        assert!(bad_folder.override_excludes(&["a/**/[".to_string()], &[]).is_err());
+        assert!(
+            bad_folder
+                .override_excludes(&["a/**/[".to_string()], &[])
+                .is_err()
+        );
         let mut bad_package = CommandConfig::default();
-        assert!(bad_package.override_excludes(&[], &["[".to_string()]).is_err());
+        assert!(
+            bad_package
+                .override_excludes(&[], &["[".to_string()])
+                .is_err()
+        );
     }
 }

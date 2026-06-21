@@ -202,12 +202,16 @@ mod tests {
 
     #[test]
     fn empty_exclude_sets_match_nothing() {
-        assert!(!FolderExcludeSet::compile(&[])
-            .expect("compile")
-            .excludes_path(Utf8Path::new("apps/admin")));
-        assert!(!PackageExcludeSet::compile(&[])
-            .expect("compile")
-            .excludes_name("@luup/api"));
+        assert!(
+            !FolderExcludeSet::compile(&[])
+                .expect("compile")
+                .excludes_path(Utf8Path::new("apps/admin"))
+        );
+        assert!(
+            !PackageExcludeSet::compile(&[])
+                .expect("compile")
+                .excludes_name("@luup/api")
+        );
     }
 
     fn touch(path: &Utf8Path) {

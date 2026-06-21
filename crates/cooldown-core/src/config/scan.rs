@@ -120,7 +120,9 @@ pub(crate) fn scan_config_from_config(
         }
     }
     for (name, selector) in config.tool.unwrap_or_default() {
-        let folders = selector.exclude_folders.filter(|entries| !entries.is_empty());
+        let folders = selector
+            .exclude_folders
+            .filter(|entries| !entries.is_empty());
         let packages = selector
             .exclude_packages
             .filter(|entries| !entries.is_empty());
@@ -193,7 +195,10 @@ exclude-folders = ["fixtures"]
             vec!["build", "fixtures", "vendor"]
         );
         // A different tool doesn't pick up cargo's per-tool excludes.
-        assert_eq!(cfg.exclude_folders_for(&base, "go"), vec!["build", "fixtures"]);
+        assert_eq!(
+            cfg.exclude_folders_for(&base, "go"),
+            vec!["build", "fixtures"]
+        );
         // Another command's base omits the [outdated] entry.
         assert_eq!(cfg.resolved("upgrade").exclude_folders, vec!["build"]);
     }
@@ -211,7 +216,10 @@ exclude-packages = ["@scope/*"]
         );
         // A `[global]` `exclude-packages` resolves into every command's base; the per-tool list is
         // held separately and combined at the member-filter site (workspace::dependencies_in_scope).
-        assert_eq!(cfg.resolved("outdated").exclude_packages, vec!["internal-*"]);
+        assert_eq!(
+            cfg.resolved("outdated").exclude_packages,
+            vec!["internal-*"]
+        );
         assert_eq!(cfg.tool_exclude_packages["npm"], vec!["@scope/*"]);
         assert!(!cfg.tool_exclude_packages.contains_key("cargo"));
         // Folders and packages are independent surfaces.
@@ -220,13 +228,17 @@ exclude-packages = ["@scope/*"]
 
     #[test]
     fn invalid_exclude_glob_is_rejected_at_parse() {
-        assert!(parse_scan_config("[global]\nexclude-folders = [\"a/**/[\"]\n", &Origin::Default)
-            .is_err());
-        assert!(parse_scan_config(
-            "[tool.npm]\nexclude-packages = [\"[\"]\n",
-            &Origin::Default
-        )
-        .is_err());
+        assert!(
+            parse_scan_config(
+                "[global]\nexclude-folders = [\"a/**/[\"]\n",
+                &Origin::Default
+            )
+            .is_err()
+        );
+        assert!(
+            parse_scan_config("[tool.npm]\nexclude-packages = [\"[\"]\n", &Origin::Default)
+                .is_err()
+        );
     }
 
     #[test]
@@ -318,7 +330,10 @@ exclude-folders = ["fixtures"]
 "#,
         );
 
-        assert_eq!(cfg.resolved("fix").exclude_folders, vec!["dist", "fixtures"]);
+        assert_eq!(
+            cfg.resolved("fix").exclude_folders,
+            vec!["dist", "fixtures"]
+        );
         assert_eq!(cfg.resolved("upgrade").exclude_folders, vec!["dist"]);
     }
 

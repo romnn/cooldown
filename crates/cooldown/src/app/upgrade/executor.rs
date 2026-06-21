@@ -100,7 +100,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     transitive,
                     downgrade_pinned,
                 } => {
-                    let plan = self.plan_fix_changes(&deps, transitive, downgrade_pinned).await;
+                    let plan = self
+                        .plan_fix_changes(&deps, transitive, downgrade_pinned)
+                        .await;
                     self.emit_fix_warnings(plan.warnings);
                     plan.changes
                 }
@@ -374,7 +376,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
     ) {
         for _ in 0..MAX_FIX_ROUNDS {
-            let plan = self.plan_fix_changes(&deps, transitive, downgrade_pinned).await;
+            let plan = self
+                .plan_fix_changes(&deps, transitive, downgrade_pinned)
+                .await;
             if plan.changes.is_empty() {
                 self.emit_fix_warnings(plan.warnings);
                 return;
@@ -735,7 +739,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Errors recorded so far this run (project-level plus per-change) — the before/after delta tells
     /// `reconcile_graph` whether the upgrade loop hit a failure it must not re-trigger.
     fn errored_count(&self) -> usize {
-        self.acc.errors.len() + self.acc.items.iter().filter(|item| item.error.is_some()).count()
+        self.acc.errors.len()
+            + self
+                .acc
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count()
     }
 
     fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {

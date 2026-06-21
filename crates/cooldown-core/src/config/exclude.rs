@@ -91,7 +91,9 @@ fn package_glob(pattern: &str) -> Result<Glob, CoreError> {
         .literal_separator(false)
         .build()
         .map_err(|error| {
-            CoreError::Config(format!("invalid exclude-packages glob {pattern:?}: {error}"))
+            CoreError::Config(format!(
+                "invalid exclude-packages glob {pattern:?}: {error}"
+            ))
         })
 }
 

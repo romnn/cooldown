@@ -188,7 +188,11 @@ mod tests {
             .expect("scan succeeds");
 
         let captured: Vec<&str> = out.iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(captured, vec!["main.go"], "only top-level source is captured");
+        assert_eq!(
+            captured,
+            vec!["main.go"],
+            "only top-level source is captured"
+        );
     }
 
     #[test]
