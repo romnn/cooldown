@@ -40,7 +40,7 @@ pub(crate) struct SelectorToml {
 ///
 /// Every field mirrors a CLI flag. Resolution is uniform: an explicit CLI flag always wins, then a
 /// `[<command>]` value, then `[global]`, then the built-in default. `None`/empty means "unset", so a
-/// section only overrides what it names. Keys are kebab-case (`major-all`, `all-artifacts`, …), the
+/// section only overrides what it names. Keys are kebab-case (`all-artifacts`, `fail-on-unknown-age`, …), the
 /// same spelling as the flags. New config-driven flags are added here and nowhere else.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -67,8 +67,6 @@ pub struct CommandConfig {
     pub gitignore: Option<bool>,
     /// Cross-major candidate scope (`--major` / `--no-major`).
     pub major: Option<bool>,
-    /// Apply cross-major to all eligible deps (`--major-all`).
-    pub major_all: Option<bool>,
     /// List up-to-date deps in `outdated` (`--all`).
     pub all: Option<bool>,
     /// Gate every recorded artifact in `check` (`--all-artifacts`).
@@ -112,7 +110,6 @@ impl CommandConfig {
         self.package.append(&mut other.package);
         self.gitignore = other.gitignore.or(self.gitignore);
         self.major = other.major.or(self.major);
-        self.major_all = other.major_all.or(self.major_all);
         self.all = other.all.or(self.all);
         self.all_artifacts = other.all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = other.allow_stale_lock.or(self.allow_stale_lock);
@@ -144,7 +141,6 @@ impl CommandConfig {
         }
         self.gitignore = explicit.gitignore.or(self.gitignore);
         self.major = explicit.major.or(self.major);
-        self.major_all = explicit.major_all.or(self.major_all);
         self.all = explicit.all.or(self.all);
         self.all_artifacts = explicit.all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = explicit.allow_stale_lock.or(self.allow_stale_lock);

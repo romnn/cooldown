@@ -568,7 +568,7 @@ fn render_mutation(
 }
 
 /// The distinct package names of the cross-major updates held back as `needs --major` rows (sorted,
-/// deduped across projects) — what the `--major` command in the suggestion card should target.
+/// deduped across projects) — the count and subjects the suggestion card reports.
 fn major_held_back(items: &[UpgradeItem]) -> Vec<&str> {
     let mut names: Vec<&str> = items
         .iter()
@@ -601,8 +601,8 @@ fn paint(text: &str, ansi: &str, use_color: bool) -> String {
     }
 }
 
-/// Render a free-floating "Tip" card suggesting the exact `--major` command that adopts the held-back
-/// cross-major updates (`--major` plus a `-p` per distinct package, so the user takes only those).
+/// Render a free-floating "Tip" card suggesting the `cooldown upgrade --major` command that adopts the
+/// held-back cross-major updates (plain `--major` takes them all; the user scopes with `-p` to subset).
 ///
 /// It is a hand-drawn rounded box with a titled top border, a colored frame, and the command set
 /// apart in green — there is no lightweight Rust equivalent of JS's `boxen`, and drawing it directly
@@ -612,10 +612,9 @@ fn push_major_card(out: &mut String, names: &[&str], use_color: bool) {
     if names.is_empty() {
         return;
     }
-    let mut cmd = String::from("cooldown upgrade --major");
-    for name in names {
-        let _ = write!(cmd, " -p {name}");
-    }
+    // Plain `--major` adopts every held-back cross-major (the rows above); a `-p` list would only be
+    // needed to take a subset, which the table already makes visible.
+    let cmd = String::from("cooldown upgrade --major");
     let subject = if names.len() == 1 {
         "1 package has".to_string()
     } else {
@@ -1147,9 +1146,9 @@ mod tests {
             "summary breakout missing:\n{out}"
         );
         assert!(out.contains("fs4") && out.contains("1.1.0"), "{out}");
-        // The exact, scoped command — sorted, so it takes only these two — offered in the card.
+        // The card offers the plain `--major` command, which adopts both held-back majors at once.
         assert!(
-            out.contains("cooldown upgrade --major -p fs4 -p toml_edit"),
+            out.contains("cooldown upgrade --major"),
             "suggestion command missing:\n{out}"
         );
     }
@@ -1200,20 +1199,18 @@ mod tests {
 
     #[test]
     fn major_command_dedups_a_package_held_back_in_several_projects() {
-        // The same package held back in two projects yields ONE `-p` flag and one tally entry per
-        // distinct name — so the suggested command is never `-p widget -p widget`.
+        // The same package held back in two projects counts twice in the tally but is ONE distinct
+        // name — so the card's subject says "1 package", not "2".
         let items = [
             needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/a"),
             needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/b"),
         ];
         let out = render_upgrade_of(&items);
-        // Two held-back rows (one per project) → the tally counts both, but the command targets the
-        // one distinct package once.
         assert!(out.contains("2 need --major"), "{out}");
-        assert!(out.contains("cooldown upgrade --major -p widget"), "{out}");
+        assert!(out.contains("cooldown upgrade --major"), "{out}");
         assert!(
-            !out.contains("-p widget -p widget"),
-            "command must dedup the package:\n{out}"
+            out.contains("1 package has a major update available"),
+            "the card subject must dedup the package name:\n{out}"
         );
     }
 
@@ -1254,7 +1251,7 @@ mod tests {
             "titled rounded box missing:\n{out}"
         );
         assert!(
-            out.contains("cooldown upgrade --major -p fs4"),
+            out.contains("cooldown upgrade --major"),
             "command missing:\n{out}"
         );
         assert!(

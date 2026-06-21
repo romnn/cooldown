@@ -277,7 +277,8 @@ pub(in crate::cli) struct GlobalArgs {
     #[arg(long, global = true, value_name = "GLOB")]
     pub(in crate::cli) allow: Vec<String>,
     /// Allow major version changes. Default: ON for `outdated` (so a new major is discoverable),
-    /// OFF for `upgrade`/`check`/etc. (a major bump is usually breaking work you opt into).
+    /// OFF for `upgrade`/`check`/etc. (a major bump is usually breaking work you opt into). For
+    /// `upgrade`/`fix` it applies to every eligible dependency; narrow it with `--package`.
     #[arg(long, global = true)]
     pub(in crate::cli) major: bool,
     /// Stay within the current major (the inverse of `--major`; alias `--minor`). Useful for
@@ -289,9 +290,6 @@ pub(in crate::cli) struct GlobalArgs {
         conflicts_with = "major"
     )]
     pub(in crate::cli) no_major: bool,
-    /// With --major, apply cross-major to ALL eligible deps (else --package is required).
-    #[arg(long = "major-all", global = true)]
-    pub(in crate::cli) major_all: bool,
     /// Scope the command to matching packages (repeatable).
     #[arg(long, short = 'p', global = true, value_name = "GLOB")]
     pub(in crate::cli) package: Vec<String>,
@@ -406,7 +404,6 @@ pub struct CliOverrides {
     pub(crate) major: Option<bool>,
     pub(crate) gitignore: Option<bool>,
     pub(crate) all: Option<bool>,
-    pub(crate) major_all: Option<bool>,
     pub(crate) all_artifacts: Option<bool>,
     pub(crate) allow_stale_lock: Option<bool>,
     pub(crate) fail_on_unknown_age: Option<bool>,
@@ -453,7 +450,6 @@ impl CliOverrides {
             },
             // `--no-gitignore` is the only CLI control; the default (on) lives in config/built-in.
             gitignore: set_on_cli(matches, "no_gitignore").then_some(false),
-            major_all: on("major_all"),
             allow_stale_lock: on("allow_stale_lock"),
             // Per-command flags: probe the owning subcommand directly. The root never registers
             // them, so `set_on_cli`'s root `value_source` would panic on an unknown id.

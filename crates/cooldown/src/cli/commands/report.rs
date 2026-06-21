@@ -91,12 +91,6 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
 }
 
 pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
-    if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
-        return Err(CoreError::Config(
-            "`upgrade --major` rewrites import paths repo-wide; pass --package or --major-all"
-                .into(),
-        ));
-    }
     let out = ctx.ws.upgrade(ctx.opts).await;
     let meta = present::upgrade_meta(&out.meta);
     let summary = present::upgrade_summary(&out.summary);
@@ -127,12 +121,6 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
 }
 
 pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
-    if ctx.opts.allow_major && ctx.opts.package.is_empty() && !ctx.opts.major_all {
-        return Err(CoreError::Config(
-            "`fix --major` allows cross-major downgrades (very breaking); pass --package or --major-all"
-                .into(),
-        ));
-    }
     let out = ctx.ws.fix(ctx.opts).await;
     let meta = present::upgrade_meta(&out.meta);
     let summary = present::upgrade_summary(&out.summary);

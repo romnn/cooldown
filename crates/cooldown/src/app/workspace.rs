@@ -146,8 +146,6 @@ pub struct RunOpts {
     /// table, leaving only deps with an actionable update. The `latest` column on a held row still
     /// shows what is available, so this is purely a display filter.
     pub hide_pinned: bool,
-    /// `--major-all`: apply cross-major to all eligible deps (else `--package` is required).
-    pub major_all: bool,
     /// `--rewrite` (upgrade): how to treat the manifest's version constraint. Defaults to
     /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
     /// `--rewrite` selects [`RewriteMode::Always`].

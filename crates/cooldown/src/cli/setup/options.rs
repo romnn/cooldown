@@ -100,7 +100,6 @@ pub(super) fn resolve_invocation(
                 Some(crate::cli::args::TransitiveMode::Hide) => crate::app::TransitiveGate::Hide,
                 None => crate::app::TransitiveGate::Enforce,
             },
-            major_all: merged.major_all.unwrap_or(false),
             all_artifacts: merged.all_artifacts.unwrap_or(false),
             allow_stale_lock: merged.allow_stale_lock.unwrap_or(false),
             fail_on_unknown_age: merged.fail_on_unknown_age.unwrap_or(false),
@@ -131,7 +130,6 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
     CommandConfig {
         gitignore: Some(true),
         major: Some(default_major),
-        major_all: Some(false),
         all: Some(false),
         all_artifacts: Some(false),
         allow_stale_lock: Some(false),
@@ -160,7 +158,6 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         package: global.package.clone(),
         gitignore: overrides.gitignore,
         major: overrides.major,
-        major_all: overrides.major_all,
         all: overrides.all,
         all_artifacts: overrides.all_artifacts,
         allow_stale_lock: overrides.allow_stale_lock,
