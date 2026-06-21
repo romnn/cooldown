@@ -24,6 +24,26 @@ pub(super) enum PlanMode {
     },
 }
 
+/// Backstop on the `fix`/reconcile fixpoint loop: a downgrade can lower another dep's floor and
+/// make it newly fixable (an umbrella module freeing its submodules), so planning re-runs after each
+/// round until nothing new is planned. Real graphs converge in a few rounds; this only guards a
+/// pathological cycle from looping forever.
+const MAX_FIX_ROUNDS: usize = 12;
+
+/// A `fix` downgrade that could not be planned, deferred so the caller emits it only once the
+/// fixpoint settles — a dep held in an early round may become fixable in a later one, so its warning
+/// would be stale if emitted eagerly.
+struct FixWarning {
+    package: String,
+    message: String,
+}
+
+/// One round of `fix` planning: the downgrades to apply and the unfixable violations to report.
+struct FixPlan {
+    changes: Vec<Change>,
+    warnings: Vec<FixWarning>,
+}
+
 /// The evolving per-project state during one-change upgrade trials.
 struct TrialState {
     /// In-cooldown, non-baselined pins present before the next trial.
@@ -70,9 +90,21 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.project_label(),
             self.ctx.pctx.tool
         ));
-        let planned = self.plan_changes(&deps).await;
 
         if self.ctx.opts.dry_run {
+            // A single-pass preview: a fixpoint can't be simulated without applying, since a
+            // downgrade's effect on other deps' floors only shows after a re-lock.
+            let planned = match self.mode {
+                PlanMode::Upgrade => self.plan_upgrade_changes(&deps).await,
+                PlanMode::Fix {
+                    transitive,
+                    downgrade_pinned,
+                } => {
+                    let plan = self.plan_fix_changes(&deps, transitive, downgrade_pinned).await;
+                    self.emit_fix_warnings(plan.warnings);
+                    plan.changes
+                }
+            };
             self.record_dry_run(&planned);
             return;
         }
@@ -96,29 +128,39 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut state = TrialState {
             baseline_violations,
         };
-        let applied_before = self.applied_count();
-        let errored_before = self.errored_count();
-        for change in planned {
-            if !self.apply_change(change, &mut state).await {
-                break;
+        match self.mode {
+            PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
+            PlanMode::Fix {
+                transitive,
+                downgrade_pinned,
+            } => {
+                self.fix_to_fixpoint(deps, transitive, downgrade_pinned, &mut state)
+                    .await;
             }
         }
 
-        // `upgrade` (default mode) reconciles the graph it just re-locked: downgrade any too-fresh
-        // transitive a forward move floated up, so the new lock is gate-clean in one pass — no
-        // separate `fix` needed. `--transitive allow`/`hide` opt out (the floated-up transitive was
-        // already kept-and-reported / ignored in `apply_change`). Skip it when the upgrade made no
-        // clean forward progress: nothing floated up, and a broken re-lock probe must not be re-hit.
+        self.finalize().await;
+    }
+
+    /// Apply the forward moves, then (under the default transitive mode) reconcile the graph the
+    /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
+    /// `upgrade` ends gate-clean — no separate `fix` needed.
+    async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) {
+        let applied_before = self.applied_count();
+        let errored_before = self.errored_count();
+        let planned = self.plan_upgrade_changes(&deps).await;
+        for change in planned {
+            if !self.apply_change(change, state).await {
+                break;
+            }
+        }
+        // Skip reconciliation when the upgrade made no clean forward progress: nothing floated up,
+        // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
             self.applied_count() > applied_before && self.errored_count() == errored_before;
-        if matches!(self.mode, PlanMode::Upgrade)
-            && self.transitive_mode() == TransitiveGate::Enforce
-            && upgraded_cleanly
-        {
-            self.reconcile_graph(&mut state).await;
+        if self.transitive_mode() == TransitiveGate::Enforce && upgraded_cleanly {
+            self.reconcile_to_fixpoint(state).await;
         }
-
-        self.finalize().await;
     }
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
@@ -139,19 +181,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Err(error) => {
                 self.record_project_error(&error, None);
                 None
-            }
-        }
-    }
-
-    async fn plan_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
-        match self.mode {
-            PlanMode::Upgrade => self.plan_upgrade_changes(deps).await,
-            PlanMode::Fix {
-                transitive,
-                downgrade_pinned,
-            } => {
-                self.plan_fix_changes(deps, transitive, downgrade_pinned)
-                    .await
             }
         }
     }
@@ -225,12 +254,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Plan downgrades for `fix`: every dependency whose locked version is too fresh moves to the
     /// newest matured version older than it. A pin is left in place with a warning unless
     /// `downgrade_pinned`; a violation with no matured older version is reported as a warning too.
+    /// Warnings are returned (not emitted) so the fixpoint caller surfaces only the final round's —
+    /// a dep held now may become fixable once an umbrella module ahead of it is downgraded.
     async fn plan_fix_changes(
         &mut self,
         deps: &[Dependency],
         transitive: TransitiveGate,
         downgrade_pinned: bool,
-    ) -> Vec<Change> {
+    ) -> FixPlan {
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
@@ -244,6 +275,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await;
         let mut planned = Vec::new();
+        let mut warnings = Vec::new();
         for (dep, releases) in fetched {
             let releases = match releases {
                 Ok(releases) => releases,
@@ -267,32 +299,44 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // `--transitive allow`: leave a too-fresh transitive in place (still reported), only
             // downgrade direct deps. `hide` never reaches here — transitives aren't in scope.
             if transitive == TransitiveGate::Allow && !dep.direct {
-                self.record_fix_warning(&format!(
-                    "{}@{} is younger than its cooldown; left in place by --transitive allow",
-                    dep.package.name, dep.current
-                ), &dep.package.name);
+                warnings.push(FixWarning {
+                    package: dep.package.name.clone(),
+                    message: format!(
+                        "{}@{} is younger than its cooldown; left in place by --transitive allow",
+                        dep.package.name, dep.current
+                    ),
+                });
                 continue;
             }
             if fix.current.graph_held {
-                self.record_fix_warning(&format!(
-                    "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
-                    dep.package.name, dep.current
-                ), &dep.package.name);
+                warnings.push(FixWarning {
+                    package: dep.package.name.clone(),
+                    message: format!(
+                        "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
+                        dep.package.name, dep.current
+                    ),
+                });
                 continue;
             }
             // An exact pin is a deliberate choice: warn and leave it unless `--downgrade-pinned`.
             if dep.pinned && !downgrade_pinned {
-                self.record_fix_warning(&format!(
-                    "{}@{} is pinned and younger than its cooldown; downgrade it manually or rerun with --downgrade-pinned",
-                    dep.package.name, dep.current
-                ), &dep.package.name);
+                warnings.push(FixWarning {
+                    package: dep.package.name.clone(),
+                    message: format!(
+                        "{}@{} is pinned and younger than its cooldown; downgrade it manually or rerun with --downgrade-pinned",
+                        dep.package.name, dep.current
+                    ),
+                });
                 continue;
             }
             let Some(target) = fix.target else {
-                self.record_fix_warning(&format!(
-                    "{}@{} is younger than its cooldown and no older version has matured; `baseline` it or wait",
-                    dep.package.name, dep.current
-                ), &dep.package.name);
+                warnings.push(FixWarning {
+                    package: dep.package.name.clone(),
+                    message: format!(
+                        "{}@{} is younger than its cooldown and no older version has matured; `baseline` it or wait",
+                        dep.package.name, dep.current
+                    ),
+                });
                 continue;
             };
             let kind = releases
@@ -308,7 +352,79 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 members: dep.members.clone(),
             });
         }
-        planned
+        FixPlan {
+            changes: planned,
+            warnings,
+        }
+    }
+
+    /// Apply `fix` downgrades round by round until the graph stops changing: each round re-discovers
+    /// the (re-locked) graph and re-plans, because a downgrade can free a dep that was graph-held a
+    /// round earlier. The deferred unfixable warnings are surfaced once, from the settling round.
+    async fn fix_to_fixpoint(
+        &mut self,
+        mut deps: Vec<Dependency>,
+        transitive: TransitiveGate,
+        downgrade_pinned: bool,
+        state: &mut TrialState,
+    ) {
+        for _ in 0..MAX_FIX_ROUNDS {
+            let plan = self.plan_fix_changes(&deps, transitive, downgrade_pinned).await;
+            if plan.changes.is_empty() {
+                self.emit_fix_warnings(plan.warnings);
+                return;
+            }
+            let applied_before = self.applied_count();
+            for change in plan.changes {
+                if !self.apply_change(change, state).await {
+                    return;
+                }
+            }
+            // No forward progress despite a non-empty plan (e.g. every downgrade was skipped): stop
+            // rather than spin, and surface what is left.
+            if self.applied_count() == applied_before {
+                self.emit_fix_warnings(plan.warnings);
+                return;
+            }
+            let Some(next) = self.scoped_deps().await else {
+                return;
+            };
+            deps = next;
+        }
+    }
+
+    /// Downgrade any too-fresh transitive a forward `upgrade` move floated up, to a fixpoint — the
+    /// `fix` half of a single-pass `upgrade`. Reuses the per-change trial so each downgrade is
+    /// applied, re-locked, and verified like any other.
+    async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) {
+        for _ in 0..MAX_FIX_ROUNDS {
+            let Some(deps) = self.reconcile_deps().await else {
+                return;
+            };
+            let plan = self
+                .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
+                .await;
+            if plan.changes.is_empty() {
+                self.emit_fix_warnings(plan.warnings);
+                return;
+            }
+            let applied_before = self.applied_count();
+            for change in plan.changes {
+                if !self.apply_change(change, state).await {
+                    return;
+                }
+            }
+            if self.applied_count() == applied_before {
+                self.emit_fix_warnings(plan.warnings);
+                return;
+            }
+        }
+    }
+
+    fn emit_fix_warnings(&mut self, warnings: Vec<FixWarning>) {
+        for warning in warnings {
+            self.record_fix_warning(&warning.message, &warning.package);
+        }
     }
 
     fn record_fix_warning(&mut self, message: &str, package: &str) {
@@ -437,23 +553,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     fn transitive_mode(&self) -> TransitiveGate {
         self.ctx.opts.transitive_mode
-    }
-
-    /// Downgrade any too-fresh, reconcilable transitive the forward moves floated up, so `upgrade`
-    /// leaves the same gate-clean lock a follow-up `fix` would. Reuses the per-change trial
-    /// (`apply_change`), so each downgrade is applied, re-locked, and verified like any other.
-    async fn reconcile_graph(&mut self, state: &mut TrialState) {
-        let Some(deps) = self.reconcile_deps().await else {
-            return;
-        };
-        let downgrades = self
-            .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
-            .await;
-        for change in downgrades {
-            if !self.apply_change(change, state).await {
-                break;
-            }
-        }
     }
 
     async fn reconcile_deps(&mut self) -> Option<Vec<Dependency>> {
