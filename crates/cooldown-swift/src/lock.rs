@@ -5,6 +5,7 @@
 //! nested `object.pins` with `repositoryURL`) shapes are handled.
 
 use cooldown_core::{CoreError, Result};
+use std::collections::HashSet;
 
 #[derive(serde::Deserialize)]
 struct Resolved {
@@ -79,6 +80,30 @@ fn github_repo(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// The `owner/repo` of each GitHub dependency declared *directly* in a `Package.swift` manifest (its
+/// `.package(url: "…")` entries), used to mark which `Package.resolved` pins are direct — the lock
+/// itself does not say. A best-effort source scan: every `url:` field's quoted value is run through
+/// the same GitHub-URL parser as the lock, so only version-pinnable GitHub deps are returned.
+#[must_use]
+pub fn direct_repos(package_swift: &str) -> HashSet<String> {
+    let mut repos = HashSet::new();
+    for segment in package_swift.split("url:").skip(1) {
+        let Some(start) = segment.find('"') else {
+            continue;
+        };
+        let after = &segment[start + 1..];
+        let Some(end) = after.find('"') else {
+            continue;
+        };
+        if let Some(repo) = github_repo(&after[..end]) {
+            // SwiftPM/GitHub identities are case-insensitive, and the manifest URL and the resolved
+            // file's URL are independent — lower-case so `Apple/swift-log` matches `apple/swift-log`.
+            repos.insert(repo.to_lowercase());
+        }
+    }
+    repos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +160,27 @@ mod tests {
             parse_resolved(resolved).unwrap(),
             vec![("Alamofire/Alamofire".to_string(), "5.6.0".to_string())]
         );
+    }
+
+    #[test]
+    fn direct_repos_extracts_declared_github_packages() {
+        let manifest = r#"
+            // swift-tools-version:5.9
+            let package = Package(
+                name: "App",
+                dependencies: [
+                    .package(url: "https://github.com/Apple/Swift-Log.git", from: "1.0.0"),
+                    .package(url: "https://github.com/apple/swift-nio", .upToNextMajor(from: "2.0.0")),
+                    .package(path: "../Local"),
+                    .package(url: "https://example.com/private/repo.git", from: "1.0.0"),
+                ]
+            )
+        "#;
+        let repos = direct_repos(manifest);
+        // Lower-cased so a mixed-case manifest URL still matches the resolved file's identity.
+        assert!(repos.contains("apple/swift-log"));
+        assert!(repos.contains("apple/swift-nio"));
+        // A local path dep (no `url:`) and a non-GitHub remote are not direct GitHub deps.
+        assert_eq!(repos.len(), 2);
     }
 }

@@ -88,17 +88,30 @@ impl ToolRead for SwiftTool {
         }
     }
 
-    async fn dependencies(&self, project: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
-        // Package.resolved is the resolved graph and does not mark which pins are direct, so every
-        // version-pinned GitHub dependency is reported (and treated as direct).
+    async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        // Package.resolved is the resolved graph and does not mark which pins are direct, so cross-
+        // reference the manifest: a pin declared via `.package(url: …)` in Package.swift is direct,
+        // the rest are transitive. If the manifest is absent or names no GitHub deps, fall back to
+        // treating every pin as direct (the resolved graph is all we have). The direct/transitive
+        // split lets `--major` rewrite direct deps across a major while leaving transitives capped.
         let content = std::fs::read_to_string(project.root.join("Package.resolved"))?;
+        let direct = std::fs::read_to_string(project.root.join("Package.swift"))
+            .ok()
+            .map(|manifest| lock::direct_repos(&manifest))
+            .filter(|repos| !repos.is_empty());
         let mut deps = Vec::new();
         for (repo, ver) in lock::parse_resolved(&content)? {
+            let is_direct = direct
+                .as_ref()
+                .is_none_or(|repos| repos.contains(&repo.to_lowercase()));
+            if scope == DepScope::Direct && !is_direct {
+                continue;
+            }
             deps.push(Dependency {
                 package: PackageId::new(SWIFT_ID, repo, Some(GITHUB.to_string())),
                 current: Version::new(ver.clone()),
                 current_quality: classify_quality(&ver),
-                direct: true,
+                direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 members: Vec::new(),
