@@ -551,7 +551,8 @@ pub enum SkipReason {
     TransitiveInCooldown,
     /// The resolver/MVS rejected the change.
     ResolverConflict,
-    /// The candidate was filtered out (e.g. requires `--major`).
+    /// The dependency has no editable version requirement to retarget — it is transitive-only or a
+    /// path/git source — so `upgrade` cannot move it by rewriting a constraint.
     NotEligible,
 }
 
@@ -576,7 +577,9 @@ impl SkipReason {
                 "would introduce a transitive dependency younger than its window"
             }
             SkipReason::ResolverConflict => "the resolver rejected this change",
-            SkipReason::NotEligible => "candidate not eligible under the current candidate filter",
+            SkipReason::NotEligible => {
+                "no editable requirement to change (transitive-only or path/git dependency)"
+            }
         }
     }
 }
@@ -702,5 +705,39 @@ mod tests {
             );
         }
         assert!(tool_id("carg").is_none(), "a typo is rejected");
+    }
+
+    #[test]
+    fn skip_reason_messages_are_accurate_and_distinct() {
+        use super::SkipReason;
+        // `NotEligible` describes a missing requirement (a `=`-pinned/transitive-only dep `upgrade`
+        // cannot retarget), not the candidate filter — the old wording mislabelled a graph-pinned
+        // transitive like `generic-array` whose `cargo update --precise` was rejected.
+        let not_eligible = SkipReason::NotEligible.message();
+        assert!(
+            not_eligible.contains("no editable requirement"),
+            "NotEligible should name the missing requirement, got: {not_eligible}"
+        );
+        assert!(
+            !not_eligible.contains("candidate filter"),
+            "NotEligible must not blame the candidate filter, got: {not_eligible}"
+        );
+        // ResolverConflict's exact wording is already pinned by the `message()` doctest; here we
+        // only assert every reason has a *distinct* message so two skips never read identically.
+        let all = [
+            SkipReason::GraphHeld,
+            SkipReason::TransitiveInCooldown,
+            SkipReason::ResolverConflict,
+            SkipReason::NotEligible,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    a.message(),
+                    b.message(),
+                    "skip-reason messages must be distinct"
+                );
+            }
+        }
     }
 }
