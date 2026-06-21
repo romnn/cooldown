@@ -89,12 +89,14 @@ impl Workspace {
     /// the cooldown to the newest version that has already matured past it — the dual of `upgrade`,
     /// which never moves a dependency forward.
     ///
-    /// By default only direct deps are touched and exact pins are left in place with a warning;
-    /// `opts.transitive` extends it to too-fresh transitives, and `opts.downgrade_pinned` rewrites
-    /// pins down too. Each downgrade is applied one at a time with the same rollback/verify trial.
+    /// By default the whole resolved graph is fixed — too-fresh direct *and* transitive deps are
+    /// downgraded to a matured version; `opts.transitive_mode` relaxes that (`Allow` leaves
+    /// transitives in place, `Hide` is direct-only), and `opts.downgrade_pinned` rewrites pins down
+    /// too. Exact pins are otherwise left in place with a warning. Each downgrade is applied one at a
+    /// time with the same rollback/verify trial.
     pub async fn fix(&self, opts: &RunOpts) -> UpgradeOutcome {
         let mode = PlanMode::Fix {
-            transitive: opts.transitive,
+            transitive: opts.transitive_mode,
             downgrade_pinned: opts.downgrade_pinned,
         };
         self.run_plan(opts, mode).await

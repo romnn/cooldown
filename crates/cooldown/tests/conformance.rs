@@ -722,7 +722,7 @@ async fn check_transitive_allow_and_hide_modes() {
     // `--transitive allow`: the fresh transitive is still evaluated and reported, but as a non-fatal
     // `allowed` finding (distinct from a baselined `acknowledged`), so the gate passes.
     let mut allow = opts();
-    allow.check_transitive = cooldown::app::TransitiveGate::Allow;
+    allow.transitive_mode = cooldown::app::TransitiveGate::Allow;
     let out = workspace(make(), Baseline::default()).check(&allow).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.violations, 0);
@@ -738,7 +738,7 @@ async fn check_transitive_allow_and_hide_modes() {
 
     // `--transitive hide`: the transitive is not evaluated at all (direct-only), gate passes.
     let mut hide = opts();
-    hide.check_transitive = cooldown::app::TransitiveGate::Hide;
+    hide.transitive_mode = cooldown::app::TransitiveGate::Hide;
     let out = workspace(make(), Baseline::default()).check(&hide).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.violations, 0);
@@ -948,7 +948,7 @@ async fn fix_warns_and_leaves_graph_held_violation() {
 }
 
 #[tokio::test]
-async fn fix_only_downgrades_transitive_deps_when_opted_in() {
+async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
     let (_g, root) = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
@@ -960,41 +960,49 @@ async fn fix_only_downgrades_transitive_deps_when_opted_in() {
     );
     locked.insert("t".to_string(), release_named(&package_releases, "v1.0.2"));
 
-    let without_flag = workspace(
-        fake(
-            root.clone(),
-            vec![dep("b", "v1.0.0", true)],
-            vec![dep("t", "v1.0.2", false)],
-            releases.clone(),
-            locked.clone(),
-        ),
-        Baseline::default(),
-    )
-    .fix(&opts())
-    .await;
-    assert_eq!(without_flag.exit, Exit::Ok);
-    assert_eq!(without_flag.summary.applied, 0);
-    assert!(without_flag.items.is_empty());
+    // A fresh workspace per case: the fake records applied versions across a `fix` run.
+    let make = || {
+        workspace(
+            fake(
+                root.clone(),
+                vec![dep("b", "v1.0.0", true)],
+                vec![dep("t", "v1.0.2", false)],
+                releases.clone(),
+                locked.clone(),
+            ),
+            Baseline::default(),
+        )
+    };
 
-    let ws = workspace(
-        fake(
-            root,
-            vec![dep("b", "v1.0.0", true)],
-            vec![dep("t", "v1.0.2", false)],
-            releases,
-            locked,
-        ),
-        Baseline::default(),
-    );
-    let mut opts = opts();
-    opts.transitive = true;
-
-    let out = ws.fix(&opts).await;
-
+    // Default (Enforce): the whole resolved graph is fixed, so the too-fresh transitive `t` is
+    // downgraded to its newest matured version — no opt-in needed.
+    let out = make().fix(&opts()).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.items[0].name, "t");
     assert_eq!(out.items[0].to, "v1.0.1");
+
+    // `--transitive hide`: direct-only, so the transitive is neither evaluated nor touched.
+    let mut hide = opts();
+    hide.transitive_mode = cooldown::app::TransitiveGate::Hide;
+    let out = make().fix(&hide).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+
+    // `--transitive allow`: the transitive is evaluated and reported, but left in place; only direct
+    // deps would be downgraded.
+    let mut allow = opts();
+    allow.transitive_mode = cooldown::app::TransitiveGate::Allow;
+    let out = make().fix(&allow).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("left in place by --transitive allow")),
+        "the allowed transitive is reported"
+    );
 }
 
 #[tokio::test]

@@ -84,13 +84,16 @@ pub struct Cli {
     pub(in crate::cli) global: GlobalArgs,
 }
 
-/// `check --transitive <mode>`: how the gate treats a too-fresh *transitive* dependency.
+/// `--transitive <mode>`: how `check`/`fix`/`upgrade` handle too-fresh *transitive* dependencies.
+/// Absent, each command acts on them by default (check fails, fix downgrades, upgrade reconciles);
+/// these modes relax that. The same spelling across the three commands keeps the surface consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-pub(crate) enum CheckTransitive {
-    /// Evaluate transitive deps but never fail the gate on them; report them as allowed.
+pub(crate) enum TransitiveMode {
+    /// Include transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
+    /// `upgrade` leave them in place (direct deps are still handled).
     Allow,
-    /// Skip evaluating transitive deps entirely (a direct-only gate).
+    /// Skip transitive deps entirely — a direct-only run.
     Hide,
 }
 
@@ -123,6 +126,11 @@ pub(in crate::cli) enum Command {
     },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
+        /// How to treat too-fresh *transitive* deps dragged in by the re-lock. Default: reconcile
+        /// them down to a matured version so the new lock is gate-clean. `hide` leaves the graph
+        /// alone (direct-only); `allow` reports them but doesn't roll them back.
+        #[arg(long, value_enum, value_name = "MODE")]
+        transitive: Option<TransitiveMode>,
         /// Also compile/sync after re-locking.
         #[arg(long)]
         build: bool,
@@ -137,10 +145,11 @@ pub(in crate::cli) enum Command {
     },
     /// Fix cooldown violations: downgrade too-fresh deps to a matured version (never upgrades).
     Fix {
-        /// Also downgrade too-fresh transitive deps, not just direct ones. Dangerous: downgrading a
-        /// transitive can break a direct dependency that relies on the newer version.
-        #[arg(long)]
-        transitive: bool,
+        /// How to treat too-fresh *transitive* deps. Default: downgrade them too, to the newest
+        /// matured version the graph still allows. `hide` skips them (direct-only fix); `allow`
+        /// leaves them in place but still downgrades direct deps.
+        #[arg(long, value_enum, value_name = "MODE")]
+        transitive: Option<TransitiveMode>,
         /// Downgrade and rewrite exact-pinned deps too. By default a pinned cooldown violation is
         /// left in place with a warning, since a pin is a deliberate choice.
         #[arg(long = "downgrade-pinned")]
@@ -153,7 +162,7 @@ pub(in crate::cli) enum Command {
         /// How to treat too-fresh *transitive* deps. Default: fail the gate on them. `allow` keeps
         /// them visible but non-fatal; `hide` skips evaluating transitive deps entirely (direct-only).
         #[arg(long, value_enum, value_name = "MODE")]
-        transitive: Option<CheckTransitive>,
+        transitive: Option<TransitiveMode>,
         /// Gate every artifact in a universal lock, not just env-relevant ones.
         #[arg(long = "all-artifacts")]
         all_artifacts: bool,
@@ -363,10 +372,12 @@ pub struct CliOverrides {
     pub(crate) fail_on_unknown_age: Option<bool>,
     pub(crate) strict: Option<bool>,
     pub(crate) build: Option<bool>,
+    /// `outdated --transitive` — list indirect deps in the report (a bool; outdated-only).
     pub(crate) transitive: Option<bool>,
     pub(crate) downgrade_pinned: Option<bool>,
-    /// `check --transitive <allow|hide>` — the gate's transitive-handling mode, if set on the CLI.
-    pub(crate) check_transitive: Option<CheckTransitive>,
+    /// `check`/`fix`/`upgrade --transitive <allow|hide>` — the shared transitive-handling mode, if
+    /// set on the CLI. Absent, each command acts on transitives by default.
+    pub(crate) transitive_mode: Option<TransitiveMode>,
     /// `outdated --exit-code [N]` — the CI gate exit code, if set on the CLI.
     pub(crate) exit_code: Option<u8>,
     /// `outdated --hide-pinned` — CLI-only display filter (not config-backed).
@@ -428,16 +439,16 @@ impl CliOverrides {
                 "no_fail_on_stricter_native",
             ))
             .then_some(true),
-            // `--transitive` is a per-command bool on both `outdated` (show transitives) and `fix`
-            // (downgrade them); probe each subcommand directly — the root never registers it.
-            transitive: (set_on_subcommand(matches, "outdated", "transitive")
-                || set_on_subcommand(matches, "fix", "transitive"))
-            .then_some(true),
+            // `outdated --transitive` is a bool (list indirect deps in the report).
+            transitive: set_on_subcommand(matches, "outdated", "transitive").then_some(true),
             downgrade_pinned: set_on_subcommand(matches, "fix", "downgrade_pinned").then_some(true),
-            // `--transitive` carries a value only under `check`; read it from that subcommand.
-            check_transitive: matches
-                .subcommand_matches("check")
-                .and_then(|sub| sub.get_one::<CheckTransitive>("transitive").copied()),
+            // `--transitive <allow|hide>` is the shared enum on `check`/`fix`/`upgrade`; only the
+            // active subcommand carries a value, so take it from whichever ran.
+            transitive_mode: ["check", "fix", "upgrade"].iter().find_map(|command| {
+                matches
+                    .subcommand_matches(command)
+                    .and_then(|sub| sub.get_one::<TransitiveMode>("transitive").copied())
+            }),
             // `--exit-code [N]` carries an optional value under `outdated`.
             exit_code: matches
                 .subcommand_matches("outdated")
@@ -563,13 +574,27 @@ mod tests {
 
     #[test]
     fn fix_flags_are_explicit_overrides() {
-        let ov = overrides(&["cooldown", "fix", "--transitive", "--downgrade-pinned"]);
-        assert_eq!(ov.transitive, Some(true));
+        let ov = overrides(&["cooldown", "fix", "--transitive", "hide", "--downgrade-pinned"]);
+        assert_eq!(ov.transitive_mode, Some(super::TransitiveMode::Hide));
         assert_eq!(ov.downgrade_pinned, Some(true));
     }
 
     #[test]
-    fn outdated_transitive_is_an_explicit_override() {
+    fn transitive_mode_is_captured_from_check_fix_or_upgrade() {
+        assert_eq!(
+            overrides(&["cooldown", "check", "--transitive", "allow"]).transitive_mode,
+            Some(super::TransitiveMode::Allow)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--transitive", "hide"]).transitive_mode,
+            Some(super::TransitiveMode::Hide)
+        );
+        // Default (no flag) leaves it unset, so each command applies its own act-on-transitives default.
+        assert_eq!(overrides(&["cooldown", "fix"]).transitive_mode, None);
+    }
+
+    #[test]
+    fn outdated_transitive_is_a_bool_override() {
         assert_eq!(
             overrides(&["cooldown", "outdated", "--transitive"]).transitive,
             Some(true)

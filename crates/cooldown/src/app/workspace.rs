@@ -98,13 +98,16 @@ impl Progress {
     }
 }
 
-/// How `check` treats a too-fresh *transitive* dependency (`check --transitive <mode>`).
+/// How `check`/`fix`/`upgrade` handle too-fresh *transitive* dependencies (`--transitive <mode>`).
+/// The full graph is in scope by default; the modes relax that consistently across the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransitiveGate {
-    /// Fail the gate on a too-fresh transitive dep (the strict default; evaluates the full graph).
+    /// Act on too-fresh transitive deps (the default, full graph): `check` fails on them, `fix`
+    /// downgrades them, `upgrade` reconciles them to a matured version.
     #[default]
-    Fail,
-    /// Evaluate transitive deps but never fail the gate on them — report them as allowed.
+    Enforce,
+    /// Evaluate transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
+    /// `upgrade` leave them in place while still handling direct deps.
     Allow,
     /// Don't evaluate transitive deps at all (direct-only).
     Hide,
@@ -149,15 +152,14 @@ pub struct RunOpts {
     /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
-    /// `--transitive`: include transitive deps in the operation. For `outdated` it adds them to the
-    /// report; for `fix` it also downgrades too-fresh transitive deps, not just direct ones.
+    /// `outdated --transitive`: include transitive (indirect) deps in the report.
     pub transitive: bool,
     /// `--downgrade-pinned` (fix): downgrade and rewrite exact-pinned deps too; otherwise a pinned
     /// violation is left in place with a warning.
     pub downgrade_pinned: bool,
-    /// `--transitive <mode>` (check): how the gate treats a too-fresh transitive dep. Defaults to
-    /// [`TransitiveGate::Fail`].
-    pub check_transitive: TransitiveGate,
+    /// `--transitive <mode>` (check/fix/upgrade): how the operation handles too-fresh transitive
+    /// deps. Defaults to [`TransitiveGate::Enforce`] — act on the full graph.
+    pub transitive_mode: TransitiveGate,
     /// `--all-artifacts` (check): gate every recorded artifact.
     pub all_artifacts: bool,
     /// `--allow-stale-lock`: downgrade a stale/absent lock from failure to a warning.

@@ -90,11 +90,12 @@ pub(super) fn resolve_invocation(
             },
             transitive: merged.transitive.unwrap_or(false),
             downgrade_pinned: merged.downgrade_pinned.unwrap_or(false),
-            // `check --transitive <mode>` is read straight from the CLI (per-command, not config).
-            check_transitive: match overrides.check_transitive {
-                Some(crate::cli::args::CheckTransitive::Allow) => crate::app::TransitiveGate::Allow,
-                Some(crate::cli::args::CheckTransitive::Hide) => crate::app::TransitiveGate::Hide,
-                None => crate::app::TransitiveGate::Fail,
+            // `--transitive <mode>` is read straight from the CLI (per-command, not config); absent,
+            // each command acts on transitives by default (Enforce).
+            transitive_mode: match overrides.transitive_mode {
+                Some(crate::cli::args::TransitiveMode::Allow) => crate::app::TransitiveGate::Allow,
+                Some(crate::cli::args::TransitiveMode::Hide) => crate::app::TransitiveGate::Hide,
+                None => crate::app::TransitiveGate::Enforce,
             },
             major_all: merged.major_all.unwrap_or(false),
             all_artifacts: merged.all_artifacts.unwrap_or(false),

@@ -1,6 +1,6 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
-use crate::app::{SkippedInfo, UpgradeItem, Workspace, diag_from_error};
+use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
     Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
     SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
@@ -15,8 +15,9 @@ pub(super) enum PlanMode {
     Upgrade,
     /// `fix`: downgrade deps whose locked version is too fresh to the newest matured older version.
     Fix {
-        /// Also act on too-fresh transitive deps (`--transitive`), not just direct ones.
-        transitive: bool,
+        /// How too-fresh transitive deps are handled (`--transitive <mode>`): `Enforce` downgrades
+        /// them too, `Allow` reports but leaves them, `Hide` skips them entirely (direct-only).
+        transitive: TransitiveGate,
         /// Downgrade and rewrite exact-pinned deps too (`--downgrade-pinned`); otherwise a pinned
         /// violation is left in place with a warning.
         downgrade_pinned: bool,
@@ -105,11 +106,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
-        // `fix --transitive` acts on the whole resolved graph; everything else is direct-only.
+        // `fix` evaluates the whole resolved graph unless transitives are hidden; `upgrade` plans
+        // forward moves on direct deps only (its graph reconciliation is a separate post-lock pass).
         let scope = match self.mode {
-            PlanMode::Fix {
-                transitive: true, ..
-            } => DepScope::Graph,
+            PlanMode::Fix { transitive, .. } if transitive != TransitiveGate::Hide => {
+                DepScope::Graph
+            }
             _ => DepScope::Direct,
         };
         match self
@@ -129,8 +131,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         match self.mode {
             PlanMode::Upgrade => self.plan_upgrade_changes(deps).await,
             PlanMode::Fix {
-                downgrade_pinned, ..
-            } => self.plan_fix_changes(deps, downgrade_pinned).await,
+                transitive,
+                downgrade_pinned,
+            } => {
+                self.plan_fix_changes(deps, transitive, downgrade_pinned)
+                    .await
+            }
         }
     }
 
@@ -206,6 +212,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn plan_fix_changes(
         &mut self,
         deps: &[Dependency],
+        transitive: TransitiveGate,
         downgrade_pinned: bool,
     ) -> Vec<Change> {
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
@@ -239,6 +246,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
             // alone, so `fix` only ever touches what `check` would reject.
             if fix.current.status != Status::CurrentInCooldown {
+                continue;
+            }
+            // `--transitive allow`: leave a too-fresh transitive in place (still reported), only
+            // downgrade direct deps. `hide` never reaches here — transitives aren't in scope.
+            if transitive == TransitiveGate::Allow && !dep.direct {
+                self.record_fix_warning(&format!(
+                    "{}@{} is younger than its cooldown; left in place by --transitive allow",
+                    dep.package.name, dep.current
+                ), &dep.package.name);
                 continue;
             }
             if fix.current.graph_held {

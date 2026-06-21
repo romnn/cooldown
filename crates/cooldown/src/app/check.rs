@@ -98,7 +98,7 @@ impl<'a> CheckRunner<'a> {
     fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
         // `check --transitive hide` skips evaluating transitive deps; every other mode (including
         // `allow`) gates the full resolved graph.
-        let scope = if opts.check_transitive == TransitiveGate::Hide {
+        let scope = if opts.transitive_mode == TransitiveGate::Hide {
             DepScope::Direct
         } else {
             DepScope::Graph
@@ -315,7 +315,7 @@ impl<'a> CheckRunner<'a> {
         // it is reported but non-fatal, with the distinct `Allowed` status so it stays auditable
         // apart from a baselined acknowledgment. A per-version baseline record wins over the blanket
         // policy.
-        let allowed_transitive = self.opts.check_transitive == TransitiveGate::Allow && !dep.direct;
+        let allowed_transitive = self.opts.transitive_mode == TransitiveGate::Allow && !dep.direct;
         let status = match CheckStatus::from_pin_status(pv.status, baseline_acked) {
             Some(CheckStatus::Violation) if allowed_transitive => Some(CheckStatus::Allowed),
             other => other,

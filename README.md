@@ -62,15 +62,20 @@ When `check` goes red because a dependency is younger than its cooldown, you hav
 has *already* matured past the cooldown, so `check` passes while the protection holds. It never
 moves a dependency forward, and it only touches deps that are actually in violation.
 
-By default `fix` acts on **direct deps only** and leaves **exact pins** in place with a warning
-(a pin is a deliberate choice). Two opt-in flags widen that:
+By default `fix` works on the **whole resolved graph**, the same surface `check` gates: a too-fresh
+**transitive** dep is rolled back to the newest matured version the graph still allows, not just
+direct deps. This is safe by construction — the graph floor *is* a version every requirer already
+accepts, and a mature direct dep was built against versions from before the window anyway, so a
+fresh transitive it didn't ask for is the riskier state. `--transitive` relaxes this, mirroring
+`check`:
 
-- `--downgrade-pinned` — downgrade and rewrite exact-pinned deps too (`=2.13.0` → `=2.3.1`).
-- `--transitive` — also downgrade too-fresh *transitive* deps. Dangerous: rolling a transitive back
-  can break a direct dependency that needs the newer version, so it is opt-in.
+- `--transitive hide` — direct-only: ignore transitive deps entirely.
+- `--transitive allow` — report too-fresh transitives but leave them in place; still fix direct deps.
 
-A violation with no older matured version to fall back to is reported as a warning (`baseline` it or
-wait) rather than downgraded.
+A transitive the graph pins at the fresh version (no lower version satisfies its requirers) can't be
+rolled back on its own — `fix` reports it so you can address the dep forcing it. Exact pins are left
+in place with a warning unless `--downgrade-pinned`, and a violation with no older matured version to
+fall back to is likewise reported (`baseline` it or wait) rather than downgraded.
 
 #### Manifest constraints
 
