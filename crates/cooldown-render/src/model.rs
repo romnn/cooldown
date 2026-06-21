@@ -332,6 +332,10 @@ pub struct UpgradeItem {
     /// Whether the dependency is declared directly by a workspace member; `false` means transitive
     /// (the report attributes it as "via …").
     pub direct: bool,
+    /// Whether the change lowers the version (a cooldown rollback) rather than raising it; drives the
+    /// "downgraded" vs "upgraded" status word.
+    #[serde(default)]
+    pub downgrade: bool,
     /// The workspace member package(s) that declare this dependency (direct) or reach it through the
     /// graph (transitive). Empty when not attributable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

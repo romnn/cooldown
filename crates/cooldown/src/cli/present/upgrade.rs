@@ -31,6 +31,7 @@ fn upgrade_item(item: &app::UpgradeItem) -> render::UpgradeItem {
         tool: item.tool.clone(),
         project: item.project.clone(),
         direct: item.direct,
+        downgrade: item.downgrade,
         members: item.members.clone(),
         registry: item.registry.clone(),
         from: item.from.clone(),

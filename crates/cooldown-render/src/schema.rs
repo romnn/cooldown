@@ -206,12 +206,13 @@ pub fn json_schema() -> Value {
         },
         "upgradeItem": {
             "type": "object",
-            "required": ["name", "tool", "project", "direct", "from", "to", "kind", "applied"],
+            "required": ["name", "tool", "project", "direct", "downgrade", "from", "to", "kind", "applied"],
             "properties": {
                 "name": { "type": "string" },
                 "tool": { "type": "string" },
                 "project": { "type": "string" },
                 "direct": { "type": "boolean" },
+                "downgrade": { "type": "boolean" },
                 "registry": { "type": "string" },
                 "members": members,
                 "from": { "type": "string" },

@@ -228,6 +228,7 @@ fn old_import_path_for_cross_major() {
         from: Version::new("v1.5.0"),
         to: Version::new("v2.0.0"),
         kind: UpdateKind::Major,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -241,6 +242,7 @@ fn old_import_path_for_cross_major() {
         from: Version::new("v2.3.0"),
         to: Version::new("v3.0.0"),
         kind: UpdateKind::Major,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -259,6 +261,7 @@ fn old_import_path_for_cross_major_downgrade() {
         from: Version::new("v3.0.1"),
         to: Version::new("v2.9.0"),
         kind: UpdateKind::Major,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -275,6 +278,7 @@ fn old_import_path_for_cross_major_downgrade() {
         from: Version::new("v2.0.1"),
         to: Version::new("v1.9.0"),
         kind: UpdateKind::Major,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -289,6 +293,7 @@ fn old_import_path_for_cross_major_downgrade() {
         from: Version::new("v2.0.1"),
         to: Version::new("v2.0.0"),
         kind: UpdateKind::Patch,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -330,6 +335,7 @@ fn apply_spawn_failure_is_not_downgraded_to_skip() {
         from: Version::new("v1.0.0"),
         to: Version::new("v1.0.1"),
         kind: UpdateKind::Patch,
+        downgrade: false,
         direct: true,
         members: Vec::new(),
     };
@@ -371,6 +377,7 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
                     from: Version::new("v1.0.0"),
                     to: Version::new("v2.0.0"),
                     kind: UpdateKind::Major,
+                    downgrade: false,
                     direct: true,
                     members: Vec::new(),
                 }],

@@ -1110,6 +1110,55 @@ async fn upgrade_major_adopts_the_update_instead_of_hinting() {
 }
 
 #[tokio::test]
+async fn upgrade_major_crosses_a_direct_but_not_a_transitive() {
+    // `--major` rewrites a *direct* dep's manifest constraint across a major boundary, but a
+    // transitive dep has no editable constraint and the resolver would reject an independent
+    // cross-major bump — so it is capped to its current major. Tool-agnostic: proven on the fake
+    // adapter, so it holds for every tool that reports `direct` correctly.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), a_v1_and_matured_v2());
+    releases.insert("t".to_string(), a_v1_and_matured_v2());
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("a", "v1.0.0", true)],
+            vec![dep("t", "v1.0.0", false)],
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+    let out = ws
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..opts()
+        })
+        .await;
+
+    // The direct dep crosses the major boundary.
+    let a = out.items.iter().find(|it| it.name == "a").expect("a planned");
+    assert_eq!(a.to, "v2.0.0");
+    assert!(a.applied);
+    // The transitive dep is not carried across the major — it produces no item at all.
+    assert!(
+        !out.items.iter().any(|it| it.name == "t"),
+        "a transitive must not be cross-major'd under --major: {:?}",
+        out.items
+    );
+}
+
+#[tokio::test]
 async fn upgrade_does_not_hint_a_transitive_major_update() {
     // Only a directly-declared dep can be adopted by `--major` (it rewrites a manifest constraint),
     // so a transitive cross-major must never be hinted — `cooldown upgrade --major -p <transitive>`
@@ -1202,6 +1251,8 @@ async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
     assert_eq!(out.items[0].from, "v1.0.2");
     assert_eq!(out.items[0].to, "v1.0.1");
     assert!(out.items[0].applied);
+    // The rollback is flagged a downgrade (so the report says "downgraded", not "upgraded").
+    assert!(out.items[0].downgrade);
 }
 
 #[tokio::test]

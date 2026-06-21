@@ -438,13 +438,14 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
-/// The (status word, reason detail, color) for one mutation row — both cells share the color.
-/// `applied_word` is the verb's past tense (`"upgraded"`/`"downgraded"`). A held-back cross-major is
-/// a `skipped` row whose reason is `needs --major`; a clean apply has an empty reason (Status says
-/// it).
-fn mutation_status(it: &UpgradeItem, applied_word: &'static str) -> (&'static str, String, Color) {
+/// The (status word, reason detail, color) for one mutation row — both cells share the color. The
+/// applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is `downgraded`,
+/// not `upgraded`. A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean
+/// apply has an empty reason (Status says it).
+fn mutation_status(it: &UpgradeItem) -> (&'static str, String, Color) {
     if it.applied {
-        (applied_word, String::new(), Color::Green)
+        let word = if it.downgrade { "downgraded" } else { "upgraded" };
+        (word, String::new(), Color::Green)
     } else if let Some(sk) = &it.skipped {
         let detail = if sk.reason == SkipReason::NeedsMajor {
             "needs --major".to_string()
@@ -495,13 +496,8 @@ fn render_mutation(
         // the row's color).
         header.extend(["From", "To", "Status", "Reason"]);
         t.set_header(header);
-        let applied_word = if verb == "upgrade" {
-            "upgraded"
-        } else {
-            "downgraded"
-        };
         for it in items {
-            let (status, detail, color) = mutation_status(it, applied_word);
+            let (status, detail, color) = mutation_status(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -1084,6 +1080,7 @@ mod tests {
             tool: "cargo".into(),
             project: project.into(),
             direct: true,
+            downgrade: false,
             members: Vec::new(),
             registry: None,
             from: from.into(),
@@ -1119,6 +1116,37 @@ mod tests {
             &[],
             &RenderOptions::default(),
         )
+    }
+
+    fn applied_item(name: &str, from: &str, to: &str, downgrade: bool) -> UpgradeItem {
+        UpgradeItem {
+            name: name.into(),
+            tool: "cargo".into(),
+            project: ".".into(),
+            direct: true,
+            downgrade,
+            members: Vec::new(),
+            registry: None,
+            from: from.into(),
+            to: to.into(),
+            kind: UpdateKind::Minor,
+            applied: true,
+            skipped: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn applied_status_word_is_per_item_direction() {
+        // A too-fresh pin an `upgrade` rolls back is a downgrade, not an upgrade, even though the
+        // command is `upgrade` — so both words can appear in one report.
+        let items = [
+            applied_item("fs4", "0.13.1", "1.1.0", false),
+            applied_item("insta", "1.48.0", "1.47.2", true),
+        ];
+        let out = render_upgrade_of(&items);
+        assert!(out.contains("upgraded"), "forward move says upgraded:\n{out}");
+        assert!(out.contains("downgraded"), "rollback says downgraded:\n{out}");
     }
 
     #[test]

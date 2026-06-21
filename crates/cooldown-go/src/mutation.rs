@@ -155,6 +155,7 @@ mod tests {
             from: Version::new(from),
             to: Version::new(to),
             kind: UpdateKind::Minor,
+            downgrade: false,
             direct: true,
             members: Vec::new(),
         }

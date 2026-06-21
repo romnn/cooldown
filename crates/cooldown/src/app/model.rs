@@ -196,6 +196,8 @@ pub struct UpgradeItem {
     /// Whether this dependency is declared directly by a workspace member; `false` means it was
     /// pulled in transitively (reports attribute it as "via …").
     pub direct: bool,
+    /// Whether the change lowers the version (a cooldown rollback) rather than raising it.
+    pub downgrade: bool,
     pub members: Vec<MemberRef>,
     pub registry: Option<String>,
     pub from: String,

@@ -218,7 +218,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &dep,
                 &releases,
                 &self.ctx.pctx.policy.layers,
-                &rctx,
+                &dep_resolve_ctx(&rctx, &dep),
                 self.ws.now(),
             );
             // Surface an adoptable cross-major update the user could take with `--major` (it would
@@ -241,11 +241,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|candidate| candidate.version == target)
                 .map_or(cooldown_core::UpdateKind::Minor, |candidate| candidate.kind);
             let package = target_package_for(&releases, &dep, &target);
+            // Whether this move is a rollback. The forward planner only adopts a strictly newer
+            // matured version (`evaluate` filters to `order > current`), so this is currently always
+            // false — a too-fresh pin is rolled back by the fix/reconcile pass instead, which flags it
+            // directly. Computed rather than hardcoded so the label stays correct if that ever changes.
+            let downgrade = is_downgrade(&releases, &dep.current, &target);
             planned.push(Change {
                 package,
                 from: dep.current.clone(),
                 to: target,
                 kind,
+                downgrade,
                 direct: dep.direct,
                 members: dep.members.clone(),
             });
@@ -294,6 +300,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             from: dep.current.clone(),
             to: major_target,
             kind,
+            // A held-back cross-major is a forward move the user could take with `--major`.
+            downgrade: false,
             direct: dep.direct,
             members: dep.members.clone(),
         };
@@ -344,7 +352,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &dep,
                 &releases,
                 &self.ctx.pctx.policy.layers,
-                &rctx,
+                &dep_resolve_ctx(&rctx, &dep),
                 self.ws.now(),
             );
             // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
@@ -408,6 +416,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 from: dep.current.clone(),
                 to: target,
                 kind,
+                // `fix` only ever rolls a too-fresh pin back.
+                downgrade: true,
                 direct: dep.direct,
                 members: dep.members.clone(),
             });
@@ -814,6 +824,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 }
 
+/// The resolve context for one dependency. A cross-major move needs an editable manifest constraint
+/// to rewrite, which only a direct dependency has; an indirect dep can never take a cross-major bump
+/// on its own (the resolver rejects it, producing noise), so it is always capped to its current major
+/// even under `--major`. It still re-adopts a matured newer version *within* its major.
+fn dep_resolve_ctx<'a>(rctx: &ResolveContext<'a>, dep: &Dependency) -> ResolveContext<'a> {
+    ResolveContext {
+        allow_major: dep.direct && rctx.allow_major,
+        ..*rctx
+    }
+}
+
+/// Whether `to` is an older release than `from` — i.e. the move is a cooldown rollback, not a forward
+/// upgrade. Compares the releases' [`ReleaseOrder`] tokens (the canonical ordering the rest of the
+/// module uses), so it is independent of slice order. Unknown versions compare as not-a-downgrade.
+fn is_downgrade(releases: &[Release], from: &Version, to: &Version) -> bool {
+    let order = |v: &Version| releases.iter().find(|release| &release.version == v).map(|r| &r.order);
+    matches!((order(to), order(from)), (Some(t), Some(f)) if t < f)
+}
+
 /// The target [`PackageId`] for a move from `dep.current` to `target`, derived from the matching
 /// releases' major keys — rewriting a Go `/vN` path-major and keeping the name stable otherwise.
 /// Shared by the upgrade and fix planners.
@@ -868,6 +897,7 @@ fn plan_item(
         tool: tool.to_string(),
         project: project.to_string(),
         direct: change.direct,
+        downgrade: change.downgrade,
         members: change.members.clone(),
         registry: change.package.registry.clone(),
         from: change.from.to_string(),
@@ -904,8 +934,33 @@ fn record_skip_item(
 
 #[cfg(test)]
 mod tests {
-    use super::target_package;
-    use cooldown_core::{MajorKey, PackageId, ToolId};
+    use super::{is_downgrade, target_package};
+    use cooldown_core::{
+        MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, ToolId, Version,
+    };
+
+    fn rel(version: &str, order: u8) -> Release {
+        Release {
+            version: Version::new(version),
+            order: ReleaseOrder(vec![order]),
+            major: MajorKey(String::new()),
+            kind_from_current: None,
+            published_at: None,
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
+    }
+
+    #[test]
+    fn is_downgrade_compares_release_order() {
+        let releases = [rel("1.0.0", 0), rel("1.0.1", 1), rel("1.0.2", 2)];
+        // Rolling a too-fresh pin back to an older release is a downgrade.
+        assert!(is_downgrade(&releases, &Version::new("1.0.2"), &Version::new("1.0.1")));
+        // A forward move is not.
+        assert!(!is_downgrade(&releases, &Version::new("1.0.0"), &Version::new("1.0.2")));
+        // A version not in the set is treated as not-a-downgrade.
+        assert!(!is_downgrade(&releases, &Version::new("1.0.0"), &Version::new("9.9.9")));
+    }
 
     fn go(name: &str) -> PackageId {
         PackageId::new(ToolId("go"), name, None)

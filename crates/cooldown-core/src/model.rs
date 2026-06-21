@@ -506,6 +506,10 @@ pub struct Change {
     pub to: Version,
     /// The update kind of the change.
     pub kind: UpdateKind,
+    /// Whether this change *lowers* the version — a cooldown rollback to the newest matured version
+    /// rather than a forward move. Drives the report's "downgraded" vs "upgraded" status word, so an
+    /// `upgrade` that rolls a too-fresh pin back is not mislabelled "upgraded".
+    pub downgrade: bool,
     /// Whether the changed dependency is declared directly by a workspace member (vs. pulled in
     /// transitively). Carried so reports can attribute a transitive change as "via …".
     pub direct: bool,

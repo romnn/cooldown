@@ -332,6 +332,7 @@ mod tests {
             from: Version::new("1.0.0"),
             to: Version::new("1.0.1"),
             kind: cooldown_core::UpdateKind::Patch,
+            downgrade: false,
             direct: true,
             members: Vec::new(),
         };
