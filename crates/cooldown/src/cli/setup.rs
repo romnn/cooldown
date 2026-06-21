@@ -25,14 +25,19 @@ pub(crate) async fn prepare_run(
     let configs =
         discovery::ConfigSources::load(&repo_root, global.config.as_deref(), global.no_global)?;
     let scan = configs.scan_config()?;
-    let cfg = scan.resolved(command_key);
+    let mut cfg = scan.resolved(command_key);
+    // CLI `--exclude-folders`/`--exclude-packages` are the highest-precedence layer: they replace the
+    // resolved `[global]`/`[<command>]` lists (per-tool `[tool.*]` excludes, carried on `scan`, still
+    // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
+    // commands' resolution; both detection and member-filtering read the override from `cfg`.
+    cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
     let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
     let adapters = detect::adapter_set(invocation.offline(), invocation.fresh())?;
     let projects = detect::detect_projects(
         &adapters,
         &workdir,
         &scan,
-        command_key,
+        &cfg.exclude_folders,
         invocation.tools(),
         invocation.respect_gitignore(),
     )?;
@@ -52,10 +57,12 @@ pub(crate) async fn prepare_run(
     let now = jiff::Timestamp::now();
     let ws = Workspace::new(adapters, ctxs, now, baseline);
     let mut opts = invocation.into_run_opts();
-    // The scan-exclude globs also filter workspace-member dependencies (by member path or package
-    // name), so carry both global/command and per-tool excludes into the run.
-    opts.exclude = cfg.exclude;
-    opts.exclude_by_tool = scan.tool_exclude;
+    // The scan-exclude globs also filter workspace-member dependencies (folders by member path,
+    // packages by member name), so carry both global/command and per-tool excludes into the run.
+    opts.exclude_folders = cfg.exclude_folders;
+    opts.exclude_packages = cfg.exclude_packages;
+    opts.exclude_folders_by_tool = scan.tool_exclude_folders;
+    opts.exclude_packages_by_tool = scan.tool_exclude_packages;
     Ok(PreparedRun {
         repo_root,
         ws,

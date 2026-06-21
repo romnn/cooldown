@@ -24,9 +24,16 @@ pub(crate) struct SelectorToml {
     pub(crate) latest: Option<bool>,
     pub(crate) freeze: Option<String>,
     pub(crate) floor: Option<String>,
-    /// Scan-exclude globs. Meaningful only under `[tool.<name>]` (added to the scan exclude list
-    /// for that tool); ignored on registry/package/project selectors, which are policy-only.
-    pub(crate) exclude: Option<Vec<String>>,
+    /// `.gitignore`-style directories never scanned. Meaningful only under `[tool.<name>]` (added to
+    /// that tool's scan-exclude list); ignored on registry/package/project selectors, which are
+    /// policy-only.
+    #[serde(rename = "exclude-folders")]
+    pub(crate) exclude_folders: Option<Vec<String>>,
+    /// Package-name globs whose workspace members are dropped from reports. Meaningful only under
+    /// `[tool.<name>]`, where the ecosystem's name format is known (`my-pkg` vs `@scope/my-pkg`);
+    /// ignored on registry/package/project selectors.
+    #[serde(rename = "exclude-packages")]
+    pub(crate) exclude_packages: Option<Vec<String>>,
 }
 
 /// CLI-flag defaults from one config section: `[global]` (shared) or a `[<command>]` section.
@@ -38,10 +45,18 @@ pub(crate) struct SelectorToml {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandConfig {
-    /// Extra scan-exclude globs (added to `[global]` and `[tool.*]` excludes). `--exclude` has no
-    /// CLI form; this is the only way to set it.
+    /// Directories never scanned, `.gitignore`-style (added to `[global]` and `[tool.*]` lists).
+    /// Has no CLI form; config is the only way to set it. See [`compile_folder_globset`].
+    ///
+    /// [`compile_folder_globset`]: crate::config::compile_folder_globset
     #[serde(default)]
-    pub exclude: Vec<String>,
+    pub exclude_folders: Vec<String>,
+    /// Workspace members dropped from reports when their package name matches one of these globs
+    /// (added to `[global]` and `[tool.*]` lists). See [`compile_package_globset`].
+    ///
+    /// [`compile_package_globset`]: crate::config::compile_package_globset
+    #[serde(default)]
+    pub exclude_packages: Vec<String>,
     /// Restrict to these tools (`--tool`); empty means "all detected".
     #[serde(default)]
     pub tool: Vec<String>,
@@ -91,7 +106,8 @@ impl CommandConfig {
     /// fields take the higher-precedence value when set.
     #[must_use]
     pub fn merge_layer(mut self, mut other: CommandConfig) -> CommandConfig {
-        self.exclude.append(&mut other.exclude);
+        self.exclude_folders.append(&mut other.exclude_folders);
+        self.exclude_packages.append(&mut other.exclude_packages);
         self.tool.append(&mut other.tool);
         self.package.append(&mut other.package);
         self.gitignore = other.gitignore.or(self.gitignore);
@@ -144,6 +160,31 @@ impl CommandConfig {
         self.exit_code = explicit.exit_code.or(self.exit_code);
         self.concurrency = explicit.concurrency.or(self.concurrency);
         self
+    }
+
+    /// Replace the folder/package excludes with CLI-provided lists (`--exclude-folders` /
+    /// `--exclude-packages`) — the highest-precedence layer. Each list is a no-op when empty (flag
+    /// not given); a non-empty list replaces this resolved value and is validated up front so a bad
+    /// CLI glob fails fast, like the config ones. Per-tool `[tool.*]` excludes are carried separately
+    /// (on [`ScanConfig`](super::ScanConfig)) and are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`](crate::CoreError) if a pattern is not a valid glob.
+    pub fn override_excludes(
+        &mut self,
+        folders: &[String],
+        packages: &[String],
+    ) -> Result<(), crate::CoreError> {
+        if !folders.is_empty() {
+            super::compile_folder_globset(folders)?;
+            self.exclude_folders = folders.to_vec();
+        }
+        if !packages.is_empty() {
+            super::compile_package_globset(packages)?;
+            self.exclude_packages = packages.to_vec();
+        }
+        Ok(())
     }
 }
 
@@ -204,5 +245,42 @@ impl WindowFields {
             && !self.latest
             && self.freeze.is_none()
             && self.allow.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandConfig;
+
+    #[test]
+    fn override_excludes_replaces_non_empty_validates_and_noops_on_empty() {
+        let seed = CommandConfig {
+            exclude_folders: vec!["build".to_string()],
+            exclude_packages: vec!["internal-*".to_string()],
+            ..CommandConfig::default()
+        };
+
+        // Non-empty lists replace the resolved value (the highest-precedence CLI layer).
+        let mut replaced = seed.clone();
+        replaced
+            .override_excludes(&["dist".to_string()], &["@scope/*".to_string()])
+            .expect("valid override");
+        assert_eq!(replaced.exclude_folders, vec!["dist"]);
+        assert_eq!(replaced.exclude_packages, vec!["@scope/*"]);
+
+        // An empty list is a no-op (flag not given), leaving the config value intact; the two sides
+        // are independent.
+        let mut folders_only = seed.clone();
+        folders_only
+            .override_excludes(&["dist".to_string()], &[])
+            .expect("valid override");
+        assert_eq!(folders_only.exclude_folders, vec!["dist"]);
+        assert_eq!(folders_only.exclude_packages, vec!["internal-*"]);
+
+        // Bad CLI globs fail fast, like the config ones.
+        let mut bad_folder = CommandConfig::default();
+        assert!(bad_folder.override_excludes(&["a/**/[".to_string()], &[]).is_err());
+        let mut bad_package = CommandConfig::default();
+        assert!(bad_package.override_excludes(&[], &["[".to_string()]).is_err());
     }
 }

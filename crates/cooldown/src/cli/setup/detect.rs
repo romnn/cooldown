@@ -63,7 +63,7 @@ pub(super) fn detect_projects(
     adapters: &AdapterSet,
     workdir: &camino::Utf8Path,
     scan: &ScanConfig,
-    command_key: &str,
+    exclude_folders_base: &[String],
     tools: &[ToolId],
     respect_gitignore: bool,
 ) -> Result<Vec<(ToolId, Project)>, CoreError> {
@@ -79,7 +79,7 @@ pub(super) fn detect_projects(
         // The orchestrator owns the scan: the adapter only declares its marker, and we apply the
         // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
         let marker = adapter.project_marker();
-        let exclude = scan.exclude_for(command_key, id.as_str());
+        let exclude = scan.exclude_folders_for(exclude_folders_base, id.as_str());
         let dirs = find_marker_dirs(
             workdir,
             marker.lockfile,

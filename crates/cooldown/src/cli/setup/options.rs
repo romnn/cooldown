@@ -75,8 +75,10 @@ pub(super) fn resolve_invocation(
             tool: tools,
             package,
             // Populated in `setup` from the scan config, which owns the exclude globs.
-            exclude: Vec::new(),
-            exclude_by_tool: BTreeMap::default(),
+            exclude_folders: Vec::new(),
+            exclude_folders_by_tool: BTreeMap::default(),
+            exclude_packages: Vec::new(),
+            exclude_packages_by_tool: BTreeMap::default(),
             allow_major: merged.major.unwrap_or(default_major),
             // A display filter, read straight from the CLI (not config-file backed).
             hide_pinned: overrides.hide_pinned.unwrap_or(false),

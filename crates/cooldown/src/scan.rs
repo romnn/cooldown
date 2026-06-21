@@ -7,7 +7,8 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::CoreError;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use cooldown_core::config::{compile_folder_globset, compile_package_globset};
+use globset::GlobSet;
 use ignore::WalkBuilder;
 
 /// Find every directory under `root` that directly contains a file named `marker`.
@@ -20,9 +21,11 @@ use ignore::WalkBuilder;
 ///   (a stray `Cargo.lock` in a generated folder is not a project), but a lockfile that is itself
 ///   ignored at the file level is still detected — libraries routinely `.gitignore` their
 ///   `Cargo.lock`, and that must not make the project disappear.
-/// - `exclude`: extra directory globs that are never scanned, in addition to gitignore. A bare name
-///   (`"target"`) excludes that directory at any depth; an entry with a `/` is a path glob relative
-///   to `root` (`"third_party/grammars"`). `**` is supported.
+/// - `exclude`: extra directory globs that are never scanned, in addition to gitignore, with
+///   `.gitignore` semantics (see [`compile_folder_globset`]): a bare name (`"target"`, trailing
+///   slash optional) prunes that directory at any depth, a leading slash (`"/build"`) anchors to
+///   `root`, and an interior slash (`"third_party/grammars"`) is a root-relative path. `**` is
+///   supported.
 /// - `topmost_only`: when true, a match's descendants are not reported. A `Cargo.lock`/`uv.lock`
 ///   marks a workspace root that already owns its members, so nested lockfiles below it are skipped.
 ///
@@ -39,7 +42,7 @@ pub fn find_marker_dirs(
     exclude: &[String],
     topmost_only: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
-    let excludes = build_globset(exclude)?;
+    let excludes = compile_folder_globset(exclude)?;
     let root_owned = root.to_owned();
 
     let mut builder = WalkBuilder::new(root);
@@ -93,20 +96,17 @@ pub fn find_marker_dirs(
     Ok(dirs)
 }
 
-/// Whether `path` (a directory) is excluded by name (matched at any depth) or by its path relative
-/// to `root`.
+/// Whether `path` (a directory) is excluded, matching its path relative to `root` against the
+/// folder globset. Matching the relative path (rather than the bare name) is what lets a leading
+/// slash anchor to the root: a bare name still prunes at any depth because
+/// [`compile_folder_globset`] gives it the `**/` variant.
 fn is_excluded(path: &std::path::Path, root: &Utf8Path, excludes: &GlobSet) -> bool {
     if excludes.is_empty() {
         return false;
     }
-    let name_excluded = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|name| excludes.is_match(name));
-    let rel_excluded = Utf8Path::from_path(path)
+    Utf8Path::from_path(path)
         .and_then(|p| p.strip_prefix(root).ok())
-        .is_some_and(|rel| !rel.as_str().is_empty() && excludes.is_match(rel.as_std_path()));
-    name_excluded || rel_excluded
+        .is_some_and(|rel| !rel.as_str().is_empty() && excludes.is_match(rel.as_std_path()))
 }
 
 /// Drop any directory that has an ancestor already in the set (sorted input puts ancestors first).
@@ -120,57 +120,53 @@ fn keep_topmost(dirs: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
     kept
 }
 
-/// A compiled set of exclude globs for filtering workspace-member dependencies. A member is excluded
-/// when its *path* (or any ancestor — so `packages/ts/luup` also excludes `packages/ts/luup/api`) or
-/// its *package name* matches an exclude glob. Matching the name lets a scoped glob like `@luup/*`
-/// exclude every `@luup/...` package regardless of where it lives in the tree.
-pub(crate) struct ExcludeSet(GlobSet);
+/// `exclude-folders` compiled for filtering workspace members by *location*. A member is excluded
+/// when its path — or any ancestor, so `packages/ts/luup` also excludes `packages/ts/luup/api` —
+/// matches a folder glob (`.gitignore` semantics; see [`compile_folder_globset`]).
+pub(crate) struct FolderExcludeSet(GlobSet);
 
-impl ExcludeSet {
-    /// Compile the exclude globs (an empty set matches nothing).
+impl FolderExcludeSet {
+    /// Compile the folder-exclude globs (an empty set matches nothing).
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Config`] if a glob is invalid.
     pub(crate) fn compile(patterns: &[String]) -> Result<Self, CoreError> {
-        Ok(Self(build_globset(patterns)?))
+        Ok(Self(compile_folder_globset(patterns)?))
     }
 
-    /// Whether a member at `path` with package `name` is excluded.
+    /// Whether a member living at `path` (or under an excluded ancestor) is excluded.
     #[must_use]
-    pub(crate) fn excludes_member(&self, path: &Utf8Path, name: &str) -> bool {
+    pub(crate) fn excludes_path(&self, path: &Utf8Path) -> bool {
         if self.0.is_empty() {
             return false;
         }
-        let path_excluded = path.ancestors().any(|ancestor| {
+        path.ancestors().any(|ancestor| {
             !ancestor.as_str().is_empty() && self.0.is_match(ancestor.as_std_path())
-        });
-        path_excluded || self.0.is_match(std::path::Path::new(name))
+        })
     }
 }
 
-/// Build a [`GlobSet`] from the exclude patterns. A bare name also matches that directory at any
-/// depth (so `"target"` excludes every `target/`, not just one at the root).
-fn build_globset(patterns: &[String]) -> Result<GlobSet, CoreError> {
-    let mut builder = GlobSetBuilder::new();
-    for pat in patterns {
-        let trimmed = pat.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        builder.add(compile_glob(trimmed)?);
-        if !trimmed.contains('/') {
-            builder.add(compile_glob(&format!("**/{trimmed}"))?);
-        }
-    }
-    builder
-        .build()
-        .map_err(|e| CoreError::Config(format!("invalid exclude set: {e}")))
-}
+/// `exclude-packages` compiled for filtering workspace members by *package name*. A scoped glob like
+/// `@luup/*` excludes every `@luup/...` member regardless of where it lives in the tree (see
+/// [`compile_package_globset`]).
+pub(crate) struct PackageExcludeSet(GlobSet);
 
-fn compile_glob(pattern: &str) -> Result<Glob, CoreError> {
-    Glob::new(pattern)
-        .map_err(|e| CoreError::Config(format!("invalid exclude glob {pattern:?}: {e}")))
+impl PackageExcludeSet {
+    /// Compile the package-exclude globs (an empty set matches nothing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if a glob is invalid.
+    pub(crate) fn compile(patterns: &[String]) -> Result<Self, CoreError> {
+        Ok(Self(compile_package_globset(patterns)?))
+    }
+
+    /// Whether a member with package `name` is excluded.
+    #[must_use]
+    pub(crate) fn excludes_name(&self, name: &str) -> bool {
+        !self.0.is_empty() && self.0.is_match(std::path::Path::new(name))
+    }
 }
 
 #[cfg(test)]
@@ -182,23 +178,36 @@ mod tests {
     }
 
     #[test]
-    fn exclude_set_matches_member_by_path_prefix_or_name() {
-        let set = ExcludeSet::compile(&["packages/ts/luup".to_string(), "@luup/*".to_string()])
-            .expect("compile");
+    fn folder_exclude_set_matches_member_by_path_prefix() {
+        let set = FolderExcludeSet::compile(&["packages/ts/luup".to_string()]).expect("compile");
         // A path under an excluded directory is excluded (ancestor match).
-        assert!(set.excludes_member(Utf8Path::new("packages/ts/luup/api"), "@luup/api"));
-        // Excluded by scoped package-name glob regardless of where it lives.
-        assert!(set.excludes_member(Utf8Path::new("apps/landingpage"), "@luup/landingpage"));
-        // A sibling path / unscoped name is kept.
-        assert!(!set.excludes_member(Utf8Path::new("apps/admin"), "@airtype/admin"));
+        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup/api")));
+        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup")));
+        // A sibling path is kept.
+        assert!(!set.excludes_path(Utf8Path::new("apps/admin")));
         // The root importer (`.`) is never matched by a sub-path exclude.
-        assert!(!set.excludes_member(Utf8Path::new("."), "root-pkg"));
+        assert!(!set.excludes_path(Utf8Path::new(".")));
     }
 
     #[test]
-    fn empty_exclude_set_matches_nothing() {
-        let set = ExcludeSet::compile(&[]).expect("compile");
-        assert!(!set.excludes_member(Utf8Path::new("apps/admin"), "@luup/api"));
+    fn package_exclude_set_matches_member_by_name_glob() {
+        let set = PackageExcludeSet::compile(&["@luup/*".to_string()]).expect("compile");
+        // Excluded by scoped package-name glob regardless of where it lives.
+        assert!(set.excludes_name("@luup/landingpage"));
+        assert!(set.excludes_name("@luup/api"));
+        // A different scope / unscoped name is kept.
+        assert!(!set.excludes_name("@airtype/admin"));
+        assert!(!set.excludes_name("root-pkg"));
+    }
+
+    #[test]
+    fn empty_exclude_sets_match_nothing() {
+        assert!(!FolderExcludeSet::compile(&[])
+            .expect("compile")
+            .excludes_path(Utf8Path::new("apps/admin")));
+        assert!(!PackageExcludeSet::compile(&[])
+            .expect("compile")
+            .excludes_name("@luup/api"));
     }
 
     fn touch(path: &Utf8Path) {
@@ -240,6 +249,36 @@ mod tests {
         let excludes = vec!["third_party".to_string()];
         let found = find_marker_dirs(&root, "uv.lock", false, &excludes, false).expect("scan");
         assert_eq!(found, vec![root]);
+    }
+
+    #[test]
+    fn exclude_with_trailing_slash_matches_like_bare_name() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = utf8(tmp.path());
+        touch(&root.join("uv.lock"));
+        touch(&root.join("examples/dep/uv.lock"));
+        touch(&root.join("nested/examples/uv.lock"));
+
+        // `"examples/"` is the natural directory-exclude idiom; the trailing slash must not change
+        // its meaning. Like the bare name, it prunes `examples/` at any depth.
+        let excludes = vec!["examples/".to_string()];
+        let found = find_marker_dirs(&root, "uv.lock", false, &excludes, false).expect("scan");
+        assert_eq!(found, vec![root]);
+    }
+
+    #[test]
+    fn exclude_with_leading_slash_anchors_to_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = utf8(tmp.path());
+        touch(&root.join("uv.lock"));
+        touch(&root.join("examples/uv.lock"));
+        touch(&root.join("nested/examples/uv.lock"));
+
+        // `/examples` anchors to the repo root: the top-level examples is pruned, the nested one is
+        // kept (unlike the bare name, which would prune both).
+        let excludes = vec!["/examples".to_string()];
+        let found = find_marker_dirs(&root, "uv.lock", false, &excludes, false).expect("scan");
+        assert_eq!(found, vec![root.clone(), root.join("nested/examples")]);
     }
 
     #[test]

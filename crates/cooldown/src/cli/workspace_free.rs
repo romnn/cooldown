@@ -71,12 +71,15 @@ min-age = "7d"
 # Flag defaults: [global] applies to every subcommand; a [<command>] section overrides it; an
 # explicit CLI flag overrides both. Keys are the kebab-case flag names. A few examples:
 # [global]
-# exclude = ["third_party"]   # directories never scanned (gitignore is honored by default)
+# exclude-folders = ["third_party"]  # directories never scanned, .gitignore-style (gitignore is
+#                                     #   honored by default); /name anchors to the repo root
+# exclude-packages = ["@scope/*"]    # workspace members dropped from reports by package-name glob
 # gitignore = true            # set false to scan gitignored paths too
 # offline = false             # cache-only; concurrency = 8 tunes the registry fan-out
 #
 # [tool.cargo]
-# exclude = ["vendor"]        # extra excludes for one tool
+# exclude-folders = ["vendor"]       # extra folder excludes for one tool
+# exclude-packages = ["xtask"]       # ecosystem-specific package excludes (npm: "@scope/*")
 #
 # [outdated]
 # major = true                # outdated shows cross-major by default; set false for minor-only

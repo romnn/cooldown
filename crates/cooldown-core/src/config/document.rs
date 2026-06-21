@@ -56,7 +56,7 @@ min-age = "14d"
 major = true
 
 [tool.cargo]
-exclude = ["vendor"]
+exclude-folders = ["vendor"]
 "#,
             &Origin::Global,
         )
@@ -67,6 +67,6 @@ exclude = ["vendor"]
 
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
         assert_eq!(scan.global.major, Some(true));
-        assert_eq!(scan.exclude_for("outdated", "cargo"), vec!["vendor"]);
+        assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
     }
 }

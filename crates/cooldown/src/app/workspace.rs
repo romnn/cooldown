@@ -122,15 +122,21 @@ pub struct RunOpts {
     pub tool: Vec<ToolId>,
     /// Scope to packages matching any of these globs (empty = all).
     pub package: Vec<PatternGlob>,
-    /// Scan-exclude path globs (`[global]`/`[<command>]` `exclude`). Beyond pruning project
-    /// detection, these also drop a dependency whose declaring workspace members all sit under an
-    /// excluded path — so a pnpm/cargo workspace can exclude a member's deps even though one root
-    /// lock covers the whole workspace.
-    pub exclude: Vec<String>,
-    /// Additional `[tool.<name>] exclude` globs, keyed by canonical tool name. Kept separate from
-    /// [`exclude`](Self::exclude) so one tool's excludes do not over-filter another tool in a
-    /// polyglot run.
-    pub exclude_by_tool: BTreeMap<String, Vec<String>>,
+    /// `exclude-folders` globs (`[global]`/`[<command>]`), `.gitignore` semantics. Beyond pruning
+    /// project detection, these also drop a dependency whose declaring workspace members all sit
+    /// under an excluded path — so a pnpm/cargo workspace can exclude a member's deps even though one
+    /// root lock covers the whole workspace.
+    pub exclude_folders: Vec<String>,
+    /// Additional `[tool.<name>].exclude-folders` globs, keyed by canonical tool name. Kept separate
+    /// from [`exclude_folders`](Self::exclude_folders) so one tool's excludes do not over-filter
+    /// another tool in a polyglot run.
+    pub exclude_folders_by_tool: BTreeMap<String, Vec<String>>,
+    /// `exclude-packages` globs (`[global]`/`[<command>]`): drop a dependency whose declaring
+    /// workspace members all match one of these package-name globs (`@scope/*`).
+    pub exclude_packages: Vec<String>,
+    /// Additional `[tool.<name>].exclude-packages` globs, keyed by canonical tool name — where the
+    /// ecosystem's package-name format is known (`my-pkg` vs `@scope/my-pkg`).
+    pub exclude_packages_by_tool: BTreeMap<String, Vec<String>>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
     /// `--hide-pinned` (outdated): omit held rows (exact `==`/`=` pins and commit pins) from the
@@ -343,18 +349,24 @@ impl Workspace {
         // declaring member was excluded. Pruning the members before anything reads them means a kept
         // dep is attributed only to non-excluded packages — so its "used by" representative is never
         // an excluded package. A dep with no attributable members is left untouched.
-        let mut exclude = opts.exclude.clone();
-        if let Some(per_tool) = opts.exclude_by_tool.get(pctx.tool.as_str()) {
-            exclude.extend(per_tool.iter().cloned());
+        let mut folders = opts.exclude_folders.clone();
+        let mut packages = opts.exclude_packages.clone();
+        if let Some(per_tool) = opts.exclude_folders_by_tool.get(pctx.tool.as_str()) {
+            folders.extend(per_tool.iter().cloned());
         }
-        if !exclude.is_empty() {
-            let excludes = crate::scan::ExcludeSet::compile(&exclude)?;
+        if let Some(per_tool) = opts.exclude_packages_by_tool.get(pctx.tool.as_str()) {
+            packages.extend(per_tool.iter().cloned());
+        }
+        if !folders.is_empty() || !packages.is_empty() {
+            let folder_excludes = crate::scan::FolderExcludeSet::compile(&folders)?;
+            let package_excludes = crate::scan::PackageExcludeSet::compile(&packages)?;
             deps.retain_mut(|dep| {
                 if dep.members.is_empty() {
                     return true;
                 }
                 dep.members.retain(|member| {
-                    !excludes.excludes_member(camino::Utf8Path::new(&member.path), &member.name)
+                    !folder_excludes.excludes_path(camino::Utf8Path::new(&member.path))
+                        && !package_excludes.excludes_name(&member.name)
                 });
                 !dep.members.is_empty()
             });

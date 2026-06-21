@@ -15,8 +15,10 @@ pub struct ScanConfig {
     pub global: CommandConfig,
     /// Per-subcommand sections, keyed by command name (`"outdated"`, `"upgrade"`, …).
     pub commands: BTreeMap<String, CommandConfig>,
-    /// `[tool.<name>].exclude` lists, keyed by tool name.
-    pub tool_exclude: BTreeMap<String, Vec<String>>,
+    /// `[tool.<name>].exclude-folders` lists, keyed by tool name.
+    pub tool_exclude_folders: BTreeMap<String, Vec<String>>,
+    /// `[tool.<name>].exclude-packages` lists, keyed by tool name.
+    pub tool_exclude_packages: BTreeMap<String, Vec<String>>,
 }
 
 impl ScanConfig {
@@ -29,8 +31,17 @@ impl ScanConfig {
             let slot = self.commands.entry(key).or_default();
             *slot = std::mem::take(slot).merge_layer(value);
         }
-        for (key, value) in other.tool_exclude {
-            self.tool_exclude.entry(key).or_default().extend(value);
+        for (key, value) in other.tool_exclude_folders {
+            self.tool_exclude_folders
+                .entry(key)
+                .or_default()
+                .extend(value);
+        }
+        for (key, value) in other.tool_exclude_packages {
+            self.tool_exclude_packages
+                .entry(key)
+                .or_default()
+                .extend(value);
         }
         self
     }
@@ -46,15 +57,38 @@ impl ScanConfig {
         config
     }
 
-    /// Scan-exclude globs for `command` + `tool`: `[global]` + `[<command>]` (via
-    /// [`resolved`](Self::resolved)) plus the `[tool.<eco>].exclude` list.
+    /// Combine a resolved folder-exclude `base` (`[global]`+`[<command>]`, possibly overridden by a
+    /// CLI `--exclude-folders`) with the `[tool.<eco>].exclude-folders` list for `tool`. The base is
+    /// passed in rather than re-resolved here so the CLI override — applied to the resolved
+    /// [`CommandConfig`](CommandConfig::override_excludes), not to this shared config — is honored.
     #[must_use]
-    pub fn exclude_for(&self, command: &str, tool: &str) -> Vec<String> {
-        let mut out = self.resolved(command).exclude;
-        if let Some(per_tool) = self.tool_exclude.get(tool) {
+    pub fn exclude_folders_for(&self, base: &[String], tool: &str) -> Vec<String> {
+        let mut out = base.to_vec();
+        if let Some(per_tool) = self.tool_exclude_folders.get(tool) {
             out.extend(per_tool.iter().cloned());
         }
         out
+    }
+
+    /// Compile every folder/package glob across `[global]`, each `[<command>]`, and each
+    /// `[tool.<name>]`, so an invalid pattern is rejected when the config is parsed rather than deep
+    /// inside a later scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if any pattern is not a valid glob.
+    fn validate(&self) -> Result<(), CoreError> {
+        for section in std::iter::once(&self.global).chain(self.commands.values()) {
+            super::compile_folder_globset(&section.exclude_folders)?;
+            super::compile_package_globset(&section.exclude_packages)?;
+        }
+        for folders in self.tool_exclude_folders.values() {
+            super::compile_folder_globset(folders)?;
+        }
+        for packages in self.tool_exclude_packages.values() {
+            super::compile_package_globset(packages)?;
+        }
+        Ok(())
     }
 }
 
@@ -63,8 +97,9 @@ impl ScanConfig {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Config`] if `content` is not valid config TOML, or if a `[tool.<name>]`
-/// carrying an `exclude` names an unknown tool.
+/// Returns [`CoreError::Config`] if `content` is not valid config TOML, if a `[tool.<name>]`
+/// carrying an `exclude-folders`/`exclude-packages` names an unknown tool, or if any exclude glob
+/// is invalid.
 pub(crate) fn scan_config_from_config(
     config: ConfigToml,
     _origin: &Origin,
@@ -85,20 +120,34 @@ pub(crate) fn scan_config_from_config(
         }
     }
     for (name, selector) in config.tool.unwrap_or_default() {
-        let Some(exclude) = selector.exclude.filter(|entries| !entries.is_empty()) else {
+        let folders = selector.exclude_folders.filter(|entries| !entries.is_empty());
+        let packages = selector
+            .exclude_packages
+            .filter(|entries| !entries.is_empty());
+        if folders.is_none() && packages.is_none() {
             continue;
-        };
+        }
         let tool = tool_id(&name).ok_or_else(|| {
             CoreError::Config(format!(
                 "unknown tool `{name}` in [tool.{name}]; recognised: {}",
                 recognized_tool_names()
             ))
         })?;
-        scan.tool_exclude
-            .entry(tool.as_str().to_string())
-            .or_default()
-            .extend(exclude);
+        let key = tool.as_str().to_string();
+        if let Some(folders) = folders {
+            scan.tool_exclude_folders
+                .entry(key.clone())
+                .or_default()
+                .extend(folders);
+        }
+        if let Some(packages) = packages {
+            scan.tool_exclude_packages
+                .entry(key)
+                .or_default()
+                .extend(packages);
+        }
     }
+    scan.validate()?;
     Ok(scan)
 }
 
@@ -122,29 +171,62 @@ mod tests {
     }
 
     #[test]
-    fn exclude_combines_global_tool_and_command() {
+    fn exclude_folders_combine_resolved_base_and_per_tool() {
         let cfg = scan(
             r#"
 [global]
-exclude = ["build"]
+exclude-folders = ["build"]
 
 [tool.cargo]
-exclude = ["vendor"]
+exclude-folders = ["vendor"]
 
 [outdated]
-exclude = ["fixtures"]
+exclude-folders = ["fixtures"]
 "#,
         );
-        // The scan exclude list combines [global] + [<command>] + [tool.<eco>] (order is
-        // irrelevant — it is a prune set).
+        // [global] + [<command>] resolve into the base; `exclude_folders_for` adds the per-tool list
+        // (order is irrelevant — it is a prune set).
+        let base = cfg.resolved("outdated").exclude_folders;
+        assert_eq!(base, vec!["build", "fixtures"]);
         assert_eq!(
-            cfg.exclude_for("outdated", "cargo"),
+            cfg.exclude_folders_for(&base, "cargo"),
             vec!["build", "fixtures", "vendor"]
         );
-        // Another command gets [global] + [tool] but not the [outdated] entry.
-        assert_eq!(cfg.exclude_for("upgrade", "cargo"), vec!["build", "vendor"]);
         // A different tool doesn't pick up cargo's per-tool excludes.
-        assert_eq!(cfg.exclude_for("outdated", "go"), vec!["build", "fixtures"]);
+        assert_eq!(cfg.exclude_folders_for(&base, "go"), vec!["build", "fixtures"]);
+        // Another command's base omits the [outdated] entry.
+        assert_eq!(cfg.resolved("upgrade").exclude_folders, vec!["build"]);
+    }
+
+    #[test]
+    fn exclude_packages_resolve_global_and_hold_per_tool() {
+        let cfg = scan(
+            r#"
+[global]
+exclude-packages = ["internal-*"]
+
+[tool.npm]
+exclude-packages = ["@scope/*"]
+"#,
+        );
+        // A `[global]` `exclude-packages` resolves into every command's base; the per-tool list is
+        // held separately and combined at the member-filter site (workspace::dependencies_in_scope).
+        assert_eq!(cfg.resolved("outdated").exclude_packages, vec!["internal-*"]);
+        assert_eq!(cfg.tool_exclude_packages["npm"], vec!["@scope/*"]);
+        assert!(!cfg.tool_exclude_packages.contains_key("cargo"));
+        // Folders and packages are independent surfaces.
+        assert!(cfg.resolved("outdated").exclude_folders.is_empty());
+    }
+
+    #[test]
+    fn invalid_exclude_glob_is_rejected_at_parse() {
+        assert!(parse_scan_config("[global]\nexclude-folders = [\"a/**/[\"]\n", &Origin::Default)
+            .is_err());
+        assert!(parse_scan_config(
+            "[tool.npm]\nexclude-packages = [\"[\"]\n",
+            &Origin::Default
+        )
+        .is_err());
     }
 
     #[test]
@@ -179,10 +261,10 @@ gitignore = false
 
     #[test]
     fn merge_concatenates_excludes_and_lets_later_scalars_win() {
-        let base = scan("[global]\nexclude = [\"a\"]\ngitignore = true\n");
-        let over = scan("[global]\nexclude = [\"b\"]\ngitignore = false\n");
+        let base = scan("[global]\nexclude-folders = [\"a\"]\ngitignore = true\n");
+        let over = scan("[global]\nexclude-folders = [\"b\"]\ngitignore = false\n");
         let merged = base.merge(over);
-        assert_eq!(merged.exclude_for("outdated", "cargo"), vec!["a", "b"]);
+        assert_eq!(merged.resolved("outdated").exclude_folders, vec!["a", "b"]);
         assert_eq!(merged.resolved("outdated").gitignore, Some(false));
     }
 
@@ -229,21 +311,23 @@ dry-run = true
         let cfg = scan(
             r#"
 [global]
-exclude = ["dist"]
+exclude-folders = ["dist"]
 
 [fix]
-exclude = ["fixtures"]
+exclude-folders = ["fixtures"]
 "#,
         );
 
-        assert_eq!(cfg.exclude_for("fix", "cargo"), vec!["dist", "fixtures"]);
-        assert_eq!(cfg.exclude_for("upgrade", "cargo"), vec!["dist"]);
+        assert_eq!(cfg.resolved("fix").exclude_folders, vec!["dist", "fixtures"]);
+        assert_eq!(cfg.resolved("upgrade").exclude_folders, vec!["dist"]);
     }
 
     #[test]
     fn empty_config_is_inert() {
         let cfg = scan("min-age = \"7d\"\n");
-        assert!(cfg.exclude_for("outdated", "cargo").is_empty());
+        assert!(cfg.exclude_folders_for(&[], "cargo").is_empty());
+        assert!(cfg.resolved("outdated").exclude_folders.is_empty());
+        assert!(cfg.resolved("outdated").exclude_packages.is_empty());
         assert_eq!(cfg.resolved("outdated").gitignore, None);
         assert_eq!(cfg.resolved("outdated").major, None);
         assert_eq!(cfg.resolved("outdated").strict, None);

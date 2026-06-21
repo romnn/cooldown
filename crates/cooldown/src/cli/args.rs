@@ -269,6 +269,14 @@ pub(in crate::cli) struct GlobalArgs {
     /// (shorthand for `--tool cargo`; the right default for a Cargo workspace in a polyglot monorepo).
     #[arg(long, global = true, conflicts_with = "tool")]
     pub(in crate::cli) cargo: bool,
+    /// Directories never scanned, `.gitignore`-style — overrides the `[global]`/`[<command>]` config
+    /// lists (per-tool `[tool.*]` excludes still apply). Repeatable.
+    #[arg(long = "exclude-folders", global = true, value_name = "GLOB")]
+    pub(in crate::cli) exclude_folders: Vec<String>,
+    /// Workspace members dropped from reports by package-name glob — overrides the
+    /// `[global]`/`[<command>]` config lists (per-tool `[tool.*]` excludes still apply). Repeatable.
+    #[arg(long = "exclude-packages", global = true, value_name = "GLOB")]
+    pub(in crate::cli) exclude_packages: Vec<String>,
     /// Don't honor `.gitignore` while detecting projects (the rare repo whose lockfiles are
     /// themselves ignored). By default detection skips gitignored paths — correct and faster.
     #[arg(long = "no-gitignore", global = true)]

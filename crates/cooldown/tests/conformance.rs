@@ -488,7 +488,7 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
     };
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
-    opts.exclude_by_tool
+    opts.exclude_folders_by_tool
         .insert(GO.as_str().to_string(), vec!["apps/dropped".to_string()]);
 
     let out = ws.outdated(&opts).await;
@@ -502,6 +502,132 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
         vec!["kept"]
     );
     assert_eq!(out.items[0].members[0].path, "apps/kept");
+}
+
+#[tokio::test]
+async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
+    let (_g, root) = tmp_root();
+    let mut kept = dep("kept", "v1.0.0", true);
+    kept.members = vec![MemberRef {
+        name: "@app/kept".into(),
+        path: "apps/kept".into(),
+    }];
+    let mut dropped = dep("dropped", "v1.0.0", true);
+    dropped.members = vec![MemberRef {
+        name: "@internal/dropped".into(),
+        path: "apps/dropped".into(),
+    }];
+    let mut releases = HashMap::new();
+    for name in ["kept", "dropped"] {
+        releases.insert(
+            name.to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+    }
+    let fake = FakeEco {
+        direct: vec![kept, dropped],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked: HashMap::new(),
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::default(),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    // `@internal/*` matches the member's package NAME (`@internal/dropped`); it does NOT match the
+    // member's path (`apps/dropped`), so this proves exclusion is name-based, not path-based. Keyed
+    // by the canonical tool id.
+    opts.exclude_packages_by_tool
+        .insert(GO.as_str().to_string(), vec!["@internal/*".to_string()]);
+
+    let out = ws.outdated(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(
+        out.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kept"]
+    );
+    assert_eq!(out.items[0].members[0].name, "@app/kept");
+}
+
+#[tokio::test]
+async fn global_exclude_packages_prunes_workspace_member_dependencies() {
+    // Coverage for the global/command `opts.exclude_packages` branch (set from `[global]`/
+    // `[<command>]` or `--exclude-packages`), distinct from the per-tool map: `dependencies_in_scope`
+    // seeds its package matcher from `opts.exclude_packages` before extending with the per-tool list.
+    let (_g, root) = tmp_root();
+    let mut kept = dep("kept", "v1.0.0", true);
+    kept.members = vec![MemberRef {
+        name: "@app/kept".into(),
+        path: "apps/kept".into(),
+    }];
+    let mut dropped = dep("dropped", "v1.0.0", true);
+    dropped.members = vec![MemberRef {
+        name: "@internal/dropped".into(),
+        path: "apps/dropped".into(),
+    }];
+    let mut releases = HashMap::new();
+    for name in ["kept", "dropped"] {
+        releases.insert(
+            name.to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+    }
+    let fake = FakeEco {
+        direct: vec![kept, dropped],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked: HashMap::new(),
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::default(),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.exclude_packages = vec!["@internal/*".to_string()];
+
+    let out = ws.outdated(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(
+        out.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kept"]
+    );
 }
 
 #[tokio::test]

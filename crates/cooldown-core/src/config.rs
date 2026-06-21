@@ -6,11 +6,13 @@
 //! the same rule the CLI enforces for `--latest`/`--freeze`/`--min-age`.
 
 mod document;
+mod exclude;
 mod layers;
 mod scan;
 mod schema;
 
 pub use document::ConfigDocument;
+pub use exclude::{compile_folder_globset, compile_package_globset};
 pub use layers::{builtin_default_layer, layer_from_fields, parse_config};
 pub use scan::{ScanConfig, parse_scan_config};
 pub use schema::{CommandConfig, WindowFields};
