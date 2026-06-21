@@ -234,11 +234,24 @@ pub struct BuildInfo {
     pub ok: Option<bool>,
 }
 
+/// An adoptable update `upgrade` held back because it crosses a major boundary and `--major` was
+/// not set — surfaced so the user knows it exists and how to take it, instead of it vanishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MajorUpdate {
+    pub name: String,
+    pub project: String,
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeMeta {
     pub applied: bool,
     pub lock_verified: Option<bool>,
     pub build: BuildInfo,
+    /// Adoptable cross-major updates `upgrade` did not apply because `--major` was off. Empty for
+    /// `fix` and for an `upgrade --major` run (which adopts them).
+    pub major_available: Vec<MajorUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

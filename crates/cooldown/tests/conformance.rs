@@ -1008,6 +1008,140 @@ async fn upgrade_applies_clean_change() {
     assert_eq!(out.items[0].to, "v1.1.0");
 }
 
+/// Releases for package "a": the current v1.0.0 plus a long-matured cross-major v2.0.0. `kind =
+/// Major` makes v2.0.0 ineligible under a default (major-off) run yet adoptable under `--major`.
+fn a_v1_and_matured_v2() -> Vec<Release> {
+    vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v2.0.0",
+            1,
+            Some("2026-01-15T00:00:00Z"),
+            Some(UpdateKind::Major),
+        ),
+    ]
+}
+
+/// A fixture for package "a" locked at v1.0.0 with `a_releases`, placed as a direct dep (`direct`)
+/// or a transitive one. Mirrors the dogfooding `fs4`/`toml_edit` case where `outdated` shows a
+/// cross-major update but a default `upgrade` skips it.
+fn major_update_fake(root: camino::Utf8PathBuf, direct: bool, a_releases: Vec<Release>) -> FakeEco {
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), a_releases);
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let (direct, transitive) = if direct {
+        (vec![dep("a", "v1.0.0", true)], vec![])
+    } else {
+        (vec![], vec![dep("a", "v1.0.0", false)])
+    };
+    FakeEco {
+        direct,
+        transitive,
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    }
+}
+
+#[tokio::test]
+async fn upgrade_surfaces_adoptable_major_update_held_back_by_default() {
+    let (_g, root) = tmp_root();
+    let ws = workspace(
+        major_update_fake(root, true, a_v1_and_matured_v2()),
+        Baseline::default(),
+    );
+    let out = ws.upgrade(&opts()).await;
+    // The default (major-off) run applies nothing — the only newer release is cross-major…
+    assert_eq!(out.summary.applied, 0);
+    // …but it is surfaced as a hint so the user knows it exists and how to take it.
+    assert_eq!(out.meta.major_available.len(), 1);
+    let hint = &out.meta.major_available[0];
+    assert_eq!(hint.name, "a");
+    assert_eq!(hint.from, "v1.0.0");
+    assert_eq!(hint.to, "v2.0.0");
+}
+
+#[tokio::test]
+async fn upgrade_major_adopts_the_update_instead_of_hinting() {
+    let (_g, root) = tmp_root();
+    let ws = workspace(
+        major_update_fake(root, true, a_v1_and_matured_v2()),
+        Baseline::default(),
+    );
+    let out = ws
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..opts()
+        })
+        .await;
+    // With `--major` the same update is adopted, not held back — so no hint is emitted.
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].to, "v2.0.0");
+    assert!(
+        out.meta.major_available.is_empty(),
+        "no hint when --major adopts the update"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_does_not_hint_a_transitive_major_update() {
+    // Only a directly-declared dep can be adopted by `--major` (it rewrites a manifest constraint),
+    // so a transitive cross-major must never be hinted — `cooldown upgrade --major -p <transitive>`
+    // would do nothing. The dep is in scope (graph) but `dep.direct` is false.
+    let (_g, root) = tmp_root();
+    let ws = workspace(
+        major_update_fake(root, false, a_v1_and_matured_v2()),
+        Baseline::default(),
+    );
+    let out = ws.upgrade(&opts()).await;
+    assert!(
+        out.meta.major_available.is_empty(),
+        "a transitive major update must not be hinted"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_applies_the_in_range_update_and_still_hints_the_major() {
+    // A dep with both a matured in-range minor (v1.1.0) and a matured cross-major (v2.0.0): the
+    // default run adopts the minor and still surfaces the major as a separate hint. The hint's `to`
+    // is the major (not the just-applied minor) — the `!=` guard keeps them distinct.
+    let (_g, root) = tmp_root();
+    let releases = vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v1.1.0",
+            1,
+            Some("2026-01-10T00:00:00Z"),
+            Some(UpdateKind::Minor),
+        ),
+        rel(
+            "v2.0.0",
+            2,
+            Some("2026-01-15T00:00:00Z"),
+            Some(UpdateKind::Major),
+        ),
+    ];
+    let ws = workspace(major_update_fake(root, true, releases), Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].to, "v1.1.0");
+    assert_eq!(out.meta.major_available.len(), 1);
+    assert_eq!(out.meta.major_available[0].from, "v1.0.0");
+    assert_eq!(out.meta.major_available[0].to, "v2.0.0");
+}
+
 #[tokio::test]
 async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
     let (_g, root) = tmp_root();

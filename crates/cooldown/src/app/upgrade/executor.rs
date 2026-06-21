@@ -1,9 +1,11 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
-use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
+use crate::app::{
+    MajorUpdate, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
+};
 use cooldown_core::{
     Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
-    SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
+    ResolveContext, SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -205,6 +207,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.fanout(),
             )
             .await;
+        let major_rctx = ResolveContext {
+            allow_major: true,
+            ..rctx
+        };
         let mut planned = Vec::new();
         for (dep, releases) in fetched {
             let releases = match releases {
@@ -221,6 +227,30 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &rctx,
                 self.ws.now(),
             );
+            // On a default (major-off) run, flag an adoptable cross-major update the user could take
+            // with `--major` — only for a directly-declared, non-pinned dep, where re-running with
+            // `--major` would actually adopt it. This reads only the candidates already fetched for
+            // the plan (the same scope `outdated` uses), so it adds no fetch work and never points at
+            // a version `outdated` would not also show.
+            if !self.ctx.opts.allow_major && dep.direct && !dep.pinned {
+                let major = evaluate(
+                    &dep,
+                    &releases,
+                    &self.ctx.pctx.policy.layers,
+                    &major_rctx,
+                    self.ws.now(),
+                );
+                if let Some(major_target) = major.adoptable_target
+                    && Some(&major_target) != verdict.adoptable_target.as_ref()
+                {
+                    self.acc.major_available.push(MajorUpdate {
+                        name: dep.package.name.clone(),
+                        project: self.project_label.clone(),
+                        from: dep.current.to_string(),
+                        to: major_target.to_string(),
+                    });
+                }
+            }
             // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
             // version a human could manually pin to — but `upgrade` must never move it on its own.
             if verdict.status == cooldown_core::Status::Held {

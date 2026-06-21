@@ -9,7 +9,9 @@
 mod executor;
 
 use self::executor::{PlanMode, ProjectUpgradeExecutor};
-use super::{BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace};
+use super::{
+    BuildInfo, Exit, MajorUpdate, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace,
+};
 use cooldown_core::{Diagnostic, ToolRead, ToolWrite};
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
@@ -39,6 +41,9 @@ pub(super) struct UpgradeAccum {
     /// matured older version to downgrade to.
     pub(super) warnings: Vec<Diagnostic>,
     pub(super) strict_incomplete: bool,
+    /// Adoptable cross-major updates skipped because `--major` was off — surfaced as a hint so the
+    /// user is not left wondering why an `outdated`-listed update was not taken.
+    pub(super) major_available: Vec<MajorUpdate>,
     /// `None` until a build is attempted; `Some(false)` once any project's build fails.
     pub(super) build_ok: Option<bool>,
     pub(super) build_requested: bool,
@@ -169,6 +174,7 @@ impl Workspace {
                 requested: acc.build_requested,
                 ok: acc.build_ok,
             },
+            major_available: acc.major_available,
         };
         let summary = UpgradeSummary {
             applied,
