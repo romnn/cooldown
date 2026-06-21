@@ -87,7 +87,7 @@ pub fn json_schema() -> Value {
         "type": "object",
         "required": ["reason", "message"],
         "properties": {
-            "reason": { "enum": ["graph_held", "transitive_in_cooldown", "resolver_conflict", "not_eligible"] },
+            "reason": { "enum": ["graph_held", "transitive_in_cooldown", "resolver_conflict", "not_eligible", "needs_major"] },
             "message": { "type": "string" },
             "offending": { "type": "string" }
         },
@@ -206,11 +206,12 @@ pub fn json_schema() -> Value {
         },
         "upgradeItem": {
             "type": "object",
-            "required": ["name", "tool", "project", "from", "to", "kind", "applied"],
+            "required": ["name", "tool", "project", "direct", "from", "to", "kind", "applied"],
             "properties": {
                 "name": { "type": "string" },
                 "tool": { "type": "string" },
                 "project": { "type": "string" },
+                "direct": { "type": "boolean" },
                 "registry": { "type": "string" },
                 "members": members,
                 "from": { "type": "string" },
@@ -315,20 +316,6 @@ pub fn json_schema() -> Value {
                             "ok": { "type": ["boolean", "null"] }
                         },
                         "additionalProperties": false
-                    })),
-                    ("majorAvailable", json!({
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["name", "project", "from", "to"],
-                            "properties": {
-                                "name": { "type": "string" },
-                                "project": { "type": "string" },
-                                "from": { "type": "string" },
-                                "to": { "type": "string" }
-                            },
-                            "additionalProperties": false
-                        }
                     }))
                 ]),
                 vec!["applied", "lockVerified", "build"],

@@ -191,6 +191,8 @@ pub struct RunOpts {
     /// `--show-projects`: add the per-project "Project" column to the dependency tables. Hidden by
     /// default, since the "Used by" names usually suffice and the path is mostly noise.
     pub show_projects: bool,
+    /// `--no-suggestions`: suppress actionable tips (e.g. the `--major` command after `upgrade`).
+    pub no_suggestions: bool,
     /// `--json`: machine-readable output (never changes the exit code).
     pub json: bool,
     /// Where coarse progress notes go while the command runs.

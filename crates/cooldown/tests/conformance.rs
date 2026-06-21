@@ -1063,14 +1063,24 @@ async fn upgrade_surfaces_adoptable_major_update_held_back_by_default() {
         Baseline::default(),
     );
     let out = ws.upgrade(&opts()).await;
-    // The default (major-off) run applies nothing — the only newer release is cross-major…
+    // Nothing is applied; the held-back cross-major counts as a skip (a `skipped` row whose Result is
+    // `needs --major`)…
     assert_eq!(out.summary.applied, 0);
-    // …but it is surfaced as a hint so the user knows it exists and how to take it.
-    assert_eq!(out.meta.major_available.len(), 1);
-    let hint = &out.meta.major_available[0];
-    assert_eq!(hint.name, "a");
-    assert_eq!(hint.from, "v1.0.0");
-    assert_eq!(hint.to, "v2.0.0");
+    assert_eq!(out.summary.skipped, 1);
+    // …recorded as a held-back item the user can act on with `--major`.
+    let held: Vec<_> = out
+        .items
+        .iter()
+        .filter(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        })
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].name, "a");
+    assert_eq!(held[0].from, "v1.0.0");
+    assert_eq!(held[0].to, "v2.0.0");
 }
 
 #[tokio::test]
@@ -1086,12 +1096,16 @@ async fn upgrade_major_adopts_the_update_instead_of_hinting() {
             ..opts()
         })
         .await;
-    // With `--major` the same update is adopted, not held back — so no hint is emitted.
+    // With `--major` the same update is adopted, not held back — so no `needs --major` item.
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.items[0].to, "v2.0.0");
     assert!(
-        out.meta.major_available.is_empty(),
-        "no hint when --major adopts the update"
+        !out.items.iter().any(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        }),
+        "no held-back item when --major adopts the update"
     );
 }
 
@@ -1107,8 +1121,12 @@ async fn upgrade_does_not_hint_a_transitive_major_update() {
     );
     let out = ws.upgrade(&opts()).await;
     assert!(
-        out.meta.major_available.is_empty(),
-        "a transitive major update must not be hinted"
+        !out.items.iter().any(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        }),
+        "a transitive major update must not be flagged"
     );
 }
 
@@ -1136,10 +1154,23 @@ async fn upgrade_applies_the_in_range_update_and_still_hints_the_major() {
     let ws = workspace(major_update_fake(root, true, releases), Baseline::default());
     let out = ws.upgrade(&opts()).await;
     assert_eq!(out.summary.applied, 1);
-    assert_eq!(out.items[0].to, "v1.1.0");
-    assert_eq!(out.meta.major_available.len(), 1);
-    assert_eq!(out.meta.major_available[0].from, "v1.0.0");
-    assert_eq!(out.meta.major_available[0].to, "v2.0.0");
+    assert!(out.items.iter().any(|it| it.applied && it.to == "v1.1.0"));
+    // The major is still flagged as `needs --major` (to = the major, not the just-applied minor),
+    // and is informational — not counted in the skipped tally.
+    let held: Vec<_> = out
+        .items
+        .iter()
+        .filter(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        })
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].from, "v1.0.0");
+    assert_eq!(held[0].to, "v2.0.0");
+    // The held-back major counts as a skip (the renderer breaks out the "need --major" subset).
+    assert_eq!(out.summary.skipped, 1);
 }
 
 #[tokio::test]

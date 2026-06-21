@@ -68,6 +68,15 @@ impl ResolvedGraph {
             .any(|(_, deps)| deps.iter().any(|d| d == id))
     }
 
+    /// Resolve a graph node id to its workspace-member `(name, path)`, or `None` for a node that is
+    /// not a known package. The shared mapping behind both attribution methods below.
+    fn member_of(&self, node: &str) -> Option<MemberRef> {
+        self.packages.get(node).map(|info| MemberRef {
+            name: info.name.clone(),
+            path: info.path.clone(),
+        })
+    }
+
     /// The workspace member crates that directly depend on `id` — the source packages a dependency
     /// is attributed to in reports. Sorted by name and deduplicated for stable output.
     #[must_use]
@@ -80,16 +89,24 @@ impl ResolvedGraph {
                     .get(*root)
                     .is_some_and(|deps| deps.iter().any(|dep| dep == id))
             })
-            .filter_map(|root| {
-                self.packages.get(root).map(|info| MemberRef {
-                    name: info.name.clone(),
-                    path: info.path.clone(),
-                })
-            })
+            .filter_map(|root| self.member_of(root))
             .collect();
         members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
         members.dedup();
         members
+    }
+
+    /// The workspace members that reach `id` through the graph — directly or transitively — so a
+    /// *transitive* dependency can be attributed to the members that pull it in ("via …"). Uses the
+    /// shared, tool-agnostic reverse-reachability helper over this graph's edges.
+    #[must_use]
+    pub fn reaching_members(&self, id: &str) -> Vec<MemberRef> {
+        let edges = self
+            .edges
+            .iter()
+            .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())));
+        let roots: HashSet<&str> = self.roots.iter().map(String::as_str).collect();
+        cooldown_adapter_util::reaching_members(edges, &roots, id, |node| self.member_of(node))
     }
 }
 
@@ -450,5 +467,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("app-a", "apps/a")]
         );
+    }
+
+    #[test]
+    fn reaching_members_attributes_a_transitive_dep_to_its_requirers() {
+        // root-a → dep → trans : `trans` is transitive, reached only through `dep`, so it is
+        // attributed to app-a (rendered "via app-a").
+        let pkg = |name: &str, path: &str| PkgInfo {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+            path: path.to_string(),
+        };
+        let graph = ResolvedGraph {
+            packages: HashMap::from([
+                ("root-a".to_string(), pkg("app-a", "apps/a")),
+                ("root-b".to_string(), pkg("app-b", "apps/b")),
+                ("dep".to_string(), pkg("serde", ".")),
+                ("trans".to_string(), pkg("syn", ".")),
+            ]),
+            roots: HashSet::from(["root-a".to_string(), "root-b".to_string()]),
+            edges: HashMap::from([
+                ("root-a".to_string(), vec!["dep".to_string()]),
+                ("root-b".to_string(), Vec::new()),
+                ("dep".to_string(), vec!["trans".to_string()]),
+                ("trans".to_string(), Vec::new()),
+            ]),
+            exact_pins: HashSet::new(),
+        };
+
+        let names = |members: Vec<MemberRef>| {
+            members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // Transitive: only app-a reaches `trans`.
+        assert_eq!(names(graph.reaching_members("trans")), vec!["app-a"]);
+        // Direct deps are reached too — reaching is a superset of direct.
+        assert_eq!(names(graph.reaching_members("dep")), vec!["app-a"]);
     }
 }

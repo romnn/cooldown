@@ -506,8 +506,11 @@ pub struct Change {
     pub to: Version,
     /// The update kind of the change.
     pub kind: UpdateKind,
-    /// The workspace member package(s) that declare this dependency, for source attribution in
-    /// reports (see [`Dependency::members`]).
+    /// Whether the changed dependency is declared directly by a workspace member (vs. pulled in
+    /// transitively). Carried so reports can attribute a transitive change as "via …".
+    pub direct: bool,
+    /// The workspace member package(s) that declare this dependency (direct) or that reach it through
+    /// the graph (transitive), for source attribution in reports (see [`Dependency::members`]).
     pub members: Vec<MemberRef>,
 }
 
@@ -554,6 +557,11 @@ pub enum SkipReason {
     /// The dependency has no editable version requirement to retarget — it is transitive-only or a
     /// path/git source — so `upgrade` cannot move it by rewriting a constraint.
     NotEligible,
+    /// An adoptable update crosses a major boundary and `--major` was not set; re-run with `--major`
+    /// (per `--package`) to take it. It counts as a skip (the report breaks out how many such rows
+    /// need `--major`), but unlike a real skip it never fails a `--strict` run — you chose not to
+    /// take it, the run did not fail to.
+    NeedsMajor,
 }
 
 impl SkipReason {
@@ -580,6 +588,7 @@ impl SkipReason {
             SkipReason::NotEligible => {
                 "no editable requirement to change (transitive-only or path/git dependency)"
             }
+            SkipReason::NeedsMajor => "needs --major to adopt",
         }
     }
 }

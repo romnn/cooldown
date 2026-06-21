@@ -20,7 +20,7 @@ mod workspace;
 pub use baseline::Baseline;
 pub use model::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
-    EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, MajorUpdate, OutdatedItem, OutdatedStatus,
+    EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
     OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};

@@ -1,11 +1,9 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
-use crate::app::{
-    MajorUpdate, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
-};
+use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan,
-    ResolveContext, SkipReason, Status, UpdateKind, check_pin, evaluate, evaluate_fix,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan, Release,
+    ResolveContext, SkipReason, Status, UpdateKind, Version, check_pin, evaluate, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -207,10 +205,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.fanout(),
             )
             .await;
-        let major_rctx = ResolveContext {
-            allow_major: true,
-            ..rctx
-        };
         let mut planned = Vec::new();
         for (dep, releases) in fetched {
             let releases = match releases {
@@ -227,30 +221,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &rctx,
                 self.ws.now(),
             );
-            // On a default (major-off) run, flag an adoptable cross-major update the user could take
-            // with `--major` — only for a directly-declared, non-pinned dep, where re-running with
-            // `--major` would actually adopt it. This reads only the candidates already fetched for
-            // the plan (the same scope `outdated` uses), so it adds no fetch work and never points at
-            // a version `outdated` would not also show.
-            if !self.ctx.opts.allow_major && dep.direct && !dep.pinned {
-                let major = evaluate(
-                    &dep,
-                    &releases,
-                    &self.ctx.pctx.policy.layers,
-                    &major_rctx,
-                    self.ws.now(),
-                );
-                if let Some(major_target) = major.adoptable_target
-                    && Some(&major_target) != verdict.adoptable_target.as_ref()
-                {
-                    self.acc.major_available.push(MajorUpdate {
-                        name: dep.package.name.clone(),
-                        project: self.project_label.clone(),
-                        from: dep.current.to_string(),
-                        to: major_target.to_string(),
-                    });
-                }
-            }
+            // Surface an adoptable cross-major update the user could take with `--major` (it would
+            // otherwise vanish from a default run even though `outdated` lists it).
+            self.record_held_back_major(&dep, &releases, &rctx, verdict.adoptable_target.as_ref());
             // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
             // version a human could manually pin to — but `upgrade` must never move it on its own.
             if verdict.status == cooldown_core::Status::Held {
@@ -282,10 +255,65 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 from: dep.current.clone(),
                 to: target,
                 kind,
+                direct: dep.direct,
                 members: dep.members.clone(),
             });
         }
         planned
+    }
+
+    /// On a default (major-off) run, record an adoptable cross-major update as a `needs --major`
+    /// skip — only for a directly-declared, non-pinned dep where re-running with `--major` would
+    /// actually adopt it. `scoped_target` is the major-off run's own adoptable target, so a
+    /// coincident in-range adoptable is not re-flagged as a major.
+    fn record_held_back_major(
+        &mut self,
+        dep: &Dependency,
+        releases: &[Release],
+        rctx: &ResolveContext,
+        scoped_target: Option<&Version>,
+    ) {
+        if self.ctx.opts.allow_major || !dep.direct || dep.pinned {
+            return;
+        }
+        let major_rctx = ResolveContext {
+            allow_major: true,
+            ..*rctx
+        };
+        let major = evaluate(
+            dep,
+            releases,
+            &self.ctx.pctx.policy.layers,
+            &major_rctx,
+            self.ws.now(),
+        );
+        let Some(major_target) = major.adoptable_target else {
+            return;
+        };
+        if Some(&major_target) == scoped_target {
+            return;
+        }
+        let kind = major
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version == major_target)
+            .map_or(UpdateKind::Major, |candidate| candidate.kind);
+        let change = Change {
+            package: dep.package.clone(),
+            from: dep.current.clone(),
+            to: major_target,
+            kind,
+            direct: dep.direct,
+            members: dep.members.clone(),
+        };
+        self.record_change_skip(
+            &change,
+            Some(SkippedInfo {
+                reason: SkipReason::NeedsMajor,
+                message: SkipReason::NeedsMajor.message().to_string(),
+                offending: None,
+            }),
+        );
     }
 
     /// Plan downgrades for `fix`: every dependency whose locked version is too fresh moves to the
@@ -386,6 +414,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 from: dep.current.clone(),
                 to: target,
                 kind,
+                direct: dep.direct,
                 members: dep.members.clone(),
             });
         }
@@ -825,6 +854,7 @@ fn plan_item(
         name: change.package.name.clone(),
         tool: tool.to_string(),
         project: project.to_string(),
+        direct: change.direct,
         members: change.members.clone(),
         registry: change.package.registry.clone(),
         from: change.from.to_string(),

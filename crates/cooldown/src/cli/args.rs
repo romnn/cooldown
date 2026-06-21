@@ -343,6 +343,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// No effect in a single-root repo (there is no distinct project to show).
     #[arg(long = "show-projects", global = true)]
     pub(in crate::cli) show_projects: bool,
+    /// Suppress actionable tips (e.g. the `--major` command `upgrade` prints when it holds back a
+    /// cross-major update). The reports and their counts are unaffected.
+    #[arg(long = "no-suggestions", global = true)]
+    pub(in crate::cli) no_suggestions: bool,
     /// Downgrade a stale/absent lock from failure (the default) to a warning.
     #[arg(
         long = "allow-stale-lock",

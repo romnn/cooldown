@@ -384,6 +384,7 @@ mod tests {
             from: Version::new("2.34.1"),
             to: Version::new("2.34.2"),
             kind: cooldown_core::UpdateKind::Patch,
+            direct: true,
             members: Vec::new(),
         };
         let err = CoreError::ToolSpawn {

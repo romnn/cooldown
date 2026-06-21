@@ -193,6 +193,9 @@ pub struct UpgradeItem {
     pub name: String,
     pub tool: String,
     pub project: String,
+    /// Whether this dependency is declared directly by a workspace member; `false` means it was
+    /// pulled in transitively (reports attribute it as "via …").
+    pub direct: bool,
     pub members: Vec<MemberRef>,
     pub registry: Option<String>,
     pub from: String,
@@ -209,14 +212,20 @@ impl UpgradeItem {
     /// status precedence the renderer uses (applied > skipped > error > planned).
     #[must_use]
     pub(crate) fn sort_rank(&self) -> u8 {
-        if self.applied {
-            3
-        } else if self.skipped.is_some() {
-            1
+        if let Some(skip) = &self.skipped {
+            // Real skips lead; a held-back `needs --major` is informational (not a failure), so it
+            // sorts after them, before planned and the applied (succeeded) rows.
+            if skip.reason == SkipReason::NeedsMajor {
+                2
+            } else {
+                1
+            }
         } else if self.error.is_some() {
             0
+        } else if self.applied {
+            4
         } else {
-            2
+            3
         }
     }
 }
@@ -234,24 +243,11 @@ pub struct BuildInfo {
     pub ok: Option<bool>,
 }
 
-/// An adoptable update `upgrade` held back because it crosses a major boundary and `--major` was
-/// not set — surfaced so the user knows it exists and how to take it, instead of it vanishing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MajorUpdate {
-    pub name: String,
-    pub project: String,
-    pub from: String,
-    pub to: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeMeta {
     pub applied: bool,
     pub lock_verified: Option<bool>,
     pub build: BuildInfo,
-    /// Adoptable cross-major updates `upgrade` did not apply because `--major` was off. Empty for
-    /// `fix` and for an `upgrade --major` run (which adopts them).
-    pub major_available: Vec<MajorUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -85,7 +85,6 @@ fn no_tool_mutation(
                     requested: false,
                     ok: None,
                 },
-                major_available: Vec::new(),
             },
             render::UpgradeSummary {
                 applied: 0,

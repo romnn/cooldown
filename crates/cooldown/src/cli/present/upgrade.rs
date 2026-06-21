@@ -10,16 +10,6 @@ pub(in crate::cli) fn upgrade_meta(meta: &app::UpgradeMeta) -> render::UpgradeMe
             requested: meta.build.requested,
             ok: meta.build.ok,
         },
-        major_available: meta.major_available.iter().map(major_update).collect(),
-    }
-}
-
-fn major_update(update: &app::MajorUpdate) -> render::MajorUpdate {
-    render::MajorUpdate {
-        name: update.name.clone(),
-        project: update.project.clone(),
-        from: update.from.clone(),
-        to: update.to.clone(),
     }
 }
 
@@ -40,6 +30,7 @@ fn upgrade_item(item: &app::UpgradeItem) -> render::UpgradeItem {
         name: item.name.clone(),
         tool: item.tool.clone(),
         project: item.project.clone(),
+        direct: item.direct,
         members: item.members.clone(),
         registry: item.registry.clone(),
         from: item.from.clone(),

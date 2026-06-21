@@ -761,6 +761,7 @@ mod tests {
             from: Version::new(from),
             to: Version::new(to),
             kind: cooldown_core::UpdateKind::Minor,
+            direct: true,
             members: Vec::new(),
         }
     }

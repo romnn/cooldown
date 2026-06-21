@@ -113,6 +113,7 @@ pub(super) fn resolve_invocation(
             list_packages: global.list_packages,
             paths: global.paths,
             show_projects: global.show_projects,
+            no_suggestions: global.no_suggestions,
             json,
             progress: progress_mode(json, global.log_level),
             concurrency: merged.concurrency.unwrap_or(8),

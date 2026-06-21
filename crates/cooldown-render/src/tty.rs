@@ -2,12 +2,11 @@
 //! that), and styled for the terminal otherwise.
 
 use crate::model::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, MajorUpdate,
-    OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary,
-    Window,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
+    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
-use cooldown_core::{Diagnostic, MemberRef, Status};
+use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status};
 use std::fmt::Write as _;
 
 /// The color of the package-name column (every listed dependency is actionable).
@@ -30,6 +29,8 @@ pub struct RenderOptions {
     /// Add the "Project" column attributing each row to its project. Hidden by default; even when
     /// set, the column only appears if some row's project is not the repo root.
     pub show_projects: bool,
+    /// Suppress actionable tips (e.g. the `--major` command after an `upgrade` holds a major back).
+    pub no_suggestions: bool,
 }
 
 /// Whether the "Used by" column should appear: at least one row attributes a source package.
@@ -180,8 +181,9 @@ fn check_cooldown_cell(window: &Window, age_days: Option<f64>) -> String {
 /// Render the "Used by" column for one dependency: the member packages by name (or by path under
 /// `paths`). Blank when unattributed; with `list_all`, every member on its own line (a multi-line
 /// cell, so the row's other columns stay on the first line); otherwise the shortest label plus a
-/// `(+N others)` count, keeping the summarized cell narrow.
-fn members_cell(members: &[MemberRef], list_all: bool, paths: bool) -> String {
+/// `(+N others)` count, keeping the summarized cell narrow. A transitive dependency (`!direct`) is
+/// the members that *reach* it, prefixed `via …` so it does not read as a direct declarer.
+fn members_cell(members: &[MemberRef], list_all: bool, paths: bool, direct: bool) -> String {
     let mut labels: Vec<String> = members
         .iter()
         .map(|member| {
@@ -197,20 +199,22 @@ fn members_cell(members: &[MemberRef], list_all: bool, paths: bool) -> String {
     if labels.is_empty() {
         return String::new();
     }
-    if list_all {
-        return labels.join("\n");
-    }
-    // Show the shortest label first to keep the column narrow; alphabetical breaks length ties.
-    let first = labels
-        .iter()
-        .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
-        .cloned()
-        .unwrap_or_default();
-    match labels.len() - 1 {
-        0 => first,
-        1 => format!("{first} (+1 other)"),
-        n => format!("{first} (+{n} others)"),
-    }
+    let cell = if list_all {
+        labels.join("\n")
+    } else {
+        // Show the shortest label first to keep the column narrow; alphabetical breaks length ties.
+        let first = labels
+            .iter()
+            .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+            .cloned()
+            .unwrap_or_default();
+        match labels.len() - 1 {
+            0 => first,
+            1 => format!("{first} (+1 other)"),
+            n => format!("{first} (+{n} others)"),
+        }
+    };
+    if direct { cell } else { format!("via {cell}") }
 }
 
 /// Render the `outdated` report.
@@ -227,6 +231,8 @@ pub fn render_outdated(
         list_packages,
         paths,
         show_projects,
+        // Tips only appear in the mutation reports (`upgrade`/`fix`).
+        no_suggestions: _,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() {
@@ -270,7 +276,12 @@ pub fn render_outdated(
             );
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
-                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+                row.push(Cell::new(members_cell(
+                    &it.members,
+                    list_packages,
+                    paths,
+                    it.direct,
+                )));
             }
             if project {
                 row.push(Cell::new(path_label(&it.project)));
@@ -322,6 +333,8 @@ pub fn render_check(
         list_packages,
         paths,
         show_projects,
+        // Tips only appear in the mutation reports (`upgrade`/`fix`).
+        no_suggestions: _,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() {
@@ -364,7 +377,12 @@ pub fn render_check(
             }
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
-                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+                row.push(Cell::new(members_cell(
+                    &it.members,
+                    list_packages,
+                    paths,
+                    it.direct,
+                )));
             }
             if project {
                 row.push(Cell::new(path_label(&it.project)));
@@ -420,6 +438,27 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
+/// The (status word, reason detail, color) for one mutation row — both cells share the color.
+/// `applied_word` is the verb's past tense (`"upgraded"`/`"downgraded"`). A held-back cross-major is
+/// a `skipped` row whose reason is `needs --major`; a clean apply has an empty reason (Status says
+/// it).
+fn mutation_status(it: &UpgradeItem, applied_word: &'static str) -> (&'static str, String, Color) {
+    if it.applied {
+        (applied_word, String::new(), Color::Green)
+    } else if let Some(sk) = &it.skipped {
+        let detail = if sk.reason == SkipReason::NeedsMajor {
+            "needs --major".to_string()
+        } else {
+            sk.message.clone()
+        };
+        ("skipped", detail, Color::Yellow)
+    } else if let Some(e) = &it.error {
+        ("failed", e.message.clone(), Color::Red)
+    } else {
+        ("planned", String::new(), Color::Cyan)
+    }
+}
+
 fn render_mutation(
     verb: &str,
     meta: &UpgradeMeta,
@@ -434,6 +473,7 @@ fn render_mutation(
         list_packages,
         paths,
         show_projects,
+        no_suggestions,
     } = opts;
     let mut out = String::new();
     if items.is_empty() {
@@ -449,29 +489,35 @@ fn render_mutation(
         if project {
             header.push("Project");
         }
-        header.extend(["From", "To", "Kind", "Result"]);
+        // No "Kind" column: for a `0.x` dep the semver-field kind (e.g. `minor`) contradicts a
+        // `needs --major` result, and From/To already shows the size of the jump. "Status" is the
+        // colored one-word outcome; "Reason" is the detail — empty for a clean upgrade (both share
+        // the row's color).
+        header.extend(["From", "To", "Status", "Reason"]);
         t.set_header(header);
+        let applied_word = if verb == "upgrade" {
+            "upgraded"
+        } else {
+            "downgraded"
+        };
         for it in items {
-            let (label, color) = if it.applied {
-                ("applied".to_string(), Color::Green)
-            } else if let Some(sk) = &it.skipped {
-                (format!("skipped: {}", sk.message), Color::Yellow)
-            } else if let Some(e) = &it.error {
-                (format!("error: {}", e.message), Color::Red)
-            } else {
-                ("planned".to_string(), Color::Cyan)
-            };
+            let (status, detail, color) = mutation_status(it, applied_word);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
-                row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
+                row.push(Cell::new(members_cell(
+                    &it.members,
+                    list_packages,
+                    paths,
+                    it.direct,
+                )));
             }
             if project {
                 row.push(Cell::new(path_label(&it.project)));
             }
             row.push(Cell::new(&it.from));
             row.push(Cell::new(&it.to));
-            row.push(Cell::new(format!("{:?}", it.kind).to_lowercase()));
-            row.push(cell_colored(label, color, use_color));
+            row.push(cell_colored(status, color, use_color));
+            row.push(cell_colored(detail, color, use_color));
             t.add_row(row);
         }
         out.push_str(&dim_borders(&t.to_string(), use_color));
@@ -482,10 +528,26 @@ fn render_mutation(
         Some(false) => "lock verification FAILED",
         None => "dry-run (lock untouched)",
     };
+    // The held-back `needs --major` rows are counted in `skipped`; break out how many so the user
+    // sees what is merely a flag away.
+    let names = major_held_back(items);
+    let needs_major = items
+        .iter()
+        .filter(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        })
+        .count();
+    let major_note = if needs_major == 0 {
+        String::new()
+    } else {
+        format!(" ({needs_major} need --major)")
+    };
     let _ = writeln!(
         out,
-        "\n{} applied · {} skipped · {} errors · {}",
-        summary.applied, summary.skipped, summary.errors, lock
+        "\n{} applied · {} skipped{} · {} errors · {}",
+        summary.applied, summary.skipped, major_note, summary.errors, lock
     );
     if meta.build.requested {
         let _ = writeln!(
@@ -498,15 +560,38 @@ fn render_mutation(
             }
         );
     }
-    push_major_available(&mut out, &meta.major_available, use_color);
+    if !no_suggestions {
+        push_major_card(&mut out, &names, use_color);
+    }
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
 }
 
-/// Yellow / green for the cross-major hint, applied only when coloring is on.
-const HINT_HEADER: &str = "\x1b[33m";
-const HINT_CMD: &str = "\x1b[32m";
+/// The distinct package names of the cross-major updates held back as `needs --major` rows (sorted,
+/// deduped across projects) — what the `--major` command in the suggestion card should target.
+fn major_held_back(items: &[UpgradeItem]) -> Vec<&str> {
+    let mut names: Vec<&str> = items
+        .iter()
+        .filter(|it| {
+            it.skipped
+                .as_ref()
+                .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
+        })
+        .map(|it| it.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Colors for the suggestion card (applied only when coloring is on).
+const CARD_BORDER: &str = "\x1b[36m"; // cyan box
+const CARD_TITLE: &str = "\x1b[1;36m"; // bold-cyan "Tip" title
+const CARD_CMD: &str = "\x1b[1;32m"; // bold-green command
 const ANSI_RESET: &str = "\x1b[0m";
+/// Horizontal padding inside the card, and how far the whole card is indented from the margin.
+const CARD_PAD: usize = 2;
+const CARD_INDENT: &str = "  ";
 
 fn paint(text: &str, ansi: &str, use_color: bool) -> String {
     if use_color {
@@ -516,49 +601,70 @@ fn paint(text: &str, ansi: &str, use_color: bool) -> String {
     }
 }
 
-/// Render the cross-major hint after an `upgrade`: the adoptable major updates a default (major-off)
-/// run held back, each as `name  from → to`, plus the exact `--major` command to adopt them. Nothing
-/// is emitted for `fix` or `upgrade --major` (the list is empty there). The whole point is that the
-/// user not be left wondering why an `outdated`-listed update was silently skipped.
-fn push_major_available(out: &mut String, updates: &[MajorUpdate], use_color: bool) {
-    if updates.is_empty() {
+/// Render a free-floating "Tip" card suggesting the exact `--major` command that adopts the held-back
+/// cross-major updates (`--major` plus a `-p` per distinct package, so the user takes only those).
+///
+/// It is a hand-drawn rounded box with a titled top border, a colored frame, and the command set
+/// apart in green — there is no lightweight Rust equivalent of JS's `boxen`, and drawing it directly
+/// keeps full control of color without fighting a table renderer's ANSI-vs-width accounting. Indented
+/// so it reads as an aside. Suppressed by `--no-suggestions` (the caller checks that).
+fn push_major_card(out: &mut String, names: &[&str], use_color: bool) {
+    if names.is_empty() {
         return;
     }
-    // The same package can be held back in several projects; collapse identical `name from → to`
-    // rows so the listing matches the deduped `-p` command below. The per-project breakdown stays
-    // available in `--json` (which keeps every entry, with its `project`).
-    let mut rows: Vec<&MajorUpdate> = Vec::new();
-    for u in updates {
-        if !rows
-            .iter()
-            .any(|r| r.name == u.name && r.from == u.from && r.to == u.to)
-        {
-            rows.push(u);
-        }
-    }
-    let header = format!(
-        "{} major update{} held back (need --major to adopt):",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" }
-    );
-    let _ = writeln!(out, "\n{}", paint(&header, HINT_HEADER, use_color));
-
-    let name_w = rows.iter().map(|u| u.name.len()).max().unwrap_or(0);
-    let from_w = rows.iter().map(|u| u.from.len()).max().unwrap_or(0);
-    for u in &rows {
-        let _ = writeln!(out, "  {:<name_w$}  {:<from_w$} → {}", u.name, u.from, u.to);
-    }
-
-    // The exact command to adopt them: `--major` plus a `-p` for each distinct package (so the user
-    // takes only these, not every cross-major update in the graph).
-    let mut names: Vec<&str> = rows.iter().map(|u| u.name.as_str()).collect();
-    names.sort_unstable();
-    names.dedup();
     let mut cmd = String::from("cooldown upgrade --major");
     for name in names {
         let _ = write!(cmd, " -p {name}");
     }
-    let _ = writeln!(out, "  run: {}", paint(&cmd, HINT_CMD, use_color));
+    let subject = if names.len() == 1 {
+        "1 package has".to_string()
+    } else {
+        format!("{} packages have", names.len())
+    };
+    let them = if names.len() == 1 { "it" } else { "them" };
+
+    // (line, is_command); empty lines are vertical padding inside the box.
+    let rows = [
+        (String::new(), false),
+        (format!("{subject} a major update available."), false),
+        (format!("To upgrade {them}, run:"), false),
+        (String::new(), false),
+        (cmd, true),
+        (String::new(), false),
+    ];
+    let inner = rows
+        .iter()
+        .map(|(line, _)| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let span = inner + CARD_PAD * 2;
+
+    // Top border carrying the title: `╭─ Tip ─────╮`.
+    let title = "─ Tip ";
+    let fill = "─".repeat(span.saturating_sub(title.chars().count()));
+    let top = if use_color {
+        format!(
+            "{CARD_BORDER}╭─ {ANSI_RESET}{CARD_TITLE}Tip{ANSI_RESET}{CARD_BORDER} {fill}╮{ANSI_RESET}"
+        )
+    } else {
+        format!("╭{title}{fill}╮")
+    };
+    let bar = paint("│", CARD_BORDER, use_color);
+    let bottom = paint(&format!("╰{}╯", "─".repeat(span)), CARD_BORDER, use_color);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{CARD_INDENT}{top}");
+    for (line, is_cmd) in &rows {
+        let body = if *is_cmd {
+            paint(line, CARD_CMD, use_color)
+        } else {
+            line.clone()
+        };
+        let right = " ".repeat(inner - line.chars().count());
+        let pad = " ".repeat(CARD_PAD);
+        let _ = writeln!(out, "{CARD_INDENT}{bar}{pad}{body}{right}{pad}{bar}");
+    }
+    let _ = writeln!(out, "{CARD_INDENT}{bottom}");
 }
 
 /// Render the `explain` derivation.
@@ -643,10 +749,11 @@ mod tests {
         render_check, render_fix, render_outdated, render_upgrade,
     };
     use crate::{
-        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, MajorUpdate,
-        OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeMeta, UpgradeSummary, Window,
+        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
+        OutdatedStatus, OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
+        Window,
     };
-    use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
+    use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef, SkipReason, UpdateKind};
 
     /// Members whose name is the given string and whose path is `path/<name>`.
     fn members(names: &[&str]) -> Vec<MemberRef> {
@@ -715,35 +822,57 @@ mod tests {
 
     #[test]
     fn members_cell_blank_when_unattributed() {
-        assert_eq!(members_cell(&[], false, false), "");
-        assert_eq!(members_cell(&[], true, true), "");
+        assert_eq!(members_cell(&[], false, false, true), "");
+        assert_eq!(members_cell(&[], true, true, false), "");
     }
 
     #[test]
     fn members_cell_shows_shortest_name_first_then_count() {
         // The shortest label leads (keeps the column narrow); alphabetical breaks length ties.
-        assert_eq!(members_cell(&members(&["solo"]), false, false), "solo");
         assert_eq!(
-            members_cell(&members(&["bbb", "aa"]), false, false),
+            members_cell(&members(&["solo"]), false, false, true),
+            "solo"
+        );
+        assert_eq!(
+            members_cell(&members(&["bbb", "aa"]), false, false, true),
             "aa (+1 other)"
         );
         assert_eq!(
-            members_cell(&members(&["apps/admin", "zz", "apps/web"]), false, false),
+            members_cell(
+                &members(&["apps/admin", "zz", "apps/web"]),
+                false,
+                false,
+                true
+            ),
             "zz (+2 others)"
         );
     }
 
     #[test]
+    fn members_cell_transitive_is_prefixed_via() {
+        // A transitive dep is attributed to the members that pull it in, prefixed `via`.
+        assert_eq!(
+            members_cell(&members(&["bbb", "aa"]), false, false, false),
+            "via aa (+1 other)"
+        );
+        // An unattributed transitive is still blank.
+        assert_eq!(members_cell(&[], false, false, false), "");
+    }
+
+    #[test]
     fn members_cell_lists_all_sorted_on_separate_lines() {
         assert_eq!(
-            members_cell(&members(&["b", "a", "c"]), true, false),
+            members_cell(&members(&["b", "a", "c"]), true, false, true),
             "a\nb\nc"
         );
     }
 
     #[test]
     fn members_cell_paths_mode_uses_path() {
-        assert_eq!(members_cell(&members(&["pkg"]), false, true), "path/pkg");
+        assert_eq!(
+            members_cell(&members(&["pkg"]), false, true, true),
+            "path/pkg"
+        );
     }
 
     #[test]
@@ -936,113 +1065,202 @@ mod tests {
                 list_packages: false,
                 paths: false,
                 show_projects: false,
+                no_suggestions: false,
             },
         );
 
         assert!(out.starts_with("No dependencies match the current display filters."));
     }
 
-    #[test]
-    fn upgrade_surfaces_held_back_major_updates_with_a_runnable_command() {
-        // The ruff/dogfooding scenario: a default (major-off) upgrade applies nothing, but two
-        // cross-major updates are adoptable. They must be visible — with the exact command to take
-        // them — so the user is not left wondering why `outdated` listed them.
-        let meta = UpgradeMeta {
+    /// An `upgrade` item for `name` held back by the major gate (`needs --major`).
+    fn needs_major_item(
+        name: &str,
+        from: &str,
+        to: &str,
+        kind: UpdateKind,
+        project: &str,
+    ) -> UpgradeItem {
+        UpgradeItem {
+            name: name.into(),
+            tool: "cargo".into(),
+            project: project.into(),
+            direct: true,
+            members: Vec::new(),
+            registry: None,
+            from: from.into(),
+            to: to.into(),
+            kind,
             applied: false,
-            lock_verified: None,
-            build: BuildInfo {
-                requested: false,
-                ok: None,
+            skipped: Some(SkippedInfo {
+                reason: SkipReason::NeedsMajor,
+                message: SkipReason::NeedsMajor.message().to_string(),
+                offending: None,
+            }),
+            error: None,
+        }
+    }
+
+    fn render_upgrade_of(items: &[UpgradeItem]) -> String {
+        render_upgrade(
+            &UpgradeMeta {
+                applied: false,
+                lock_verified: None,
+                build: BuildInfo {
+                    requested: false,
+                    ok: None,
+                },
             },
-            major_available: vec![
-                MajorUpdate {
-                    name: "fs4".into(),
-                    project: ".".into(),
-                    from: "0.13.1".into(),
-                    to: "1.1.0".into(),
-                },
-                MajorUpdate {
-                    name: "toml_edit".into(),
-                    project: ".".into(),
-                    from: "0.23.10+spec-1.0.0".into(),
-                    to: "0.25.12+spec-1.1.0".into(),
-                },
-            ],
-        };
-        let out = render_upgrade(
-            &meta,
             &UpgradeSummary {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
             },
-            &[],
+            items,
             &[],
             &[],
             &RenderOptions::default(),
+        )
+    }
+
+    #[test]
+    fn upgrade_renders_held_back_majors_as_needs_major_rows_with_a_command() {
+        // The dogfooding scenario: a default (major-off) upgrade holds back two cross-major updates.
+        // They render as `skipped` rows whose Result is `needs --major`, are broken out in the
+        // summary, and the exact command to adopt them is offered in the suggestion card.
+        let items = [
+            needs_major_item("fs4", "0.13.1", "1.1.0", UpdateKind::Major, "."),
+            needs_major_item(
+                "toml_edit",
+                "0.23.10+spec-1.0.0",
+                "0.25.12+spec-1.1.0",
+                UpdateKind::Minor,
+                ".",
+            ),
+        ];
+        let out = render_upgrade_of(&items);
+        assert!(
+            out.contains("needs --major"),
+            "Result detail missing:\n{out}"
         );
         assert!(
-            out.contains("2 major updates held back (need --major to adopt):"),
-            "header missing:\n{out}"
+            out.contains("2 need --major"),
+            "summary breakout missing:\n{out}"
         );
-        assert!(out.contains("fs4") && out.contains("→ 1.1.0"), "{out}");
-        assert!(
-            out.contains("toml_edit") && out.contains("→ 0.25.12+spec-1.1.0"),
-            "{out}"
-        );
-        // The exact, scoped re-run command — deduped and sorted, so it takes only these two.
+        assert!(out.contains("fs4") && out.contains("1.1.0"), "{out}");
+        // The exact, scoped command — sorted, so it takes only these two — offered in the card.
         assert!(
             out.contains("cooldown upgrade --major -p fs4 -p toml_edit"),
-            "runnable command missing:\n{out}"
+            "suggestion command missing:\n{out}"
         );
     }
 
     #[test]
-    fn major_hint_collapses_duplicate_rows_across_projects() {
-        // The same package held back in two projects must render as ONE row (and one `-p` flag),
-        // not two identical-looking lines — the per-project detail lives in `--json`.
-        let meta = UpgradeMeta {
-            applied: false,
-            lock_verified: None,
-            build: BuildInfo {
-                requested: false,
-                ok: None,
-            },
-            major_available: vec![
-                MajorUpdate {
-                    name: "widget".into(),
-                    project: "apps/a".into(),
-                    from: "1.0.0".into(),
-                    to: "2.0.0".into(),
-                },
-                MajorUpdate {
-                    name: "widget".into(),
-                    project: "apps/b".into(),
-                    from: "1.0.0".into(),
-                    to: "2.0.0".into(),
-                },
-            ],
-        };
+    fn no_suggestions_hides_the_tip_but_keeps_the_rows_and_tally() {
+        let items = [needs_major_item(
+            "fs4",
+            "0.13.1",
+            "1.1.0",
+            UpdateKind::Major,
+            ".",
+        )];
         let out = render_upgrade(
-            &meta,
+            &UpgradeMeta {
+                applied: false,
+                lock_verified: None,
+                build: BuildInfo {
+                    requested: false,
+                    ok: None,
+                },
+            },
             &UpgradeSummary {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
             },
+            &items,
             &[],
             &[],
-            &[],
-            &RenderOptions::default(),
+            &RenderOptions {
+                no_suggestions: true,
+                ..RenderOptions::default()
+            },
+        );
+        // The row and the tally still appear — only the suggestion card is suppressed.
+        assert!(out.contains("needs --major"), "{out}");
+        assert!(out.contains("1 need --major"), "{out}");
+        assert!(
+            !out.contains("cooldown upgrade --major"),
+            "the suggestion card must be hidden under --no-suggestions:\n{out}"
         );
         assert!(
-            out.contains("1 major update held back"),
-            "duplicate rows should collapse to one (singular header):\n{out}"
+            !out.contains("major update available"),
+            "the card text must be hidden too:\n{out}"
         );
-        // `widget` appears exactly twice: once in the single row, once in the `-p` command — not a
-        // third time from an un-collapsed duplicate row.
-        assert_eq!(out.matches("widget").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn major_command_dedups_a_package_held_back_in_several_projects() {
+        // The same package held back in two projects yields ONE `-p` flag and one tally entry per
+        // distinct name — so the suggested command is never `-p widget -p widget`.
+        let items = [
+            needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/a"),
+            needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/b"),
+        ];
+        let out = render_upgrade_of(&items);
+        // Two held-back rows (one per project) → the tally counts both, but the command targets the
+        // one distinct package once.
+        assert!(out.contains("2 need --major"), "{out}");
         assert!(out.contains("cooldown upgrade --major -p widget"), "{out}");
+        assert!(
+            !out.contains("-p widget -p widget"),
+            "command must dedup the package:\n{out}"
+        );
+    }
+
+    #[test]
+    fn suggestion_card_is_titled_and_colored_when_color_is_on() {
+        let items = [needs_major_item(
+            "fs4",
+            "0.13.1",
+            "1.1.0",
+            UpdateKind::Major,
+            ".",
+        )];
+        let out = render_upgrade(
+            &UpgradeMeta {
+                applied: false,
+                lock_verified: None,
+                build: BuildInfo {
+                    requested: false,
+                    ok: None,
+                },
+            },
+            &UpgradeSummary {
+                applied: 0,
+                skipped: 1,
+                errors: 0,
+            },
+            &items,
+            &[],
+            &[],
+            &RenderOptions {
+                use_color: true,
+                ..RenderOptions::default()
+            },
+        );
+        // The border and the title are separated by color escapes, so check them independently.
+        assert!(
+            out.contains('╭') && out.contains("Tip"),
+            "titled rounded box missing:\n{out}"
+        );
+        assert!(
+            out.contains("cooldown upgrade --major -p fs4"),
+            "command missing:\n{out}"
+        );
+        assert!(
+            out.contains('\u{1b}'),
+            "the card should carry color when use_color is on:\n{out}"
+        );
     }
 
     #[test]
@@ -1055,7 +1273,6 @@ mod tests {
                     requested: false,
                     ok: None,
                 },
-                major_available: Vec::new(),
             },
             &UpgradeSummary {
                 applied: 0,
@@ -1098,6 +1315,7 @@ mod tests {
                 list_packages: false,
                 paths: false,
                 show_projects: false,
+                no_suggestions: false,
             },
         );
 

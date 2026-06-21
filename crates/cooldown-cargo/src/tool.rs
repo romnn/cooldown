@@ -130,7 +130,13 @@ impl ToolRead for CargoTool {
                 direct,
                 artifacts: Vec::new(),
                 graph_floor,
-                members: graph.direct_members(id),
+                // Direct deps are attributed to their declarers; a transitive dep is attributed to
+                // the members that reach it through the graph (rendered as "via …").
+                members: if direct {
+                    graph.direct_members(id)
+                } else {
+                    graph.reaching_members(id)
+                },
                 pinned: graph.is_exact_pinned(&info.name, &info.version),
             });
         }
@@ -326,6 +332,7 @@ mod tests {
             from: Version::new("1.0.0"),
             to: Version::new("1.0.1"),
             kind: cooldown_core::UpdateKind::Patch,
+            direct: true,
             members: Vec::new(),
         };
         let err = CoreError::ToolSpawn {
