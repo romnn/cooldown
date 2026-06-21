@@ -46,7 +46,6 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 futures.workspace = true
-fs4.workspace = true
 globset.workspace = true
 ignore.workspace = true
 tracing.workspace = true

@@ -2,8 +2,7 @@
 //! project state.
 
 use cooldown_core::CoreError;
-use fs4::fs_std::FileExt;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
 
 /// Holds an OS-backed exclusive lock on `<root>/.cooldown.lock` for the lifetime of the value.
@@ -22,14 +21,16 @@ impl ProjectLock {
             .write(true)
             .truncate(false)
             .open(&path)?;
-        match file.try_lock_exclusive() {
-            Ok(true) => {}
-            Ok(false) => {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
                 return Err(CoreError::LockConflict(format!(
                     "{path} is locked by another mutating cooldown run"
                 )));
             }
-            Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+            Err(TryLockError::Error(e)) => {
+                return Err(CoreError::Filesystem(format!("{path}: {e}")));
+            }
         }
 
         file.set_len(0)?;
