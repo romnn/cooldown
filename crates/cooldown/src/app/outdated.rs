@@ -218,9 +218,15 @@ impl<'a> OutdatedRunner<'a> {
     ) -> OutdatedItem {
         let verdict = evaluate(dep, releases, &pctx.policy.layers, rctx, self.ws.now());
 
-        // Prefer a candidate's window; fall back to a current-pin resolution when there is none.
-        let window = if let Some(c) = verdict.candidates.last() {
-            render_window(&c.window, self.ws.now())
+        // The candidate whose cooldown the report displays: the newest by default, or the soonest to
+        // mature under `--countdown soonest`. Both the `window` and `candidate_age_days` below read
+        // from this one candidate so the cooldown cell stays internally consistent (`age/window`).
+        let shown = verdict.cooldown_candidate(self.opts.cooldown_horizon, self.ws.now());
+
+        // Prefer the shown candidate's window; fall back to a current-pin resolution when there is
+        // no candidate at all (up to date / commit pin).
+        let window = if let Some(candidate) = shown {
+            render_window(&candidate.window, self.ws.now())
         } else {
             let q = ResolveQuery {
                 tool: pctx.tool,
@@ -235,13 +241,26 @@ impl<'a> OutdatedRunner<'a> {
             )
         };
 
-        // The age of the newest candidate — the version whose `window` is shown above — so the
+        // The age of the shown candidate — the version whose `window` is shown above — so the
         // report can read its cooldown position as `age/window` (e.g. `13d/14d`, almost adoptable).
-        let candidate_age_days = verdict
+        let candidate_age_days = shown
+            .and_then(|candidate| candidate.published_at)
+            .map(|published| age_days(published, self.ws.now()));
+
+        // Under `--countdown soonest` the cooldown can count down to a version no other column names
+        // (an intermediate that matures before the newest candidate). Label that version so the cell
+        // is unambiguous; in the default `latest` view the shown candidate *is* the newest one, so
+        // there is nothing to add. Compare against the newest candidate (not `verdict.latest`, which
+        // also counts an unclassifiable newest release that never became a candidate) so the default
+        // view stays byte-identical: under `Latest`, `shown` is exactly `candidates.last()`.
+        let newest = verdict
             .candidates
             .last()
-            .and_then(|c| c.published_at)
-            .map(|published| age_days(published, self.ws.now()));
+            .map(|candidate| &candidate.version);
+        let cooldown_version = shown
+            .map(|candidate| &candidate.version)
+            .filter(|&version| Some(version) != newest)
+            .map(ToString::to_string);
 
         let latest = verdict.latest.as_ref().map(|lv| {
             let published = releases
@@ -265,6 +284,7 @@ impl<'a> OutdatedRunner<'a> {
             members: dep.members.clone(),
             window,
             candidate_age_days,
+            cooldown_version,
             status: verdict.status.into(),
             adoptable_target: verdict.adoptable_target.map(|v| v.to_string()),
             latest,
@@ -311,6 +331,7 @@ fn error_item(
             clamped_by: None,
         },
         candidate_age_days: None,
+        cooldown_version: None,
         status: OutdatedStatus::Error,
         adoptable_target: None,
         latest: None,

@@ -89,6 +89,9 @@ pub(super) fn resolve_invocation(
                 cooldown_core::RewriteMode::Auto
             },
             transitive: merged.transitive.unwrap_or(false),
+            // A display control, read straight from the CLI (not config-file backed); absent, the
+            // report counts down to the latest version.
+            cooldown_horizon: overrides.countdown.unwrap_or_default().horizon(),
             downgrade_pinned: merged.downgrade_pinned.unwrap_or(false),
             // `--transitive <mode>` is read straight from the CLI (per-command, not config); absent,
             // each command acts on transitives by default (Enforce).

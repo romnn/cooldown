@@ -91,6 +91,7 @@ mod tests {
                     clamped_by: None,
                 },
                 candidate_age_days: Some(47.0),
+                cooldown_version: None,
                 status: OutdatedStatus::Adoptable,
                 adoptable_target: Some("v0.18.0".into()),
                 latest: Some(LatestInfo {

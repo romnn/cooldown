@@ -75,10 +75,15 @@ pub struct OutdatedItem {
     /// workspace packages); empty when the source cannot be attributed.
     pub members: Vec<MemberRef>,
     pub window: Window,
-    /// Age in (fractional) days of the newest upgrade candidate — the version whose cooldown
+    /// Age in (fractional) days of the shown upgrade candidate — the version whose cooldown
     /// [`window`](OutdatedItem::window) is shown. `None` when there is no newer candidate (up to
     /// date, a commit pin) or its publish time is unknown.
     pub candidate_age_days: Option<f64>,
+    /// The version the cooldown countdown refers to, when it is *not* the
+    /// [`latest`](OutdatedItem::latest) version — e.g. under `--countdown soonest`, where an
+    /// intermediate version matures before the newest one. `None` when the countdown tracks the
+    /// latest version (the default), so no extra label is needed.
+    pub cooldown_version: Option<String>,
     pub status: OutdatedStatus,
     pub adoptable_target: Option<String>,
     pub latest: Option<LatestInfo>,

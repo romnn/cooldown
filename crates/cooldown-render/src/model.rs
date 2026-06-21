@@ -161,11 +161,17 @@ pub struct OutdatedItem {
     pub members: Vec<MemberRef>,
     /// The resolved cooldown [`Window`] applied to this dependency.
     pub window: Window,
-    /// Age in (fractional) days of the newest upgrade candidate — the version whose
+    /// Age in (fractional) days of the shown upgrade candidate — the version whose
     /// [`window`](OutdatedItem::window) is shown. Omitted when there is no newer candidate (up to
     /// date, a commit pin) or its publish time is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_age_days: Option<f64>,
+    /// The version the cooldown countdown refers to, when it is *not* the
+    /// [`latest`](OutdatedItem::latest) version — e.g. under `--countdown soonest`, where an
+    /// intermediate version matures before the newest one. Omitted when the countdown tracks the
+    /// latest version (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_version: Option<String>,
     /// The verdict for this dependency.
     pub status: OutdatedStatus,
     /// The newest version that has matured past its window, if any.

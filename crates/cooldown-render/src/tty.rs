@@ -147,13 +147,23 @@ fn age_over_window_cell(window: &Window, age: &str) -> String {
     with_window_clamp(format!("{age}/{}", fmt_days(window.min_age_days)), window)
 }
 
-/// The `outdated` "Cooldown" cell: the newest candidate's `age/window` (e.g. `13d/14d`) when a
+/// The `outdated` "Cooldown" cell: the shown candidate's `age/window` (e.g. `13d/14d`) when a
 /// newer version exists, or the bare window when there is no candidate. A stricter native /
-/// registry clamp is appended as `(≥<source>)`, matching the rest of the report.
-fn cooldown_cell(window: &Window, candidate_age_days: Option<f64>) -> String {
-    match candidate_age_days {
+/// registry clamp is appended as `(≥<source>)`, matching the rest of the report. When the countdown
+/// refers to a version no other column names (under `--countdown soonest`), that version is appended
+/// in parentheses, e.g. `4d/7d (0.15.17)`.
+fn cooldown_cell(
+    window: &Window,
+    candidate_age_days: Option<f64>,
+    version: Option<&str>,
+) -> String {
+    let cell = match candidate_age_days {
         Some(age) => age_over_window_cell(window, &fmt_days(age)),
         None => with_window_clamp(fmt_days(window.min_age_days), window),
+    };
+    match version {
+        Some(version) => format!("{cell} ({version})"),
+        None => cell,
     }
 }
 
@@ -247,7 +257,11 @@ pub fn render_outdated(
                 .latest
                 .as_ref()
                 .map_or_else(|| "—".into(), |l| l.version.clone());
-            let cooldown = cooldown_cell(&it.window, it.candidate_age_days);
+            let cooldown = cooldown_cell(
+                &it.window,
+                it.candidate_age_days,
+                it.cooldown_version.as_deref(),
+            );
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(&it.members, list_packages, paths)));
@@ -562,8 +576,8 @@ mod tests {
         render_check, render_fix, render_outdated,
     };
     use crate::{
-        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, OutdatedSummary, UpgradeMeta,
-        UpgradeSummary, Window,
+        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
+        OutdatedStatus, OutdatedSummary, UpgradeMeta, UpgradeSummary, Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
 
@@ -590,19 +604,29 @@ mod tests {
         };
 
         // A newer candidate reads as `age/window` — 13 days into a 14-day cooldown.
-        assert_eq!(cooldown_cell(&window(None), Some(13.0)), "13d/14d");
-        assert_eq!(cooldown_cell(&window(None), Some(0.02)), "0d/14d");
-        assert_eq!(cooldown_cell(&window(None), Some(1.5)), "2d/14d");
+        assert_eq!(cooldown_cell(&window(None), Some(13.0), None), "13d/14d");
+        assert_eq!(cooldown_cell(&window(None), Some(0.02), None), "0d/14d");
+        assert_eq!(cooldown_cell(&window(None), Some(1.5), None), "2d/14d");
         // No newer candidate (up to date, commit pin) → just the policy window.
-        assert_eq!(cooldown_cell(&window(None), None), "14d");
+        assert_eq!(cooldown_cell(&window(None), None, None), "14d");
         // A stricter native/registry clamp is appended either way.
         assert_eq!(
-            cooldown_cell(&window(Some("native")), Some(2.0)),
+            cooldown_cell(&window(Some("native")), Some(2.0), None),
             "2d/14d (≥native)"
         );
         assert_eq!(
-            cooldown_cell(&window(Some("native")), None),
+            cooldown_cell(&window(Some("native")), None, None),
             "14d (≥native)"
+        );
+        // Under `--countdown soonest` the cooldown refers to a version no other column names, so it
+        // is appended in parentheses (after any clamp).
+        assert_eq!(
+            cooldown_cell(&window(None), Some(4.0), Some("0.15.17")),
+            "4d/14d (0.15.17)"
+        );
+        assert_eq!(
+            cooldown_cell(&window(Some("native")), Some(4.0), Some("0.15.17")),
+            "4d/14d (≥native) (0.15.17)"
         );
     }
 
@@ -713,6 +737,51 @@ mod tests {
         assert!(!out.contains(" Age "));
         assert!(!out.contains(" Window "));
         assert!(out.contains("13d/14d"));
+    }
+
+    #[test]
+    fn outdated_cooldown_cell_labels_a_non_latest_countdown() {
+        // The ruff `--countdown soonest` row: the cooldown counts down to 0.15.17, which no other
+        // column names, so the cell labels it — `4d/7d (0.15.17)`.
+        let summary = OutdatedSummary {
+            total: 1,
+            adoptable: 1,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        };
+        let item = OutdatedItem {
+            name: "ruff".into(),
+            tool: "uv".into(),
+            project: ".".into(),
+            registry: None,
+            direct: true,
+            current: "0.15.15".into(),
+            members: Vec::new(),
+            window: Window {
+                min_age_days: 7.0,
+                source: "default".into(),
+                clamped_by: None,
+            },
+            candidate_age_days: Some(4.0),
+            cooldown_version: Some("0.15.17".into()),
+            status: OutdatedStatus::Adoptable,
+            adoptable_target: Some("0.15.16".into()),
+            latest: Some(LatestInfo {
+                version: "0.15.18".into(),
+                published_at: None,
+                age_days: None,
+            }),
+            error: None,
+        };
+        let out = render_outdated(&summary, &[item], &[], &[], &RenderOptions::default());
+        assert!(
+            out.contains("4d/7d (0.15.17)"),
+            "cooldown cell should label the soonest version:\n{out}"
+        );
     }
 
     #[test]
