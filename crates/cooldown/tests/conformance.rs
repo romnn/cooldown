@@ -395,6 +395,133 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
 }
 
 #[tokio::test]
+async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
+    // The ruff scenario: locked at 0.15.15 with three newer patches under the default 7-day window
+    // (now = 2026-06-17, cutoff 2026-06-10). 0.15.16 has matured (adoptable); 0.15.17 and 0.15.18 are
+    // still cooling. 0.15.18 is the freshest (newest), but 0.15.17 unlocks three days sooner.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "ruff".to_string(),
+        vec![
+            rel("0.15.15", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "0.15.16",
+                1,
+                Some("2026-06-05T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ), // matured
+            rel(
+                "0.15.17",
+                2,
+                Some("2026-06-13T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ), // cooling, matures soonest
+            rel(
+                "0.15.18",
+                3,
+                Some("2026-06-16T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ), // cooling, the newest
+        ],
+    );
+    let make = || {
+        workspace(
+            fake(
+                root.clone(),
+                vec![dep("ruff", "0.15.15", true)],
+                vec![],
+                releases.clone(),
+                HashMap::new(),
+            ),
+            Baseline::default(),
+        )
+    };
+
+    // Default horizon (latest): the Cooldown column tracks the freshest version, 0.15.18 (age 1d).
+    // It needs no version label because that is exactly what the Latest column already shows.
+    let latest = make().outdated(&opts()).await;
+    let item = latest
+        .items
+        .iter()
+        .find(|i| i.name == "ruff")
+        .expect("ruff");
+    assert_eq!(item.status, OutdatedStatus::Adoptable);
+    assert_eq!(item.adoptable_target.as_deref(), Some("0.15.16"));
+    assert_eq!(item.latest.as_ref().unwrap().version, "0.15.18");
+    assert_eq!(item.candidate_age_days, Some(1.0));
+    assert_eq!(item.cooldown_version, None);
+
+    // Soonest horizon: the Cooldown column tracks 0.15.17 (age 4d) — the next version to mature —
+    // while adoptable/latest are unchanged, because the choice is display-only. Because 0.15.17 is
+    // not the latest version, it is labelled so the cell reads `4d/7d (0.15.17)`.
+    let soonest_opts = RunOpts {
+        cooldown_horizon: CooldownHorizon::Soonest,
+        ..opts()
+    };
+    let soonest = make().outdated(&soonest_opts).await;
+    let item = soonest
+        .items
+        .iter()
+        .find(|i| i.name == "ruff")
+        .expect("ruff");
+    assert_eq!(item.status, OutdatedStatus::Adoptable);
+    assert_eq!(item.adoptable_target.as_deref(), Some("0.15.16"));
+    assert_eq!(item.latest.as_ref().unwrap().version, "0.15.18");
+    assert_eq!(item.candidate_age_days, Some(4.0));
+    assert_eq!(item.cooldown_version.as_deref(), Some("0.15.17"));
+}
+
+#[tokio::test]
+async fn outdated_default_view_never_labels_even_with_an_unclassifiable_newest() {
+    // Regression: the default (`latest`) view must never append a `(version)` label. Here the newest
+    // eligible release 0.15.18 is unclassifiable (`kind_from_current = None`), so it is `verdict.latest`
+    // yet never becomes a candidate; the shown candidate is the next one down, 0.15.17. The label is
+    // suppressed by comparing the shown version against the newest *candidate* (not `verdict.latest`),
+    // so the cell stays bare — byte-identical to the pre-feature output.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "ruff".to_string(),
+        vec![
+            rel("0.15.15", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "0.15.16",
+                1,
+                Some("2026-06-05T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ), // adoptable
+            rel(
+                "0.15.17",
+                2,
+                Some("2026-06-13T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ), // cooling, the newest *candidate*
+            rel("0.15.18", 3, Some("2026-06-16T00:00:00Z"), None), // newest eligible, but unclassifiable → skipped as a candidate
+        ],
+    );
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("ruff", "0.15.15", true)],
+            vec![],
+            releases,
+            HashMap::new(),
+        ),
+        Baseline::default(),
+    );
+    let out = ws.outdated(&opts()).await;
+    let item = out.items.iter().find(|i| i.name == "ruff").expect("ruff");
+    // `latest` reports the unclassifiable newest; the cooldown tracks the newest candidate, unlabelled.
+    assert_eq!(item.latest.as_ref().unwrap().version, "0.15.18");
+    assert_eq!(item.candidate_age_days, Some(4.0));
+    assert_eq!(
+        item.cooldown_version, None,
+        "the default view must not label the cooldown version"
+    );
+}
+
+#[tokio::test]
 async fn upgrade_readopts_a_matured_indirect_while_fix_leaves_it() {
     // A fix-downgrade is not a permanent pin: once the newer version of an indirect dep clears the
     // window, `upgrade` moves it forward again, while `fix` (downgrade-only) never does.
@@ -1063,9 +1190,9 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
     assert!(
-        out.warnings
-            .iter()
-            .any(|warning| warning.message.contains("left in place by --transitive allow")),
+        out.warnings.iter().any(|warning| warning
+            .message
+            .contains("left in place by --transitive allow")),
         "the allowed transitive is reported"
     );
 }
