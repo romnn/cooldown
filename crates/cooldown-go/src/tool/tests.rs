@@ -250,6 +250,51 @@ fn old_import_path_for_cross_major() {
     );
 }
 
+#[test]
+fn old_import_path_for_cross_major_downgrade() {
+    // `fix --major` rolling /v3 back to /v2: the old path is derived from `from`'s major, the new
+    // path is the rewritten package name.
+    let to_v2 = Change {
+        package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+        from: Version::new("v3.0.1"),
+        to: Version::new("v2.9.0"),
+        kind: UpdateKind::Major,
+        direct: true,
+        members: Vec::new(),
+    };
+    assert_eq!(
+        crate::mutation::old_import_path(&to_v2),
+        Some("example.com/foo/v3".to_string())
+    );
+
+    // /v2 back to the v1 base path: the rewritten package name carries no `/vN` suffix, but the old
+    // `/v2` imports must still be rewritten to the base — the case the old `path_major.is_empty()`
+    // guard wrongly skipped.
+    let to_v1 = Change {
+        package: PackageId::new(GO_ID, "example.com/foo", None),
+        from: Version::new("v2.0.1"),
+        to: Version::new("v1.9.0"),
+        kind: UpdateKind::Major,
+        direct: true,
+        members: Vec::new(),
+    };
+    assert_eq!(
+        crate::mutation::old_import_path(&to_v1),
+        Some("example.com/foo/v2".to_string())
+    );
+
+    // A same-major downgrade changes no import path (old == new).
+    let same_major = Change {
+        package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+        from: Version::new("v2.0.1"),
+        to: Version::new("v2.0.0"),
+        kind: UpdateKind::Patch,
+        direct: true,
+        members: Vec::new(),
+    };
+    assert_eq!(crate::mutation::old_import_path(&same_major), None);
+}
+
 fn dep(name: &str, current: &str) -> Dependency {
     Dependency {
         package: PackageId::new(GO_ID, name, None),
@@ -484,4 +529,62 @@ async fn releases_do_not_fetch_info_for_versions_older_than_the_current_pin() {
         .find(|r| r.version.as_str() == "v1.3.0")
         .expect("newer release present");
     assert!(newer.published_at.is_some());
+}
+
+#[tokio::test]
+async fn releases_discover_lower_major_paths_for_cross_major_downgrade() {
+    // A /v2 module under `--major`: discovery walks DOWN to the v1 base path so `fix` can roll a
+    // too-fresh pin back across the major boundary. The upward probes find nothing (empty lists).
+    let routes = HashMap::from([
+        ("/example.com/mod/v2/@v/list".to_string(), (200, "v2.0.0\n")),
+        (
+            "/example.com/mod/v2/@v/v2.0.0.info".to_string(),
+            (200, r#"{"Version":"v2.0.0","Time":"2026-03-01T00:00:00Z"}"#),
+        ),
+        ("/example.com/mod/v3/@v/list".to_string(), (200, "")),
+        ("/example.com/mod/v4/@v/list".to_string(), (200, "")),
+        ("/example.com/mod/@v/list".to_string(), (200, "v1.9.0\n")),
+        (
+            "/example.com/mod/@v/v1.9.0.info".to_string(),
+            (200, r#"{"Version":"v1.9.0","Time":"2026-01-01T00:00:00Z"}"#),
+        ),
+    ]);
+    let server = TestServer::new(routes);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
+    let tool = GoTool::new(crate::proxy::GoProxy::new(
+        http,
+        vec![ProxyBase {
+            url: server.base_url.clone(),
+            fallback_on_errors: false,
+        }],
+    ));
+    let repo = tempfile::tempdir().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+    let project = project(&root);
+
+    let releases = tool
+        .releases(
+            &dep("example.com/mod/v2", "v2.0.0"),
+            &fetch_ctx(&project),
+            CandidateScope::AllowCrossMajor,
+        )
+        .await
+        .expect("cross-major downgrade discovery");
+
+    let versions: Vec<&str> = releases.iter().map(|r| r.version.as_str()).collect();
+    assert!(
+        versions.contains(&"v1.9.0"),
+        "the lower-major downgrade candidate is discovered: {versions:?}"
+    );
+    assert!(
+        versions.contains(&"v2.0.0"),
+        "the current pin is present: {versions:?}"
+    );
+    // The lower-major candidate is attributed to the v1 base path (an empty path-major).
+    let v1 = releases
+        .iter()
+        .find(|r| r.version.as_str() == "v1.9.0")
+        .expect("v1.9.0 present");
+    assert_eq!(v1.major.0, "");
 }

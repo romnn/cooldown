@@ -47,22 +47,28 @@ pub(crate) fn rewrite_imports(
 
 pub(crate) fn old_import_path(change: &Change) -> Option<String> {
     let new_path = &change.package.name;
-    let (prefix, path_major, ok) = semver::split_path_version(new_path);
-    // `ok` only means the path is well-formed; `path_major` is empty when the new path carries no
-    // `/vN` suffix. A module with no suffix is not path-versioned — a `+incompatible` module like
-    // `github.com/docker/cli` stays on one import path across its v2+ majors — so there is nothing
-    // to rewrite. Without this guard the v2+ `from` major would synthesize a bogus `…/vN` old path
-    // and trigger a spurious import-tree scan.
-    if !ok || path_major.is_empty() {
+    let (prefix, _path_major, ok) = semver::split_path_version(new_path);
+    if !ok {
         return None;
     }
+    // A `+incompatible` module (e.g. `github.com/docker/cli`) stays on one import path across its v2+
+    // majors, so there is nothing to rewrite — and synthesizing a `…/vN` old path would trigger a
+    // spurious import-tree scan. The current pin's `+incompatible` marker is what identifies it; the
+    // new path's suffix cannot, since a legitimate downgrade *to* the v1 base path also has none.
+    if semver::is_incompatible(change.from.as_str()) {
+        return None;
+    }
+    // The old import path is the one for `from`'s major (`new_path` already encodes `to`'s major); v1
+    // lives at the base path. A move that does not change the path (same major, or a base↔base patch)
+    // has nothing to rewrite.
     let from_major = semver::major(change.from.as_str());
     let n: u32 = from_major.trim_start_matches('v').parse().ok()?;
-    if n <= 1 {
-        Some(prefix)
+    let old = if n <= 1 {
+        prefix
     } else {
-        Some(semver::major_path(&prefix, n))
-    }
+        semver::major_path(&prefix, n)
+    };
+    (&old != new_path).then_some(old)
 }
 
 fn capture_import_targets(

@@ -127,7 +127,10 @@ pub(super) async fn releases(
         .map(|release| (module.clone(), release))
         .collect();
     if candidates == CandidateScope::AllowCrossMajor {
-        for path in discover_major_paths(proxy, module).await? {
+        let mut cross_paths = discover_major_paths(proxy, module).await?;
+        // Lower majors too, so `fix --major` can cross a major boundary downward.
+        cross_paths.extend(discover_lower_major_paths(proxy, module).await?);
+        for path in cross_paths {
             let package = PackageId::new(super::GO_ID, path.clone(), registry.clone());
             for release in proxy.releases(&package).await? {
                 raw.push((path.clone(), release));
@@ -207,13 +210,14 @@ pub(super) fn classify_kind(current: &str, candidate: &str) -> Option<UpdateKind
     }
 }
 
-/// Discover higher major-version module paths (`prefix/v2`, `/v3`, …) for cross-major candidates.
-async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<String>> {
+/// The `(prefix, current major)` of a module *path* — `1` for a v0/v1/base path — or `None` when the
+/// path is not a well-formed module path to discover other majors from.
+fn path_current_major(module: &str) -> Option<(String, u32)> {
     let (prefix, path_major, ok) = semver::split_path_version(module);
     if !ok {
-        return Ok(Vec::new());
+        return None;
     }
-    let current_major: u32 = if path_major.is_empty() {
+    let major = if path_major.is_empty() {
         1
     } else {
         path_major
@@ -221,6 +225,15 @@ async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<Strin
             .trim_start_matches('v')
             .parse()
             .unwrap_or(1)
+    };
+    Some((prefix, major))
+}
+
+/// Discover higher major-version module paths (`prefix/v2`, `/v3`, …) for cross-major *upgrade*
+/// candidates. Walks up from the current major, stopping after two consecutive misses (or `+8`).
+async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<String>> {
+    let Some((prefix, current_major)) = path_current_major(module) else {
+        return Ok(Vec::new());
     };
     let mut found = Vec::new();
     let mut misses = 0;
@@ -235,6 +248,30 @@ async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<Strin
             misses = 0;
         }
         next_major += 1;
+    }
+    Ok(found)
+}
+
+/// Discover lower major-version module paths (`prefix/v2`, …, the base `prefix` for v1) so a `fix`
+/// downgrade can roll a too-fresh pin back across a major boundary (`/v3` → `/v2`, or `/v2` → the v1
+/// base path). The range is bounded by the current major, and a v0/v1 module has no lower path, so
+/// this is a no-op for the common case and only probes the rare v2+ module.
+async fn discover_lower_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<String>> {
+    let Some((prefix, current_major)) = path_current_major(module) else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for major in (1..current_major).rev() {
+        // Go's v1 lives at the base path (`example.com/foo`) with no `/v1` suffix — except gopkg.in,
+        // whose v1 is `gopkg.in/pkg.v1`, which `major_path` builds (it only special-cases the base).
+        let path = if major == 1 && !prefix.starts_with("gopkg.in/") {
+            prefix.clone()
+        } else {
+            semver::major_path(&prefix, major)
+        };
+        if !proxy.list(&path).await?.is_empty() {
+            found.push(path);
+        }
     }
     Ok(found)
 }

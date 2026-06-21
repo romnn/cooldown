@@ -240,16 +240,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .iter()
                 .find(|candidate| candidate.version == target)
                 .map_or(cooldown_core::UpdateKind::Minor, |candidate| candidate.kind);
-            let current_major = releases
-                .iter()
-                .find(|release| release.version == dep.current)
-                .map_or(MajorKey(String::new()), |release| release.major.clone());
-            let target_major = releases
-                .iter()
-                .find(|release| release.version == target)
-                .map(|release| release.major.clone())
-                .unwrap_or(current_major.clone());
-            let package = target_package(&dep, &current_major, &target_major);
+            let package = target_package_for(&releases, &dep, &target);
             planned.push(Change {
                 package,
                 from: dep.current.clone(),
@@ -409,8 +400,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|release| release.version == target)
                 .and_then(|release| release.kind_from_current)
                 .unwrap_or(UpdateKind::Minor);
+            // A cross-major downgrade (Go `/v3` → `/v2`, or `/v2` → the v1 base path) changes the
+            // import path; `target_package_for` reconstructs it (a no-op for same-major moves and for
+            // tools whose name is stable across majors).
             planned.push(Change {
-                package: dep.package.clone(),
+                package: target_package_for(&releases, &dep, &target),
                 from: dep.current.clone(),
                 to: target,
                 kind,
@@ -820,27 +814,46 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 }
 
+/// The target [`PackageId`] for a move from `dep.current` to `target`, derived from the matching
+/// releases' major keys — rewriting a Go `/vN` path-major and keeping the name stable otherwise.
+/// Shared by the upgrade and fix planners.
+fn target_package_for(releases: &[Release], dep: &Dependency, target: &Version) -> PackageId {
+    let current_major = releases
+        .iter()
+        .find(|release| release.version == dep.current)
+        .map_or(MajorKey(String::new()), |release| release.major.clone());
+    let target_major = releases
+        .iter()
+        .find(|release| release.version == *target)
+        .map(|release| release.major.clone())
+        .unwrap_or(current_major.clone());
+    target_package(&dep.package, &current_major, &target_major)
+}
+
 /// Reconstruct the target `PackageId`, handling Go-style `/vN` path-major changes (the `MajorKey`
 /// is a path suffix). For tools where the package name is stable across majors, the name is kept.
 fn target_package(
-    dep: &Dependency,
+    package: &PackageId,
     current_major: &MajorKey,
     target_major: &MajorKey,
 ) -> PackageId {
     let suffix = &target_major.0;
+    // A Go `MajorKey` is a path suffix (`/v2`, `.v2`); a registry tool's is version-derived (`1`).
+    // Rewrite the path on any cross-major Go move — including a downgrade to the v1 base path, where
+    // the *current* major is the suffix and the target is empty (so checking only `suffix` misses it).
+    let is_path_major = |key: &str| key.starts_with('/') || key.starts_with('.');
     let name = if current_major.0 != target_major.0
-        && (suffix.starts_with('/') || suffix.starts_with('.'))
+        && (is_path_major(&current_major.0) || is_path_major(suffix))
     {
-        let prefix = dep
-            .package
+        let prefix = package
             .name
             .strip_suffix(&current_major.0)
-            .unwrap_or(&dep.package.name);
+            .unwrap_or(&package.name);
         format!("{prefix}{suffix}")
     } else {
-        dep.package.name.clone()
+        package.name.clone()
     };
-    PackageId::new(dep.package.tool, name, dep.package.registry.clone())
+    PackageId::new(package.tool, name, package.registry.clone())
 }
 
 fn plan_item(
@@ -887,4 +900,56 @@ fn record_skip_item(
 ) {
     acc.items
         .push(plan_item(change, project, tool, false, skipped));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_package;
+    use cooldown_core::{MajorKey, PackageId, ToolId};
+
+    fn go(name: &str) -> PackageId {
+        PackageId::new(ToolId("go"), name, None)
+    }
+
+    fn major(key: &str) -> MajorKey {
+        MajorKey(key.to_string())
+    }
+
+    #[test]
+    fn target_package_rewrites_a_go_path_major_in_both_directions() {
+        // Upgrade base → /v2 and /v2 → /v3.
+        assert_eq!(
+            target_package(&go("example.com/foo"), &major(""), &major("/v2")).name,
+            "example.com/foo/v2"
+        );
+        assert_eq!(
+            target_package(&go("example.com/foo/v2"), &major("/v2"), &major("/v3")).name,
+            "example.com/foo/v3"
+        );
+        // Downgrade /v3 → /v2 and /v2 → the v1 base path — the moves `fix --major` now makes.
+        assert_eq!(
+            target_package(&go("example.com/foo/v3"), &major("/v3"), &major("/v2")).name,
+            "example.com/foo/v2"
+        );
+        assert_eq!(
+            target_package(&go("example.com/foo/v2"), &major("/v2"), &major("")).name,
+            "example.com/foo"
+        );
+    }
+
+    #[test]
+    fn target_package_keeps_the_name_when_the_major_is_version_derived() {
+        // A registry tool's `MajorKey` is a bare version axis (`0.23` → `0.25`), not a path suffix,
+        // so the package name is stable across majors.
+        let cargo = PackageId::new(ToolId("cargo"), "toml_edit", Some("crates.io".to_string()));
+        assert_eq!(
+            target_package(&cargo, &major("0.23"), &major("0.25")).name,
+            "toml_edit"
+        );
+        // A same-major move keeps the name too.
+        assert_eq!(
+            target_package(&go("example.com/foo/v2"), &major("/v2"), &major("/v2")).name,
+            "example.com/foo/v2"
+        );
+    }
 }
