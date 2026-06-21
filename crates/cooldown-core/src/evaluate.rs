@@ -617,4 +617,63 @@ mod tests {
         assert!(verdict.current.graph_held);
         assert_eq!(verdict.target, None);
     }
+
+    #[test]
+    fn cooldown_horizon_picks_latest_or_soonest_to_mature() {
+        // Mirrors the ruff scenario: locked at 0.15.15 with three newer patches. With a 7-day window
+        // and now = 2026-06-17 (cutoff 2026-06-10), 0.15.16 has matured (adoptable) while 0.15.17 and
+        // 0.15.18 are still cooling. 0.15.18 is the freshest, but 0.15.17 matures three days sooner.
+        let now: Timestamp = "2026-06-17T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("0.15.15", 0, "2026-01-01T00:00:00Z"),
+            dated("0.15.16", 1, "2026-06-05T00:00:00Z"), // matured before the cutoff → adoptable
+            dated("0.15.17", 2, "2026-06-13T00:00:00Z"), // cooling, matures 2026-06-20
+            dated("0.15.18", 3, "2026-06-16T00:00:00Z"), // cooling, matures 2026-06-23 (the newest)
+        ];
+        let verdict = evaluate(
+            &fix_dep("0.15.15"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+
+        // The horizon never moves the decision: 0.15.16 is adoptable, 0.15.18 is the latest.
+        assert_eq!(verdict.adoptable_target, Some(Version::new("0.15.16")));
+        assert_eq!(verdict.latest, Some(Version::new("0.15.18")));
+
+        // `Latest` (the default) reports the newest candidate; `Soonest` reports the cooling
+        // candidate that unlocks first — 0.15.17, not the freshest 0.15.18.
+        let latest = verdict
+            .cooldown_candidate(crate::CooldownHorizon::Latest, now)
+            .expect("a candidate");
+        assert_eq!(latest.version, Version::new("0.15.18"));
+        let soonest = verdict
+            .cooldown_candidate(crate::CooldownHorizon::Soonest, now)
+            .expect("a candidate");
+        assert_eq!(soonest.version, Version::new("0.15.17"));
+    }
+
+    #[test]
+    fn soonest_horizon_falls_back_to_newest_when_nothing_cools() {
+        // Every newer release has already matured (cutoff 2026-06-10), so there is no cooling
+        // candidate to count down to — `Soonest` then matches `Latest` (the newest candidate).
+        let now: Timestamp = "2026-06-17T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("0.15.15", 0, "2026-01-01T00:00:00Z"),
+            dated("0.15.16", 1, "2026-06-01T00:00:00Z"),
+            dated("0.15.17", 2, "2026-06-05T00:00:00Z"),
+        ];
+        let verdict = evaluate(
+            &fix_dep("0.15.15"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+        let soonest = verdict
+            .cooldown_candidate(crate::CooldownHorizon::Soonest, now)
+            .expect("a candidate");
+        assert_eq!(soonest.version, Version::new("0.15.17"));
+    }
 }

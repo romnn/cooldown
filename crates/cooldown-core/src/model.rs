@@ -3,6 +3,7 @@
 //! the tool hands back releases already classified, carrying an opaque ordering token and the
 //! update-kind relative to the current pin.
 
+use crate::duration::since;
 use crate::policy::ResolvedWindow;
 use camino::Utf8PathBuf;
 use std::fmt;
@@ -385,6 +386,35 @@ pub struct Candidate {
     pub published_at: Option<jiff::Timestamp>,
 }
 
+impl Candidate {
+    /// How long this candidate must still wait to mature past its window at `now`: the gap between
+    /// its publish instant and the window [`cutoff`](ResolvedWindow::cutoff). Positive while the
+    /// candidate is cooling, non-positive once it has matured. `None` when the publish time is
+    /// unknown — an [`UnknownAge`](Status::UnknownAge) candidate never matures, so it has no
+    /// countdown. Used to order cooling candidates for [`CooldownHorizon::Soonest`].
+    fn time_to_mature(&self, now: jiff::Timestamp) -> Option<jiff::SignedDuration> {
+        self.published_at
+            .map(|published| since(published, self.window.cutoff(now)))
+    }
+}
+
+/// Which still-cooling upgrade the `outdated` report's cooldown countdown tracks when more than one
+/// newer version exists. Both variants leave the *decision* untouched — what is adoptable and the
+/// headline [`Status`] are unchanged; they only choose which candidate's `age/window` the report
+/// surfaces in its cooldown column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CooldownHorizon {
+    /// Track the newest eligible candidate — "how long until the latest version matures". The
+    /// default, and what the report has always shown.
+    #[default]
+    Latest,
+    /// Track the still-cooling candidate that matures first — "how long until the *next* upgrade
+    /// unlocks". When an intermediate version clears its window days before the newest release does,
+    /// this surfaces that nearer date instead. Falls back to the newest candidate when nothing is
+    /// currently cooling.
+    Soonest,
+}
+
 /// The aggregate verdict for a dependency over its candidate set.
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -396,6 +426,36 @@ pub struct Verdict {
     pub latest: Option<Version>,
     /// The per-candidate verdicts in ascending release order; the newest candidate is last.
     pub candidates: Vec<Candidate>,
+}
+
+impl Verdict {
+    /// The candidate whose cooldown countdown the `outdated` report should display under `horizon`.
+    ///
+    /// [`Latest`](CooldownHorizon::Latest) is the newest candidate (the last one).
+    /// [`Soonest`](CooldownHorizon::Soonest) is the still-[`InCooldown`](Status::InCooldown)
+    /// candidate that will mature first — useful when an intermediate version clears its window days
+    /// before the newest release does — and falls back to the newest candidate when none are
+    /// currently cooling. `None` only when there is no candidate at all (up to date, or a commit
+    /// pin). The choice is presentation-only: it never affects `adoptable_target`, `latest`, or
+    /// `status`.
+    #[must_use]
+    pub fn cooldown_candidate(
+        &self,
+        horizon: CooldownHorizon,
+        now: jiff::Timestamp,
+    ) -> Option<&Candidate> {
+        match horizon {
+            CooldownHorizon::Latest => self.candidates.last(),
+            CooldownHorizon::Soonest => self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.status == Status::InCooldown)
+                .filter_map(|candidate| Some((candidate, candidate.time_to_mature(now)?)))
+                .min_by_key(|&(_, remaining)| remaining)
+                .map(|(candidate, _)| candidate)
+                .or_else(|| self.candidates.last()),
+        }
+    }
 }
 
 /// The verdict over the currently-locked release (the `check` gate). `graph_held`/`graph_floor`
