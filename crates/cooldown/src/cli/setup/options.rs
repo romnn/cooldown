@@ -112,6 +112,7 @@ pub(super) fn resolve_invocation(
             // Pure presentation flags, read straight from the CLI (not config-file backed).
             list_packages: global.list_packages,
             paths: global.paths,
+            show_projects: global.show_projects,
             json,
             progress: progress_mode(json, global.log_level),
             concurrency: merged.concurrency.unwrap_or(8),

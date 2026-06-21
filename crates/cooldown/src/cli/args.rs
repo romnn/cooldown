@@ -338,6 +338,11 @@ pub(in crate::cli) struct GlobalArgs {
     /// Show the "Used by" column as workspace paths instead of package names.
     #[arg(long = "paths", global = true)]
     pub(in crate::cli) paths: bool,
+    /// Add the "Project" column attributing each row to its project. Hidden by default: the
+    /// "Used by" package names usually identify a row, so the per-project path is mostly noise.
+    /// No effect in a single-root repo (there is no distinct project to show).
+    #[arg(long = "show-projects", global = true)]
+    pub(in crate::cli) show_projects: bool,
     /// Downgrade a stale/absent lock from failure (the default) to a warning.
     #[arg(
         long = "allow-stale-lock",

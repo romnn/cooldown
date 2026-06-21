@@ -11,6 +11,7 @@ fn render_options(ctx: &CommandContext<'_>) -> render::tty::RenderOptions {
         use_color: ctx.color,
         list_packages: ctx.opts.list_packages,
         paths: ctx.opts.paths,
+        show_projects: ctx.opts.show_projects,
     }
 }
 

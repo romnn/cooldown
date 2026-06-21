@@ -26,6 +26,9 @@ pub struct RenderOptions {
     pub list_packages: bool,
     /// Show the "Used by" column as workspace paths instead of package names.
     pub paths: bool,
+    /// Add the "Project" column attributing each row to its project. Hidden by default; even when
+    /// set, the column only appears if some row's project is not the repo root.
+    pub show_projects: bool,
 }
 
 /// Whether the "Used by" column should appear: at least one row attributes a source package.
@@ -33,8 +36,9 @@ fn has_attribution<T>(items: &[T], members: impl Fn(&T) -> &[MemberRef]) -> bool
     items.iter().any(|it| !members(it).is_empty())
 }
 
-/// Whether the "Project" column should appear: some row's project is not just the root. A repo whose
-/// only project is the root (`.`) gains no column; multi-project trees (uv packages) keep it.
+/// Whether some row's project is not just the root — a precondition for the opt-in "Project" column
+/// (`--show-projects`). A repo whose only project is the root (`.`) has nothing to attribute, so the
+/// column stays hidden even when the flag is set; multi-project trees (uv packages) can show it.
 fn has_distinct_project<T>(items: &[T], project: impl Fn(&T) -> &str) -> bool {
     items.iter().any(|it| !is_root_path(project(it)))
 }
@@ -221,6 +225,7 @@ pub fn render_outdated(
         use_color,
         list_packages,
         paths,
+        show_projects,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() {
@@ -233,7 +238,7 @@ pub fn render_outdated(
         }
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = has_distinct_project(items, |it| it.project.as_str());
+        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -315,6 +320,7 @@ pub fn render_check(
         use_color,
         list_packages,
         paths,
+        show_projects,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() {
@@ -325,7 +331,7 @@ pub fn render_check(
         );
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = has_distinct_project(items, |it| it.project.as_str());
+        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -426,13 +432,14 @@ fn render_mutation(
         use_color,
         list_packages,
         paths,
+        show_projects,
     } = opts;
     let mut out = String::new();
     if items.is_empty() {
         let _ = writeln!(out, "Nothing to {verb}.");
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = has_distinct_project(items, |it| it.project.as_str());
+        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -785,6 +792,68 @@ mod tests {
     }
 
     #[test]
+    fn outdated_project_column_is_opt_in() {
+        // Two rows in distinct (non-root) projects: there *is* a project to attribute, but the
+        // column only appears once the user opts in with `--show-projects`.
+        let summary = OutdatedSummary {
+            total: 2,
+            adoptable: 2,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        };
+        let item = |project: &str| OutdatedItem {
+            name: "ruff".into(),
+            tool: "uv".into(),
+            project: project.into(),
+            registry: None,
+            direct: true,
+            current: "0.15.15".into(),
+            members: Vec::new(),
+            window: Window {
+                min_age_days: 7.0,
+                source: "default".into(),
+                clamped_by: None,
+            },
+            candidate_age_days: Some(4.0),
+            cooldown_version: None,
+            status: OutdatedStatus::Adoptable,
+            adoptable_target: Some("0.15.16".into()),
+            latest: None,
+            error: None,
+        };
+        let items = [item("maintenance/rag"), item("packages/api")];
+
+        // Hidden by default, even though the projects are distinct.
+        let hidden = render_outdated(&summary, &items, &[], &[], &RenderOptions::default());
+        assert!(
+            !hidden.contains("Project"),
+            "Project column should be hidden by default:\n{hidden}"
+        );
+        assert!(!hidden.contains("maintenance/rag"));
+
+        // `--show-projects` brings the column (and the project paths) back.
+        let shown = render_outdated(
+            &summary,
+            &items,
+            &[],
+            &[],
+            &RenderOptions {
+                show_projects: true,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(
+            shown.contains("Project"),
+            "Project column should appear under --show-projects:\n{shown}"
+        );
+        assert!(shown.contains("maintenance/rag"));
+    }
+
+    #[test]
     fn empty_filtered_outdated_table_does_not_claim_up_to_date() {
         let summary = OutdatedSummary {
             total: 6,
@@ -806,6 +875,7 @@ mod tests {
                 use_color: false,
                 list_packages: false,
                 paths: false,
+                show_projects: false,
             },
         );
 
@@ -863,6 +933,7 @@ mod tests {
                 use_color: false,
                 list_packages: false,
                 paths: false,
+                show_projects: false,
             },
         );
 

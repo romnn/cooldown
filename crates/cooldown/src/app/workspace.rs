@@ -188,6 +188,9 @@ pub struct RunOpts {
     pub list_packages: bool,
     /// `--paths`: render the "Used by" column as workspace paths instead of package names.
     pub paths: bool,
+    /// `--show-projects`: add the per-project "Project" column to the dependency tables. Hidden by
+    /// default, since the "Used by" names usually suffice and the path is mostly noise.
+    pub show_projects: bool,
     /// `--json`: machine-readable output (never changes the exit code).
     pub json: bool,
     /// Where coarse progress notes go while the command runs.
