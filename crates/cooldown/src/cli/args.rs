@@ -126,9 +126,11 @@ pub(in crate::cli) enum Command {
     },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
-        /// How to treat too-fresh *transitive* deps dragged in by the re-lock. Default: reconcile
-        /// them down to a matured version so the new lock is gate-clean. `hide` leaves the graph
-        /// alone (direct-only); `allow` reports them but doesn't roll them back.
+        /// How to treat *transitive* (indirect) deps. Default: move them too — advance each to its
+        /// newest matured version, and reconcile any too-fresh one a re-lock drags in back down, so
+        /// the new lock is gate-clean. `hide` is direct-only (transitives untouched); `allow` still
+        /// advances the graph but leaves a floated-up too-fresh transitive in place (reported, not
+        /// rolled back).
         #[arg(long, value_enum, value_name = "MODE")]
         transitive: Option<TransitiveMode>,
         /// Also compile/sync after re-locking.

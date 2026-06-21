@@ -395,6 +395,69 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
 }
 
 #[tokio::test]
+async fn upgrade_readopts_a_matured_indirect_while_fix_leaves_it() {
+    // A fix-downgrade is not a permanent pin: once the newer version of an indirect dep clears the
+    // window, `upgrade` moves it forward again, while `fix` (downgrade-only) never does.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "t".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            // Newer, and now itself matured past the 7-day window (cutoff 2026-06-10).
+            rel(
+                "v1.0.1",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+        ],
+    );
+    // A direct dep with nothing newer, so only the indirect `t` could move.
+    releases.insert(
+        "a".to_string(),
+        vec![rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None)],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+
+    let make = || {
+        workspace(
+            fake(
+                root.clone(),
+                vec![dep("a", "v2.0.0", true)],
+                vec![dep("t", "v1.0.0", false)],
+                releases.clone(),
+                locked.clone(),
+            ),
+            Baseline::default(),
+        )
+    };
+
+    // `fix` never moves a dep forward — `t@v1.0.0` is already matured, so it is left untouched.
+    let fixed = make().fix(&opts()).await;
+    assert_eq!(fixed.summary.applied, 0);
+    assert!(fixed.items.is_empty());
+
+    // `upgrade` re-adopts the newest matured version of the indirect dep.
+    let upgraded = make().upgrade(&opts()).await;
+    assert_eq!(upgraded.summary.applied, 1);
+    let item = upgraded
+        .items
+        .iter()
+        .find(|item| item.name == "t")
+        .expect("t advanced");
+    assert_eq!(item.to, "v1.0.1");
+}
+
+#[tokio::test]
 async fn outdated_transitive_scopes_in_indirect_deps() {
     let (_g, root) = tmp_root();
     let mut releases = HashMap::new();

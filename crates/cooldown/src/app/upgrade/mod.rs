@@ -75,12 +75,17 @@ impl<'a> UpgradeCtx<'a> {
 }
 
 impl Workspace {
-    /// Move direct deps to the newest version older than the cooldown, applying changes one at a
-    /// time and re-locking after each.
+    /// Move every dependency to the newest version that has matured past the cooldown, applying
+    /// changes one at a time and re-locking after each.
     ///
-    /// If a re-lock drags in a too-fresh, non-baselined transitive, only the files that change may
-    /// have touched are restored and that change is reported as skipped — never committing a state
-    /// a subsequent `check` would reject. With `--dry-run` the plan is reported without mutation.
+    /// By default this works the whole resolved graph (`opts.transitive_mode`): direct *and* indirect
+    /// deps advance to their newest matured version, so an indirect dep a `fix` rolled back is
+    /// re-adopted once its newer version clears the window. `Hide` narrows to direct deps; `Allow`
+    /// leaves floated-up transitives in place. After the forward moves, the graph is reconciled —
+    /// any too-fresh transitive a re-lock dragged in is rolled back — so a single `upgrade` ends
+    /// gate-clean. If a forced fresh transitive can't be reconciled, that change is restored and
+    /// reported as skipped, never committing a state a subsequent `check` would reject. With
+    /// `--dry-run` the plan is reported without mutation.
     pub async fn upgrade(&self, opts: &RunOpts) -> UpgradeOutcome {
         self.run_plan(opts, PlanMode::Upgrade).await
     }

@@ -104,7 +104,7 @@ min-age = "14d"
 | Command            | What it does                                                                 |
 | ------------------ | ---------------------------------------------------------------------------- |
 | `outdated`         | What could update, split into adoptable-now vs in-cooldown.                  |
-| `upgrade`          | Move direct deps to the newest version older than the cooldown; re-locks.    |
+| `upgrade`          | Move the whole graph (direct + indirect) to the newest matured version; re-locks. |
 | `fix`              | Downgrade too-fresh deps to a matured version to clear a `check` violation.  |
 | `check`            | The CI gate over the resolved lockfile graph (fail-closed).                  |
 | `baseline`         | Record currently-young deps as acknowledged so `check` adopts cleanly.       |

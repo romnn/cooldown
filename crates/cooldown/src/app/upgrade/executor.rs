@@ -164,13 +164,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
-        // `fix` evaluates the whole resolved graph unless transitives are hidden; `upgrade` plans
-        // forward moves on direct deps only (its graph reconciliation is a separate post-lock pass).
-        let scope = match self.mode {
-            PlanMode::Fix { transitive, .. } if transitive != TransitiveGate::Hide => {
-                DepScope::Graph
-            }
-            _ => DepScope::Direct,
+        // Both commands work the whole resolved graph by default: `upgrade` moves every dep (direct
+        // and indirect) toward its newest matured version, `fix` rolls too-fresh ones back. So an
+        // indirect dep a `fix` rolled back is re-adopted by `upgrade` once its newer version clears
+        // the window — the downgrade is a floor, not a pin. `--transitive hide` narrows to direct.
+        let transitive = match self.mode {
+            PlanMode::Fix { transitive, .. } => transitive,
+            PlanMode::Upgrade => self.transitive_mode(),
+        };
+        let scope = if transitive == TransitiveGate::Hide {
+            DepScope::Direct
+        } else {
+            DepScope::Graph
         };
         match self
             .ws
