@@ -21,6 +21,7 @@ use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
 use cooldown_uv::pypi::PYPI;
 use cooldown_uv::version;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 
 /// The per-tool knobs the generic adapter needs: identity, the lockfile it reads, the driver
@@ -35,6 +36,11 @@ pub trait CondaLayout: Send + Sync + 'static {
 
     /// Parses the lock into its resolved conda/PyPI dependency list.
     fn parse(content: &str) -> Vec<CondaDep>;
+
+    /// The package names declared in the project's *source* manifest (`environment.yml` /
+    /// `pixi.toml`), so the resolved lock can be split direct vs. transitive — the lock itself does
+    /// not say. `None` when no manifest is found, so the caller treats every locked package as direct.
+    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>>;
 
     /// The driver args that re-pin `name` to `version`.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
@@ -57,6 +63,13 @@ impl CondaLayout for CondaLock {
         lock::parse_conda_lock(content)
     }
 
+    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
+        let content = std::fs::read_to_string(root.join("environment.yml"))
+            .or_else(|_| std::fs::read_to_string(root.join("environment.yaml")))
+            .ok()?;
+        Some(lock::environment_yml_direct(&content))
+    }
+
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
         vec!["install".into(), "-y".into(), format!("{name}={version}")]
     }
@@ -73,6 +86,11 @@ impl CondaLayout for Pixi {
 
     fn parse(content: &str) -> Vec<CondaDep> {
         lock::parse_pixi_lock(content)
+    }
+
+    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
+        let content = std::fs::read_to_string(root.join("pixi.toml")).ok()?;
+        Some(lock::pixi_toml_direct(&content))
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -163,18 +181,27 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         }
     }
 
-    async fn dependencies(&self, project: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
-        // conda-world locks do not mark which packages are direct vs transitive, so every resolved
-        // package is reported (and treated as direct); both scopes see the same set.
+    async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        // conda-world locks do not mark direct vs. transitive, so cross-reference the source manifest
+        // (`environment.yml` / `pixi.toml`): a package named there is direct, the rest transitive. The
+        // split lets `--major` rewrite direct deps across a major while leaving transitives capped.
+        // When no manifest is found, fall back to treating every resolved package as direct.
         let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let direct = L::direct_names(&project.root).filter(|names| !names.is_empty());
         let mut deps = Vec::new();
         for entry in L::parse(&content) {
+            let is_direct = direct
+                .as_ref()
+                .is_none_or(|names| names.contains(&lock::normalize_name(&entry.name)));
+            if scope == DepScope::Direct && !is_direct {
+                continue;
+            }
             let registry = if entry.conda { CONDA } else { PYPI };
             deps.push(Dependency {
                 package: PackageId::new(L::ID, entry.name, Some(registry.to_string())),
                 current: Version::new(entry.version.clone()),
                 current_quality: classify_quality(&entry.version),
-                direct: true,
+                direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 members: Vec::new(),

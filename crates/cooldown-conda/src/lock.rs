@@ -189,6 +189,108 @@ fn pypi_from_url(url: &str) -> Option<CondaDep> {
     })
 }
 
+/// Normalize a package name so the manifest's spelling matches the lock's. PyPI names are
+/// case-insensitive and fold runs of `-`, `_`, `.` to a single `-` (PEP 503); conda names lower-case
+/// the same way. So `scikit-learn`/`scikit_learn`, `Flask`/`flask`, and `ruamel.yaml`/`ruamel-yaml`
+/// all compare equal — the manifest and the URL-derived lock name need not be spelled identically.
+#[must_use]
+pub fn normalize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for c in name.trim().chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !prev_sep {
+                out.push('-');
+            }
+            prev_sep = true;
+        } else {
+            out.extend(c.to_lowercase());
+            prev_sep = false;
+        }
+    }
+    out
+}
+
+/// The conda/PyPI package name of a manifest dependency entry, stripped of a channel prefix
+/// (`conda-forge::numpy`), version constraint (`numpy>=1.20`), or extras (`requests[security]`).
+/// `None` for a blank or nested-mapping entry.
+fn spec_name(spec: &str) -> Option<String> {
+    let cleaned = clean(spec);
+    let bare = cleaned.rsplit("::").next().unwrap_or(cleaned.as_str());
+    let end = bare
+        .find(['=', '<', '>', '!', '~', ' ', '[', ';'])
+        .unwrap_or(bare.len());
+    let name = bare[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The directly-declared package names in an `environment.yml` — every `dependencies:` list entry,
+/// including the names under a nested `- pip:` list. Used to split the resolved lock into direct vs.
+/// transitive (the lock itself does not say). A best-effort line scan, matching the lock parsers.
+#[must_use]
+pub fn environment_yml_direct(content: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut in_deps = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A top-level mapping key (indent 0, not a list item) opens or closes the deps block.
+        if line.starts_with(|c: char| !c.is_whitespace()) && !trimmed.starts_with('-') {
+            in_deps = trimmed.starts_with("dependencies:");
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        let Some(item) = trimmed.strip_prefix('-') else {
+            continue;
+        };
+        let item = item.trim();
+        // `- pip:` (or any nested mapping) is a marker, not a package.
+        if item.is_empty() || item.ends_with(':') {
+            continue;
+        }
+        if let Some(name) = spec_name(item) {
+            names.insert(normalize_name(&name));
+        }
+    }
+    names
+}
+
+/// The directly-declared package names in a `pixi.toml` — the keys of every `[dependencies]`,
+/// `[pypi-dependencies]`, and per-feature `[feature.*.dependencies]` table. Best-effort line scan.
+#[must_use]
+pub fn pixi_toml_direct(content: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut in_deps = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let section = section.trim();
+            in_deps = section == "dependencies"
+                || section == "pypi-dependencies"
+                || section.ends_with(".dependencies")
+                || section.ends_with(".pypi-dependencies");
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        if let Some((key, _)) = trimmed.split_once('=') {
+            let key = normalize_name(&clean(key));
+            if !key.is_empty() {
+                names.insert(key);
+            }
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +326,41 @@ mod tests {
             version: "2.28.0".into(),
             conda: false
         }));
+    }
+
+    #[test]
+    fn normalize_name_folds_case_and_separators() {
+        assert_eq!(normalize_name("Flask"), "flask");
+        assert_eq!(normalize_name("scikit_learn"), "scikit-learn");
+        assert_eq!(normalize_name("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(normalize_name("PyYAML"), "pyyaml");
+        // Runs of separators collapse to a single dash (PEP 503).
+        assert_eq!(normalize_name("foo__bar"), "foo-bar");
+    }
+
+    #[test]
+    fn environment_yml_direct_collects_and_normalizes_names() {
+        let yml = "name: myenv\nchannels:\n  - conda-forge\ndependencies:\n  - python=3.9\n  - conda-forge::numpy>=1.20\n  - pandas\n  - pip\n  - pip:\n    - Flask==2.0\n    - scikit_learn>=1.0\n";
+        let direct = environment_yml_direct(yml);
+        // PEP 503-normalized so the manifest spelling matches the URL-derived lock name
+        // (`Flask`→`flask`, `scikit_learn`→`scikit-learn`).
+        for name in ["python", "numpy", "pandas", "pip", "flask", "scikit-learn"] {
+            assert!(direct.contains(name), "missing {name}: {direct:?}");
+        }
+        // The `pip:` nested-list marker is not itself a package, and `channels:` entries are ignored.
+        assert!(!direct.contains("conda-forge"));
+    }
+
+    #[test]
+    fn pixi_toml_direct_collects_dependency_tables_only() {
+        let toml = "[project]\nname = \"app\"\n\n[dependencies]\npython = \">=3.9\"\nnumpy = \"*\"\n\n[pypi-dependencies]\nFlask = \"*\"\n\n[feature.test.dependencies]\npytest = \"*\"\n\n[tasks]\nrun = \"python app.py\"\n";
+        let direct = pixi_toml_direct(toml);
+        // The `[pypi-dependencies]` key `Flask` is normalized to `flask` to match the lock.
+        for name in ["python", "numpy", "flask", "pytest"] {
+            assert!(direct.contains(name), "missing {name}: {direct:?}");
+        }
+        // Keys of non-dependency tables (`[project]`, `[tasks]`) are not collected.
+        assert!(!direct.contains("name"));
+        assert!(!direct.contains("run"));
     }
 }
