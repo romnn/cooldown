@@ -111,7 +111,16 @@ pub(super) async fn releases(
             listed
         }
     };
-    let own_path = own_path_releases(proxy, module, current, own_versions).await?;
+    // For a downgrade (`fix`/`upgrade` rolling a too-fresh pin back), the publish times of the
+    // versions between the graph floor and the current pin must be known, so time down to the floor —
+    // not just the current pin and newer. The floor is the current pin for a graph-held dep (no extra
+    // work) and usually just below it otherwise, so this stays clear of the historical-tag burst the
+    // timing skip in `own_path_releases` avoids.
+    let timing_floor = dep
+        .graph_floor
+        .as_ref()
+        .map_or(current, |floor| floor.as_str());
+    let own_path = own_path_releases(proxy, module, timing_floor, own_versions).await?;
     // (source_path, raw_release) across the module's own path and discovered higher majors.
     let mut raw: Vec<(String, RawRelease)> = own_path
         .into_iter()
@@ -149,27 +158,31 @@ pub(super) async fn releases(
     Ok(build_releases(current, raw))
 }
 
-/// Build the module's own-path [`RawRelease`]s, fetching publish times only for the current pin and
-/// versions newer than it.
+/// Build the module's own-path [`RawRelease`]s, fetching publish times only for `timing_floor` and
+/// newer.
 ///
-/// A version older than the current pin can never be an upgrade candidate ([`evaluate`] only
-/// considers releases ordered above the current pin) nor the checked pin, so its publish time is
-/// never read. Fetching `.info` for every historical tag just to discard it is what turned a
-/// many-versioned module — the Azure SDK submodules carry ~100 tags each — into a ~100-request burst
-/// per module that tripped the proxy's rate limit on a cold cache and surfaced as spurious `error`
-/// rows. Older versions are still listed (untimed) so semver ordering and the current pin's position
-/// in the release set stay intact.
+/// `timing_floor` is the graph floor (or the current pin when there is no lower floor): `check` and
+/// `outdated` only look up from the current pin, while `fix`/`upgrade` may roll a too-fresh pin down
+/// to the newest matured version the graph still allows, so the publish times of the
+/// `[floor, current)` window must be known too. Versions older than the floor can never be an upgrade
+/// candidate ([`evaluate`] only considers releases ordered above the current pin), the checked pin,
+/// nor a downgrade target (it would fall below the graph floor), so their publish time is never read.
+/// Fetching `.info` for every historical tag just to discard it is what turned a many-versioned
+/// module — the Azure SDK submodules carry ~100 tags each — into a ~100-request burst per module that
+/// tripped the proxy's rate limit on a cold cache and surfaced as spurious `error` rows. Older
+/// versions are still listed (untimed) so semver ordering and the current pin's position in the
+/// release set stay intact.
 ///
 /// [`evaluate`]: cooldown_core::evaluate
 async fn own_path_releases(
     proxy: &GoProxy,
     module: &str,
-    current: &str,
+    timing_floor: &str,
     versions: Vec<String>,
 ) -> Result<Vec<RawRelease>> {
     let (to_time, untimed): (Vec<String>, Vec<String>) = versions
         .into_iter()
-        .partition(|version| semver::compare(version, current) != Ordering::Less);
+        .partition(|version| semver::compare(version, timing_floor) != Ordering::Less);
     let mut releases = proxy.releases_for(module, to_time).await?;
     releases.extend(untimed.into_iter().map(|version| RawRelease {
         version: Version::new(version),

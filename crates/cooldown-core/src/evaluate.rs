@@ -396,9 +396,18 @@ pub fn evaluate_fix(
         };
     }
     let cutoff = pin.window.cutoff(now);
+    // Never roll below the graph floor: the resolved graph requires at least that version, so a lower
+    // one would not actually be selected (and would be re-bumped on the next lock). When the floor is
+    // not among the fetched releases, fall back to no lower bound.
+    let floor_order = dep
+        .graph_floor
+        .as_ref()
+        .and_then(|floor| releases.iter().find(|r| r.version == *floor))
+        .map(|r| r.order.clone());
     let target = releases
         .iter()
         .filter(|r| r.order < current.order)
+        .filter(|r| floor_order.as_ref().is_none_or(|floor| r.order >= *floor))
         .filter(|r| {
             quality_eligible(r, dep.current_quality)
                 && major_eligible(r, &current.major, ctx.allow_major)
@@ -564,6 +573,33 @@ mod tests {
             now,
         );
         assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert_eq!(verdict.target, None);
+    }
+
+    #[test]
+    fn fix_target_never_rolls_below_the_graph_floor() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        // 1.0.0/1.0.1 matured; 1.0.2/1.0.3 are too fresh. The pin is 1.0.3.
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.0.1", 1, "2025-12-15T00:00:00Z"),
+            dated("1.0.2", 2, "2026-01-06T00:00:00Z"),
+            dated("1.0.3", 3, "2026-01-07T00:00:00Z"),
+        ];
+
+        // Floor 1.0.1: the newest matured version at or above the floor is 1.0.1 — that is the target.
+        let mut at_floor = fix_dep("1.0.3");
+        at_floor.graph_floor = Some(Version::new("1.0.1"));
+        let verdict = evaluate_fix(&at_floor, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.target, Some(Version::new("1.0.1")));
+
+        // Floor 1.0.2: the only matured older versions (1.0.0, 1.0.1) sit below the floor, so there
+        // is nothing safe to roll back to — never pick a version the graph forbids.
+        let mut below_floor = fix_dep("1.0.3");
+        below_floor.graph_floor = Some(Version::new("1.0.2"));
+        let verdict = evaluate_fix(&below_floor, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert!(!verdict.current.graph_held, "floor 1.0.2 < pin 1.0.3");
         assert_eq!(verdict.target, None);
     }
 
