@@ -2,8 +2,9 @@
 //! that), and styled for the terminal otherwise.
 
 use crate::model::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
-    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, MajorUpdate,
+    OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary,
+    Window,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, MemberRef, Status};
@@ -497,8 +498,67 @@ fn render_mutation(
             }
         );
     }
+    push_major_available(&mut out, &meta.major_available, use_color);
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
+}
+
+/// Yellow / green for the cross-major hint, applied only when coloring is on.
+const HINT_HEADER: &str = "\x1b[33m";
+const HINT_CMD: &str = "\x1b[32m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+fn paint(text: &str, ansi: &str, use_color: bool) -> String {
+    if use_color {
+        format!("{ansi}{text}{ANSI_RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Render the cross-major hint after an `upgrade`: the adoptable major updates a default (major-off)
+/// run held back, each as `name  from → to`, plus the exact `--major` command to adopt them. Nothing
+/// is emitted for `fix` or `upgrade --major` (the list is empty there). The whole point is that the
+/// user not be left wondering why an `outdated`-listed update was silently skipped.
+fn push_major_available(out: &mut String, updates: &[MajorUpdate], use_color: bool) {
+    if updates.is_empty() {
+        return;
+    }
+    // The same package can be held back in several projects; collapse identical `name from → to`
+    // rows so the listing matches the deduped `-p` command below. The per-project breakdown stays
+    // available in `--json` (which keeps every entry, with its `project`).
+    let mut rows: Vec<&MajorUpdate> = Vec::new();
+    for u in updates {
+        if !rows
+            .iter()
+            .any(|r| r.name == u.name && r.from == u.from && r.to == u.to)
+        {
+            rows.push(u);
+        }
+    }
+    let header = format!(
+        "{} major update{} held back (need --major to adopt):",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    let _ = writeln!(out, "\n{}", paint(&header, HINT_HEADER, use_color));
+
+    let name_w = rows.iter().map(|u| u.name.len()).max().unwrap_or(0);
+    let from_w = rows.iter().map(|u| u.from.len()).max().unwrap_or(0);
+    for u in &rows {
+        let _ = writeln!(out, "  {:<name_w$}  {:<from_w$} → {}", u.name, u.from, u.to);
+    }
+
+    // The exact command to adopt them: `--major` plus a `-p` for each distinct package (so the user
+    // takes only these, not every cross-major update in the graph).
+    let mut names: Vec<&str> = rows.iter().map(|u| u.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut cmd = String::from("cooldown upgrade --major");
+    for name in names {
+        let _ = write!(cmd, " -p {name}");
+    }
+    let _ = writeln!(out, "  run: {}", paint(&cmd, HINT_CMD, use_color));
 }
 
 /// Render the `explain` derivation.
@@ -580,11 +640,11 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 mod tests {
     use super::{
         RenderOptions, check_cooldown_cell, has_distinct_project, members_cell, path_label,
-        render_check, render_fix, render_outdated,
+        render_check, render_fix, render_outdated, render_upgrade,
     };
     use crate::{
-        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
-        OutdatedStatus, OutdatedSummary, UpgradeMeta, UpgradeSummary, Window,
+        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, MajorUpdate,
+        OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeMeta, UpgradeSummary, Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef};
 
@@ -883,6 +943,109 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_surfaces_held_back_major_updates_with_a_runnable_command() {
+        // The ruff/dogfooding scenario: a default (major-off) upgrade applies nothing, but two
+        // cross-major updates are adoptable. They must be visible — with the exact command to take
+        // them — so the user is not left wondering why `outdated` listed them.
+        let meta = UpgradeMeta {
+            applied: false,
+            lock_verified: None,
+            build: BuildInfo {
+                requested: false,
+                ok: None,
+            },
+            major_available: vec![
+                MajorUpdate {
+                    name: "fs4".into(),
+                    project: ".".into(),
+                    from: "0.13.1".into(),
+                    to: "1.1.0".into(),
+                },
+                MajorUpdate {
+                    name: "toml_edit".into(),
+                    project: ".".into(),
+                    from: "0.23.10+spec-1.0.0".into(),
+                    to: "0.25.12+spec-1.1.0".into(),
+                },
+            ],
+        };
+        let out = render_upgrade(
+            &meta,
+            &UpgradeSummary {
+                applied: 0,
+                skipped: 0,
+                errors: 0,
+            },
+            &[],
+            &[],
+            &[],
+            &RenderOptions::default(),
+        );
+        assert!(
+            out.contains("2 major updates held back (need --major to adopt):"),
+            "header missing:\n{out}"
+        );
+        assert!(out.contains("fs4") && out.contains("→ 1.1.0"), "{out}");
+        assert!(
+            out.contains("toml_edit") && out.contains("→ 0.25.12+spec-1.1.0"),
+            "{out}"
+        );
+        // The exact, scoped re-run command — deduped and sorted, so it takes only these two.
+        assert!(
+            out.contains("cooldown upgrade --major -p fs4 -p toml_edit"),
+            "runnable command missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn major_hint_collapses_duplicate_rows_across_projects() {
+        // The same package held back in two projects must render as ONE row (and one `-p` flag),
+        // not two identical-looking lines — the per-project detail lives in `--json`.
+        let meta = UpgradeMeta {
+            applied: false,
+            lock_verified: None,
+            build: BuildInfo {
+                requested: false,
+                ok: None,
+            },
+            major_available: vec![
+                MajorUpdate {
+                    name: "widget".into(),
+                    project: "apps/a".into(),
+                    from: "1.0.0".into(),
+                    to: "2.0.0".into(),
+                },
+                MajorUpdate {
+                    name: "widget".into(),
+                    project: "apps/b".into(),
+                    from: "1.0.0".into(),
+                    to: "2.0.0".into(),
+                },
+            ],
+        };
+        let out = render_upgrade(
+            &meta,
+            &UpgradeSummary {
+                applied: 0,
+                skipped: 0,
+                errors: 0,
+            },
+            &[],
+            &[],
+            &[],
+            &RenderOptions::default(),
+        );
+        assert!(
+            out.contains("1 major update held back"),
+            "duplicate rows should collapse to one (singular header):\n{out}"
+        );
+        // `widget` appears exactly twice: once in the single row, once in the `-p` command — not a
+        // third time from an un-collapsed duplicate row.
+        assert_eq!(out.matches("widget").count(), 2, "{out}");
+        assert!(out.contains("cooldown upgrade --major -p widget"), "{out}");
+    }
+
+    #[test]
     fn empty_fix_report_uses_fix_wording() {
         let out = render_fix(
             &UpgradeMeta {
@@ -892,6 +1055,7 @@ mod tests {
                     requested: false,
                     ok: None,
                 },
+                major_available: Vec::new(),
             },
             &UpgradeSummary {
                 applied: 0,

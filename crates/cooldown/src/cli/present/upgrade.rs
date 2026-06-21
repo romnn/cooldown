@@ -10,6 +10,16 @@ pub(in crate::cli) fn upgrade_meta(meta: &app::UpgradeMeta) -> render::UpgradeMe
             requested: meta.build.requested,
             ok: meta.build.ok,
         },
+        major_available: meta.major_available.iter().map(major_update).collect(),
+    }
+}
+
+fn major_update(update: &app::MajorUpdate) -> render::MajorUpdate {
+    render::MajorUpdate {
+        name: update.name.clone(),
+        project: update.project.clone(),
+        from: update.from.clone(),
+        to: update.to.clone(),
     }
 }
 

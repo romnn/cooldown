@@ -373,6 +373,21 @@ pub struct BuildInfo {
     pub ok: Option<bool>,
 }
 
+/// An adoptable cross-major update `upgrade` held back because `--major` was off — reported so the
+/// user can see it (and how to take it) instead of it silently vanishing from a default run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MajorUpdate {
+    /// The package name.
+    pub name: String,
+    /// The project (manifest/workspace member) the dependency was found in.
+    pub project: String,
+    /// The current (locked) version.
+    pub from: String,
+    /// The adoptable cross-major version `--major` would take.
+    pub to: String,
+}
+
 /// The flattened top-level `meta` for `upgrade` or `fix`: apply/lock/build outcomes.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -383,6 +398,10 @@ pub struct UpgradeMeta {
     pub lock_verified: Option<bool>,
     /// The post-mutation build result.
     pub build: BuildInfo,
+    /// Adoptable cross-major updates not applied because `--major` was off (a hint to re-run with
+    /// it). Empty — and omitted from JSON — for `fix` and for an `upgrade --major` run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub major_available: Vec<MajorUpdate>,
 }
 
 /// One step in an `explain` derivation: a config layer's contribution to the resolved window.

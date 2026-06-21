@@ -315,6 +315,20 @@ pub fn json_schema() -> Value {
                             "ok": { "type": ["boolean", "null"] }
                         },
                         "additionalProperties": false
+                    })),
+                    ("majorAvailable", json!({
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "project", "from", "to"],
+                            "properties": {
+                                "name": { "type": "string" },
+                                "project": { "type": "string" },
+                                "from": { "type": "string" },
+                                "to": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }
                     }))
                 ]),
                 vec!["applied", "lockVerified", "build"],
