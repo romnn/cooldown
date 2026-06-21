@@ -79,9 +79,9 @@ pub(super) fn resolve_invocation(
             exclude_by_tool: BTreeMap::default(),
             allow_major: merged.major.unwrap_or(default_major),
             // A display filter, read straight from the CLI (not config-file backed).
-            hide_pinned: global.hide_pinned,
+            hide_pinned: overrides.hide_pinned.unwrap_or(false),
             // Read straight from the CLI (not config-file backed).
-            rewrite: if global.rewrite {
+            rewrite: if overrides.rewrite.unwrap_or(false) {
                 cooldown_core::RewriteMode::Always
             } else {
                 cooldown_core::RewriteMode::Auto
@@ -115,7 +115,7 @@ pub(super) fn resolve_invocation(
         respect_gitignore: merged.gitignore.unwrap_or(true),
         env_policy: env_window_fields(),
         cli_policy: cli_window_fields(global),
-        strict_native: strict_native_mode(global),
+        strict_native: strict_native_mode(overrides),
     })
 }
 
@@ -165,15 +165,15 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         offline: overrides.offline,
         fresh: overrides.fresh,
         json: overrides.json,
-        exit_code: global.exit_code,
+        exit_code: overrides.exit_code,
         ..CommandConfig::default()
     }
 }
 
-fn strict_native_mode(global: &GlobalArgs) -> StrictNativeMode {
-    if global.no_fail_on_stricter_native {
+fn strict_native_mode(overrides: &CliOverrides) -> StrictNativeMode {
+    if overrides.no_fail_on_stricter_native == Some(true) {
         StrictNativeMode::ForceOff
-    } else if global.fail_on_stricter_native {
+    } else if overrides.fail_on_stricter_native == Some(true) {
         StrictNativeMode::ForceOn
     } else {
         StrictNativeMode::Inherit

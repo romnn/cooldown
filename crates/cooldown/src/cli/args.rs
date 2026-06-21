@@ -102,9 +102,39 @@ pub(in crate::cli) enum Command {
         /// summary line still counts the whole resolved graph.
         #[arg(long)]
         transitive: bool,
+        /// Also list up-to-date deps. Hidden by default so the report shows only deps with something
+        /// to act on; the summary line still counts every dependency.
+        #[arg(long)]
+        all: bool,
+        /// Hide held rows (exact `==`/`=` pins and commit pins) from the table, leaving only deps
+        /// with an actionable update. A held row's `Latest` column still shows what is available.
+        #[arg(long = "hide-pinned")]
+        hide_pinned: bool,
+        /// Exit with this code when adoptable updates exist, for CI gating. Bare `--exit-code` means
+        /// 1, or pass `--exit-code=N`; omitting it keeps `outdated` informational (always exit 0).
+        #[arg(
+            long = "exit-code",
+            value_name = "CODE",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "1"
+        )]
+        exit_code: Option<u8>,
     },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
-    Upgrade,
+    Upgrade {
+        /// Also compile/sync after re-locking.
+        #[arg(long)]
+        build: bool,
+        /// Always rewrite the manifest's version constraint to the adopted version, even for in-range
+        /// moves. By default the constraint is left untouched and only the lock moves, unless the
+        /// target falls outside the current constraint (e.g. a cross-major bump), which always
+        /// rewrites the one owning manifest entry.
+        #[arg(long)]
+        rewrite: bool,
+        #[command(flatten)]
+        mutation: MutationArgs,
+    },
     /// Fix cooldown violations: downgrade too-fresh deps to a matured version (never upgrades).
     Fix {
         /// Also downgrade too-fresh transitive deps, not just direct ones. Dangerous: downgrading a
@@ -115,6 +145,8 @@ pub(in crate::cli) enum Command {
         /// left in place with a warning, since a pin is a deliberate choice.
         #[arg(long = "downgrade-pinned")]
         downgrade_pinned: bool,
+        #[command(flatten)]
+        mutation: MutationArgs,
     },
     /// Exit non-zero if anything resolved is younger than the cooldown (the CI gate).
     Check {
@@ -122,6 +154,14 @@ pub(in crate::cli) enum Command {
         /// them visible but non-fatal; `hide` skips evaluating transitive deps entirely (direct-only).
         #[arg(long, value_enum, value_name = "MODE")]
         transitive: Option<CheckTransitive>,
+        /// Gate every artifact in a universal lock, not just env-relevant ones.
+        #[arg(long = "all-artifacts")]
+        all_artifacts: bool,
+        /// Fail (not just warn) on deps with no publish time.
+        #[arg(long = "fail-on-unknown-age")]
+        fail_on_unknown_age: bool,
+        #[command(flatten)]
+        strict_native: StrictNativeArgs,
     },
     /// Record currently-young deps as acknowledged, so `check` can be adopted cleanly.
     Baseline {
@@ -136,13 +176,37 @@ pub(in crate::cli) enum Command {
         package: String,
     },
     /// The fully-resolved config, with the origin of each value.
-    Config,
+    Config {
+        #[command(flatten)]
+        strict_native: StrictNativeArgs,
+    },
     /// Scaffold a documented starter cooldown.toml (refuses to clobber).
     Init,
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
-    /// Write the resolved policy down into native configs (opt-in; later phase).
+    /// Write the resolved policy down into native configs.
     Sync,
+}
+
+/// Flags shared by the mutating commands (`upgrade`, `fix`). Flattened into each so the flag is
+/// scoped to where it applies (not silently accepted on every command).
+#[derive(Args)]
+pub(in crate::cli) struct MutationArgs {
+    /// Fail (exit 1) if the mutation cannot complete cleanly.
+    #[arg(long)]
+    pub(in crate::cli) strict: bool,
+}
+
+/// Flags shared by the policy-introspection commands (`check`, `config`). Flattened into each so
+/// the strict-native controls are scoped to where they apply.
+#[derive(Args)]
+pub(in crate::cli) struct StrictNativeArgs {
+    /// Fail when repo policy overrides a stricter native value.
+    #[arg(long = "fail-on-stricter-native")]
+    pub(in crate::cli) fail_on_stricter_native: bool,
+    /// Override a config-set `strict-native` (the only way to turn it off).
+    #[arg(long = "no-fail-on-stricter-native")]
+    pub(in crate::cli) no_fail_on_stricter_native: bool,
 }
 
 #[derive(Args)]
@@ -188,11 +252,6 @@ pub(in crate::cli) struct GlobalArgs {
     /// With --major, apply cross-major to ALL eligible deps (else --package is required).
     #[arg(long = "major-all", global = true)]
     pub(in crate::cli) major_all: bool,
-    /// (outdated) Also list up-to-date deps. Hidden by default so the report shows only deps with
-    /// something to act on; the summary line still counts every dependency.
-    #[arg(long, global = true)]
-    pub(in crate::cli) all: bool,
-
     /// Scope the command to matching packages (repeatable).
     #[arg(long, short = 'p', global = true, value_name = "GLOB")]
     pub(in crate::cli) package: Vec<String>,
@@ -214,17 +273,6 @@ pub(in crate::cli) struct GlobalArgs {
     /// themselves ignored). By default detection skips gitignored paths — correct and faster.
     #[arg(long = "no-gitignore", global = true)]
     pub(in crate::cli) no_gitignore: bool,
-    /// (outdated) Exit with this code when adoptable updates exist, for CI gating. Bare `--exit-code`
-    /// means 1, or pass `--exit-code=N`; omitting it keeps `outdated` informational (always exit 0).
-    #[arg(
-        long = "exit-code",
-        global = true,
-        value_name = "CODE",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "1"
-    )]
-    pub(in crate::cli) exit_code: Option<u8>,
     /// Diagnostic log verbosity on stderr (`RUST_LOG` overrides). One of: off, error, warn, info,
     /// debug, trace.
     #[arg(
@@ -236,19 +284,12 @@ pub(in crate::cli) struct GlobalArgs {
         env = "COOLDOWN_LOG"
     )]
     pub(in crate::cli) log_level: LogLevel,
-    /// (outdated) Hide held rows (exact `==`/`=` pins and commit pins) from the table, leaving only
-    /// deps with an actionable update. A held row's `Latest` column still shows what is available.
-    #[arg(long = "hide-pinned", global = true)]
-    pub(in crate::cli) hide_pinned: bool,
     /// List every source package on its own line instead of `first (+N others)`.
     #[arg(long = "list-packages", global = true)]
     pub(in crate::cli) list_packages: bool,
     /// Show the "Used by" column as workspace paths instead of package names.
     #[arg(long = "paths", global = true)]
     pub(in crate::cli) paths: bool,
-    /// (check) gate every artifact in a universal lock, not just env-relevant ones.
-    #[arg(long = "all-artifacts", global = true)]
-    pub(in crate::cli) all_artifacts: bool,
     /// Downgrade a stale/absent lock from failure (the default) to a warning.
     #[arg(
         long = "allow-stale-lock",
@@ -256,27 +297,6 @@ pub(in crate::cli) struct GlobalArgs {
         env = "COOLDOWN_ALLOW_STALE_LOCK"
     )]
     pub(in crate::cli) allow_stale_lock: bool,
-    /// Make `check` fail (not just warn) on deps with no publish time.
-    #[arg(long = "fail-on-unknown-age", global = true)]
-    pub(in crate::cli) fail_on_unknown_age: bool,
-    /// Make `check`/`config` fail when repo policy overrides a stricter native value.
-    #[arg(long = "fail-on-stricter-native", global = true)]
-    pub(in crate::cli) fail_on_stricter_native: bool,
-    /// Override a config-set `strict-native` (the only way to turn it off).
-    #[arg(long = "no-fail-on-stricter-native", global = true)]
-    pub(in crate::cli) no_fail_on_stricter_native: bool,
-    /// (upgrade/fix) fail (exit 1) if the mutation cannot complete cleanly.
-    #[arg(long, global = true)]
-    pub(in crate::cli) strict: bool,
-    /// (upgrade) also compile/sync after re-locking.
-    #[arg(long, global = true)]
-    pub(in crate::cli) build: bool,
-    /// (upgrade) Always rewrite the manifest's version constraint to the adopted version, even for
-    /// in-range moves. By default the constraint is left untouched and only the lock moves, unless
-    /// the target falls outside the current constraint (e.g. a cross-major bump), which always
-    /// rewrites the one owning manifest entry.
-    #[arg(long, global = true)]
-    pub(in crate::cli) rewrite: bool,
     /// Sync the policy into native config (e.g. uv `exclude-newer`) before running this command, so
     /// cooldown.toml stays the source of truth. No-op under `--dry-run`.
     #[arg(long, global = true)]
@@ -339,6 +359,16 @@ pub struct CliOverrides {
     pub(crate) downgrade_pinned: Option<bool>,
     /// `check --transitive <allow|hide>` — the gate's transitive-handling mode, if set on the CLI.
     pub(crate) check_transitive: Option<CheckTransitive>,
+    /// `outdated --exit-code [N]` — the CI gate exit code, if set on the CLI.
+    pub(crate) exit_code: Option<u8>,
+    /// `outdated --hide-pinned` — CLI-only display filter (not config-backed).
+    pub(crate) hide_pinned: Option<bool>,
+    /// `upgrade --rewrite` — CLI-only manifest-rewrite control (not config-backed).
+    pub(crate) rewrite: Option<bool>,
+    /// `check`/`config --fail-on-stricter-native` — CLI-only (not config-backed).
+    pub(crate) fail_on_stricter_native: Option<bool>,
+    /// `check`/`config --no-fail-on-stricter-native` — CLI-only override of a config `strict-native`.
+    pub(crate) no_fail_on_stricter_native: Option<bool>,
     pub(crate) dry_run: Option<bool>,
     pub(crate) offline: Option<bool>,
     pub(crate) fresh: Option<bool>,
@@ -361,13 +391,35 @@ impl CliOverrides {
             },
             // `--no-gitignore` is the only CLI control; the default (on) lives in config/built-in.
             gitignore: set_on_cli(matches, "no_gitignore").then_some(false),
-            all: on("all"),
             major_all: on("major_all"),
-            all_artifacts: on("all_artifacts"),
             allow_stale_lock: on("allow_stale_lock"),
-            fail_on_unknown_age: on("fail_on_unknown_age"),
-            strict: on("strict"),
-            build: on("build"),
+            // Per-command flags: probe the owning subcommand directly. The root never registers
+            // them, so `set_on_cli`'s root `value_source` would panic on an unknown id.
+            all: set_on_subcommand(matches, "outdated", "all").then_some(true),
+            all_artifacts: set_on_subcommand(matches, "check", "all_artifacts").then_some(true),
+            fail_on_unknown_age: set_on_subcommand(matches, "check", "fail_on_unknown_age")
+                .then_some(true),
+            build: set_on_subcommand(matches, "upgrade", "build").then_some(true),
+            hide_pinned: set_on_subcommand(matches, "outdated", "hide_pinned").then_some(true),
+            rewrite: set_on_subcommand(matches, "upgrade", "rewrite").then_some(true),
+            // `--strict` is shared by the mutating commands (flattened into both `upgrade` and `fix`).
+            strict: (set_on_subcommand(matches, "upgrade", "strict")
+                || set_on_subcommand(matches, "fix", "strict"))
+            .then_some(true),
+            // The strict-native pair is shared by `check` and `config`.
+            fail_on_stricter_native: (set_on_subcommand(matches, "check", "fail_on_stricter_native")
+                || set_on_subcommand(matches, "config", "fail_on_stricter_native"))
+            .then_some(true),
+            no_fail_on_stricter_native: (set_on_subcommand(
+                matches,
+                "check",
+                "no_fail_on_stricter_native",
+            ) || set_on_subcommand(
+                matches,
+                "config",
+                "no_fail_on_stricter_native",
+            ))
+            .then_some(true),
             // `--transitive` is a per-command bool on both `outdated` (show transitives) and `fix`
             // (downgrade them); probe each subcommand directly — the root never registers it.
             transitive: (set_on_subcommand(matches, "outdated", "transitive")
@@ -378,6 +430,10 @@ impl CliOverrides {
             check_transitive: matches
                 .subcommand_matches("check")
                 .and_then(|sub| sub.get_one::<CheckTransitive>("transitive").copied()),
+            // `--exit-code [N]` carries an optional value under `outdated`.
+            exit_code: matches
+                .subcommand_matches("outdated")
+                .and_then(|sub| sub.get_one::<u8>("exit_code").copied()),
             dry_run: on("dry_run"),
             offline: on("offline"),
             fresh: on("fresh"),
@@ -454,20 +510,47 @@ mod tests {
 
     #[test]
     fn global_flags_are_detected_before_or_after_the_subcommand() {
-        // After the subcommand (the common form)...
+        // A genuinely global flag propagates whether it comes before or after the subcommand.
         assert_eq!(
-            overrides(&["cooldown", "outdated", "--all"]).all,
+            overrides(&["cooldown", "outdated", "--dry-run"]).dry_run,
             Some(true)
         );
+        assert_eq!(
+            overrides(&["cooldown", "--dry-run", "outdated"]).dry_run,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn per_command_flags_are_captured_from_their_subcommand() {
+        assert_eq!(overrides(&["cooldown", "outdated", "--all"]).all, Some(true));
         assert_eq!(
             overrides(&["cooldown", "upgrade", "--strict"]).strict,
             Some(true)
         );
-        // ...and before it (global args propagate either way).
         assert_eq!(
-            overrides(&["cooldown", "--strict", "upgrade"]).strict,
+            overrides(&["cooldown", "fix", "--strict"]).strict,
             Some(true)
         );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--exit-code=2"]).exit_code,
+            Some(2)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--fail-on-stricter-native"]).fail_on_stricter_native,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn per_command_flags_are_rejected_on_the_wrong_command() {
+        // The whole point of scoping: a flag is an error where it does not apply, not silently
+        // accepted. `--hide-pinned` belongs to `outdated`, not `check`.
+        let parsed = Cli::command().try_get_matches_from(["cooldown", "check", "--hide-pinned"]);
+        assert!(parsed.is_err());
+        // `--strict` belongs to the mutating commands, not `outdated`.
+        let parsed = Cli::command().try_get_matches_from(["cooldown", "outdated", "--strict"]);
+        assert!(parsed.is_err());
     }
 
     #[test]
