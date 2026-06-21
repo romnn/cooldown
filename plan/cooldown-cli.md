@@ -111,8 +111,8 @@ have a matching config key and a `COOLDOWN_*` env var; flags win. **Invocation**
 --min-age <dur>            window: "7d", "2 weeks", "36h", ISO-8601 "P7D" (default 7d)
 --latest                   opt OUT (window = 0) — the explicit, audited escape hatch
 --min-age-major <dur>      per-kind windows (also --min-age-minor, --min-age-patch)
---major                    candidate filter: allow major version changes (default: within current major)
---major-all                with --major, apply cross-major to ALL eligible deps (else --package is required)
+--major                    candidate filter: allow major version changes (default: within current major;
+                           for upgrade/fix applies to every eligible dep unless narrowed with --package)
 --freeze <date>            absolute cutoff instead of a rolling window (reproducible)
 --package <glob>           scope the command to matching packages (repeatable)
 --allow <glob>             exempt matching packages from the cooldown (repeatable, audited)
@@ -168,8 +168,8 @@ Shared vocabulary, different jobs:
   _policy_ selectors.
 
 Cross-major Go upgrades rewrite import paths repo-wide, so bare `cooldown upgrade --major` (no
-`--package`) is rejected — pass `--package` or `--major-all`. `upgrade --include-indirect` is an
-error (acting on transitive is a non-goal).
+`--package`) applies to **every** eligible dependency; narrow it with `--package` to take only a
+subset. `upgrade --include-indirect` is an error (acting on transitive is a non-goal).
 
 ### `check` semantics (precise)
 
