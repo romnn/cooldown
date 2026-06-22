@@ -156,9 +156,9 @@ pub struct RunOpts {
     /// `outdated --transitive`: include transitive (indirect) deps in the report.
     pub transitive: bool,
     /// `--countdown <latest|soonest>` (outdated): which still-cooling upgrade the Cooldown column
-    /// counts down to. [`Latest`](cooldown_core::CooldownHorizon::Latest) tracks the newest version
-    /// (the default); [`Soonest`](cooldown_core::CooldownHorizon::Soonest) tracks the next version to
-    /// mature. Display-only — it changes which candidate's `age/window` the report shows, never what
+    /// counts down to. [`Soonest`](cooldown_core::CooldownHorizon::Soonest) tracks the next version
+    /// to mature (the default); [`Latest`](cooldown_core::CooldownHorizon::Latest) tracks the newest
+    /// version. Display-only — it changes which candidate's `age/window` the report shows, never what
     /// is adoptable.
     pub cooldown_horizon: cooldown_core::CooldownHorizon,
     /// `--downgrade-pinned` (fix): downgrade and rewrite exact-pinned deps too; otherwise a pinned

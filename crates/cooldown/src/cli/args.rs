@@ -103,11 +103,11 @@ pub(crate) enum TransitiveMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[value(rename_all = "kebab-case")]
 pub(crate) enum Countdown {
-    /// Count down to the newest version maturing — the longest wait (the default).
-    #[default]
+    /// Count down to the newest version maturing — the longest wait.
     Latest,
     /// Count down to the next version to mature — the soonest unlock, which an intermediate release
-    /// can reach days before the newest one does.
+    /// can reach days before the newest one does (the default).
+    #[default]
     Soonest,
 }
 
@@ -138,8 +138,8 @@ pub(in crate::cli) enum Command {
         #[arg(long = "hide-pinned")]
         hide_pinned: bool,
         /// Which still-cooling upgrade the "Cooldown" column counts down to when several newer
-        /// versions exist: `latest` (the newest version — the default) or `soonest` (the next
-        /// version to mature, which an intermediate release can reach days earlier). Display-only.
+        /// versions exist: `soonest` (the next version to mature, which an intermediate release can
+        /// reach days earlier — the default) or `latest` (the newest version). Display-only.
         #[arg(long, value_name = "WHICH", value_enum)]
         countdown: Option<Countdown>,
         /// Exit with this code when adoptable updates exist, for CI gating. Bare `--exit-code` means
@@ -454,7 +454,7 @@ pub struct CliOverrides {
     /// `outdated --hide-pinned` — CLI-only display filter (not config-backed).
     pub(crate) hide_pinned: Option<bool>,
     /// `outdated --countdown <latest|soonest>` — CLI-only display control (not config-backed);
-    /// `None` falls back to [`Countdown::Latest`].
+    /// `None` falls back to [`Countdown::Soonest`].
     pub(crate) countdown: Option<Countdown>,
     /// `upgrade --rewrite` — CLI-only manifest-rewrite control (not config-backed).
     pub(crate) rewrite: Option<bool>,
@@ -494,7 +494,7 @@ impl CliOverrides {
             build: set_on_subcommand(matches, "upgrade", "build").then_some(true),
             hide_pinned: set_on_subcommand(matches, "outdated", "hide_pinned").then_some(true),
             // `--countdown <latest|soonest>` carries an enum value under `outdated`; absent, the
-            // report keeps its `latest` default.
+            // report keeps its `soonest` default.
             countdown: matches
                 .subcommand_matches("outdated")
                 .and_then(|sub| sub.get_one::<Countdown>("countdown").copied()),
@@ -706,7 +706,7 @@ mod tests {
             overrides(&["cooldown", "outdated", "--countdown", "latest"]).countdown,
             Some(super::Countdown::Latest)
         );
-        // Absent, it is unset, so the report keeps its `latest` default.
+        // Absent, it is unset, so the report keeps its `soonest` default.
         assert_eq!(overrides(&["cooldown", "outdated"]).countdown, None);
     }
 

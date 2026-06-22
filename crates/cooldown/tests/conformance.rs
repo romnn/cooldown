@@ -443,9 +443,14 @@ async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
         )
     };
 
-    // Default horizon (latest): the Cooldown column tracks the freshest version, 0.15.18 (age 1d).
-    // It needs no version label because that is exactly what the Latest column already shows.
-    let latest = make().outdated(&opts()).await;
+    // Latest horizon (explicit, now that `soonest` is the default): the Cooldown column tracks the
+    // freshest version, 0.15.18 (age 1d). It needs no version label because that is exactly what the
+    // Latest column already shows.
+    let latest_opts = RunOpts {
+        cooldown_horizon: CooldownHorizon::Latest,
+        ..opts()
+    };
+    let latest = make().outdated(&latest_opts).await;
     let item = latest
         .items
         .iter()

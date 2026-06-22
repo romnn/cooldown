@@ -417,14 +417,13 @@ impl Candidate {
 /// surfaces in its cooldown column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CooldownHorizon {
-    /// Track the newest eligible candidate — "how long until the latest version matures". The
-    /// default, and what the report has always shown.
-    #[default]
+    /// Track the newest eligible candidate — "how long until the latest version matures".
     Latest,
     /// Track the still-cooling candidate that matures first — "how long until the *next* upgrade
     /// unlocks". When an intermediate version clears its window days before the newest release does,
     /// this surfaces that nearer date instead. Falls back to the newest candidate when nothing is
-    /// currently cooling.
+    /// currently cooling. The default: the soonest unlock is the more actionable countdown.
+    #[default]
     Soonest,
 }
 
