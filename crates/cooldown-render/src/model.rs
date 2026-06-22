@@ -110,6 +110,12 @@ pub enum OutdatedStatus {
     UpToDate,
     /// A newer version exists and has matured past its window.
     Adoptable,
+    /// A newer version has matured past its window but the whole-graph upgrade resolve cannot land
+    /// it — a mutually-exclusive requirement holds it out of the graph. The matured version still
+    /// appears as [`adoptable_target`](OutdatedItem::adoptable_target); the blocker (when one can be
+    /// named) appears as [`blocked_by`](OutdatedItem::blocked_by). `upgrade` reports the same
+    /// dependency as held, so the two commands agree.
+    Blocked,
     /// A newer version exists but is younger than its window.
     InCooldown,
     /// Exempted by an `allow` rule (or a pseudo/commit pin).
@@ -177,6 +183,11 @@ pub struct OutdatedItem {
     /// The newest version that has matured past its window, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adoptable_target: Option<String>,
+    /// When `status` is [`OutdatedStatus::Blocked`], the package whose requirement holds the matured
+    /// [`adoptable_target`](OutdatedItem::adoptable_target) out of the resolved graph, when one can be
+    /// named. Omitted for every other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
     /// The newest existing version and its age, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<LatestInfo>,
@@ -193,6 +204,9 @@ pub struct OutdatedSummary {
     pub total: usize,
     /// The number with status [`OutdatedStatus::Adoptable`].
     pub adoptable: usize,
+    /// The number with status [`OutdatedStatus::Blocked`] — matured but held out of the graph by a
+    /// conflicting requirement, so `upgrade` cannot land it.
+    pub blocked: usize,
     /// The number with status [`OutdatedStatus::InCooldown`].
     pub in_cooldown: usize,
     /// The number with status [`OutdatedStatus::UpToDate`].

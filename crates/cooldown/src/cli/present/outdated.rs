@@ -6,6 +6,7 @@ pub(in crate::cli) fn outdated_summary(summary: &app::OutdatedSummary) -> render
     render::OutdatedSummary {
         total: summary.total,
         adoptable: summary.adoptable,
+        blocked: summary.blocked,
         in_cooldown: summary.in_cooldown,
         up_to_date: summary.up_to_date,
         exempt: summary.exempt,
@@ -33,6 +34,7 @@ fn outdated_item(item: &app::OutdatedItem) -> render::OutdatedItem {
         cooldown_version: item.cooldown_version.clone(),
         status: outdated_status(item.status),
         adoptable_target: item.adoptable_target.clone(),
+        blocked_by: item.blocked_by.clone(),
         latest: item.latest.as_ref().map(latest_info),
         error: item.error.clone(),
     }

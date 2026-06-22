@@ -37,6 +37,7 @@ use serde::Serialize;
 ///     OutdatedSummary {
 ///         total: 0,
 ///         adoptable: 0,
+///         blocked: 0,
 ///         in_cooldown: 0,
 ///         up_to_date: 0,
 ///         exempt: 0,
@@ -70,6 +71,7 @@ mod tests {
             OutdatedSummary {
                 total: 1,
                 adoptable: 1,
+                blocked: 0,
                 in_cooldown: 0,
                 up_to_date: 0,
                 exempt: 0,
@@ -94,6 +96,7 @@ mod tests {
                 cooldown_version: None,
                 status: OutdatedStatus::Adoptable,
                 adoptable_target: Some("v0.18.0".into()),
+                blocked_by: None,
                 latest: Some(LatestInfo {
                     version: "v0.18.0".into(),
                     published_at: Some("2026-05-01T00:00:00Z".into()),

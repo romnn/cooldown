@@ -23,6 +23,10 @@ pub struct LatestInfo {
 pub enum OutdatedStatus {
     UpToDate,
     Adoptable,
+    /// A newer version has matured past its window and would otherwise be adoptable, but the
+    /// whole-graph upgrade resolve cannot land it: another requirement in the graph conflicts with
+    /// it. `upgrade` reports the same dependency as `held`, so `outdated` and `upgrade` agree.
+    Blocked,
     InCooldown,
     Exempt,
     Held,
@@ -54,11 +58,12 @@ impl OutdatedStatus {
             OutdatedStatus::Error => 0,
             OutdatedStatus::UnknownAge => 1,
             OutdatedStatus::Held => 2,
-            OutdatedStatus::CurrentInCooldown => 3,
-            OutdatedStatus::InCooldown => 4,
-            OutdatedStatus::Exempt => 5,
-            OutdatedStatus::UpToDate => 6,
-            OutdatedStatus::Adoptable => 7,
+            OutdatedStatus::Blocked => 3,
+            OutdatedStatus::CurrentInCooldown => 4,
+            OutdatedStatus::InCooldown => 5,
+            OutdatedStatus::Exempt => 6,
+            OutdatedStatus::UpToDate => 7,
+            OutdatedStatus::Adoptable => 8,
         }
     }
 }
@@ -86,6 +91,10 @@ pub struct OutdatedItem {
     pub cooldown_version: Option<String>,
     pub status: OutdatedStatus,
     pub adoptable_target: Option<String>,
+    /// When [`status`](OutdatedItem::status) is [`OutdatedStatus::Blocked`], the name of the package
+    /// whose requirement holds the matured [`adoptable_target`](OutdatedItem::adoptable_target) out of
+    /// the resolved graph. `None` for every other status, or when no single blocker can be named.
+    pub blocked_by: Option<String>,
     pub latest: Option<LatestInfo>,
     pub error: Option<Diagnostic>,
 }
@@ -94,6 +103,7 @@ pub struct OutdatedItem {
 pub struct OutdatedSummary {
     pub total: usize,
     pub adoptable: usize,
+    pub blocked: usize,
     pub in_cooldown: usize,
     pub up_to_date: usize,
     pub exempt: usize,

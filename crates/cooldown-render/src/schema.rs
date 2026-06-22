@@ -113,10 +113,11 @@ pub fn json_schema() -> Value {
         "effectiveInfo": effective,
         "outdatedSummary": {
             "type": "object",
-            "required": ["total", "adoptable", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
+            "required": ["total", "adoptable", "blocked", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
             "properties": {
                 "total": { "type": "integer", "minimum": 0 },
                 "adoptable": { "type": "integer", "minimum": 0 },
+                "blocked": { "type": "integer", "minimum": 0 },
                 "inCooldown": { "type": "integer", "minimum": 0 },
                 "upToDate": { "type": "integer", "minimum": 0 },
                 "exempt": { "type": "integer", "minimum": 0 },
@@ -144,6 +145,7 @@ pub fn json_schema() -> Value {
                     "enum": [
                         "up_to_date",
                         "adoptable",
+                        "blocked",
                         "in_cooldown",
                         "exempt",
                         "held",
@@ -153,6 +155,7 @@ pub fn json_schema() -> Value {
                     ]
                 },
                 "adoptableTarget": { "type": "string" },
+                "blockedBy": { "type": "string" },
                 "latest": { "$ref": "#/$defs/latestInfo" },
                 "error": { "$ref": "#/$defs/diagnostic" }
             },

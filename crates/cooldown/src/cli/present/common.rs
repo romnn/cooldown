@@ -43,6 +43,7 @@ pub(super) fn outdated_status(status: app::OutdatedStatus) -> render::OutdatedSt
     match status {
         app::OutdatedStatus::UpToDate => render::OutdatedStatus::UpToDate,
         app::OutdatedStatus::Adoptable => render::OutdatedStatus::Adoptable,
+        app::OutdatedStatus::Blocked => render::OutdatedStatus::Blocked,
         app::OutdatedStatus::InCooldown => render::OutdatedStatus::InCooldown,
         app::OutdatedStatus::Exempt => render::OutdatedStatus::Exempt,
         app::OutdatedStatus::Held => render::OutdatedStatus::Held,

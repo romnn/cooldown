@@ -110,7 +110,7 @@ fn status_color(s: OutdatedStatus) -> Color {
         OutdatedStatus::InCooldown => Color::Yellow,
         OutdatedStatus::CurrentInCooldown | OutdatedStatus::Error => Color::Red,
         OutdatedStatus::Exempt => Color::Cyan,
-        OutdatedStatus::Held => Color::DarkGrey,
+        OutdatedStatus::Blocked | OutdatedStatus::Held => Color::DarkGrey,
         OutdatedStatus::UnknownAge => Color::Magenta,
     }
 }
@@ -122,6 +122,7 @@ fn status_label(s: OutdatedStatus) -> &'static str {
         OutdatedStatus::InCooldown => "in cooldown",
         OutdatedStatus::CurrentInCooldown => "current in cooldown",
         OutdatedStatus::Exempt => "exempt",
+        OutdatedStatus::Blocked => "blocked",
         OutdatedStatus::Held => "held",
         OutdatedStatus::UnknownAge => "unknown age",
         OutdatedStatus::Error => "error",
@@ -300,8 +301,14 @@ pub fn render_outdated(
             row.push(adoptable);
             row.push(Cell::new(latest));
             row.push(Cell::new(cooldown));
+            // A blocked row names the conflicting requirer inline ("blocked by <pkg>") so the matured
+            // target reads as "wanted but held out of the graph by …", mirroring the `upgrade` skip.
+            let status_text = match (it.status, &it.blocked_by) {
+                (OutdatedStatus::Blocked, Some(blocker)) => format!("blocked by {blocker}"),
+                _ => status_label(it.status).to_string(),
+            };
             row.push(cell_colored(
-                status_label(it.status),
+                status_text,
                 status_color(it.status),
                 use_color,
             ));
@@ -312,8 +319,9 @@ pub fn render_outdated(
     }
     let _ = write!(
         out,
-        "\n{} adoptable · {} in cooldown · {} up-to-date · {} exempt · {} held · {} unknown-age",
+        "\n{} adoptable · {} blocked · {} in cooldown · {} up-to-date · {} exempt · {} held · {} unknown-age",
         summary.adoptable,
+        summary.blocked,
         summary.in_cooldown,
         summary.up_to_date,
         summary.exempt,
@@ -951,6 +959,7 @@ mod tests {
         let summary = OutdatedSummary {
             total: 1,
             adoptable: 1,
+            blocked: 0,
             in_cooldown: 0,
             up_to_date: 0,
             exempt: 0,
@@ -975,6 +984,7 @@ mod tests {
             cooldown_version: Some("0.15.17".into()),
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
+            blocked_by: None,
             latest: Some(LatestInfo {
                 version: "0.15.18".into(),
                 published_at: None,
@@ -997,6 +1007,7 @@ mod tests {
         let summary = OutdatedSummary {
             total: 1,
             adoptable: 0,
+            blocked: 0,
             in_cooldown: 0,
             up_to_date: 1,
             exempt: 0,
@@ -1021,6 +1032,7 @@ mod tests {
             cooldown_version: None,
             status: OutdatedStatus::UpToDate,
             adoptable_target: None,
+            blocked_by: None,
             latest: Some(LatestInfo {
                 version: "1.21.4".into(),
                 published_at: None,
@@ -1042,6 +1054,7 @@ mod tests {
         let summary = OutdatedSummary {
             total: 2,
             adoptable: 2,
+            blocked: 0,
             in_cooldown: 0,
             up_to_date: 0,
             exempt: 0,
@@ -1066,6 +1079,7 @@ mod tests {
             cooldown_version: None,
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
+            blocked_by: None,
             latest: None,
             error: None,
         };
@@ -1102,6 +1116,7 @@ mod tests {
         let summary = OutdatedSummary {
             total: 6,
             adoptable: 0,
+            blocked: 0,
             in_cooldown: 0,
             up_to_date: 0,
             exempt: 0,
@@ -1384,6 +1399,7 @@ mod tests {
         let summary = OutdatedSummary {
             total: 0,
             adoptable: 0,
+            blocked: 0,
             in_cooldown: 0,
             up_to_date: 0,
             exempt: 0,

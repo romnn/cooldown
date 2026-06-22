@@ -29,6 +29,7 @@ fn no_tool_outdated(generated_at: String, error: Diagnostic) -> Result<String, C
             render::OutdatedSummary {
                 total: 0,
                 adoptable: 0,
+                blocked: 0,
                 in_cooldown: 0,
                 up_to_date: 0,
                 exempt: 0,
