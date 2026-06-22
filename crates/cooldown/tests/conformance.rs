@@ -1838,3 +1838,328 @@ async fn explain_applies_registry_scoped_rule() {
             .any(|s| s.applied && s.selector.as_deref() == Some("registry=proxy.example"))
     );
 }
+
+/// A minimal repo-scoped fake tool used to assert `sync`'s `SyncScope::Repo` dispatch: it counts
+/// `write_repo_native` calls so a multi-project run can prove the shared file is written exactly
+/// once, and tracks whether the value was already written so a second run reports `Unchanged`.
+struct RepoScopedFake {
+    root: Utf8PathBuf,
+    repo_writes: Arc<Mutex<usize>>,
+    already_written: Mutex<bool>,
+}
+
+const REPO_TOOL: ToolId = ToolId("repotool");
+
+impl RepoScopedFake {
+    fn project(&self, rel: &str) -> Project {
+        let root = self.root.join(rel);
+        Project {
+            root: root.clone(),
+            kind: REPO_TOOL,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolRead for RepoScopedFake {
+    fn id(&self) -> ToolId {
+        REPO_TOOL
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            can_sync: true,
+            ..Default::default()
+        }
+    }
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        cooldown_core::ProjectMarker {
+            lockfile: "repo.lock",
+            manifest: "pyproject.toml",
+            workspace_root: false,
+        }
+    }
+    async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
+        Ok(Vec::new())
+    }
+    async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for RepoScopedFake {
+    async fn releases(
+        &self,
+        _dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
+        Ok(Vec::new())
+    }
+    async fn locked_release(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+    ) -> Result<Release> {
+        Err(CoreError::NotFound(dep.package.name.clone()))
+    }
+}
+
+#[async_trait]
+impl ToolWrite for RepoScopedFake {
+    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::default())
+    }
+    async fn apply(
+        &self,
+        _p: &Project,
+        _plan: &Plan,
+        _journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        Ok(ApplyReport::default())
+    }
+    async fn build(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+    fn sync_scope(&self) -> SyncScope {
+        SyncScope::Repo
+    }
+    async fn write_repo_native(
+        &self,
+        repo_root: &camino::Utf8Path,
+        _policy: &ResolvedPolicy,
+        _dry_run: bool,
+    ) -> Result<SyncReport> {
+        *self.repo_writes.lock().unwrap() += 1;
+        let path = repo_root.join("uv.toml");
+        let mut written = self.already_written.lock().unwrap();
+        if *written {
+            Ok(SyncReport::Unchanged { path })
+        } else {
+            *written = true;
+            Ok(SyncReport::Written { path })
+        }
+    }
+}
+
+#[tokio::test]
+async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
+    let (_dir, root) = tmp_root();
+    let repo_writes = Arc::new(Mutex::new(0usize));
+    let fake = RepoScopedFake {
+        root: root.clone(),
+        repo_writes: Arc::clone(&repo_writes),
+        already_written: Mutex::new(false),
+    };
+    // Two in-scope projects of the same repo-scoped tool must still trigger a single repo write.
+    let contexts = ["a", "b"]
+        .into_iter()
+        .map(|rel| ProjectCtx {
+            tool: REPO_TOOL,
+            project: fake.project(rel),
+            rel_path: Utf8PathBuf::from(rel),
+            policy: PolicyStack {
+                layers: vec![builtin_default_layer()],
+                strict_native: false,
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut adapters = AdapterSet::new();
+    adapters.register(Arc::new(fake));
+    let ws = Workspace::new(
+        adapters,
+        contexts,
+        now(),
+        Baseline::default(),
+        root.clone(),
+        vec![builtin_default_layer()],
+    );
+
+    let out = ws.sync(&opts()).await;
+    // Exactly one repo write and one item (labelled "." for the repo root), not one per project.
+    assert_eq!(*repo_writes.lock().unwrap(), 1);
+    assert_eq!(out.items.len(), 1);
+    assert_eq!(out.items[0].project, ".");
+    assert_eq!(out.items[0].status, cooldown::app::SyncStatus::Written);
+    assert_eq!(out.summary.written, 1);
+    // The default 7d window renders as the relative span uv re-evaluates each run.
+    assert_eq!(out.items[0].window.as_deref(), Some("7d"));
+
+    // A second sync against the now-current repo file reports unchanged, and still writes once more
+    // only to compare (the adapter's own idempotence covers the no-op file write).
+    let again = ws.sync(&opts()).await;
+    assert_eq!(again.items.len(), 1);
+    assert_eq!(again.items[0].status, cooldown::app::SyncStatus::Unchanged);
+    assert_eq!(again.summary.unchanged, 1);
+}
+
+/// A minimal project-scoped fake tool used to assert `sync`'s `SyncScope::Project` dispatch: it
+/// counts `write_native` calls so a multi-project run can prove the per-project file is written once
+/// per project. Guards the regression where a tool overrides `write_native` but forgets `sync_scope`,
+/// which silently defaults to `SyncScope::None` and stops `sync` writing anything.
+struct ProjectScopedFake {
+    root: Utf8PathBuf,
+    native_writes: Arc<Mutex<Vec<String>>>,
+}
+
+const PROJECT_TOOL: ToolId = ToolId("projecttool");
+
+impl ProjectScopedFake {
+    fn project(&self, rel: &str) -> Project {
+        let root = self.root.join(rel);
+        Project {
+            root: root.clone(),
+            kind: PROJECT_TOOL,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolRead for ProjectScopedFake {
+    fn id(&self) -> ToolId {
+        PROJECT_TOOL
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            can_sync: true,
+            ..Default::default()
+        }
+    }
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        cooldown_core::ProjectMarker {
+            lockfile: "project.lock",
+            manifest: "pyproject.toml",
+            workspace_root: false,
+        }
+    }
+    async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
+        Ok(Vec::new())
+    }
+    async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for ProjectScopedFake {
+    async fn releases(
+        &self,
+        _dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
+        Ok(Vec::new())
+    }
+    async fn locked_release(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+    ) -> Result<Release> {
+        Err(CoreError::NotFound(dep.package.name.clone()))
+    }
+}
+
+#[async_trait]
+impl ToolWrite for ProjectScopedFake {
+    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::default())
+    }
+    async fn apply(
+        &self,
+        _p: &Project,
+        _plan: &Plan,
+        _journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        Ok(ApplyReport::default())
+    }
+    async fn build(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+    fn sync_scope(&self) -> SyncScope {
+        SyncScope::Project
+    }
+    async fn write_native(
+        &self,
+        project: &Project,
+        _policy: &ResolvedPolicy,
+        _dry_run: bool,
+    ) -> Result<SyncReport> {
+        let path = project.root.join("project.toml");
+        self.native_writes.lock().unwrap().push(path.to_string());
+        Ok(SyncReport::Written { path })
+    }
+}
+
+#[tokio::test]
+async fn sync_project_scope_writes_native_per_project() {
+    let (_dir, root) = tmp_root();
+    let native_writes = Arc::new(Mutex::new(Vec::new()));
+    let fake = ProjectScopedFake {
+        root: root.clone(),
+        native_writes: Arc::clone(&native_writes),
+    };
+    // Two in-scope projects of the same project-scoped tool must each get a `write_native`, so a tool
+    // that overrides `write_native` but forgets `sync_scope` (defaulting to `None`) is caught.
+    let contexts = ["a", "b"]
+        .into_iter()
+        .map(|rel| ProjectCtx {
+            tool: PROJECT_TOOL,
+            project: fake.project(rel),
+            rel_path: Utf8PathBuf::from(rel),
+            policy: PolicyStack {
+                layers: vec![builtin_default_layer()],
+                strict_native: false,
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut adapters = AdapterSet::new();
+    adapters.register(Arc::new(fake));
+    let ws = Workspace::new(
+        adapters,
+        contexts,
+        now(),
+        Baseline::default(),
+        root.clone(),
+        vec![builtin_default_layer()],
+    );
+
+    let out = ws.sync(&opts()).await;
+    // One `write_native` per project (two), and one written item per project.
+    assert_eq!(native_writes.lock().unwrap().len(), 2);
+    assert_eq!(out.items.len(), 2);
+    assert!(
+        out.items
+            .iter()
+            .all(|item| item.status == cooldown::app::SyncStatus::Written)
+    );
+    assert_eq!(out.summary.written, 2);
+    assert_eq!(
+        out.items
+            .iter()
+            .map(|item| item.project.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+}
