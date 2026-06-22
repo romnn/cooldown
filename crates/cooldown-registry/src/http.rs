@@ -1,5 +1,6 @@
 //! The shared HTTP client: one `reqwest::Client`, an on-disk cache with ETag/TTL refresh, a
-//! per-host concurrency cap with 429 backoff, and offline/fresh modes.
+//! per-host concurrency cap with optional per-host request pacing and 429 backoff, and
+//! offline/fresh modes.
 //!
 //! - `--offline`: cache only; a miss is a hard [`CoreError::OfflineMiss`] (the caller maps it to
 //!   `UnknownAge` — never a false "ok").
@@ -13,7 +14,7 @@ use jiff::Timestamp;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Configuration knobs for a [`SharedHttp`] client.
@@ -27,6 +28,12 @@ pub struct HttpOptions {
     pub user_agent: String,
     /// The maximum number of in-flight requests allowed per host.
     pub per_host_concurrency: usize,
+    /// Per-host minimum spacing between outgoing requests, keyed by host (e.g. `"api.github.com"`).
+    /// A listed host has its requests started at least this far apart, keeping a strict registry
+    /// under its rate budget; a host with no entry is bounded only by [`per_host_concurrency`].
+    ///
+    /// [`per_host_concurrency`]: HttpOptions::per_host_concurrency
+    pub per_host_min_interval: HashMap<String, Duration>,
     /// The per-request timeout applied by the underlying `reqwest::Client`.
     pub request_timeout: Duration,
     /// The number of times a 429/5xx backoff is retried before the request fails.
@@ -44,11 +51,20 @@ impl Default for HttpOptions {
                 " (+https://github.com/romnn/cooldown)"
             )
             .to_string(),
-            per_host_concurrency: 8,
+            per_host_concurrency: 16,
+            per_host_min_interval: default_host_min_intervals(),
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
         }
     }
+}
+
+/// Built-in per-host request spacing. Only registries with a strict rate budget are listed;
+/// everything else is governed by the concurrency cap alone. `api.github.com` (Swift package
+/// discovery) has a 60-requests/hour unauthenticated budget and trips secondary limits on bursts,
+/// so its requests are spaced ~1s apart — polite, and never bursty enough to draw a 403/429.
+fn default_host_min_intervals() -> HashMap<String, Duration> {
+    HashMap::from([("api.github.com".to_string(), Duration::from_secs(1))])
 }
 
 /// A response served by [`SharedHttp::get`], from the network or the on-disk cache.
@@ -93,6 +109,36 @@ struct Inner {
     opts: HttpOptions,
     publish: Arc<PublishStore>,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
+    pacers: Mutex<HashMap<String, Arc<HostPacer>>>,
+}
+
+/// A per-host request pacer: requests to the host start at least `interval` apart, so a strict
+/// registry is never hit in a burst. Cloned [`SharedHttp`] handles share one pacer per host (it
+/// lives behind the [`Inner`] map), so the spacing holds across every adapter targeting that host.
+struct HostPacer {
+    interval: Duration,
+    /// The earliest instant the next request may start. Behind an async mutex so callers queue on
+    /// it — awaiting their turn — instead of each polling a clock.
+    gate: tokio::sync::Mutex<Instant>,
+}
+
+impl HostPacer {
+    fn new(interval: Duration) -> Self {
+        HostPacer {
+            interval,
+            gate: tokio::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Await this host's turn, then claim the next slot. Callers serialize on the gate, and each
+    /// sleeps only until its reserved instant — a timer wait, never a poll — so consecutive requests
+    /// to the host begin at least `interval` apart.
+    async fn throttle(&self) {
+        let mut next = self.gate.lock().await;
+        let start = (*next).max(Instant::now());
+        tokio::time::sleep_until(tokio::time::Instant::from_std(start)).await;
+        *next = start + self.interval;
+    }
 }
 
 impl SharedHttp {
@@ -121,6 +167,7 @@ impl SharedHttp {
                 opts,
                 publish,
                 hosts: Mutex::new(HashMap::new()),
+                pacers: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -148,8 +195,27 @@ impl SharedHttp {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hosts
             .entry(host.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(self.inner.opts.per_host_concurrency)))
+            .or_insert_with(|| {
+                Arc::new(Semaphore::new(self.inner.opts.per_host_concurrency.max(1)))
+            })
             .clone()
+    }
+
+    /// The pacer for `host`, or `None` when the host has no configured minimum interval (the common
+    /// case — only strict registries are paced). Built lazily and shared across clones.
+    fn pacer_for(&self, host: &str) -> Option<Arc<HostPacer>> {
+        let interval = self.inner.opts.per_host_min_interval.get(host).copied()?;
+        let mut pacers = self
+            .inner
+            .pacers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(
+            pacers
+                .entry(host.to_string())
+                .or_insert_with(|| Arc::new(HostPacer::new(interval)))
+                .clone(),
+        )
     }
 
     /// Performs a `GET` of `url`, honoring the cache `ttl`, offline/fresh modes, `ETag`
@@ -199,6 +265,12 @@ impl SharedHttp {
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_else(|| "unknown".to_string());
+        // Pace a strict host before taking a concurrency permit, so the wait never occupies an
+        // in-flight slot. Hosts with no configured interval skip this entirely.
+        if let Some(pacer) = self.pacer_for(&host) {
+            tracing::trace!(host, "awaiting host pace");
+            pacer.throttle().await;
+        }
         let sem = self.semaphore_for(&host);
         // The per-host semaphores are never closed, so `acquire` only fails if one were; treat
         // that impossible case as a transient error rather than panicking.
@@ -382,5 +454,26 @@ mod tests {
         let response = http.get(url, Duration::ZERO).await.expect("stale fallback");
         assert!(response.from_cache);
         assert_eq!(response.body, "cached");
+    }
+
+    #[tokio::test]
+    async fn host_pacer_serializes_calls_by_the_interval() {
+        let pacer = HostPacer::new(Duration::from_millis(50));
+        let started = Instant::now();
+        // The first call is immediate; the next two each await ~one more interval, so three calls
+        // span ~two intervals end to end.
+        pacer.throttle().await;
+        pacer.throttle().await;
+        pacer.throttle().await;
+        assert!(started.elapsed() >= Duration::from_millis(90));
+    }
+
+    #[test]
+    fn pacer_is_built_only_for_configured_hosts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(dir.path(), HttpOptions::default()).expect("shared http");
+        // The built-in default paces GitHub (strict budget) but leaves CDN-backed registries free.
+        assert!(http.pacer_for("api.github.com").is_some());
+        assert!(http.pacer_for("index.crates.io").is_none());
     }
 }
