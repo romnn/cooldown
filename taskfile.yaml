@@ -99,7 +99,17 @@ tasks:
   outdated:
     desc: "check for outdated cargo workspace dependencies"
     cmds:
+      - cargo run -- outdated --sync {{.CLI_ARGS}}
+
+  outdated:legacy:
+    desc: "check for outdated cargo workspace dependencies"
+    cmds:
       - cargo outdated --workspace --ignore-external-rel --exit-code 1 -v {{.CLI_ARGS}}
+
+  upgrade:
+    desc: "upgrade outdated cargo workspace dependencies"
+    cmds:
+      - cargo run -- upgrade --major --sync {{.CLI_ARGS}}
 
   unused:
     desc: "check for unused cargo workspace dependencies"
