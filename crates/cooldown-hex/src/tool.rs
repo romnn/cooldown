@@ -92,6 +92,7 @@ impl ToolRead for HexTool {
         let content = std::fs::read_to_string(project.root.join("mix.lock"))?;
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let direct = lock::parse_direct(&manifest);
+        let ceilings = lock::graph_ceilings(&content);
 
         let mut deps = Vec::new();
         for (name, ver) in lock::parse_resolved(&content) {
@@ -100,13 +101,20 @@ impl ToolRead for HexTool {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(HEX_ID, name, Some(HEXPM.to_string())),
+                package: PackageId::new(HEX_ID, name.clone(), Some(HEXPM.to_string())),
                 current: Version::new(ver.clone()),
                 current_quality: classify_quality(&ver),
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
-                graph_ceiling: None,
+                // A requirer pinning this dep `== X` caps it at its resolved version. The active
+                // check (pin equals the resolved version) records the canonical resolved form so it
+                // matches a fetched release, mirroring the uv adapter.
+                graph_ceiling: ceilings.get(&name).and_then(|pin| {
+                    version::compare(pin, &ver)
+                        .is_eq()
+                        .then(|| Version::new(ver.clone()))
+                }),
                 members: Vec::new(),
                 pinned: false,
             });
