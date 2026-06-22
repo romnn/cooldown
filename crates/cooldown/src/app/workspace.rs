@@ -4,8 +4,8 @@ use super::release_cache::{ReleaseCache, ReleaseResolver};
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext, PatternGlob,
-    PolicyStack, Project, Release, ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId,
-    ToolRead, ToolWrite,
+    PolicyLayer, PolicyStack, Project, Release, ReleaseFetcher, ResolveContext, ResolvedWindow,
+    ToolId, ToolRead, ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
@@ -229,6 +229,12 @@ pub struct Workspace {
     adapters: AdapterSet,
     projects: Vec<ProjectCtx>,
     now: Timestamp,
+    /// The repo root the run was anchored at, used as the write target for repo-scoped native config
+    /// (a single `uv.toml`) and to label its `sync` item with the repo-relative path (".").
+    repo_root: Utf8PathBuf,
+    /// The repo-root policy cascade (no native layer), used to resolve a repo-wide window once for
+    /// [`cooldown_core::SyncScope::Repo`] adapters without borrowing any project's layers.
+    repo_layers: Vec<PolicyLayer>,
     pub(crate) baseline: Baseline,
     /// The run-scoped release resolver every fetch routes through, so a package shared across
     /// workspace members or re-resolved across `upgrade` fixpoint rounds hits the registry once.
@@ -294,18 +300,22 @@ impl AdapterSet {
 
 impl Workspace {
     /// Assemble a workspace from the detected adapters, per-project contexts, the run's single
-    /// `now`, and the loaded baseline.
+    /// `now`, the loaded baseline, and the repo root with its native-free policy cascade.
     #[must_use]
     pub fn new(
         adapters: AdapterSet,
         projects: Vec<ProjectCtx>,
         now: Timestamp,
         baseline: Baseline,
+        repo_root: Utf8PathBuf,
+        repo_layers: Vec<PolicyLayer>,
     ) -> Self {
         Workspace {
             adapters,
             projects,
             now,
+            repo_root,
+            repo_layers,
             baseline,
             release_cache: Box::new(ReleaseCache::new()),
         }
@@ -315,6 +325,16 @@ impl Workspace {
     #[must_use]
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+
+    /// The repo root the run was anchored at.
+    pub(crate) fn repo_root(&self) -> &camino::Utf8Path {
+        &self.repo_root
+    }
+
+    /// The repo-root policy cascade (no native layer) for resolving a repo-wide window.
+    pub(crate) fn repo_layers(&self) -> &[PolicyLayer] {
+        &self.repo_layers
     }
 
     /// The per-project contexts in this workspace.

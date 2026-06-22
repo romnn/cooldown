@@ -319,6 +319,7 @@ fn project(root: &Utf8Path) -> Project {
         root: root.to_owned(),
         kind: GO_ID,
         manifest: root.join("go.mod"),
+        exclude_newer: None,
     }
 }
 
@@ -367,6 +368,7 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
         root: root.clone(),
         kind: GO_ID,
         manifest,
+        exclude_newer: None,
     };
 
     let journal = tool

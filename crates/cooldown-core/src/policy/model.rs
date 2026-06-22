@@ -188,6 +188,57 @@ impl WindowSpec {
     }
 }
 
+/// Formats a [`WindowSpec`] as a tool-facing `exclude-newer`-style cutoff value, or `None` when the
+/// spec excludes nothing.
+///
+/// This is the single renderer for the resolver cutoff cooldown hands to publish-time-aware tools
+/// (uv's `--exclude-newer` / native `uv.toml`): both the per-project resolution window and `sync`'s
+/// native write go through it, so they never disagree. An age becomes a *relative* span ("14 days",
+/// "36 hours", "90 seconds"; singular "1 day") so the tool re-evaluates it against the current "now"
+/// on each check and a re-check stays stable across runs — an absolute cutoff would drift every run
+/// and report the lock perpetually stale. A freeze becomes its absolute RFC3339 instant. A
+/// zero/negative age and [`WindowSpec::Latest`] exclude nothing, so they map to `None`.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_core::{WindowSpec, window_exclude_newer};
+/// use jiff::SignedDuration;
+///
+/// assert_eq!(
+///     window_exclude_newer(&WindowSpec::MinAge(SignedDuration::from_hours(24 * 14))).as_deref(),
+///     Some("14 days"),
+/// );
+/// assert_eq!(window_exclude_newer(&WindowSpec::Latest), None);
+/// ```
+#[must_use]
+pub fn window_exclude_newer(spec: &WindowSpec) -> Option<String> {
+    const SECS_PER_DAY: i64 = 86_400;
+    const SECS_PER_HOUR: i64 = 3_600;
+    match spec {
+        WindowSpec::MinAge(duration) => {
+            let secs = duration.as_secs();
+            if secs <= 0 {
+                return None;
+            }
+            let (count, unit) = if secs % SECS_PER_DAY == 0 {
+                (secs / SECS_PER_DAY, "day")
+            } else if secs % SECS_PER_HOUR == 0 {
+                (secs / SECS_PER_HOUR, "hour")
+            } else {
+                (secs, "second")
+            };
+            Some(if count == 1 {
+                format!("1 {unit}")
+            } else {
+                format!("{count} {unit}s")
+            })
+        }
+        WindowSpec::Freeze(timestamp) => Some(timestamp.to_string()),
+        WindowSpec::Latest => None,
+    }
+}
+
 /// Per-kind windows mapping the `min-age` table field-for-field. A fixed-field struct: no `Ord` on
 /// `UpdateKind`, no heap alloc.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -401,6 +452,28 @@ impl ResolvedWindow {
         }
     }
 
+    /// The window's spec with any binding floor folded in, mirroring [`cutoff`](Self::cutoff)'s clamp.
+    ///
+    /// A longer floor pushes the cutoff earlier (stricter), so the returned spec is never weaker than
+    /// cooldown's own gate: a `MinAge` rises to the longer of its age and the floor; a `Latest`
+    /// (window = 0) becomes `MinAge(floor)` when a floor still binds; a `Freeze` becomes `MinAge(floor)`
+    /// only when the floor's relative cutoff lands earlier than the freeze date, otherwise the absolute
+    /// freeze stands. With no binding floor the spec is returned unchanged. This is the spec a
+    /// resolver cutoff or native `exclude-newer` is rendered from, so a floor-protected window is never
+    /// persisted weaker than [`cutoff`](Self::cutoff) enforces.
+    #[must_use]
+    pub fn effective_spec(&self, now: Timestamp) -> WindowSpec {
+        let Some(floor) = self.floor else {
+            return self.spec.clone();
+        };
+        match &self.spec {
+            WindowSpec::MinAge(duration) => WindowSpec::MinAge((*duration).max(floor)),
+            WindowSpec::Latest => WindowSpec::MinAge(floor),
+            WindowSpec::Freeze(instant) if (now - floor) < *instant => WindowSpec::MinAge(floor),
+            WindowSpec::Freeze(instant) => WindowSpec::Freeze(*instant),
+        }
+    }
+
     /// The origin of a floor that actually tightened the window at `now`, for the JSON `clampedBy`.
     #[must_use]
     pub fn clamped_by(&self, now: Timestamp) -> Option<&Origin> {
@@ -427,5 +500,51 @@ impl ResolvedWindow {
             Some(selector) => format!("{}:{selector}", self.decided_by.token()),
             None => self.decided_by.token(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowSpec, window_exclude_newer};
+    use jiff::{SignedDuration, Timestamp};
+
+    #[test]
+    fn window_exclude_newer_renders_relative_spans() {
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::MinAge(SignedDuration::from_hours(24 * 14)))
+                .as_deref(),
+            Some("14 days")
+        );
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::MinAge(SignedDuration::from_hours(36))).as_deref(),
+            Some("36 hours")
+        );
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::MinAge(SignedDuration::from_secs(90))).as_deref(),
+            Some("90 seconds")
+        );
+    }
+
+    #[test]
+    fn window_exclude_newer_uses_singular_for_one() {
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::MinAge(SignedDuration::from_hours(24))).as_deref(),
+            Some("1 day")
+        );
+    }
+
+    #[test]
+    fn window_exclude_newer_maps_empty_windows_to_none() {
+        assert_eq!(window_exclude_newer(&WindowSpec::MinAge(SignedDuration::ZERO)), None);
+        assert_eq!(window_exclude_newer(&WindowSpec::Latest), None);
+    }
+
+    #[test]
+    fn window_exclude_newer_renders_freeze_as_rfc3339() {
+        let instant: Timestamp = "2026-06-01T00:00:00Z".parse().expect("timestamp");
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::Freeze(instant)).as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
     }
 }

@@ -1,7 +1,6 @@
 use camino::Utf8Path;
 use cooldown_core::{
-    CoreError, NativePolicyLayer, NativeRule, PatternGlob, RawWindow, ResolvedPolicy, Result,
-    Selector, SyncReport, WindowSpec,
+    CoreError, NativePolicyLayer, NativeRule, PatternGlob, RawWindow, Result, Selector,
 };
 use cooldown_toml_util::read_toml_file;
 use std::collections::HashSet;
@@ -168,79 +167,6 @@ fn parse_raw_window(s: &str) -> Option<RawWindow> {
     cooldown_core::duration::parse_duration(s)
         .ok()
         .map(RawWindow::RelativeDuration)
-}
-
-const SECS_PER_DAY: i64 = 86_400;
-
-/// Write the resolved default window into `[tool.uv] exclude-newer`, format-preserving and
-/// idempotent (via [`cooldown_toml_util::set_toml_string`]).
-///
-/// uv has a single `exclude-newer`, so only the policy's default window is synced — per-kind windows
-/// and per-package rules are not expressed. A `Latest`/zero window means "no cooldown", which leaves
-/// the manifest untouched (reported as [`SyncReport::Unchanged`]).
-///
-/// Under `dry_run` the manifest is never written; the report still reflects what would change.
-///
-/// # Errors
-///
-/// Returns a [`CoreError`] if the manifest cannot be parsed or written.
-pub(crate) fn write_native(
-    manifest: &Utf8Path,
-    policy: &ResolvedPolicy,
-    dry_run: bool,
-) -> Result<SyncReport> {
-    let Some(value) = policy
-        .default_window
-        .as_ref()
-        .and_then(format_exclude_newer)
-    else {
-        // No default window, or an opt-out — nothing to bake into the native config.
-        return Ok(SyncReport::Unchanged {
-            path: manifest.to_owned(),
-        });
-    };
-    let changed = cooldown_toml_util::set_toml_string(
-        manifest,
-        &["tool", "uv", "exclude-newer"],
-        &value,
-        dry_run,
-    )?;
-    let path = manifest.to_owned();
-    Ok(if changed {
-        SyncReport::Written { path }
-    } else {
-        SyncReport::Unchanged { path }
-    })
-}
-
-/// Render a window as a uv `exclude-newer` string that round-trips through `parse_duration`: whole
-/// days/hours as a friendly span ("14 days", "36 hours"), otherwise seconds; an absolute freeze as
-/// its RFC3339 instant. `Latest` (an explicit opt-out / zero window) yields `None`.
-fn format_exclude_newer(spec: &WindowSpec) -> Option<String> {
-    match spec {
-        WindowSpec::MinAge(duration) => {
-            let secs = duration.as_secs();
-            if secs <= 0 {
-                None
-            } else if secs % SECS_PER_DAY == 0 {
-                Some(friendly_span(secs / SECS_PER_DAY, "day"))
-            } else if secs % 3_600 == 0 {
-                Some(friendly_span(secs / 3_600, "hour"))
-            } else {
-                Some(friendly_span(secs, "second"))
-            }
-        }
-        WindowSpec::Freeze(timestamp) => Some(timestamp.to_string()),
-        WindowSpec::Latest => None,
-    }
-}
-
-fn friendly_span(count: i64, unit: &str) -> String {
-    if count == 1 {
-        format!("1 {unit}")
-    } else {
-        format!("{count} {unit}s")
-    }
 }
 
 #[cfg(test)]

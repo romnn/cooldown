@@ -18,8 +18,8 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
     ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
+    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, SyncScope,
+    ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -387,6 +387,15 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             .await
     }
 
+    fn sync_scope(&self) -> SyncScope {
+        // Only pnpm has a native min-age file, so only pnpm is project-scoped; the others sync nothing.
+        if L::NATIVE_MIN_AGE_FILE.is_some() {
+            SyncScope::Project
+        } else {
+            SyncScope::None
+        }
+    }
+
     async fn write_native(
         &self,
         project: &Project,
@@ -556,6 +565,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
 
         let direct = tool()
@@ -597,6 +607,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
 
         let direct = tool()
@@ -642,6 +653,7 @@ mod tests {
             root: root.clone(),
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
 
         let direct = pnpm_tool()
@@ -691,6 +703,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
 
         let captured = tool()
@@ -730,6 +743,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
         let mut planned = change("nanoid", "3.1.0", "3.3.0");
         planned.members = vec![MemberRef {
@@ -780,6 +794,7 @@ mod tests {
             root: root.clone(),
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
         (dir, project)
     }
@@ -875,6 +890,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
         let change = change("nanoid", "3.1.0", "5.1.11");
 
@@ -905,6 +921,7 @@ mod tests {
             root: root.clone(),
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
         let mut change = change("nanoid", "3.1.0", "3.3.0");
         change.members = vec![
@@ -944,6 +961,7 @@ mod tests {
             root: root.clone(),
             kind: Npm::ID,
             manifest: root.join("package.json"),
+            exclude_newer: None,
         };
         let plan = Plan {
             changes: vec![change("nanoid", "3.1.0", "3.3.0")],

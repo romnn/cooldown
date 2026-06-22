@@ -4,10 +4,11 @@
 //! Cargo) report `unsupported`; nothing is written for them.
 
 use super::{Exit, RunOpts, Workspace, diag_from_error};
+use camino::Utf8Path;
 use cooldown_core::{
-    Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, WindowSpec, resolve,
+    Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, SyncScope, ToolId,
+    WindowSpec, resolve,
 };
-use jiff::SignedDuration;
 
 /// What happened when syncing one project's native config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,19 @@ pub struct SyncSummary {
     pub errors: usize,
 }
 
+impl SyncSummary {
+    /// Tally one non-error outcome. An [`SyncStatus::Error`] is counted at the failing call site
+    /// (which also carries the diagnostic), so it is a no-op here.
+    fn record(&mut self, status: SyncStatus) {
+        match status {
+            SyncStatus::Written => self.written += 1,
+            SyncStatus::Unchanged => self.unchanged += 1,
+            SyncStatus::Unsupported => self.unsupported += 1,
+            SyncStatus::Error => {}
+        }
+    }
+}
+
 /// The result of `sync`: the per-project findings, counts, and the process exit.
 pub struct SyncOutcome {
     /// Per-status counts.
@@ -78,23 +92,37 @@ pub struct SyncOutcome {
 }
 
 impl Workspace {
-    /// Write the resolved policy's default window into each in-scope project's native config.
+    /// Write the resolved cooldown policy down into native config, dispatching on each tool's
+    /// [`SyncScope`].
     ///
-    /// Idempotent: a project already in sync is reported `unchanged` and its manifest is not
-    /// rewritten. Fail-soft per project: a write failure becomes an `error` item (and a non-zero
-    /// exit) without aborting the other projects.
+    /// A [`SyncScope::Project`] tool is synced per in-scope project (its manifest's native field).
+    /// A [`SyncScope::Repo`] tool's single repo-level file (uv's root `uv.toml`) is resolved against
+    /// the repo-wide cascade and written **exactly once per tool**, no matter how many of its
+    /// projects are in scope — so concurrent project upgrades never race on the shared file. A
+    /// [`SyncScope::None`] tool reports a single `unsupported` item.
+    ///
+    /// Idempotent: a target already in sync is reported `unchanged` and not rewritten. Fail-soft: a
+    /// write failure becomes one `error` item (and a non-zero exit) without aborting the rest.
     pub async fn sync(&self, opts: &RunOpts) -> SyncOutcome {
         let mut items = Vec::new();
         let mut summary = SyncSummary::default();
 
+        // The distinct in-scope tools, in first-seen order. Each is handled once: a repo-scoped tool
+        // is written exactly once (never per project), a project-scoped tool iterates its own
+        // projects. The final item list is sorted below, so this order is not load-bearing.
+        let mut tools: Vec<ToolId> = Vec::new();
         for pctx in self.scoped_projects(opts) {
-            let project = pctx.rel_path.to_string();
-            let tool = pctx.tool;
+            if !tools.contains(&pctx.tool) {
+                tools.push(pctx.tool);
+            }
+        }
+
+        for tool in tools {
             let Some(writer) = self.mutator(tool) else {
                 summary.unsupported += 1;
                 items.push(SyncItem {
                     tool: tool.as_str().to_string(),
-                    project,
+                    project: repo_relative_root(),
                     status: SyncStatus::Unsupported,
                     path: None,
                     window: None,
@@ -103,56 +131,27 @@ impl Workspace {
                 continue;
             };
 
-            // Resolve the policy's default (bare) window for this project. The empty package name
-            // matches no package-specific rule, so this is the window `sync` bakes into the single
-            // native field; per-package and per-kind windows are not expressible there.
-            let query = ResolveQuery {
-                tool,
-                package: "",
-                registry: None,
-                project: &pctx.rel_path,
-                kind: ResolveKind::CurrentPin,
-            };
-            let resolved = resolve(&pctx.policy.layers, &query, self.now());
-            let window = effective_window(&resolved.window.spec, resolved.window.floor);
-            let policy = ResolvedPolicy {
-                default_window: Some(window.clone()),
-            };
-
-            let item = match writer
-                .write_native(&pctx.project, &policy, opts.dry_run)
-                .await
-            {
-                Ok(report) => {
-                    let (status, path) = classify(&report);
-                    match status {
-                        SyncStatus::Written => summary.written += 1,
-                        SyncStatus::Unchanged => summary.unchanged += 1,
-                        SyncStatus::Unsupported => summary.unsupported += 1,
-                        SyncStatus::Error => {}
-                    }
-                    SyncItem {
-                        tool: tool.as_str().to_string(),
-                        project,
-                        status,
-                        path,
-                        window: Some(window_display(&window)),
-                        error: None,
+            match writer.sync_scope() {
+                SyncScope::Project => {
+                    for pctx in self.scoped_projects(opts).filter(|pctx| pctx.tool == tool) {
+                        items.push(self.sync_project(writer, pctx, tool, opts, &mut summary).await);
                     }
                 }
-                Err(error) => {
-                    summary.errors += 1;
-                    SyncItem {
+                SyncScope::Repo => {
+                    items.push(self.sync_repo(writer, tool, opts, &mut summary).await);
+                }
+                SyncScope::None => {
+                    summary.unsupported += 1;
+                    items.push(SyncItem {
                         tool: tool.as_str().to_string(),
-                        project: project.clone(),
-                        status: SyncStatus::Error,
+                        project: repo_relative_root(),
+                        status: SyncStatus::Unsupported,
                         path: None,
                         window: None,
-                        error: Some(diag_from_error(&error, tool, &project, None)),
-                    }
+                        error: None,
+                    });
                 }
-            };
-            items.push(item);
+            }
         }
 
         items.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.tool.cmp(&b.tool)));
@@ -168,6 +167,117 @@ impl Workspace {
             exit,
         }
     }
+
+    /// Sync one project's per-project native config ([`SyncScope::Project`]).
+    async fn sync_project(
+        &self,
+        writer: &dyn cooldown_core::ToolWrite,
+        pctx: &super::ProjectCtx,
+        tool: ToolId,
+        opts: &RunOpts,
+        summary: &mut SyncSummary,
+    ) -> SyncItem {
+        let project = pctx.rel_path.to_string();
+        // Resolve the policy's default (bare) window for this project. The empty package name
+        // matches no package-specific rule, so this is the window `sync` bakes into the single
+        // native field; per-package and per-kind windows are not expressible there.
+        let query = ResolveQuery {
+            tool,
+            package: "",
+            registry: None,
+            project: &pctx.rel_path,
+            kind: ResolveKind::CurrentPin,
+        };
+        let resolved = resolve(&pctx.policy.layers, &query, self.now());
+        let window = resolved.window.effective_spec(self.now());
+        let policy = ResolvedPolicy {
+            default_window: Some(window.clone()),
+        };
+        match writer.write_native(&pctx.project, &policy, opts.dry_run).await {
+            Ok(report) => {
+                let (status, path) = classify(&report);
+                summary.record(status);
+                SyncItem {
+                    tool: tool.as_str().to_string(),
+                    project,
+                    status,
+                    path,
+                    window: Some(window_display(&window)),
+                    error: None,
+                }
+            }
+            Err(error) => {
+                summary.errors += 1;
+                let diagnostic = diag_from_error(&error, tool, &project, None);
+                SyncItem {
+                    tool: tool.as_str().to_string(),
+                    project,
+                    status: SyncStatus::Error,
+                    path: None,
+                    window: None,
+                    error: Some(diagnostic),
+                }
+            }
+        }
+    }
+
+    /// Sync a tool's single repo-level native config ([`SyncScope::Repo`]), exactly once.
+    async fn sync_repo(
+        &self,
+        writer: &dyn cooldown_core::ToolWrite,
+        tool: ToolId,
+        opts: &RunOpts,
+        summary: &mut SyncSummary,
+    ) -> SyncItem {
+        let project = repo_relative_root();
+        // Resolve the repo-wide default window once against the repo-root cascade (no native layer),
+        // independent of any single project's layers. The empty package name and `.` project keep it
+        // to the bare default window — the only thing a single native field can carry.
+        let query = ResolveQuery {
+            tool,
+            package: "",
+            registry: None,
+            project: Utf8Path::new("."),
+            kind: ResolveKind::CurrentPin,
+        };
+        let resolved = resolve(self.repo_layers(), &query, self.now());
+        let window = resolved.window.effective_spec(self.now());
+        let policy = ResolvedPolicy {
+            default_window: Some(window.clone()),
+        };
+        match writer.write_repo_native(self.repo_root(), &policy, opts.dry_run).await {
+            Ok(report) => {
+                let (status, path) = classify(&report);
+                summary.record(status);
+                SyncItem {
+                    tool: tool.as_str().to_string(),
+                    project,
+                    status,
+                    path,
+                    window: Some(window_display(&window)),
+                    error: None,
+                }
+            }
+            Err(error) => {
+                summary.errors += 1;
+                let diagnostic = diag_from_error(&error, tool, &project, None);
+                SyncItem {
+                    tool: tool.as_str().to_string(),
+                    project,
+                    status: SyncStatus::Error,
+                    path: None,
+                    window: None,
+                    error: Some(diagnostic),
+                }
+            }
+        }
+    }
+
+}
+
+/// The repo root as a repo-relative path: always `.`.
+fn repo_relative_root() -> String {
+    ".".to_string()
 }
 
 /// Map a [`SyncReport`] to a [`SyncStatus`] and the native config path it touched.
@@ -177,14 +287,6 @@ fn classify(report: &SyncReport) -> (SyncStatus, Option<String>) {
         SyncReport::Unchanged { path } => (SyncStatus::Unchanged, Some(path.to_string())),
         SyncReport::Deferred { .. } => (SyncStatus::Written, None),
         SyncReport::Unsupported => (SyncStatus::Unsupported, None),
-    }
-}
-
-/// The window to write: the decided spec, raised to the binding floor when the floor is stricter.
-fn effective_window(spec: &WindowSpec, floor: Option<SignedDuration>) -> WindowSpec {
-    match (spec, floor) {
-        (WindowSpec::MinAge(decided), Some(floor)) if floor > *decided => WindowSpec::MinAge(floor),
-        _ => spec.clone(),
     }
 }
 

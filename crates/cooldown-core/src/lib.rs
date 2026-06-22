@@ -17,10 +17,10 @@ pub use evaluate::{FixVerdict, ResolveContext, check_pin, evaluate, evaluate_fix
 pub use model::*;
 pub use policy::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
-    ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve,
+    ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve, window_exclude_newer,
 };
 pub use ports::{
     Capabilities, Clock, NativePolicyLayer, NativeRule, PackageRegistry, ProjectMutationFile,
     ProjectMutationJournal, RawArtifact, RawRelease, RawWindow, ReleaseFetcher, ResolvedPolicy,
-    SyncReport, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
+    SyncReport, SyncScope, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
 };

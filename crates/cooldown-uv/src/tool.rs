@@ -16,8 +16,8 @@ use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
     MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead,
-    ToolWrite, VerifyReport, Version,
+    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId,
+    ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -209,7 +209,7 @@ impl ToolRead for UvTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        match self.uv.verify_check(&project.root).await {
+        match self.uv.verify_check(&project.root, project.exclude_newer.as_deref()).await {
             Ok(ok) => Ok(verify_current_report(
                 ok,
                 "uv.lock is current",
@@ -338,7 +338,12 @@ impl UvTool {
 
     async fn lock_to_target(&self, project: &Project, change: &Change) -> Result<()> {
         self.uv
-            .upgrade_to(&project.root, &change.package.name, change.to.as_str())
+            .upgrade_to(
+                &project.root,
+                &change.package.name,
+                change.to.as_str(),
+                project.exclude_newer.as_deref(),
+            )
             .await
     }
 }
@@ -385,16 +390,44 @@ impl ToolWrite for UvTool {
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
-        self.uv.sync(&project.root).await
+        self.uv.sync(&project.root, project.exclude_newer.as_deref()).await
     }
 
-    async fn write_native(
+    // uv's native cooldown config is repo-scoped (`SyncScope::Repo`), not per-project: the per-project
+    // `[tool.uv] exclude-newer` in a `pyproject.toml` is inert to uv and a per-project `uv.toml` would
+    // shadow that project's `[tool.uv]` sources/overrides. So `write_native` stays the default
+    // `Unsupported` (cooldown drives the window directly via `--exclude-newer` / `UV_EXCLUDE_NEWER` on
+    // every invocation) and the sync instead writes a single repo-root `uv.toml` via
+    // `write_repo_native`. The native *reader* still honors a window a project declares.
+
+    fn sync_scope(&self) -> SyncScope {
+        SyncScope::Repo
+    }
+
+    async fn write_repo_native(
         &self,
-        project: &Project,
+        repo_root: &Utf8Path,
         policy: &ResolvedPolicy,
         dry_run: bool,
     ) -> Result<SyncReport> {
-        crate::native::write_native(&project.manifest, policy, dry_run)
+        let path = repo_root.join("uv.toml");
+        let Some(value) = policy
+            .default_window
+            .as_ref()
+            .and_then(cooldown_core::window_exclude_newer)
+        else {
+            // A `Latest`/zero window excludes nothing, so there is no native cutoff to write.
+            return Ok(SyncReport::Unchanged { path });
+        };
+        // A `uv.toml` is a flat config file, so the key is the top-level `exclude-newer` — not the
+        // `[tool.uv]`-nested form a `pyproject.toml` uses.
+        let written =
+            cooldown_toml_util::set_toml_string(&path, &["exclude-newer"], &value, dry_run)?;
+        if written {
+            Ok(SyncReport::Written { path })
+        } else {
+            Ok(SyncReport::Unchanged { path })
+        }
     }
 }
 
@@ -433,6 +466,7 @@ mod tests {
             root: Utf8PathBuf::from("."),
             kind: UV_ID,
             manifest: Utf8PathBuf::from("pyproject.toml"),
+            exclude_newer: None,
         };
         let dep = Dependency {
             package: PackageId::new(UV_ID, "requests", Some(PYPI.to_string())),
@@ -529,6 +563,7 @@ mod tests {
             root: root.clone(),
             kind: UV_ID,
             manifest,
+            exclude_newer: None,
         };
 
         let graph = tool
@@ -581,6 +616,7 @@ mod tests {
             root: root.clone(),
             kind: UV_ID,
             manifest,
+            exclude_newer: None,
         };
 
         let journal = eco
@@ -592,5 +628,73 @@ mod tests {
 
         journal.restore(&project.root).expect("restore");
         assert!(!lock.exists());
+    }
+
+    fn uv_tool() -> UvTool {
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let tool = UvTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        // Keep the cache dir alive for the duration of the tool by leaking it: tests are short-lived
+        // and this avoids a dangling temp path while the tool holds the HTTP client.
+        std::mem::forget(cache_dir);
+        tool
+    }
+
+    #[tokio::test]
+    async fn write_repo_native_writes_flat_exclude_newer_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let tool = uv_tool();
+        assert_eq!(tool.sync_scope(), SyncScope::Repo);
+
+        let policy = ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 14),
+            )),
+        };
+        let uv_toml = root.join("uv.toml");
+
+        let first = tool
+            .write_repo_native(&root, &policy, false)
+            .await
+            .expect("write");
+        assert!(matches!(first, SyncReport::Written { .. }));
+        // The flat top-level key is written into the repo-root uv.toml, not the [tool.uv] nested form.
+        let written = std::fs::read_to_string(&uv_toml).expect("read uv.toml");
+        assert!(
+            written.contains("exclude-newer = \"14 days\""),
+            "unexpected uv.toml contents: {written}"
+        );
+        assert!(!written.contains("[tool.uv]"));
+
+        // A second run with the same policy is a no-op.
+        let second = tool
+            .write_repo_native(&root, &policy, false)
+            .await
+            .expect("write");
+        assert!(matches!(second, SyncReport::Unchanged { .. }));
+    }
+
+    #[tokio::test]
+    async fn write_repo_native_reports_unchanged_for_latest_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let tool = uv_tool();
+        let policy = ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::Latest),
+        };
+
+        let report = tool
+            .write_repo_native(&root, &policy, false)
+            .await
+            .expect("write");
+        assert!(matches!(report, SyncReport::Unchanged { .. }));
+        // A `Latest` window excludes nothing, so no uv.toml is created.
+        assert!(!root.join("uv.toml").exists());
     }
 }

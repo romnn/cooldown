@@ -228,6 +228,7 @@ mod tests {
             root: root.clone(),
             kind: BUNDLER_ID,
             manifest: root.join("Gemfile"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = BundlerTool::from_http(

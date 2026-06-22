@@ -89,6 +89,7 @@ impl FakeEco {
             root: self.root.clone(),
             kind: GO,
             manifest: self.root.join("go.mod"),
+            exclude_newer: None,
         }
     }
 }
@@ -262,7 +263,14 @@ fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
     };
     let mut adapters = AdapterSet::new();
     adapters.register(Arc::new(fake));
-    Workspace::new(adapters, vec![ctx], now(), baseline)
+    Workspace::new(
+        adapters,
+        vec![ctx],
+        now(),
+        baseline,
+        Utf8PathBuf::from("."),
+        Vec::new(),
+    )
 }
 
 fn opts() -> RunOpts {
@@ -1806,7 +1814,14 @@ async fn explain_applies_registry_scoped_rule() {
     };
     let mut adapters = AdapterSet::new();
     adapters.register(Arc::new(fake));
-    let ws = Workspace::new(adapters, vec![ctx], now(), Baseline::default());
+    let ws = Workspace::new(
+        adapters,
+        vec![ctx],
+        now(),
+        Baseline::default(),
+        Utf8PathBuf::from("."),
+        Vec::new(),
+    );
 
     let out = ws.explain("a", &opts()).await;
     assert_eq!(out.exit, Exit::Ok);

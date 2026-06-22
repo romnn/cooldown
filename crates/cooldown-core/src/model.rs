@@ -496,6 +496,16 @@ pub struct Project {
     pub kind: ToolId,
     /// The path to the project's manifest (e.g. `Cargo.toml`, `go.mod`).
     pub manifest: Utf8PathBuf,
+    /// The resolution window for this project as a publish-time cutoff string, populated by the
+    /// application from the resolved policy. Tools whose resolver honors such a cutoff (uv's
+    /// `--exclude-newer` / `UV_EXCLUDE_NEWER`) pass it so the lock resolves against cooldown's *own*
+    /// window rather than whatever the tool or environment defaults to. It is a *relative* span
+    /// (`"14 days"`) for an age window, or an absolute RFC3339 instant for a freeze — relative so a
+    /// re-check stays stable across runs (an absolute `now - window` would drift every run and report
+    /// the lock perpetually stale). `None` only when there is no effective window: detection (no
+    /// policy resolved yet), or a `Latest`/zero-age window with no binding floor. The application fills
+    /// it in once policy is resolved.
+    pub exclude_newer: Option<String>,
 }
 
 /// What slice of the dependency set a command evaluates.

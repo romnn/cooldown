@@ -396,6 +396,7 @@ mod tests {
             root: camino::Utf8PathBuf::from(root),
             kind: ToolId("test"),
             manifest: camino::Utf8PathBuf::from(root),
+            exclude_newer: None,
         }
     }
 

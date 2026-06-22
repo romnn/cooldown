@@ -229,6 +229,7 @@ mod tests {
             root: root.clone(),
             kind: SWIFT_ID,
             manifest: root.join("Package.swift"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = SwiftTool::from_http(

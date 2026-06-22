@@ -231,6 +231,7 @@ mod tests {
             root: root.clone(),
             kind: HEX_ID,
             manifest: root.join("mix.exs"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = HexTool::from_http(

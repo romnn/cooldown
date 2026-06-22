@@ -301,6 +301,7 @@ mod tests {
             root: root.clone(),
             kind: Maven::ID,
             manifest: root.join("pom.xml"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = JavaTool::<Maven>::from_http(

@@ -109,6 +109,7 @@ pub(super) fn detect_projects(
                     manifest: dir.join(marker.manifest),
                     root: dir,
                     kind: id,
+                    exclude_newer: None,
                 },
             ));
         }

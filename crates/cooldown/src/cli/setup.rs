@@ -46,26 +46,30 @@ pub(crate) async fn prepare_run(
         invocation.respect_gitignore(),
     )?;
     let shared = policy::build_shared_layers(&configs, &invocation)?;
-    let ctxs = policy::assemble_projects(
-        &adapters,
-        &repo_root,
-        projects,
-        &configs,
-        &shared,
-        &invocation,
-        global.no_native,
-    )
-    .await?;
-
-    let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
     // The evaluation clock is a port (`Clock`): real runs read the system clock, while `--now`
     // (debug builds only) injects a fixed instant so the README screenshots regenerate reproducibly.
-    // Sample it once here so every dependency in the run is judged against the same "now".
+    // Sample it once here so every dependency in the run is judged against the same "now" — and so
+    // each project's resolution cutoff (`now - window`) is computed against the same instant.
     let now = match global.now_override()? {
         Some(instant) => FixedClock::new(instant).now(),
         None => SystemClock.now(),
     };
-    let ws = Workspace::new(adapters, ctxs, now, baseline);
+    let assembly = policy::ProjectAssembly {
+        adapters: &adapters,
+        repo_root: &repo_root,
+        configs: &configs,
+        shared: &shared,
+        invocation: &invocation,
+        no_native: global.no_native,
+        now,
+    };
+    let ctxs = policy::assemble_projects(&assembly, projects).await?;
+    // The repo-root cascade (no native layer) lets `sync` resolve a repo-wide window once for
+    // repo-scoped adapters (uv's root `uv.toml`) without borrowing any project's layers.
+    let repo_layers = policy::repo_layers(&configs, &shared, &repo_root)?;
+
+    let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
+    let ws = Workspace::new(adapters, ctxs, now, baseline, repo_root.clone(), repo_layers);
     let mut opts = invocation.into_run_opts();
     // The scan-exclude globs also filter workspace-member dependencies (folders by member path,
     // packages by member name), so carry both global/command and per-tool excludes into the run.

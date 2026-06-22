@@ -298,6 +298,7 @@ mod tests {
             root: root.clone(),
             kind: Poetry::ID,
             manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = PyTool::<Poetry>::from_http(

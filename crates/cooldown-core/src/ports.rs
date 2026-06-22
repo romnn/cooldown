@@ -262,6 +262,50 @@ pub trait ToolWrite: Send + Sync {
     ) -> Result<SyncReport> {
         Ok(SyncReport::Unsupported)
     }
+
+    /// Where this adapter's native cooldown config lives, which decides how `sync` drives it.
+    ///
+    /// The default [`SyncScope::None`] is correct for tools without any native cooldown concept
+    /// (Go, Cargo): `sync` writes nothing for them. Adapters whose native config is per-project
+    /// override to [`SyncScope::Project`] (and implement [`write_native`](ToolWrite::write_native));
+    /// adapters whose native config is a single repo-level file override to [`SyncScope::Repo`] (and
+    /// implement [`write_repo_native`](ToolWrite::write_repo_native)).
+    fn sync_scope(&self) -> SyncScope {
+        SyncScope::None
+    }
+
+    /// Writes the resolved repo-wide policy into a single repo-level native config file (the `sync`
+    /// operation for [`SyncScope::Repo`] adapters, e.g. uv's root `uv.toml`).
+    ///
+    /// Called **once per repo**, not per project, so concurrent project upgrades never race on the
+    /// shared file. The default returns [`SyncReport::Unsupported`]; only [`SyncScope::Repo`]
+    /// adapters override it. As with [`write_native`](ToolWrite::write_native), `dry_run` must report
+    /// what it *would* do without touching any file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the repo-level native config cannot be written.
+    async fn write_repo_native(
+        &self,
+        _repo_root: &Utf8Path,
+        _policy: &ResolvedPolicy,
+        _dry_run: bool,
+    ) -> Result<SyncReport> {
+        Ok(SyncReport::Unsupported)
+    }
+}
+
+/// Where a tool's native cooldown config lives, which decides how `sync` drives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncScope {
+    /// No native cooldown config at all (e.g. Go, Cargo); `sync` writes nothing.
+    None,
+    /// Native config lives in each project's own manifest; `sync` writes it per project via
+    /// [`ToolWrite::write_native`].
+    Project,
+    /// A single repo-level native file (e.g. uv's root `uv.toml`); `sync` writes it exactly once per
+    /// repo via [`ToolWrite::write_repo_native`], so concurrent project upgrades never race on it.
+    Repo,
 }
 
 /// Convenience bound for concrete adapters that implement the read-side, registry-fetch, and

@@ -296,6 +296,7 @@ mod tests {
             root: root.clone(),
             kind: DENO_ID,
             manifest: root.join("deno.json"),
+            exclude_newer: None,
         };
 
         let mut direct = DenoTool::read_deps(&project, DepScope::Direct).expect("direct");

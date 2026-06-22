@@ -376,6 +376,7 @@ mod tests {
             root: root.clone(),
             kind: CARGO_ID,
             manifest,
+            exclude_newer: None,
         };
 
         let journal = eco

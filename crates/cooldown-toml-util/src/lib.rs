@@ -68,6 +68,9 @@ pub fn write_document(path: &Utf8Path, doc: &toml_edit::DocumentMut) -> Result<(
 /// written, `Ok(false)` if the leaf already equalled `val` (so `sync` is idempotent and does not
 /// churn unchanged manifests).
 ///
+/// A missing file is treated as an empty document, so the leaf is written into a freshly created
+/// file (needed for a repo-level `uv.toml` that does not exist yet).
+///
 /// When `dry_run` is set the file is never written; the return value still reports whether it would
 /// have changed.
 ///
@@ -85,8 +88,11 @@ pub fn set_toml_string(
     let (last, parents) = keys
         .split_last()
         .ok_or_else(|| CoreError::Config("empty TOML key path".to_string()))?;
-    let content =
-        std::fs::read_to_string(path).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    };
     let mut doc = content
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| CoreError::Config(format!("{path}: invalid TOML: {e}")))?;

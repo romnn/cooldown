@@ -345,6 +345,7 @@ mod tests {
             root: root.clone(),
             kind: Pixi::ID,
             manifest: root.join("pixi.lock"),
+            exclude_newer: None,
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = CondaEnvTool::<Pixi>::from_http(
