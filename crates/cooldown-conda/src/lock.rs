@@ -4,7 +4,7 @@
 //! time to the matching registry. The lockfiles are read with a small line scanner rather than a
 //! full YAML dependency, since only a few fields per entry are needed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// One resolved dependency from a conda-world lock: its name, pinned version, and which registry
 /// owns it (`conda` ⇒ anaconda.org, otherwise PyPI).
@@ -146,6 +146,135 @@ pub fn parse_pixi_lock(content: &str) -> Vec<CondaDep> {
 
 fn clean(s: &str) -> String {
     s.trim().trim_matches(['"', '\'']).to_string()
+}
+
+/// Records `version` as one of the exact pins requirers impose on `name`, de-duplicated. A name maps
+/// to *all* distinct exact pins, not a single one: a multi-platform lock can pin the same name to
+/// different versions per platform, so collapsing to one value (last-write-wins) could drop the pin
+/// that matches the resolved version. The consumer picks the pin equal to the resolved version.
+fn push_ceiling(ceilings: &mut HashMap<String, Vec<String>>, name: String, version: String) {
+    let versions = ceilings.entry(name).or_default();
+    if !versions.contains(&version) {
+        versions.push(version);
+    }
+}
+
+/// The graph ceiling candidates for each conda package some *requirer* caps at an exact version in
+/// `pixi.lock`: a `depends:` edge `name version [build]` or a `constrains:` (`run_constrained`) entry
+/// pins it — the upgrade-direction mirror of a floor. Relational/fuzzy specs (`python >=3.9`,
+/// `numpy 1.21.*`, `>=2.44,<2.45`) name no exact ceiling. The caller's active check (the pin must
+/// equal the resolved version) makes a bare prefix spec safe: it is honored only when resolution
+/// landed exactly on it.
+#[must_use]
+pub fn pixi_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
+    let mut ceilings = HashMap::new();
+    let mut in_packages = false;
+    let mut in_constraints = false;
+    for line in content.lines() {
+        if !line.starts_with([' ', '-']) && !line.trim().is_empty() {
+            in_packages = line.starts_with("packages:");
+            in_constraints = false;
+            continue;
+        }
+        if !in_packages {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- conda:") || trimmed.starts_with("- pypi:") {
+            in_constraints = false; // a new package entry ends the previous constraint list
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            if in_constraints
+                && let Some((name, version)) = exact_match_spec(item)
+            {
+                push_ceiling(&mut ceilings, normalize_name(name), version.to_string());
+            }
+            continue;
+        }
+        // A mapping key within the entry: `depends:`/`constrains:` open a constraint list; any other
+        // field (`sha256:`, `name:`, …) ends it.
+        if trimmed.starts_with("depends:") || trimmed.starts_with("constrains:") {
+            in_constraints = true;
+        } else if trimmed.contains(':') {
+            in_constraints = false;
+        }
+    }
+    ceilings
+}
+
+/// The graph ceiling candidates for each conda package some *requirer* pins exactly in
+/// `conda-lock.yml`: every `package:` entry's `dependencies:` mapping (`name: "spec"`) is scanned, and
+/// a `name: "==X"` or bare `name: "X [build]"` value caps that dep at `X` (a trailing build string is
+/// dropped, matching the pixi path). Indent-aware: only entries nested below the `dependencies:` key
+/// are mapping values, not sibling fields (`version:`, `manager:`).
+#[must_use]
+pub fn conda_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
+    let mut ceilings = HashMap::new();
+    let mut in_package = false;
+    let mut deps_indent: Option<usize> = None;
+    for line in content.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_package = line.starts_with("package:");
+            deps_indent = None;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        if let Some(open) = deps_indent {
+            if indent > open {
+                if let Some((key, spec)) = trimmed.split_once(':') {
+                    let cleaned = clean(spec);
+                    // The value is a match-spec; drop a trailing build string before testing it,
+                    // exactly as `exact_match_spec` does for the pixi path.
+                    if let Some(version) = cleaned.split_whitespace().next().and_then(exact_version) {
+                        push_ceiling(&mut ceilings, normalize_name(key.trim()), version.to_string());
+                    }
+                }
+                continue;
+            }
+            deps_indent = None; // dedented back to the entry's fields: the mapping has ended
+        }
+        // A new list entry resets per-entry state; `dependencies:` opens the mapping block. `field`
+        // has any `- ` list marker stripped, so a new package entry surfaces as a bare `name:`.
+        let field = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        if field.starts_with("name:") {
+            deps_indent = None;
+        }
+        if field.starts_with("dependencies:") {
+            deps_indent = Some(indent);
+        }
+    }
+    ceilings
+}
+
+/// The `(name, version)` of an exact conda match-spec — `libprotobuf 6.31.1` or
+/// `ld_impl_linux-64 2.44 h1423503_1` (the trailing build is ignored). `None` for an unconstrained
+/// name or a relational/fuzzy spec (`python >=3.9`, `numpy 1.21.*`).
+fn exact_match_spec(spec: &str) -> Option<(&str, &str)> {
+    let mut tokens = spec.split_whitespace();
+    let name = tokens.next()?;
+    let version = exact_version(tokens.next()?)?;
+    Some((name, version))
+}
+
+/// The version from an exact conda version spec — a bare version (`6.31.1`) or `==X`. `None` for a
+/// relational/fuzzy spec (`>=3.9`, `1.21.*`, `>=2.44,<2.45`) or an empty spec.
+fn exact_version(spec: &str) -> Option<&str> {
+    let version = spec.strip_prefix("==").unwrap_or(spec).trim();
+    // Reject relational/fuzzy operators, plus PEP 508 marker (`;`) and extra (`[`) punctuation that a
+    // pypi-style requirement in a pixi list could carry, so only a bare version is treated as exact.
+    // `!` is *not* rejected: it is the conda/PEP 440 epoch separator (`1!2.0.3`); the relational `!=`
+    // is still caught by the `=` it contains.
+    if version.is_empty()
+        || version.contains(['<', '>', '=', '~', '*', ',', '|', ' ', ';', '['])
+    {
+        return None;
+    }
+    Some(version)
 }
 
 /// Extracts `(name, version)` from a conda artifact URL: the filename is
@@ -349,6 +478,67 @@ mod tests {
         }
         // The `pip:` nested-list marker is not itself a package, and `channels:` entries are ignored.
         assert!(!direct.contains("conda-forge"));
+    }
+
+    #[test]
+    fn pixi_lock_ceilings_reads_depends_and_constrains_exact_pins() {
+        // protobuf depends on libprotobuf at an exact build (a ceiling) and python as a range;
+        // it also `constrains:` zlib exactly. The build suffix on libprotobuf is ignored.
+        let lock = "version: 6\npackages:\n- conda: https://conda.anaconda.org/conda-forge/linux-64/protobuf-6.31.1-py.conda\n  sha256: abc\n  depends:\n  - libprotobuf 6.31.1 hcaab2f7_0\n  - python >=3.9\n  constrains:\n  - zlib 1.3.1\n- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.0-h.conda\n  sha256: def\n";
+        let ceilings = pixi_lock_ceilings(lock);
+        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
+        assert_eq!(ceilings.get("zlib").map(Vec::as_slice), Some(["1.3.1".to_string()].as_slice()));
+        assert_eq!(ceilings.get("python"), None); // `>=3.9` is a range
+        assert_eq!(ceilings.len(), 2);
+    }
+
+    #[test]
+    fn pixi_lock_ceilings_collects_divergent_per_platform_pins() {
+        // A multi-platform lock can pin one name to different exact versions; both are kept so the
+        // per-platform resolved version can match its own pin (last-write-wins would drop one).
+        let lock = "version: 6\npackages:\n- conda: https://x/linux-64/app-1.0-h.conda\n  depends:\n  - libfoo 1.0\n- conda: https://x/osx-64/app-1.0-h.conda\n  depends:\n  - libfoo 2.0\n";
+        let mut pins = pixi_lock_ceilings(lock).remove("libfoo").unwrap_or_default();
+        pins.sort();
+        assert_eq!(pins, vec!["1.0".to_string(), "2.0".to_string()]);
+    }
+
+    #[test]
+    fn conda_lock_ceilings_reads_dependencies_mapping_exact_pins() {
+        // numpy's `dependencies:` mapping pins libprotobuf exactly and python as a range; the
+        // sibling `version:`/`manager:` fields are not mistaken for dependency entries.
+        let lock = "version: 1\npackage:\n  - name: numpy\n    version: \"1.24.0\"\n    manager: conda\n    dependencies:\n      libprotobuf: \"==6.31.1\"\n      python: \">=3.9,<3.13\"\n  - name: requests\n    version: \"2.28.0\"\n    manager: pip\nmetadata: {}\n";
+        let ceilings = conda_lock_ceilings(lock);
+        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
+        assert_eq!(ceilings.get("python"), None); // compound range
+        assert_eq!(ceilings.get("version"), None); // a sibling field, not a dependency
+        assert_eq!(ceilings.len(), 1);
+    }
+
+    #[test]
+    fn conda_lock_ceilings_drops_build_suffix_on_value() {
+        // A build-qualified exact value (`6.31.1 h1234_0`) is recognized; the build string is dropped.
+        let lock = "version: 1\npackage:\n  - name: numpy\n    version: \"1.24.0\"\n    manager: conda\n    dependencies:\n      libprotobuf: \"6.31.1 h1234_0\"\nmetadata: {}\n";
+        let ceilings = conda_lock_ceilings(lock);
+        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn exact_match_spec_and_version_recognise_only_exact_pins() {
+        assert_eq!(exact_match_spec("libprotobuf 6.31.1"), Some(("libprotobuf", "6.31.1")));
+        assert_eq!(exact_match_spec("ld_impl 2.44 h1423503_1"), Some(("ld_impl", "2.44")));
+        assert_eq!(exact_match_spec("python >=3.9"), None);
+        assert_eq!(exact_match_spec("numpy 1.21.*"), None);
+        assert_eq!(exact_match_spec("solo-name"), None); // unconstrained
+        assert_eq!(exact_version("==6.31.1"), Some("6.31.1"));
+        assert_eq!(exact_version("6.31.1"), Some("6.31.1"));
+        assert_eq!(exact_version(">=2.44,<2.45"), None);
+        assert_eq!(exact_version("3.12.*"), None);
+        assert_eq!(exact_version("!=2.0"), None); // relational not-equal, caught by the `=`
+        // A conda/PEP 440 epoch version is exact — the `!` separator must be accepted.
+        assert_eq!(exact_version("1!2.0.3"), Some("1!2.0.3"));
+        assert_eq!(exact_match_spec("openssl 1!1.1.1"), Some(("openssl", "1!1.1.1")));
+        // A PEP 508 marker token must not be mistaken for a version (a pypi-style list entry).
+        assert_eq!(exact_match_spec("tomli ; python_full_version < \"3.11\""), None);
     }
 
     #[test]

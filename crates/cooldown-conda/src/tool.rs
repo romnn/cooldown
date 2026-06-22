@@ -21,7 +21,7 @@ use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
 use cooldown_uv::pypi::PYPI;
 use cooldown_uv::version;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 /// The per-tool knobs the generic adapter needs: identity, the lockfile it reads, the driver
@@ -36,6 +36,11 @@ pub trait CondaLayout: Send + Sync + 'static {
 
     /// Parses the lock into its resolved conda/PyPI dependency list.
     fn parse(content: &str) -> Vec<CondaDep>;
+
+    /// The graph ceiling candidates (`name` → every exact version a requirer pins it to) for each
+    /// conda package some requirer caps — `pixi.lock` `depends:`/`constrains:` or `conda-lock.yml`
+    /// `dependencies:`.
+    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>>;
 
     /// The package names declared in the project's *source* manifest (`environment.yml` /
     /// `pixi.toml`), so the resolved lock can be split direct vs. transitive — the lock itself does
@@ -63,6 +68,10 @@ impl CondaLayout for CondaLock {
         lock::parse_conda_lock(content)
     }
 
+    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>> {
+        lock::conda_lock_ceilings(content)
+    }
+
     fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
         let content = std::fs::read_to_string(root.join("environment.yml"))
             .or_else(|_| std::fs::read_to_string(root.join("environment.yaml")))
@@ -86,6 +95,10 @@ impl CondaLayout for Pixi {
 
     fn parse(content: &str) -> Vec<CondaDep> {
         lock::parse_pixi_lock(content)
+    }
+
+    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>> {
+        lock::pixi_lock_ceilings(content)
     }
 
     fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
@@ -188,14 +201,30 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         // When no manifest is found, fall back to treating every resolved package as direct.
         let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let direct = L::direct_names(&project.root).filter(|names| !names.is_empty());
+        let ceilings = L::graph_ceilings(&content);
         let mut deps = Vec::new();
         for entry in L::parse(&content) {
+            let normalized = lock::normalize_name(&entry.name);
             let is_direct = direct
                 .as_ref()
-                .is_none_or(|names| names.contains(&lock::normalize_name(&entry.name)));
+                .is_none_or(|names| names.contains(&normalized));
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // A requirer's exact `depends:`/`constrains:` spec caps this package at its resolved
+            // version: the ceiling is honored only when some pin equals it, so a fuzzy prefix spec
+            // holds only when resolution landed exactly on it. The match is by string equality, not
+            // `version::compare`: conda versions are routinely not PEP 440 (calver `2022g`, R-style
+            // `r4.1.2`), and `compare` treats two unparseable strings as equal — that would falsely
+            // cap a dep whose pin and resolved version merely both fail to parse. The ceilings come
+            // from conda match-specs, so they apply only to conda packages: a same-named PyPI package
+            // (both ecosystems coexist in one lock) must not be held by a conda constraint.
+            let graph_ceiling = entry
+                .conda
+                .then(|| ceilings.get(&normalized))
+                .flatten()
+                .filter(|pins| pins.iter().any(|pin| pin == &entry.version))
+                .map(|_| Version::new(entry.version.clone()));
             let registry = if entry.conda { CONDA } else { PYPI };
             deps.push(Dependency {
                 package: PackageId::new(L::ID, entry.name, Some(registry.to_string())),
@@ -204,7 +233,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
-                graph_ceiling: None,
+                graph_ceiling,
                 members: Vec::new(),
                 pinned: false,
             });
