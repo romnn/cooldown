@@ -18,8 +18,8 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
     ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, SyncScope,
-    ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
+    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport,
+    SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};

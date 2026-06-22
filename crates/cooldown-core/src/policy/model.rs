@@ -535,7 +535,10 @@ mod tests {
 
     #[test]
     fn window_exclude_newer_maps_empty_windows_to_none() {
-        assert_eq!(window_exclude_newer(&WindowSpec::MinAge(SignedDuration::ZERO)), None);
+        assert_eq!(
+            window_exclude_newer(&WindowSpec::MinAge(SignedDuration::ZERO)),
+            None
+        );
         assert_eq!(window_exclude_newer(&WindowSpec::Latest), None);
     }
 

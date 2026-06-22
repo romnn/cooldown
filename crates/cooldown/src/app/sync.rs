@@ -134,7 +134,10 @@ impl Workspace {
             match writer.sync_scope() {
                 SyncScope::Project => {
                     for pctx in self.scoped_projects(opts).filter(|pctx| pctx.tool == tool) {
-                        items.push(self.sync_project(writer, pctx, tool, opts, &mut summary).await);
+                        items.push(
+                            self.sync_project(writer, pctx, tool, opts, &mut summary)
+                                .await,
+                        );
                     }
                 }
                 SyncScope::Repo => {
@@ -193,7 +196,10 @@ impl Workspace {
         let policy = ResolvedPolicy {
             default_window: Some(window.clone()),
         };
-        match writer.write_native(&pctx.project, &policy, opts.dry_run).await {
+        match writer
+            .write_native(&pctx.project, &policy, opts.dry_run)
+            .await
+        {
             Ok(report) => {
                 let (status, path) = classify(&report);
                 summary.record(status);
@@ -245,7 +251,10 @@ impl Workspace {
         let policy = ResolvedPolicy {
             default_window: Some(window.clone()),
         };
-        match writer.write_repo_native(self.repo_root(), &policy, opts.dry_run).await {
+        match writer
+            .write_repo_native(self.repo_root(), &policy, opts.dry_run)
+            .await
+        {
             Ok(report) => {
                 let (status, path) = classify(&report);
                 summary.record(status);
@@ -272,7 +281,6 @@ impl Workspace {
             }
         }
     }
-
 }
 
 /// The repo root as a repo-relative path: always `.`.

@@ -129,27 +129,47 @@ impl Uv {
         }
     }
 
-    /// Re-resolves the lock, pinning `name` to `version`.
+    /// Re-resolves the **whole** dependency graph once under cooldown's window, letting uv settle every
+    /// conflict itself.
     ///
-    /// Runs `uv lock --upgrade-package <name>==<version>`, which lets uv adjust
-    /// the rest of the graph to keep it consistent.
+    /// With `upgrade = true` it runs `uv lock --upgrade --exclude-newer <cutoff>`: uv re-resolves the
+    /// entire graph to the maximal versions admissible under the cutoff, resolving every mutual
+    /// exclusion (e.g. raising `huggingface-hub` forces `typer` down) on its own. The result is the
+    /// unique maximal-within-window lock, so a second identical invocation is a fixed point — no
+    /// per-package pins, no oscillation, and no package outside an explicit candidate set is left to
+    /// drift silently, because *every* package is re-resolved under the same cutoff.
+    ///
+    /// With `upgrade = false` it runs `uv lock --exclude-newer <cutoff>` (no `--upgrade`): a minimal
+    /// re-lock that lowers only the packages whose locked version is now *newer* than the cutoff (a
+    /// too-fresh pin is invalid under `--exclude-newer`, so uv must mature it down) while leaving every
+    /// already-compliant package untouched. This is the `fix` / reconcile form — roll the too-fresh
+    /// deps back to the window without otherwise churning the graph.
+    ///
+    /// `ceilings` caps specific packages at `<= version` via uv's own `--upgrade-package <name><=<v>`.
+    /// It is empty in the uniform-window case (one global cutoff governs the whole graph); cooldown
+    /// adds a ceiling only for a package whose verdict is stricter than the global window — a longer
+    /// per-package window, a floor, or an exempt freeze — so that per-package policy is enforced
+    /// without pinning the rest of the graph. The global `cutoff` still applies to every other package.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `uv` cannot be spawned, or [`CoreError::Tool`] if it
-    /// exits non-zero (e.g. the pin is unsatisfiable — a resolver conflict).
-    pub async fn upgrade_to(
+    /// exits non-zero (e.g. the declared requirements are unsatisfiable under the cutoff).
+    pub async fn lock_resolve(
         &self,
         dir: &Utf8Path,
-        name: &str,
-        version: &str,
+        upgrade: bool,
+        ceilings: &[(String, String)],
         cutoff: Option<&str>,
     ) -> Result<(), CoreError> {
-        let mut args = vec![
-            "lock".to_string(),
-            "--upgrade-package".to_string(),
-            format!("{name}=={version}"),
-        ];
+        let mut args = vec!["lock".to_string()];
+        if upgrade {
+            args.push("--upgrade".to_string());
+        }
+        for (name, version) in ceilings {
+            args.push("--upgrade-package".to_string());
+            args.push(format!("{name}<={version}"));
+        }
         args.extend(exclude_newer_args(cutoff));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run(dir, &arg_refs, cutoff).await

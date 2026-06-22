@@ -74,6 +74,11 @@ struct FakeEco {
     releases: HashMap<String, Vec<Release>>,
     locked: HashMap<String, Release>,
     inject_fresh_on_apply: bool,
+    /// Net version changes the fake reports as having been forced on packages the plan did not name —
+    /// the whole-graph re-resolve's collateral. Reflected into the report's `applied` set so the
+    /// executor must surface them, mirroring how the uv adapter reports a forced non-candidate move
+    /// from the full lock diff (never silent).
+    collateral_on_apply: Vec<Change>,
     stale_lock: bool,
     fail_graph_after_apply: bool,
     fail_locked_release_after_apply_for: Option<String>,
@@ -233,8 +238,18 @@ impl ToolWrite for FakeEco {
                 .applied_versions
                 .insert(change.package.name.clone(), change.to.clone());
         }
+        // A whole-graph re-resolve can force packages the plan did not name to move for consistency.
+        // Reflect those collateral moves into both the applied report and the graph state, so the
+        // executor sees — and must surface — them exactly as the uv adapter does from its lock diff.
+        let mut applied = plan.changes.clone();
+        for collateral in &self.collateral_on_apply {
+            state
+                .applied_versions
+                .insert(collateral.package.name.clone(), collateral.to.clone());
+            applied.push(collateral.clone());
+        }
         Ok(ApplyReport {
-            applied: plan.changes.clone(),
+            applied,
             skipped: Vec::new(),
         })
     }
@@ -300,6 +315,7 @@ fn fake(
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -379,6 +395,7 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
         releases,
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -629,6 +646,7 @@ async fn outdated_transitive_scopes_in_indirect_deps() {
             releases: releases.clone(),
             locked: HashMap::new(),
             inject_fresh_on_apply: false,
+            collateral_on_apply: Vec::new(),
             stale_lock: false,
             fail_graph_after_apply: false,
             fail_locked_release_after_apply_for: None,
@@ -688,6 +706,7 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
         releases,
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -749,6 +768,7 @@ async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
         releases,
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -816,6 +836,7 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
         releases,
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -860,6 +881,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
         releases: HashMap::new(),
         locked: locked.clone(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -920,6 +942,7 @@ async fn check_transitive_allow_and_hide_modes() {
         releases: HashMap::new(),
         locked: locked.clone(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -967,6 +990,7 @@ async fn check_fails_closed_on_stale_lock() {
         releases: HashMap::new(),
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: true,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1010,6 +1034,7 @@ async fn upgrade_applies_clean_change() {
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1024,6 +1049,95 @@ async fn upgrade_applies_clean_change() {
     assert_eq!(out.summary.applied, 1);
     assert!(out.items[0].applied);
     assert_eq!(out.items[0].to, "v1.1.0");
+}
+
+#[tokio::test]
+async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
+    // The reviewer fixture in adapter terms: upgrading the planned candidate `a` forces the
+    // whole-graph re-resolve to move `b` — a package the plan never named — backward for consistency
+    // (`b` is not a cooldown candidate; it is dragged along). That collateral move is part of the
+    // committed lock, so it MUST appear in the report. The silent-non-candidate-downgrade bug was
+    // exactly this move being applied to the lock yet omitted from the report, which let it ping-pong
+    // back on the next run. Here the forced `b` downgrade is asserted to surface as its own applied row.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    // `b` only has its current and an older release; the resolve forces it to the older one.
+    releases.insert(
+        "b".to_string(),
+        vec![
+            rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel("v2.1.0", 1, Some("2026-06-01T00:00:00Z"), None),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "b".to_string(),
+        rel("v2.1.0", 1, Some("2026-06-01T00:00:00Z"), None),
+    );
+    let forced_b_downgrade = Change {
+        package: PackageId::new(GO, "b", None),
+        from: Version::new("v2.1.0"),
+        to: Version::new("v2.0.0"),
+        kind: UpdateKind::Minor,
+        downgrade: true,
+        direct: false,
+        members: Vec::new(),
+    };
+    let fake = FakeEco {
+        // `b` is a transitive in the graph but never planned (its newest is already current, so the
+        // upgrade planner does not move it); only the resolve's consistency requirement moves it.
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![dep("b", "v2.1.0", false)],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        collateral_on_apply: vec![forced_b_downgrade],
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    // Both the planned `a` upgrade and the forced `b` downgrade are reported — nothing silent.
+    let a = out
+        .items
+        .iter()
+        .find(|item| item.name == "a")
+        .expect("a row");
+    assert!(a.applied);
+    assert_eq!(a.to, "v1.1.0");
+    let b = out
+        .items
+        .iter()
+        .find(|item| item.name == "b")
+        .expect("the forced non-candidate downgrade must be reported, never silent");
+    assert!(b.applied);
+    assert_eq!(b.from, "v2.1.0");
+    assert_eq!(b.to, "v2.0.0");
+    assert!(b.downgrade);
 }
 
 /// Releases for package "a": the current v1.0.0 plus a long-matured cross-major v2.0.0. `kind =
@@ -1063,6 +1177,7 @@ fn major_update_fake(root: camino::Utf8PathBuf, direct: bool, a_releases: Vec<Re
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1278,6 +1393,47 @@ async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
 }
 
 #[tokio::test]
+async fn fix_downgrades_two_simultaneously_too_fresh_deps_in_one_batch() {
+    // Both direct deps are younger than the window, so a single `fix` round plans both and applies
+    // them as one batch (the joint, ceiling-constrained resolve). Each is a legitimate downgrade of a
+    // too-fresh dep; neither must be reported as a conflict because the other also moved backward —
+    // the regression the earlier collateral-downgrade guard introduced, where a fix that matured two
+    // deps together was rolled back as a false conflict.
+    let (_g, root) = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    releases.insert("b".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("b".to_string(), release_named(&package_releases, "v1.0.2"));
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("a", "v1.0.2", true), dep("b", "v1.0.2", true)],
+            Vec::new(),
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 2);
+    assert_eq!(out.summary.skipped, 0);
+    assert!(out.warnings.is_empty());
+    for name in ["a", "b"] {
+        let item = out.items.iter().find(|item| item.name == name).expect(name);
+        assert_eq!(item.from, "v1.0.2");
+        assert_eq!(item.to, "v1.0.1");
+        assert!(item.applied);
+        assert!(item.downgrade);
+    }
+}
+
+#[tokio::test]
 async fn fix_warns_and_leaves_exact_pin_unless_opted_in() {
     let (_g, root) = tmp_root();
     let package_releases = too_fresh_fix_releases();
@@ -1469,6 +1625,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
         releases,
         locked,
         inject_fresh_on_apply: true, // applying the change drags in `t`
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1527,6 +1684,7 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
         releases,
         locked,
         inject_fresh_on_apply: true, // applying the `a` upgrade drags in `t`
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1580,6 +1738,7 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
         releases,
         locked,
         inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1629,6 +1788,7 @@ async fn upgrade_fails_closed_when_post_apply_validation_errors() {
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: true,
         fail_locked_release_after_apply_for: None,
@@ -1674,6 +1834,7 @@ async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: Some("a".into()),
@@ -1719,6 +1880,7 @@ async fn upgrade_reports_final_lock_and_build_failures() {
         releases,
         locked,
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1757,6 +1919,7 @@ async fn explain_traces_the_default_window() {
         releases: HashMap::new(),
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1785,6 +1948,7 @@ async fn explain_applies_registry_scoped_rule() {
         releases: HashMap::new(),
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,

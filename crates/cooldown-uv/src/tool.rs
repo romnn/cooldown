@@ -209,7 +209,11 @@ impl ToolRead for UvTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        match self.uv.verify_check(&project.root, project.exclude_newer.as_deref()).await {
+        match self
+            .uv
+            .verify_check(&project.root, project.exclude_newer.as_deref())
+            .await
+        {
             Ok(ok) => Ok(verify_current_report(
                 ok,
                 "uv.lock is current",
@@ -278,70 +282,189 @@ impl ReleaseFetcher for UvTool {
     }
 }
 
-/// The result of applying one change: adopted, or skipped with a reason. Tool-spawn failures
-/// propagate as `Err` instead, so a broken `uv` aborts rather than masquerading as a per-change skip.
-enum ChangeOutcome {
-    Applied,
-    Skipped(SkipReason),
+/// The resolved registry-package versions of a lock, keyed by package name — the snapshot `apply`
+/// diffs before/after the whole-graph re-resolve to report *every* net version change (the upgrades,
+/// the downgrades the resolve forced for consistency, and the candidates left held below their
+/// newest-within-window). Only registry packages carry a comparable version; the root and path/git
+/// sources are skipped.
+fn locked_versions(lock: &UvLock) -> std::collections::HashMap<String, String> {
+    lock.packages
+        .iter()
+        .filter(|pkg| {
+            pkg.source
+                .as_ref()
+                .is_some_and(crate::lock::Source::is_registry)
+        })
+        .filter_map(|pkg| {
+            pkg.version
+                .clone()
+                .map(|version| (pkg.name.clone(), version))
+        })
+        .collect()
+}
+
+/// The package whose declared requirement holds `held` below `target` — a depender on `held` with an
+/// upper bound the target would exceed. Names the structural blocker even when it did not itself move
+/// (e.g. `huggingface-hub` at 1.18.0 requiring `typer<0.26.0` keeps `typer` below 0.26.x), which a
+/// pure version diff cannot see. Only the upper bound of a specifier is parsed — the form that
+/// excludes a *newer* target; an unbounded or lower-only requirement never holds a candidate down.
+/// Skips `held` itself and is order-stable across requirers.
+fn blocking_requirer(lock: &UvLock, held: &str, target: &str) -> Option<String> {
+    let mut requirers: Vec<&str> = lock
+        .packages
+        .iter()
+        .filter(|pkg| pkg.name != held)
+        .filter(|pkg| {
+            pkg.metadata.as_ref().is_some_and(|metadata| {
+                metadata.requires_dist.iter().any(|req| {
+                    req.name == held
+                        && req
+                            .specifier
+                            .as_deref()
+                            .and_then(specifier_upper_bound)
+                            .is_some_and(|bound| version::compare(target, bound).is_ge())
+                })
+            })
+        })
+        .map(|pkg| pkg.name.as_str())
+        .collect();
+    requirers.sort_unstable();
+    requirers.into_iter().next().map(str::to_string)
+}
+
+/// The exclusive/inclusive upper-bound version of a PEP 440 specifier, if it carries one (`<X`,
+/// `<=X`, or a compound `>=A,<X`). A target at or above this bound is excluded by the requirement, so
+/// the requirer is holding the dependency below it. Returns `None` for unbounded or lower-only
+/// specifiers, which never cap a newer target.
+fn specifier_upper_bound(specifier: &str) -> Option<&str> {
+    specifier
+        .split(',')
+        .filter_map(|clause| {
+            let clause = clause.trim();
+            clause
+                .strip_prefix("<=")
+                .or_else(|| clause.strip_prefix('<'))
+                .map(str::trim)
+        })
+        .filter(|bound| !bound.is_empty() && !bound.contains('*'))
+        .min_by(|a, b| version::compare(a, b))
+}
+
+/// A net version change `apply` derived from the before/after lock diff for a package the plan did not
+/// itself name — collateral movement the whole-graph re-resolve forced. Reported so no package's
+/// version change is ever silent: a forced downgrade of a non-candidate (e.g. `typer` regressing
+/// because `huggingface-hub` rose) surfaces as its own report row.
+fn collateral_change(name: &str, from: &str, to: &str) -> Change {
+    let from_version = Version::new(from.to_string());
+    let to_version = Version::new(to.to_string());
+    let downgrade = version::compare(to, from).is_lt();
+    Change {
+        package: PackageId::new(UV_ID, name.to_string(), Some(PYPI.to_string())),
+        from: from_version,
+        to: to_version,
+        // A collateral move is always transitive consistency churn, not a directly-declared bump, and
+        // its update kind is informational only; `Minor` is the neutral label the renderer shows.
+        kind: cooldown_core::UpdateKind::Minor,
+        downgrade,
+        direct: false,
+        members: Vec::new(),
+    }
 }
 
 impl UvTool {
-    /// Apply one change, honoring the [`RewriteMode`]. `Auto` first tries to move the lock within the
-    /// declared requirement (`uv lock --upgrade-package name==version`) and only rewrites the
-    /// `pyproject.toml` constraint when that is rejected — typically because the target is past an
-    /// upper bound. `Always` rewrites the requirement up front (a no-op for an unconstrained dep).
-    async fn apply_change(
+    /// Re-resolve the **whole** graph once under cooldown's window, honoring [`RewriteMode`] for the
+    /// planned candidates and any per-package ceilings cooldown's verdict imposes.
+    ///
+    /// `upgrade` selects `uv lock --upgrade` (forward, maximal-within-window) versus a plain re-lock
+    /// (minimal, matures only too-fresh pins down — the `fix`/reconcile form). Widening runs only for
+    /// the planned candidates whose declared `pyproject` requirement would otherwise cap them below
+    /// their target: `Always` widens every candidate up front; `Auto` widens only those the resolve
+    /// left short of their target because of their *own* declared cap (a candidate held by *another*
+    /// package's requirement is a real conflict the full-lock diff then reports, not a missing widen).
+    ///
+    /// After the global-window resolve, any planned candidate that landed *newer* than cooldown's
+    /// target (because that package carries a stricter-than-global per-package window, a floor, or an
+    /// exempt freeze) is re-capped to its target via uv's `--upgrade-package <name><=<target>` and the
+    /// graph re-resolved, so a per-package window is enforced natively without pinning the rest of the
+    /// graph. The uniform-window case adds no ceilings and is a single whole-graph resolve.
+    async fn whole_graph_resolve(
         &self,
         project: &Project,
-        change: &Change,
-        mode: RewriteMode,
-    ) -> Result<ChangeOutcome> {
-        match mode {
-            RewriteMode::Always => {
+        plan: &Plan,
+        upgrade: bool,
+    ) -> Result<()> {
+        if matches!(plan.rewrite, RewriteMode::Always) {
+            for change in &plan.changes {
                 manifest::widen_constraint(
                     &project.manifest,
                     &change.package.name,
                     change.to.as_str(),
                 )?;
-                self.relock(project, change).await
             }
-            RewriteMode::Auto => match self.lock_to_target(project, change).await {
-                Ok(()) => Ok(ChangeOutcome::Applied),
-                Err(err) if err.is_tool_spawn_failure() => Err(err),
-                Err(_) => {
-                    // The lock-only move was rejected. If the requirement can be widened, do so and
-                    // retry; otherwise there is no constraint to relax (the dep is transitive-only or
-                    // pinned), so the resolver is holding it where it is — a real conflict.
-                    let widened = manifest::widen_constraint(
+        }
+        self.lock_once(project, upgrade, &[]).await?;
+
+        if upgrade && matches!(plan.rewrite, RewriteMode::Auto) {
+            // Widen only the candidates uv could not raise to their target because their own declared
+            // requirement caps them, then re-resolve. A candidate still short after a no-op widen round
+            // is blocked by another package (a real conflict), so widening stops and the diff reports it.
+            for _ in 0..plan.changes.len() {
+                let after = locked_versions(&read_lock(project)?);
+                let mut widened_any = false;
+                for change in &plan.changes {
+                    let reached = after.get(&change.package.name).is_some_and(|current| {
+                        version::compare(current, change.to.as_str()).is_ge()
+                    });
+                    if reached {
+                        continue;
+                    }
+                    if manifest::widen_constraint(
                         &project.manifest,
                         &change.package.name,
                         change.to.as_str(),
-                    )?;
-                    if !widened {
-                        return Ok(ChangeOutcome::Skipped(SkipReason::ResolverConflict));
+                    )? {
+                        widened_any = true;
                     }
-                    self.relock(project, change).await
                 }
-            },
+                if !widened_any {
+                    break;
+                }
+                self.lock_once(project, upgrade, &[]).await?;
+            }
         }
+
+        // Per-package window enforcement: a candidate the global-window resolve placed *above*
+        // cooldown's target carries a stricter-than-global window (a longer per-package age, a floor,
+        // or an exempt freeze that cooldown already folded into the target). Cap exactly those packages
+        // at their target and re-resolve; the uniform case finds none and skips this entirely.
+        let after = locked_versions(&read_lock(project)?);
+        let ceilings: Vec<(String, String)> = plan
+            .changes
+            .iter()
+            .filter(|change| {
+                after
+                    .get(&change.package.name)
+                    .is_some_and(|locked| version::compare(locked, change.to.as_str()).is_gt())
+            })
+            .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
+            .collect();
+        if !ceilings.is_empty() {
+            self.lock_once(project, upgrade, &ceilings).await?;
+        }
+        Ok(())
     }
 
-    /// Re-lock to the target after a (possible) constraint rewrite, mapping a resolver rejection to a
-    /// skip and a spawn failure to a fatal error.
-    async fn relock(&self, project: &Project, change: &Change) -> Result<ChangeOutcome> {
-        match self.lock_to_target(project, change).await {
-            Ok(()) => Ok(ChangeOutcome::Applied),
-            Err(err) if err.is_tool_spawn_failure() => Err(err),
-            Err(_) => Ok(ChangeOutcome::Skipped(SkipReason::ResolverConflict)),
-        }
-    }
-
-    async fn lock_to_target(&self, project: &Project, change: &Change) -> Result<()> {
+    async fn lock_once(
+        &self,
+        project: &Project,
+        upgrade: bool,
+        ceilings: &[(String, String)],
+    ) -> Result<()> {
         self.uv
-            .upgrade_to(
+            .lock_resolve(
                 &project.root,
-                &change.package.name,
-                change.to.as_str(),
+                upgrade,
+                ceilings,
                 project.exclude_newer.as_deref(),
             )
             .await
@@ -373,24 +496,111 @@ impl ToolWrite for UvTool {
         &self,
         project: &Project,
         plan: &Plan,
-        _journal: &ProjectMutationJournal,
+        journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
-        for change in &plan.changes {
-            match self.apply_change(project, change, plan.rewrite).await? {
-                ChangeOutcome::Applied => report.applied.push(change.clone()),
-                ChangeOutcome::Skipped(reason) => report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason,
-                    offending: Some(change.package.clone()),
-                }),
+        if plan.changes.is_empty() {
+            return Ok(report);
+        }
+
+        // The pre-apply lock, taken from the journal (`mutation_journal` captured `uv.lock` before the
+        // re-resolve). The whole-graph resolve emits one consistent lock; the report is the diff of this
+        // snapshot against the result, so *every* net version change is surfaced. A missing/unparsable
+        // snapshot leaves `before` empty, so a package that moved is still reported (never silent).
+        let before = journal
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new("uv.lock"))
+            .and_then(|file| file.contents.as_deref())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|content| UvLock::parse(content).ok())
+            .map(|lock| locked_versions(&lock))
+            .unwrap_or_default();
+
+        // The whole graph is re-resolved in one pass under cooldown's window: `--upgrade` for forward
+        // moves (maximal-within-window), a plain re-lock for an all-downgrade plan (`fix`/reconcile —
+        // mature only the too-fresh pins). uv settles every conflict itself, so the result is the unique
+        // fixed point under the window — no per-package pins for the bulk of the graph, no oscillation,
+        // and no package left to drift unreported because *every* package is re-resolved under the cutoff.
+        let upgrade = !plan.changes.iter().all(|change| change.downgrade);
+        match self.whole_graph_resolve(project, plan, upgrade).await {
+            Ok(()) => {}
+            Err(err) if err.is_tool_spawn_failure() => return Err(err),
+            // The whole resolve was unsatisfiable (no consistent lock under the window): every candidate
+            // is held. The caller restores the journal, so no partial lock is kept.
+            Err(_) => {
+                for change in &plan.changes {
+                    report.skipped.push(Skipped {
+                        change: change.clone(),
+                        reason: SkipReason::ResolverConflict,
+                        offending: Some(change.package.clone()),
+                    });
+                }
+                return Ok(report);
             }
         }
+
+        let after_lock = read_lock(project)?;
+        let after = locked_versions(&after_lock);
+        let planned: std::collections::HashSet<&str> = plan
+            .changes
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+
+        // Each planned candidate either reached cooldown's target (its newest-within-window) — reported
+        // applied — or fell short because a mutually-exclusive requirement won — reported held, naming
+        // the blocker. "Reached" respects the move's direction: a forward candidate must land at or
+        // above its target, a downgrade at or below it.
+        for change in &plan.changes {
+            let landed = after.get(change.package.name.as_str());
+            let reached = landed.is_some_and(|version| {
+                let ordering = version::compare(version, change.to.as_str());
+                if change.downgrade {
+                    ordering.is_le()
+                } else {
+                    ordering.is_ge()
+                }
+            });
+            if reached {
+                report.applied.push(change.clone());
+            } else {
+                // uv could not place this candidate at its target without breaking the lock — another
+                // requirement won. Name the package whose upper-bound requirement structurally holds it
+                // below the target so the report says "held: conflicts with <pkg>"; absent a known
+                // blocker it falls back to the candidate itself (the generic "resolver rejected" form).
+                let offender =
+                    blocking_requirer(&after_lock, &change.package.name, change.to.as_str())
+                        .unwrap_or_else(|| change.package.name.clone());
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::ResolverConflict,
+                    offending: Some(PackageId::new(UV_ID, offender, Some(PYPI.to_string()))),
+                });
+            }
+        }
+
+        // The hard requirement: no net version change to *any* package may be omitted. A package the
+        // plan did not name that the whole-graph resolve moved (a transitive forced backward to keep the
+        // lock consistent, or a transitive matured down by `fix`) is surfaced as its own collateral
+        // applied row — the silent, unreported drift that earlier per-candidate designs allowed.
+        let mut collateral: Vec<Change> = before
+            .iter()
+            .filter(|(name, _)| !planned.contains(name.as_str()))
+            .filter_map(|(name, from)| {
+                let to = after.get(name)?;
+                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
+            })
+            .collect();
+        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        report.applied.extend(collateral);
         Ok(report)
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
-        self.uv.sync(&project.root, project.exclude_newer.as_deref()).await
+        self.uv
+            .sync(&project.root, project.exclude_newer.as_deref())
+            .await
     }
 
     // uv's native cooldown config is repo-scoped (`SyncScope::Repo`), not per-project: the per-project
@@ -436,9 +646,133 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use cooldown_adapter_util::skipped_on_apply_error;
-    use cooldown_core::{ArtifactId, CoreError, FetchContext, RawArtifact, RawRelease};
+    use cooldown_core::{ArtifactId, Change, CoreError, FetchContext, RawArtifact, RawRelease};
     use indoc::indoc;
     use jiff::Timestamp;
+
+    fn lock_with(packages: &[(&str, &str)]) -> UvLock {
+        use std::fmt::Write as _;
+        let mut content = String::from("version = 1\nrevision = 3\n");
+        for (name, version) in packages {
+            write!(
+                content,
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n"
+            )
+            .expect("writing to a String never fails");
+        }
+        UvLock::parse(&content).expect("lock parses")
+    }
+
+    /// The collateral net version changes the diff surfaces for packages the plan did not name — the
+    /// before/after pairs that differ, excluding the planned set. Mirrors `apply`'s collateral pass.
+    fn collateral_changes(
+        before: &std::collections::HashMap<String, String>,
+        after: &std::collections::HashMap<String, String>,
+        planned: &std::collections::HashSet<&str>,
+    ) -> Vec<Change> {
+        let mut changes: Vec<Change> = before
+            .iter()
+            .filter(|(name, _)| !planned.contains(name.as_str()))
+            .filter_map(|(name, from)| {
+                let to = after.get(name)?;
+                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
+            })
+            .collect();
+        changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        changes
+    }
+
+    #[test]
+    fn collateral_change_surfaces_a_forced_non_candidate_downgrade() {
+        // Raising `huggingface-hub` forces `typer` from 0.26.7 down to 0.25.1 as a consistency move.
+        // `typer` is not planned, so the diff must surface it as its own collateral row — the silent,
+        // unreported drift earlier per-candidate designs allowed.
+        let before = locked_versions(&lock_with(&[
+            ("huggingface-hub", "1.16.1"),
+            ("typer", "0.26.7"),
+        ]));
+        let after = locked_versions(&lock_with(&[
+            ("huggingface-hub", "1.18.0"),
+            ("typer", "0.25.1"),
+        ]));
+        let collateral = collateral_changes(&before, &after, &planned_set(&["huggingface-hub"]));
+        assert_eq!(collateral.len(), 1);
+        let typer = &collateral[0];
+        assert_eq!(typer.package.name, "typer");
+        assert_eq!(typer.from.as_str(), "0.26.7");
+        assert_eq!(typer.to.as_str(), "0.25.1");
+        assert!(
+            typer.downgrade,
+            "a forced regression is reported as a downgrade"
+        );
+    }
+
+    #[test]
+    fn collateral_change_excludes_planned_and_unchanged_packages() {
+        // `a` is planned (its own row, not collateral), `b` is unchanged (no row at all), and `c` is an
+        // unplanned forward move (a real collateral change). Only `c` is surfaced.
+        let before = locked_versions(&lock_with(&[
+            ("a", "2.0.0"),
+            ("b", "2.0.0"),
+            ("c", "1.0.0"),
+        ]));
+        let after = locked_versions(&lock_with(&[
+            ("a", "1.0.0"),
+            ("b", "2.0.0"),
+            ("c", "1.5.0"),
+        ]));
+        let collateral = collateral_changes(&before, &after, &planned_set(&["a"]));
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "c");
+        assert!(!collateral[0].downgrade);
+    }
+
+    fn planned_set<'a>(names: &'a [&'a str]) -> std::collections::HashSet<&'a str> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn specifier_upper_bound_reads_only_the_upper_clause() {
+        assert_eq!(specifier_upper_bound("<0.26.0"), Some("0.26.0"));
+        assert_eq!(specifier_upper_bound("<=1.4"), Some("1.4"));
+        assert_eq!(specifier_upper_bound(">=0.20.0,<0.26.0"), Some("0.26.0"));
+        // Lower-only and unbounded specifiers never cap a newer target.
+        assert_eq!(specifier_upper_bound(">=1.1.5"), None);
+        assert_eq!(specifier_upper_bound("==6.33.5"), None);
+        assert_eq!(specifier_upper_bound("<*"), None);
+    }
+
+    #[test]
+    fn blocking_requirer_names_a_structural_upper_bound_holder() {
+        // `huggingface-hub` (committed at 1.18.0) requires `typer<0.26.0`, which holds the `typer`
+        // candidate at 0.25.1 below its 0.26.7 target. The requirement names the structural blocker so
+        // the held skip can say "held: conflicts with huggingface-hub".
+        let lock = UvLock::parse(indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "huggingface-hub"
+            version = "1.18.0"
+            source = { registry = "https://pypi.org/simple" }
+            dependencies = [{ name = "typer" }]
+
+            [package.metadata]
+            requires-dist = [{ name = "typer", specifier = ">=0.20.0,<0.26.0" }]
+
+            [[package]]
+            name = "typer"
+            version = "0.25.1"
+            source = { registry = "https://pypi.org/simple" }
+        "#})
+        .expect("lock parses");
+        assert_eq!(
+            blocking_requirer(&lock, "typer", "0.26.7"),
+            Some("huggingface-hub".to_string())
+        );
+        // When the target is *within* the requirement's bound, the requirer is not a blocker.
+        assert_eq!(blocking_requirer(&lock, "typer", "0.25.5"), None);
+    }
 
     #[test]
     fn apply_spawn_failure_is_not_downgraded_to_skip() {

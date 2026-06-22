@@ -151,11 +151,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let applied_before = self.applied_count();
         let errored_before = self.errored_count();
         let planned = self.plan_upgrade_changes(&deps).await;
-        for change in planned {
-            if !self.apply_change(change, state).await {
-                break;
-            }
-        }
+        self.apply_batch(planned, state).await;
         // Skip reconciliation when the upgrade made no clean forward progress: nothing floated up,
         // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
@@ -447,12 +443,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
             let applied_before = self.applied_count();
-            for change in plan.changes {
-                if !self.apply_change(change, state).await {
-                    return;
-                }
+            if !self.apply_batch(plan.changes, state).await {
+                self.emit_fix_warnings(plan.warnings);
+                return;
             }
-            // No forward progress despite a non-empty plan (e.g. every downgrade was skipped): stop
+            // No forward progress despite a non-empty plan (e.g. every downgrade was held): stop
             // rather than spin, and surface what is left.
             if self.applied_count() == applied_before {
                 self.emit_fix_warnings(plan.warnings);
@@ -481,10 +476,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
             let applied_before = self.applied_count();
-            for change in plan.changes {
-                if !self.apply_change(change, state).await {
-                    return;
-                }
+            if !self.apply_batch(plan.changes, state).await {
+                self.emit_fix_warnings(plan.warnings);
+                return;
             }
             if self.applied_count() == applied_before {
                 self.emit_fix_warnings(plan.warnings);
@@ -520,11 +514,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    async fn apply_change(&mut self, change: Change, state: &mut TrialState) -> bool {
+    /// Apply a round's planned changes as **one** atomic plan, so a tool that re-resolves jointly
+    /// (uv's ceiling resolve) settles conflicts between candidates in a single pass and produces one
+    /// consistent lock. The whole batch shares a single journal: the resulting lock is indivisible, so
+    /// if it drags in an irreducible fresh transitive the entire batch is rolled back rather than a
+    /// single change. Returns whether the round made forward progress worth continuing the fixpoint.
+    async fn apply_batch(&mut self, changes: Vec<Change>, state: &mut TrialState) -> bool {
+        if changes.is_empty() {
+            return false;
+        }
         let plan = Plan {
-            changes: vec![change.clone()],
+            changes: changes.clone(),
             rewrite: self.ctx.opts.rewrite,
         };
+        let primary = changes
+            .first()
+            .map(|change| change.package.name.clone())
+            .unwrap_or_default();
         let journal = match self
             .ctx
             .writer
@@ -533,7 +539,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(journal) => journal,
             Err(error) => {
-                self.record_project_error(&error, Some(&change.package.name));
+                self.record_project_error(&error, Some(&primary));
                 return false;
             }
         };
@@ -546,81 +552,166 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(report) => report,
             Err(error) => {
-                return self.restore_with_change_error(&journal, &change, &error);
+                let restored = self.restore_journal(&journal);
+                for change in &changes {
+                    let diag = diag_from_error(
+                        &error,
+                        self.ctx.pctx.tool,
+                        self.project_label(),
+                        Some(&change.package.name),
+                    );
+                    self.record_change_error(change, diag);
+                }
+                return restored;
             }
         };
 
-        if report.applied.is_empty() {
-            let restored = self.restore_journal(&journal);
-            self.acc.strict_incomplete = true;
-            self.record_change_skip(
-                &change,
-                report
-                    .skipped
-                    .into_iter()
-                    .next()
-                    .map(|skipped| SkippedInfo {
-                        reason: skipped.reason,
-                        message: skipped.reason.message().to_string(),
-                        offending: skipped.offending.map(|package| package.name),
-                    }),
-            );
-            return restored;
+        // A held candidate (the resolve could not place it at its target without breaking the lock) is
+        // reported as a skip naming the package that blocks it.
+        let applied: HashSet<String> = report
+            .applied
+            .iter()
+            .map(|change| change.package.name.clone())
+            .collect();
+        let planned: HashSet<String> = changes
+            .iter()
+            .map(|change| change.package.name.clone())
+            .collect();
+        // Net version changes the resolve forced on packages the plan did not name (a transitive
+        // pushed backward for consistency, or matured down by a downgrade). These are part of the
+        // committed lock and must be surfaced, never silent — the whole point of the full-lock-diff
+        // report. They are recorded as applied rows once the batch commits below.
+        let collateral: Vec<Change> = report
+            .applied
+            .iter()
+            .filter(|change| !planned.contains(&change.package.name))
+            .cloned()
+            .collect();
+        self.record_batch_skips(report.skipped);
+
+        if applied.is_empty() {
+            // Nothing landed: roll the (unchanged or partial) lock back to the captured state.
+            return self.restore_journal(&journal);
         }
 
         let after = match self.graph_violations().await {
             Ok(after) => after,
             Err(error) => {
-                return self.restore_with_change_error(&journal, &change, &error);
+                // The post-apply gate probe failed: fail closed by rolling the batch back and
+                // recording the failure against each applied change (never committing an unverified
+                // lock).
+                let restored = self.restore_journal(&journal);
+                for change in &changes {
+                    if applied.contains(&change.package.name) {
+                        let diag = diag_from_error(
+                            &error,
+                            self.ctx.pctx.tool,
+                            self.project_label(),
+                            Some(&change.package.name),
+                        );
+                        self.record_change_error(change, diag);
+                    }
+                }
+                return restored;
             }
         };
         let after_keys: HashSet<(String, String)> = after.keys().cloned().collect();
+        if self.gate_batch_transitives(&after, &after_keys, &changes, &applied, state) {
+            return self.restore_journal(&journal);
+        }
+
+        state.baseline_violations = after_keys;
+        for change in &changes {
+            if applied.contains(&change.package.name) {
+                self.record_change_applied(change);
+            }
+        }
+        for change in &collateral {
+            self.record_change_applied(change);
+        }
+        true
+    }
+
+    /// Record each held candidate (uv lowered it below its ceiling, or the resolve rejected it) as a
+    /// skip, naming the package that blocks it via [`conflict_skip_message`].
+    fn record_batch_skips(&mut self, skipped: Vec<cooldown_core::Skipped>) {
+        for skipped in skipped {
+            let offending = skipped.offending.map(|package| package.name);
+            self.acc.strict_incomplete = true;
+            let change = skipped.change;
+            self.record_change_skip(
+                &change,
+                Some(SkippedInfo {
+                    reason: skipped.reason,
+                    message: conflict_skip_message(
+                        skipped.reason,
+                        offending.as_deref(),
+                        &change.package.name,
+                    ),
+                    offending,
+                }),
+            );
+        }
+    }
+
+    /// The transitive-cooldown gate over a committed batch. The joint resolve may drag a fresh
+    /// transitive into the graph; how we react follows the transitive mode: `Hide` ignores
+    /// transitives; `Allow` keeps the lock and reports them; `Enforce` (default) keeps it only when
+    /// every new violation is *reconcilable* (the reconcile pass can downgrade it later). Returns
+    /// `true` when `Enforce` found a fresh, irreducible dep the resolve forced in — the caller rolls
+    /// the whole batch back, since committing a version that requires a too-fresh transitive defeats
+    /// the cooldown. Records the applied changes as `TransitiveInCooldown` skips in that case.
+    fn gate_batch_transitives(
+        &mut self,
+        after: &HashMap<(String, String), bool>,
+        after_keys: &HashSet<(String, String)>,
+        changes: &[Change],
+        applied: &HashSet<String>,
+        state: &TrialState,
+    ) -> bool {
         let new_violations: Vec<&(String, String)> =
             after_keys.difference(&state.baseline_violations).collect();
-        // A change that drags a fresh transitive into the graph. How we react follows the transitive
-        // mode: `Hide` ignores transitives; `Allow` keeps the change and reports them; `Enforce`
-        // (default) keeps it only when every new violation is *reconcilable* (the reconcile pass can
-        // downgrade it later) and rolls back when the upgrade *forces* a fresh, irreducible dep —
-        // adopting a version that requires a too-fresh transitive defeats the cooldown.
-        if !new_violations.is_empty() {
-            match self.transitive_mode() {
-                TransitiveGate::Hide => {}
-                TransitiveGate::Allow => {
-                    for (package, version) in &new_violations {
-                        self.record_fix_warning(
-                            &format!(
-                                "{package}@{version} is younger than its cooldown; left in place by --transitive allow"
-                            ),
-                            package,
-                        );
-                    }
+        if new_violations.is_empty() {
+            return false;
+        }
+        match self.transitive_mode() {
+            TransitiveGate::Hide => false,
+            TransitiveGate::Allow => {
+                for (package, version) in &new_violations {
+                    self.record_fix_warning(
+                        &format!(
+                            "{package}@{version} is younger than its cooldown; left in place by --transitive allow"
+                        ),
+                        package,
+                    );
                 }
-                TransitiveGate::Enforce => {
-                    if let Some((forced_pkg, _)) = new_violations
-                        .iter()
-                        .find(|key| !after.get(**key).copied().unwrap_or(false))
-                    {
-                        let restored = self.restore_journal(&journal);
-                        self.acc.strict_incomplete = true;
+                false
+            }
+            TransitiveGate::Enforce => {
+                let Some((forced_pkg, _)) = new_violations
+                    .iter()
+                    .find(|key| !after.get(**key).copied().unwrap_or(false))
+                else {
+                    // Every new violation is reconcilable; keep the lock and let the reconcile pass
+                    // (after the upgrade loop) downgrade the floated-up transitives.
+                    return false;
+                };
+                self.acc.strict_incomplete = true;
+                for change in changes {
+                    if applied.contains(&change.package.name) {
                         self.record_change_skip(
-                            &change,
+                            change,
                             Some(SkippedInfo {
                                 reason: SkipReason::TransitiveInCooldown,
                                 message: SkipReason::TransitiveInCooldown.message().to_string(),
                                 offending: Some(forced_pkg.clone()),
                             }),
                         );
-                        return restored;
                     }
-                    // Every new violation is reconcilable; keep the change and let `reconcile_graph`
-                    // (after the upgrade loop) downgrade the floated-up transitives.
                 }
+                true
             }
         }
-
-        state.baseline_violations = after_keys;
-        self.record_change_applied(&change);
-        true
     }
 
     fn transitive_mode(&self) -> TransitiveGate {
@@ -654,23 +745,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 false
             }
         }
-    }
-
-    fn restore_with_change_error(
-        &mut self,
-        journal: &cooldown_core::ProjectMutationJournal,
-        change: &Change,
-        error: &cooldown_core::CoreError,
-    ) -> bool {
-        let restored = self.restore_journal(journal);
-        let diag = diag_from_error(
-            error,
-            self.ctx.pctx.tool,
-            self.project_label(),
-            Some(&change.package.name),
-        );
-        self.record_change_error(change, diag);
-        restored
     }
 
     async fn finalize(&mut self) {
@@ -890,6 +964,22 @@ fn target_package(
     PackageId::new(package.tool, name, package.registry.clone())
 }
 
+/// The user-facing skip message. A resolver conflict caused by a *different* package — adopting the
+/// candidate would have regressed it (a mutually-exclusive requirement) — names that package, so the
+/// report says which dependency is holding the candidate back rather than the generic "the resolver
+/// rejected this change". Any other skip keeps the reason's own message.
+fn conflict_skip_message(reason: SkipReason, offending: Option<&str>, changed: &str) -> String {
+    match (reason, offending) {
+        // A conflict blamed on a *different* package: adopting the candidate would have regressed it.
+        // A conflict whose offender is the candidate itself is just "the resolver rejected this pin",
+        // so it keeps the generic message.
+        (SkipReason::ResolverConflict, Some(offending)) if offending != changed => {
+            format!("held: conflicts with {offending}")
+        }
+        _ => reason.message().to_string(),
+    }
+}
+
 fn plan_item(
     change: &Change,
     project: &str,
@@ -939,10 +1029,45 @@ fn record_skip_item(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_downgrade, target_package};
+    use super::{conflict_skip_message, is_downgrade, target_package};
     use cooldown_core::{
-        MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, ToolId, Version,
+        MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId, Version,
     };
+
+    #[test]
+    fn conflict_skip_message_names_a_different_offender() {
+        // A resolver conflict blamed on another package — adopting it would have regressed that
+        // package — names it, so the report explains which dependency holds the candidate back.
+        assert_eq!(
+            conflict_skip_message(
+                SkipReason::ResolverConflict,
+                Some("typer"),
+                "huggingface-hub"
+            ),
+            "held: conflicts with typer"
+        );
+    }
+
+    #[test]
+    fn conflict_skip_message_keeps_generic_message_when_offender_is_self() {
+        // The resolver rejected the pin itself (no other package to blame): keep the generic message.
+        assert_eq!(
+            conflict_skip_message(SkipReason::ResolverConflict, Some("foo"), "foo"),
+            SkipReason::ResolverConflict.message()
+        );
+        assert_eq!(
+            conflict_skip_message(SkipReason::ResolverConflict, None, "foo"),
+            SkipReason::ResolverConflict.message()
+        );
+    }
+
+    #[test]
+    fn conflict_skip_message_passes_through_non_conflict_reasons() {
+        assert_eq!(
+            conflict_skip_message(SkipReason::NeedsMajor, Some("bar"), "foo"),
+            SkipReason::NeedsMajor.message()
+        );
+    }
 
     fn rel(version: &str, order: u8) -> Release {
         Release {

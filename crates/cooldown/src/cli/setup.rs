@@ -69,7 +69,14 @@ pub(crate) async fn prepare_run(
     let repo_layers = policy::repo_layers(&configs, &shared, &repo_root)?;
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
-    let ws = Workspace::new(adapters, ctxs, now, baseline, repo_root.clone(), repo_layers);
+    let ws = Workspace::new(
+        adapters,
+        ctxs,
+        now,
+        baseline,
+        repo_root.clone(),
+        repo_layers,
+    );
     let mut opts = invocation.into_run_opts();
     // The scan-exclude globs also filter workspace-member dependencies (folders by member path,
     // packages by member name), so carry both global/command and per-tool excludes into the run.
