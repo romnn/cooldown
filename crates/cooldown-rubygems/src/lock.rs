@@ -156,7 +156,10 @@ mod tests {
         // `racc` pins `nokogiri (>= 1.13, < 2.0)` as a compound range — neither names a ceiling.
         let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n      actioncable (= 7.0.0)\n      rake (~> 13.0)\n    actioncable (7.0.0)\n    racc (1.6.0)\n      nokogiri (>= 1.13, < 2.0)\n\nDEPENDENCIES\n  rails\n";
         let ceilings = graph_ceilings(lock);
-        assert_eq!(ceilings.get("actioncable").map(String::as_str), Some("7.0.0"));
+        assert_eq!(
+            ceilings.get("actioncable").map(String::as_str),
+            Some("7.0.0")
+        );
         assert_eq!(ceilings.get("rake"), None); // range, not exact
         assert_eq!(ceilings.get("nokogiri"), None); // compound range
         assert_eq!(ceilings.len(), 1);

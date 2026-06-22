@@ -185,9 +185,7 @@ pub fn pixi_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
             continue;
         }
         if let Some(item) = trimmed.strip_prefix("- ") {
-            if in_constraints
-                && let Some((name, version)) = exact_match_spec(item)
-            {
+            if in_constraints && let Some((name, version)) = exact_match_spec(item) {
                 push_ceiling(&mut ceilings, normalize_name(name), version.to_string());
             }
             continue;
@@ -230,8 +228,13 @@ pub fn conda_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
                     let cleaned = clean(spec);
                     // The value is a match-spec; drop a trailing build string before testing it,
                     // exactly as `exact_match_spec` does for the pixi path.
-                    if let Some(version) = cleaned.split_whitespace().next().and_then(exact_version) {
-                        push_ceiling(&mut ceilings, normalize_name(key.trim()), version.to_string());
+                    if let Some(version) = cleaned.split_whitespace().next().and_then(exact_version)
+                    {
+                        push_ceiling(
+                            &mut ceilings,
+                            normalize_name(key.trim()),
+                            version.to_string(),
+                        );
                     }
                 }
                 continue;
@@ -269,9 +272,7 @@ fn exact_version(spec: &str) -> Option<&str> {
     // pypi-style requirement in a pixi list could carry, so only a bare version is treated as exact.
     // `!` is *not* rejected: it is the conda/PEP 440 epoch separator (`1!2.0.3`); the relational `!=`
     // is still caught by the `=` it contains.
-    if version.is_empty()
-        || version.contains(['<', '>', '=', '~', '*', ',', '|', ' ', ';', '['])
-    {
+    if version.is_empty() || version.contains(['<', '>', '=', '~', '*', ',', '|', ' ', ';', '[']) {
         return None;
     }
     Some(version)
@@ -486,8 +487,14 @@ mod tests {
         // it also `constrains:` zlib exactly. The build suffix on libprotobuf is ignored.
         let lock = "version: 6\npackages:\n- conda: https://conda.anaconda.org/conda-forge/linux-64/protobuf-6.31.1-py.conda\n  sha256: abc\n  depends:\n  - libprotobuf 6.31.1 hcaab2f7_0\n  - python >=3.9\n  constrains:\n  - zlib 1.3.1\n- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.0-h.conda\n  sha256: def\n";
         let ceilings = pixi_lock_ceilings(lock);
-        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
-        assert_eq!(ceilings.get("zlib").map(Vec::as_slice), Some(["1.3.1".to_string()].as_slice()));
+        assert_eq!(
+            ceilings.get("libprotobuf").map(Vec::as_slice),
+            Some(["6.31.1".to_string()].as_slice())
+        );
+        assert_eq!(
+            ceilings.get("zlib").map(Vec::as_slice),
+            Some(["1.3.1".to_string()].as_slice())
+        );
         assert_eq!(ceilings.get("python"), None); // `>=3.9` is a range
         assert_eq!(ceilings.len(), 2);
     }
@@ -497,7 +504,9 @@ mod tests {
         // A multi-platform lock can pin one name to different exact versions; both are kept so the
         // per-platform resolved version can match its own pin (last-write-wins would drop one).
         let lock = "version: 6\npackages:\n- conda: https://x/linux-64/app-1.0-h.conda\n  depends:\n  - libfoo 1.0\n- conda: https://x/osx-64/app-1.0-h.conda\n  depends:\n  - libfoo 2.0\n";
-        let mut pins = pixi_lock_ceilings(lock).remove("libfoo").unwrap_or_default();
+        let mut pins = pixi_lock_ceilings(lock)
+            .remove("libfoo")
+            .unwrap_or_default();
         pins.sort();
         assert_eq!(pins, vec!["1.0".to_string(), "2.0".to_string()]);
     }
@@ -508,7 +517,10 @@ mod tests {
         // sibling `version:`/`manager:` fields are not mistaken for dependency entries.
         let lock = "version: 1\npackage:\n  - name: numpy\n    version: \"1.24.0\"\n    manager: conda\n    dependencies:\n      libprotobuf: \"==6.31.1\"\n      python: \">=3.9,<3.13\"\n  - name: requests\n    version: \"2.28.0\"\n    manager: pip\nmetadata: {}\n";
         let ceilings = conda_lock_ceilings(lock);
-        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
+        assert_eq!(
+            ceilings.get("libprotobuf").map(Vec::as_slice),
+            Some(["6.31.1".to_string()].as_slice())
+        );
         assert_eq!(ceilings.get("python"), None); // compound range
         assert_eq!(ceilings.get("version"), None); // a sibling field, not a dependency
         assert_eq!(ceilings.len(), 1);
@@ -519,13 +531,22 @@ mod tests {
         // A build-qualified exact value (`6.31.1 h1234_0`) is recognized; the build string is dropped.
         let lock = "version: 1\npackage:\n  - name: numpy\n    version: \"1.24.0\"\n    manager: conda\n    dependencies:\n      libprotobuf: \"6.31.1 h1234_0\"\nmetadata: {}\n";
         let ceilings = conda_lock_ceilings(lock);
-        assert_eq!(ceilings.get("libprotobuf").map(Vec::as_slice), Some(["6.31.1".to_string()].as_slice()));
+        assert_eq!(
+            ceilings.get("libprotobuf").map(Vec::as_slice),
+            Some(["6.31.1".to_string()].as_slice())
+        );
     }
 
     #[test]
     fn exact_match_spec_and_version_recognise_only_exact_pins() {
-        assert_eq!(exact_match_spec("libprotobuf 6.31.1"), Some(("libprotobuf", "6.31.1")));
-        assert_eq!(exact_match_spec("ld_impl 2.44 h1423503_1"), Some(("ld_impl", "2.44")));
+        assert_eq!(
+            exact_match_spec("libprotobuf 6.31.1"),
+            Some(("libprotobuf", "6.31.1"))
+        );
+        assert_eq!(
+            exact_match_spec("ld_impl 2.44 h1423503_1"),
+            Some(("ld_impl", "2.44"))
+        );
         assert_eq!(exact_match_spec("python >=3.9"), None);
         assert_eq!(exact_match_spec("numpy 1.21.*"), None);
         assert_eq!(exact_match_spec("solo-name"), None); // unconstrained
@@ -536,9 +557,15 @@ mod tests {
         assert_eq!(exact_version("!=2.0"), None); // relational not-equal, caught by the `=`
         // A conda/PEP 440 epoch version is exact — the `!` separator must be accepted.
         assert_eq!(exact_version("1!2.0.3"), Some("1!2.0.3"));
-        assert_eq!(exact_match_spec("openssl 1!1.1.1"), Some(("openssl", "1!1.1.1")));
+        assert_eq!(
+            exact_match_spec("openssl 1!1.1.1"),
+            Some(("openssl", "1!1.1.1"))
+        );
         // A PEP 508 marker token must not be mistaken for a version (a pypi-style list entry).
-        assert_eq!(exact_match_spec("tomli ; python_full_version < \"3.11\""), None);
+        assert_eq!(
+            exact_match_spec("tomli ; python_full_version < \"3.11\""),
+            None
+        );
     }
 
     #[test]
