@@ -629,7 +629,7 @@ pub enum ArtifactScope {
 
 /// Whether release discovery should stay within the current major line or also probe cross-major
 /// candidates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateScope {
     /// Only same-major candidates are relevant (`--major` not set).
     CurrentMajorOnly,

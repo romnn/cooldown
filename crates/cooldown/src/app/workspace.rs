@@ -1,10 +1,13 @@
 use super::baseline::Baseline;
 use super::model::Window;
+use super::release_cache::{ReleaseCache, ReleaseResolver};
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext, PatternGlob,
-    PolicyStack, Project, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
+    PolicyStack, Project, Release, ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId,
+    ToolRead, ToolWrite,
 };
+use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -227,12 +230,18 @@ pub struct Workspace {
     projects: Vec<ProjectCtx>,
     now: Timestamp,
     pub(crate) baseline: Baseline,
+    /// The run-scoped release resolver every fetch routes through, so a package shared across
+    /// workspace members or re-resolved across `upgrade` fixpoint rounds hits the registry once.
+    /// Held as the [`ReleaseResolver`] port (not the concrete cache) so it is swappable and
+    /// mockable. See [`release_cache`](super::release_cache).
+    release_cache: Box<dyn ReleaseResolver>,
 }
 
 /// The registered tool adapters, split into read-side and mutation-side ports.
 #[derive(Default)]
 pub struct AdapterSet {
     readers: Vec<Arc<dyn ToolRead>>,
+    fetchers: HashMap<ToolId, Arc<dyn ReleaseFetcher>>,
     writers: HashMap<ToolId, Arc<dyn ToolWrite>>,
 }
 
@@ -250,8 +259,10 @@ impl AdapterSet {
     {
         let id = adapter.id();
         let reader: Arc<dyn ToolRead> = adapter.clone();
+        let fetcher: Arc<dyn ReleaseFetcher> = adapter.clone();
         let writer: Arc<dyn ToolWrite> = adapter;
         self.readers.push(reader);
+        self.fetchers.insert(id, fetcher);
         self.writers.insert(id, writer);
     }
 
@@ -272,6 +283,13 @@ impl AdapterSet {
     pub fn writer(&self, id: ToolId) -> Option<&dyn ToolWrite> {
         self.writers.get(&id).map(std::convert::AsRef::as_ref)
     }
+
+    /// The registry-fetch port for one tool. Intentionally private to this module: it is reached
+    /// only by [`Workspace`]'s cache-backed fetch methods, so no caller elsewhere can fetch releases
+    /// without going through the release cache — the [`ReleaseFetcher`] never leaves this module.
+    fn release_fetcher(&self, id: ToolId) -> Option<&dyn ReleaseFetcher> {
+        self.fetchers.get(&id).map(std::convert::AsRef::as_ref)
+    }
 }
 
 impl Workspace {
@@ -289,6 +307,7 @@ impl Workspace {
             projects,
             now,
             baseline,
+            release_cache: Box::new(ReleaseCache::new()),
         }
     }
 
@@ -400,6 +419,106 @@ impl Workspace {
             allow_major: opts.allow_major,
         }
     }
+
+    /// Fetch the locked release for each dep through the run's release cache, concurrently.
+    ///
+    /// The cache (a [`ReleaseResolver`]) is the only thing handed the tool's [`ReleaseFetcher`], so
+    /// every locked-release read is single-flight-deduplicated and rate-limited by construction —
+    /// there is no API to fetch one any other way.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(tool = adapter.id().as_str(), deps = deps.len(), fanout)
+    )]
+    pub(crate) async fn fetch_locked_releases(
+        &self,
+        adapter: &dyn ToolRead,
+        deps: Vec<Dependency>,
+        fetch: &FetchContext<'_>,
+        fanout: usize,
+    ) -> Vec<(Dependency, cooldown_core::Result<Release>)> {
+        let started = std::time::Instant::now();
+        let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
+            return no_fetcher_results(adapter.id(), deps);
+        };
+        let results = stream::iter(deps)
+            .map(|dep| async move {
+                let result = self
+                    .release_cache
+                    .locked_release(fetcher, &dep, fetch)
+                    .await;
+                (dep, result)
+            })
+            .buffer_unordered(fanout)
+            .collect()
+            .await;
+        self.log_release_fetch(started);
+        results
+    }
+
+    /// Fetch the candidate releases for each dep through the run's release cache, concurrently. See
+    /// [`fetch_locked_releases`](Self::fetch_locked_releases) for why this is the only fetch path.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(tool = adapter.id().as_str(), deps = deps.len(), fanout)
+    )]
+    pub(crate) async fn fetch_candidate_releases(
+        &self,
+        adapter: &dyn ToolRead,
+        deps: Vec<Dependency>,
+        fetch: &FetchContext<'_>,
+        candidate_scope: CandidateScope,
+        fanout: usize,
+    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+        let started = std::time::Instant::now();
+        let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
+            return no_fetcher_results(adapter.id(), deps);
+        };
+        let results = stream::iter(deps)
+            .map(|dep| async move {
+                let result = self
+                    .release_cache
+                    .candidate_releases(fetcher, &dep, fetch, candidate_scope)
+                    .await;
+                (dep, result)
+            })
+            .buffer_unordered(fanout)
+            .collect()
+            .await;
+        self.log_release_fetch(started);
+        results
+    }
+
+    /// Emit per-fetch timing plus cumulative cache effectiveness, nested under the fetch span so the
+    /// tool and dep count are already in scope.
+    fn log_release_fetch(&self, started: std::time::Instant) {
+        let stats = self.release_cache.stats();
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            cache_lookups = stats.lookups,
+            cache_resolved = stats.resolved,
+            cache_saved = stats.saved(),
+            "release fetch complete"
+        );
+    }
+}
+
+/// The fallback result when a tool somehow has no registered [`ReleaseFetcher`] (every registered
+/// adapter has one, so this is unreachable in practice) — one typed error per dep, never a panic.
+fn no_fetcher_results<T>(
+    tool: ToolId,
+    deps: Vec<Dependency>,
+) -> Vec<(Dependency, cooldown_core::Result<T>)> {
+    deps.into_iter()
+        .map(|dep| {
+            let err = cooldown_core::CoreError::System(format!(
+                "no release fetcher registered for tool {}",
+                tool.as_str()
+            ));
+            (dep, Err(err))
+        })
+        .collect()
 }
 
 /// Map a resolved window to its JSON view at `now`.

@@ -175,7 +175,6 @@ impl crate::app::Workspace {
         opts: &super::RunOpts,
     ) -> Result<Vec<AckEntry>, CoreError> {
         use cooldown_core::{DepScope, Status, check_pin};
-        use futures::stream::{self, StreamExt};
 
         let mut entries = Vec::new();
         for pctx in self.scoped_projects(opts) {
@@ -187,14 +186,10 @@ impl crate::app::Workspace {
                 .await?;
             let fctx = Self::fetch_context(pctx, opts);
             let rctx = Self::resolve_ctx(pctx, opts);
-            let fctx_ref = &fctx;
-            let fetched: Vec<_> = stream::iter(deps)
-                .map(|dep| async move {
-                    let r = adapter.locked_release(&dep, fctx_ref).await;
-                    (dep, r)
-                })
-                .buffer_unordered(opts.fanout())
-                .collect()
+            // Route through the cache-backed fetch — the only locked-release path — so a package
+            // shared with other commands/projects this run is not re-fetched.
+            let fetched = self
+                .fetch_locked_releases(adapter, deps, &fctx, opts.fanout())
                 .await;
 
             for (dep, result) in fetched {

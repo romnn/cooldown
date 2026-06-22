@@ -15,9 +15,9 @@ use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
     MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, ResolvedPolicy,
-    Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead, ToolWrite,
-    VerifyReport, Version,
+    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
+    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead,
+    ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -185,6 +185,24 @@ impl ToolRead for UvTool {
         Ok(deps)
     }
 
+    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
+        parse_native(&project.manifest)
+    }
+
+    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+        match self.uv.verify_check(&project.root).await {
+            Ok(ok) => Ok(verify_current_report(
+                ok,
+                "uv.lock is current",
+                "uv.lock is stale; run `uv lock`",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for UvTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -193,6 +211,13 @@ impl ToolRead for UvTool {
     ) -> Result<Vec<Release>> {
         let raw = self.pypi.releases(&dep.package).await?;
         Ok(build_releases(dep.current.as_str(), raw, dep, fetch))
+    }
+
+    fn releases_are_project_scoped(&self) -> bool {
+        // uv is artifact-granular: `releases`/`locked_release` derive publish instants from the
+        // project's own locked artifacts (`dep.artifacts`, and this project's `uv.lock`), so the
+        // answer differs per project. The cache must key by project, not share across uv projects.
+        true
     }
 
     async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release> {
@@ -231,21 +256,6 @@ impl ToolRead for UvTool {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
-        parse_native(&project.manifest)
-    }
-
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        match self.uv.verify_check(&project.root).await {
-            Ok(ok) => Ok(verify_current_report(
-                ok,
-                "uv.lock is current",
-                "uv.lock is stale; run `uv lock`",
-            )),
-            Err(e) => Err(e),
-        }
     }
 }
 

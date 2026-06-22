@@ -1,6 +1,5 @@
 use super::{ProjectCtx, RunOpts, Workspace};
-use cooldown_core::{CandidateScope, Dependency, FetchContext, Release, ResolveContext, ToolRead};
-use futures::stream::{self, StreamExt};
+use cooldown_core::{FetchContext, ResolveContext, ToolRead};
 
 /// The common read-side context for one scoped project: adapter, label, fetch context, and
 /// resolve context.
@@ -24,40 +23,5 @@ impl Workspace {
             fetch: Workspace::fetch_context(pctx, opts),
             resolve: Workspace::resolve_ctx(pctx, opts),
         })
-    }
-
-    pub(crate) async fn fetch_locked_releases(
-        &self,
-        adapter: &dyn ToolRead,
-        deps: Vec<Dependency>,
-        fetch: &FetchContext<'_>,
-        fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Release>)> {
-        stream::iter(deps)
-            .map(|dep| async {
-                let result = adapter.locked_release(&dep, fetch).await;
-                (dep, result)
-            })
-            .buffer_unordered(fanout)
-            .collect()
-            .await
-    }
-
-    pub(crate) async fn fetch_candidate_releases(
-        &self,
-        adapter: &dyn ToolRead,
-        deps: Vec<Dependency>,
-        fetch: &FetchContext<'_>,
-        candidate_scope: CandidateScope,
-        fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
-        stream::iter(deps)
-            .map(|dep| async {
-                let result = adapter.releases(&dep, fetch, candidate_scope).await;
-                (dep, result)
-            })
-            .buffer_unordered(fanout)
-            .collect()
-            .await
     }
 }

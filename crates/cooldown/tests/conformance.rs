@@ -144,6 +144,21 @@ impl ToolRead for FakeEco {
         }
         Ok(out)
     }
+    async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        let stale = self.stale_lock
+            || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
+        Ok(VerifyReport {
+            ok: !stale,
+            detail: if stale { "stale".into() } else { "tidy".into() },
+        })
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for FakeEco {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -191,17 +206,6 @@ impl ToolRead for FakeEco {
             .get(&dep.package.name)
             .cloned()
             .ok_or_else(|| CoreError::NotFound(dep.package.name.clone()))
-    }
-    async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(None)
-    }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
-        let stale = self.stale_lock
-            || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
-        Ok(VerifyReport {
-            ok: !stale,
-            detail: if stale { "stale".into() } else { "tidy".into() },
-        })
     }
 }
 

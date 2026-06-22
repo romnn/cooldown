@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal, Release, Result,
-    ToolId, ToolRead, ToolWrite, VerifyReport,
+    NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
+    ReleaseFetcher, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -111,6 +111,17 @@ impl ToolRead for GoTool {
         graph::dependencies(&self.go, self.registry(), project, scope).await
     }
 
+    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None) // Go has no native cooldown config.
+    }
+
+    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+        graph::verify_lock_current(&self.go, project).await
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for GoTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -126,12 +137,11 @@ impl ToolRead for GoTool {
         graph::locked_release(&self.proxy, dep).await
     }
 
-    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(None) // Go has no native cooldown config.
-    }
-
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        graph::verify_lock_current(&self.go, project).await
+    fn releases_are_project_scoped(&self) -> bool {
+        // `releases` resolves candidates from `go list -m -versions` run in the asking module's
+        // root (and uses `dep.graph_floor`), so the answer differs per Go module — each `go.mod` is
+        // its own project. The cache must key by project, not share across modules.
+        true
     }
 }
 

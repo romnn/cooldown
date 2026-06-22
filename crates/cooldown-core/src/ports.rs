@@ -1,10 +1,11 @@
 //! The ports (traits) and the I/O-facing types that cross them.
 //!
-//! [`ToolRead`] is the read-side port the informational and gating use cases speak to:
-//! discovery, dependency graphs, classified releases, locked-release metadata, native policy, and
-//! lock-currency verification. [`ToolWrite`] is the mutation-side port used only by commands
-//! that rewrite project state. [`PackageRegistry`] is the finer-grained port each adapter is built
-//! from (constructor-injected, reusable and fakeable in unit tests).
+//! [`ToolRead`] is the read-side port the informational and gating use cases speak to: discovery,
+//! dependency graphs, native policy, and lock-currency verification. [`ReleaseFetcher`] is the
+//! registry-fetch port (classified releases and locked-release metadata), kept separate so the use
+//! cases can only reach it through the run's release cache. [`ToolWrite`] is the mutation-side port
+//! used only by commands that rewrite project state. [`PackageRegistry`] is the finer-grained port
+//! each adapter is built from (constructor-injected, reusable and fakeable in unit tests).
 
 use crate::error::Result;
 use crate::model::{
@@ -42,21 +43,16 @@ pub struct Capabilities {
 
 /// The read-side port the use cases speak to, implemented once per tool adapter.
 ///
-/// An `ToolRead` reads native project state, yields classified [`Release`]s, and verifies
-/// that native lock state is current. It is deliberately mechanism-only: it never decides the
-/// cooldown (the core does) and never builds a [`Rule`]/[`WindowSpec`] (window normalisation
-/// happens once, in [`normalize_native`]). Adapters are typically assembled on top of the
-/// finer-grained [`PackageRegistry`] port.
+/// An `ToolRead` reads native project state (its dependencies and native cooldown config) and
+/// verifies that native lock state is current. It is deliberately mechanism-only: it never decides
+/// the cooldown (the core does) and never builds a [`Rule`]/[`WindowSpec`] (window normalisation
+/// happens once, in [`normalize_native`]).
+///
+/// The registry-fetch methods live on the separate [`ReleaseFetcher`] port, so code holding a
+/// `dyn ToolRead` *cannot* fetch releases — and therefore cannot sidestep the run's release cache.
 ///
 /// The trait is made object-safe via [`macro@async_trait`] so the use cases can hold a
 /// `dyn ToolRead` and drive any tool uniformly. Implementations must be `Send + Sync`.
-///
-/// # Contract
-///
-/// Implementors must uphold the invariants documented on each method. In particular, [`releases`]
-/// must return candidates sorted ascending by release order (see [`debug_assert_sorted`]).
-///
-/// [`releases`]: ToolRead::releases
 #[async_trait]
 pub trait ToolRead: Send + Sync {
     /// Returns the stable identifier of this tool (e.g. Go, Cargo, uv).
@@ -96,6 +92,44 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
+    /// Returns the tool's native cooldown config translated into the unified rule model.
+    ///
+    /// Each window is left RAW (see [`RawWindow`]) so the core normalises absolute-vs-rolling
+    /// exactly once via [`normalize_native`]. Tools without a native cooldown concept (Go)
+    /// return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the native config exists but cannot be parsed.
+    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>>;
+
+    /// Verifies the lock is current relative to its manifest — the fail-closed `check` precondition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if currency cannot be determined; a stale lock is
+    /// reported in the [`VerifyReport`].
+    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
+}
+
+/// The registry-fetch port: classified candidate releases and the locked release for a dependency.
+///
+/// Split out from [`ToolRead`] on purpose. These are the only methods that hit a registry, and the
+/// application layer must route every call through the run-scoped release cache (for single-flight
+/// dedup across a workspace and across `upgrade` fixpoint rounds) and the rate-limited HTTP client.
+/// To make that non-optional, the use cases are never handed a `dyn ReleaseFetcher`: they hold a
+/// [`ToolRead`] (which cannot fetch) and reach releases only through the cache. "Forgetting to
+/// cache" is then a compile error, not a code-review catch.
+///
+/// Adapters are typically assembled on top of the finer-grained [`PackageRegistry`] port. The trait
+/// is object-safe via [`macro@async_trait`]; implementations must be `Send + Sync`.
+///
+/// # Contract
+///
+/// [`releases`](ReleaseFetcher::releases) must return its candidates sorted ascending by release
+/// order — see [`debug_assert_sorted`], which the core relies on.
+#[async_trait]
+pub trait ReleaseFetcher: Send + Sync {
     /// Returns the classified candidate releases for `dep`, sorted ascending by release order.
     ///
     /// Each candidate carries its order, `kind_from_current`, and publish times, resolved via the
@@ -129,24 +163,18 @@ pub trait ToolRead: Send + Sync {
     /// publish instant cannot be resolved.
     async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release>;
 
-    /// Returns the tool's native cooldown config translated into the unified rule model.
+    /// Whether this fetcher's results depend on the *asking project* (its lockfile, module graph, or
+    /// resolved environment) rather than being a pure function of the package and version.
     ///
-    /// Each window is left RAW (see [`RawWindow`]) so the core normalises absolute-vs-rolling
-    /// exactly once via [`normalize_native`]. Tools without a native cooldown concept (Go)
-    /// return `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if the native config exists but cannot be parsed.
-    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>>;
-
-    /// Verifies the lock is current relative to its manifest — the fail-closed `check` precondition.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if currency cannot be determined; a stale lock is
-    /// reported in the [`VerifyReport`].
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
+    /// The run-scoped release cache uses this to decide its key: a project-scoped fetcher is keyed
+    /// per project, so two projects that share a `(package, version)` never serve each other's
+    /// answer; a project-independent fetcher (a global registry index) is shared across the whole
+    /// run. Defaults to `false` — correct for every registry-index adapter. Override to `true` when
+    /// `releases`/`locked_release` read [`FetchContext::project`] or per-project [`Dependency`] state
+    /// (e.g. Go's per-module `go list -m -versions`, uv's per-project locked artifact times).
+    fn releases_are_project_scoped(&self) -> bool {
+        false
+    }
 }
 
 /// The mutation-side port for tools that can rewrite project state.
@@ -223,10 +251,11 @@ pub trait ToolWrite: Send + Sync {
     }
 }
 
-/// Convenience bound for concrete adapters that implement both the read-side and write-side ports.
-pub trait Tool: ToolRead + ToolWrite {}
+/// Convenience bound for concrete adapters that implement the read-side, registry-fetch, and
+/// write-side ports.
+pub trait Tool: ToolRead + ReleaseFetcher + ToolWrite {}
 
-impl<T> Tool for T where T: ToolRead + ToolWrite {}
+impl<T> Tool for T where T: ToolRead + ReleaseFetcher + ToolWrite {}
 
 /// The pre-change contents of the files a planned mutation may rewrite.
 #[derive(Debug, Clone, Default)]
@@ -438,7 +467,7 @@ pub enum SyncReport {
     },
 }
 
-/// Asserts, in debug builds, that an adapter's [`releases`](ToolRead::releases) output is sorted
+/// Asserts, in debug builds, that an adapter's [`releases`](ReleaseFetcher::releases) output is sorted
 /// ascending by release order.
 ///
 /// The core relies on this ordering invariant, so adapters should call this on the slice they are

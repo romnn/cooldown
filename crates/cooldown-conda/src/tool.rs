@@ -14,8 +14,8 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, Result, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version,
+    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
+    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -211,6 +211,21 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         Ok(deps)
     }
 
+    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+
+    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
+        Ok(verify_current_report(
+            true,
+            "lockfile taken as current",
+            "lockfile is stale",
+        ))
+    }
+}
+
+#[async_trait]
+impl<L: CondaLayout> ReleaseFetcher for CondaEnvTool<L> {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -240,18 +255,6 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(None)
-    }
-
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "lockfile taken as current",
-            "lockfile is stale",
-        ))
     }
 }
 

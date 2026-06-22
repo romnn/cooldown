@@ -13,8 +13,8 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality, Result, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version,
+    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
+    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -113,6 +113,21 @@ impl ToolRead for HexTool {
         Ok(deps)
     }
 
+    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+
+    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
+        Ok(verify_current_report(
+            true,
+            "mix.lock taken as current",
+            "mix.lock is stale",
+        ))
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for HexTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -137,18 +152,6 @@ impl ToolRead for HexTool {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(None)
-    }
-
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "mix.lock taken as current",
-            "mix.lock is stale",
-        ))
     }
 }
 

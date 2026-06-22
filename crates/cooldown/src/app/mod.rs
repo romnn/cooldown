@@ -13,6 +13,7 @@ mod lock;
 mod model;
 mod outdated;
 mod read;
+mod release_cache;
 mod sync;
 mod upgrade;
 mod workspace;

@@ -16,8 +16,8 @@ use cooldown_adapter_util::{skipped_on_apply_error, verify_current_report};
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseOrder, Result, ToolId, ToolRead, ToolWrite,
-    VerifyReport, Version,
+    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result, ToolId, ToolRead,
+    ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashSet;
@@ -166,6 +166,21 @@ impl ToolRead for DenoTool {
         DenoTool::read_deps(project, scope)
     }
 
+    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+
+    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
+        Ok(verify_current_report(
+            true,
+            "lockfile taken as current",
+            "lockfile is stale",
+        ))
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for DenoTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -187,18 +202,6 @@ impl ToolRead for DenoTool {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
-        Ok(None)
-    }
-
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "lockfile taken as current",
-            "lockfile is stale",
-        ))
     }
 }
 

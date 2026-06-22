@@ -13,8 +13,8 @@ use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
     ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext, NativePolicyLayer,
     PackageId, PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
-    ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, VerifyReport, Version,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId,
+    ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::BTreeSet;
@@ -143,6 +143,24 @@ impl ToolRead for CargoTool {
         Ok(deps)
     }
 
+    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
+        parse_native(&project.manifest)
+    }
+
+    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+        match self.cargo.verify_locked(&project.root).await {
+            Ok(ok) => Ok(verify_current_report(
+                ok,
+                "Cargo.lock is current",
+                "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for CargoTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -167,21 +185,6 @@ impl ToolRead for CargoTool {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
-        parse_native(&project.manifest)
-    }
-
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
-        match self.cargo.verify_locked(&project.root).await {
-            Ok(ok) => Ok(verify_current_report(
-                ok,
-                "Cargo.lock is current",
-                "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
-            )),
-            Err(e) => Err(e),
-        }
     }
 }
 

@@ -17,9 +17,9 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
-    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseOrder, ReleaseQuality,
-    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId, ToolRead,
-    ToolWrite, VerifyReport, Version, WindowSpec,
+    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, ToolId,
+    ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -215,6 +215,24 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         Ok(deps)
     }
 
+    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
+        // npm has no standard in-manifest cooldown/freeze field, so there is no native layer.
+        Ok(None)
+    }
+
+    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
+        // The npm-family CLIs lack a cheap, uniform "is the lock current?" probe, so cooldown
+        // trusts the committed lock as the source of truth rather than re-resolving on every read.
+        Ok(verify_current_report(
+            true,
+            "lockfile taken as current",
+            "lockfile is stale",
+        ))
+    }
+}
+
+#[async_trait]
+impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -239,21 +257,6 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             yanked: false,
             quality: dep.current_quality,
         })
-    }
-
-    async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
-        // npm has no standard in-manifest cooldown/freeze field, so there is no native layer.
-        Ok(None)
-    }
-
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        // The npm-family CLIs lack a cheap, uniform "is the lock current?" probe, so cooldown
-        // trusts the committed lock as the source of truth rather than re-resolving on every read.
-        Ok(verify_current_report(
-            true,
-            "lockfile taken as current",
-            "lockfile is stale",
-        ))
     }
 }
 
