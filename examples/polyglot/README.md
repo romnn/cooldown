@@ -4,9 +4,18 @@ Throwaway projects used to generate the README screenshots (`task screenshots`, 
 `scripts/screenshots.sh`) and to exercise each adapter end to end. Every project pins deliberately
 old dependency versions so `cooldown` always has updates to show; the exact "latest" versions drift
 as registries evolve, but the demo stays valid and regenerates from this repo (no external checkout).
+The screenshots are captured at a fixed instant via the debug-only `--now` flag, so they regenerate
+identically; run live (a release build, no `--now`), the same projects show the same statuses with
+day-counts that have simply moved on.
 
-- `cargo/` — a standalone Cargo project (`Cargo.toml` + `Cargo.lock`; its `[workspace]` keeps it out
-  of the parent workspace). Caret constraints with an old lock, so `upgrade` can move them.
+- `cargo/` — a standalone Cargo project (`Cargo.toml` + `Cargo.lock` + `cooldown.toml`; its
+  `[workspace]` keeps it out of the parent workspace). Tuned so one `outdated --countdown soonest` run
+  lands on **every** status at once: a few old caret pins (**adoptable**); `bincode` is an exact `=`
+  pin (**held**); `once_cell` is pinned to its latest (**up-to-date**); `itertools` is waived by an
+  `allow` rule (**exempt**); and two contrasting **in cooldown** rows — `bytes`, whose only newer
+  release is still cooling, and `log`, pinned below a burst of releases so `--countdown soonest`
+  counts down to the *next* version to unlock (an intermediate) rather than the newest. This is the
+  project the README screenshots are shot from.
 - `go/`   — a Go module (`go.mod` + `go.sum`). `require`s old versions of a few well-known modules.
 - `python/` — a uv project (`pyproject.toml` + `uv.lock`). Dependencies are `==`-pinned to old
   versions so the lock stays in sync (no stale-lock error); `outdated`/`check` work, but `upgrade`

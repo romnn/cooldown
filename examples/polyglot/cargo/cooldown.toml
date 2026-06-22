@@ -1,0 +1,27 @@
+# cooldown.toml — the policy this example showcases. Deliberately small and illustrative, arranged so
+# `cooldown outdated --tool cargo --countdown soonest` lands on every status at once.
+
+# Default: refuse to adopt any version younger than 7 days.
+min-age = "7d"
+
+# `itertools` is an audited opt-out (imagine a trusted first-party crate) — adopt it with no cooldown.
+# Its row reads "exempt".
+allow = ["itertools"]
+
+# `bytes` is pinned just below a single recent release; `freeze` pins the cutoff so that release stays
+# inside its window no matter when you run this. This is the simple cooldown case — the only newer
+# version is the latest, and it is still cooling ("Nd/7d").
+[package.bytes]
+freeze = "2026-06-15"
+
+# `log` carries a longer 30-day cooldown and is pinned below a burst of recent releases, so several
+# are cooling at once. Under `--countdown soonest` its row counts down to the *next* one to mature (an
+# intermediate the other columns don't name) instead of the newest — the "almost unlocked" case the
+# screenshot uses `soonest` to show off.
+[package.log]
+min-age = "30d"
+
+# Show up-to-date dependencies too (off by default), so the example's `outdated` lists every status —
+# including `once_cell`, which is pinned to its latest release.
+[outdated]
+all = true

@@ -1,6 +1,7 @@
-# A tiny, standalone Cargo project used only to generate cooldown's README screenshots.
-# Dependencies are deliberately pinned to older versions in Cargo.lock so `cooldown outdated`
-# always has something to show. `[workspace]` keeps it out of the parent cooldown workspace.
+# A tiny, standalone Cargo project used to generate cooldown's README screenshots and to show off
+# every `outdated` status at once (see `cooldown.toml` for the policy). Most deps are pinned to old
+# versions in Cargo.lock so a newer one has matured (adoptable); the rest are deliberately arranged
+# to land on the other statuses. `[workspace]` keeps it out of the parent cooldown workspace.
 [package]
 name = "cooldown-example-cargo"
 version = "0.1.0"
@@ -10,13 +11,20 @@ publish = false
 [workspace]
 
 [dependencies]
+# Old caret pins: a newer version has matured past the window → "adoptable".
 serde = "1.0.150"
 tokio = "1.25.0"
 clap = "4.1.0"
 regex = "1.7.0"
-anyhow = "1.0.68"
-bytes = "1.3.0"
-log = "0.4.17"
-once_cell = "1.16.0"
+# `itertools` is waived by an `allow` rule in cooldown.toml → "exempt".
 itertools = "0.10.5"
-bincode = "2.0.1"
+# `bytes` is pinned just below its one recent release, which cooldown.toml freezes inside the window
+# → "in cooldown" (the simple case: the latest is the only newer version, still cooling).
+bytes = "1.11.1"
+# `log` is pinned below a burst of recent releases with a 30-day window (cooldown.toml), so several
+# cool at once → "in cooldown"; `--countdown soonest` then counts down to the next one to unlock.
+log = "0.4.29"
+# `once_cell` is pinned to the latest release → "up-to-date".
+once_cell = "1.21.4"
+# An exact `=` pin never moves on its own → "held" (cooldown still shows what it could move to).
+bincode = "=2.0.1"
