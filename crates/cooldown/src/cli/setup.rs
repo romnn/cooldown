@@ -3,7 +3,7 @@ mod options;
 mod policy;
 
 use super::{CliOverrides, GlobalArgs};
-use crate::app::{Baseline, Workspace};
+use crate::app::{Baseline, Clock, FixedClock, SystemClock, Workspace};
 use crate::discovery;
 use camino::Utf8PathBuf;
 use cooldown_core::CoreError;
@@ -58,7 +58,13 @@ pub(crate) async fn prepare_run(
     .await?;
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
-    let now = jiff::Timestamp::now();
+    // The evaluation clock is a port (`Clock`): real runs read the system clock, while `--now`
+    // (debug builds only) injects a fixed instant so the README screenshots regenerate reproducibly.
+    // Sample it once here so every dependency in the run is judged against the same "now".
+    let now = match global.now_override()? {
+        Some(instant) => FixedClock::new(instant).now(),
+        None => SystemClock.now(),
+    };
     let ws = Workspace::new(adapters, ctxs, now, baseline);
     let mut opts = invocation.into_run_opts();
     // The scan-exclude globs also filter workspace-member dependencies (folders by member path,

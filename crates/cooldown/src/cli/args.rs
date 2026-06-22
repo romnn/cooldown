@@ -395,6 +395,35 @@ pub(in crate::cli) struct GlobalArgs {
         default_value_t = ColorMode::Auto
     )]
     pub(in crate::cli) color: ColorMode,
+    /// Evaluate as if the current time were this RFC3339 instant or `YYYY-MM-DD` date, instead of the
+    /// system clock. Debug builds only (hidden); it exists to regenerate the README screenshots
+    /// reproducibly. Releases dated after it are treated as not-yet-published.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, value_name = "DATE", hide = true)]
+    pub(in crate::cli) now: Option<String>,
+}
+
+impl GlobalArgs {
+    /// The evaluation-clock override (`--now`), parsed to an instant. Always `None` in release
+    /// builds — the flag exists only in debug builds — so production runs read the system clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`](cooldown_core::CoreError) if the value is not an RFC3339 instant or a
+    /// `YYYY-MM-DD` date.
+    pub(in crate::cli) fn now_override(
+        &self,
+    ) -> Result<Option<jiff::Timestamp>, cooldown_core::CoreError> {
+        #[cfg(debug_assertions)]
+        let parsed = self
+            .now
+            .as_deref()
+            .map(cooldown_core::duration::parse_freeze)
+            .transpose();
+        #[cfg(not(debug_assertions))]
+        let parsed: Result<Option<jiff::Timestamp>, cooldown_core::CoreError> = Ok(None);
+        parsed
+    }
 }
 
 /// The flags the user set *explicitly* (on the command line or via an env var), captured once from

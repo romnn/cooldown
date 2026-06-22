@@ -41,6 +41,19 @@ pub struct Capabilities {
     pub artifact_granular: bool,
 }
 
+/// The run's clock — the single source of the evaluation instant ("now").
+///
+/// Time is a port so the "now" boundary can be injected like any other dependency: production wires
+/// a system clock, while tests and reproducible output (e.g. the README screenshots) wire a fixed
+/// instant. The clock is sampled **once** at the start of a run and the resulting [`Timestamp`] is
+/// threaded through the otherwise clock-free core, so every dependency in one run is judged against
+/// the same "now" — sampling per call would let the instant drift mid-run. Implementations must be
+/// `Send + Sync`.
+pub trait Clock: Send + Sync {
+    /// The current instant.
+    fn now(&self) -> Timestamp;
+}
+
 /// The read-side port the use cases speak to, implemented once per tool adapter.
 ///
 /// An `ToolRead` reads native project state (its dependencies and native cooldown config) and

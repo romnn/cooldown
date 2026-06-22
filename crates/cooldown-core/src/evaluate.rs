@@ -44,6 +44,18 @@ fn query<'a>(
     }
 }
 
+/// Whether a release is visible as of `now`: a release dated **after** the evaluation instant does
+/// not exist yet from the run's point of view, so it is neither a candidate nor the `latest`. Under
+/// the real system clock no release is ever future-dated, so this is a no-op there; it only bites
+/// when a fixed [`Clock`](crate::Clock) is injected to evaluate the registry "as of" an earlier
+/// instant, keeping [`evaluate`]'s candidate and `latest` set honest — no versions from the future,
+/// hence no negative candidate ages. ([`check_pin`] judges the already-locked pin directly, not a
+/// candidate set, so it does not consult this.) A release with an unknown publish time is always
+/// visible — it is judged [`UnknownAge`](Status::UnknownAge).
+fn visible_at(r: &Release, now: Timestamp) -> bool {
+    r.published_at.is_none_or(|published| published <= now)
+}
+
 /// Whether a candidate's quality makes it eligible: prereleases are excluded unless the current
 /// pin is itself a prerelease; pseudo-versions (commit pins) are never normal upgrade targets.
 fn quality_eligible(r: &Release, current_quality: ReleaseQuality) -> bool {
@@ -185,7 +197,7 @@ pub fn evaluate(
     if dep.current_quality == ReleaseQuality::Pseudo {
         let latest = releases
             .iter()
-            .filter(|r| r.quality.is_stable_like() && !r.yanked)
+            .filter(|r| r.quality.is_stable_like() && !r.yanked && visible_at(r, now))
             .max_by(|a, b| a.order.cmp(&b.order))
             .map(|r| r.version.clone());
         return Verdict {
@@ -210,14 +222,15 @@ pub fn evaluate(
     let current_order = current.order.clone();
     let current_major = current.major.clone();
 
-    // Eligible = the releases adoption could target (quality + major filter + not yanked), current
-    // included, so `latest` is well-defined even when up to date.
+    // Eligible = the releases adoption could target (quality + major filter + not yanked, and not
+    // dated after `now`), current included, so `latest` is well-defined even when up to date.
     let eligible: Vec<&Release> = releases
         .iter()
         .filter(|r| {
             quality_eligible(r, dep.current_quality)
                 && major_eligible(r, &current_major, ctx.allow_major)
                 && !r.yanked
+                && (r.version == dep.current || visible_at(r, now))
         })
         .collect();
 
@@ -574,6 +587,40 @@ mod tests {
         );
         assert_eq!(verdict.current.status, Status::CurrentInCooldown);
         assert_eq!(verdict.target, None);
+    }
+
+    #[test]
+    fn releases_dated_after_now_are_not_yet_visible() {
+        // With a fixed clock injected (an "as-of" view), a release published after `now` does not
+        // exist yet: it is neither the `latest` nor a candidate, so the report stays honest — no
+        // versions from the future and no negative ages. Under the real clock nothing is ever
+        // future-dated, so this guard never fires in production.
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"), // the pin
+            dated("1.0.1", 1, "2025-12-20T00:00:00Z"), // matured before the cutoff → adoptable
+            dated("1.0.2", 2, "2026-02-01T00:00:00Z"), // published AFTER now → not yet visible
+        ];
+        let verdict = evaluate(
+            &fix_dep("1.0.0"),
+            &releases,
+            &[seven_day_layer()],
+            &ctx(),
+            now,
+        );
+        assert_eq!(
+            verdict.latest,
+            Some(Version::new("1.0.1")),
+            "the future-dated 1.0.2 must not become the latest"
+        );
+        assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.1")));
+        assert!(
+            verdict
+                .candidates
+                .iter()
+                .all(|c| c.version != Version::new("1.0.2")),
+            "a release dated after now must not be a candidate"
+        );
     }
 
     #[test]

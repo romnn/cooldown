@@ -8,6 +8,7 @@
 
 pub mod baseline;
 mod check;
+mod clock;
 mod explain;
 mod lock;
 mod model;
@@ -19,6 +20,7 @@ mod upgrade;
 mod workspace;
 
 pub use baseline::Baseline;
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use model::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,

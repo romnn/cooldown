@@ -20,7 +20,7 @@ pub use policy::{
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, resolve,
 };
 pub use ports::{
-    Capabilities, NativePolicyLayer, NativeRule, PackageRegistry, ProjectMutationFile,
+    Capabilities, Clock, NativePolicyLayer, NativeRule, PackageRegistry, ProjectMutationFile,
     ProjectMutationJournal, RawArtifact, RawRelease, RawWindow, ReleaseFetcher, ResolvedPolicy,
     SyncReport, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
 };
