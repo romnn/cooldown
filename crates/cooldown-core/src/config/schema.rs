@@ -93,7 +93,8 @@ pub struct CommandConfig {
     pub json: Option<bool>,
     /// `outdated` CI gate exit code (`--exit-code`).
     pub exit_code: Option<u8>,
-    /// Concurrency for the registry fan-out (no CLI flag; defaults to 8).
+    /// Concurrency for the registry fan-out — also the per-host in-flight cap (`--concurrency`,
+    /// `COOLDOWN_CONCURRENCY`; defaults to 16).
     pub concurrency: Option<usize>,
 }
 

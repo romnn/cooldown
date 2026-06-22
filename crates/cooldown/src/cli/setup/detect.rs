@@ -27,12 +27,20 @@ pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
     }
 }
 
-pub(super) fn adapter_set(offline: bool, fresh: bool) -> Result<AdapterSet, CoreError> {
+pub(super) fn adapter_set(
+    offline: bool,
+    fresh: bool,
+    concurrency: usize,
+) -> Result<AdapterSet, CoreError> {
     let http = SharedHttp::new(
         discovery::cache_dir().into_std_path_buf(),
         HttpOptions {
             offline,
             fresh,
+            // The resolve knob caps both the fan-out width and the per-host in-flight requests, so
+            // raising `--concurrency` actually widens the registry fetch (the per-host semaphore,
+            // not the fan-out, is otherwise the binding cap since every dep of one tool hits one host).
+            per_host_concurrency: concurrency.max(1),
             request_timeout: Duration::from_secs(30),
             ..Default::default()
         },

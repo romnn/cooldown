@@ -35,6 +35,10 @@ impl ResolvedInvocation {
         self.fresh
     }
 
+    pub(super) fn concurrency(&self) -> usize {
+        self.run.concurrency
+    }
+
     pub(super) fn respect_gitignore(&self) -> bool {
         self.respect_gitignore
     }
@@ -115,7 +119,13 @@ pub(super) fn resolve_invocation(
             no_suggestions: global.no_suggestions,
             json,
             progress: progress_mode(json, global.log_level),
-            concurrency: merged.concurrency.unwrap_or(8),
+            // `--concurrency` (CLI/env) wins over a `[<command>]`/`[global]` config value, then the
+            // built-in default. Sets both the fan-out width and the per-host HTTP cap downstream.
+            concurrency: global
+                .concurrency
+                .or(merged.concurrency)
+                .unwrap_or(16)
+                .max(1),
         },
         offline: merged.offline.unwrap_or(false),
         fresh: merged.fresh.unwrap_or(false),
@@ -142,7 +152,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         offline: Some(false),
         fresh: Some(false),
         json: Some(false),
-        concurrency: Some(8),
+        concurrency: Some(16),
         ..CommandConfig::default()
     }
 }
@@ -266,7 +276,7 @@ mod tests {
         let cfg = builtin_command_config(true);
         assert_eq!(cfg.major, Some(true));
         assert_eq!(cfg.gitignore, Some(true));
-        assert_eq!(cfg.concurrency, Some(8));
+        assert_eq!(cfg.concurrency, Some(16));
     }
 
     #[test]

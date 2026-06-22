@@ -32,7 +32,11 @@ pub(crate) async fn prepare_run(
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
     let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
-    let adapters = detect::adapter_set(invocation.offline(), invocation.fresh())?;
+    let adapters = detect::adapter_set(
+        invocation.offline(),
+        invocation.fresh(),
+        invocation.concurrency(),
+    )?;
     let projects = detect::detect_projects(
         &adapters,
         &workdir,

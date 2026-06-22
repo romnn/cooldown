@@ -365,6 +365,11 @@ pub(in crate::cli) struct GlobalArgs {
     /// Ignore the local cache; always hit the registry (use in CI gates).
     #[arg(long, global = true, visible_alias = "no-cache")]
     pub(in crate::cli) fresh: bool,
+    /// How many registry requests to run concurrently — sets both the fan-out width and the
+    /// per-host in-flight cap. Higher finishes a large workspace faster; too high can trip a
+    /// registry's rate limit. Defaults to 16; also settable per-section in config as `concurrency`.
+    #[arg(long, global = true, value_name = "N", env = "COOLDOWN_CONCURRENCY")]
+    pub(in crate::cli) concurrency: Option<usize>,
     /// Ignore the native config layer (reproducibility / debugging).
     #[arg(long = "no-native", global = true)]
     pub(in crate::cli) no_native: bool,

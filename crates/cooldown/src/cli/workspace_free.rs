@@ -77,7 +77,7 @@ const STARTER_CONFIG: &str = indoc! {r#"
     #                                     #   honored by default); /name anchors to the repo root
     # exclude-packages = ["@scope/*"]    # workspace members dropped from reports by package-name glob
     # gitignore = true            # set false to scan gitignored paths too
-    # offline = false             # cache-only; concurrency = 8 tunes the registry fan-out
+    # offline = false             # cache-only; concurrency = 16 tunes the registry fan-out (--concurrency)
     #
     # [tool.cargo]
     # exclude-folders = ["vendor"]       # extra folder excludes for one tool
