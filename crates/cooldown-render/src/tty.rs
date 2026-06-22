@@ -153,11 +153,12 @@ fn age_over_window_cell(window: &Window, age: &str) -> String {
     with_window_clamp(format!("{age}/{}", fmt_days(window.min_age_days)), window)
 }
 
-/// The `outdated` "Cooldown" cell: the shown candidate's `age/window` (e.g. `13d/14d`) when a
-/// newer version exists, or the bare window when there is no candidate. A stricter native /
-/// registry clamp is appended as `(≥<source>)`, matching the rest of the report. When the countdown
-/// refers to a version no other column names (under `--countdown soonest`), that version is appended
-/// in parentheses, e.g. `4d/7d (0.15.17)`.
+/// The `outdated` "Cooldown" cell: the shown version's `age/window` (e.g. `13d/14d`) — the upgrade
+/// candidate's age when a newer version exists, or the current pin's age when up to date. Falls back
+/// to the bare window when no age applies — a commit pin, or an unknown publish time. A stricter
+/// native / registry clamp is appended as `(≥<source>)`, matching the rest of the report. When the
+/// countdown refers to a version no other column names (under `--countdown soonest`), that version is
+/// appended in parentheses, e.g. `4d/7d (0.15.17)`.
 fn cooldown_cell(
     window: &Window,
     candidate_age_days: Option<f64>,
@@ -269,11 +270,20 @@ pub fn render_outdated(
                 .latest
                 .as_ref()
                 .map_or_else(|| "—".into(), |l| l.version.clone());
-            let cooldown = cooldown_cell(
-                &it.window,
-                it.candidate_age_days,
-                it.cooldown_version.as_deref(),
-            );
+            // No upgrade candidate: when the dep is up to date the `latest` column *is* the current
+            // pin, so its age is the pin's — show that over the window for a consistent `age/window`
+            // cell instead of a bare window. Keyed on `latest == current` (the real invariant), so a
+            // commit pin (whose `latest` differs from the pin) and the rare up-to-date-with-an-
+            // unclassifiable-newer-release case (whose `latest` is some other version) both fall
+            // through to the bare window rather than borrowing the wrong version's age.
+            let current_age_days = it.candidate_age_days.or_else(|| {
+                it.latest
+                    .as_ref()
+                    .filter(|latest| latest.version == it.current)
+                    .and_then(|latest| latest.age_days)
+            });
+            let cooldown =
+                cooldown_cell(&it.window, current_age_days, it.cooldown_version.as_deref());
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -976,6 +986,52 @@ mod tests {
         assert!(
             out.contains("4d/7d (0.15.17)"),
             "cooldown cell should label the soonest version:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outdated_up_to_date_shows_current_age_over_window() {
+        // An up-to-date dep has no upgrade candidate, but its cooldown cell still reads `age/window`
+        // (the current pin's age, always older than the window) instead of a bare window — `latest`
+        // is the current version when up to date, so its age is the pin's.
+        let summary = OutdatedSummary {
+            total: 1,
+            adoptable: 0,
+            in_cooldown: 0,
+            up_to_date: 1,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        };
+        let item = OutdatedItem {
+            name: "once_cell".into(),
+            tool: "cargo".into(),
+            project: ".".into(),
+            registry: None,
+            direct: true,
+            current: "1.21.4".into(),
+            members: Vec::new(),
+            window: Window {
+                min_age_days: 7.0,
+                source: "default".into(),
+                clamped_by: None,
+            },
+            candidate_age_days: None,
+            cooldown_version: None,
+            status: OutdatedStatus::UpToDate,
+            adoptable_target: None,
+            latest: Some(LatestInfo {
+                version: "1.21.4".into(),
+                published_at: None,
+                age_days: Some(102.0),
+            }),
+            error: None,
+        };
+        let out = render_outdated(&summary, &[item], &[], &[], &RenderOptions::default());
+        assert!(
+            out.contains("102d/7d"),
+            "up-to-date cooldown should read age/window, not a bare window:\n{out}"
         );
     }
 
