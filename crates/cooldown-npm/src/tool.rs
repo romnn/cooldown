@@ -208,6 +208,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                graph_ceiling: None,
                 members,
                 pinned,
             });

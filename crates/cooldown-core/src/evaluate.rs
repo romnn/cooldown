@@ -6,8 +6,8 @@
 //! is never mature" is enforced here, once.
 
 use crate::model::{
-    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseQuality, Status, ToolId,
-    UpdateKind, Verdict, Version,
+    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseOrder, ReleaseQuality, Status,
+    ToolId, UpdateKind, Verdict, Version,
 };
 use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
 use camino::Utf8Path;
@@ -78,6 +78,49 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
     allow_major || (r.major == *current_major && r.kind_from_current != Some(UpdateKind::Major))
 }
 
+/// The release order of the dependency's graph ceiling — the version a requirer pins it to with `==`
+/// (its [`graph_ceiling`](Dependency::graph_ceiling)) — when that version is among `releases`.
+/// [`evaluate`] excludes candidates ordered above it; `None` means no ceiling (or the ceiling version
+/// is not present here), so candidates are uncapped. The upgrade-direction mirror of `graph_floor`.
+fn graph_ceiling_order<'a>(dep: &Dependency, releases: &'a [Release]) -> Option<&'a ReleaseOrder> {
+    let ceiling = dep.graph_ceiling.as_ref()?;
+    releases
+        .iter()
+        .find(|r| r.version == *ceiling)
+        .map(|r| &r.order)
+}
+
+/// Classify one newer release as a [`Candidate`]: resolve its per-kind cooldown window and judge its
+/// publish instant against that window's cutoff at `now` ([`Exempt`](Status::Exempt) when an `allow`
+/// rule waives it, [`UnknownAge`](Status::UnknownAge) when undated). `None` for an unclassifiable
+/// jump (no `kind_from_current`) — the adapter classifies every real upgrade, so this only skips.
+fn classify_candidate(
+    r: &Release,
+    dep: &Dependency,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> Option<Candidate> {
+    let kind = r.kind_from_current?;
+    let window = resolve(layers, &query(dep, ctx, ResolveKind::Candidate(kind)), now).window;
+    let status = if window.exempt {
+        Status::Exempt
+    } else {
+        match r.published_at {
+            None => Status::UnknownAge,
+            Some(p) if p <= window.cutoff(now) => Status::Adoptable,
+            Some(_) => Status::InCooldown,
+        }
+    };
+    Some(Candidate {
+        version: r.version.clone(),
+        kind,
+        window,
+        status,
+        published_at: r.published_at,
+    })
+}
+
 /// Evaluates a dependency against its classified releases, producing a per-candidate [`Verdict`].
 ///
 /// This is the engine behind the `outdated` and `upgrade` commands. Given the currently-locked
@@ -107,11 +150,13 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 /// (the newest candidate that is [`Adoptable`](Status::Adoptable) or [`Exempt`](Status::Exempt), or
 /// `None`). The headline `status` is [`Status::Adoptable`] whenever any candidate has matured;
 /// otherwise it is the newest candidate's status, or [`Status::UpToDate`] when no newer candidate
-/// exists. Two special cases override that: exact manifest pins are [`Status::Held`] when there is a
-/// candidate to review, and a commit pin (pseudo-version) has no tagged version to compare and
-/// yields [`Status::Held`]. If the current pin is absent from `releases` the result is
-/// conservatively [`Status::UpToDate`] (`check`, via [`check_pin`], is the real gate and does not
-/// rely on this).
+/// exists — except when the only newer releases lie above the dependency's
+/// [`graph_ceiling`](Dependency::graph_ceiling) (a requirer's `==` pin), which yields
+/// [`Status::Held`] with `latest` still surfacing the newest version. Two further cases override the
+/// rollup: exact manifest pins are [`Status::Held`] when there is a candidate to review, and a commit
+/// pin (pseudo-version) has no tagged version to compare and yields [`Status::Held`]. If the current
+/// pin is absent from `releases` the result is conservatively [`Status::UpToDate`] (`check`, via
+/// [`check_pin`], is the real gate and does not rely on this).
 ///
 /// # Examples
 ///
@@ -132,6 +177,7 @@ fn major_eligible(r: &Release, current_major: &MajorKey, allow_major: bool) -> b
 ///     direct: true,
 ///     artifacts: Vec::new(),
 ///     graph_floor: None,
+///     graph_ceiling: None,
 ///     members: Vec::new(),
 ///     pinned: false,
 /// };
@@ -222,6 +268,12 @@ pub fn evaluate(
     let current_order = current.order.clone();
     let current_major = current.major.clone();
 
+    // A requirer may pin this dependency exactly (`==`), capping it below newer releases; candidates
+    // ordered above that ceiling are excluded (the upgrade-direction mirror of `graph_floor`). A
+    // ceiling below the current version is not a real upper bound — the graph resolved past it — so
+    // it is ignored, leaving a legal upgrade free rather than wrongly holding the dependency.
+    let ceiling_order = graph_ceiling_order(dep, releases).filter(|order| **order >= current_order);
+
     // Eligible = the releases adoption could target (quality + major filter + not yanked, and not
     // dated after `now`), current included, so `latest` is well-defined even when up to date.
     let eligible: Vec<&Release> = releases
@@ -240,36 +292,31 @@ pub fn evaluate(
         .map(|r| r.version.clone())
         .or_else(|| Some(dep.current.clone()));
 
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for r in eligible.iter().filter(|r| r.order > current_order) {
-        let Some(kind) = r.kind_from_current else {
-            continue; // unclassifiable jump; skip (the adapter classifies every real upgrade)
-        };
-        let res = resolve(layers, &query(dep, ctx, ResolveKind::Candidate(kind)), now);
-        let window = res.window;
-        let status = if window.exempt {
-            Status::Exempt
-        } else {
-            match r.published_at {
-                None => Status::UnknownAge,
-                Some(p) if p <= window.cutoff(now) => Status::Adoptable,
-                Some(_) => Status::InCooldown,
-            }
-        };
-        candidates.push(Candidate {
-            version: r.version.clone(),
-            kind,
-            window,
-            status,
-            published_at: r.published_at,
-        });
-    }
+    // Each newer eligible release within the ceiling becomes a candidate; the headline status and
+    // adoptable target are rolled up from this set below.
+    let candidates: Vec<Candidate> = eligible
+        .iter()
+        .copied()
+        .filter(|r| r.order > current_order && ceiling_order.is_none_or(|c| r.order <= *c))
+        .filter_map(|r| classify_candidate(r, dep, layers, ctx, now))
+        .collect();
 
     // `candidates` is in ascending order (from sorted releases); the headline is the newest. An
-    // empty candidate set means no newer eligible release, i.e. up to date.
+    // empty candidate set means no newer *admissible* release — "up to date", unless the graph
+    // ceiling excluded a newer one: then the dependency is pinned at its current version by a
+    // requirer's `==` (graph-held), with `latest` still showing the newest version for context.
     let Some(headline) = candidates.last() else {
+        let blocked_by_ceiling = ceiling_order.is_some_and(|ceiling| {
+            eligible
+                .iter()
+                .any(|r| r.order > current_order && r.order > *ceiling)
+        });
         return Verdict {
-            status: Status::UpToDate,
+            status: if blocked_by_ceiling {
+                Status::Held
+            } else {
+                Status::UpToDate
+            },
             adoptable_target: None,
             latest,
             candidates,
@@ -326,9 +373,11 @@ pub fn evaluate(
 ///
 /// The [`PinVerdict`] carries the `status`, the resolved [`window`](crate::ResolvedWindow), and the
 /// `published_at` instant for rendering. It additionally annotates whether the resolved graph forces
-/// this pin: when [`Dependency::graph_floor`] equals the locked version, `graph_held` is set. A
-/// graph-held but too-fresh pin is *still* a [`Status::CurrentInCooldown`] violation — the flag lets
-/// it be baselined deliberately rather than silently passed.
+/// this pin: when [`Dependency::graph_floor`] *or* [`Dependency::graph_ceiling`] equals the locked
+/// version, `graph_held` is set (a ceiling comes from an exact requirer pin, which holds the version
+/// from above and below alike). A graph-held but too-fresh pin is *still* a
+/// [`Status::CurrentInCooldown`] violation — the flag lets it be baselined deliberately rather than
+/// silently passed.
 #[must_use]
 pub fn check_pin(
     dep: &Dependency,
@@ -352,7 +401,13 @@ pub fn check_pin(
         }
     };
 
-    let graph_held = matches!(&dep.graph_floor, Some(v) if *v == locked.version);
+    // A `graph_floor` equal to the locked version holds the pin from below; a `graph_ceiling` equal
+    // to it holds it from above. Both of cooldown's ceilings come from exact (`==`/`=`) requirer pins,
+    // which lock the version in *both* directions, so a ceiling at the locked version means the pin
+    // cannot be downgraded either — `fix` must leave it for a human even when no floor was computed
+    // (hex/rubygems/conda never compute a floor; uv skips editable/path requirers).
+    let graph_held = matches!(&dep.graph_floor, Some(v) if *v == locked.version)
+        || matches!(&dep.graph_ceiling, Some(v) if *v == locked.version);
 
     PinVerdict {
         status,
@@ -445,7 +500,8 @@ fn unknown_pin_verdict(
     PinVerdict {
         status: Status::UnknownAge,
         window: res.window,
-        graph_held: matches!(&dep.graph_floor, Some(v) if *v == dep.current),
+        graph_held: matches!(&dep.graph_floor, Some(v) if *v == dep.current)
+            || matches!(&dep.graph_ceiling, Some(v) if *v == dep.current),
         graph_floor: dep.graph_floor.clone(),
         published_at: None,
     }
@@ -508,6 +564,7 @@ mod tests {
             direct: true,
             artifacts: Vec::new(),
             graph_floor: None,
+            graph_ceiling: None,
             members: Vec::new(),
             pinned: false,
         }
@@ -529,6 +586,52 @@ mod tests {
             project: Utf8Path::new("/repo"),
             allow_major: false,
         }
+    }
+
+    #[test]
+    fn graph_ceiling_holds_a_transitive_pinned_at_its_current_version() {
+        // A requirer pins this dependency `==1.0.0`, so the graph forbids moving up even though 1.0.1
+        // has matured — the upgrade-direction mirror of `graph_floor`. The dep is `Held`, with
+        // `latest` still surfacing the newer version for context and no adoptable target.
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"), // current, matured
+            dated("1.0.1", 1, "2025-12-15T00:00:00Z"), // newer, matured — but above the ceiling
+        ];
+        let mut dep = fix_dep("1.0.0");
+        dep.graph_ceiling = Some(Version::new("1.0.0"));
+        let verdict = evaluate(&dep, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.status, Status::Held);
+        assert_eq!(verdict.latest, Some(Version::new("1.0.1")));
+        assert_eq!(verdict.adoptable_target, None);
+        assert!(verdict.candidates.is_empty());
+
+        // Without the ceiling the same matured 1.0.1 is freely adoptable — the ceiling is the only
+        // thing holding it.
+        dep.graph_ceiling = None;
+        let verdict = evaluate(&dep, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.status, Status::Adoptable);
+        assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.1")));
+    }
+
+    #[test]
+    fn graph_ceiling_caps_candidates_but_admits_those_at_or_below_it() {
+        // The graph permits up to 1.1.0 (a requirer's `==1.1.0`): 1.1.0 is an ordinary adoptable
+        // candidate while 1.2.0 above the ceiling is excluded — `latest` still shows 1.2.0.
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.1.0", 1, "2025-12-15T00:00:00Z"), // matured, at the ceiling
+            dated("1.2.0", 2, "2025-12-20T00:00:00Z"), // matured, above the ceiling
+        ];
+        let mut dep = fix_dep("1.0.0");
+        dep.graph_ceiling = Some(Version::new("1.1.0"));
+        let verdict = evaluate(&dep, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.status, Status::Adoptable);
+        assert_eq!(verdict.adoptable_target, Some(Version::new("1.1.0")));
+        assert_eq!(verdict.latest, Some(Version::new("1.2.0")));
+        assert_eq!(verdict.candidates.len(), 1);
+        assert_eq!(verdict.candidates[0].version, Version::new("1.1.0"));
     }
 
     #[test]
@@ -659,6 +762,26 @@ mod tests {
         ];
         let mut dep = fix_dep("1.0.1");
         dep.graph_floor = Some(Version::new("1.0.1"));
+        let verdict = evaluate_fix(&dep, &releases, &[seven_day_layer()], &ctx(), now);
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert!(verdict.current.graph_held);
+        assert_eq!(verdict.target, None);
+    }
+
+    #[test]
+    fn fix_does_not_downgrade_a_ceiling_held_pin_without_a_floor() {
+        // A transitive dep pinned `==1.0.1` by a requirer carries only a `graph_ceiling` (hex/
+        // rubygems/conda never compute a floor; uv skips editable requirers). The `==` locks it in
+        // both directions, so `fix` must leave the too-fresh pin in place rather than plan a
+        // downgrade the requirer would re-bump.
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            dated("1.0.0", 0, "2025-12-01T00:00:00Z"),
+            dated("1.0.1", 1, "2026-01-07T00:00:00Z"),
+        ];
+        let mut dep = fix_dep("1.0.1");
+        dep.graph_floor = None;
+        dep.graph_ceiling = Some(Version::new("1.0.1"));
         let verdict = evaluate_fix(&dep, &releases, &[seven_day_layer()], &ctx(), now);
         assert_eq!(verdict.current.status, Status::CurrentInCooldown);
         assert!(verdict.current.graph_held);

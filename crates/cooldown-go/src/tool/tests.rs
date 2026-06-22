@@ -308,6 +308,7 @@ fn dep(name: &str, current: &str) -> Dependency {
         direct: true,
         artifacts: Vec::new(),
         graph_floor: None,
+        graph_ceiling: None,
         members: Vec::new(),
         pinned: false,
     }

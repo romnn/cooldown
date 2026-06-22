@@ -135,6 +135,7 @@ impl ToolRead for UvTool {
         let lock = read_lock(project)?;
         let direct: std::collections::HashSet<String> = lock.direct_names().into_iter().collect();
         let floors = lock.graph_floors();
+        let ceilings = lock.graph_ceilings();
         let exact_pins = crate::native::exact_pinned_names(&project.manifest);
         // A uv project is a single package, so it is the source for every dependency it declares.
         // The lock's root package carries the project's package name.
@@ -167,6 +168,23 @@ impl ToolRead for UvTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // The project's own exact pin surfaces as `pinned` (held, with a repin target shown); the
+            // ceiling is reserved for caps imposed by *other* requirers, so it is only set when the
+            // dependency is not already pinned (mirroring the cargo adapter).
+            let pinned = exact_pins.contains(&pkg.name);
+            // A requirer's `==` pin caps this package only when it is *active*: some pinned version
+            // must equal the version uv resolved here. A marker-gated or otherwise inactive pin
+            // resolves to a different version and imposes no real bound, so it is ignored. The
+            // resolved version is recorded as the ceiling so it is the canonical form that matches a
+            // fetched release (the raw specifier may not be PEP 440-normalized).
+            let graph_ceiling = (!pinned)
+                .then(|| ceilings.get(&pkg.name))
+                .flatten()
+                .filter(|pins| {
+                    pins.iter()
+                        .any(|pin| crate::version::compare(pin, version).is_eq())
+                })
+                .map(|_| Version::new(version.clone()));
             deps.push(Dependency {
                 package: PackageId::new(UV_ID, pkg.name.clone(), Some(PYPI.to_string())),
                 current: Version::new(version.clone()),
@@ -174,12 +192,13 @@ impl ToolRead for UvTool {
                 direct: is_direct,
                 artifacts: pkg.artifact_ids(),
                 graph_floor: floors.get(&pkg.name).map(|v| Version::new(v.clone())),
+                graph_ceiling,
                 members: if is_direct {
                     project_member.clone()
                 } else {
                     Vec::new()
                 },
-                pinned: exact_pins.contains(&pkg.name),
+                pinned,
             });
         }
         Ok(deps)
@@ -422,6 +441,7 @@ mod tests {
             direct: true,
             artifacts: vec![ArtifactId("wheel:py3-none-any".into())],
             graph_floor: None,
+            graph_ceiling: None,
             members: Vec::new(),
             pinned: false,
         };

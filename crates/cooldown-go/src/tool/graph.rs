@@ -80,6 +80,9 @@ fn dependency_of(
         direct: !module.indirect,
         artifacts: Vec::new(),
         graph_floor,
+        // Go's module graph yields only a floor (MVS minimum); it does not impose an `==`-style
+        // upper bound on a transitive module, so there is no ceiling to record.
+        graph_ceiling: None,
         members: Vec::new(),
         pinned: false,
     })

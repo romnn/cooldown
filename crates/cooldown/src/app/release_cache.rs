@@ -385,6 +385,7 @@ mod tests {
             direct: true,
             artifacts: Vec::new(),
             graph_floor: None,
+            graph_ceiling: None,
             members: Vec::new(),
             pinned: false,
         }

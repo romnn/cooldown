@@ -204,6 +204,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
+                graph_ceiling: None,
                 members: Vec::new(),
                 pinned: false,
             });

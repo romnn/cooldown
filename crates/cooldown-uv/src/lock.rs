@@ -87,6 +87,28 @@ pub struct Dep {
     pub name: String,
 }
 
+/// A `[package.metadata] requires-dist` entry: a declared requirement *with* its version specifier —
+/// the constraint the package author wrote (e.g. `protobuf==6.33.5`). Distinct from [`Dep`], the
+/// resolved graph edge, which records only the name (the specifier is dropped post-resolution).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DepSpec {
+    /// The depended-on package name, PEP 503-normalised by uv.
+    pub name: String,
+    /// The declared version specifier (e.g. `"==6.33.5"`, `">=1,<2"`); `None` when unconstrained.
+    #[serde(default)]
+    pub specifier: Option<String>,
+}
+
+/// A package's `[package.metadata]` table. Carries `requires-dist`, the declared requirements whose
+/// version specifiers the resolved [`dependencies`](Package::dependencies) edges drop — the only
+/// place the lock records that, say, a requirer pinned a transitive dep `==`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Metadata {
+    /// `requires-dist` — the package's declared dependencies with their version specifiers.
+    #[serde(default, rename = "requires-dist")]
+    pub requires_dist: Vec<DepSpec>,
+}
+
 /// One `[[package]]` entry in `uv.lock` — a resolved node in the dependency graph.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Package {
@@ -107,6 +129,10 @@ pub struct Package {
     /// `[package.optional-dependencies]` — extras, keyed by extra name.
     #[serde(default, rename = "optional-dependencies")]
     pub optional_dependencies: std::collections::HashMap<String, Vec<Dep>>,
+    /// `[package.metadata]` — the declared requirements (with version specifiers), the source for
+    /// the graph *ceiling* that the resolved `dependencies` edges cannot express.
+    #[serde(default)]
+    pub metadata: Option<Metadata>,
     /// The source distribution, if the resolution includes one.
     #[serde(default)]
     pub sdist: Option<File>,
@@ -267,6 +293,32 @@ impl UvLock {
         floors
     }
 
+    /// The graph ceiling candidates: every exact (`==X`) version some *requirer* pins each dependency
+    /// to in its `requires-dist` — the upgrade-direction mirror of [`graph_floors`](Self::graph_floors).
+    /// Open or merely upper-capped specifiers (`>=`, `<7`, `~=`) impose no nameable exact ceiling and
+    /// are skipped (the conservative default — they remain freely upgradable). A name maps to *all*
+    /// distinct exact pins, not a single one: requirers may disagree (e.g. one pin gated by an inactive
+    /// marker), and the consumer picks the pin equal to the resolved version. Collapsing to one value
+    /// (last-write-wins) could let an inactive pin overwrite and drop the real cap.
+    #[must_use]
+    pub fn graph_ceilings(&self) -> HashMap<String, Vec<String>> {
+        let mut ceilings: HashMap<String, Vec<String>> = HashMap::new();
+        for pkg in &self.packages {
+            let Some(metadata) = &pkg.metadata else {
+                continue;
+            };
+            for req in &metadata.requires_dist {
+                if let Some(version) = exact_pin(req.specifier.as_deref()) {
+                    let versions = ceilings.entry(req.name.clone()).or_default();
+                    if !versions.iter().any(|v| v == version) {
+                        versions.push(version.to_string());
+                    }
+                }
+            }
+        }
+        ceilings
+    }
+
     /// Finds the package resolved at exactly `name` and `version`, if present.
     ///
     /// `uv.lock` holds a single entry per name, so a version mismatch yields `None`.
@@ -276,6 +328,25 @@ impl UvLock {
             .iter()
             .find(|p| p.name == name && p.version.as_deref() == Some(version))
     }
+}
+
+/// The version from a lone exact specifier (`==X` or the arbitrary-equality `===X`), or `None` for
+/// anything else — unconstrained, a range, a compound specifier (`>=6,<7`), or a prefix wildcard
+/// (`==1.2.*`). Only a single exact operator names a ceiling without consulting the available-version
+/// set, so that is all this recognises. `===` is tried before `==` so it does not leave a stray `=`.
+fn exact_pin(specifier: Option<&str>) -> Option<&str> {
+    let spec = specifier?.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let version = spec
+        .strip_prefix("===")
+        .or_else(|| spec.strip_prefix("=="))?
+        .trim();
+    if version.is_empty() || version.contains('*') {
+        return None;
+    }
+    Some(version)
 }
 
 #[cfg(test)]
@@ -364,6 +435,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["wheel:py3-none-any".to_string()]
         );
+    }
+
+    /// Mirrors the real monorepo shape: a path package (`luup-common`) pins `protobuf` exactly and
+    /// lower-bounds `structlog`, so a downstream project gets protobuf transitively capped at the pin.
+    const CEILING_SAMPLE: &str = indoc! {r#"
+        version = 1
+        revision = 3
+        requires-python = ">=3.12"
+
+        [[package]]
+        name = "demo"
+        version = "0.1.0"
+        source = { virtual = "." }
+        dependencies = [{ name = "luup-common" }]
+
+        [[package]]
+        name = "luup-common"
+        version = "0.1.0"
+        source = { editable = "../luup-common" }
+        dependencies = [{ name = "protobuf" }, { name = "structlog" }]
+
+        [package.metadata]
+        requires-dist = [
+            { name = "protobuf", specifier = "==6.33.5" },
+            { name = "structlog", specifier = ">=25.5.0" },
+        ]
+
+        [[package]]
+        name = "protobuf"
+        version = "6.33.5"
+        source = { registry = "https://pypi.org/simple" }
+
+        [[package]]
+        name = "structlog"
+        version = "25.6.0"
+        source = { registry = "https://pypi.org/simple" }
+    "#};
+
+    #[test]
+    fn graph_ceilings_records_only_exact_pins_from_requirers() {
+        let lock = UvLock::parse(CEILING_SAMPLE).unwrap();
+        let ceilings = lock.graph_ceilings();
+        // A requirer pins `protobuf==6.33.5`, so it cannot be upgraded past that.
+        assert_eq!(
+            ceilings.get("protobuf").map(Vec::as_slice),
+            Some(["6.33.5".to_string()].as_slice())
+        );
+        // `structlog` is only lower-bounded (`>=25.5.0`) — no exact ceiling, freely upgradable.
+        assert_eq!(ceilings.get("structlog"), None);
+        // `graph_floors` skips editable/path packages, so a dep pulled only by `luup-common` has no
+        // floor — the ceiling is the *only* graph constraint that catches such a transitive pin.
+        assert_eq!(lock.graph_floors().get("protobuf"), None);
+    }
+
+    #[test]
+    fn exact_pin_recognises_only_a_lone_double_equals() {
+        assert_eq!(exact_pin(Some("==6.33.5")), Some("6.33.5"));
+        assert_eq!(exact_pin(Some(" == 6.33.5 ")), Some("6.33.5"));
+        assert_eq!(exact_pin(Some("===6.33.5")), Some("6.33.5")); // PEP 440 arbitrary equality
+        assert_eq!(exact_pin(Some(">=6.30,<7")), None); // compound range, no nameable ceiling
+        assert_eq!(exact_pin(Some(">=6.33.5")), None); // lower bound only
+        assert_eq!(exact_pin(Some("<7")), None); // upper cap, but not an exact version
+        assert_eq!(exact_pin(Some("==1.2.*")), None); // prefix match, not exact
+        assert_eq!(exact_pin(None), None);
     }
 
     #[test]

@@ -322,6 +322,19 @@ pub struct Dependency {
     /// The lowest version the resolved graph permits (MVS floor or a `=` pin), read from the
     /// lock; `None` when unconstrained.
     pub graph_floor: Option<Version>,
+    /// The highest version the resolved graph permits — symmetric to [`graph_floor`](Self::graph_floor).
+    /// Set when a *requirer* pins this dependency exactly (e.g. another package's `protobuf==6.33.5`
+    /// caps a transitive `protobuf`), so it cannot be upgraded past this version even though newer
+    /// releases exist; `evaluate` then reports it [`Status::Held`]. `None` means unbounded above (the
+    /// common case — most deps can move up). A direct manifest pin is captured by
+    /// [`pinned`](Self::pinned) instead; this field is for the *transitive* ceiling the graph imposes.
+    ///
+    /// Invariant every adapter upholds: when set, this equals [`current`](Self::current) — an exact
+    /// `==`/`=` pin forces the dependency to resolve to exactly that version, so an *active* ceiling is
+    /// always the resolved version (adapters confirm the pin matches `current` before recording it).
+    /// `evaluate` relies on this: a ceiling above the fetched releases would be silently uncapped, and
+    /// `check_pin` treats a ceiling at the locked version as graph-held in both directions.
+    pub graph_ceiling: Option<Version>,
     /// The workspace member package(s) that declare this dependency at this resolved version — e.g.
     /// cargo member crates, pnpm/npm workspace packages, the uv project itself. Reports attribute the
     /// dependency to these packages (by name, or by path under `--paths`). Empty when the adapter

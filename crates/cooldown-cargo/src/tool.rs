@@ -130,6 +130,7 @@ impl ToolRead for CargoTool {
                 direct,
                 artifacts: Vec::new(),
                 graph_floor,
+                graph_ceiling: None,
                 // Direct deps are attributed to their declarers; a transitive dep is attributed to
                 // the members that reach it through the graph (rendered as "via …").
                 members: if direct {
