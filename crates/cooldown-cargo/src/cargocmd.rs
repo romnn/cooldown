@@ -17,6 +17,14 @@ pub struct ResolvedGraph {
     /// `=` requirement forces that resolved version, so it is held: it cannot move without editing a
     /// `Cargo.toml`.
     pub exact_pins: HashSet<(String, String)>,
+    /// `(crate, version)` nodes some *requirer* caps with an exact `=x.y.z` requirement — the
+    /// upgrade-direction mirror of the graph floor. Cargo coexists multiple versions of one crate, so
+    /// the cap is per resolved node, not per name: only the node whose version equals the pin is held
+    /// (the ceiling is that node's own version). Restricted to pins whose edge is actually in the
+    /// resolved graph: dev-dependencies and inactive (optional/target-gated) edges are excluded, as
+    /// they cap nothing. Workspace-member pins are surfaced via [`exact_pins`](Self::exact_pins)
+    /// instead, so the consumer ignores a ceiling on a pinned node.
+    pub graph_ceilings: HashSet<(String, String)>,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -56,6 +64,14 @@ impl ResolvedGraph {
     #[must_use]
     pub fn is_exact_pinned(&self, crate_name: &str, version: &str) -> bool {
         self.exact_pins
+            .contains(&(crate_name.to_string(), version.to_string()))
+    }
+
+    /// Is the `crate_name`@`version` node capped by some requirer's exact `=x.y.z` requirement (its
+    /// graph ceiling)? Keyed per node because Cargo coexists multiple versions of a crate.
+    #[must_use]
+    pub fn is_graph_capped(&self, crate_name: &str, version: &str) -> bool {
+        self.graph_ceilings
             .contains(&(crate_name.to_string(), version.to_string()))
     }
 
@@ -167,6 +183,11 @@ struct RawDep {
     name: String,
     /// The semver requirement string, e.g. `^1.0.197` (default caret) or `=1.0.197` (exact pin).
     req: String,
+    /// The dependency kind: absent/`null` for a normal dep, `"dev"`, or `"build"`. A transitive
+    /// crate's dev-dependencies are not resolved into the build graph, so a dev `=` pin caps nothing
+    /// and is excluded from the ceiling; normal and build dependencies are.
+    #[serde(default)]
+    kind: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct RawResolve {
@@ -262,18 +283,36 @@ impl Cargo {
             .await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
             .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
+        Ok(Self::build_graph(raw))
+    }
+
+    /// Builds the [`ResolvedGraph`] from parsed `cargo metadata`. Split from [`Self::metadata`] so the
+    /// graph logic — exact pins, the active-edge ceiling intersection, reverse edges — is unit-testable
+    /// without spawning cargo.
+    fn build_graph(raw: RawMeta) -> ResolvedGraph {
         let workspace_root = raw.workspace_root.clone();
         let roots: HashSet<String> = raw.workspace_members.iter().cloned().collect();
         let mut packages = HashMap::new();
         let mut exact_pins = HashSet::new();
+        // `(requirer id, dep name, exact pinned version)` for every non-dev `=x.y.z` requirement.
+        // Resolved against the activated graph below: a declared pin behind a disabled feature or a
+        // non-matching `target` cfg is not a real edge and must not cap, so this is a candidate list,
+        // not the final ceiling set.
+        let mut exact_edges: Vec<(String, String, String)> = Vec::new();
         for p in raw.packages {
-            // Exact pins are declared by workspace members; a transitive crate's own `=` reqs are
-            // not the workspace's choice and are left to the graph-held logic.
-            if roots.contains(&p.id) {
-                for dep in &p.dependencies {
-                    if let Some(version) = exact_req_version(&dep.req) {
-                        exact_pins.insert((dep.name.clone(), version));
-                    }
+            for dep in &p.dependencies {
+                let Some(version) = exact_req_version(&dep.req) else {
+                    continue;
+                };
+                // A workspace member's own exact pin is the project's choice: it surfaces as
+                // `pinned` (held, but with an adoptable target showing what it could be repinned to).
+                if roots.contains(&p.id) {
+                    exact_pins.insert((dep.name.clone(), version.clone()));
+                }
+                // A dev dependency of a transitive crate is not in the resolved build graph and caps
+                // nothing; normal and build dependencies do, once confirmed active below.
+                if dep.kind.as_deref() != Some("dev") {
+                    exact_edges.push((p.id.clone(), dep.name.clone(), version));
                 }
             }
             packages.insert(
@@ -286,18 +325,36 @@ impl Cargo {
                 },
             );
         }
-        let mut edges = HashMap::new();
+        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
         if let Some(resolve) = raw.resolve {
             for node in resolve.nodes {
                 edges.insert(node.id, node.deps.into_iter().map(|d| d.pkg).collect());
             }
         }
-        Ok(ResolvedGraph {
+        // A `=x.y.z` requirement caps a node only when its edge is actually in the resolved graph:
+        // keep an exact pin only if the requirer resolves an edge to a node of that name and version.
+        // An inactive (optional/target-gated) edge is declared but absent from `resolve.nodes`, so it
+        // contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate.
+        let mut graph_ceilings = HashSet::new();
+        for (requirer, name, version) in exact_edges {
+            let active = edges.get(&requirer).is_some_and(|dep_ids| {
+                dep_ids.iter().any(|id| {
+                    packages
+                        .get(id)
+                        .is_some_and(|info| info.name == name && info.version == version)
+                })
+            });
+            if active {
+                graph_ceilings.insert((name, version));
+            }
+        }
+        ResolvedGraph {
             packages,
             roots,
             edges,
             exact_pins,
-        })
+            graph_ceilings,
+        }
     }
 
     /// Returns whether `Cargo.lock` is current relative to `Cargo.toml`.
@@ -411,10 +468,60 @@ mod tests {
             roots: HashSet::new(),
             edges: HashMap::new(),
             exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
+            graph_ceilings: HashSet::new(),
         };
 
         assert!(graph.is_exact_pinned("serde", "1.0.197"));
         assert!(!graph.is_exact_pinned("serde", "0.9.0"));
+    }
+
+    #[test]
+    fn graph_cap_is_version_specific() {
+        // serde_derive is capped at 1.0.228 by some requirer's `=1.0.228`; a coexisting 1.0.300 node
+        // pulled by a caret requirer is not capped — the ceiling is keyed per (name, version) node.
+        let graph = ResolvedGraph {
+            packages: HashMap::new(),
+            roots: HashSet::new(),
+            edges: HashMap::new(),
+            exact_pins: HashSet::new(),
+            graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
+        };
+
+        assert!(graph.is_graph_capped("serde_derive", "1.0.228"));
+        assert!(!graph.is_graph_capped("serde_derive", "1.0.300"));
+        assert!(!graph.is_graph_capped("serde", "1.0.228"));
+    }
+
+    #[test]
+    fn graph_ceiling_ignores_inactive_pin_edges() {
+        // `live` pins `dep =1.0.0` and resolves an edge to it → a real ceiling. `ghost` declares
+        // `other =2.0.0` but its edge is absent from `resolve.nodes` (an inactive optional/target
+        // dep); `other` resolves to 2.0.0 only via `open`'s caret range, so it is NOT capped.
+        let json = r#"{
+            "packages": [
+                {"id": "live", "name": "live", "version": "1.0.0",
+                 "dependencies": [{"name": "dep", "req": "=1.0.0"}]},
+                {"id": "ghost", "name": "ghost", "version": "0.1.0",
+                 "dependencies": [{"name": "other", "req": "=2.0.0", "kind": null}]},
+                {"id": "open", "name": "open", "version": "1.0.0",
+                 "dependencies": [{"name": "other", "req": "^2.0"}]},
+                {"id": "dep", "name": "dep", "version": "1.0.0"},
+                {"id": "other", "name": "other", "version": "2.0.0"}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "live", "deps": [{"pkg": "dep"}]},
+                {"id": "open", "deps": [{"pkg": "other"}]},
+                {"id": "ghost", "deps": []},
+                {"id": "dep", "deps": []},
+                {"id": "other", "deps": []}
+            ]}
+        }"#;
+        let raw: RawMeta = serde_json::from_str(json).expect("parse metadata");
+        let graph = Cargo::build_graph(raw);
+        assert!(graph.is_graph_capped("dep", "1.0.0")); // active `=` edge → real ceiling
+        assert!(!graph.is_graph_capped("other", "2.0.0")); // pinned only by an inactive edge
     }
 
     #[test]
@@ -457,6 +564,7 @@ mod tests {
                 ("root-b".to_string(), Vec::new()),
             ]),
             exact_pins: HashSet::new(),
+            graph_ceilings: HashSet::new(),
         };
 
         assert_eq!(
@@ -494,6 +602,7 @@ mod tests {
                 ("trans".to_string(), Vec::new()),
             ]),
             exact_pins: HashSet::new(),
+            graph_ceilings: HashSet::new(),
         };
 
         let names = |members: Vec<MemberRef>| {

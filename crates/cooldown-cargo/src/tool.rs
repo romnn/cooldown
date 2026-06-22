@@ -123,6 +123,10 @@ impl ToolRead for CargoTool {
             } else {
                 None
             };
+            // A workspace member's own exact pin is `pinned` (held, with a repin target shown); the
+            // ceiling is reserved for *transitive* caps a requirer imposes that the project cannot
+            // repin away, so it is only set when the node is not already pinned.
+            let pinned = graph.is_exact_pinned(&info.name, &info.version);
             deps.push(Dependency {
                 package: PackageId::new(CARGO_ID, info.name.clone(), Some(CRATES_IO.to_string())),
                 current: Version::new(info.version.clone()),
@@ -130,7 +134,8 @@ impl ToolRead for CargoTool {
                 direct,
                 artifacts: Vec::new(),
                 graph_floor,
-                graph_ceiling: None,
+                graph_ceiling: (!pinned && graph.is_graph_capped(&info.name, &info.version))
+                    .then(|| Version::new(info.version.clone())),
                 // Direct deps are attributed to their declarers; a transitive dep is attributed to
                 // the members that reach it through the graph (rendered as "via …").
                 members: if direct {
@@ -138,7 +143,7 @@ impl ToolRead for CargoTool {
                 } else {
                     graph.reaching_members(id)
                 },
-                pinned: graph.is_exact_pinned(&info.name, &info.version),
+                pinned,
             });
         }
         Ok(deps)
