@@ -174,7 +174,9 @@ impl Go {
         dir: &Utf8Path,
         args: &[&str],
     ) -> Result<std::process::Output, CoreError> {
-        Command::new(&self.bin)
+        tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn go");
+        let started = std::time::Instant::now();
+        let result = Command::new(&self.bin)
             .args(args)
             // Neutralize an ambient GOFLAGS for cooldown's own invocations. Repos commonly set
             // `GOFLAGS=-mod=mod` (via .env, a dotenv loaded by their task runner, or `go env -w`),
@@ -190,7 +192,15 @@ impl Go {
             .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
                 detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            })
+            });
+        tracing::debug!(
+            bin = self.bin,
+            args = ?args,
+            elapsed_ms = started.elapsed().as_millis(),
+            ok = result.is_ok(),
+            "go finished"
+        );
+        result
     }
 
     /// Run, requiring success; returns stdout.
