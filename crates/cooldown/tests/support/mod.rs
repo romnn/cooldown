@@ -445,6 +445,41 @@ fn pnpm_version_gt(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
 }
 
+/// A [`PinParser`] for `deno.lock`: the `name -> newest pinned version` map unioning the top-level
+/// `jsr` and `npm` objects, each keyed `name@version` (scoped names keep their leading `@`). A name
+/// can appear at several versions (duplicate graph copies); the newest is kept so a moved direct
+/// declaration is not masked by a stale transitive copy — matching the adapter's own `locked_versions`.
+/// `deno.lock` is JSON, so this parses it with `serde_json` (already a test dependency) rather than a
+/// line scan, the `deno.lock` analogue of [`pnpm_lock_pins`].
+pub fn deno_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(lock) else {
+        return BTreeMap::new();
+    };
+    let mut pins: BTreeMap<String, String> = BTreeMap::new();
+    for section in ["jsr", "npm"] {
+        let Some(obj) = doc.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for key in obj.keys() {
+            let Some(at) = key.rfind('@').filter(|&index| index > 0) else {
+                continue;
+            };
+            let (name, version) = (key[..at].to_string(), key[at + 1..].to_string());
+            match pins.entry(name) {
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if pnpm_version_gt(&version, slot.get()) {
+                        *slot.get_mut() = version;
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(version);
+                }
+            }
+        }
+    }
+    pins
+}
+
 /// Split a `module/path v1.2.3` line into `(path, version)`, requiring a `v`-prefixed second field.
 fn go_require_pair(line: &str) -> Option<(String, String)> {
     let mut fields = line.split_whitespace();

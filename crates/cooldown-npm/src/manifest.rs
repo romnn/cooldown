@@ -194,7 +194,14 @@ fn bump_range(old: &str, target: &str) -> String {
     }
 }
 
-fn replace_declared_range(
+/// Replace the string value of `name` within the top-level `field` object, returning the rewritten
+/// document or `None` when the `field`→`name`→`old` path is not present verbatim.
+///
+/// The edit is byte-targeted: it locates the value by walking to the named top-level object, then to
+/// the key *inside* that object, and rewrites only the value span. So a key that happens to equal the
+/// value (a bare-specifier import), or an identical string living in another top-level object (a Deno
+/// `scopes` entry), is never mistaken for the value — and the rest of the file stays byte-identical.
+pub(crate) fn replace_declared_range(
     content: &str,
     field: &str,
     name: &str,
