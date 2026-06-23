@@ -261,3 +261,104 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "second fix must leave the lock byte-identical"
     );
 }
+
+/// A uv workspace whose dependency is declared in a MEMBER (`packages/app`), never the virtual root.
+/// uv resolves the whole workspace into one shared `uv.lock` (a single flat environment — unlike
+/// cargo/pnpm it cannot hold two versions of one package), so the upgrade must reach the member's
+/// declaration. This is the monorepo-conformance analog of the pnpm member-dep regression.
+const WORKSPACE_ROOT_PYPROJECT: &str = r#"[tool.uv.workspace]
+members = ["packages/app"]
+"#;
+
+/// The member that actually declares `certifi`, with a loose floor so an older seed is a clear
+/// forward move. Declared only here — the workspace root carries no dependencies of its own.
+const WORKSPACE_MEMBER_PYPROJECT: &str = r#"[project]
+name = "cooldown-uv-workspace-member"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "certifi>=2024.1.1",
+]
+"#;
+
+/// An early seed cutoff so the member's `certifi` resolves to an old version, strictly below the
+/// newest matured under `FREEZE` — a clear forward move the upgrade must land.
+const WORKSPACE_SEED: &str = "2024-06-01T00:00:00Z";
+
+fn workspace_member_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", WORKSPACE_ROOT_PYPROJECT);
+    fixture.write("packages/app/pyproject.toml", WORKSPACE_MEMBER_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, WORKSPACE_SEED);
+    fixture
+}
+
+#[test]
+fn upgrade_moves_a_member_declared_dependency() {
+    skip_if_missing!("uv");
+    let fixture = workspace_member_fixture();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // certifi is declared only in `packages/app`, never the workspace root. The whole-workspace
+    // re-resolve MUST reach the member and move it forward.
+    assert!(
+        upgrade.applied_names().contains("certifi"),
+        "member-declared certifi must be upgraded\napplied={:?}\nheld={:?}",
+        upgrade.applied_names(),
+        upgrade.held_conflict_names()
+    );
+    let (from, to) = upgrade
+        .change_for("certifi")
+        .expect("certifi should be in the report");
+    assert_ne!(from, to, "certifi must move to a newer matured version");
+
+    // The landed version is within the cooldown window (no overshoot): `check` is clean.
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert_eq!(
+        check.summary_violations(),
+        0,
+        "the member upgrade must leave the graph cooldown-clean"
+    );
+
+    // Converged: a second upgrade is a byte-stable no-op.
+    let lock_after_first = fixture.read_bytes("uv.lock");
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a fixed point"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("uv.lock"),
+        "lock must be byte-identical across the two converged runs"
+    );
+}
+
+#[test]
+fn outdated_does_not_falsely_block_a_member_declared_dependency() {
+    skip_if_missing!("uv");
+    let fixture = workspace_member_fixture();
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    let blocked = outdated.outdated_with_status("blocked");
+
+    assert!(
+        adoptable.contains("certifi"),
+        "member-declared certifi must be adoptable\nadoptable={adoptable:?}\nblocked={blocked:?}"
+    );
+    assert!(
+        !blocked.contains("certifi"),
+        "member-declared certifi must NOT be falsely blocked\nblocked={blocked:?}"
+    );
+}

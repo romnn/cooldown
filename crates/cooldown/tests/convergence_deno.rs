@@ -256,3 +256,91 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "second fix must leave the lock byte-identical"
     );
 }
+
+/// A deno workspace whose dependency is declared in a MEMBER (`member/deno.json`), never the root.
+/// deno resolves the whole workspace into one shared `deno.lock`, so the upgrade must reach the
+/// member's import. The monorepo-conformance analog of the pnpm member-dep regression.
+const WORKSPACE_ROOT_DENO_JSON: &str = r#"{
+  "workspace": ["./member"]
+}
+"#;
+
+const WORKSPACE_MEMBER_DENO_JSON: &str = r#"{
+  "name": "@cooldown/member",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
+  "imports": {
+    "debug": "npm:debug@^4.0.0"
+  }
+}
+"#;
+
+fn workspace_member_fixture(seed_cutoff: &str) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("deno.json", WORKSPACE_ROOT_DENO_JSON);
+    fixture.write("member/deno.json", WORKSPACE_MEMBER_DENO_JSON);
+    fixture.write("member/mod.ts", "");
+    seed_lock(&fixture, seed_cutoff);
+    fixture
+}
+
+#[test]
+fn upgrade_moves_a_member_declared_dependency() {
+    skip_if_missing!("deno");
+    let fixture = workspace_member_fixture(SEED_EARLY);
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // debug is imported only by the member, never the workspace root. The whole-workspace re-resolve
+    // MUST reach the member and move it forward within its major.
+    assert!(
+        upgrade.applied_names().contains("debug"),
+        "member-declared debug must be upgraded\napplied={:?}\nheld={:?}",
+        upgrade.applied_names(),
+        upgrade.held_conflict_names()
+    );
+    let (from, to) = upgrade
+        .change_for("debug")
+        .expect("debug should be in the report");
+    assert_ne!(from, to, "debug must move to a newer matured version");
+
+    // Converged: a second upgrade is a byte-stable no-op.
+    let lock_after_first = fixture.read_bytes("deno.lock");
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a fixed point"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("deno.lock"),
+        "lock must be byte-identical across the two converged runs"
+    );
+}
+
+#[test]
+fn outdated_does_not_falsely_block_a_member_declared_dependency() {
+    skip_if_missing!("deno");
+    let fixture = workspace_member_fixture(SEED_EARLY);
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    let blocked = outdated.outdated_with_status("blocked");
+
+    assert!(
+        adoptable.contains("debug"),
+        "member-declared debug must be adoptable\nadoptable={adoptable:?}\nblocked={blocked:?}"
+    );
+    assert!(
+        !blocked.contains("debug"),
+        "member-declared debug must NOT be falsely blocked\nblocked={blocked:?}"
+    );
+}

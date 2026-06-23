@@ -324,3 +324,85 @@ fn build_gate_rejects_an_api_incompatible_joint_resolve() {
         report.summary_errors()
     );
 }
+
+/// A monorepo of two INDEPENDENT Go modules, each with its own `go.mod`/`go.sum`. Go has no shared
+/// lock — every module resolves on its own (`workspace_root` is false), so cooldown discovers each
+/// `go.mod` as a separate project. This is Go's monorepo-conformance analog: a single `cooldown` run
+/// at the repo root must upgrade EVERY module it discovers, not just the first.
+const MULTI_MODULE_A_GO_MOD: &str =
+    "module example.com/a\n\ngo 1.23\n\nrequire k8s.io/api v0.29.0\n";
+
+const MULTI_MODULE_A_MAIN: &str = r#"package main
+
+import corev1 "k8s.io/api/core/v1"
+
+func main() { _ = corev1.Pod{} }
+"#;
+
+const MULTI_MODULE_B_GO_MOD: &str =
+    "module example.com/b\n\ngo 1.23\n\nrequire k8s.io/apimachinery v0.29.0\n";
+
+const MULTI_MODULE_B_MAIN: &str = r#"package main
+
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+func main() { _ = metav1.ObjectMeta{} }
+"#;
+
+fn multi_module_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("mod-a/go.mod", MULTI_MODULE_A_GO_MOD);
+    fixture.write("mod-a/main.go", MULTI_MODULE_A_MAIN);
+    fixture.write("mod-b/go.mod", MULTI_MODULE_B_GO_MOD);
+    fixture.write("mod-b/main.go", MULTI_MODULE_B_MAIN);
+    // Each module resolves independently (no shared lock), so seed each with its own `go mod tidy`
+    // (`go -C <dir>` runs the command in that module directory).
+    fixture
+        .run_tool("go", &["-C", "mod-a", "mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+        .run_tool("go", &["-C", "mod-b", "mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+#[test]
+fn upgrade_moves_every_module_in_a_multi_module_repo() {
+    skip_if_missing!("go");
+    let fixture = multi_module_fixture();
+
+    let go_mod_before: Vec<Vec<u8>> = ["mod-a", "mod-b"]
+        .iter()
+        .map(|module| fixture.read_bytes(&format!("{module}/go.mod")))
+        .collect();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // A single run at the repo root must upgrade BOTH modules' deps — not just whichever it discovered
+    // first. k8s.io/api is required only by mod-a, k8s.io/apimachinery only by mod-b.
+    let applied = upgrade.applied_names();
+    assert!(
+        applied.contains("k8s.io/api"),
+        "mod-a's k8s.io/api must be upgraded\napplied={applied:?}"
+    );
+    assert!(
+        applied.contains("k8s.io/apimachinery"),
+        "mod-b's k8s.io/apimachinery must be upgraded\napplied={applied:?}"
+    );
+
+    // Both modules' go.mod actually changed.
+    for (module, before) in ["mod-a", "mod-b"].iter().zip(go_mod_before) {
+        assert_ne!(
+            before,
+            fixture.read_bytes(&format!("{module}/go.mod")),
+            "{module}/go.mod must change"
+        );
+    }
+}

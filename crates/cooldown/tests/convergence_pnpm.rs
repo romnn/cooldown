@@ -407,3 +407,246 @@ fn upgrade_honors_a_stricter_per_package_window() {
         "the lock must be byte-identical across the two converged runs"
     );
 }
+
+/// A workspace whose dependency is declared in a MEMBER (`pkgs/app`), never the root `package.json`.
+/// This is the monorepo-conformance fixture: the earlier adapter ran `pnpm update <pkg>@<target>`
+/// without `--recursive`, which at the workspace root only re-pins root-declared dependencies — so a
+/// member-declared candidate silently stayed put and `outdated` reported it falsely `blocked`.
+const WORKSPACE_ROOT_PACKAGE_JSON: &str = r#"{
+  "name": "cooldown-pnpm-workspace-root",
+  "version": "0.1.0",
+  "private": true
+}
+"#;
+
+const WORKSPACE_YAML: &str = "packages:\n  - \"pkgs/*\"\n";
+
+/// The member that actually declares `eslint`. Seeded on the old 9.0.0 line (a clear forward move to
+/// the project-default-window newest), declared only here — not in the workspace root.
+const WORKSPACE_MEMBER_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/app",
+  "version": "0.1.0",
+  "dependencies": {
+    "eslint": "^9.0.0"
+  }
+}
+"#;
+
+fn workspace_member_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write("pkgs/app/package.json", WORKSPACE_MEMBER_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    // Reuse the per-package fixture's eslint timeline: seed at 9.0.0, resolve at the project-default
+    // freeze whose newest matured eslint is 9.5.0 — a forward move the upgrade must land.
+    seed_lock(&fixture, PERPKG_SEED);
+    fixture
+}
+
+#[test]
+fn upgrade_moves_a_member_declared_dependency() {
+    skip_if_missing!("pnpm");
+    let fixture = workspace_member_fixture();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", PERPKG_PROJECT_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", PERPKG_PROJECT_FREEZE])
+            .stderr_str()
+    );
+
+    // eslint is declared only in `pkgs/app`, never the root. The whole-graph `--recursive` resolve
+    // MUST reach the member and move it; the pre-fix adapter left it untouched (and never reported it
+    // applied), which is exactly the member-dep regression this guards.
+    assert!(
+        upgrade.applied_names().contains("eslint"),
+        "member-declared eslint must be upgraded\napplied={:?}\nheld={:?}",
+        upgrade.applied_names(),
+        upgrade.held_conflict_names()
+    );
+    let (from, to) = upgrade
+        .change_for("eslint")
+        .expect("eslint should be in the report");
+    assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
+    assert!(
+        to.starts_with("9.") && to != "9.0.0",
+        "member eslint must move forward within its major, got {to}"
+    );
+
+    // The committed lock holds exactly the reported target — the resolve reached the member's pin.
+    let pins = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        pins.get("eslint").map(String::as_str),
+        Some(to.as_str()),
+        "the lock must hold the member's eslint at the reported target {to}"
+    );
+
+    // The landed version is within the cooldown window (not an overshoot): `check` is clean.
+    let check = fixture.cooldown_json(&["check", "--freeze", PERPKG_PROJECT_FREEZE]);
+    assert_eq!(
+        check.summary_violations(),
+        0,
+        "the member upgrade must leave the graph cooldown-clean"
+    );
+
+    // Converged: a second upgrade is a byte-stable no-op.
+    let lock_after_first = fixture.read_bytes("pnpm-lock.yaml");
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", PERPKG_PROJECT_FREEZE]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a fixed point"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "lock must be byte-identical across the two converged runs"
+    );
+}
+
+#[test]
+fn outdated_does_not_falsely_block_a_member_declared_dependency() {
+    skip_if_missing!("pnpm");
+    let fixture = workspace_member_fixture();
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", PERPKG_PROJECT_FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    let blocked = outdated.outdated_with_status("blocked");
+
+    // The whole-graph verify resolve lands the member-declared eslint, so `outdated` must call it
+    // adoptable — never `blocked`. Before the `--recursive` fix the verify resolve could not move the
+    // member dep, so every member candidate fell into `blocked`.
+    assert!(
+        adoptable.contains("eslint"),
+        "member-declared eslint must be adoptable\nadoptable={adoptable:?}\nblocked={blocked:?}"
+    );
+    assert!(
+        !blocked.contains("eslint"),
+        "member-declared eslint must NOT be falsely blocked\nblocked={blocked:?}"
+    );
+}
+
+/// Two members that declare the SAME dependency at DIFFERENT majors. pnpm keeps both lines (like
+/// cargo, unlike uv's single flat environment), so the whole-graph resolve must preserve them:
+/// exact-pinning one target across the workspace would collapse every other copy onto it.
+const MULTI_VERSION_A_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/app-v4",
+  "version": "0.1.0",
+  "dependencies": {
+    "chalk": "^4.1.0"
+  }
+}
+"#;
+
+const MULTI_VERSION_B_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/app-v5",
+  "version": "0.1.0",
+  "dependencies": {
+    "chalk": "^5.0.0"
+  }
+}
+"#;
+
+/// An early seed so the chalk v5 line has a clear within-window forward move (the v4 line is already at
+/// its final 4.1.2). Both majors are present in the seed lock.
+const MULTI_VERSION_SEED: &str = "2022-06-01T00:00:00Z";
+
+fn multi_version_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write("pkgs/a/package.json", MULTI_VERSION_A_PACKAGE_JSON);
+    fixture.write("pkgs/b/package.json", MULTI_VERSION_B_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, MULTI_VERSION_SEED);
+    fixture
+}
+
+/// Whether the lock holds at least one `chalk` package key on the given major line (`"4."`/`"5."`).
+fn lock_has_chalk_major(lock: &[u8], major_prefix: &str) -> bool {
+    String::from_utf8_lossy(lock).lines().any(|line| {
+        line.trim_start()
+            .starts_with(&format!("chalk@{major_prefix}"))
+    })
+}
+
+#[test]
+fn upgrade_preserves_distinct_versions_across_members() {
+    skip_if_missing!("pnpm");
+    let fixture = multi_version_fixture();
+
+    // Sanity: the seed holds both major lines.
+    let seed_lock = fixture.read_bytes("pnpm-lock.yaml");
+    assert!(
+        lock_has_chalk_major(&seed_lock, "4."),
+        "seed must hold a chalk v4 line"
+    );
+    assert!(
+        lock_has_chalk_major(&seed_lock, "5."),
+        "seed must hold a chalk v5 line"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // BOTH lines must survive: the v4 importer keeps a chalk v4, the v5 importer a chalk v5. The
+    // pre-fix exact-pin (`pnpm update chalk@<a> chalk@<b> --no-save`) collapsed every copy onto a
+    // single target, erasing one line.
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert!(
+        lock_has_chalk_major(&after, "4."),
+        "chalk v4 line must survive the upgrade"
+    );
+    assert!(
+        lock_has_chalk_major(&after, "5."),
+        "chalk v5 line must survive the upgrade"
+    );
+}
+
+/// `sync` bakes the cooldown.toml policy into pnpm's native config: the default `min-age` becomes
+/// `minimumReleaseAge`, AND every `[package."…"] latest` selector becomes an entry in
+/// `minimumReleaseAgeExclude` — so a package cooldown's own policy exempts is also exempt from pnpm's
+/// rolling gate (otherwise the native window would keep quarantining a `latest`-pinned package, the
+/// `@typescript/native-preview` nightly problem). `sync` writes the native YAML directly (no resolver
+/// run), but the fixture still needs the pnpm project marker for discovery.
+#[test]
+fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::new();
+    fixture.write(
+        "package.json",
+        "{\n  \"name\": \"cooldown-sync-fixture\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    );
+    fixture.write("pnpm-workspace.yaml", "packages: []\n");
+    fixture.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    fixture.write(
+        "cooldown.toml",
+        "min-age = \"14d\"\n\n[package.\"@typescript/native-preview\"]\nlatest = true\n",
+    );
+
+    let report = fixture.cooldown_json(&["sync", "--tool", "pnpm"]);
+    assert!(
+        report.ok(),
+        "sync should succeed: {}",
+        fixture.cooldown(&["sync", "--tool", "pnpm"]).stderr_str()
+    );
+
+    let yaml = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8");
+    assert!(
+        yaml.contains("minimumReleaseAge: 20160"),
+        "the default 14d window is synced as minutes: {yaml}"
+    );
+    assert!(
+        yaml.contains("minimumReleaseAgeExclude:") && yaml.contains("@typescript/native-preview"),
+        "the latest-exempt package is written to the native exemption list: {yaml}"
+    );
+}

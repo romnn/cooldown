@@ -268,3 +268,104 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "second fix must leave the lock byte-identical"
     );
 }
+
+/// Two workspace members that depend on the SAME crate at DIFFERENT, semver-incompatible majors.
+/// cargo keeps both versions in one `Cargo.lock` (like pnpm, unlike uv's single environment), so the
+/// whole-graph resolve must preserve both lines. cooldown targets each instance with `update -p
+/// <crate>@<from> --precise <to>`, so it moves one line without collapsing the other — this test locks
+/// that property in alongside the pnpm multi-version test. (The existing fixtures already exercise
+/// member-declared deps: `serde`/`log` live in `crates/app`, never the bare `[workspace]` root.)
+const MULTI_VERSION_ROOT_MANIFEST: &str = r#"[workspace]
+members = ["crates/old", "crates/new"]
+resolver = "2"
+"#;
+
+const MULTI_VERSION_OLD_MANIFEST: &str = r#"[package]
+name = "old"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "1"
+"#;
+
+const MULTI_VERSION_NEW_MANIFEST: &str = r#"[package]
+name = "new"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2"
+"#;
+
+fn multi_version_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", MULTI_VERSION_ROOT_MANIFEST)
+        .write("crates/old/Cargo.toml", MULTI_VERSION_OLD_MANIFEST)
+        .write("crates/old/src/lib.rs", "")
+        .write("crates/new/Cargo.toml", MULTI_VERSION_NEW_MANIFEST)
+        .write("crates/new/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+}
+
+/// Every `version` recorded for `crate_name` in a `Cargo.lock` — a crate held at several majors has
+/// one `[[package]]` block per version, so this returns them all (unlike `toml_lock_pins`, which keeps
+/// only the newest).
+fn cargo_lock_versions_of(crate_name: &str, lock: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(lock);
+    let mut versions = Vec::new();
+    let mut in_target = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("name = ") {
+            in_target = rest.trim_matches('"') == crate_name;
+        } else if in_target && let Some(rest) = line.strip_prefix("version = ") {
+            versions.push(rest.trim_matches('"').to_string());
+            in_target = false;
+        }
+    }
+    versions
+}
+
+#[test]
+fn upgrade_preserves_distinct_versions_across_members() {
+    skip_if_missing!("cargo");
+    let fixture = multi_version_fixture();
+
+    // Sanity: the seed holds both major lines.
+    let seed = fixture.read_bytes("Cargo.lock");
+    let before = cargo_lock_versions_of("bitflags", &seed);
+    assert!(
+        before.iter().any(|v| v.starts_with("1.")),
+        "seed must hold a bitflags v1 line, got {before:?}"
+    );
+    assert!(
+        before.iter().any(|v| v.starts_with("2.")),
+        "seed must hold a bitflags v2 line, got {before:?}"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // BOTH lines must survive: `crates/old` keeps a bitflags v1, `crates/new` a bitflags v2. A naive
+    // single-target pin would collapse one onto the other.
+    let after = cargo_lock_versions_of("bitflags", &fixture.read_bytes("Cargo.lock"));
+    assert!(
+        after.iter().any(|v| v.starts_with("1.")),
+        "bitflags v1 line must survive the upgrade, got {after:?}"
+    );
+    assert!(
+        after.iter().any(|v| v.starts_with("2.")),
+        "bitflags v2 line must survive the upgrade, got {after:?}"
+    );
+}
