@@ -4,6 +4,11 @@ CARGO_WORKSPACE_DIR = { value = "", relative = true }
 [alias]
 c = 'check --workspace --all-targets'
 
+# testing (nextest profiles; see .config/nextest.toml)
+t = 'nextest run -P default --retries 0 --no-tests warn --all-targets'
+ti = 'nextest run -P integration --retries 0 --no-tests warn --all-targets'
+tci = 'nextest run -P ci --retries 0 --no-tests warn --all-targets'
+
 # linting
 l = "clippy --all-targets --no-deps"
 lint = "clippy --all-targets --no-deps"

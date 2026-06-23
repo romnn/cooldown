@@ -128,19 +128,26 @@ tasks:
       - cargo fmt --all {{.CLI_ARGS}}
 
   test:
-    desc: "test cargo workspace"
+    desc: "test cargo workspace (unit only; nextest default profile)"
+    aliases: [test:unit]
     cmds:
-      - cargo nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
+      - cargo nextest run -P default --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:fc:
     desc: "test cargo workspace for all combinations of features"
     cmds:
-      - cargo fc nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
+      - cargo fc nextest run -P default --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:integration:
-    desc: "run the #[ignore]-gated, real-tool integration tests (drive uv etc. against PyPI; needs the mise.toml toolchain + network)"
+    desc: "run the real-tool integration tests (drive uv/cargo/go/pnpm against live registries; needs the mise.toml toolchain + network)"
     cmds:
-      - cargo nextest run -p cooldown --run-ignored all --no-tests "warn" {{.CLI_ARGS}}
+      - cargo nextest run -P integration --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
+
+  test:all:
+    desc: "run the full suite: unit + the real-tool integration tests (nextest ci profile)"
+    aliases: [test:ci]
+    cmds:
+      - cargo nextest run -P ci --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:doc:
     desc: "run doctests in cargo workspace"

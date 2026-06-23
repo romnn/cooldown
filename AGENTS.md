@@ -47,6 +47,63 @@ is what surfaces that.
 green there, not just on the non-`:fc` tasks. They run N builds so they are
 slower; keep them for the end of a change rather than the inner loop.
 
+## Testing
+
+Tests split into two buckets: fast, hermetic **unit** tests and slow,
+network-driven **integration** tests. The split is enforced by a nextest binary
+filter (`.config/nextest.toml`), not by `#[ignore]`.
+
+### Cargo aliases
+
+| Alias | Runs | Scope |
+|-------|------|-------|
+| `cargo t` | `nextest run -P default` | unit tests only (offline, fast) |
+| `cargo ti` | `nextest run -P integration` | the real-tool integration tests only |
+| `cargo tci` | `nextest run -P ci` | **everything** — unit + the non-hermetic integration tests |
+
+`cargo t` is the inner loop; it never hits the network. `cargo tci` runs the
+full suite including the integration tests that drive the real package managers.
+
+### Nextest profiles
+
+Three profiles in `.config/nextest.toml`, distinguished by `default-filter`:
+
+- `default` — **unit only**: excludes every integration binary/module.
+- `integration` — **integration only**: exactly the binaries/modules `default`
+  excludes (generous slow-timeout for the network round-trips).
+- `ci` — **all**: `default-filter = 'all()'`.
+
+### Task targets
+
+| Task | Profile | Scope |
+|------|---------|-------|
+| `task test` (alias `test:unit`) | `default` | unit only |
+| `task test:integration` | `integration` | integration only |
+| `task test:all` (alias `test:ci`) | `ci` | everything |
+
+### What makes a test an integration test
+
+A test is treated as an integration test (and so kept out of `cargo t` /
+`task test`) when **any** of these match:
+
+- its binary is named `convergence_*`, or
+- its binary is named `e2e*`, or
+- its binary is named `integration_test` / `integration_tests`, or
+- it lives in an `integration_test::` / `integration_tests::` module.
+
+The filter both profiles use is
+`binary(/^(convergence_|e2e|integration_tests?$)/) or test(/integration_tests?::/)`.
+The three binary prefixes share one `binary()` predicate on purpose: nextest
+errors if a `binary()` regex matches zero binaries, and only `convergence_*`
+binaries exist today — one alternation regex keeps `e2e*` /
+`integration_test(s)` future-proof without tripping that check. These tests drive the real package
+managers (`uv`, `cargo`, `go`, `pnpm`, provisioned via `mise.toml`) against live
+registries, so they need the toolchain plus network access. Each one calls
+`skip_if_missing!` to skip cleanly when its tool is absent. To add a new
+integration test, name its binary `convergence_*` (or one of the forms above) or
+put it in an `integration_test(s)::` module — no `#[ignore]` needed; the filter
+picks it up. Run it via `cargo ti` / `cargo tci` / `task test:integration`.
+
 ## Multiline strings
 
 Use the [`indoc`](https://docs.rs/indoc) macros for every multiline string
