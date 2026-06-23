@@ -1,0 +1,34 @@
+# Default == unit tests only.
+#
+# Excludes the non-hermetic integration suites: any binary named `convergence_*`, `e2e*`, or
+# `integration_test`/`integration_tests`, and any `integration_test(s)::` module. So `cargo t` /
+# `task test` stay fast and offline. The three binary-name prefixes are one alternation inside a
+# single `binary()` predicate on purpose: nextest errors if a `binary()` regex matches zero binaries,
+# and the `e2e`/`integration_test(s)` binaries do not exist yet — folding them into one regex that
+# also matches the existing `convergence_*` binaries keeps the classification future-proof without
+# tripping that check.
+[profile.default]
+default-filter = 'not (binary(/^(convergence_|e2e|integration_tests?$)/) or test(/integration_tests?::/))'
+fail-fast = { max-fail = "all" }
+retries = 0
+# Hard cap: 60s per unit test (they are all offline and fast).
+slow-timeout = { period = "60s", terminate-after = 1, grace-period = "10s" }
+
+# Integration-only profile: exactly the suites the default profile excludes.
+#
+# These drive the real package managers (provisioned via mise.toml) against live registries, so they
+# get a generous slow-timeout for the network round-trips.
+[profile.integration]
+default-filter = 'binary(/^(convergence_|e2e|integration_tests?$)/) or test(/integration_tests?::/)'
+fail-fast = { max-fail = "all" }
+retries = 0
+# Hard cap: 5 minutes per test — these hit the network.
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "10s" }
+
+# CI: run everything (unit + integration).
+[profile.ci]
+default-filter = 'all()'
+fail-fast = false
+retries = 0
+# Hard cap: 5 minutes per test — covers the network integration tests too.
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "10s" }

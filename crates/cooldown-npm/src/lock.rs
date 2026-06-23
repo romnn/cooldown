@@ -44,6 +44,35 @@ pub trait NodeLock: Send + Sync + 'static {
     /// `package.json` range itself.
     fn relock_args() -> Vec<String>;
 
+    /// Whether this manager re-resolves the whole importer graph jointly in a single pass, so cooldown
+    /// drives the whole-graph re-resolve/diff path rather than the per-package relock loop.
+    ///
+    /// Only pnpm does: one `pnpm update --latest --lockfile-only --config.minimumReleaseAge=<m>`
+    /// re-resolves the entire importer graph at once — direct *and* transitive — to the newest versions
+    /// matured past the cooldown window, the prerequisite for settling mutually-exclusive peer
+    /// conflicts at a single fixed point instead of ping-ponging between per-package pins. npm/yarn/bun
+    /// have no equivalent joint resolve under a window, so they keep the per-package relock path.
+    #[must_use]
+    fn supports_whole_graph_resolve() -> bool {
+        false
+    }
+
+    /// The single command that re-resolves the whole graph under cooldown's window — pnpm's
+    /// `update --latest --lockfile-only --config.minimumReleaseAge=<minutes>` (forward) or a plain
+    /// `install --lockfile-only --config.minimumReleaseAge=<minutes>` reconcile.
+    ///
+    /// `--latest` floats every importer's dependency — direct and transitive — to the newest version
+    /// the window admits, in one joint resolve; `minimumReleaseAge` is the rolling minute count below
+    /// which a release is too fresh, so the resolve never adopts an in-cooldown version (the whole
+    /// point: it caps *transitives* too, which a per-package update of a direct dependency cannot do).
+    /// `--no-save`/`--lockfile-only` keep `package.json` and `node_modules` untouched. A `None`
+    /// `window_minutes` (a true `Latest` opt-out) omits the cap and resolves to the very newest.
+    /// `None` for managers without a joint resolve under a window.
+    #[must_use]
+    fn whole_graph_args(_upgrade: bool, _window_minutes: Option<i64>) -> Option<Vec<String>> {
+        None
+    }
+
     /// The driver args that move **only** the lock to an exact, already-in-range `version`, leaving
     /// the declared `package.json` range untouched — the lock-only path for `RewriteMode::Auto`.
     ///
@@ -246,6 +275,34 @@ impl NodeLock for Pnpm {
 
     fn relock_args() -> Vec<String> {
         vec!["install".into(), "--lockfile-only".into()]
+    }
+
+    fn supports_whole_graph_resolve() -> bool {
+        true
+    }
+
+    fn whole_graph_args(upgrade: bool, window_minutes: Option<i64>) -> Option<Vec<String>> {
+        // `--latest` raises every importer's dependency to the newest admissible version in one joint
+        // re-resolve (the forward `upgrade` form); a bare `install --lockfile-only` is the minimal
+        // reconcile (`fix`) form that re-settles the graph without floating versions up. `--no-save`
+        // keeps `package.json` ranges as the author wrote them (the caller widens an out-of-range
+        // manifest itself first); `--lockfile-only` skips `node_modules`. `minimumReleaseAge` is the
+        // rolling minute count below which a release is too fresh, so neither variant adopts an
+        // in-cooldown version — and crucially it caps transitives, which a per-package update cannot.
+        let mut args = if upgrade {
+            vec![
+                "update".to_string(),
+                "--latest".to_string(),
+                "--lockfile-only".to_string(),
+                "--no-save".to_string(),
+            ]
+        } else {
+            vec!["install".to_string(), "--lockfile-only".to_string()]
+        };
+        if let Some(minutes) = window_minutes {
+            args.push(format!("--config.minimumReleaseAge={minutes}"));
+        }
+        Some(args)
     }
 
     fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {

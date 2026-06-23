@@ -19,21 +19,13 @@
 //! newest-typer; cooldown adopts the newest typer and accepts a collateral huggingface-hub
 //! downgrade, then holds huggingface-hub's newer line out (it would force typer back down).
 //!
-//! # Running
-//!
-//! Gated `#[ignore]`-by-default (and skips with a message if `uv` is missing), so the fast unit run
-//! (`cargo nextest run`, which does not run ignored tests) is unaffected. Run them with the real
-//! toolchain from `mise.toml`:
-//!
-//! ```bash
-//! task test:integration         # cargo nextest run -p cooldown --run-ignored all
-//! # or directly:
-//! cargo test -p cooldown --test convergence_uv -- --ignored
-//! ```
-//!
-//! TODO(ecosystems): cargo, go, and pnpm are the next adapters to cover. Their whole-graph
-//! re-resolve is unfixed, so each is a separate step: add a fixture generator (manifest + seeded
-//! lock) here and reuse the same invariant assertions on the returned `Envelope`.
+//! Sibling files cover the other adapters whose whole-graph re-resolve is now fixed, each reusing the
+//! tool-agnostic `support/` harness: a fixture generator (manifest + seeding via the ecosystem's own
+//! package manager) and a `PinParser`, then the same invariant assertions on the returned `Envelope`.
+//! `convergence_cargo.rs` seeds via `cargo generate-lockfile` (`Cargo.lock` reuses
+//! `support::toml_lock_pins`); `convergence_go.rs` seeds via `go mod tidy` (`support::go_mod_pins`);
+//! `convergence_pnpm.rs` seeds via `pnpm install --lockfile-only --config.minimumReleaseAge=<m>`
+//! (`support::pnpm_lock_pins`).
 
 #![allow(
     clippy::unwrap_used,
@@ -44,7 +36,7 @@
 
 mod support;
 
-use support::Fixture;
+use support::{Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. At this instant the huggingface-hub/typer conflict exists in
 /// PyPI's immutable history, so the resolve is reproducible forever.
@@ -93,7 +85,6 @@ fn conflict_fixture(seed_cutoff: &str) -> Fixture {
 }
 
 #[test]
-#[ignore = "drives the real uv resolver + PyPI network; run via `task test:integration`"]
 fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("uv");
     let fixture = conflict_fixture(FREEZE);
@@ -126,7 +117,6 @@ fn upgrade_converges_to_a_fixed_point() {
 }
 
 #[test]
-#[ignore = "drives the real uv resolver + PyPI network; run via `task test:integration`"]
 fn upgrade_reports_every_moved_version_no_silent_change() {
     skip_if_missing!("uv");
     let fixture = conflict_fixture(FREEZE);
@@ -138,7 +128,7 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     // Compute the set of packages whose pinned version changed in the lock, independent of the
     // report, then assert the report's applied set covers exactly those — the forced collateral
     // huggingface-hub downgrade included, never silent.
-    let moved_in_lock = changed_packages(&lock_before, &lock_after);
+    let moved_in_lock = changed_packages(&lock_before, &lock_after, toml_lock_pins);
     assert!(
         !moved_in_lock.is_empty(),
         "the upgrade should have moved at least one package"
@@ -164,7 +154,6 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
 }
 
 #[test]
-#[ignore = "drives the real uv resolver + PyPI network; run via `task test:integration`"]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("uv");
     let fixture = conflict_fixture(FREEZE);
@@ -196,7 +185,6 @@ fn outdated_agrees_with_upgrade() {
 }
 
 #[test]
-#[ignore = "drives the real uv resolver + PyPI network; run via `task test:integration`"]
 fn upgrade_dry_run_agrees_with_real_upgrade() {
     skip_if_missing!("uv");
 
@@ -235,7 +223,6 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
 }
 
 #[test]
-#[ignore = "drives the real uv resolver + PyPI network; run via `task test:integration`"]
 fn fix_matures_too_fresh_deps_and_is_idempotent() {
     skip_if_missing!("uv");
 
@@ -273,54 +260,4 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         fixture.read_bytes("uv.lock"),
         "second fix must leave the lock byte-identical"
     );
-}
-
-/// The set of packages whose pinned version *moved* between two uv.lock files — i.e. present in
-/// both locks at a different version. A line-based diff over `name = "…"` / `version = "…"` pairs is
-/// enough to detect every moved pin without a TOML dependency in the test.
-///
-/// Packages that leave or join the graph are deliberately excluded: a removal/addition is a
-/// graph-shape consequence of a reported direct move (e.g. typer 0.26 dropping its `click`
-/// dependency removes `click` from the lock), not a silent *version* change. The invariant under
-/// test is that no surviving package's version moves without appearing in the report.
-fn changed_packages(before: &[u8], after: &[u8]) -> std::collections::BTreeSet<String> {
-    let before_pins = parse_pins(before);
-    let after_pins = parse_pins(after);
-    let mut changed = std::collections::BTreeSet::new();
-    for (name, before_version) in &before_pins {
-        if let Some(after_version) = after_pins.get(name)
-            && before_version != after_version
-        {
-            changed.insert(name.clone());
-        }
-    }
-    changed
-}
-
-/// Parse `name`/`version` pairs from a uv.lock. uv emits each `[[package]]` as a `name = "…"` line
-/// followed (within the same block) by a `version = "…"` line.
-fn parse_pins(lock: &[u8]) -> std::collections::BTreeMap<String, String> {
-    let text = String::from_utf8_lossy(lock);
-    let mut pins = std::collections::BTreeMap::new();
-    let mut current_name: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = field(trimmed, "name") {
-            current_name = Some(value);
-        } else if let Some(value) = field(trimmed, "version")
-            && let Some(name) = current_name.take()
-        {
-            pins.insert(name, value);
-        }
-    }
-    pins
-}
-
-/// Extract the quoted value of a `key = "value"` line, if the line is exactly that field.
-fn field(line: &str, key: &str) -> Option<String> {
-    let rest = line.strip_prefix(key)?.trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let inner = rest.strip_prefix('"')?;
-    let end = inner.find('"')?;
-    Some(inner[..end].to_owned())
 }

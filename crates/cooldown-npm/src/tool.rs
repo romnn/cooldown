@@ -25,6 +25,28 @@ use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 
+/// The resolved lock's `name -> version` map, the snapshot `apply` diffs before/after the whole-graph
+/// re-resolve so *every* net version change is reported (the planned moves, the collateral churn the
+/// joint resolve forced on other packages, and the candidates left held below their target). A name
+/// that resolves to several versions (a duplicated graph copy) keeps its newest, so a moved direct
+/// declaration is never masked by a stale transitive copy of the same name.
+fn locked_versions<L: NodeLock>(content: &str) -> HashMap<String, String> {
+    let mut versions: HashMap<String, String> = HashMap::new();
+    for (name, version) in L::parse(content).unwrap_or_default() {
+        match versions.entry(name) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if version::compare(&version, slot.get()).is_gt() {
+                    *slot.get_mut() = version;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(version);
+            }
+        }
+    }
+    versions
+}
+
 /// Resolve each member path to its `package.json` "name", read once per `dependencies()` call. A
 /// path with no readable name is omitted, so the caller falls back to showing the path itself.
 fn member_names(root: &Utf8Path, paths: &HashSet<String>) -> HashMap<String, String> {
@@ -336,22 +358,130 @@ fn candidate_manifests(project: &Project, change: &Change) -> Vec<Utf8PathBuf> {
         .collect()
 }
 
-#[async_trait]
-impl<L: NodeLock> ToolWrite for NpmTool<L> {
-    async fn mutation_journal(
-        &self,
-        project: &Project,
-        plan: &Plan,
-    ) -> Result<ProjectMutationJournal> {
-        journal::<L>(project, plan)
+/// cooldown's resolution window as pnpm's rolling `minimumReleaseAge` minute count, derived from the
+/// project's `exclude_newer` cutoff (the same value uv hands its resolver as `--exclude-newer`).
+///
+/// pnpm has no absolute publish-date cutoff, only a rolling "exclude releases younger than N minutes"
+/// — but the two coincide: excluding everything younger than `now - cutoff` is exactly excluding
+/// everything published after `cutoff`. So both forms the application emits map to a minute count:
+/// a *relative* span (`"14 days"`, `"36 hours"`, `"90 seconds"`) for an age window converts directly,
+/// and an absolute RFC3339 instant (a `--freeze` cutoff, or the `now` instant a `Latest`/opt-out
+/// passes) converts as `now - instant`. `now` is supplied by the caller so the conversion is
+/// deterministic under a fixed clock. A future instant or a zero/negative span yields `None`
+/// (nothing to exclude).
+fn window_minutes_from_cutoff(cutoff: Option<&str>, now: jiff::Timestamp) -> Option<i64> {
+    let cutoff = cutoff?.trim();
+    if let Some((count, unit)) = cutoff.split_once(' ')
+        && let Ok(count) = count.parse::<i64>()
+    {
+        let minutes = match unit.trim_end_matches('s') {
+            "day" => count.checked_mul(24 * 60)?,
+            "hour" => count.checked_mul(60)?,
+            "minute" => count,
+            // A second-granularity window rounds up to a whole minute so a sub-minute age still
+            // excludes the just-published release rather than silently disabling the cooldown.
+            "second" => count.checked_add(59)? / 60,
+            _ => return None,
+        };
+        return (minutes > 0).then_some(minutes);
     }
+    // An absolute instant (freeze / `now` opt-out): the rolling age that reproduces it is `now - it`.
+    let instant: jiff::Timestamp = cutoff.parse().ok()?;
+    let minutes = now.duration_since(instant).as_secs() / 60;
+    (minutes > 0).then_some(minutes)
+}
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+/// A net version change `apply` derived from the before/after lock diff for a package the plan did not
+/// itself name — collateral movement the whole-graph re-resolve forced. Reported so no package's
+/// version change is ever silent: a transitive pushed backward (or forward) to keep the lock
+/// consistent surfaces as its own report row.
+fn collateral_change<L: NodeLock>(name: &str, from: &str, to: &str) -> Change {
+    Change {
+        package: PackageId::new(L::ID, name.to_string(), Some(NPM.to_string())),
+        from: Version::new(from.to_string()),
+        to: Version::new(to.to_string()),
+        // A collateral move is transitive consistency churn, not a directly-declared bump; its update
+        // kind is informational only and `Minor` is the neutral label the renderer shows.
+        kind: cooldown_core::UpdateKind::Minor,
+        downgrade: version::compare(to, from).is_lt(),
+        direct: false,
+        members: Vec::new(),
+    }
+}
+
+/// Whether a planned candidate landed at or beyond its target in `after`, respecting the move's
+/// direction: a forward move must reach at/above its target, a downgrade at/below it. A package the
+/// resolve dropped from the lock (no entry) counts as not reached.
+fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
+    after.get(&change.package.name).is_some_and(|landed| {
+        let ordering = version::compare(landed, change.to.as_str());
+        if change.downgrade {
+            ordering.is_le()
+        } else {
+            ordering.is_ge()
+        }
+    })
+}
+
+/// Name the package whose peer/version requirement structurally holds `held` below `target`, scanning
+/// the resolved `pnpm-lock.yaml`. pnpm appends a `(peer@x)` suffix to a package key whenever its
+/// presence depends on a peer being resolved a certain way, so a held candidate that has *no* matured
+/// key in the resolved graph is mutually exclusive with whatever peer the resolver did pick. The named
+/// blocker is the unique *other* package that carries a peer-suffixed key — the sibling whose peer
+/// choice excluded `held`. When blame is ambiguous (no peer-suffixed sibling, or several) it returns
+/// `None`, so the caller falls back to the generic "the resolver rejected this change" message — the
+/// same best-effort contract as uv's `unique_edge_requirer`.
+fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
+    let mut blockers: BTreeSet<String> = BTreeSet::new();
+    for (name, _) in pnpm_peer_suffixed_keys(lock) {
+        if name != held {
+            blockers.insert(name);
+        }
+    }
+    match blockers.len() {
+        1 => blockers.into_iter().next(),
+        _ => None,
+    }
+}
+
+/// The `(name, peer-suffix)` of every `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer
+/// disambiguation suffix — the resolved entries whose identity depends on a peer resolution. Used to
+/// attribute a held peer conflict to the sibling that forced the peer choice.
+fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut in_packages = false;
+    for line in lock.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(stripped) = line.strip_prefix("  ") {
+            if !in_packages || stripped.starts_with(' ') {
+                continue;
+            }
+            let key = stripped
+                .trim()
+                .trim_end_matches(':')
+                .trim_matches('\'')
+                .trim_matches('"');
+            let Some(open) = key.find('(') else { continue };
+            let suffix = key[open..].to_string();
+            let base = key[..open].to_string();
+            if let Some((name, _version)) = crate::lock::split_name_version(&base) {
+                out.push((name, suffix));
+            }
+        } else {
+            in_packages = line.starts_with("packages:");
+        }
+    }
+    out
+}
+
+impl<L: NodeLock> NpmTool<L> {
+    /// The original per-package apply: for each change, move the lock with a lock-only update (pnpm)
+    /// or, after widening the declaring `package.json`, a pinned/bare relock. Kept for npm/yarn/bun,
+    /// which have neither a window flag nor a single joint resolve, so a batched whole-graph pass would
+    /// gain nothing over moving each change in turn.
+    async fn apply_per_package(&self, project: &Project, plan: &Plan) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             let args = if let Some(args) = lockonly_command::<L>(project, change, plan.rewrite)? {
@@ -379,6 +509,233 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             }
         }
         Ok(report)
+    }
+
+    /// Re-resolve the **whole** importer graph once under a single global cooldown window (pnpm), then
+    /// report the full before/after lock diff — the proven uv/go pattern ported to pnpm, but bounded by
+    /// what pnpm can express.
+    ///
+    /// One `pnpm update --latest --lockfile-only --no-save --config.minimumReleaseAge=<minutes>` jointly
+    /// re-resolves every importer, settling mutually-exclusive peer conflicts at a single fixed point
+    /// instead of ping-ponging between per-package updates. pnpm exposes only one knob for cooldown,
+    /// `minimumReleaseAge`: a single rolling age applied to the entire graph. It has no per-package
+    /// publish-date cutoff, so this pass enforces only the *project-default* window for the whole graph
+    /// and cannot honor a *stricter per-package* window the plan may carry. This is a known gap: uv
+    /// re-caps each node with a per-package `<=` cutoff, and cargo/go pin every node to its exact
+    /// per-node target, but pnpm cannot be told either in one pass. The plan's per-package windows are
+    /// left to cooldown's reconcile/check to flag rather than to pnpm to enforce here. The report is the
+    /// diff of the journal's pre-apply lock against the result, so every planned candidate is reported
+    /// reached or held (naming the conflicting peer where attributable) and every collateral move of an
+    /// unplanned package surfaces as its own row. A resolver failure marks all candidates held and lets
+    /// the caller restore the journal.
+    async fn apply_whole_graph(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        if plan.changes.is_empty() {
+            return Ok(report);
+        }
+
+        let before = journal
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
+            .and_then(|file| file.contents.as_deref())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(locked_versions::<L>)
+            .unwrap_or_default();
+
+        let upgrade = !plan.changes.iter().all(|change| change.downgrade);
+        // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the current
+        // instant. An absolute `--freeze` cutoff becomes `now - freeze` minutes — equivalent to the
+        // freeze date as long as the same `now` governs both the seed and this resolve (it does:
+        // wall-clock advances only seconds between them, far below the day-scale window under test).
+        let window_minutes =
+            window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
+        match self
+            .whole_graph_resolve(project, plan, upgrade, window_minutes)
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.is_tool_spawn_failure() => return Err(err),
+            // The joint resolve was unsatisfiable under the window: every candidate is held. The caller
+            // restores the journal, so no partial lock is kept.
+            Err(_) => {
+                for change in &plan.changes {
+                    report.skipped.push(Skipped {
+                        change: change.clone(),
+                        reason: SkipReason::ResolverConflict,
+                        offending: Some(change.package.clone()),
+                    });
+                }
+                return Ok(report);
+            }
+        }
+
+        let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let after = locked_versions::<L>(&after_content);
+        let planned: HashSet<&str> = plan
+            .changes
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+
+        for change in &plan.changes {
+            let name = change.package.name.as_str();
+            // Whether the lock's version for this name actually moved. A name can resolve to several
+            // copies in a pnpm graph; `before`/`after` track its *newest* copy, so a candidate planned
+            // off a stale duplicate copy whose newest copy is already at the target shows no net move.
+            // Reporting only genuine moves keeps the report set equal to the lock-diff set: a converged
+            // re-run, where nothing moved, reports zero applied (no oscillation).
+            let moved = match (before.get(name), after.get(name)) {
+                (Some(from), Some(to)) => version::compare(from, to).is_ne(),
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
+            if reached(&after, change) {
+                if moved {
+                    report.applied.push(change.clone());
+                }
+                // Reached its target without a net lock move — already satisfied (a duplicate copy of
+                // the same name is at the target). A no-op, neither applied nor held.
+            } else {
+                // The joint resolve could not place this candidate at its target without breaking the
+                // lock — a mutually-exclusive peer won. Name the sibling whose peer choice excluded it
+                // so the report says "held: conflicts with <pkg>"; absent a unique blocker it falls
+                // back to the candidate itself (the generic "resolver rejected" form).
+                let offender =
+                    peer_conflict_blocker(&after_content, name).unwrap_or_else(|| name.to_string());
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::ResolverConflict,
+                    offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
+                });
+            }
+        }
+
+        let mut collateral: Vec<Change> = before
+            .iter()
+            .filter(|(name, _)| !planned.contains(name.as_str()))
+            .filter_map(|(name, from)| {
+                let to = after.get(name)?;
+                (version::compare(from, to).is_ne()).then(|| collateral_change::<L>(name, from, to))
+            })
+            .collect();
+        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        report.applied.extend(collateral);
+        Ok(report)
+    }
+
+    /// Widen the declaring manifests per [`RewriteMode`], then run the single joint resolve under the
+    /// window.
+    ///
+    /// `Always` widens every candidate up front; `Auto` widens only the candidates the resolve left
+    /// short of their target because of their *own* declared `package.json` range (a candidate held by
+    /// *another* package's peer requirement is a real conflict the lock diff then reports, not a
+    /// missing widen), re-resolving until a round widens nothing. Each resolve is one
+    /// `pnpm update --latest --config.minimumReleaseAge=<m>`, so the whole importer graph — direct and
+    /// transitive — settles jointly to the newest-within-window fixed point in a single pass.
+    async fn whole_graph_resolve(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        upgrade: bool,
+        window_minutes: Option<i64>,
+    ) -> Result<()> {
+        if matches!(plan.rewrite, RewriteMode::Always) {
+            for change in &plan.changes {
+                manifest::widen_constraints(
+                    &project.root,
+                    &change.members,
+                    &change.package.name,
+                    change.to.as_str(),
+                )?;
+            }
+        }
+        self.joint_resolve(project, upgrade, window_minutes).await?;
+
+        if upgrade && matches!(plan.rewrite, RewriteMode::Auto) {
+            // Widen only the candidates the joint resolve could not raise to their target because their
+            // own declared range caps them, then re-resolve. A candidate still short after a no-op widen
+            // round is blocked by another package (a real conflict), so widening stops and the diff
+            // reports it.
+            for _ in 0..plan.changes.len() {
+                let after = read_locked::<L>(project)?;
+                let mut widened_any = false;
+                for change in &plan.changes {
+                    let reached = after.get(&change.package.name).is_some_and(|current| {
+                        version::compare(current, change.to.as_str()).is_ge()
+                    });
+                    if reached {
+                        continue;
+                    }
+                    let rewrite = manifest::widen_constraints(
+                        &project.root,
+                        &change.members,
+                        &change.package.name,
+                        change.to.as_str(),
+                    )?;
+                    if !rewrite.modified.is_empty() {
+                        widened_any = true;
+                    }
+                }
+                if !widened_any {
+                    break;
+                }
+                self.joint_resolve(project, upgrade, window_minutes).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn joint_resolve(
+        &self,
+        project: &Project,
+        upgrade: bool,
+        window_minutes: Option<i64>,
+    ) -> Result<()> {
+        let Some(args) = L::whole_graph_args(upgrade, window_minutes) else {
+            return Ok(());
+        };
+        self.cmd.run(&project.root, &args).await
+    }
+}
+
+/// The current on-disk lock's `name -> version` map, re-read between widen rounds to observe what the
+/// latest joint resolve produced.
+fn read_locked<L: NodeLock>(project: &Project) -> Result<HashMap<String, String>> {
+    let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+    Ok(locked_versions::<L>(&content))
+}
+
+#[async_trait]
+impl<L: NodeLock> ToolWrite for NpmTool<L> {
+    async fn mutation_journal(
+        &self,
+        project: &Project,
+        plan: &Plan,
+    ) -> Result<ProjectMutationJournal> {
+        journal::<L>(project, plan)
+    }
+
+    async fn apply(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph in one
+        // pass and reports the full before/after lock diff, so a candidate can never silently move
+        // another package and mutually-exclusive peers settle at a single fixed point. The others
+        // (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock path.
+        if L::supports_whole_graph_resolve() {
+            self.apply_whole_graph(project, plan, journal).await
+        } else {
+            self.apply_per_package(project, plan).await
+        }
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
@@ -487,9 +844,125 @@ fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str, dry_run: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::Npm;
+    use crate::lock::{Npm, Pnpm};
     use camino::Utf8PathBuf;
     use indoc::indoc;
+
+    #[test]
+    fn window_minutes_from_cutoff_handles_spans_and_absolute_instants() {
+        let now: jiff::Timestamp = "2024-08-15T00:00:00Z".parse().unwrap();
+        // The application renders an age window as a relative span; each maps directly to minutes.
+        assert_eq!(
+            window_minutes_from_cutoff(Some("14 days"), now),
+            Some(14 * 24 * 60)
+        );
+        assert_eq!(
+            window_minutes_from_cutoff(Some("1 day"), now),
+            Some(24 * 60)
+        );
+        assert_eq!(
+            window_minutes_from_cutoff(Some("36 hours"), now),
+            Some(36 * 60)
+        );
+        assert_eq!(window_minutes_from_cutoff(Some("1 hour"), now), Some(60));
+        // Sub-minute ages round up so the cooldown is never silently disabled.
+        assert_eq!(window_minutes_from_cutoff(Some("90 seconds"), now), Some(2));
+        assert_eq!(window_minutes_from_cutoff(Some("30 seconds"), now), Some(1));
+        // An absolute freeze instant converts to `now - instant` minutes (14 days here).
+        assert_eq!(
+            window_minutes_from_cutoff(Some("2024-08-01T00:00:00Z"), now),
+            Some(14 * 24 * 60)
+        );
+        // A future instant (or no cutoff) excludes nothing → None.
+        assert_eq!(
+            window_minutes_from_cutoff(Some("2024-09-01T00:00:00Z"), now),
+            None
+        );
+        assert_eq!(window_minutes_from_cutoff(None, now), None);
+    }
+
+    #[test]
+    fn whole_graph_args_resolves_under_the_window_only_for_pnpm() {
+        // pnpm floats the whole graph to latest-within-window in one joint resolve; the window rides
+        // inline as `minimumReleaseAge`, capping transitives a per-package update could never move.
+        assert_eq!(
+            Pnpm::whole_graph_args(true, Some(20160)),
+            Some(vec![
+                "update".to_string(),
+                "--latest".to_string(),
+                "--lockfile-only".to_string(),
+                "--no-save".to_string(),
+                "--config.minimumReleaseAge=20160".to_string(),
+            ])
+        );
+        // The reconcile (fix) variant is a plain re-lock; a true Latest opt-out drops the min-age flag.
+        assert_eq!(
+            Pnpm::whole_graph_args(false, None),
+            Some(vec!["install".to_string(), "--lockfile-only".to_string()])
+        );
+        // npm/yarn/bun have no joint resolve under a window, so they keep the per-package path.
+        assert!(!Npm::supports_whole_graph_resolve());
+        assert!(Pnpm::supports_whole_graph_resolve());
+        assert_eq!(Npm::whole_graph_args(true, Some(20160)), None);
+        assert_eq!(crate::lock::Yarn::whole_graph_args(true, None), None);
+        assert_eq!(crate::lock::Bun::whole_graph_args(false, None), None);
+    }
+
+    #[test]
+    fn locked_versions_keeps_the_newest_copy_of_a_duplicated_name() {
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  foo@1.0.0:\n    resolution: {integrity: sha512-a}\n\n  foo@2.0.0:\n    resolution: {integrity: sha512-b}\n\n  bar@3.1.0:\n    resolution: {integrity: sha512-c}\n";
+        let versions = locked_versions::<Pnpm>(lock);
+        assert_eq!(versions.get("foo").map(String::as_str), Some("2.0.0"));
+        assert_eq!(versions.get("bar").map(String::as_str), Some("3.1.0"));
+    }
+
+    #[test]
+    fn reached_respects_move_direction() {
+        let mut after = HashMap::new();
+        after.insert("pkg-a".to_string(), "2.0.0".to_string());
+        let forward = change("pkg-a", "1.0.0", "2.0.0");
+        assert!(reached(&after, &forward));
+        let forward_short = change("pkg-a", "1.0.0", "2.1.0");
+        assert!(!reached(&after, &forward_short));
+        let mut down = change("pkg-a", "3.0.0", "2.0.0");
+        down.downgrade = true;
+        assert!(reached(&after, &down));
+        let mut down_short = change("pkg-a", "3.0.0", "1.0.0");
+        down_short.downgrade = true;
+        assert!(!reached(&after, &down_short));
+    }
+
+    #[test]
+    fn collateral_change_marks_a_forced_regression_as_a_downgrade() {
+        let down = collateral_change::<Pnpm>("shared", "2.0.1", "1.4.0");
+        assert_eq!(down.package.name, "shared");
+        assert!(down.downgrade);
+        assert!(!down.direct);
+        let up = collateral_change::<Pnpm>("shared", "1.4.0", "2.0.1");
+        assert!(!up.downgrade);
+    }
+
+    #[test]
+    fn peer_conflict_blocker_names_a_unique_peer_suffixed_sibling() {
+        // `pkg-b` carries a `(shared@1.4.0)` peer suffix — its identity depends on the peer choice the
+        // resolver made, which excluded the held `pkg-a`. With a single such sibling, blame is
+        // unambiguous and `pkg-b` is named.
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  pkg-a@1.0.0:\n    resolution: {integrity: sha512-a}\n\n  pkg-b@2.0.0(shared@1.4.0):\n    resolution: {integrity: sha512-b}\n\n  shared@1.4.0:\n    resolution: {integrity: sha512-c}\n";
+        assert_eq!(
+            peer_conflict_blocker(lock, "pkg-a"),
+            Some("pkg-b".to_string())
+        );
+        // The held package's own peer-suffixed key never blames itself.
+        let self_only = "lockfileVersion: '9.0'\n\npackages:\n\n  pkg-a@1.0.0(shared@2.0.0):\n    resolution: {integrity: sha512-a}\n";
+        assert_eq!(peer_conflict_blocker(self_only, "pkg-a"), None);
+    }
+
+    #[test]
+    fn peer_conflict_blocker_is_generic_when_blame_is_ambiguous() {
+        // Two distinct peer-suffixed siblings make blame ambiguous → None (generic message).
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  pkg-b@2.0.0(shared@1.0.0):\n    resolution: {integrity: sha512-b}\n\n  pkg-c@2.0.0(shared@1.0.0):\n    resolution: {integrity: sha512-c}\n";
+        assert_eq!(peer_conflict_blocker(lock, "pkg-a"), None);
+    }
 
     #[test]
     fn set_yaml_scalar_adds_updates_and_is_idempotent() {

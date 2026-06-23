@@ -25,6 +25,11 @@ pub struct ResolvedGraph {
     /// they cap nothing. Workspace-member pins are surfaced via [`exact_pins`](Self::exact_pins)
     /// instead, so the consumer ignores a ceiling on a pinned node.
     pub graph_ceilings: HashSet<(String, String)>,
+    /// For each capped `(crate, version)` node, the *requirer* crate names whose active `=x.y.z`
+    /// edge imposes that cap — the blame source when a candidate is held below its target by a shared
+    /// single-major pin. A node may have several requirers all pinning the same version; the consumer
+    /// names one. Keyed by the same `(name, version)` as [`graph_ceilings`](Self::graph_ceilings).
+    pub ceiling_requirers: HashMap<(String, String), Vec<String>>,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -73,6 +78,24 @@ impl ResolvedGraph {
     pub fn is_graph_capped(&self, crate_name: &str, version: &str) -> bool {
         self.graph_ceilings
             .contains(&(crate_name.to_string(), version.to_string()))
+    }
+
+    /// The requirer crate whose active `=x.y.z` edge caps any node of `held` below `target` — the
+    /// crate to blame when a candidate is held back by a shared single-major exact pin. Scans the
+    /// capped nodes of `held`, keeps those pinned below `target`, and returns the (sorted, stable)
+    /// first requirer name. `None` when no requirer caps `held` below the target.
+    #[must_use]
+    pub fn exact_requirer_of(&self, held: &str, target: &str) -> Option<String> {
+        let mut requirers: Vec<&str> = self
+            .ceiling_requirers
+            .iter()
+            .filter(|((name, version), _)| {
+                name == held && crate::version::compare(target, version).is_gt()
+            })
+            .flat_map(|(_, requirers)| requirers.iter().map(String::as_str))
+            .collect();
+        requirers.sort_unstable();
+        requirers.into_iter().next().map(str::to_string)
     }
 
     /// Is `id` required by a non-root node (held by the graph)?
@@ -286,6 +309,15 @@ impl Cargo {
         Ok(Self::build_graph(raw))
     }
 
+    /// Builds a [`ResolvedGraph`] from raw `cargo metadata` JSON, for tests that exercise the graph
+    /// logic (exact-pin ceilings, requirer blame) without spawning `cargo`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn build_graph_from_json(json: &str) -> ResolvedGraph {
+        let raw: RawMeta = serde_json::from_str(json).expect("parse metadata");
+        Self::build_graph(raw)
+    }
+
     /// Builds the [`ResolvedGraph`] from parsed `cargo metadata`. Split from [`Self::metadata`] so the
     /// graph logic — exact pins, the active-edge ceiling intersection, reverse edges — is unit-testable
     /// without spawning cargo.
@@ -336,6 +368,7 @@ impl Cargo {
         // An inactive (optional/target-gated) edge is declared but absent from `resolve.nodes`, so it
         // contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate.
         let mut graph_ceilings = HashSet::new();
+        let mut ceiling_requirers: HashMap<(String, String), Vec<String>> = HashMap::new();
         for (requirer, name, version) in exact_edges {
             let active = edges.get(&requirer).is_some_and(|dep_ids| {
                 dep_ids.iter().any(|id| {
@@ -345,7 +378,14 @@ impl Cargo {
                 })
             });
             if active {
-                graph_ceilings.insert((name, version));
+                let key = (name.clone(), version.clone());
+                graph_ceilings.insert(key.clone());
+                if let Some(requirer_name) = packages.get(&requirer).map(|info| info.name.clone()) {
+                    ceiling_requirers
+                        .entry(key)
+                        .or_default()
+                        .push(requirer_name);
+                }
             }
         }
         ResolvedGraph {
@@ -354,6 +394,7 @@ impl Cargo {
             edges,
             exact_pins,
             graph_ceilings,
+            ceiling_requirers,
         }
     }
 
@@ -389,25 +430,35 @@ impl Cargo {
         }
     }
 
-    /// Pins `name` from `from` to `to` via `cargo update -p <name>@<from> --precise <to>`.
-    ///
-    /// The `@<from>` disambiguates when a crate name resolves to multiple versions in the graph.
+    /// Pins every `(name, from)` in `specs` to the single shared version `to` in one whole-graph
+    /// re-resolve via `cargo update -p A@<from> -p B@<from> … --precise <to>`. `--precise` accepts a
+    /// single version but multiple `[SPEC]`s, so crates that share a target version are batched into
+    /// one re-resolve; the caller groups distinct targets and calls this once per group. Each
+    /// `@<from>` disambiguates a crate name that resolves to multiple versions in the graph.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if
-    /// the update is rejected (e.g. a `=`-pin or resolver conflict that blocks `--precise`).
-    pub async fn update_precise(
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if the
+    /// update is rejected (e.g. a `=`-pin or resolver conflict blocks the precise move). A rejection
+    /// is the caller's signal that the candidates stay where the resolver placed them.
+    pub async fn update_precise_many(
         &self,
         dir: &Utf8Path,
-        name: &str,
-        from: &str,
+        specs: &[(String, String)],
         to: &str,
     ) -> Result<(), CoreError> {
-        let spec = format!("{name}@{from}");
-        self.run(dir, &["update", "-p", &spec, "--precise", to])
-            .await
-            .map(|_| ())
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<String> = vec!["update".to_string()];
+        for (name, from) in specs {
+            args.push("-p".to_string());
+            args.push(format!("{name}@{from}"));
+        }
+        args.push("--precise".to_string());
+        args.push(to.to_string());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(dir, &arg_refs).await.map(|_| ())
     }
 
     /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].
@@ -469,6 +520,7 @@ mod tests {
             edges: HashMap::new(),
             exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
             graph_ceilings: HashSet::new(),
+            ceiling_requirers: HashMap::new(),
         };
 
         assert!(graph.is_exact_pinned("serde", "1.0.197"));
@@ -485,6 +537,7 @@ mod tests {
             edges: HashMap::new(),
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
+            ceiling_requirers: HashMap::new(),
         };
 
         assert!(graph.is_graph_capped("serde_derive", "1.0.228"));
@@ -565,6 +618,7 @@ mod tests {
             ]),
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
+            ceiling_requirers: HashMap::new(),
         };
 
         assert_eq!(
@@ -603,6 +657,7 @@ mod tests {
             ]),
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
+            ceiling_requirers: HashMap::new(),
         };
 
         let names = |members: Vec<MemberRef>| {

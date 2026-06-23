@@ -375,9 +375,37 @@ impl Go {
     /// Returns [`CoreError::ToolSpawn`] if `go get` fails to spawn, or [`CoreError::Tool`] if it
     /// exits non-zero (e.g. the resolver rejects the requested version).
     pub async fn get(&self, dir: &Utf8Path, module: &str, version: &str) -> Result<(), CoreError> {
-        self.run(dir, &["get", &format!("{module}@{version}")])
+        self.get_many(dir, &[(module.to_string(), version.to_string())])
             .await
-            .map(|_| ())
+    }
+
+    /// `go get module1@v1 module2@v2 …` — the batched whole-graph form: every `module@version`
+    /// target is passed to one invocation so Go runs a single minimal-version-selection (MVS) pass
+    /// that settles all candidates jointly, rather than a sequence of per-module re-resolves.
+    ///
+    /// Each argument raises that module's `require` to an MVS *floor* (`max(all requirements)`), so
+    /// the joint result is deterministic and convergent — there is no `<` upper bound for two
+    /// candidates to push each other below forever. A no-op call (`targets` empty) is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if `go get` fails to spawn, or [`CoreError::Tool`] if it
+    /// exits non-zero (e.g. the joint resolve/compile rejects the requested set).
+    pub async fn get_many(
+        &self,
+        dir: &Utf8Path,
+        targets: &[(String, String)],
+    ) -> Result<(), CoreError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let specs: Vec<String> = targets
+            .iter()
+            .map(|(module, version)| format!("{module}@{version}"))
+            .collect();
+        let mut args = vec!["get"];
+        args.extend(specs.iter().map(String::as_str));
+        self.run(dir, &args).await.map(|_| ())
     }
 
     /// `go mod tidy` — prune/add indirects and sync `go.sum`.

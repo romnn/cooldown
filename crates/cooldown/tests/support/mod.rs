@@ -1,24 +1,30 @@
-//! Shared harness for the temp-dir convergence integration tests.
+//! Shared, tool-agnostic harness for the temp-dir convergence integration tests.
 //!
 //! Each test creates a fresh temp dir, writes a minimal project fixture on the fly (a fresh temp
 //! dir is the same deterministic starting state every run — no checked-in repos, no stale-lock
-//! drift), runs the real `cooldown` binary against it, and parses the `--json` envelope.
+//! drift), seeds a starting lock with the ecosystem's own package manager, runs the real
+//! `cooldown` binary against it, and parses the `--json` envelope.
 //!
 //! The fixtures pin the resolution clock to a fixed instant via the cooldown `--freeze <DATE>`
-//! cutoff (an absolute exclude-newer), so the underlying resolver replays PyPI's immutable history
-//! and reproduces the same resolve forever. Tests assert invariants (convergence, no-silent-change,
-//! cross-command agreement), never hard-coded versions.
+//! cutoff (an absolute exclude-newer), so the underlying resolver replays the registry's immutable
+//! history and reproduces the same resolve forever. Tests assert invariants (convergence,
+//! no-silent-change, cross-command agreement), never hard-coded versions.
 //!
-//! The harness is intentionally ecosystem-agnostic: [`Fixture`] only knows how to write files and
-//! drive `cooldown`. Adding cargo/go/pnpm coverage later is "write a fixture generator + reuse the
-//! same invariant assertions on the returned [`Envelope`]", not a rewrite.
+//! Everything here is ecosystem-agnostic. [`Fixture`] only knows how to write files, run an
+//! arbitrary tool (so each ecosystem can seed its own lock — `uv lock`, `cargo generate-lockfile`,
+//! `go mod tidy`, `pnpm install --lockfile-only`, …), drive `cooldown`, and parse the returned
+//! [`Envelope`]. The lock-diff helper [`changed_packages`] is parameterized by a [`PinParser`] so
+//! each lock format plugs in its own pin extraction; [`toml_lock_pins`] covers the TOML
+//! `[[package]]` shape shared by `uv.lock` and `Cargo.lock`. Adding a new ecosystem is "write a
+//! fixture generator + a pin parser, then reuse the same invariant assertions on the returned
+//! [`Envelope`]", not a rewrite.
 
 #![allow(
     dead_code,
-    reason = "the harness is shared across per-ecosystem integration test files; not every helper is used by every file, and only uv is covered today"
+    reason = "the harness is shared across per-ecosystem integration test files; not every helper is used by every file, and not every ecosystem is covered yet"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -192,6 +198,22 @@ impl Envelope {
         self.summary_u64("violations")
     }
 
+    /// The number of *direct* dependencies `check` flagged as a cooldown violation (`direct == true`
+    /// and `status == "violation"`). A direct violation is always reducible by `fix`, so it must be
+    /// zero after a `fix` converges; graph-held transitive violations may remain (the resolver pins
+    /// them and `fix` cannot roll them back). Used by the cargo `fix` invariant.
+    pub fn summary_direct_violations(&self) -> u64 {
+        let count = self
+            .items()
+            .iter()
+            .filter(|item| {
+                item.get("direct").and_then(serde_json::Value::as_bool) == Some(true)
+                    && item.get("status").and_then(serde_json::Value::as_str) == Some("violation")
+            })
+            .count();
+        u64::try_from(count).unwrap_or(u64::MAX)
+    }
+
     /// Names of items the mutation actually moved (`applied == true`).
     pub fn applied_names(&self) -> BTreeSet<String> {
         self.filter_names(|item| {
@@ -278,4 +300,166 @@ macro_rules! skip_if_missing {
             return;
         }
     };
+}
+
+/// Extracts the `name -> pinned version` map from a lock file's raw bytes. Each lock format has its
+/// own shape, so each ecosystem supplies a parser (e.g. [`toml_lock_pins`] for `uv.lock` /
+/// `Cargo.lock`). Used by [`changed_packages`] to diff two locks without depending on the format.
+pub type PinParser = fn(&[u8]) -> BTreeMap<String, String>;
+
+/// The set of packages whose pinned version *moved* between two lock files — i.e. present in both
+/// locks at a different version, parsed via the ecosystem's `pins` strategy.
+///
+/// Packages that leave or join the graph are deliberately excluded: a removal/addition is a
+/// graph-shape consequence of a reported direct move (e.g. a dependency dropping one of its own
+/// deps removes that transitive package from the lock), not a silent *version* change. The
+/// invariant under test is that no surviving package's version moves without appearing in the
+/// report.
+pub fn changed_packages(before: &[u8], after: &[u8], pins: PinParser) -> BTreeSet<String> {
+    let before_pins = pins(before);
+    let after_pins = pins(after);
+    let mut changed = BTreeSet::new();
+    for (name, before_version) in &before_pins {
+        if let Some(after_version) = after_pins.get(name)
+            && before_version != after_version
+        {
+            changed.insert(name.clone());
+        }
+    }
+    changed
+}
+
+/// A [`PinParser`] for TOML lock files that emit each package as a `[[package]]` block with a
+/// `name = "…"` line followed (within the same block) by a `version = "…"` line. This is the shape
+/// of both `uv.lock` and `Cargo.lock`, so both ecosystems share it. A line-based scan is enough to
+/// detect every moved pin without a TOML dependency in the test.
+pub fn toml_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8_lossy(lock);
+    let mut pins = BTreeMap::new();
+    let mut current_name: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = toml_field(trimmed, "name") {
+            current_name = Some(value);
+        } else if let Some(value) = toml_field(trimmed, "version")
+            && let Some(name) = current_name.take()
+        {
+            pins.insert(name, value);
+        }
+    }
+    pins
+}
+
+/// A [`PinParser`] for `go.mod`: the `module path → version` map of every `require` directive,
+/// handling both the single-line form (`require path v1.2.3`) and the grouped `require ( … )` block.
+/// A trailing `// indirect` (or any `//` comment) is stripped. This is the `go.mod` analogue of
+/// [`toml_lock_pins`], so the Go convergence test can diff two `go.mod` files via [`changed_packages`]
+/// without a TOML dependency.
+pub fn go_mod_pins(go_mod: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8_lossy(go_mod);
+    let mut pins = BTreeMap::new();
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = match raw.find("//") {
+            Some(index) => &raw[..index],
+            None => raw,
+        }
+        .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_block {
+            if line == ")" {
+                in_block = false;
+            } else if let Some((path, version)) = go_require_pair(line) {
+                pins.insert(path, version);
+            }
+        } else if line == "require (" {
+            in_block = true;
+        } else if let Some(rest) = line.strip_prefix("require ")
+            && let Some((path, version)) = go_require_pair(rest.trim())
+        {
+            pins.insert(path, version);
+        }
+    }
+    pins
+}
+
+/// A [`PinParser`] for `pnpm-lock.yaml`: the `name -> newest pinned version` map of every key in the
+/// top-level `packages:` section. Each key is `name@version` (scoped names keep their leading `@`),
+/// optionally followed by a `(peer@x)` peer-disambiguation suffix that is stripped. A name can appear
+/// at several versions (duplicate graph copies); the newest is kept so a moved direct declaration is
+/// not masked by a stale transitive copy — matching the adapter's own `locked_versions`. This is the
+/// `pnpm-lock.yaml` analogue of [`toml_lock_pins`], so the pnpm convergence test can diff two locks
+/// via [`changed_packages`] without a YAML dependency.
+pub fn pnpm_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8_lossy(lock);
+    let mut pins: BTreeMap<String, String> = BTreeMap::new();
+    let mut in_packages = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(stripped) = line.strip_prefix("  ") {
+            if !in_packages || stripped.starts_with(' ') {
+                continue; // outside the section, or a nested field of a package entry
+            }
+            let key = stripped
+                .trim()
+                .trim_end_matches(':')
+                .trim_matches('\'')
+                .trim_matches('"');
+            // Drop the `(peer@x)` suffix pnpm appends to disambiguate peer resolutions.
+            let key = key.split('(').next().unwrap_or(key);
+            let Some(at) = key.rfind('@').filter(|&index| index > 0) else {
+                continue;
+            };
+            let (name, version) = (key[..at].to_string(), key[at + 1..].to_string());
+            match pins.entry(name) {
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if pnpm_version_gt(&version, slot.get()) {
+                        *slot.get_mut() = version;
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(version);
+                }
+            }
+        } else {
+            in_packages = line.starts_with("packages:");
+        }
+    }
+    pins
+}
+
+/// A coarse "is `a` a newer version than `b`" for keeping the newest duplicate copy in
+/// [`pnpm_lock_pins`]. Compares dot-separated numeric components left to right; a non-numeric
+/// component (a prerelease tag) compares as lower. Exact precision is not needed — the diff only asks
+/// whether a name's newest copy *changed*, and both locks parse identically.
+fn pnpm_version_gt(a: &str, b: &str) -> bool {
+    let parts = |v: &str| -> Vec<i64> {
+        v.split(['.', '-', '+'])
+            .map(|component| component.parse::<i64>().unwrap_or(-1))
+            .collect()
+    };
+    parts(a) > parts(b)
+}
+
+/// Split a `module/path v1.2.3` line into `(path, version)`, requiring a `v`-prefixed second field.
+fn go_require_pair(line: &str) -> Option<(String, String)> {
+    let mut fields = line.split_whitespace();
+    let path = fields.next()?;
+    let version = fields.next()?;
+    version
+        .starts_with('v')
+        .then(|| (path.to_string(), version.to_string()))
+}
+
+/// Extract the quoted value of a `key = "value"` line, if the line is exactly that field.
+fn toml_field(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let inner = rest.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_owned())
 }

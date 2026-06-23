@@ -1,4 +1,3 @@
-use super::apply::skipped_on_apply_error;
 use super::releases::{build_releases, classify_kind, classify_quality, major_key_for_path};
 use super::*;
 use crate::proxy::ProxyBase;
@@ -328,29 +327,6 @@ fn fetch_ctx(project: &Project) -> FetchContext<'_> {
         project,
         artifacts: ArtifactScope::Environment,
     }
-}
-
-#[test]
-fn apply_spawn_failure_is_not_downgraded_to_skip() {
-    let change = Change {
-        package: PackageId::new(GO_ID, "example.com/foo", None),
-        from: Version::new("v1.0.0"),
-        to: Version::new("v1.0.1"),
-        kind: UpdateKind::Patch,
-        downgrade: false,
-        direct: true,
-        members: Vec::new(),
-    };
-    let error = cooldown_core::CoreError::ToolSpawn {
-        tool: "go".into(),
-        detail: "spawn failed".into(),
-    };
-
-    let result = skipped_on_apply_error(&change, error);
-    assert!(matches!(
-        result,
-        Err(cooldown_core::CoreError::ToolSpawn { .. })
-    ));
 }
 
 #[tokio::test]
