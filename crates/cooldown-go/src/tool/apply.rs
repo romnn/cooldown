@@ -54,14 +54,10 @@ pub(super) async fn apply(
         Ok(()) => {}
         Err(err) if err.is_tool_spawn_failure() => return Err(err),
         // The joint resolve/compile was rejected (an incompatible API surfaced by `go build` inside
-        // `go get`, or an otherwise-unsatisfiable set): every candidate is held. The caller restores
-        // the journal, so no partial `go.mod`/`go.sum` is kept.
-        Err(_) => {
-            for change in &plan.changes {
-                report.skipped.push(resolver_conflict(change));
-            }
-            return Ok(report);
-        }
+        // `go get`, or an otherwise-unsatisfiable set). Propagate so the caller's `apply_resilient`
+        // can isolate the offending candidate(s) and apply the rest, instead of holding every
+        // candidate. The caller restores the journal, so no partial `go.mod`/`go.sum` is kept.
+        Err(err) => return Err(err),
     }
 
     // Cross-major path changes → rewrite `/vN` import paths old→new for the planned set. The single

@@ -506,18 +506,11 @@ impl ToolWrite for CargoTool {
         match self.whole_graph_resolve(project, plan).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // A non-spawn failure during the resolve (e.g. an unreadable lock between rounds): the
-            // caller restores the journal, so no partial lock is kept.
-            Err(_) => {
-                for change in &plan.changes {
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(change.package.clone()),
-                    });
-                }
-                return Ok(report);
-            }
+            // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict, an unfetchable
+            // version, an unreadable lock between rounds). Propagate so the caller's `apply_resilient`
+            // can isolate the offending candidate(s) and apply the rest, instead of holding every
+            // candidate. The caller restores the journal, so no partial lock is kept.
+            Err(err) => return Err(err),
         }
 
         let after = locked_versions(&read_lock(project)?);

@@ -609,18 +609,11 @@ impl ToolWrite for UvTool {
         match self.whole_graph_resolve(project, plan, upgrade).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The whole resolve was unsatisfiable (no consistent lock under the window): every candidate
-            // is held. The caller restores the journal, so no partial lock is kept.
-            Err(_) => {
-                for change in &plan.changes {
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(change.package.clone()),
-                    });
-                }
-                return Ok(report);
-            }
+            // The whole resolve is unsatisfiable (no consistent lock under the window). Propagate so
+            // the caller's `apply_resilient` can isolate the offending candidate(s) and apply the rest,
+            // instead of holding every candidate. The caller restores the journal, so no partial lock
+            // is kept.
+            Err(err) => return Err(err),
         }
 
         let after_lock = read_lock(project)?;

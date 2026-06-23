@@ -570,18 +570,11 @@ impl<L: NodeLock> NpmTool<L> {
         {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The joint resolve was unsatisfiable under the window: every candidate is held. The caller
+            // The joint resolve is unsatisfiable as a whole. Propagate the failure so the caller's
+            // `apply_resilient` can isolate the offending candidate(s) (an unfetchable version, one
+            // side of a conflict) and apply the rest, instead of holding every candidate. The caller
             // restores the journal, so no partial lock is kept.
-            Err(_) => {
-                for change in &plan.changes {
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(change.package.clone()),
-                    });
-                }
-                return Ok(report);
-            }
+            Err(err) => return Err(err),
         }
 
         let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;

@@ -437,7 +437,10 @@ async fn resolve_held(
 
     let plan = Plan { changes, rewrite };
     let journal = writer.mutation_journal(temp_project, &plan).await?;
-    let report = writer.apply(temp_project, &plan, &journal).await?;
+    // Resilient apply: one unfetchable/conflicting candidate must not poison the whole verify resolve
+    // and make every adoptable candidate look blocked — it is isolated and the rest still resolve.
+    let report =
+        super::resilient_apply::apply_resilient(writer, temp_project, &plan, &journal).await?;
 
     let mut held = std::collections::HashMap::new();
     for skipped in report.skipped {

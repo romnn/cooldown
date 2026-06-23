@@ -16,6 +16,7 @@ mod outdated;
 mod project_copy;
 mod read;
 mod release_cache;
+mod resilient_apply;
 mod sync;
 mod upgrade;
 mod workspace;

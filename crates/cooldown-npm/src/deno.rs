@@ -504,14 +504,10 @@ impl ToolWrite for DenoTool {
         match self.cmd.run(&project.root, &args).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The joint resolve was unsatisfiable under the window: every candidate is held. The
-            // caller restores the journal, so no partial lock is kept.
-            Err(_) => {
-                for change in &plan.changes {
-                    report.skipped.push(resolver_conflict(change));
-                }
-                return Ok(report);
-            }
+            // The joint resolve is unsatisfiable as a whole. Propagate so the caller's `apply_resilient`
+            // can isolate the offending candidate(s) and apply the rest, instead of holding every
+            // candidate. The caller restores the journal, so no partial lock is kept.
+            Err(err) => return Err(err),
         }
 
         let after = locked_versions(&std::fs::read_to_string(project.root.join("deno.lock"))?);

@@ -520,11 +520,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         };
 
-        let report = match self
-            .ctx
-            .writer
-            .apply(&self.ctx.pctx.project, &plan, &journal)
-            .await
+        // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
+        // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
+        let report = match super::super::resilient_apply::apply_resilient(
+            self.ctx.writer,
+            &self.ctx.pctx.project,
+            &plan,
+            &journal,
+        )
+        .await
         {
             Ok(report) => report,
             Err(error) => {
