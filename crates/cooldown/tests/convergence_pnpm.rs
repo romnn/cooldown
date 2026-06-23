@@ -55,15 +55,17 @@ const FREEZE_LATER: &str = "2024-10-01T00:00:00Z";
 
 /// The conflict fixture manifest. `eslint` spans the v8/v9 boundary and `@typescript-eslint/eslint-plugin`
 /// the v7/v8 boundary, so the within-window upgrade pulls the peer-mutually-exclusive newest of each.
-/// The exact seed pins (eslint 8.40.0, plugin 7.0.0) are old enough that the matured line is a clear
-/// forward move.
+/// The caret ranges (`^8.40.0`, `^7.0.0`) seed an old v7/eslint-8 line that is a clear forward move and,
+/// being open ranges rather than exact pins, let cooldown actually *plan* the move (an exact pin is
+/// `held`, so plan-respecting apply would never touch it). The eslint split is cross-major, so the
+/// conflict tests pass `--major` to admit it.
 const PACKAGE_JSON: &str = r#"{
   "name": "cooldown-pnpm-conflict-fixture",
   "version": "0.1.0",
   "private": true,
   "dependencies": {
-    "eslint": "8.40.0",
-    "@typescript-eslint/eslint-plugin": "7.0.0"
+    "eslint": "^8.40.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0"
   }
 }
 "#;
@@ -115,14 +117,15 @@ fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("pnpm");
     let fixture = conflict_fixture(FREEZE);
 
-    // First upgrade: cooldown re-resolves the whole graph under the window in one joint pass, floating
-    // direct and transitive deps to the newest-within-window set and settling the eslint peer split.
-    let first = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    // First upgrade: cooldown re-resolves the whole graph under the window in one joint pass, pinning
+    // each planned candidate to its target and settling the cross-major eslint peer split (`--major`
+    // admits the v8→v9 / v7→v8 moves).
+    let first = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
     assert!(
         first.ok(),
         "first upgrade should succeed: {}",
         fixture
-            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
             .stderr_str()
     );
     assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
@@ -134,7 +137,7 @@ fn upgrade_converges_to_a_fixed_point() {
     let lock_after_first = fixture.read_bytes("pnpm-lock.yaml");
 
     // Second upgrade: already at the fixed point, so nothing moves and the lock is byte-identical.
-    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
     assert_eq!(
         second.summary_applied(),
         0,
@@ -153,7 +156,7 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     let fixture = conflict_fixture(FREEZE);
 
     let lock_before = fixture.read_bytes("pnpm-lock.yaml");
-    let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
     assert!(report.ok(), "upgrade should succeed");
     let lock_after = fixture.read_bytes("pnpm-lock.yaml");
 
@@ -180,14 +183,15 @@ fn outdated_agrees_with_upgrade() {
 
     // Converge first so `outdated` and `upgrade` describe the same stable state.
     fixture
-        .cooldown(&["upgrade", "--freeze", FREEZE])
+        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
         .expect_success();
 
-    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--transitive"]);
+    let outdated =
+        fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE, "--transitive"]);
     let blocked = outdated.outdated_with_status("blocked");
     let adoptable = outdated.outdated_with_status("adoptable");
 
-    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE, "--dry-run"]);
     let held = upgrade.held_conflict_names();
 
     // Everything `upgrade` reports held, `outdated` must mark blocked. (A duplicate graph copy held by
@@ -210,18 +214,18 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
     // Real upgrade converges one fixture; the held set on the converged state is the real held set.
     let real_fixture = conflict_fixture(FREEZE);
     real_fixture
-        .cooldown(&["upgrade", "--freeze", FREEZE])
+        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
         .expect_success();
-    let real = real_fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
+    let real = real_fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE, "--dry-run"]);
     let real_held = real.held_conflict_names();
 
     // Dry-run on a separate converged fixture: the held set must match and the lock is untouched.
     let dry_fixture = conflict_fixture(FREEZE);
     dry_fixture
-        .cooldown(&["upgrade", "--freeze", FREEZE])
+        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
         .expect_success();
     let lock_before = dry_fixture.read_bytes("pnpm-lock.yaml");
-    let dry = dry_fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
+    let dry = dry_fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE, "--dry-run"]);
     let dry_held = dry.held_conflict_names();
     let lock_after = dry_fixture.read_bytes("pnpm-lock.yaml");
 
@@ -271,5 +275,135 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         lock_after_fix,
         fixture.read_bytes("pnpm-lock.yaml"),
         "second fix must leave the lock byte-identical"
+    );
+}
+
+/// The per-package-window fixture's manifest: a single direct `eslint` on the v9 line with a caret
+/// range, so the upgrade is free to float it within v9 (an exact pin would be `held`). eslint's dense
+/// 2024 release cadence (a minor every ~2 weeks) makes the project-default window and a stricter
+/// per-package window admit *different* newest versions, which is the whole point of the test.
+const PERPKG_PACKAGE_JSON: &str = r#"{
+  "name": "cooldown-pnpm-perpkg-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "eslint": "^9.0.0"
+  }
+}
+"#;
+
+/// The seed cutoff for the per-package fixture: old enough that the seeded `eslint` (9.0.0, published
+/// 2024-04-05) sits *below* both the project-default and the stricter per-package target, so the
+/// upgrade is a clear forward move under either window.
+const PERPKG_SEED: &str = "2024-04-10T00:00:00Z";
+
+/// The project-default resolution cutoff for the per-package fixture. eslint 9.5.0 (2024-06-14) is the
+/// newest matured under this window, so a uniform run would land 9.5.0 — the version the stricter
+/// per-package window must hold the package *below*.
+const PERPKG_PROJECT_FREEZE: &str = "2024-07-01T00:00:00Z";
+
+/// The stricter per-package cutoff for `eslint`. It is earlier than the project default, so eslint's
+/// own window admits only up to 9.4.0 (2024-05-31) — strictly older than the 9.5.0 the project-default
+/// window admits. Expressed in the config as a `min-age` (the per-package window knob), computed at
+/// run time as the day-count reproducing this absolute instant, so the matured target is deterministic
+/// regardless of when the test runs.
+const PERPKG_STRICT_FREEZE: &str = "2024-06-05T00:00:00Z";
+
+/// The eslint version the stricter per-package window admits (newest matured on or before
+/// `PERPKG_STRICT_FREEZE`). The project-default window admits a *newer* one, so landing here proves the
+/// per-package target — not the global-window-newest — is what the resolve pinned.
+const PERPKG_STRICT_TARGET: &str = "9.4.0";
+
+/// The eslint version the *project-default* window admits — strictly newer than the stricter
+/// per-package target. The fix is correct only if the resolve does NOT overshoot onto this version.
+const PERPKG_PROJECT_NEWEST: &str = "9.5.0";
+
+/// Whole days (rounded down) from `cutoff` to now — the `min-age` value that reproduces an absolute
+/// cutoff as a rolling window. eslint's releases are ~2 weeks apart and `cutoff` sits mid-gap, so the
+/// day-granularity rounding never drifts the matured set across a release boundary.
+fn min_age_days(cutoff: &str) -> i64 {
+    let cutoff: jiff::Timestamp = cutoff.parse().expect("cutoff parses");
+    let days = jiff::Timestamp::now().duration_since(cutoff).as_secs() / (24 * 60 * 60);
+    assert!(days > 0, "cutoff {cutoff} must be in the past");
+    days
+}
+
+/// A pnpm project with a `cooldown.toml` that sets the project-default window (a `freeze`) and gives
+/// `eslint` a *stricter* per-package `min-age`. Both rules live in the same config layer, so the
+/// eslint-specific selector beats the bare default by specificity — eslint resolves under its stricter
+/// window while everything else uses the project default. (The project default is a config `freeze`,
+/// not a CLI `--freeze`: a CLI flag is the highest-authority layer and would override the per-package
+/// rule, which is exactly the overshoot this test guards against.)
+fn perpkg_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", PERPKG_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    let config = format!(
+        "freeze = \"{PERPKG_PROJECT_FREEZE}\"\n\n[package.\"eslint\"]\nmin-age = \"{}d\"\n",
+        min_age_days(PERPKG_STRICT_FREEZE),
+    );
+    fixture.write("cooldown.toml", &config);
+    seed_lock(&fixture, PERPKG_SEED);
+    fixture
+}
+
+#[test]
+fn upgrade_honors_a_stricter_per_package_window() {
+    skip_if_missing!("pnpm");
+    let fixture = perpkg_fixture();
+
+    // The upgrade re-resolves the whole graph, pinning each candidate to its own per-package target.
+    // eslint's stricter window admits only 9.4.0, so it must land there — NOT the 9.5.0 the
+    // project-default window would admit. A bare `--latest --config.minimumReleaseAge=<global>` resolve
+    // (the old behavior) would overshoot eslint onto 9.5.0, leaving it in violation of its own window.
+    let upgrade = fixture.cooldown_json(&["upgrade"]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture.cooldown(&["upgrade"]).stderr_str()
+    );
+    assert_eq!(upgrade.lock_verified(), Some(true), "upgrade re-locks");
+
+    let (from, to) = upgrade
+        .change_for("eslint")
+        .expect("eslint should be in the report");
+    assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
+    assert_eq!(
+        to, PERPKG_STRICT_TARGET,
+        "eslint must land at its stricter per-package target {PERPKG_STRICT_TARGET}, not the \
+         project-default-window newest {PERPKG_PROJECT_NEWEST}"
+    );
+
+    // The committed lock pins exactly the per-package target — the resolve never overshot.
+    let lock_pins = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        lock_pins.get("eslint").map(String::as_str),
+        Some(PERPKG_STRICT_TARGET),
+        "the lock must hold eslint at {PERPKG_STRICT_TARGET}"
+    );
+
+    // With eslint at its own target and every transitive within the project-default window, the graph
+    // is cooldown-clean: `check` reports zero violations. (The old overshoot left eslint one minor
+    // too fresh, which `check` would have flagged.)
+    let check = fixture.cooldown_json(&["check"]);
+    assert_eq!(
+        check.summary_violations(),
+        0,
+        "check must report zero violations after the per-package-correct upgrade"
+    );
+
+    // A second upgrade is a fixed point: eslint is already at its target, nothing moves, and the lock
+    // is byte-identical — no ping-pong between the per-package target and the global-window-newest.
+    let lock_after_first = fixture.read_bytes("pnpm-lock.yaml");
+    let second = fixture.cooldown_json(&["upgrade"]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a no-op (fixed point)"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "the lock must be byte-identical across the two converged runs"
     );
 }

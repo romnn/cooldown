@@ -511,23 +511,26 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Re-resolve the **whole** importer graph once under a single global cooldown window (pnpm), then
-    /// report the full before/after lock diff — the proven uv/go pattern ported to pnpm, but bounded by
-    /// what pnpm can express.
+    /// Re-resolve the **whole** importer graph once (pnpm), pinning every planned candidate to its
+    /// EXACT per-package target, then report the full before/after lock diff — the proven cargo/go
+    /// pattern ported to pnpm.
     ///
-    /// One `pnpm update --latest --lockfile-only --no-save --config.minimumReleaseAge=<minutes>` jointly
-    /// re-resolves every importer, settling mutually-exclusive peer conflicts at a single fixed point
-    /// instead of ping-ponging between per-package updates. pnpm exposes only one knob for cooldown,
-    /// `minimumReleaseAge`: a single rolling age applied to the entire graph. It has no per-package
-    /// publish-date cutoff, so this pass enforces only the *project-default* window for the whole graph
-    /// and cannot honor a *stricter per-package* window the plan may carry. This is a known gap: uv
-    /// re-caps each node with a per-package `<=` cutoff, and cargo/go pin every node to its exact
-    /// per-node target, but pnpm cannot be told either in one pass. The plan's per-package windows are
-    /// left to cooldown's reconcile/check to flag rather than to pnpm to enforce here. The report is the
-    /// diff of the journal's pre-apply lock against the result, so every planned candidate is reported
-    /// reached or held (naming the conflicting peer where attributable) and every collateral move of an
-    /// unplanned package surfaces as its own row. A resolver failure marks all candidates held and lets
-    /// the caller restore the journal.
+    /// One `pnpm update <pkg>@<target> … --lockfile-only --no-save --config.minimumReleaseAge=<minutes>`
+    /// jointly re-resolves every importer, settling mutually-exclusive peer conflicts at a single fixed
+    /// point instead of ping-ponging between per-package updates. Each `<pkg>@<target>` is the
+    /// candidate's own `change.to`, computed by cooldown-core under that package's window, so a package
+    /// with a *stricter* per-package window lands at its older per-package target rather than
+    /// overshooting onto the global-window-newest — the gap a bare `--latest` left, since pnpm's
+    /// `minimumReleaseAge` is a single global knob with no per-package publish-date cutoff. This mirrors
+    /// cargo's `update --precise <to>` and go's `get module@<to>`: the per-package target already
+    /// encodes the per-package window, so pinning it enforces that window exactly. `minimumReleaseAge`
+    /// is still passed as the *transitive* floor (a fresh transitive the pins drag in is capped to the
+    /// project-default window, so the uniform-window case lands the same lock as before); transitives
+    /// floated past it are reconciled down by the caller's transitive-cooldown gate, exactly as for
+    /// cargo/go. The report is the diff of the journal's pre-apply lock against the result, so every
+    /// planned candidate is reported reached or held (naming the conflicting peer where attributable)
+    /// and every collateral move of an unplanned package surfaces as its own row. A resolver failure
+    /// marks all candidates held and lets the caller restore the journal.
     async fn apply_whole_graph(
         &self,
         project: &Project,
@@ -548,15 +551,16 @@ impl<L: NodeLock> NpmTool<L> {
             .map(locked_versions::<L>)
             .unwrap_or_default();
 
-        let upgrade = !plan.changes.iter().all(|change| change.downgrade);
         // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the current
         // instant. An absolute `--freeze` cutoff becomes `now - freeze` minutes — equivalent to the
         // freeze date as long as the same `now` governs both the seed and this resolve (it does:
-        // wall-clock advances only seconds between them, far below the day-scale window under test).
+        // wall-clock advances only seconds between them, far below the day-scale window under test). It
+        // is passed only as the *transitive* floor here; each planned candidate is pinned to its exact
+        // per-package target, so its own (possibly stricter) window is enforced by the pin, not this cap.
         let window_minutes =
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
         match self
-            .whole_graph_resolve(project, plan, upgrade, window_minutes)
+            .whole_graph_resolve(project, plan, window_minutes)
             .await
         {
             Ok(()) => {}
@@ -629,24 +633,40 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Widen the declaring manifests per [`RewriteMode`], then run the single joint resolve under the
-    /// window.
+    /// Widen the declaring manifests per [`RewriteMode`], then run the single joint resolve pinning
+    /// every planned candidate to its exact per-package target under the transitive window.
     ///
-    /// `Always` widens every candidate up front; `Auto` widens only the candidates the resolve left
-    /// short of their target because of their *own* declared `package.json` range (a candidate held by
-    /// *another* package's peer requirement is a real conflict the lock diff then reports, not a
-    /// missing widen), re-resolving until a round widens nothing. Each resolve is one
-    /// `pnpm update --latest --config.minimumReleaseAge=<m>`, so the whole importer graph — direct and
-    /// transitive — settles jointly to the newest-within-window fixed point in a single pass.
+    /// `Always` widens every candidate up front; `Auto` widens only the candidates whose target falls
+    /// *outside* their own declared `package.json` range (a cross-major or otherwise out-of-range move).
+    /// This widen is mandatory, not optional: `pnpm update <pkg>@<target> --no-save` re-pins the lock to
+    /// the exact target even when it is out of range, but leaves the manifest as the author wrote it — so
+    /// an unwidened out-of-range pin commits a lock the manifest does not admit, and the very next
+    /// resolve (which re-resolves any package it is *not* pinning, against its manifest range) snaps the
+    /// candidate back into range, breaking the fixed point. Widening the owning constraint first keeps
+    /// the manifest and lock consistent so a converged graph re-applies byte-stable. A candidate the
+    /// resolve still leaves short of its (now in-range) target is held by *another* package's peer
+    /// requirement — a real conflict the lock diff reports, not a missing widen — so no post-resolve
+    /// re-widen loop is needed. The resolve is one
+    /// `pnpm update <pkg>@<target> … --config.minimumReleaseAge=<m>`, so the whole importer graph —
+    /// direct and transitive — settles jointly in a single pass with each candidate at its target.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
-        upgrade: bool,
         window_minutes: Option<i64>,
     ) -> Result<()> {
-        if matches!(plan.rewrite, RewriteMode::Always) {
-            for change in &plan.changes {
+        let pins = plan_pins(plan);
+        for change in &plan.changes {
+            // `Always` widens every candidate; `Auto` widens only those whose target is out of the
+            // declared range, so an in-range move keeps the author's range while an out-of-range pin
+            // stays consistent with the manifest. A candidate not declared in any owning manifest
+            // (`target_in_declared_range` returns `false`) is widened too, so the pin is never left
+            // dangling against a range that excludes it.
+            let widen = match plan.rewrite {
+                RewriteMode::Always => true,
+                RewriteMode::Auto => !target_in_declared_range(project, change)?,
+            };
+            if widen {
                 manifest::widen_constraints(
                     &project.root,
                     &change.members,
@@ -655,60 +675,38 @@ impl<L: NodeLock> NpmTool<L> {
                 )?;
             }
         }
-        self.joint_resolve(project, upgrade, window_minutes).await?;
-
-        if upgrade && matches!(plan.rewrite, RewriteMode::Auto) {
-            // Widen only the candidates the joint resolve could not raise to their target because their
-            // own declared range caps them, then re-resolve. A candidate still short after a no-op widen
-            // round is blocked by another package (a real conflict), so widening stops and the diff
-            // reports it.
-            for _ in 0..plan.changes.len() {
-                let after = read_locked::<L>(project)?;
-                let mut widened_any = false;
-                for change in &plan.changes {
-                    let reached = after.get(&change.package.name).is_some_and(|current| {
-                        version::compare(current, change.to.as_str()).is_ge()
-                    });
-                    if reached {
-                        continue;
-                    }
-                    let rewrite = manifest::widen_constraints(
-                        &project.root,
-                        &change.members,
-                        &change.package.name,
-                        change.to.as_str(),
-                    )?;
-                    if !rewrite.modified.is_empty() {
-                        widened_any = true;
-                    }
-                }
-                if !widened_any {
-                    break;
-                }
-                self.joint_resolve(project, upgrade, window_minutes).await?;
-            }
-        }
+        self.joint_resolve(project, &pins, window_minutes).await?;
+        // The up-front pass already widened every out-of-range target, so a candidate the resolve still
+        // left short of its target is blocked by *another* package's requirement (a peer conflict),
+        // which widening its own declared range cannot resolve — the lock diff reports it held. No
+        // post-resolve re-widen loop is needed: an in-range candidate is never capped by its own range,
+        // and an out-of-range one was already widened before the single pin pass.
         Ok(())
     }
 
     async fn joint_resolve(
         &self,
         project: &Project,
-        upgrade: bool,
+        pins: &[(String, String)],
         window_minutes: Option<i64>,
     ) -> Result<()> {
-        let Some(args) = L::whole_graph_args(upgrade, window_minutes) else {
+        let Some(args) = L::whole_graph_args(pins, window_minutes) else {
             return Ok(());
         };
         self.cmd.run(&project.root, &args).await
     }
 }
 
-/// The current on-disk lock's `name -> version` map, re-read between widen rounds to observe what the
-/// latest joint resolve produced.
-fn read_locked<L: NodeLock>(project: &Project) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-    Ok(locked_versions::<L>(&content))
+/// The `(name, target)` pin for every planned candidate, the exact per-package targets the joint
+/// resolve passes to `pnpm update`. `change.to` already encodes each package's own window (computed
+/// by cooldown-core), so pinning it enforces that window exactly — identical to cargo's `--precise`
+/// and go's `module@<to>`. Both the forward `upgrade` targets and the `fix` rollback targets are
+/// passed; pnpm re-pins the lock to whatever exact version it is given.
+fn plan_pins(plan: &Plan) -> Vec<(String, String)> {
+    plan.changes
+        .iter()
+        .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
+        .collect()
 }
 
 #[async_trait]
@@ -882,30 +880,41 @@ mod tests {
     }
 
     #[test]
-    fn whole_graph_args_resolves_under_the_window_only_for_pnpm() {
-        // pnpm floats the whole graph to latest-within-window in one joint resolve; the window rides
-        // inline as `minimumReleaseAge`, capping transitives a per-package update could never move.
+    fn whole_graph_args_pins_each_per_package_target_only_for_pnpm() {
+        // pnpm pins each planned candidate to its EXACT per-package target in one joint resolve, so a
+        // stricter-windowed package lands at its own (possibly older) target rather than overshooting.
+        // The window rides inline as `minimumReleaseAge`, the floor for any fresh transitive the pins
+        // drag in.
+        let pins = vec![
+            ("eslint".to_string(), "9.5.0".to_string()),
+            (
+                "@typescript-eslint/eslint-plugin".to_string(),
+                "8.0.0".to_string(),
+            ),
+        ];
         assert_eq!(
-            Pnpm::whole_graph_args(true, Some(20160)),
+            Pnpm::whole_graph_args(&pins, Some(20160)),
             Some(vec![
                 "update".to_string(),
-                "--latest".to_string(),
+                "eslint@9.5.0".to_string(),
+                "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
             ])
         );
-        // The reconcile (fix) variant is a plain re-lock; a true Latest opt-out drops the min-age flag.
+        // No pins (the `fix` reconcile with an empty plan) is a plain re-lock; a true Latest opt-out
+        // drops the min-age flag.
         assert_eq!(
-            Pnpm::whole_graph_args(false, None),
+            Pnpm::whole_graph_args(&[], None),
             Some(vec!["install".to_string(), "--lockfile-only".to_string()])
         );
-        // npm/yarn/bun have no joint resolve under a window, so they keep the per-package path.
+        // npm/yarn/bun have no joint resolve, so they keep the per-package path.
         assert!(!Npm::supports_whole_graph_resolve());
         assert!(Pnpm::supports_whole_graph_resolve());
-        assert_eq!(Npm::whole_graph_args(true, Some(20160)), None);
-        assert_eq!(crate::lock::Yarn::whole_graph_args(true, None), None);
-        assert_eq!(crate::lock::Bun::whole_graph_args(false, None), None);
+        assert_eq!(Npm::whole_graph_args(&pins, Some(20160)), None);
+        assert_eq!(crate::lock::Yarn::whole_graph_args(&pins, None), None);
+        assert_eq!(crate::lock::Bun::whole_graph_args(&[], None), None);
     }
 
     #[test]

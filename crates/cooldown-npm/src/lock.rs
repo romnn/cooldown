@@ -47,29 +47,38 @@ pub trait NodeLock: Send + Sync + 'static {
     /// Whether this manager re-resolves the whole importer graph jointly in a single pass, so cooldown
     /// drives the whole-graph re-resolve/diff path rather than the per-package relock loop.
     ///
-    /// Only pnpm does: one `pnpm update --latest --lockfile-only --config.minimumReleaseAge=<m>`
-    /// re-resolves the entire importer graph at once — direct *and* transitive — to the newest versions
-    /// matured past the cooldown window, the prerequisite for settling mutually-exclusive peer
+    /// Only pnpm does: one `pnpm update <pkg>@<target> … --lockfile-only --config.minimumReleaseAge=<m>`
+    /// re-resolves the entire importer graph at once — direct *and* transitive — pinning each planned
+    /// candidate to its exact per-package target, the prerequisite for settling mutually-exclusive peer
     /// conflicts at a single fixed point instead of ping-ponging between per-package pins. npm/yarn/bun
-    /// have no equivalent joint resolve under a window, so they keep the per-package relock path.
+    /// have no equivalent joint resolve, so they keep the per-package relock path.
     #[must_use]
     fn supports_whole_graph_resolve() -> bool {
         false
     }
 
-    /// The single command that re-resolves the whole graph under cooldown's window — pnpm's
-    /// `update --latest --lockfile-only --config.minimumReleaseAge=<minutes>` (forward) or a plain
-    /// `install --lockfile-only --config.minimumReleaseAge=<minutes>` reconcile.
+    /// The single command that re-resolves the whole graph under cooldown's window, pinning each
+    /// planned candidate to its EXACT per-package target — pnpm's
+    /// `update <pkg>@<target> … --lockfile-only --no-save --config.minimumReleaseAge=<minutes>`
+    /// (the forward `upgrade` and the `fix` rollback both pass their `change.to` targets) or, with no
+    /// `pins`, a plain `install --lockfile-only --config.minimumReleaseAge=<minutes>` reconcile.
     ///
-    /// `--latest` floats every importer's dependency — direct and transitive — to the newest version
-    /// the window admits, in one joint resolve; `minimumReleaseAge` is the rolling minute count below
-    /// which a release is too fresh, so the resolve never adopts an in-cooldown version (the whole
-    /// point: it caps *transitives* too, which a per-package update of a direct dependency cannot do).
-    /// `--no-save`/`--lockfile-only` keep `package.json` and `node_modules` untouched. A `None`
-    /// `window_minutes` (a true `Latest` opt-out) omits the cap and resolves to the very newest.
-    /// `None` for managers without a joint resolve under a window.
+    /// Each `pin` is the `(name, target)` the core computed for that candidate's own window, so the
+    /// resolve lands every direct candidate at exactly its per-package target — never overshooting a
+    /// package whose stricter per-package window admits an older version than the global one (the gap a
+    /// bare `--latest` left, since pnpm's `minimumReleaseAge` is a single global value). `minimumReleaseAge`
+    /// is still passed as the *transitive* floor: a fresh transitive the pins drag in is capped to the
+    /// project-default window, so the uniform-window case lands the same lock as before while the
+    /// per-package targets are honored exactly. Transitives the pins float past the global window are
+    /// reconciled down by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no
+    /// global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json` and `node_modules`
+    /// untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap. `None` for managers
+    /// without a joint resolve.
     #[must_use]
-    fn whole_graph_args(_upgrade: bool, _window_minutes: Option<i64>) -> Option<Vec<String>> {
+    fn whole_graph_args(
+        _pins: &[(String, String)],
+        _window_minutes: Option<i64>,
+    ) -> Option<Vec<String>> {
         None
     }
 
@@ -281,23 +290,31 @@ impl NodeLock for Pnpm {
         true
     }
 
-    fn whole_graph_args(upgrade: bool, window_minutes: Option<i64>) -> Option<Vec<String>> {
-        // `--latest` raises every importer's dependency to the newest admissible version in one joint
-        // re-resolve (the forward `upgrade` form); a bare `install --lockfile-only` is the minimal
-        // reconcile (`fix`) form that re-settles the graph without floating versions up. `--no-save`
-        // keeps `package.json` ranges as the author wrote them (the caller widens an out-of-range
-        // manifest itself first); `--lockfile-only` skips `node_modules`. `minimumReleaseAge` is the
-        // rolling minute count below which a release is too fresh, so neither variant adopts an
-        // in-cooldown version — and crucially it caps transitives, which a per-package update cannot.
-        let mut args = if upgrade {
-            vec![
-                "update".to_string(),
-                "--latest".to_string(),
-                "--lockfile-only".to_string(),
-                "--no-save".to_string(),
-            ]
-        } else {
+    fn whole_graph_args(
+        pins: &[(String, String)],
+        window_minutes: Option<i64>,
+    ) -> Option<Vec<String>> {
+        // `pnpm update <name>@<target> …` pins each planned candidate to its EXACT per-package target
+        // in one joint re-resolve, so a package whose stricter per-package window admits an older
+        // version than the project default lands at its own target rather than overshooting onto the
+        // global-window-newest (the gap a bare `--latest` left). With no pins (the `fix` reconcile with
+        // an empty plan), a plain `install --lockfile-only` re-settles the graph without floating
+        // versions up. `--no-save` keeps `package.json` ranges as the author wrote them (the caller
+        // widens an out-of-range manifest itself first); `--lockfile-only` skips `node_modules`.
+        // `minimumReleaseAge` stays as the *transitive* floor — a fresh transitive the pins drag in is
+        // capped to the project-default window, so the uniform-window case lands the same lock as
+        // before. Transitives floated past the window are reconciled down by the caller's
+        // transitive-cooldown gate, exactly as for cargo/go.
+        let mut args = if pins.is_empty() {
             vec!["install".to_string(), "--lockfile-only".to_string()]
+        } else {
+            let mut args = vec!["update".to_string()];
+            for (name, target) in pins {
+                args.push(format!("{name}@{target}"));
+            }
+            args.push("--lockfile-only".to_string());
+            args.push("--no-save".to_string());
+            args
         };
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
