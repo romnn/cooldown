@@ -1,0 +1,29 @@
+# Pinned package managers for cooldown's integration tests.
+#
+# These provision the REAL tools the integration suite drives end to end (see
+# crates/cooldown/tests/convergence_uv.rs and the harness in tests/support/). The tests
+# generate fixtures on the fly and run the actual resolver, so the toolchain must be pinned
+# to keep runs reproducible across machines and over time.
+#
+# `rust` is pinned to the version already active on this machine (`rustc 1.96.0`), so adding
+# this file does NOT switch the toolchain under cooldown's own `cargo build`. Every other
+# version below is an exact `mise ls-remote <tool>` hit (verified), not an invented tag.
+#
+# conda is intentionally omitted: it has no clean mise-managed backend here (`mise ls-remote
+# conda` returns nothing), so pinning it would be a ghost. A real-tool conda integration test
+# would need a conda provisioned some other way; the cooldown-conda adapter is otherwise covered
+# by the network-free conformance tests.
+[tools]
+rust = "1.96.0"
+uv = "0.11.23"
+go = "1.26.4"
+node = "26.3.1"
+pnpm = "11.8.0"
+python = "3.14.6"
+ruby = "4.0.5"
+erlang = "29.0.2"
+elixir = "1.20.1-otp-29"
+java = "26.0.1"
+maven = "3.9.16"
+deno = "2.8.3"
+swift = "6.3.2"

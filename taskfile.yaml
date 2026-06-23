@@ -137,6 +137,11 @@ tasks:
     cmds:
       - cargo fc nextest run --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
+  test:integration:
+    desc: "run the #[ignore]-gated, real-tool integration tests (drive uv etc. against PyPI; needs the mise.toml toolchain + network)"
+    cmds:
+      - cargo nextest run -p cooldown --run-ignored all --no-tests "warn" {{.CLI_ARGS}}
+
   test:doc:
     desc: "run doctests in cargo workspace"
     cmds:
