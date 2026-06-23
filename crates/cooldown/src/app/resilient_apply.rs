@@ -43,8 +43,8 @@ pub(crate) async fn apply_resilient(
         Err(_) => {}
     }
 
-    let accepted = maximal_satisfiable_subset(writer, project, &plan.changes, plan.rewrite, journal)
-        .await?;
+    let accepted =
+        maximal_satisfiable_subset(writer, project, &plan.changes, plan.rewrite, journal).await?;
     // Each change in a plan is uniquely keyed by (name, target): the planner never emits two moves of
     // the same package to the same version (a multi-version dep keeps distinct targets per line). Keyed
     // by owned strings so the accepted subset can be moved into the commit plan below.
@@ -299,7 +299,10 @@ mod tests {
 
         assert_eq!(
             names(&report.applied),
-            ["a", "b", "c", "d"].iter().map(ToString::to_string).collect()
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(ToString::to_string)
+                .collect()
         );
         assert_eq!(
             skipped_names(&report),
@@ -325,7 +328,10 @@ mod tests {
         );
         assert_eq!(
             skipped_names(&report),
-            ["colors", "left-pad"].iter().map(ToString::to_string).collect()
+            ["colors", "left-pad"]
+                .iter()
+                .map(ToString::to_string)
+                .collect()
         );
     }
 
@@ -348,7 +354,11 @@ mod tests {
         let applied = names(&report.applied);
         assert!(["a", "b", "c"].iter().all(|n| applied.contains(*n)));
         let held = skipped_names(&report);
-        assert_eq!(held.len(), 1, "exactly one of the conflicting pair is held: {held:?}");
+        assert_eq!(
+            held.len(),
+            1,
+            "exactly one of the conflicting pair is held: {held:?}"
+        );
         assert!(held.contains("x") || held.contains("y"));
         // The committed set is satisfiable: it does not contain both x and y.
         assert!(!(applied.contains("x") && applied.contains("y")));
@@ -379,7 +389,10 @@ mod tests {
 
         let result = apply_resilient(&writer, &project, &plan, &journal).await;
 
-        assert!(result.is_err(), "a missing binary must propagate, not bisect");
+        assert!(
+            result.is_err(),
+            "a missing binary must propagate, not bisect"
+        );
         // Exactly one apply: the first attempt errored as a spawn failure, no recovery trials.
         assert_eq!(writer.apply_calls.load(Ordering::SeqCst), 1);
     }
