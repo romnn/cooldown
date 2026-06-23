@@ -13,6 +13,7 @@ mod explain;
 mod lock;
 mod model;
 mod outdated;
+mod project_copy;
 mod read;
 mod release_cache;
 mod sync;

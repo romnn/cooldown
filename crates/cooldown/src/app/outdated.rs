@@ -432,26 +432,12 @@ async fn resolve_held(
     changes: Vec<Change>,
     rewrite: cooldown_core::RewriteMode,
 ) -> cooldown_core::Result<std::collections::HashMap<String, Option<String>>> {
-    let scratch = tempfile::tempdir()?;
-    let scratch_root = camino::Utf8Path::from_path(scratch.path()).ok_or_else(|| {
-        cooldown_core::CoreError::PathEncoding("temp dir path is not valid utf-8".to_string())
-    })?;
-    copy_project_tree(project.root.as_std_path(), scratch.path())?;
-
-    let manifest_rel = project
-        .manifest
-        .strip_prefix(&project.root)
-        .unwrap_or(&project.manifest);
-    let temp_project = Project {
-        root: scratch_root.to_owned(),
-        kind: project.kind,
-        manifest: scratch_root.join(manifest_rel),
-        exclude_newer: project.exclude_newer.clone(),
-    };
+    let copy = super::project_copy::ProjectCopy::create(project)?;
+    let temp_project = &copy.project;
 
     let plan = Plan { changes, rewrite };
-    let journal = writer.mutation_journal(&temp_project, &plan).await?;
-    let report = writer.apply(&temp_project, &plan, &journal).await?;
+    let journal = writer.mutation_journal(temp_project, &plan).await?;
+    let report = writer.apply(temp_project, &plan, &journal).await?;
 
     let mut held = std::collections::HashMap::new();
     for skipped in report.skipped {
@@ -483,39 +469,6 @@ fn apply_held(
             item.blocked_by = blocker.clone();
         }
     }
-}
-
-/// Recursively copy a project tree into `dest`, skipping directories that the resolver never needs and
-/// that would make the copy expensive or self-referential — virtualenvs, VCS metadata, and bytecode
-/// caches. The resolver reads only the manifests/lock and resolves dependency metadata from its own
-/// global cache, so omitting these is safe and keeps the throwaway copy cheap.
-fn copy_project_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    const SKIP_DIRS: &[&str] = &[
-        ".venv",
-        "venv",
-        ".git",
-        "__pycache__",
-        "node_modules",
-        "target",
-    ];
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let name = entry.file_name();
-        let from = entry.path();
-        let to = dest.join(&name);
-        if file_type.is_dir() {
-            if name.to_str().is_some_and(|n| SKIP_DIRS.contains(&n)) {
-                continue;
-            }
-            copy_project_tree(&from, &to)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&from, &to)?;
-        }
-        // Symlinks and other special entries are irrelevant to resolution and are skipped.
-    }
-    Ok(())
 }
 
 fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {

@@ -9,7 +9,9 @@
 mod executor;
 
 use self::executor::{PlanMode, ProjectUpgradeExecutor};
-use super::{BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace};
+use super::{
+    BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
+};
 use cooldown_core::{Diagnostic, ToolRead, ToolWrite};
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
@@ -120,9 +122,45 @@ impl Workspace {
             let Some(writer) = self.mutator(pctx.tool) else {
                 continue;
             };
+
+            // Under `--dry-run`, preview the TRUE outcome of the real run: run the identical
+            // whole-graph mutation flow against a throwaway recursive copy of the project, then discard
+            // the copy. Because the copy drives the same `apply`/re-lock/reconcile path, the reported
+            // lock diff (held candidates shown skipped with their blocker, landed candidates shown
+            // applied) equals what the real run produces — the real `uv.lock`/`pyproject.toml` are
+            // never written. `dry_copy` owns the temp tree (removed when it drops at the end of the
+            // iteration); `dry_pctx` owns the copied context the executor borrows.
+            let _dry_copy;
+            let dry_pctx;
+            let effective_pctx = if opts.dry_run {
+                match super::project_copy::ProjectCopy::create(&pctx.project) {
+                    Ok(copy) => {
+                        dry_pctx = super::ProjectCtx {
+                            tool: pctx.tool,
+                            project: copy.project.clone(),
+                            rel_path: pctx.rel_path.clone(),
+                            policy: pctx.policy.clone(),
+                        };
+                        _dry_copy = copy;
+                        &dry_pctx
+                    }
+                    Err(error) => {
+                        acc.errors.push(diag_from_error(
+                            &error,
+                            pctx.tool,
+                            pctx.rel_path.as_str(),
+                            None,
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                pctx
+            };
+
             ProjectUpgradeExecutor::new(
                 self,
-                UpgradeCtx::new(reader, writer, pctx, opts),
+                UpgradeCtx::new(reader, writer, effective_pctx, opts),
                 mode,
                 &mut acc,
             )
@@ -132,7 +170,8 @@ impl Workspace {
 
         // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
         // items explicitly so the output is stable, status-first (errored/skipped lead, applied
-        // last; a `--dry-run` is all `planned`, so it stays in name order).
+        // last). A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its
+        // items carry the real applied/skipped outcome and sort identically to the real run.
         acc.items.sort_by(|a, b| {
             a.project
                 .cmp(&b.project)

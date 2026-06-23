@@ -91,26 +91,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.pctx.tool
         ));
 
-        if self.ctx.opts.dry_run {
-            // A single-pass preview: a fixpoint can't be simulated without applying, since a
-            // downgrade's effect on other deps' floors only shows after a re-lock.
-            let planned = match self.mode {
-                PlanMode::Upgrade => self.plan_upgrade_changes(&deps).await,
-                PlanMode::Fix {
-                    transitive,
-                    downgrade_pinned,
-                } => {
-                    let plan = self
-                        .plan_fix_changes(&deps, transitive, downgrade_pinned)
-                        .await;
-                    self.emit_fix_warnings(plan.warnings);
-                    plan.changes
-                }
-            };
-            self.record_dry_run(&planned);
-            return;
-        }
-
         let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
             Ok(guard) => guard,
             Err(error) => {
@@ -500,18 +480,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .with_package(package);
         self.acc.strict_incomplete = true;
         self.acc.warnings.push(diag);
-    }
-
-    fn record_dry_run(&mut self, planned: &[Change]) {
-        for change in planned {
-            self.acc.items.push(plan_item(
-                change,
-                self.project_label(),
-                self.ctx.tool_name(),
-                false,
-                None,
-            ));
-        }
     }
 
     /// Apply a round's planned changes as **one** atomic plan, so a tool that re-resolves jointly

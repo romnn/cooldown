@@ -2327,3 +2327,286 @@ async fn sync_project_scope_writes_native_per_project() {
         vec!["a", "b"]
     );
 }
+
+/// A fake whose whole-graph `apply` HOLDS the `typer` candidate (the resolve cannot place
+/// `typer@0.26.7` because `huggingface-hub` requires `typer<0.26.0`) and lands nothing, exactly as
+/// the real uv resolve does in the `download-huggingface-dataset-snapshot` repro. Every `apply`
+/// writes a sentinel file into the project root it is handed, so a dry-run (which must run against a
+/// throwaway copy) leaves the real root's sentinel absent while a real run creates it — proving the
+/// mutation landed only on the copy.
+struct HeldConflictFake {
+    root: Utf8PathBuf,
+}
+
+const HELD_TOOL: ToolId = ToolId("helduv");
+
+impl HeldConflictFake {
+    fn project(&self) -> Project {
+        Project {
+            root: self.root.clone(),
+            kind: HELD_TOOL,
+            manifest: self.root.join("pyproject.toml"),
+            exclude_newer: None,
+        }
+    }
+
+    fn typer_releases() -> Vec<Release> {
+        vec![
+            // Long-matured under the 7d default (now = 2026-06-17), so the locked pin is not itself a
+            // cooldown violation and the newer 0.26.7 is an adoptable forward move the planner takes.
+            rel("0.25.1", 0, Some("2026-01-10T00:00:00Z"), None),
+            rel(
+                "0.26.7",
+                1,
+                Some("2026-02-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ]
+    }
+}
+
+#[async_trait]
+impl ToolRead for HeldConflictFake {
+    fn id(&self) -> ToolId {
+        HELD_TOOL
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        cooldown_core::ProjectMarker {
+            lockfile: "uv.lock",
+            manifest: "pyproject.toml",
+            workspace_root: true,
+        }
+    }
+    async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
+        Ok(vec![dep("typer", "0.25.1", true)])
+    }
+    async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
+    }
+    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for HeldConflictFake {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+        _candidates: cooldown_core::CandidateScope,
+    ) -> Result<Vec<Release>> {
+        if dep.package.name == "typer" {
+            Ok(Self::typer_releases())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    async fn locked_release(
+        &self,
+        dep: &Dependency,
+        _fetch: &cooldown_core::FetchContext<'_>,
+    ) -> Result<Release> {
+        if dep.package.name == "typer" {
+            Ok(release_named(&Self::typer_releases(), "0.25.1"))
+        } else {
+            Err(CoreError::NotFound(dep.package.name.clone()))
+        }
+    }
+}
+
+#[async_trait]
+impl ToolWrite for HeldConflictFake {
+    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::default())
+    }
+    async fn apply(
+        &self,
+        p: &Project,
+        plan: &Plan,
+        _journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        // Any apply touches the tree it is handed — a dry-run must hand us the copy, never the real
+        // root, so this sentinel never appears in the real project.
+        std::fs::write(p.root.join("applied.sentinel"), "applied").unwrap();
+        // The whole-graph resolve cannot land typer's candidate: huggingface-hub requires
+        // typer<0.26.0, so it is HELD, naming the blocker — exactly upgrade's reported skip.
+        let mut report = ApplyReport::default();
+        for change in &plan.changes {
+            if change.package.name == "typer" {
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::ResolverConflict,
+                    offending: Some(PackageId::new(
+                        HELD_TOOL,
+                        "huggingface-hub".to_string(),
+                        Some("proxy.example".into()),
+                    )),
+                });
+            } else {
+                report.applied.push(change.clone());
+            }
+        }
+        Ok(report)
+    }
+    async fn build(&self, _p: &Project) -> Result<VerifyReport> {
+        Ok(VerifyReport {
+            ok: true,
+            detail: "ok".into(),
+        })
+    }
+}
+
+fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
+    let fake = HeldConflictFake { root: root.clone() };
+    let ctx = ProjectCtx {
+        tool: HELD_TOOL,
+        project: fake.project(),
+        rel_path: Utf8PathBuf::from("."),
+        policy: PolicyStack {
+            layers: vec![builtin_default_layer()],
+            strict_native: false,
+        },
+    };
+    let mut adapters = AdapterSet::new();
+    adapters.register(Arc::new(fake));
+    Workspace::new(
+        adapters,
+        vec![ctx],
+        now(),
+        Baseline::default(),
+        root,
+        Vec::new(),
+    )
+}
+
+/// The held/blocked set a run reports: every typer-or-other candidate that came back skipped, with
+/// the blocker the resolve named. Shared by the real and dry-run assertions so the two are compared
+/// by the exact same extraction.
+fn held_set(items: &[cooldown::app::UpgradeItem]) -> Vec<(String, Option<String>)> {
+    let mut held: Vec<(String, Option<String>)> = items
+        .iter()
+        .filter_map(|item| {
+            item.skipped
+                .as_ref()
+                .map(|skipped| (item.name.clone(), skipped.offending.clone()))
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+#[tokio::test]
+async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
+    // The repro: typer's matured 0.26.7 is adoptable in isolation, but the whole-graph resolve HOLDS
+    // it because huggingface-hub requires typer<0.26.0. A `--dry-run` must preview the TRUE outcome —
+    // typer HELD (not `planned`/applied) — by running the same resolve against a throwaway copy, so it
+    // agrees with the real run exactly.
+    let (_real_dir, real_root) = tmp_root();
+    let real_sentinel = real_root.join("applied.sentinel");
+
+    let dry = held_conflict_workspace(real_root.clone())
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..opts()
+        })
+        .await;
+
+    // typer is reported HELD, naming its blocker — never a phantom `planned`/applied row.
+    let typer = dry
+        .items
+        .iter()
+        .find(|item| item.name == "typer")
+        .expect("typer row");
+    assert!(
+        !typer.applied,
+        "dry-run must not promise an upgrade the real run holds"
+    );
+    let skipped = typer
+        .skipped
+        .as_ref()
+        .expect("typer must be held (skipped), not planned");
+    assert_eq!(skipped.reason, SkipReason::ResolverConflict);
+    assert_eq!(skipped.offending.as_deref(), Some("huggingface-hub"));
+    assert_eq!(dry.summary.applied, 0);
+    assert_eq!(dry.summary.skipped, 1);
+    // A dry-run never persists: the apply ran against the copy, so the real root has no sentinel and
+    // the lock is reported untouched.
+    assert!(
+        !real_sentinel.as_std_path().exists(),
+        "dry-run mutated the real project root"
+    );
+    assert_eq!(dry.meta.lock_verified, None);
+
+    // The real run produces the identical held/blocked set — the two agree by construction.
+    let (_real_dir2, real_root2) = tmp_root();
+    let real = held_conflict_workspace(real_root2.clone())
+        .upgrade(&opts())
+        .await;
+    assert_eq!(
+        held_set(&dry.items),
+        held_set(&real.items),
+        "dry-run's held set must equal the real run's"
+    );
+    assert_eq!(
+        held_set(&real.items),
+        vec![("typer".to_string(), Some("huggingface-hub".to_string()))],
+    );
+    // The real run did mutate its own (separate) root — proving the sentinel mechanism actually fires
+    // when the apply is against the real tree, so the dry-run's absent sentinel is meaningful.
+    assert!(
+        real_root2.join("applied.sentinel").as_std_path().exists(),
+        "the real run must mutate the real root",
+    );
+}
+
+#[tokio::test]
+async fn dry_run_leaves_the_real_lock_and_manifest_byte_identical() {
+    // Beyond "no sentinel": the real on-disk manifest and lock must be byte-for-byte unchanged after a
+    // dry-run, since the whole resolve ran against a throwaway copy.
+    let (_dir, root) = tmp_root();
+    let manifest = root.join("pyproject.toml");
+    let lock = root.join("uv.lock");
+    std::fs::write(
+        &manifest,
+        "[project]\nname = \"snap\"\nversion = \"0.1.0\"\ndependencies = [\"typer==0.25.1\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&lock, "version = 1\nrevision = 3\n# typer 0.25.1\n").unwrap();
+
+    let digest = |path: &camino::Utf8Path| -> Vec<u8> {
+        use std::hash::{Hash, Hasher};
+        let bytes = std::fs::read(path).unwrap();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        // Pair the content hash with the raw length so a collision cannot mask a real change.
+        let mut out = hasher.finish().to_be_bytes().to_vec();
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out
+    };
+    let manifest_before = digest(&manifest);
+    let lock_before = digest(&lock);
+
+    let out = held_conflict_workspace(root.clone())
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..opts()
+        })
+        .await;
+    // The dry-run still computed the real held outcome…
+    assert_eq!(out.summary.skipped, 1);
+    assert_eq!(out.summary.applied, 0);
+    // …without touching the real manifest or lock.
+    assert_eq!(
+        digest(&manifest),
+        manifest_before,
+        "dry-run modified the real manifest",
+    );
+    assert_eq!(digest(&lock), lock_before, "dry-run modified the real lock");
+}
