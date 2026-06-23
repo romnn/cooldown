@@ -159,6 +159,41 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
     Resolution { window, trace }
 }
 
+/// The `package` selector globs the policy marks fully exempt from the cooldown — a `latest = true`
+/// rule (a [`WindowSpec::Latest`] on any kind) or an `allow` entry.
+///
+/// These map directly onto a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`,
+/// which accepts the same glob patterns), so `sync` can bake the `cooldown.toml` `latest` packages
+/// into a tool's native config beside the default window — otherwise a `latest`-exempt package stays
+/// quarantined by the native rolling window even though cooldown's own policy exempts it. The raw glob
+/// is emitted verbatim (`@scope/*`, `@typescript/native-preview`), deduplicated and sorted for a
+/// deterministic, idempotent write. A `package` rule that sets a `min-age`/`freeze` (not `latest`) is
+/// not exempt and is never listed.
+#[must_use]
+pub fn exempt_package_globs(layers: &[PolicyLayer]) -> Vec<String> {
+    let mut globs = std::collections::BTreeSet::new();
+    for layer in layers {
+        for rule in &layer.rules {
+            let Selector::Package(glob) = &rule.selector else {
+                continue;
+            };
+            let latest = [
+                &rule.window.default,
+                &rule.window.major,
+                &rule.window.minor,
+                &rule.window.patch,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|spec| matches!(spec, WindowSpec::Latest));
+            if rule.allow || latest {
+                globs.insert(glob.raw().to_string());
+            }
+        }
+    }
+    globs.into_iter().collect()
+}
+
 /// Picks the authority-first window field for `query` and traces every rule considered.
 ///
 /// `min-age` (and the per-kind windows) is authority-first: the highest layer that sets it wins,
@@ -351,5 +386,60 @@ fn resolve_allows(
         matched: allow_matched,
         effective_floor,
         provenance,
+    }
+}
+
+#[cfg(test)]
+mod exempt_tests {
+    use super::exempt_package_globs;
+    use crate::{ByKind, Origin, PatternGlob, PolicyLayer, Rule, Selector, WindowSpec};
+    use jiff::SignedDuration;
+
+    fn package_rule(glob: &str, window: ByKind, allow: bool) -> Rule {
+        let mut rule = Rule::new(Selector::Package(PatternGlob::new(glob).expect("glob")));
+        rule.window = window;
+        rule.allow = allow;
+        rule
+    }
+
+    #[test]
+    fn collects_only_latest_and_allow_package_selectors() {
+        let mut layer = PolicyLayer::new(Origin::Cli);
+        layer.rules.push(package_rule(
+            "@scope/latest-pkg",
+            ByKind::scalar(WindowSpec::Latest),
+            false,
+        ));
+        layer
+            .rules
+            .push(package_rule("allowed-pkg", ByKind::default(), true));
+        // A `min-age` package is NOT exempt — it stays under the cooldown, so it must not be listed.
+        layer.rules.push(package_rule(
+            "min-age-pkg",
+            ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 30))),
+            false,
+        ));
+        // A non-`package` selector that is `latest` (e.g. the project default) is not a per-package
+        // exemption and must not leak into the list.
+        let mut default_latest = Rule::new(Selector::Default);
+        default_latest.window = ByKind::scalar(WindowSpec::Latest);
+        layer.rules.push(default_latest);
+
+        // Sorted + deduplicated; only the package-scoped latest/allow selectors.
+        assert_eq!(
+            exempt_package_globs(&[layer]),
+            vec!["@scope/latest-pkg".to_string(), "allowed-pkg".to_string(),]
+        );
+    }
+
+    #[test]
+    fn no_exemptions_yields_an_empty_list() {
+        let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        layer.rules.push(package_rule(
+            "plain",
+            ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 14))),
+            false,
+        ));
+        assert!(exempt_package_globs(&[layer]).is_empty());
     }
 }

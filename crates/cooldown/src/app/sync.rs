@@ -195,6 +195,9 @@ impl Workspace {
         let window = resolved.window.effective_spec(self.now());
         let policy = ResolvedPolicy {
             default_window: Some(window.clone()),
+            // Bake any `latest`/`allow` package selectors into the native per-package exemption list
+            // alongside the default window, so a cooldown-exempt package is exempt natively too.
+            exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers),
         };
         match writer
             .write_native(&pctx.project, &policy, opts.dry_run)
@@ -250,6 +253,7 @@ impl Workspace {
         let window = resolved.window.effective_spec(self.now());
         let policy = ResolvedPolicy {
             default_window: Some(window.clone()),
+            exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers()),
         };
         match writer
             .write_repo_native(self.repo_root(), &policy, opts.dry_run)

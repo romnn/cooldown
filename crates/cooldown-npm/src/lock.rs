@@ -63,20 +63,24 @@ pub trait NodeLock: Send + Sync + 'static {
     /// (the forward `upgrade` and the `fix` rollback both pass their `change.to` targets) or, with no
     /// `pins`, a plain `install --lockfile-only --config.minimumReleaseAge=<minutes>` reconcile.
     ///
-    /// Each `pin` is the `(name, target)` the core computed for that candidate's own window, so the
-    /// resolve lands every direct candidate at exactly its per-package target — never overshooting a
-    /// package whose stricter per-package window admits an older version than the global one (the gap a
-    /// bare `--latest` left, since pnpm's `minimumReleaseAge` is a single global value). `minimumReleaseAge`
-    /// is still passed as the *transitive* floor: a fresh transitive the pins drag in is capped to the
-    /// project-default window, so the uniform-window case lands the same lock as before while the
-    /// per-package targets are honored exactly. Transitives the pins float past the global window are
-    /// reconciled down by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no
-    /// global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json` and `node_modules`
-    /// untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap. `None` for managers
-    /// without a joint resolve.
+    /// Each `pin` is `(name, target)`. A `Some(target)` is an EXACT pin — the per-package target the
+    /// core computed for that candidate's own window — so the resolve lands it at exactly that version,
+    /// never overshooting a package whose stricter per-package window admits an older version than the
+    /// global one (the gap a bare `--latest` left, since pnpm's `minimumReleaseAge` is a single global
+    /// value). A `None` target floats the candidate by its declared range under the window instead of
+    /// pinning it: a name held at several versions across the workspace's importers (the v4/v5 split
+    /// pnpm allows, like cargo) cannot be exact-pinned without collapsing every other copy onto the one
+    /// target, so it is updated by name and each importer's range re-resolves independently.
+    /// `minimumReleaseAge` is still passed as the *transitive* floor: a fresh transitive the pins drag
+    /// in is capped to the project-default window, so the uniform-window case lands the same lock as
+    /// before while the per-package targets are honored exactly. Transitives the pins float past the
+    /// global window are reconciled down by the caller's transitive-cooldown gate, exactly as for
+    /// cargo/go (which have no global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json`
+    /// and `node_modules` untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap.
+    /// `None` for managers without a joint resolve.
     #[must_use]
     fn whole_graph_args(
-        _pins: &[(String, String)],
+        _pins: &[(String, Option<String>)],
         _window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         None
@@ -180,6 +184,28 @@ impl MemberIndex {
             .flatten()
             .chain(self.by_name.values().flatten())
             .cloned()
+            .collect()
+    }
+
+    /// Names that workspace importers DECLARE at more than one distinct version — a genuine version
+    /// split (one member on `chalk@^4`, another on `chalk@^5`), NOT a transitive duplicate. Derived
+    /// from per-importer declarations only, so a direct dependency that merely shares a name with a
+    /// transitive copy resolved at another version is single-declared and excluded. Only the
+    /// version-keyed (pnpm) index carries per-version importer data; the name-only (npm) index has none
+    /// and yields nothing. The whole-graph resolve range-floats these (exact-pinning one target would
+    /// collapse the other line) and exact-pins everything else.
+    #[must_use]
+    pub fn names_declared_at_multiple_versions(&self) -> HashSet<String> {
+        let mut versions: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (name, version) in self.by_version.keys() {
+            versions
+                .entry(name.as_str())
+                .or_default()
+                .insert(version.as_str());
+        }
+        versions
+            .into_iter()
+            .filter_map(|(name, set)| (set.len() > 1).then(|| name.to_string()))
             .collect()
     }
 
@@ -291,7 +317,7 @@ impl NodeLock for Pnpm {
     }
 
     fn whole_graph_args(
-        pins: &[(String, String)],
+        pins: &[(String, Option<String>)],
         window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         // `pnpm update <name>@<target> …` pins each planned candidate to its EXACT per-package target
@@ -301,6 +327,11 @@ impl NodeLock for Pnpm {
         // an empty plan), a plain `install --lockfile-only` re-settles the graph without floating
         // versions up. `--no-save` keeps `package.json` ranges as the author wrote them (the caller
         // widens an out-of-range manifest itself first); `--lockfile-only` skips `node_modules`.
+        // `--recursive` is mandatory in a workspace: a bare `pnpm update <name>@<target>` run at the
+        // workspace root only re-pins dependencies the ROOT `package.json` declares, leaving every
+        // member-declared dependency untouched — so a candidate owned by a member never moves in the
+        // lock and the diff reports it falsely held. `--recursive` re-pins the candidate across every
+        // importer that declares it (the root and all members), which is the whole-graph resolve we want.
         // `minimumReleaseAge` stays as the *transitive* floor — a fresh transitive the pins drag in is
         // capped to the project-default window, so the uniform-window case lands the same lock as
         // before. Transitives floated past the window are reconciled down by the caller's
@@ -308,9 +339,14 @@ impl NodeLock for Pnpm {
         let mut args = if pins.is_empty() {
             vec!["install".to_string(), "--lockfile-only".to_string()]
         } else {
-            let mut args = vec!["update".to_string()];
+            let mut args = vec!["update".to_string(), "--recursive".to_string()];
             for (name, target) in pins {
-                args.push(format!("{name}@{target}"));
+                // `Some(target)` pins the lock to the exact per-package target; `None` floats the name
+                // by its declared range (a multi-version dep that an exact pin would collapse).
+                match target {
+                    Some(target) => args.push(format!("{name}@{target}")),
+                    None => args.push(name.clone()),
+                }
             }
             args.push("--lockfile-only".to_string());
             args.push("--no-save".to_string());
@@ -893,6 +929,57 @@ packages:
         assert_eq!(index.members_for("vite", "7.0.0"), vec!["apps/b"]);
         // The internal workspace link is not a registry package, so it is never attributed.
         assert!(index.members_for("@airtype/api", "0.0.0").is_empty());
+    }
+
+    #[test]
+    fn names_declared_at_multiple_versions_ignores_transitive_duplicates() {
+        // `bar` is a genuine workspace split: apps/b declares 2.0.0, apps/c declares 3.0.0 — it must be
+        // flagged (range-floated, so neither line is collapsed). `foo` is declared at a SINGLE version
+        // by importers but ALSO appears as a transitive copy at 2.0.0 in `packages:` — it must NOT be
+        // flagged, so it stays exact-pinned and keeps its per-package window and any out-of-range
+        // widen. Counting the whole resolved graph (the old behavior) would wrongly float `foo`.
+        let lock = "\
+importers:
+
+  apps/a:
+    dependencies:
+      foo:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+  apps/b:
+    dependencies:
+      bar:
+        specifier: ^2.0.0
+        version: 2.0.0
+
+  apps/c:
+    dependencies:
+      bar:
+        specifier: ^3.0.0
+        version: 3.0.0
+
+packages:
+
+  foo@1.0.0:
+    resolution: {integrity: sha512-a}
+  foo@2.0.0:
+    resolution: {integrity: sha512-b}
+  bar@2.0.0:
+    resolution: {integrity: sha512-c}
+  bar@3.0.0:
+    resolution: {integrity: sha512-d}
+";
+        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
+        let split = index.names_declared_at_multiple_versions();
+        assert!(
+            split.contains("bar"),
+            "bar is declared at 2.0.0 and 3.0.0 across importers — a genuine split"
+        );
+        assert!(
+            !split.contains("foo"),
+            "foo is declared at one version by importers; its transitive 2.0.0 copy must not flag it"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::registry::{NPM, NpmRegistry};
 use crate::tool::{build_releases, classify_quality};
 use crate::version;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::verify_current_report;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
@@ -206,8 +206,8 @@ fn deno_cutoff_arg(cutoff: Option<&str>) -> Option<String> {
 /// left to the cutoff. The edit rewrites only this import's value, leaving the rest of the file
 /// byte-identical so a converged graph re-applies stably.
 fn pin_import(root: &Utf8Path, scheme: &str, name: &str, target: &str) -> Result<()> {
-    for manifest in ["deno.json", "deno.jsonc"] {
-        let path = root.join(manifest);
+    for rel in workspace_manifest_rels(root) {
+        let path = root.join(&rel);
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -245,6 +245,76 @@ fn pin_import(root: &Utf8Path, scheme: &str, name: &str, target: &str) -> Result
     Ok(())
 }
 
+/// Every `deno.json`/`deno.jsonc` manifest path (relative to the project root) that could declare an
+/// import: the root's, plus each workspace member's. deno lists member directories in the root
+/// manifest's `workspace` array, and a member declares its own imports in its own manifest — so a
+/// member-declared dependency is pinned (and journaled for rollback) there, not in the root. The root
+/// pair is always included; members are added when the root manifest declares a `workspace` array.
+fn workspace_manifest_rels(root: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let mut rels = vec![
+        Utf8PathBuf::from("deno.json"),
+        Utf8PathBuf::from("deno.jsonc"),
+    ];
+    for manifest in ["deno.json", "deno.jsonc"] {
+        let Ok(content) = std::fs::read_to_string(root.join(manifest)) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(members) = doc.get("workspace").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for member in members.iter().filter_map(serde_json::Value::as_str) {
+            let dir = member.trim_start_matches("./").trim_end_matches('/');
+            // Skip a member that resolves to the root itself (`"."`/`"./"`); its manifests are already
+            // the root pair added above.
+            if dir.is_empty() || dir == "." {
+                continue;
+            }
+            rels.push(Utf8PathBuf::from(format!("{dir}/deno.json")));
+            rels.push(Utf8PathBuf::from(format!("{dir}/deno.jsonc")));
+        }
+    }
+    // Both root manifests can declare the same `workspace` array, so a member may be added twice; keep
+    // only the first occurrence (capture/restore is idempotent, but the duplicate is needless work).
+    let mut seen = std::collections::HashSet::new();
+    rels.retain(|rel| seen.insert(rel.clone()));
+    rels
+}
+
+/// Every direct specifier the workspace declares, keyed by `(registry, name)`: the root
+/// `workspace.dependencies` unioned with each `workspace.members.<name>.dependencies`. deno records a
+/// member's own direct imports under its member entry (the root list carries only the root package's),
+/// so a dependency a member alone declares must still count as direct — otherwise it is misclassified
+/// as transitive and dropped from the default (direct-only) scope, so the upgrade never moves it.
+fn workspace_direct_specifiers(lock: &serde_json::Value) -> HashSet<(&'static str, String)> {
+    let mut direct = HashSet::new();
+    let mut collect = |array: Option<&serde_json::Value>| {
+        for spec in array
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(spec) = spec.as_str()
+                && let Some((registry, name, _)) = split_specifier(spec)
+            {
+                direct.insert((registry, name));
+            }
+        }
+    };
+    collect(lock.pointer("/workspace/dependencies"));
+    if let Some(members) = lock
+        .pointer("/workspace/members")
+        .and_then(|value| value.as_object())
+    {
+        for member in members.values() {
+            collect(member.get("dependencies"));
+        }
+    }
+    direct
+}
+
 impl DenoTool {
     fn read_deps(project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let content = std::fs::read_to_string(project.root.join("deno.lock"))?;
@@ -252,14 +322,7 @@ impl DenoTool {
             .map_err(|e| cooldown_core::CoreError::Parse(format!("deno.lock: {e}")))?;
 
         // The workspace's declared specifiers are the direct set, keyed by (registry, name).
-        let direct: HashSet<(&'static str, String)> = lock
-            .pointer("/workspace/dependencies")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|spec| spec.as_str())
-            .filter_map(|spec| split_specifier(spec).map(|(reg, name, _)| (reg, name)))
-            .collect();
+        let direct = workspace_direct_specifiers(&lock);
 
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
@@ -370,15 +433,19 @@ impl ToolWrite for DenoTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        // Deno's manifest may be `deno.json` or `deno.jsonc`; capture both (an absent one is a
-        // no-op to restore) plus the lock, since `deno add` rewrites the manifest and re-locks.
-        Ok(ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("deno.json"))?,
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("deno.jsonc"))?,
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("deno.lock"))?,
-            ],
-        })
+        // Deno's manifest may be `deno.json` or `deno.jsonc`; capture the root pair and every
+        // workspace member's pair (an absent one is a no-op to restore) plus the lock, since the
+        // resolve narrows whichever manifest declares a pinned import and re-locks. Capturing the
+        // member manifests keeps rollback correct when a member-declared candidate is the one pinned.
+        let mut files = Vec::new();
+        for rel in workspace_manifest_rels(&project.root) {
+            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
+        }
+        files.push(ProjectMutationJournal::capture_file(
+            &project.root,
+            Utf8Path::new("deno.lock"),
+        )?);
+        Ok(ProjectMutationJournal { files })
     }
 
     /// Re-resolve the **whole** dependency graph once under cooldown's window, pinning every planned

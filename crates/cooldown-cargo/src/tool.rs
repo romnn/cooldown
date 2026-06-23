@@ -23,8 +23,8 @@ use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
     ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext, NativePolicyLayer,
     PackageId, PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId,
-    ToolRead, ToolWrite, VerifyReport, Version,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason,
+    Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -438,6 +438,16 @@ fn reached(after: &BTreeMap<SlotKey, String>, change: &Change) -> bool {
 
 #[async_trait]
 impl ToolWrite for CargoTool {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // `cargo update`/`generate-lockfile` validates every workspace member's declared targets, so
+        // the throwaway copy must include `.rs` source — a member with an empty `src/` errors with "no
+        // targets specified". Source is small (the bulk of a repo is build `target/`, which is pruned).
+        ResolveInputs {
+            source_extensions: &["rs"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

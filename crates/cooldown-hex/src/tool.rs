@@ -14,7 +14,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -166,6 +166,16 @@ impl ReleaseFetcher for HexTool {
 
 #[async_trait]
 impl ToolWrite for HexTool {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // `mix deps.get`/`deps.update` COMPILES `mix.exs` (Elixir) to resolve, and a project's
+        // `mix.exs` frequently reads sibling source (a `@version` from a module, `Code.require_file`,
+        // umbrella `apps/*/mix.exs`), so the throwaway probe copy must carry `.ex`/`.exs` source.
+        ResolveInputs {
+            source_extensions: &["ex", "exs"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

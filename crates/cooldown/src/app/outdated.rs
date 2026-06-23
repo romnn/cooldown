@@ -432,7 +432,7 @@ async fn resolve_held(
     changes: Vec<Change>,
     rewrite: cooldown_core::RewriteMode,
 ) -> cooldown_core::Result<std::collections::HashMap<String, Option<String>>> {
-    let copy = super::project_copy::ProjectCopy::create(project)?;
+    let copy = super::project_copy::ProjectCopy::create(project, &writer.resolve_inputs())?;
     let temp_project = &copy.project;
 
     let plan = Plan { changes, rewrite };

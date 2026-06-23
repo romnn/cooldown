@@ -133,7 +133,10 @@ impl Workspace {
             let _dry_copy;
             let dry_pctx;
             let effective_pctx = if opts.dry_run {
-                match super::project_copy::ProjectCopy::create(&pctx.project) {
+                match super::project_copy::ProjectCopy::create(
+                    &pctx.project,
+                    &writer.resolve_inputs(),
+                ) {
                     Ok(copy) => {
                         dry_pctx = super::ProjectCtx {
                             tool: pctx.tool,

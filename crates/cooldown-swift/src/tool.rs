@@ -14,7 +14,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -166,6 +166,16 @@ impl ReleaseFetcher for SwiftTool {
 
 #[async_trait]
 impl ToolWrite for SwiftTool {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // `swift package` COMPILES `Package.swift` (and any version-specific `Package@swift-N.swift`,
+        // plus helper files it imports) to resolve, so the throwaway probe copy must carry `.swift`
+        // source — otherwise the manifest can't be built and every candidate is falsely held.
+        ResolveInputs {
+            source_extensions: &["swift"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

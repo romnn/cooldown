@@ -293,6 +293,100 @@ pub trait ToolWrite: Send + Sync {
     ) -> Result<SyncReport> {
         Ok(SyncReport::Unsupported)
     }
+
+    /// The files this adapter's mutating resolve reads, so the throwaway [`ProjectCopy`] probe (used by
+    /// `outdated`'s blocked-verification and `--dry-run`) copies ONLY these — never the full source/data
+    /// tree.
+    ///
+    /// The probe copies a project into a tempdir to run the real resolver without touching the real
+    /// lock. Copying everything is catastrophic in a large monorepo (gigabytes of assets, model
+    /// weights, and build data into a tempdir that is often tmpfs/RAM), and the resolver needs none of
+    /// it — only the dependency metadata in manifests, lockfiles, and workspace/registry config. The
+    /// default [`ResolveInputs::DEFAULT`] is the union of those across every supported manager (a
+    /// basename a tool never produces simply never matches), with no source files. Cargo and Go
+    /// override it to add their source extension, because those resolvers validate crate/module targets
+    /// and the import graph against the actual source — an empty `src/` would make the resolve error.
+    fn resolve_inputs(&self) -> ResolveInputs {
+        ResolveInputs::DEFAULT
+    }
+}
+
+/// The files a tool's mutating resolve actually reads — manifests, lockfiles, and workspace/registry
+/// config — so [`ProjectCopy`](crate) copies only these, matched by exact basename anywhere outside
+/// the pruned dirs, plus any `source_extensions` the resolve needs.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolveInputs {
+    /// Exact file basenames to copy wherever they appear in the tree.
+    pub filenames: &'static [&'static str],
+    /// File extensions (without the leading dot) to copy as source. Cargo (`rs`) and Go (`go`)
+    /// validate their targets/import graph against the real source, so the probe must include it;
+    /// declaration-only resolvers (pnpm, uv, deno) leave this empty.
+    pub source_extensions: &'static [&'static str],
+}
+
+impl ResolveInputs {
+    /// Every manifest, lockfile, and workspace/registry-config basename across all supported managers.
+    /// Copying the union is safe — a basename a given tool never produces simply never matches — and
+    /// keeps [`ProjectCopy`](crate) tool-agnostic while still excluding all source and data.
+    pub const FILENAMES: &'static [&'static str] = &[
+        // npm family
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".npmrc",
+        ".pnpmfile.cjs",
+        "yarn.lock",
+        ".yarnrc",
+        ".yarnrc.yml",
+        "bun.lock",
+        "bun.lockb",
+        // deno
+        "deno.json",
+        "deno.jsonc",
+        "deno.lock",
+        // python / uv
+        "pyproject.toml",
+        "uv.lock",
+        "uv.toml",
+        ".python-version",
+        "requirements.txt",
+        "requirements.in",
+        "setup.py",
+        "setup.cfg",
+        "Pipfile",
+        "Pipfile.lock",
+        "poetry.lock",
+        // cargo
+        "Cargo.toml",
+        "Cargo.lock",
+        // go
+        "go.mod",
+        "go.sum",
+        "go.work",
+        "go.work.sum",
+        // ruby
+        "Gemfile",
+        "Gemfile.lock",
+        // elixir / hex
+        "mix.exs",
+        "mix.lock",
+        // maven
+        "pom.xml",
+        // swift
+        "Package.swift",
+        "Package.resolved",
+        // conda
+        "environment.yml",
+        "environment.yaml",
+    ];
+
+    /// The declaration-only default: every known manifest/lock/config basename, no source files.
+    pub const DEFAULT: ResolveInputs = ResolveInputs {
+        filenames: Self::FILENAMES,
+        source_extensions: &[],
+    };
 }
 
 /// Where a tool's native cooldown config lives, which decides how `sync` drives it.
@@ -500,6 +594,10 @@ pub struct RawArtifact {
 pub struct ResolvedPolicy {
     /// The default cooldown window to write into native config, if any.
     pub default_window: Option<WindowSpec>,
+    /// Package selector globs the policy exempts from the cooldown (cooldown.toml `latest`/`allow`),
+    /// to bake into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`). Empty for
+    /// tools without such a native knob, which simply ignore it.
+    pub exempt_packages: Vec<String>,
 }
 
 /// The outcome of a `sync`/[`ToolWrite::write_native`] (post-MVP).

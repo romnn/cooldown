@@ -13,7 +13,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -163,6 +163,16 @@ impl ReleaseFetcher for BundlerTool {
 
 #[async_trait]
 impl ToolWrite for BundlerTool {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // A `gemspec` directive in the Gemfile makes bundler load the project's `*.gemspec` (Ruby),
+        // which typically `require_relative`s a `lib/**/version.rb`. The throwaway probe copy must
+        // carry both, so `.gemspec` and `.rb` source are included; a plain Gemfile ignores them.
+        ResolveInputs {
+            source_extensions: &["rb", "gemspec"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

@@ -20,4 +20,4 @@ pub use model::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, window_exclude_newer,
 };
-pub use resolve::resolve;
+pub use resolve::{exempt_package_globs, resolve};

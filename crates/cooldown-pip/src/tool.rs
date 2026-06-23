@@ -13,7 +13,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -233,6 +233,16 @@ impl<L: PyLayout> ReleaseFetcher for PyTool<L> {
 
 #[async_trait]
 impl<L: PyLayout> ToolWrite for PyTool<L> {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // `pip-compile`/`uv pip compile` EXECUTES a project's `setup.py` (and reads any version/readme
+        // file it imports) to discover its dependencies, so the throwaway probe copy must carry `.py`
+        // source. A purely `requirements.txt`/declarative project ignores the extra files.
+        ResolveInputs {
+            source_extensions: &["py"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

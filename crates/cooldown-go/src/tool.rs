@@ -15,7 +15,7 @@ use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
-    ReleaseFetcher, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
+    ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -147,6 +147,16 @@ impl ReleaseFetcher for GoTool {
 
 #[async_trait]
 impl ToolWrite for GoTool {
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // `go get`/`go mod tidy` reads the package import graph from `.go` source to keep `go.mod`
+        // requires consistent, so the throwaway copy must include source. Go source is small; the bulk
+        // of a repo (build output, modules) is in pruned dirs.
+        ResolveInputs {
+            source_extensions: &["go"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,

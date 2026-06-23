@@ -542,13 +542,18 @@ impl<L: NodeLock> NpmTool<L> {
             return Ok(report);
         }
 
-        let before = journal
+        // The pre-apply lock, captured in the journal. Both the newest-version map (for the move diff)
+        // and the multi-version set (for the exact-pin-vs-float decision) are derived from this one
+        // copy — no extra disk read, and both see exactly the lock the resolve starts from.
+        let before_content = journal
             .files
             .iter()
             .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
             .and_then(|file| file.contents.as_deref())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(locked_versions::<L>)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let before = before_content.map(locked_versions::<L>).unwrap_or_default();
+        let multi_version = before_content
+            .map(multi_version_names::<L>)
             .unwrap_or_default();
 
         // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the current
@@ -560,7 +565,7 @@ impl<L: NodeLock> NpmTool<L> {
         let window_minutes =
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
         match self
-            .whole_graph_resolve(project, plan, window_minutes)
+            .whole_graph_resolve(project, plan, &multi_version, window_minutes)
             .await
         {
             Ok(()) => {}
@@ -633,33 +638,46 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Widen the declaring manifests per [`RewriteMode`], then run the single joint resolve pinning
-    /// every planned candidate to its exact per-package target under the transitive window.
+    /// Build the per-candidate pins (exact target vs range-floated), widen the manifests the exact
+    /// pins need, then run the single joint `--recursive` resolve.
     ///
-    /// `Always` widens every candidate up front; `Auto` widens only the candidates whose target falls
-    /// *outside* their own declared `package.json` range (a cross-major or otherwise out-of-range move).
-    /// This widen is mandatory, not optional: `pnpm update <pkg>@<target> --no-save` re-pins the lock to
-    /// the exact target even when it is out of range, but leaves the manifest as the author wrote it — so
-    /// an unwidened out-of-range pin commits a lock the manifest does not admit, and the very next
-    /// resolve (which re-resolves any package it is *not* pinning, against its manifest range) snaps the
-    /// candidate back into range, breaking the fixed point. Widening the owning constraint first keeps
-    /// the manifest and lock consistent so a converged graph re-applies byte-stable. A candidate the
-    /// resolve still leaves short of its (now in-range) target is held by *another* package's peer
-    /// requirement — a real conflict the lock diff reports, not a missing widen — so no post-resolve
-    /// re-widen loop is needed. The resolve is one
-    /// `pnpm update <pkg>@<target> … --config.minimumReleaseAge=<m>`, so the whole importer graph —
-    /// direct and transitive — settles jointly in a single pass with each candidate at its target.
+    /// A candidate held at a single version across the workspace is **exact-pinned** to its
+    /// per-package target (`name@target`): the resolve lands it at exactly that version, honoring a
+    /// stricter-than-global per-package window with no overshoot. A candidate a member declares at a
+    /// version *other* members also hold at a different version (a v4/v5 split, which pnpm keeps like
+    /// cargo) is **range-floated** by name instead: exact-pinning one target would collapse every other
+    /// copy onto it, so the bare name lets each importer's range re-resolve to its own newest-within-
+    /// window line. The pre-apply lock identifies those multi-version names; a missing/unparsable lock
+    /// means nothing is multi-version yet, so every pin is exact.
+    ///
+    /// Widen is for the exact pins only, and only when their target is out of the declared range
+    /// (`Auto`) or always (`Always`). It is mandatory there: `pnpm update <pkg>@<target> --no-save`
+    /// re-pins the lock to an out-of-range target but leaves the manifest as written, so the next
+    /// resolve (which re-resolves any package it is not pinning, against its manifest range) snaps the
+    /// candidate back into range and breaks the fixed point. A range-floated candidate is never widened
+    /// — widening would let it cross its own range boundary, the very line we are preserving — and it
+    /// stays in range by construction, so it re-applies byte-stable.
+    ///
+    /// `--recursive` is what makes the resolve span the whole workspace: a bare `pnpm update` at the
+    /// root only re-pins root-declared dependencies, so a candidate a member declares would never move.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
+        multi_version: &HashSet<String>,
         window_minutes: Option<i64>,
     ) -> Result<()> {
-        let pins = plan_pins(plan);
+        let mut pins: Vec<(String, Option<String>)> = Vec::with_capacity(plan.changes.len());
         for change in &plan.changes {
-            // `Always` widens every candidate; `Auto` widens only those whose target is out of the
-            // declared range, so an in-range move keeps the author's range while an out-of-range pin
-            // stays consistent with the manifest. A candidate not declared in any owning manifest
+            let name = change.package.name.clone();
+            if multi_version.contains(&name) {
+                // Range-float: preserve every distinct line; never widen (that would cross the range
+                // boundary we are keeping).
+                pins.push((name, None));
+                continue;
+            }
+            // Exact-pin: widen the owning manifest when the target is out of range so the exact lock
+            // pin stays consistent with `package.json`. A candidate not declared in any owning manifest
             // (`target_in_declared_range` returns `false`) is widened too, so the pin is never left
             // dangling against a range that excludes it.
             let widen = match plan.rewrite {
@@ -674,20 +692,20 @@ impl<L: NodeLock> NpmTool<L> {
                     change.to.as_str(),
                 )?;
             }
+            pins.push((name, Some(change.to.as_str().to_string())));
         }
         self.joint_resolve(project, &pins, window_minutes).await?;
-        // The up-front pass already widened every out-of-range target, so a candidate the resolve still
-        // left short of its target is blocked by *another* package's requirement (a peer conflict),
-        // which widening its own declared range cannot resolve — the lock diff reports it held. No
-        // post-resolve re-widen loop is needed: an in-range candidate is never capped by its own range,
-        // and an out-of-range one was already widened before the single pin pass.
+        // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
+        // still left short of its target is blocked by *another* package's requirement (a peer
+        // conflict), which widening its own declared range cannot resolve — the lock diff reports it
+        // held. No post-resolve re-widen loop is needed.
         Ok(())
     }
 
     async fn joint_resolve(
         &self,
         project: &Project,
-        pins: &[(String, String)],
+        pins: &[(String, Option<String>)],
         window_minutes: Option<i64>,
     ) -> Result<()> {
         let Some(args) = L::whole_graph_args(pins, window_minutes) else {
@@ -697,16 +715,17 @@ impl<L: NodeLock> NpmTool<L> {
     }
 }
 
-/// The `(name, target)` pin for every planned candidate, the exact per-package targets the joint
-/// resolve passes to `pnpm update`. `change.to` already encodes each package's own window (computed
-/// by cooldown-core), so pinning it enforces that window exactly — identical to cargo's `--precise`
-/// and go's `module@<to>`. Both the forward `upgrade` targets and the `fix` rollback targets are
-/// passed; pnpm re-pins the lock to whatever exact version it is given.
-fn plan_pins(plan: &Plan) -> Vec<(String, String)> {
-    plan.changes
-        .iter()
-        .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
-        .collect()
+/// Names a workspace importer DECLARES at more than one distinct version — a genuine v4/v5 split that
+/// must be range-floated (exact-pinning one target would collapse the other line), unlike everything
+/// else which is exact-pinned.
+///
+/// Derived from per-importer declarations (`member_sources`), NOT the full resolved package set: a
+/// direct dependency that merely shares a name with a transitive copy resolved at another version is
+/// single-declared, so it stays exact-pinned — its per-package window and any out-of-range widen are
+/// honored. Counting the whole resolved graph instead would misclassify such a dep as multi-version
+/// and float it, dropping the widen so a cross-major/out-of-range target can never land.
+fn multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
+    L::member_sources(content).names_declared_at_multiple_versions()
 }
 
 #[async_trait]
@@ -766,7 +785,18 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             // expressed, so leave the file untouched.
             return Ok(SyncReport::Unchanged { path });
         };
-        let changed = set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
+        let mut changed =
+            set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
+        // The cooldown.toml `latest`/`allow` packages become pnpm's native per-package exemption list,
+        // so a package cooldown's own policy exempts is also exempt from pnpm's rolling
+        // minimumReleaseAge gate (otherwise the native window would still quarantine it). An empty list
+        // removes the key, so toggling a package back under the cooldown cleans up after itself.
+        changed |= set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &policy.exempt_packages,
+            dry_run,
+        )?;
         Ok(if changed {
             SyncReport::Written { path }
         } else {
@@ -839,6 +869,85 @@ fn set_yaml_scalar(path: &Utf8Path, key: &str, value: &str, dry_run: bool) -> Re
     Ok(changed)
 }
 
+/// Set a top-level YAML block sequence (`key:\n  - item\n  - item`) in a file, preserving comments
+/// and the rest of the document, writing only when it changes (idempotent). An empty `items` removes
+/// the key and its block entirely, so the native config never carries an empty exemption list (and a
+/// package toggled back under the cooldown cleans up after itself). Items are emitted as double-quoted
+/// scalars — safe for scoped names (`@scope/pkg`) and glob patterns (`@scope/*`) — in the order given
+/// (the caller sorts them for determinism). A missing file with non-empty `items` is created.
+///
+/// Under `dry_run` the file is never written; the return value still reports whether it would change.
+fn set_yaml_block_list(
+    path: &Utf8Path,
+    key: &str,
+    items: &[String],
+    dry_run: bool,
+) -> Result<bool> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    };
+
+    // The canonical block we want, or empty when there are no items (the key is then absent).
+    let desired: Vec<String> = if items.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(format!("{key}:"))
+            .chain(items.iter().map(|item| format!("  - \"{item}\"")))
+            .collect()
+    };
+
+    let prefix = format!("{key}:");
+    let mut out: Vec<String> = Vec::new();
+    let mut existing: Vec<String> = Vec::new();
+    let mut found = false;
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        // A top-level key has no leading indentation; its block is the following indented lines.
+        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
+            found = true;
+            existing.push(line.to_string());
+            while lines
+                .peek()
+                .is_some_and(|next| next.starts_with(char::is_whitespace))
+            {
+                existing.push(lines.next().unwrap_or_default().to_string());
+            }
+            // Splice the desired block where the old one was (or drop it when empty).
+            out.extend(desired.iter().cloned());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+
+    let changed = if found {
+        existing != desired
+    } else {
+        !desired.is_empty()
+    };
+    if !changed || dry_run {
+        return Ok(changed);
+    }
+
+    let mut text = if found {
+        out.join("\n")
+    } else {
+        // Append the new block after the existing document (e.g. below `minimumReleaseAge`).
+        let mut text = content.clone();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&desired.join("\n"));
+        text
+    };
+    if content.ends_with('\n') || !found {
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,19 +994,27 @@ mod tests {
         // stricter-windowed package lands at its own (possibly older) target rather than overshooting.
         // The window rides inline as `minimumReleaseAge`, the floor for any fresh transitive the pins
         // drag in.
+        // An exact pin (`Some`) becomes `name@target`; a range-floated multi-version candidate (`None`)
+        // becomes the bare name, so each importer's range re-resolves instead of collapsing onto one
+        // target. `--recursive` so a candidate a workspace member declares (not the root `package.json`)
+        // is actually re-pinned; a bare `pnpm update` at the root would skip it.
         let pins = vec![
-            ("eslint".to_string(), "9.5.0".to_string()),
+            ("eslint".to_string(), Some("9.5.0".to_string())),
             (
                 "@typescript-eslint/eslint-plugin".to_string(),
-                "8.0.0".to_string(),
+                Some("8.0.0".to_string()),
             ),
+            // Held at several versions across importers, so floated by range rather than pinned.
+            ("chalk".to_string(), None),
         ];
         assert_eq!(
             Pnpm::whole_graph_args(&pins, Some(20160)),
             Some(vec![
                 "update".to_string(),
+                "--recursive".to_string(),
                 "eslint@9.5.0".to_string(),
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
+                "chalk".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
@@ -1014,6 +1131,107 @@ mod tests {
             Utf8PathBuf::from_path_buf(dir.path().join("absent.yaml")).expect("utf8 path");
         assert!(set_yaml_scalar(&missing, "minimumReleaseAge", "20160", true).expect("dry new"));
         assert!(!missing.exists(), "dry run must not create the file");
+    }
+
+    #[test]
+    fn set_yaml_block_list_adds_updates_removes_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            "minimumReleaseAge: 20160\npackages:\n  - \"a\"\n# keep me\n",
+        )
+        .expect("write");
+
+        // Absent key → block appended, the rest of the document (scalar, packages, comment) preserved.
+        let items = vec![
+            "@typescript/native-preview".to_string(),
+            "@scope/*".to_string(),
+        ];
+        assert!(
+            set_yaml_block_list(&path, "minimumReleaseAgeExclude", &items, false).expect("add")
+        );
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(after.contains(
+            "minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\"\n  - \"@scope/*\""
+        ));
+        assert!(
+            after.contains("minimumReleaseAge: 20160"),
+            "scalar preserved"
+        );
+        assert!(after.contains("packages:"), "packages preserved");
+        assert!(after.contains("# keep me"), "comment preserved");
+
+        // Idempotent: the same items rewrite nothing.
+        assert!(
+            !set_yaml_block_list(&path, "minimumReleaseAgeExclude", &items, false).expect("again")
+        );
+
+        // Update in place: a different list replaces the block.
+        let fewer = vec!["@typescript/native-preview".to_string()];
+        assert!(
+            set_yaml_block_list(&path, "minimumReleaseAgeExclude", &fewer, false).expect("update")
+        );
+        let updated = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            updated.contains("minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\"\n")
+        );
+        assert!(!updated.contains("@scope/*"), "dropped item is gone");
+        assert!(updated.contains("# keep me"), "comment still preserved");
+
+        // Empty list → the key and its block are removed entirely.
+        assert!(
+            set_yaml_block_list(&path, "minimumReleaseAgeExclude", &[], false).expect("remove")
+        );
+        let removed = std::fs::read_to_string(&path).expect("read");
+        assert!(!removed.contains("minimumReleaseAgeExclude"), "key removed");
+        assert!(
+            removed.contains("minimumReleaseAge: 20160"),
+            "scalar untouched"
+        );
+        // Removing again is a no-op.
+        assert!(!set_yaml_block_list(&path, "minimumReleaseAgeExclude", &[], false).expect("noop"));
+    }
+
+    #[tokio::test]
+    async fn write_native_writes_minimum_release_age_exclude_for_latest_packages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - \"a\"\n").expect("write");
+        let project = Project {
+            root: root.clone(),
+            kind: crate::lock::Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let policy = cooldown_core::ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 14),
+            )),
+            exempt_packages: vec!["@typescript/native-preview".to_string()],
+        };
+
+        let tool = NpmTool::<crate::lock::Pnpm>::from_http(
+            SharedHttp::new(
+                tempfile::tempdir().expect("cache").path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let report = ToolWrite::write_native(&tool, &project, &policy, false)
+            .await
+            .expect("sync");
+        assert!(matches!(report, cooldown_core::SyncReport::Written { .. }));
+        let written = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).expect("read");
+        assert!(
+            written.contains("minimumReleaseAge: 20160"),
+            "window synced"
+        );
+        assert!(
+            written.contains("minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\""),
+            "latest package exempted natively: {written}"
+        );
     }
 
     fn tool() -> NpmTool<Npm> {
