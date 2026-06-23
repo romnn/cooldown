@@ -708,9 +708,12 @@ impl<L: NodeLock> NpmTool<L> {
     }
 }
 
-/// Names a workspace importer DECLARES at more than one distinct version — a genuine v4/v5 split that
-/// must be range-floated (exact-pinning one target would collapse the other line), unlike everything
-/// else which is exact-pinned.
+/// Names workspace importers DECLARE on more than one distinct line — a genuine split that must be
+/// range-floated (exact-pinning one target would collapse the other line), unlike everything else
+/// which is exact-pinned. A name splits when importers resolve it to different versions (a v4/v5
+/// split) OR declare it with different range specifiers (`~7.3.0` vs `^7.0.0`, `"<4"` vs `^4`) — the
+/// latter even at one resolved version, since exact-pinning would still drag the narrower member off
+/// its declared range.
 ///
 /// Derived from per-importer declarations (`member_sources`), NOT the full resolved package set: a
 /// direct dependency that merely shares a name with a transitive copy resolved at another version is

@@ -130,6 +130,11 @@ pub struct MemberIndex {
     exact_version: HashSet<(String, String)>,
     /// Names pinned exactly by every declaring member manifest (npm, which records ranges per name).
     exact_name: HashSet<String>,
+    /// The distinct declared *range specifiers* per name across importers (pnpm records a `specifier:`
+    /// per importer). A name two members declare with different ranges (`~7.3.0` vs `^7.0.0`, `<4` vs
+    /// `^4`) is a version split even when the lock happens to resolve both to one version, so it must
+    /// be range-floated — exact-pinning one target would drag the narrower member off its own range.
+    declared_specifiers: HashMap<String, HashSet<String>>,
     authoritative: bool,
 }
 
@@ -160,6 +165,11 @@ impl MemberIndex {
         self
     }
 
+    fn with_declared_specifiers(mut self, specifiers: HashMap<String, HashSet<String>>) -> Self {
+        self.declared_specifiers = specifiers;
+        self
+    }
+
     /// Whether `name`@`version` is exact-pinned by every member that declares it, so it is held: it
     /// cannot move without editing a manifest.
     #[must_use]
@@ -187,15 +197,21 @@ impl MemberIndex {
             .collect()
     }
 
-    /// Names that workspace importers DECLARE at more than one distinct version — a genuine version
-    /// split (one member on `chalk@^4`, another on `chalk@^5`), NOT a transitive duplicate. Derived
-    /// from per-importer declarations only, so a direct dependency that merely shares a name with a
-    /// transitive copy resolved at another version is single-declared and excluded. Only the
-    /// version-keyed (pnpm) index carries per-version importer data; the name-only (npm) index has none
-    /// and yields nothing. The whole-graph resolve range-floats these (exact-pinning one target would
-    /// collapse the other line) and exact-pins everything else.
+    /// Names that workspace importers DECLARE at more than one distinct line — a genuine split that
+    /// must be range-floated, NOT a transitive duplicate. A name splits when importers either resolve
+    /// it to different versions (one member on `chalk@4.1.2`, another on `chalk@5.3.0`) OR declare it
+    /// with different *range specifiers* (`semver@~7.3.0` vs `semver@^7.0.0`, `tailwindcss@"<4"` vs
+    /// `@^4`) — the latter even when the lock happens to resolve both to one version. Either way an
+    /// exact pin would collapse every copy onto a single target, dragging the narrower member off its
+    /// own declared range; the whole-graph resolve range-floats these instead and exact-pins the rest.
+    ///
+    /// Derived from per-importer declarations only, so a direct dependency that merely shares a name
+    /// with a transitive copy resolved at another version is single-declared and excluded. Only the
+    /// version-keyed (pnpm) index carries per-importer data; the name-only (npm) index has none and
+    /// yields nothing.
     #[must_use]
     pub fn names_declared_at_multiple_versions(&self) -> HashSet<String> {
+        let mut split: HashSet<String> = HashSet::new();
         let mut versions: HashMap<&str, HashSet<&str>> = HashMap::new();
         for (name, version) in self.by_version.keys() {
             versions
@@ -203,10 +219,20 @@ impl MemberIndex {
                 .or_default()
                 .insert(version.as_str());
         }
-        versions
-            .into_iter()
-            .filter_map(|(name, set)| (set.len() > 1).then(|| name.to_string()))
-            .collect()
+        for (name, set) in versions {
+            if set.len() > 1 {
+                split.insert(name.to_string());
+            }
+        }
+        // A name whose importers declare DIFFERENT range specifiers is a split too, even if the lock
+        // currently resolves them to the same version: an exact pin to one member's target would force
+        // the narrower-ranged sibling off its own range (the `~7.3.0`/`^7.0.0` and `<4`/`^4` cases).
+        for (name, specifiers) in &self.declared_specifiers {
+            if specifiers.len() > 1 {
+                split.insert(name.clone());
+            }
+        }
+        split
     }
 
     /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
@@ -306,6 +332,7 @@ impl NodeLock for Pnpm {
     fn member_sources(content: &str) -> MemberIndex {
         MemberIndex::version_exact(parse_pnpm_importer_members(content))
             .with_exact_versions(parse_pnpm_exact_pins(content))
+            .with_declared_specifiers(parse_pnpm_importer_specifiers(content))
     }
 
     fn relock_args() -> Vec<String> {
@@ -526,6 +553,78 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
                                 .or_default()
                                 .push(member.clone());
                         }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Maps each dependency name to the set of distinct range *specifiers* its workspace-member importers
+/// declare, read from `pnpm-lock.yaml`'s `importers:` section (each dependency records a `specifier:`
+/// line — the declared range). A name two importers declare with different specifiers (`~7.3.0` vs
+/// `^7.0.0`, `"<4"` vs `^4`) is a version split that must be range-floated, even when both currently
+/// resolve to the same version.
+///
+/// Only plain registry ranges count. A specifier carrying a protocol (`link:`, `file:`, `workspace:`,
+/// `catalog:`, `npm:` aliases, `git+…`, a URL) is skipped — a semver range never contains a `:`, so
+/// the colon test rejects every non-range form. Without it a `catalog:` reference or `npm:` alias on
+/// one member alongside a plain range on another would read as two distinct "ranges" and force a
+/// spurious split (collapsing the dep off its exact pin) even though both resolve to one version.
+///
+/// Specifiers are deduplicated PER IMPORTER (`(member, name)`): a single importer that lists the same
+/// name in two groups (e.g. `dependencies` and `peerDependencies`) with different ranges is one
+/// declaration, not a split — only the first group's specifier is kept, so a lone importer can never
+/// split itself.
+fn parse_pnpm_importer_specifiers(content: &str) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut recorded: HashSet<(String, String)> = HashSet::new();
+    let mut in_importers = false;
+    let mut member: Option<String> = None;
+    let mut in_group = false;
+    let mut dep_name: Option<String> = None;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => {
+                in_importers = trimmed == "importers:";
+                member = None;
+                in_group = false;
+                dep_name = None;
+            }
+            2 if in_importers => {
+                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')).to_string());
+                in_group = false;
+                dep_name = None;
+            }
+            4 if in_importers => {
+                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
+                dep_name = None;
+            }
+            6 if in_importers && in_group => {
+                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
+                dep_name = (!name.is_empty()).then(|| name.to_string());
+            }
+            8 if in_importers && in_group => {
+                if let (Some(member), Some(name)) = (member.as_ref(), dep_name.as_ref())
+                    && let Some(raw) = trimmed.strip_prefix("specifier:")
+                {
+                    let specifier = unquote_yaml_scalar(raw);
+                    // A semver range never contains `:`; every protocol/alias form (`workspace:`,
+                    // `catalog:`, `npm:`, `git+…`, a URL) does, so the colon test keeps only ranges.
+                    if !specifier.is_empty()
+                        && !specifier.contains(':')
+                        && recorded.insert((member.clone(), name.clone()))
+                    {
+                        map.entry(name.clone())
+                            .or_default()
+                            .insert(specifier.to_string());
                     }
                 }
             }
@@ -979,6 +1078,101 @@ packages:
         assert!(
             !split.contains("foo"),
             "foo is declared at one version by importers; its transitive 2.0.0 copy must not flag it"
+        );
+    }
+
+    #[test]
+    fn names_declared_at_multiple_specifiers_are_a_split_even_at_one_resolved_version() {
+        // `semver` is declared with DIFFERENT ranges (`~7.3.0` and `^7.0.0`) by two importers that the
+        // lock resolves to the SAME `7.3.8` — a specifier split that exact-pinning would collapse,
+        // dragging the `~7.3.0` member off its own range. It must be flagged for range-floating even
+        // though `by_version` sees a single resolved version. `chalk` is the control: both importers
+        // declare the SAME `^5.0.0` at the same resolved version, so it stays exact-pinnable.
+        let lock = indoc! {"
+            importers:
+
+              pkgs/tilde:
+                dependencies:
+                  semver:
+                    specifier: ~7.3.0
+                    version: 7.3.8
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.3.0
+
+              pkgs/caret:
+                dependencies:
+                  semver:
+                    specifier: ^7.0.0
+                    version: 7.3.8
+                  chalk:
+                    specifier: ^5.0.0
+                    version: 5.3.0
+
+            packages:
+
+              semver@7.3.8:
+                resolution: {integrity: sha512-a}
+              chalk@5.3.0:
+                resolution: {integrity: sha512-b}
+        "};
+        let index = Pnpm::member_sources(lock);
+        let split = index.names_declared_at_multiple_versions();
+        assert!(
+            split.contains("semver"),
+            "semver is declared at ~7.3.0 and ^7.0.0 — a specifier split even at one resolved version"
+        );
+        assert!(
+            !split.contains("chalk"),
+            "chalk is declared with the same ^5.0.0 range at one version — not a split, stays exact-pinnable"
+        );
+    }
+
+    #[test]
+    fn specifier_split_ignores_protocols_and_single_importer_groups() {
+        // `react`: one member references it via a pnpm `catalog:` and another via a plain `^18.0.0`,
+        // both resolving to 18.2.0. The `catalog:` form is not a registry range, so it must be ignored
+        // — leaving a single real specifier, NOT a split. `next`: a single importer lists it in BOTH
+        // `dependencies` and `peerDependencies` with different ranges; one importer cannot split
+        // itself, so only the first group's specifier counts. Neither may be flagged, or a uniformly
+        // declared dependency would lose its exact pin (and its cross-major widen).
+        let lock = indoc! {"
+            importers:
+
+              pkgs/app:
+                dependencies:
+                  react:
+                    specifier: catalog:
+                    version: 18.2.0
+                  next:
+                    specifier: ^14.0.0
+                    version: 14.2.0
+                peerDependencies:
+                  next:
+                    specifier: '>=13'
+                    version: 14.2.0
+
+              pkgs/lib:
+                dependencies:
+                  react:
+                    specifier: ^18.0.0
+                    version: 18.2.0
+
+            packages:
+
+              react@18.2.0:
+                resolution: {integrity: sha512-a}
+              next@14.2.0:
+                resolution: {integrity: sha512-b}
+        "};
+        let split = Pnpm::member_sources(lock).names_declared_at_multiple_versions();
+        assert!(
+            !split.contains("react"),
+            "react's catalog: reference is not a range; with one real specifier it must not split"
+        );
+        assert!(
+            !split.contains("next"),
+            "next is declared by a single importer (deps + peer); one importer cannot split itself"
         );
     }
 
