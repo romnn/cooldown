@@ -417,7 +417,10 @@ async fn releases_skip_cross_major_probe_when_scope_is_current_major_only() {
 }
 
 #[tokio::test]
-async fn releases_fail_closed_on_cross_major_probe_error_when_enabled() {
+async fn releases_skip_cross_major_when_probe_fails_transiently() {
+    // A transient failure on a next-major discovery probe is indistinguishable from "no such major"
+    // for discovery, so it degrades to a miss: the dependency keeps its already-computed
+    // current-major release set instead of erroring the whole fetch.
     let routes = HashMap::from([
         ("/example.com/mod/@v/list".to_string(), (200, "v1.0.0\n")),
         (
@@ -426,7 +429,7 @@ async fn releases_fail_closed_on_cross_major_probe_error_when_enabled() {
         ),
         (
             "/example.com/mod/v2/@v/list".to_string(),
-            (500, "cross-major probe should fail"),
+            (500, "cross-major probe fails transiently"),
         ),
     ]);
     let server = TestServer::new(routes);
@@ -443,15 +446,16 @@ async fn releases_fail_closed_on_cross_major_probe_error_when_enabled() {
     let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
     let project = project(&root);
 
-    let error = tool
+    let releases = tool
         .releases(
             &dep("example.com/mod", "v1.0.0"),
             &fetch_ctx(&project),
             CandidateScope::AllowCrossMajor,
         )
         .await
-        .expect_err("cross-major probe must fail closed");
-    assert!(error.is_transient());
+        .expect("transient cross-major probe must degrade to no newer major");
+    assert_eq!(releases.len(), 1);
+    assert_eq!(releases[0].version.as_str(), "v1.0.0");
 }
 
 #[tokio::test]

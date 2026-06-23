@@ -240,12 +240,23 @@ async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<Strin
     let mut next_major = current_major + 1;
     while misses < 2 && next_major <= current_major + 8 {
         let path = semver::major_path(&prefix, next_major);
-        let list = proxy.list(&path).await?;
-        if list.is_empty() {
-            misses += 1;
-        } else {
-            found.push(path);
-            misses = 0;
+        // A next-major probe is best-effort discovery: cooldown does not know whether `vN+1` exists,
+        // so it speculatively lists it. A genuine absence (404/410 → empty list) is a miss, and a
+        // transient failure (timeout / 429 / 5xx under the concurrent burst) is indistinguishable
+        // from absence for discovery, so it degrades to a miss too rather than failing the whole
+        // dependency's release fetch. Only a non-transient fault (e.g. an unparsable list) is a real
+        // error worth surfacing.
+        match proxy.list(&path).await {
+            Ok(list) if !list.is_empty() => {
+                found.push(path);
+                misses = 0;
+            }
+            Ok(_) => misses += 1,
+            Err(err) if err.is_transient() => {
+                tracing::debug!(%path, %err, "next-major probe failed transiently; treating as no newer major");
+                misses += 1;
+            }
+            Err(err) => return Err(err),
         }
         next_major += 1;
     }
@@ -269,8 +280,16 @@ async fn discover_lower_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec
         } else {
             semver::major_path(&prefix, major)
         };
-        if !proxy.list(&path).await?.is_empty() {
-            found.push(path);
+        // Like the upward walk, a lower-major probe is best-effort discovery: an absent major (empty
+        // list) is skipped, and a transient failure degrades to "skip this path" rather than failing
+        // the dependency. Only a non-transient fault propagates.
+        match proxy.list(&path).await {
+            Ok(list) if !list.is_empty() => found.push(path),
+            Ok(_) => {}
+            Err(err) if err.is_transient() => {
+                tracing::debug!(%path, %err, "lower-major probe failed transiently; skipping this major");
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(found)

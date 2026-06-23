@@ -24,6 +24,26 @@ pub(super) enum PlanMode {
     },
 }
 
+/// The dependency scope the planner hands to the resolver as upgrade/downgrade *candidates*.
+///
+/// `upgrade` actively moves only DIRECT requires forward; the resolver promotes indirect deps as a
+/// consequence of those bumps (surfaced as collateral applied rows), so handing indirect deps to the
+/// resolver as candidates only produces attempt-and-reject noise for floors nothing direct raises.
+/// `fix` instead walks the resolved graph to downgrade too-fresh transitives, so it stays
+/// graph-scoped unless `--transitive hide` narrows it to direct. The window is still enforced on
+/// indirect deps regardless: `graph_violations` and `reconcile_to_fixpoint` read the raw unscoped
+/// graph and roll back any too-fresh transitive that floats up.
+fn candidate_scope(mode: PlanMode) -> DepScope {
+    match mode {
+        PlanMode::Upgrade
+        | PlanMode::Fix {
+            transitive: TransitiveGate::Hide,
+            ..
+        } => DepScope::Direct,
+        PlanMode::Fix { .. } => DepScope::Graph,
+    }
+}
+
 /// Backstop on the `fix`/reconcile fixpoint loop: a downgrade can lower another dep's floor and
 /// make it newly fixable (an umbrella module freeing its submodules), so planning re-runs after each
 /// round until nothing new is planned. Real graphs converge in a few rounds; this only guards a
@@ -142,19 +162,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
-        // Both commands work the whole resolved graph by default: `upgrade` moves every dep (direct
-        // and indirect) toward its newest matured version, `fix` rolls too-fresh ones back. So an
-        // indirect dep a `fix` rolled back is re-adopted by `upgrade` once its newer version clears
-        // the window — the downgrade is a floor, not a pin. `--transitive hide` narrows to direct.
-        let transitive = match self.mode {
-            PlanMode::Fix { transitive, .. } => transitive,
-            PlanMode::Upgrade => self.transitive_mode(),
-        };
-        let scope = if transitive == TransitiveGate::Hide {
-            DepScope::Direct
-        } else {
-            DepScope::Graph
-        };
+        let scope = candidate_scope(self.mode);
         match self
             .ws
             .dependencies_in_scope(self.ctx.reader, self.ctx.pctx, scope, self.ctx.opts)
@@ -997,10 +1005,46 @@ fn record_skip_item(
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict_skip_message, is_downgrade, target_package};
+    use super::{PlanMode, candidate_scope, conflict_skip_message, is_downgrade, target_package};
+    use crate::app::TransitiveGate;
     use cooldown_core::{
-        MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId, Version,
+        DepScope, MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId,
+        Version,
     };
+
+    #[test]
+    fn upgrade_scopes_candidates_to_direct_requires() {
+        // `upgrade` hands only direct requires to the resolver; MVS promotes indirect deps as a
+        // consequence, so indirect deps are never attempt-and-rejected as candidates.
+        assert_eq!(candidate_scope(PlanMode::Upgrade), DepScope::Direct);
+    }
+
+    #[test]
+    fn fix_walks_the_graph_unless_transitive_hidden() {
+        // `fix` must see the resolved graph to downgrade too-fresh transitives.
+        assert_eq!(
+            candidate_scope(PlanMode::Fix {
+                transitive: TransitiveGate::Enforce,
+                downgrade_pinned: false,
+            }),
+            DepScope::Graph
+        );
+        assert_eq!(
+            candidate_scope(PlanMode::Fix {
+                transitive: TransitiveGate::Allow,
+                downgrade_pinned: false,
+            }),
+            DepScope::Graph
+        );
+        // `--transitive hide` narrows `fix` candidates to direct deps.
+        assert_eq!(
+            candidate_scope(PlanMode::Fix {
+                transitive: TransitiveGate::Hide,
+                downgrade_pinned: false,
+            }),
+            DepScope::Direct
+        );
+    }
 
     #[test]
     fn conflict_skip_message_names_a_different_offender() {
