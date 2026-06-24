@@ -235,6 +235,23 @@ impl MemberIndex {
         split
     }
 
+    /// The version `member` (an importer path) resolves `name` to, if this index carries per-importer
+    /// version data (pnpm) and the member declares the name. `None` for the name-only (npm) index,
+    /// which records no per-importer version, and for a member that does not declare the name.
+    ///
+    /// Each importer declares a name at exactly one version, so the first match is the answer. Used to
+    /// tell whether a candidate actually landed at *its declaring member*, not merely at the name's
+    /// newest copy somewhere else in the graph (a multi-version dep's higher line).
+    #[must_use]
+    pub fn resolved_version(&self, member: &str, name: &str) -> Option<&str> {
+        self.by_version
+            .iter()
+            .find_map(|((entry_name, version), members)| {
+                (entry_name == name && members.iter().any(|path| path == member))
+                    .then_some(version.as_str())
+            })
+    }
+
     /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
     /// lock carries no per-member attribution for this dependency.
     #[must_use]

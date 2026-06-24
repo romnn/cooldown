@@ -345,3 +345,39 @@ fn upgrade_never_moves_an_importer_out_of_its_declared_range() {
         "the v6 member's manifest must stay ^6.0.0 (never widened across the major): {manifest}"
     );
 }
+
+#[test]
+fn outdated_marks_a_cross_line_multi_version_bump_blocked_not_adoptable() {
+    skip_if_missing!("pnpm");
+    let fixture = multiline_fixture();
+
+    // Converge both lines within their own major: v6 → 6.3.1, v7 → 7.5.4. The only move left for the
+    // `^6` line is a cross-major bump onto v7 — which `upgrade` floats in-range and never takes.
+    fixture
+        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
+        .expect_success();
+
+    // `outdated --major` must AGREE with what `upgrade --major` does: the cross-line bump the resolve
+    // floats in-range is reported `blocked`, never `adoptable`. Before the per-member `reached` fix the
+    // resolve judged it landed (the name's newest copy, v7, already sat at the target), so `outdated`
+    // advertised an adoptable update `upgrade` would silently hold — the classification bug.
+    let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    let blocked = outdated.outdated_with_status("blocked");
+    assert!(
+        !adoptable.contains("semver"),
+        "the cross-line ^6→v7 bump must NOT be adoptable (upgrade floats v6 within ^6): adoptable={adoptable:?}"
+    );
+    assert!(
+        blocked.contains("semver"),
+        "the cross-line multi-version bump must be reported blocked: blocked={blocked:?}"
+    );
+
+    // `upgrade --major` agrees: it never applies the held cross-line bump (the v6 line stays in ^6).
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE, "--dry-run"]);
+    assert!(
+        !upgrade.applied_names().contains("semver"),
+        "upgrade must not apply the cross-line multi-version bump\napplied={:?}",
+        upgrade.applied_names()
+    );
+}

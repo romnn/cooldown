@@ -588,6 +588,13 @@ pub enum SkipReason {
     /// need `--major`), but unlike a real skip it never fails a `--strict` run — you chose not to
     /// take it, the run did not fail to.
     NeedsMajor,
+    /// The dependency is declared at multiple versions across the workspace, so it is range-floated
+    /// (each importer kept on its own line) rather than pinned to one target. A candidate whose target
+    /// is out of this importer's line — a cross-line bump, e.g. one member on `@types/node@^22` while
+    /// the target is `25`, or a peer-only dependency the resolver will not move — is deliberately held
+    /// in range. Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
+    /// upgrade, so it never fails a `--strict` run.
+    MultiVersionHeld,
 }
 
 impl SkipReason {
@@ -615,6 +622,9 @@ impl SkipReason {
                 "no editable requirement to change (transitive-only or path/git dependency)"
             }
             SkipReason::NeedsMajor => "needs --major to adopt",
+            SkipReason::MultiVersionHeld => {
+                "declared at multiple versions across the workspace; kept on its own line"
+            }
         }
     }
 }
@@ -764,6 +774,8 @@ mod tests {
             SkipReason::TransitiveInCooldown,
             SkipReason::ResolverConflict,
             SkipReason::NotEligible,
+            SkipReason::NeedsMajor,
+            SkipReason::MultiVersionHeld,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

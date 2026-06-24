@@ -617,7 +617,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn record_batch_skips(&mut self, skipped: Vec<cooldown_core::Skipped>) {
         for skipped in skipped {
             let offending = skipped.offending.map(|package| package.name);
-            self.acc.strict_incomplete = true;
+            // A multi-version dependency held within its own line is conservative-correct, not a
+            // failed upgrade — like `NeedsMajor` it must not fail a `--strict` run.
+            if skipped.reason != SkipReason::MultiVersionHeld {
+                self.acc.strict_incomplete = true;
+            }
             let change = skipped.change;
             self.record_change_skip(
                 &change,

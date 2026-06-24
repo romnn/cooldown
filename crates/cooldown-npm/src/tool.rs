@@ -409,17 +409,45 @@ fn collateral_change<L: NodeLock>(name: &str, from: &str, to: &str) -> Change {
     }
 }
 
-/// Whether a planned candidate landed at or beyond its target in `after`, respecting the move's
-/// direction: a forward move must reach at/above its target, a downgrade at/below it. A package the
-/// resolve dropped from the lock (no entry) counts as not reached.
-fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
-    after.get(&change.package.name).is_some_and(|landed| {
+/// Whether a planned candidate landed at or beyond its target, respecting the move's direction (a
+/// forward move must reach at/above its target, a downgrade at/below it).
+///
+/// Checked **per declaring member**, not against the name's newest copy: a multi-version dependency is
+/// range-floated, so a cross-line candidate (one member on `@types/node@^22` while the target is `25`,
+/// or a peer-only dep the resolver will not move) leaves *its* member short of the target even though
+/// the name's newest copy — a higher line owned by another member — already sits at it. Checking only
+/// the newest copy would falsely report such a candidate as landed.
+///
+/// A candidate landed when *at least one* of its declaring members reached the target — the bump took
+/// for that member, even if a sibling on a tighter range stayed behind (so partial float progress is
+/// committed and reported, not rolled back). It is held only when *no* declaring member reached it,
+/// which is exactly the cross-line / peer-only hold `outdated` must not call adoptable. Falls back to
+/// the newest copy when the change carries no member attribution (a collateral move) or the lock has
+/// no per-member version data.
+fn reached(
+    after_newest: &HashMap<String, String>,
+    after_members: &crate::lock::MemberIndex,
+    change: &Change,
+) -> bool {
+    let name = change.package.name.as_str();
+    let satisfied = |landed: &str| {
         let ordering = version::compare(landed, change.to.as_str());
         if change.downgrade {
             ordering.is_le()
         } else {
             ordering.is_ge()
         }
+    };
+    if change.members.is_empty() {
+        return after_newest
+            .get(name)
+            .map(String::as_str)
+            .is_some_and(satisfied);
+    }
+    change.members.iter().any(|member| {
+        after_members
+            .resolved_version(&member.path, name)
+            .is_some_and(satisfied)
     })
 }
 
@@ -579,6 +607,10 @@ impl<L: NodeLock> NpmTool<L> {
 
         let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let after = locked_versions::<L>(&after_content);
+        // Per-importer resolved versions, so a candidate's landing is judged at *its* member rather
+        // than the name's newest copy — the multi-version float leaves a lower line short of a
+        // cross-line target the higher line already satisfies.
+        let after_members = L::member_sources(&after_content);
         let planned: HashSet<&str> = plan
             .changes
             .iter()
@@ -597,12 +629,23 @@ impl<L: NodeLock> NpmTool<L> {
                 (None, Some(_)) | (Some(_), None) => true,
                 (None, None) => false,
             };
-            if reached(&after, change) {
+            if reached(&after, &after_members, change) {
                 if moved {
                     report.applied.push(change.clone());
                 }
                 // Reached its target without a net lock move — already satisfied (a duplicate copy of
                 // the same name is at the target). A no-op, neither applied nor held.
+            } else if multi_version.contains(name) {
+                // A dependency declared at multiple versions across the workspace is range-floated, so
+                // a candidate whose target is out of this member's line — a cross-line bump, or a
+                // peer-only dep `pnpm update` will not move — is deliberately kept in range, not pinned
+                // to the target. That is a conservative hold, not a resolver conflict, and it must not
+                // be advertised as adoptable: `outdated`'s verify reclassifies it blocked.
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::MultiVersionHeld,
+                    offending: None,
+                });
             } else {
                 // The joint resolve could not place this candidate at its target without breaking the
                 // lock — a mutually-exclusive peer won. Name the sibling whose peer choice excluded it
@@ -1040,18 +1083,75 @@ mod tests {
 
     #[test]
     fn reached_respects_move_direction() {
+        // These changes carry no members, so `reached` falls back to the name's newest copy.
+        let members = crate::lock::MemberIndex::default();
         let mut after = HashMap::new();
         after.insert("pkg-a".to_string(), "2.0.0".to_string());
         let forward = change("pkg-a", "1.0.0", "2.0.0");
-        assert!(reached(&after, &forward));
+        assert!(reached(&after, &members, &forward));
         let forward_short = change("pkg-a", "1.0.0", "2.1.0");
-        assert!(!reached(&after, &forward_short));
+        assert!(!reached(&after, &members, &forward_short));
         let mut down = change("pkg-a", "3.0.0", "2.0.0");
         down.downgrade = true;
-        assert!(reached(&after, &down));
+        assert!(reached(&after, &members, &down));
         let mut down_short = change("pkg-a", "3.0.0", "1.0.0");
         down_short.downgrade = true;
-        assert!(!reached(&after, &down_short));
+        assert!(!reached(&after, &members, &down_short));
+    }
+
+    #[test]
+    fn reached_checks_the_declaring_member_not_the_names_newest_copy() {
+        // A multi-version dependency: `pkgs/low` is on the v22 line, `pkgs/high` on v25. A candidate
+        // bumping `pkgs/low` to 25 must be judged at `pkgs/low`'s own copy (still 22) — NOT the name's
+        // newest copy (25, owned by `pkgs/high`), which would falsely report it landed.
+        let lock = "\
+importers:
+
+  pkgs/low:
+    dependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.20
+
+  pkgs/high:
+    dependencies:
+      '@types/node':
+        specifier: ^25.0.0
+        version: 25.9.2
+
+packages:
+
+  '@types/node@22.19.20':
+    resolution: {integrity: sha512-a}
+  '@types/node@25.9.2':
+    resolution: {integrity: sha512-b}
+";
+        let after_members = Pnpm::member_sources(lock);
+        let after_newest = locked_versions::<Pnpm>(lock);
+        assert_eq!(
+            after_newest.get("@types/node").map(String::as_str),
+            Some("25.9.2")
+        );
+
+        let mut low = change("@types/node", "22.19.20", "25.9.2");
+        low.members = vec![MemberRef {
+            name: "low".to_string(),
+            path: "pkgs/low".to_string(),
+        }];
+        assert!(
+            !reached(&after_newest, &after_members, &low),
+            "the v22 member did not reach 25 even though the name's newest copy is 25"
+        );
+
+        let mut high = change("@types/node", "25.0.0", "25.9.2");
+        high.members = vec![MemberRef {
+            name: "high".to_string(),
+            path: "pkgs/high".to_string(),
+        }];
+        assert!(
+            reached(&after_newest, &after_members, &high),
+            "the v25 member's own copy is at the target"
+        );
     }
 
     #[test]
