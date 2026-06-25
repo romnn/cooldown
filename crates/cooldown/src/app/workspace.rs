@@ -128,6 +128,12 @@ pub struct RunOpts {
     pub tool: Vec<ToolId>,
     /// Scope to packages matching any of these globs (empty = all).
     pub package: Vec<PatternGlob>,
+    /// Scope dependency rows to the workspace member containing this directory.
+    ///
+    /// Set by the CLI when `-C/--dir` points below a detected workspace root. This is intentionally
+    /// separate from [`package`](Self::package): `--package` filters dependency names, while this
+    /// filters source members so existing `cooldown --package serde` behavior stays unchanged.
+    pub source_dir: Option<Utf8PathBuf>,
     /// `exclude-folders` globs (`[global]`/`[<command>]`), `.gitignore` semantics. Beyond pruning
     /// project detection, these also drop a dependency whose declaring workspace members all sit
     /// under an excluded path — so a pnpm/cargo workspace can exclude a member's deps even though one
@@ -375,10 +381,18 @@ impl Workspace {
         self.projects
             .iter()
             .filter(move |project| opts.tool.is_empty() || opts.tool.contains(&project.tool))
+            .filter(move |project| Self::project_in_source_scope(project, opts))
     }
 
     pub(crate) fn package_in_scope(opts: &RunOpts, name: &str) -> bool {
         opts.package.is_empty() || opts.package.iter().any(|glob| glob.is_match(name))
+    }
+
+    fn project_in_source_scope(pctx: &ProjectCtx, opts: &RunOpts) -> bool {
+        let Some(source_dir) = &opts.source_dir else {
+            return true;
+        };
+        source_dir.starts_with(&pctx.project.root)
     }
 
     pub(crate) fn fetch_context<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> FetchContext<'a> {
@@ -405,6 +419,7 @@ impl Workspace {
             .into_iter()
             .filter(|dep| Self::package_in_scope(opts, &dep.package.name))
             .collect();
+        Self::retain_source_members(pctx, opts, &mut deps);
         // Drop excluded members from each dependency first, then drop a dependency whose *every*
         // declaring member was excluded. Pruning the members before anything reads them means a kept
         // dep is attributed only to non-excluded packages — so its "used by" representative is never
@@ -440,6 +455,30 @@ impl Workspace {
                 .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
         });
         Ok(deps)
+    }
+
+    fn retain_source_members(pctx: &ProjectCtx, opts: &RunOpts, deps: &mut Vec<Dependency>) {
+        let Some(source_dir) = &opts.source_dir else {
+            return;
+        };
+        let Some(source_rel) = source_dir.strip_prefix(&pctx.project.root).ok() else {
+            deps.clear();
+            return;
+        };
+        if source_rel.as_str().is_empty() {
+            return;
+        }
+
+        deps.retain_mut(|dep| {
+            if dep.members.is_empty() {
+                return false;
+            }
+            dep.members.retain(|member| {
+                let member_path = camino::Utf8Path::new(&member.path);
+                source_rel == member_path || source_rel.starts_with(member_path)
+            });
+            !dep.members.is_empty()
+        });
     }
 
     pub(crate) fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
@@ -549,6 +588,271 @@ fn no_fetcher_results<T>(
             (dep, Err(err))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cooldown_core::config::builtin_default_layer;
+    use cooldown_core::{
+        Capabilities, DepScope, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
+        PackageId, ProjectMarker, ReleaseQuality, Version,
+    };
+
+    const CARGO: ToolId = ToolId("cargo");
+    const PNPM: ToolId = ToolId("pnpm");
+    const UV: ToolId = ToolId("uv");
+
+    struct FakeReader {
+        id: ToolId,
+        deps: Vec<Dependency>,
+    }
+
+    #[async_trait]
+    impl ToolRead for FakeReader {
+        fn id(&self) -> ToolId {
+            self.id
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn project_marker(&self) -> ProjectMarker {
+            ProjectMarker {
+                lockfile: "lock",
+                manifest: "manifest",
+                alternate_manifests: &[],
+                workspace_root: true,
+            }
+        }
+
+        async fn dependencies(
+            &self,
+            _project: &Project,
+            scope: DepScope,
+        ) -> cooldown_core::Result<Vec<Dependency>> {
+            Ok(self
+                .deps
+                .iter()
+                .filter(|dep| scope == DepScope::Graph || dep.direct)
+                .cloned()
+                .collect())
+        }
+
+        async fn native_policy(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<Option<NativePolicyLayer>> {
+            Ok(None)
+        }
+
+        async fn verify_lock_current(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<LockVerifyReport> {
+            Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "current".to_string(),
+            })
+        }
+    }
+
+    fn test_workspace(root: Utf8PathBuf, ctx: ProjectCtx) -> Workspace {
+        Workspace::new(
+            AdapterSet::new(),
+            vec![ctx],
+            "2026-06-17T00:00:00Z".parse().expect("timestamp"),
+            Baseline::default(),
+            root,
+            vec![builtin_default_layer()],
+        )
+    }
+
+    fn project_ctx(tool: ToolId, root: &str) -> ProjectCtx {
+        let root = Utf8PathBuf::from(root);
+        ProjectCtx {
+            tool,
+            rel_path: Utf8PathBuf::from("."),
+            project: Project {
+                root: root.clone(),
+                kind: tool,
+                manifest: root.join("manifest"),
+                exclude_newer: None,
+            },
+            policy: PolicyStack {
+                layers: vec![builtin_default_layer()],
+                strict_native: false,
+            },
+        }
+    }
+
+    fn opts_for(source_dir: Option<&str>) -> RunOpts {
+        RunOpts {
+            source_dir: source_dir.map(Utf8PathBuf::from),
+            ..RunOpts::default()
+        }
+    }
+
+    fn dep(name: &str, member_name: &str, member_path: &str) -> Dependency {
+        Dependency {
+            package: PackageId::new(PNPM, name.to_string(), Some("registry.example".to_string())),
+            current: Version::new("1.0.0"),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            members: vec![MemberRef {
+                name: member_name.to_string(),
+                path: member_path.to_string(),
+            }],
+            pinned: false,
+        }
+    }
+
+    async fn scoped_names(tool: ToolId, source_dir: Option<&str>) -> Vec<String> {
+        let pctx = project_ctx(tool, "/repo");
+        let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
+        let reader = FakeReader {
+            id: tool,
+            deps: vec![
+                dep("left-dep", "left", "packages/left"),
+                dep("right-dep", "right", "packages/right"),
+            ],
+        };
+        ws.dependencies_in_scope(
+            &reader,
+            &ws.projects()[0],
+            DepScope::Direct,
+            &opts_for(source_dir),
+        )
+        .await
+        .expect("dependencies")
+        .into_iter()
+        .map(|dep| dep.package.name)
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn source_dir_scopes_cargo_workspace_members() {
+        assert_eq!(
+            scoped_names(CARGO, Some("/repo/packages/left")).await,
+            vec!["left-dep"]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_dir_scopes_pnpm_workspace_members() {
+        assert_eq!(
+            scoped_names(PNPM, Some("/repo/packages/right")).await,
+            vec!["right-dep"]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_dir_scopes_uv_projects_by_project_root() {
+        let left = project_ctx(UV, "/repo/packages/left");
+        let right = project_ctx(UV, "/repo/packages/right");
+        let ws = Workspace::new(
+            AdapterSet::new(),
+            vec![left, right],
+            "2026-06-17T00:00:00Z".parse().expect("timestamp"),
+            Baseline::default(),
+            Utf8PathBuf::from("/repo"),
+            vec![builtin_default_layer()],
+        );
+        let opts = opts_for(Some("/repo/packages/right"));
+
+        let projects: Vec<&Utf8PathBuf> = ws
+            .scoped_projects(&opts)
+            .map(|project| &project.project.root)
+            .collect();
+
+        assert_eq!(projects, vec![&Utf8PathBuf::from("/repo/packages/right")]);
+    }
+
+    #[tokio::test]
+    async fn source_dir_inside_member_matches_that_member() {
+        assert_eq!(
+            scoped_names(PNPM, Some("/repo/packages/left/src")).await,
+            vec!["left-dep"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_root_source_does_not_filter_members() {
+        assert_eq!(
+            scoped_names(CARGO, Some("/repo")).await,
+            vec!["left-dep", "right-dep"]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_dir_retains_only_matching_members() {
+        let pctx = project_ctx(CARGO, "/repo");
+        let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
+        let reader = FakeReader {
+            id: CARGO,
+            deps: vec![Dependency {
+                package: PackageId::new(CARGO, "shared-dep".to_string(), None),
+                current: Version::new("1.0.0"),
+                current_quality: ReleaseQuality::Stable,
+                direct: true,
+                artifacts: Vec::new(),
+                graph_floor: None,
+                graph_ceiling: None,
+                members: vec![
+                    MemberRef {
+                        name: "left".to_string(),
+                        path: "packages/left".to_string(),
+                    },
+                    MemberRef {
+                        name: "right".to_string(),
+                        path: "packages/right".to_string(),
+                    },
+                ],
+                pinned: false,
+            }],
+        };
+
+        let deps = ws
+            .dependencies_in_scope(
+                &reader,
+                &ws.projects()[0],
+                DepScope::Direct,
+                &opts_for(Some("/repo/packages/right")),
+            )
+            .await
+            .expect("dependencies");
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].members.len(), 1);
+        assert_eq!(deps[0].members[0].name, "right");
+    }
+
+    #[tokio::test]
+    async fn package_filter_still_filters_dependency_names() {
+        let pctx = project_ctx(PNPM, "/repo");
+        let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
+        let reader = FakeReader {
+            id: PNPM,
+            deps: vec![
+                dep("left-dep", "left", "packages/left"),
+                dep("right-dep", "right", "packages/right"),
+            ],
+        };
+        let mut opts = opts_for(Some("/repo/packages/left"));
+        opts.package = vec![PatternGlob::new("right-*").expect("glob")];
+
+        let deps = ws
+            .dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
+            .await
+            .expect("dependencies");
+
+        assert!(deps.is_empty());
+    }
 }
 
 /// Map a resolved window to its JSON view at `now`.

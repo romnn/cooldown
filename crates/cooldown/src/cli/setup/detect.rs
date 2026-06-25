@@ -20,11 +20,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
-    match &global.dir {
-        Some(dir) => Ok(dir.clone()),
+    let dir = match &global.dir {
+        Some(dir) if dir.is_absolute() => dir.clone(),
+        Some(dir) => Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(CoreError::from)?)
+            .map_err(|_| CoreError::PathEncoding("current dir is not valid UTF-8".into()))?
+            .join(dir),
         None => Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(CoreError::from)?)
-            .map_err(|_| CoreError::PathEncoding("current dir is not valid UTF-8".into())),
-    }
+            .map_err(|_| CoreError::PathEncoding("current dir is not valid UTF-8".into()))?,
+    };
+    std::fs::canonicalize(&dir)
+        .map_err(CoreError::from)
+        .and_then(|path| {
+            Utf8PathBuf::from_path_buf(path)
+                .map_err(|_| CoreError::PathEncoding(format!("{dir} is not valid UTF-8")))
+        })
 }
 
 pub(super) fn adapter_set(

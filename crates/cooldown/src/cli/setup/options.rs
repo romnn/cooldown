@@ -78,6 +78,7 @@ pub(super) fn resolve_invocation(
         run: RunOpts {
             tool: tools,
             package,
+            source_dir: None,
             // Populated in `setup` from the scan config, which owns the exclude globs.
             exclude_folders: Vec::new(),
             exclude_folders_by_tool: BTreeMap::default(),
