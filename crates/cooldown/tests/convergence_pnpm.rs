@@ -128,7 +128,11 @@ fn upgrade_converges_to_a_fixed_point() {
             .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
+    assert_eq!(
+        first.lock_status(),
+        Some("unknown"),
+        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
+    );
     assert!(
         first.summary_applied() >= 2,
         "first upgrade should apply the matured eslint/typescript-eslint line, got {}",
@@ -259,7 +263,11 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "fix should succeed: {}",
         fixture.cooldown(&["fix", "--freeze", FREEZE]).stderr_str()
     );
-    assert_eq!(fixed.lock_verified(), Some(true), "fix re-locks cleanly");
+    assert_eq!(
+        fixed.lock_status(),
+        Some("unknown"),
+        "pnpm fix re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
+    );
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
 
     let lock_after_fix = fixture.read_bytes("pnpm-lock.yaml");
@@ -362,7 +370,11 @@ fn upgrade_honors_a_stricter_per_package_window() {
         "upgrade should succeed: {}",
         fixture.cooldown(&["upgrade"]).stderr_str()
     );
-    assert_eq!(upgrade.lock_verified(), Some(true), "upgrade re-locks");
+    assert_eq!(
+        upgrade.lock_status(),
+        Some("unknown"),
+        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
+    );
 
     let (from, to) = upgrade
         .change_for("eslint")

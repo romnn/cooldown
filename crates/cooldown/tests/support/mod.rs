@@ -27,6 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+const TOOL_ATTEMPTS: usize = 3;
 
 /// A throwaway project tree under a temp dir, plus the means to run `cooldown` against it.
 pub struct Fixture {
@@ -66,15 +69,33 @@ impl Fixture {
     /// Run a raw command in the project root, returning its captured output. Used to drive the real
     /// package manager when seeding a starting lock (e.g. `uv lock --exclude-newer …`).
     pub fn run_tool(&self, program: &str, args: &[&str], envs: &[(&str, &str)]) -> CapturedOutput {
-        let mut command = Command::new(program);
-        command.current_dir(self.dir.path()).args(args);
-        for (key, value) in envs {
-            command.env(key, value);
+        let mut attempt = 1;
+        loop {
+            let mut command = Command::new(program);
+            command.current_dir(self.dir.path()).args(args);
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|err| panic!("spawn {program}: {err}"));
+            let captured = CapturedOutput::from(program, args, output);
+            if captured.status.success()
+                || !captured.is_transient_tool_failure()
+                || attempt == TOOL_ATTEMPTS
+            {
+                return captured;
+            }
+            eprintln!(
+                "retrying transient tool failure ({}/{TOOL_ATTEMPTS}): {}",
+                attempt + 1,
+                captured.label
+            );
+            std::thread::sleep(Duration::from_millis(
+                500 * u64::try_from(attempt).unwrap_or(1),
+            ));
+            attempt += 1;
         }
-        let output = command
-            .output()
-            .unwrap_or_else(|err| panic!("spawn {program}: {err}"));
-        CapturedOutput::from(program, args, output)
     }
 
     /// Run the built `cooldown` binary against the fixture with the given args, capturing output.
@@ -136,13 +157,42 @@ impl CapturedOutput {
         String::from_utf8_lossy(&self.stderr).into_owned()
     }
 
+    fn is_transient_tool_failure(&self) -> bool {
+        if self.status.success() {
+            return false;
+        }
+        let haystack = format!("{}\n{}", self.stdout_str(), self.stderr_str()).to_ascii_lowercase();
+        [
+            "connection reset",
+            "ssl connect error",
+            "timed out",
+            "timeout",
+            "temporary failure",
+            "could not resolve host",
+            "network is unreachable",
+            "socket hang up",
+            "econnreset",
+            "etimedout",
+            "too many requests",
+            "http 429",
+            "http 502",
+            "http 503",
+            "http 504",
+            "failed to download",
+            "download of config.json failed",
+        ]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+    }
+
     /// Assert the command exited successfully, surfacing stderr on failure.
     pub fn expect_success(self) -> Self {
         assert!(
             self.status.success(),
-            "command failed ({}): status={:?}\n--- stderr ---\n{}",
+            "command failed ({}): status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             self.label,
             self.status.code(),
+            self.stdout_str(),
             self.stderr_str(),
         );
         self
@@ -177,16 +227,29 @@ impl Envelope {
             .expect("envelope.ok")
     }
 
-    /// `meta.lockVerified` (flattened at the top level): `Some(bool)` after a real mutation, `None`
-    /// under `--dry-run`.
+    /// `meta.lockVerified` (flattened at the top level): `Some(bool)` after a real mutation with a
+    /// concrete lock-currency probe, `None` under `--dry-run` or for adapters that report
+    /// `lockStatus = "unknown"`.
     pub fn lock_verified(&self) -> Option<bool> {
         self.value
             .get("lockVerified")
             .and_then(serde_json::Value::as_bool)
     }
 
+    /// `meta.lockStatus` (flattened at the top level): `current`/`stale`/`unknown` after a real
+    /// mutation, `None` under `--dry-run`.
+    pub fn lock_status(&self) -> Option<&str> {
+        self.value
+            .get("lockStatus")
+            .and_then(serde_json::Value::as_str)
+    }
+
     pub fn summary_applied(&self) -> u64 {
         self.summary_u64("applied")
+    }
+
+    pub fn summary_skipped(&self) -> u64 {
+        self.summary_u64("skipped")
     }
 
     pub fn summary_errors(&self) -> u64 {
@@ -240,6 +303,19 @@ impl Envelope {
         })
     }
 
+    pub fn skipped_reasons_for(&self, name: &str) -> BTreeSet<String> {
+        self.items()
+            .iter()
+            .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .filter_map(|item| {
+                item.get("skipped")
+                    .and_then(|skipped| skipped.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     /// Names of `outdated` items with the given status string (e.g. `"blocked"`, `"adoptable"`).
     pub fn outdated_with_status(&self, status: &str) -> BTreeSet<String> {
         self.filter_names(|item| {
@@ -257,6 +333,37 @@ impl Envelope {
             let to = item.get("to")?.as_str()?.to_owned();
             Some((from, to))
         })
+    }
+
+    pub fn warning_kinds(&self) -> BTreeSet<String> {
+        self.diagnostic_values("warnings", "kind")
+    }
+
+    pub fn error_kinds(&self) -> BTreeSet<String> {
+        self.diagnostic_values("errors", "kind")
+    }
+
+    pub fn warning_paths(&self) -> BTreeSet<String> {
+        self.diagnostic_values("warnings", "path")
+    }
+
+    pub fn error_paths(&self) -> BTreeSet<String> {
+        self.diagnostic_values("errors", "path")
+    }
+
+    fn diagnostic_values(&self, section: &str, key: &str) -> BTreeSet<String> {
+        self.value
+            .get(section)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|diagnostic| {
+                diagnostic
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 
     fn filter_names(&self, pred: impl Fn(&serde_json::Value) -> bool) -> BTreeSet<String> {

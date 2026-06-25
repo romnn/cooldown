@@ -191,7 +191,11 @@ fn upgrade_converges_every_line_of_a_multi_version_dependency() {
             .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(upgrade.lock_verified(), Some(true), "upgrade re-locks");
+    assert_eq!(
+        upgrade.lock_status(),
+        Some("unknown"),
+        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
+    );
 
     // Convergence: BOTH importers reach the newest-within-window version their OWN range admits. The
     // non-converging adapter left the lower line (`pkgs/v6`) below its in-range latest.

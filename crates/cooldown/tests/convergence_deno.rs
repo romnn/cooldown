@@ -89,6 +89,38 @@ fn fixture(seed_cutoff: &str) -> Fixture {
     fixture
 }
 
+fn jsonc_fixture(seed_cutoff: &str) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("deno.jsonc", DENO_JSON);
+    seed_lock(&fixture, seed_cutoff);
+    fixture
+}
+
+#[test]
+fn check_on_jsonc_only_project_reports_the_jsonc_manifest_path() {
+    skip_if_missing!("deno");
+    let fixture = jsonc_fixture(SEED_EARLY);
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(
+        !check.ok(),
+        "Deno lock currency is unknown, so check must fail closed"
+    );
+    assert!(
+        check.error_kinds().contains("lock_unknown"),
+        "expected lock_unknown diagnostic, got {:?}",
+        check.error_kinds()
+    );
+    assert!(
+        check
+            .error_paths()
+            .iter()
+            .any(|path| path.ends_with("deno.jsonc")),
+        "jsonc-only project diagnostics must point at deno.jsonc, got {:?}",
+        check.error_paths()
+    );
+}
+
 #[test]
 fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("deno");
@@ -104,7 +136,11 @@ fn upgrade_converges_to_a_fixed_point() {
             .cooldown(&["upgrade", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
+    assert_eq!(
+        first.lock_status(),
+        Some("unknown"),
+        "deno applies and re-locks, but cooldown cannot prove deno.lock currency yet"
+    );
     assert!(
         first.summary_applied() >= 1,
         "first upgrade should apply the matured debug move, got {}",
@@ -233,7 +269,11 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "fix should succeed: {}",
         fixture.cooldown(&["fix", "--freeze", FREEZE]).stderr_str()
     );
-    assert_eq!(fixed.lock_verified(), Some(true), "fix re-locks cleanly");
+    assert_eq!(
+        fixed.lock_status(),
+        Some("unknown"),
+        "deno fix re-locks, but cooldown cannot prove deno.lock currency yet"
+    );
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
     assert!(
         fixed.summary_applied() >= 1,

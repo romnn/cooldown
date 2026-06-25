@@ -215,6 +215,104 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
 }
 
 #[test]
+fn upgrade_skip_only_batch_rolls_back_manifest_and_lock() {
+    skip_if_missing!("cargo");
+    let fixture = conflict_fixture();
+
+    let root_manifest_before = fixture.read_bytes("Cargo.toml");
+    let app_manifest_before = fixture.read_bytes("crates/app/Cargo.toml");
+    let lock_before = fixture.read_bytes("Cargo.lock");
+
+    // `serde` wants to move forward under the freeze cutoff, but `cd-pin`'s exact serde_derive pin
+    // blocks that target. This is a skip-only apply batch: no claimed applied change means cooldown
+    // must roll back the temporary manifest widening before any post-apply graph verification.
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--package", "serde"]);
+    assert!(
+        upgrade.ok(),
+        "skip-only upgrade should be a successful no-op: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE, "--package", "serde"])
+            .stderr_str()
+    );
+    assert_eq!(
+        upgrade.summary_applied(),
+        0,
+        "blocked serde target must not be reported applied"
+    );
+    assert_eq!(
+        upgrade.summary_errors(),
+        0,
+        "a resolver-held target is a skip, not an environment error"
+    );
+    assert!(
+        upgrade.held_conflict_names().contains("serde"),
+        "serde must be reported as held by the resolver\nheld={:?}",
+        upgrade.held_conflict_names()
+    );
+    assert_eq!(
+        root_manifest_before,
+        fixture.read_bytes("Cargo.toml"),
+        "root manifest must be restored after the skip-only trial"
+    );
+    assert_eq!(
+        app_manifest_before,
+        fixture.read_bytes("crates/app/Cargo.toml"),
+        "member manifest must be restored after the skip-only trial"
+    );
+    assert_eq!(
+        lock_before,
+        fixture.read_bytes("Cargo.lock"),
+        "lock must be restored after the skip-only trial"
+    );
+}
+
+#[test]
+fn check_fails_closed_on_stale_lock_unless_allowed() {
+    skip_if_missing!("cargo");
+    let fixture = conflict_fixture();
+
+    fixture.write(
+        "crates/app/Cargo.toml",
+        &format!("{APP_MANIFEST}regex = \"1\"\n"),
+    );
+
+    let stale = fixture.cooldown_json(&["check", "--latest", "--package", "log"]);
+    assert!(!stale.ok(), "stale lock must fail closed by default");
+    assert_eq!(stale.summary_errors(), 1);
+    assert!(
+        stale.error_kinds().contains("stale_lock"),
+        "expected a stale_lock diagnostic, got {:?}",
+        stale.error_kinds()
+    );
+
+    let allowed = fixture.cooldown_json(&[
+        "check",
+        "--latest",
+        "--allow-stale-lock",
+        "--package",
+        "log",
+    ]);
+    assert!(
+        allowed.ok(),
+        "--allow-stale-lock should downgrade the stale lock to a warning"
+    );
+    assert_eq!(allowed.summary_errors(), 0);
+    assert!(
+        allowed.warning_kinds().contains("stale_lock"),
+        "expected a stale_lock warning, got {:?}",
+        allowed.warning_kinds()
+    );
+    assert!(
+        allowed
+            .warning_paths()
+            .iter()
+            .any(|path| path.ends_with("Cargo.toml")),
+        "stale-lock warning should name the manifest path, got {:?}",
+        allowed.warning_paths()
+    );
+}
+
+#[test]
 fn fix_matures_too_fresh_deps_and_is_idempotent() {
     skip_if_missing!("cargo");
 
