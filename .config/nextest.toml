@@ -7,6 +7,14 @@
 # and the `e2e`/`integration_test(s)` binaries do not exist yet — folding them into one regex that
 # also matches the existing `convergence_*` binaries keeps the classification future-proof without
 # tripping that check.
+[test-groups]
+# Registry-backed convergence tests use live public registries. Keep each registry family modestly
+# concurrent to avoid rate limits while unit tests retain nextest's default parallelism.
+cargo-registry = { max-threads = 2 }
+go-registry = { max-threads = 2 }
+npm-registry = { max-threads = 2 }
+pypi-registry = { max-threads = 2 }
+
 [profile.default]
 default-filter = 'not (binary(/^(convergence_|e2e|integration_tests?$)/) or test(/integration_tests?::/))'
 fail-fast = { max-fail = "all" }
@@ -25,6 +33,22 @@ retries = 0
 # Hard cap: 5 minutes per test — these hit the network.
 slow-timeout = { period = "300s", terminate-after = 1, grace-period = "10s" }
 
+[[profile.integration.overrides]]
+filter = 'binary(/^convergence_cargo$/)'
+test-group = 'cargo-registry'
+
+[[profile.integration.overrides]]
+filter = 'binary(/^convergence_go$/)'
+test-group = 'go-registry'
+
+[[profile.integration.overrides]]
+filter = 'binary(/^(convergence_deno|convergence_pnpm|convergence_pnpm_multiline)$/)'
+test-group = 'npm-registry'
+
+[[profile.integration.overrides]]
+filter = 'binary(/^(convergence_pip|convergence_uv)$/)'
+test-group = 'pypi-registry'
+
 # CI: run everything (unit + integration).
 [profile.ci]
 default-filter = 'all()'
@@ -32,3 +56,19 @@ fail-fast = false
 retries = 0
 # Hard cap: 5 minutes per test — covers the network integration tests too.
 slow-timeout = { period = "300s", terminate-after = 1, grace-period = "10s" }
+
+[[profile.ci.overrides]]
+filter = 'binary(/^convergence_cargo$/)'
+test-group = 'cargo-registry'
+
+[[profile.ci.overrides]]
+filter = 'binary(/^convergence_go$/)'
+test-group = 'go-registry'
+
+[[profile.ci.overrides]]
+filter = 'binary(/^(convergence_deno|convergence_pnpm|convergence_pnpm_multiline)$/)'
+test-group = 'npm-registry'
+
+[[profile.ci.overrides]]
+filter = 'binary(/^(convergence_pip|convergence_uv)$/)'
+test-group = 'pypi-registry'

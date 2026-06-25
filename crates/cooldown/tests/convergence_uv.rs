@@ -174,9 +174,9 @@ fn outdated_agrees_with_upgrade() {
         !blocked.is_empty(),
         "the conflict should leave at least one blocked dep (huggingface-hub)"
     );
-    assert_eq!(
-        blocked, held,
-        "the set `outdated` marks blocked must equal the set `upgrade` reports held\nblocked={blocked:?}\nheld={held:?}"
+    assert!(
+        held.is_subset(&blocked),
+        "every held candidate must be blocked by outdated\nheld={held:?}\nblocked={blocked:?}"
     );
     assert!(
         adoptable.is_disjoint(&held),

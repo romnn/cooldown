@@ -165,15 +165,21 @@ fn outdated_agrees_with_upgrade() {
 
     let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--transitive"]);
     let blocked = outdated.outdated_with_status("blocked");
+    let adoptable = outdated.outdated_with_status("adoptable");
 
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
     let held = upgrade.held_conflict_names();
 
-    // Whatever `outdated` marks blocked, `upgrade` must report held — and vice versa. (Both may be
-    // empty if the seed already satisfies the window, which is still agreement.)
-    assert_eq!(
-        blocked, held,
-        "the set `outdated` marks blocked must equal the set `upgrade` reports held\nblocked={blocked:?}\nheld={held:?}"
+    // Everything `upgrade` reports held, `outdated` must mark blocked. Cargo's
+    // `outdated --transitive` can additionally flag candidates `upgrade` never plans, so `blocked`
+    // is a superset, not a strict equal.
+    assert!(
+        held.is_subset(&blocked),
+        "every held candidate must be blocked by outdated\nheld={held:?}\nblocked={blocked:?}"
+    );
+    assert!(
+        adoptable.is_disjoint(&held),
+        "nothing outdated calls adoptable may be held by upgrade\nadoptable={adoptable:?}\nheld={held:?}"
     );
 }
 

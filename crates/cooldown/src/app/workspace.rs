@@ -392,7 +392,7 @@ impl Workspace {
         let Some(source_dir) = &opts.source_dir else {
             return true;
         };
-        source_dir.starts_with(&pctx.project.root)
+        source_dir.starts_with(&pctx.project.root) || pctx.project.root.starts_with(source_dir)
     }
 
     pub(crate) fn fetch_context<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> FetchContext<'a> {
@@ -461,6 +461,9 @@ impl Workspace {
         let Some(source_dir) = &opts.source_dir else {
             return;
         };
+        if pctx.project.root.starts_with(source_dir) {
+            return;
+        }
         let Some(source_rel) = source_dir.strip_prefix(&pctx.project.root).ok() else {
             deps.clear();
             return;
@@ -588,6 +591,42 @@ fn no_fetcher_results<T>(
             (dep, Err(err))
         })
         .collect()
+}
+
+/// Map a resolved window to its JSON view at `now`.
+pub(crate) fn render_window(window: &ResolvedWindow, now: Timestamp) -> Window {
+    Window {
+        min_age_days: round2(window.effective_min_age_days(now)),
+        source: window.source(),
+        clamped_by: window.clamped_by(now).map(cooldown_core::Origin::token),
+    }
+}
+
+/// Days between two instants, rounded to 2 places for display.
+pub(crate) fn age_days(published: Timestamp, now: Timestamp) -> f64 {
+    round2(cooldown_core::duration::duration_as_days(
+        cooldown_core::duration::since(now, published),
+    ))
+}
+
+pub(crate) fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// A diagnostic built from a `CoreError`, scoped to a package where possible.
+pub(crate) fn diag_from_error(
+    err: &cooldown_core::CoreError,
+    tool: ToolId,
+    project: &str,
+    package: Option<&str>,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), err.to_string())
+        .with_tool(tool.as_str())
+        .with_project(project);
+    if let Some(package) = package {
+        diagnostic = diagnostic.with_package(package);
+    }
+    diagnostic
 }
 
 #[cfg(test)]
@@ -774,6 +813,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_dir_includes_nested_independent_projects() {
+        let left = project_ctx(UV, "/repo/services/left");
+        let right = project_ctx(UV, "/repo/services/right");
+        let outside = project_ctx(UV, "/repo/packages/outside");
+        let ws = Workspace::new(
+            AdapterSet::new(),
+            vec![left, right, outside],
+            "2026-06-17T00:00:00Z".parse().expect("timestamp"),
+            Baseline::default(),
+            Utf8PathBuf::from("/repo"),
+            vec![builtin_default_layer()],
+        );
+        let opts = opts_for(Some("/repo/services"));
+
+        let projects: Vec<&Utf8PathBuf> = ws
+            .scoped_projects(&opts)
+            .map(|project| &project.project.root)
+            .collect();
+
+        assert_eq!(
+            projects,
+            vec![
+                &Utf8PathBuf::from("/repo/services/left"),
+                &Utf8PathBuf::from("/repo/services/right")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_independent_project_keeps_all_dependencies() {
+        let pctx = project_ctx(UV, "/repo/services/left");
+        let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
+        let reader = FakeReader {
+            id: UV,
+            deps: vec![
+                dep("left-dep", "left", "."),
+                dep("right-dep", "right", "."),
+            ],
+        };
+
+        let deps = ws
+            .dependencies_in_scope(
+                &reader,
+                &ws.projects()[0],
+                DepScope::Direct,
+                &opts_for(Some("/repo/services")),
+            )
+            .await
+            .expect("dependencies");
+
+        let names: Vec<String> = deps.into_iter().map(|dep| dep.package.name).collect();
+        assert_eq!(names, vec!["left-dep", "right-dep"]);
+    }
+
+    #[tokio::test]
     async fn source_dir_inside_member_matches_that_member() {
         assert_eq!(
             scoped_names(PNPM, Some("/repo/packages/left/src")).await,
@@ -853,40 +947,4 @@ mod tests {
 
         assert!(deps.is_empty());
     }
-}
-
-/// Map a resolved window to its JSON view at `now`.
-pub(crate) fn render_window(window: &ResolvedWindow, now: Timestamp) -> Window {
-    Window {
-        min_age_days: round2(window.effective_min_age_days(now)),
-        source: window.source(),
-        clamped_by: window.clamped_by(now).map(cooldown_core::Origin::token),
-    }
-}
-
-/// Days between two instants, rounded to 2 places for display.
-pub(crate) fn age_days(published: Timestamp, now: Timestamp) -> f64 {
-    round2(cooldown_core::duration::duration_as_days(
-        cooldown_core::duration::since(now, published),
-    ))
-}
-
-pub(crate) fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
-}
-
-/// A diagnostic built from a `CoreError`, scoped to a package where possible.
-pub(crate) fn diag_from_error(
-    err: &cooldown_core::CoreError,
-    tool: ToolId,
-    project: &str,
-    package: Option<&str>,
-) -> Diagnostic {
-    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), err.to_string())
-        .with_tool(tool.as_str())
-        .with_project(project);
-    if let Some(package) = package {
-        diagnostic = diagnostic.with_package(package);
-    }
-    diagnostic
 }
