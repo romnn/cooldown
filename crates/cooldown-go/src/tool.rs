@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal, Release,
-    ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
+    LockVerifyReport, NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal,
+    Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -103,6 +103,7 @@ impl ToolRead for GoTool {
         ProjectMarker {
             lockfile: "go.mod",
             manifest: "go.mod",
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -115,7 +116,7 @@ impl ToolRead for GoTool {
         Ok(None) // Go has no native cooldown config.
     }
 
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         graph::verify_lock_current(&self.go, project).await
     }
 }

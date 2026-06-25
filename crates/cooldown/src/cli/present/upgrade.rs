@@ -6,6 +6,7 @@ pub(in crate::cli) fn upgrade_meta(meta: &app::UpgradeMeta) -> render::UpgradeMe
     render::UpgradeMeta {
         applied: meta.applied,
         lock_verified: meta.lock_verified,
+        lock_status: meta.lock_status,
         build: render::BuildInfo {
             requested: meta.build.requested,
             ok: meta.build.ok,

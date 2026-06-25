@@ -7,7 +7,7 @@ use super::{
     Workspace, age_days, diag_from_error, render_window,
 };
 use cooldown_core::{
-    DepScope, Dependency, Diagnostic, DiagnosticKind, Origin, Resolution, ResolveKind,
+    DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, Origin, Resolution, ResolveKind,
     ResolveQuery, Status, check_pin, resolve,
 };
 
@@ -222,13 +222,17 @@ impl<'a> CheckRunner<'a> {
         project_label: &str,
     ) -> LockProbe {
         match adapter.verify_lock_current(&pctx.project).await {
-            Ok(v) if v.ok => LockProbe::Continue,
+            Ok(v) if v.status == LockStatus::Current => LockProbe::Continue,
             Ok(v) => {
-                let diag = Diagnostic::new(DiagnosticKind::StaleLock, v.detail)
+                let kind = match v.status {
+                    LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
+                    LockStatus::Unknown => DiagnosticKind::LockUnknown,
+                };
+                let diag = Diagnostic::new(kind, v.detail)
                     .with_tool(pctx.tool.as_str())
                     .with_project(project_label)
                     .with_path(pctx.project.manifest.as_str());
-                if self.opts.allow_stale_lock {
+                if self.opts.allow_stale_lock && v.status == LockStatus::Stale {
                     self.acc.warnings.push(diag);
                     LockProbe::Continue
                 } else {

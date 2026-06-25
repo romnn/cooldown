@@ -3,8 +3,8 @@ use super::releases::{classify_quality, major_key_for_path};
 use crate::gocmd::{Go, GoModule};
 use crate::proxy::GoProxy;
 use cooldown_core::{
-    DepScope, Dependency, PackageId, PackageRegistry, Project, Release, ReleaseOrder, Result,
-    VerifyReport, Version,
+    DepScope, Dependency, LockStatus, LockVerifyReport, PackageId, PackageRegistry, Project,
+    Release, ReleaseOrder, Result, Version,
 };
 use std::collections::HashMap;
 
@@ -48,14 +48,14 @@ pub(super) async fn locked_release(proxy: &GoProxy, dep: &Dependency) -> Result<
     })
 }
 
-pub(super) async fn verify_lock_current(go: &Go, project: &Project) -> Result<VerifyReport> {
+pub(super) async fn verify_lock_current(go: &Go, project: &Project) -> Result<LockVerifyReport> {
     match go.mod_tidy_is_clean(&project.root).await {
-        Ok(true) => Ok(VerifyReport {
-            ok: true,
+        Ok(true) => Ok(LockVerifyReport {
+            status: LockStatus::Current,
             detail: "go.mod/go.sum are tidy".to_string(),
         }),
-        Ok(false) => Ok(VerifyReport {
-            ok: false,
+        Ok(false) => Ok(LockVerifyReport {
+            status: LockStatus::Stale,
             detail: "go.mod/go.sum are stale; run `go mod tidy`".to_string(),
         }),
         Err(error) => Err(error),

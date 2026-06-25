@@ -14,10 +14,10 @@ use camino::Utf8Path;
 use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, SyncScope,
-    ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
+    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
+    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -127,6 +127,7 @@ impl ToolRead for UvTool {
         ProjectMarker {
             lockfile: "uv.lock",
             manifest: "pyproject.toml",
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -208,7 +209,7 @@ impl ToolRead for UvTool {
         parse_native(&project.manifest)
     }
 
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport> {
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         match self
             .uv
             .verify_check(&project.root, project.exclude_newer.as_deref())

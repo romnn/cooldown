@@ -12,10 +12,10 @@ use crate::tool::{build_releases, classify_quality};
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_adapter_util::verify_current_report;
+use cooldown_adapter_util::verify_current_unknown;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result, SkipReason, Skipped,
     ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
@@ -379,6 +379,7 @@ impl ToolRead for DenoTool {
         ProjectMarker {
             lockfile: "deno.lock",
             manifest: "deno.json",
+            alternate_manifests: &["deno.jsonc"],
             workspace_root: true,
         }
     }
@@ -391,12 +392,8 @@ impl ToolRead for DenoTool {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "lockfile taken as current",
-            "lockfile is stale",
-        ))
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(verify_current_unknown("deno.lock"))
     }
 }
 

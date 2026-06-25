@@ -8,11 +8,11 @@ use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_adapter_util::{
-    Driver, build_registry_releases, skipped_on_apply_error, verify_current_report,
+    Driver, build_registry_releases, skipped_on_apply_error, verify_current_unknown,
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
     Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
@@ -170,6 +170,7 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
         ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: L::MANIFEST,
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -201,12 +202,8 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "resolved versions taken as current",
-            "resolved versions are stale",
-        ))
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(verify_current_unknown(L::LOCKFILE))
     }
 }
 

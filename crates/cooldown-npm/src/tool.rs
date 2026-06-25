@@ -12,14 +12,14 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
-    build_registry_releases, skipped_on_apply_error, verify_current_report,
+    build_registry_releases, skipped_on_apply_error, verify_current_unknown,
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
-    FetchContext, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
-    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport,
-    SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
+    FetchContext, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
+    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -175,6 +175,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: "package.json",
+            alternate_manifests: &[],
             workspace_root: true,
         }
     }
@@ -243,14 +244,8 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        // The npm-family CLIs lack a cheap, uniform "is the lock current?" probe, so cooldown
-        // trusts the committed lock as the source of truth rather than re-resolving on every read.
-        Ok(verify_current_report(
-            true,
-            "lockfile taken as current",
-            "lockfile is stale",
-        ))
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(verify_current_unknown(L::LOCKFILE))
     }
 }
 

@@ -22,6 +22,7 @@ pub fn json_schema() -> Value {
                     "stricter_native",
                     "yanked",
                     "stale_lock",
+                    "lock_unknown",
                     "tool_failed",
                     "tool_spawn_failed",
                     "lockfile_unreadable",
@@ -312,6 +313,7 @@ pub fn json_schema() -> Value {
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
                     ("lockVerified", json!({ "type": ["boolean", "null"] })),
+                    ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
                         "required": ["requested", "ok"],
@@ -322,7 +324,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockVerified", "build"],
+                vec!["applied", "lockVerified", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),
@@ -331,6 +333,7 @@ pub fn json_schema() -> Value {
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
                     ("lockVerified", json!({ "type": ["boolean", "null"] })),
+                    ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
                         "required": ["requested", "ok"],
@@ -341,7 +344,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockVerified", "build"],
+                vec!["applied", "lockVerified", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),

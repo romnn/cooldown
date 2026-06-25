@@ -236,6 +236,8 @@ pub enum DiagnosticKind {
     Yanked,
     /// A lockfile or manifest is stale relative to its source, or absent.
     StaleLock,
+    /// Lock currency could not be determined by the adapter.
+    LockUnknown,
     /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
     ToolFailed,
     /// An external tool (`go`, `cargo`, `uv`) could not be spawned at all.
@@ -271,6 +273,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::StricterNative => "stricter_native",
             DiagnosticKind::Yanked => "yanked",
             DiagnosticKind::StaleLock => "stale_lock",
+            DiagnosticKind::LockUnknown => "lock_unknown",
             DiagnosticKind::ToolFailed => "tool_failed",
             DiagnosticKind::ToolSpawnFailed => "tool_spawn_failed",
             DiagnosticKind::LockfileUnreadable => "lockfile_unreadable",

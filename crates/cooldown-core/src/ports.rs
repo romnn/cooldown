@@ -9,8 +9,8 @@
 
 use crate::error::Result;
 use crate::model::{
-    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, FetchContext, Plan, Project,
-    ProjectMarker, Release, ToolId, VerifyReport, Version,
+    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, FetchContext, LockVerifyReport,
+    Plan, Project, ProjectMarker, Release, ToolId, VerifyReport, Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -120,9 +120,9 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if currency cannot be determined; a stale lock is
-    /// reported in the [`VerifyReport`].
-    async fn verify_lock_current(&self, project: &Project) -> Result<VerifyReport>;
+    /// Returns a [`CoreError`](crate::CoreError) when the probe itself fails. A known stale lock or
+    /// unsupported currency proof is reported in the [`LockVerifyReport`].
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport>;
 }
 
 /// The registry-fetch port: classified candidate releases and the locked release for a dependency.
@@ -217,8 +217,11 @@ pub trait ToolWrite: Send + Sync {
     /// Applies `plan` to `project` and reports what was applied or skipped.
     ///
     /// Mechanics only (manifest rewrites, MVS, resolver runs); there is **no intra-plan rollback** —
-    /// the application layer captures a [`ProjectMutationJournal`] before calling `apply` and
-    /// restores it if the trial is rejected. Skips are reported as `Ok` data in the
+    /// the application layer captures a [`ProjectMutationJournal`] before calling `apply`, restores
+    /// it if the trial is rejected, and verifies the resulting graph before committing/reporting a
+    /// planned change as applied. An adapter should still return only changes it believes reached
+    /// their exact [`Change::to`](crate::model::Change::to) target, plus any collateral lock diff it
+    /// can derive from the before/after lock state. Skips are reported as `Ok` data in the
     /// [`ApplyReport`], not errors.
     ///
     /// # Errors
@@ -311,13 +314,17 @@ pub trait ToolWrite: Send + Sync {
     }
 }
 
-/// The files a tool's mutating resolve actually reads — manifests, lockfiles, and workspace/registry
-/// config — so [`ProjectCopy`](crate) copies only these, matched by exact basename anywhere outside
-/// the pruned dirs, plus any `source_extensions` the resolve needs.
+/// The files a tool's mutating resolve actually reads — manifests, lockfiles, workspace/registry
+/// config, and selected source — so the application can stage a throwaway project copy without
+/// cloning the whole tree. Inputs are matched by exact basename, explicit project-relative path
+/// prefix, or opted-in source extension.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveInputs {
     /// Exact file basenames to copy wherever they appear in the tree.
     pub filenames: &'static [&'static str],
+    /// Project-relative path prefixes to copy, for config files whose basename is too generic or
+    /// whose resolver support files live below an otherwise-pruned dot directory.
+    pub path_prefixes: &'static [&'static str],
     /// File extensions (without the leading dot) to copy as source. Cargo (`rs`) and Go (`go`)
     /// validate their targets/import graph against the real source, so the probe must include it;
     /// declaration-only resolvers (pnpm, uv, deno) leave this empty.
@@ -382,9 +389,19 @@ impl ResolveInputs {
         "environment.yaml",
     ];
 
+    /// Resolver config paths that live below otherwise-pruned dot directories or have generic names.
+    pub const PATH_PREFIXES: &'static [&'static str] = &[
+        ".cargo/config",
+        ".cargo/config.toml",
+        ".swiftpm/configuration/registries.json",
+        ".yarn/releases",
+        ".yarn/plugins",
+    ];
+
     /// The declaration-only default: every known manifest/lock/config basename, no source files.
     pub const DEFAULT: ResolveInputs = ResolveInputs {
         filenames: Self::FILENAMES,
+        path_prefixes: Self::PATH_PREFIXES,
         source_extensions: &[],
     };
 }
@@ -402,8 +419,11 @@ pub enum SyncScope {
     Repo,
 }
 
-/// Convenience bound for concrete adapters that implement the read-side, registry-fetch, and
-/// write-side ports.
+/// Convenience bound for concrete adapters that implement all three ports.
+///
+/// Application registration is still explicit: a concrete adapter may be registered as read/fetch
+/// only, or as a mutator too, so implementing [`ToolWrite`] does not accidentally make a new adapter
+/// writable at runtime.
 pub trait Tool: ToolRead + ReleaseFetcher + ToolWrite {}
 
 impl<T> Tool for T where T: ToolRead + ReleaseFetcher + ToolWrite {}

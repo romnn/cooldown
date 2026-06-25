@@ -12,7 +12,7 @@ use self::executor::{PlanMode, ProjectUpgradeExecutor};
 use super::{
     BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
-use cooldown_core::{Diagnostic, ToolRead, ToolWrite};
+use cooldown_core::{Diagnostic, DiagnosticKind, LockStatus, ToolRead, ToolWrite};
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
 /// be), plus the re-lock/build status and the exit it implies.
@@ -44,7 +44,10 @@ pub(super) struct UpgradeAccum {
     /// `None` until a build is attempted; `Some(false)` once any project's build fails.
     pub(super) build_ok: Option<bool>,
     pub(super) build_requested: bool,
-    /// `None` until the lock is verified; `Some(false)` once any project's lock is non-current.
+    /// `None` until lock currency is probed; tracks the strongest non-current outcome across
+    /// projects.
+    pub(super) lock_status: Option<LockStatus>,
+    /// `None` until the lock is verified; `Some(false)` once any project's lock is known stale.
     pub(super) lock_verified: Option<bool>,
 }
 
@@ -120,6 +123,7 @@ impl Workspace {
                 continue;
             };
             let Some(writer) = self.mutator(pctx.tool) else {
+                acc.errors.push(read_only_mutator_diag(pctx));
                 continue;
             };
 
@@ -193,8 +197,7 @@ impl Workspace {
         let err_count =
             acc.items.iter().filter(|item| item.error.is_some()).count() + acc.errors.len();
 
-        let lock_or_build_failed = acc.lock_verified == Some(false) || acc.build_ok == Some(false);
-        let exit = if err_count > 0 || lock_or_build_failed {
+        let exit = if err_count > 0 || acc.build_ok == Some(false) {
             Exit::Environment
         } else if opts.strict && acc.strict_incomplete {
             Exit::Policy
@@ -202,18 +205,7 @@ impl Workspace {
             Exit::Ok
         };
 
-        let meta = UpgradeMeta {
-            applied: applied > 0,
-            lock_verified: if opts.dry_run {
-                None
-            } else {
-                acc.lock_verified
-            },
-            build: BuildInfo {
-                requested: acc.build_requested,
-                ok: acc.build_ok,
-            },
-        };
+        let meta = upgrade_meta(opts, &acc, applied);
         let summary = UpgradeSummary {
             applied,
             skipped,
@@ -227,5 +219,34 @@ impl Workspace {
             errors: acc.errors,
             exit,
         }
+    }
+}
+
+fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticKind::Config,
+        format!(
+            "{} adapter is read-only; upgrade/fix is not supported",
+            pctx.tool
+        ),
+    )
+    .with_tool(pctx.tool.as_str())
+    .with_project(pctx.rel_path.as_str())
+    .with_path(pctx.project.manifest.as_str())
+}
+
+fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, applied: usize) -> UpgradeMeta {
+    UpgradeMeta {
+        applied: applied > 0,
+        lock_verified: if opts.dry_run {
+            None
+        } else {
+            acc.lock_verified
+        },
+        lock_status: if opts.dry_run { None } else { acc.lock_status },
+        build: BuildInfo {
+            requested: acc.build_requested,
+            ok: acc.build_ok,
+        },
     }
 }

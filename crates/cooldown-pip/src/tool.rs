@@ -7,13 +7,13 @@ use crate::lock;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_adapter_util::{
-    Driver, build_registry_releases, skipped_on_apply_error, verify_current_report,
+    Driver, build_registry_releases, skipped_on_apply_error, verify_current_unknown,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -162,6 +162,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: L::MANIFEST,
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -193,12 +194,8 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "resolved versions taken as current",
-            "resolved versions are stale",
-        ))
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(verify_current_unknown(L::LOCKFILE))
     }
 }
 
@@ -268,6 +265,17 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
         _journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
+        if L::ID == Pip::ID {
+            for change in &plan.changes {
+                if rewrite_pip_requirement(project, change)? {
+                    report.applied.push(change.clone());
+                } else {
+                    report.skipped.push(not_eligible(change));
+                }
+            }
+            return Ok(report);
+        }
+
         for change in &plan.changes {
             let args = L::upgrade_args(&change.package.name, change.to.as_str());
             match self.driver.run(&project.root, &args).await {
@@ -285,10 +293,79 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
     }
 }
 
+fn rewrite_pip_requirement(project: &Project, change: &Change) -> Result<bool> {
+    let path = project.root.join(Pip::LOCKFILE);
+    let content = std::fs::read_to_string(&path)?;
+    let Some(rewritten) =
+        lock::rewrite_requirement_pin(&content, &change.package.name, change.to.as_str())
+    else {
+        return Ok(false);
+    };
+    std::fs::write(path, rewritten)?;
+    Ok(true)
+}
+
+fn not_eligible(change: &Change) -> Skipped {
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::NotEligible,
+        offending: Some(change.package.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use indoc::indoc;
+
+    #[tokio::test]
+    async fn pip_apply_rewrites_requirements_without_invoking_pip_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        std::fs::write(
+            root.join("requirements.txt"),
+            indoc! {"
+                requests==2.28.0
+                flask==2.2.0
+            "},
+        )
+        .expect("requirements");
+        let project = Project {
+            root: root.clone(),
+            kind: Pip::ID,
+            manifest: root.join("requirements.txt"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = PyTool::<Pip>::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        let change = Change {
+            package: PackageId::new(Pip::ID, "requests", Some(PYPI.to_string())),
+            from: Version::new("2.28.0"),
+            to: Version::new("2.31.0"),
+            kind: cooldown_core::UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let plan = Plan {
+            changes: vec![change],
+            rewrite: cooldown_core::RewriteMode::Auto,
+        };
+
+        let report = tool
+            .apply(&project, &plan, &ProjectMutationJournal::default())
+            .await
+            .expect("apply");
+
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.skipped.is_empty());
+        let rewritten =
+            std::fs::read_to_string(root.join("requirements.txt")).expect("requirements");
+        assert!(rewritten.contains("requests==2.31.0"));
+    }
 
     #[tokio::test]
     async fn poetry_splits_direct_from_transitive() {

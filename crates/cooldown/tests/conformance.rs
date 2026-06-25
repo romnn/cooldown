@@ -127,6 +127,7 @@ impl ToolRead for FakeEco {
         cooldown_core::ProjectMarker {
             lockfile: "fake.lock",
             manifest: "fake.toml",
+            alternate_manifests: &[],
             workspace_root: true,
         }
     }
@@ -154,11 +155,15 @@ impl ToolRead for FakeEco {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
+    async fn verify_lock_current(&self, _p: &Project) -> Result<LockVerifyReport> {
         let stale = self.stale_lock
             || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
-        Ok(VerifyReport {
-            ok: !stale,
+        Ok(LockVerifyReport {
+            status: if stale {
+                LockStatus::Stale
+            } else {
+                LockStatus::Current
+            },
             detail: if stale { "stale".into() } else { "tidy".into() },
         })
     }
@@ -277,7 +282,105 @@ fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
         },
     };
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(fake));
+    adapters.register_target_verified_mutator(Arc::new(fake));
+    Workspace::new(
+        adapters,
+        vec![ctx],
+        now(),
+        baseline,
+        Utf8PathBuf::from("."),
+        Vec::new(),
+    )
+}
+
+struct UnknownLockFake(FakeEco);
+
+impl UnknownLockFake {
+    fn project(&self) -> Project {
+        self.0.project()
+    }
+}
+
+#[async_trait]
+impl ToolRead for UnknownLockFake {
+    fn id(&self) -> ToolId {
+        self.0.id()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        self.0.project_marker()
+    }
+
+    async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        self.0.dependencies(project, scope).await
+    }
+
+    async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
+        self.0.native_policy(project).await
+    }
+
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(LockVerifyReport {
+            status: LockStatus::Unknown,
+            detail: "fake lock currency is unknown".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ReleaseFetcher for UnknownLockFake {
+    async fn releases(
+        &self,
+        dep: &Dependency,
+        fetch: &FetchContext<'_>,
+        candidates: CandidateScope,
+    ) -> Result<Vec<Release>> {
+        self.0.releases(dep, fetch, candidates).await
+    }
+
+    async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release> {
+        self.0.locked_release(dep, fetch).await
+    }
+}
+
+#[async_trait]
+impl ToolWrite for UnknownLockFake {
+    async fn mutation_journal(&self, p: &Project, plan: &Plan) -> Result<ProjectMutationJournal> {
+        self.0.mutation_journal(p, plan).await
+    }
+
+    async fn apply(
+        &self,
+        p: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        self.0.apply(p, plan, journal).await
+    }
+
+    async fn build(&self, p: &Project) -> Result<VerifyReport> {
+        self.0.build(p).await
+    }
+}
+
+fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
+    let fake = UnknownLockFake(fake);
+    let project = fake.project();
+    let ctx = ProjectCtx {
+        tool: GO,
+        project,
+        rel_path: Utf8PathBuf::from("."),
+        policy: PolicyStack {
+            layers: vec![builtin_default_layer()],
+            strict_native: false,
+        },
+    };
+    let mut adapters = AdapterSet::new();
+    adapters.register_target_verified_mutator(Arc::new(fake));
     Workspace::new(
         adapters,
         vec![ctx],
@@ -603,7 +706,7 @@ async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_
 
     // The indirect `t` is dragged from v1.0.0 to v1.0.1 by the whole-graph re-resolve when `a` moves.
     let collateral_t = Change {
-        package: PackageId::new(GO, "t", None),
+        package: PackageId::new(GO, "t", Some("proxy.example".into())),
         from: Version::new("v1.0.0"),
         to: Version::new("v1.0.1"),
         kind: UpdateKind::Patch,
@@ -1081,6 +1184,112 @@ async fn upgrade_applies_clean_change() {
 }
 
 #[tokio::test]
+async fn upgrade_warns_when_final_lock_currency_is_unknown() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = unknown_lock_workspace(fake, Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.errors, 0);
+    assert_eq!(out.meta.lock_verified, None);
+    assert_eq!(out.meta.lock_status, Some(LockStatus::Unknown));
+    assert!(
+        out.warnings
+            .iter()
+            .any(|diag| diag.kind == DiagnosticKind::LockUnknown)
+    );
+}
+
+#[tokio::test]
+async fn upgrade_honors_allow_stale_lock_after_apply() {
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: true,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.allow_stale_lock = true;
+    let out = ws.upgrade(&opts).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.errors, 0);
+    assert_eq!(out.meta.lock_verified, Some(false));
+    assert_eq!(out.meta.lock_status, Some(LockStatus::Stale));
+    assert!(
+        out.warnings
+            .iter()
+            .any(|diag| diag.kind == DiagnosticKind::StaleLock)
+    );
+}
+
+#[tokio::test]
 async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
     // The reviewer fixture in adapter terms: upgrading the planned candidate `a` forces the
     // whole-graph re-resolve to move `b` — a package the plan never named — backward for consistency
@@ -1120,7 +1329,7 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
         rel("v2.1.0", 1, Some("2026-06-01T00:00:00Z"), None),
     );
     let forced_b_downgrade = Change {
-        package: PackageId::new(GO, "b", None),
+        package: PackageId::new(GO, "b", Some("proxy.example".into())),
         from: Version::new("v2.1.0"),
         to: Version::new("v2.0.0"),
         kind: UpdateKind::Minor,
@@ -2006,7 +2215,7 @@ async fn explain_applies_registry_scoped_rule() {
         },
     };
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(fake));
+    adapters.register_target_verified_mutator(Arc::new(fake));
     let ws = Workspace::new(
         adapters,
         vec![ctx],
@@ -2070,6 +2279,7 @@ impl ToolRead for RepoScopedFake {
         cooldown_core::ProjectMarker {
             lockfile: "repo.lock",
             manifest: "pyproject.toml",
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -2079,9 +2289,9 @@ impl ToolRead for RepoScopedFake {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
-        Ok(VerifyReport {
-            ok: true,
+    async fn verify_lock_current(&self, _p: &Project) -> Result<LockVerifyReport> {
+        Ok(LockVerifyReport {
+            status: LockStatus::Current,
             detail: "ok".into(),
         })
     }
@@ -2169,7 +2379,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(fake));
+    adapters.register_target_verified_mutator(Arc::new(fake));
     let ws = Workspace::new(
         adapters,
         contexts,
@@ -2235,6 +2445,7 @@ impl ToolRead for ProjectScopedFake {
         cooldown_core::ProjectMarker {
             lockfile: "project.lock",
             manifest: "pyproject.toml",
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -2244,9 +2455,9 @@ impl ToolRead for ProjectScopedFake {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
-        Ok(VerifyReport {
-            ok: true,
+    async fn verify_lock_current(&self, _p: &Project) -> Result<LockVerifyReport> {
+        Ok(LockVerifyReport {
+            status: LockStatus::Current,
             detail: "ok".into(),
         })
     }
@@ -2328,7 +2539,7 @@ async fn sync_project_scope_writes_native_per_project() {
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(fake));
+    adapters.register_target_verified_mutator(Arc::new(fake));
     let ws = Workspace::new(
         adapters,
         contexts,
@@ -2406,6 +2617,7 @@ impl ToolRead for HeldConflictFake {
         cooldown_core::ProjectMarker {
             lockfile: "uv.lock",
             manifest: "pyproject.toml",
+            alternate_manifests: &[],
             workspace_root: true,
         }
     }
@@ -2415,9 +2627,9 @@ impl ToolRead for HeldConflictFake {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<VerifyReport> {
-        Ok(VerifyReport {
-            ok: true,
+    async fn verify_lock_current(&self, _p: &Project) -> Result<LockVerifyReport> {
+        Ok(LockVerifyReport {
+            status: LockStatus::Current,
             detail: "ok".into(),
         })
     }
@@ -2504,7 +2716,7 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
         },
     };
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(fake));
+    adapters.register_target_verified_mutator(Arc::new(fake));
     Workspace::new(
         adapters,
         vec![ctx],

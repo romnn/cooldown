@@ -47,23 +47,23 @@ pub(super) fn adapter_set(
     )?;
 
     let mut adapters = AdapterSet::new();
-    adapters.register(Arc::new(GoTool::from_http(http.clone())));
-    adapters.register(Arc::new(CargoTool::from_http(http.clone())));
-    adapters.register(Arc::new(UvTool::from_http(http.clone())));
-    adapters.register(Arc::new(NpmCliTool::from_http(http.clone())));
-    adapters.register(Arc::new(PnpmTool::from_http(http.clone())));
-    adapters.register(Arc::new(YarnTool::from_http(http.clone())));
-    adapters.register(Arc::new(BunTool::from_http(http.clone())));
-    adapters.register(Arc::new(DenoTool::from_http(http.clone())));
-    adapters.register(Arc::new(BundlerTool::from_http(http.clone())));
-    adapters.register(Arc::new(HexTool::from_http(http.clone())));
-    adapters.register(Arc::new(MavenTool::from_http(http.clone())));
-    adapters.register(Arc::new(GradleTool::from_http(http.clone())));
-    adapters.register(Arc::new(PipTool::from_http(http.clone())));
-    adapters.register(Arc::new(PoetryTool::from_http(http.clone())));
-    adapters.register(Arc::new(CondaTool::from_http(http.clone())));
-    adapters.register(Arc::new(PixiTool::from_http(http.clone())));
-    adapters.register(Arc::new(SwiftTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(NpmCliTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(PnpmTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(YarnTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(BunTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(MavenTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(GradleTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(PipTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(PoetryTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())));
     Ok(adapters)
 }
 
@@ -103,10 +103,11 @@ pub(super) fn detect_projects(
         );
         for dir in dirs {
             tracing::debug!(tool = id.as_str(), root = %dir, "detected project");
+            let manifest = marker_manifest_path(&dir, &marker);
             projects.push((
                 id,
                 Project {
-                    manifest: dir.join(marker.manifest),
+                    manifest,
                     root: dir,
                     kind: id,
                     exclude_newer: None,
@@ -115,4 +116,39 @@ pub(super) fn detect_projects(
         }
     }
     Ok(projects)
+}
+
+fn marker_manifest_path(
+    dir: &camino::Utf8Path,
+    marker: &cooldown_core::ProjectMarker,
+) -> Utf8PathBuf {
+    std::iter::once(marker.manifest)
+        .chain(marker.alternate_manifests.iter().copied())
+        .find_map(|name| {
+            let path = dir.join(name);
+            path.exists().then_some(path)
+        })
+        .unwrap_or_else(|| dir.join(marker.manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cooldown_core::ProjectMarker;
+
+    #[test]
+    fn marker_manifest_path_uses_existing_alternate_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        std::fs::write(root.join("deno.jsonc"), "{}").unwrap();
+
+        let marker = ProjectMarker {
+            lockfile: "deno.lock",
+            manifest: "deno.json",
+            alternate_manifests: &["deno.jsonc"],
+            workspace_root: true,
+        };
+
+        assert_eq!(marker_manifest_path(root, &marker), root.join("deno.jsonc"));
+    }
 }

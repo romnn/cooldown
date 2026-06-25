@@ -6,8 +6,8 @@ pub use driver::Driver;
 
 use camino::Utf8Path;
 use cooldown_core::{
-    Change, CoreError, MajorKey, MemberRef, ProjectMutationJournal, RawRelease, Release,
-    ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped, UpdateKind, VerifyReport,
+    Change, CoreError, LockStatus, LockVerifyReport, MajorKey, MemberRef, ProjectMutationJournal,
+    RawRelease, Release, ReleaseOrder, ReleaseQuality, Result, SkipReason, Skipped, UpdateKind,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -140,14 +140,29 @@ pub fn single_lock_journal(root: &Utf8Path, lockfile: &Utf8Path) -> Result<Proje
 
 /// Build a standard lock-currency verification report from a boolean probe.
 #[must_use]
-pub fn verify_current_report(ok: bool, ok_detail: &str, stale_detail: &str) -> VerifyReport {
-    VerifyReport {
-        ok,
+pub fn verify_current_report(ok: bool, ok_detail: &str, stale_detail: &str) -> LockVerifyReport {
+    LockVerifyReport {
+        status: if ok {
+            LockStatus::Current
+        } else {
+            LockStatus::Stale
+        },
         detail: if ok {
             ok_detail.to_string()
         } else {
             stale_detail.to_string()
         },
+    }
+}
+
+/// Build a fail-closed lock-currency report for adapters that cannot prove currency yet.
+#[must_use]
+pub fn verify_current_unknown(lockfile: &str) -> LockVerifyReport {
+    LockVerifyReport {
+        status: LockStatus::Unknown,
+        detail: format!(
+            "{lockfile} currency cannot be verified by this adapter yet; refusing to assume it is current"
+        ),
     }
 }
 

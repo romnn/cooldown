@@ -259,6 +259,7 @@ pub struct BuildInfo {
 pub struct UpgradeMeta {
     pub applied: bool,
     pub lock_verified: Option<bool>,
+    pub lock_status: Option<cooldown_core::LockStatus>,
     pub build: BuildInfo,
 }
 

@@ -2,8 +2,9 @@ use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, MajorKey, PackageId, Plan, Release,
-    ResolveContext, SkipReason, Status, UpdateKind, Version, check_pin, evaluate, evaluate_fix,
+    ApplyReport, Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, MajorKey,
+    PackageId, Plan, Release, ResolveContext, SkipReason, Skipped, Status, UpdateKind, Version,
+    check_pin, evaluate, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +64,8 @@ struct FixPlan {
     changes: Vec<Change>,
     warnings: Vec<FixWarning>,
 }
+
+type ChangeTargetKey = (String, Option<String>, String);
 
 /// The evolving per-project state during one-change upgrade trials.
 struct TrialState {
@@ -533,29 +536,31 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Ok(report) => report,
             Err(error) => {
                 let restored = self.restore_journal(&journal);
-                for change in &changes {
-                    let diag = diag_from_error(
-                        &error,
-                        self.ctx.pctx.tool,
-                        self.project_label(),
-                        Some(&change.package.name),
-                    );
-                    self.record_change_error(change, diag);
-                }
+                self.record_change_errors(&error, &changes);
+                return restored;
+            }
+        };
+        if report.applied.is_empty() {
+            self.record_batch_skips(report.skipped);
+            return self.restore_journal(&journal);
+        }
+        let report = match self.verify_apply_report(report, &changes).await {
+            Ok(report) => report,
+            Err(error) => {
+                let restored = self.restore_journal(&journal);
+                self.record_change_errors(&error, &changes);
                 return restored;
             }
         };
 
         // A held candidate (the resolve could not place it at its target without breaking the lock) is
         // reported as a skip naming the package that blocks it.
-        let applied: HashSet<String> = report
-            .applied
+        let applied: HashSet<ChangeTargetKey> =
+            report.applied.iter().map(change_target_key).collect();
+        let planned_applied = planned_changes_landed(&changes, &applied);
+        let planned: HashSet<PackageId> = changes
             .iter()
-            .map(|change| change.package.name.clone())
-            .collect();
-        let planned: HashSet<String> = changes
-            .iter()
-            .map(|change| change.package.name.clone())
+            .map(|change| change.package.clone())
             .collect();
         // Net version changes the resolve forced on packages the plan did not name (a transitive
         // pushed backward for consistency, or matured down by a downgrade). These are part of the
@@ -564,13 +569,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let collateral: Vec<Change> = report
             .applied
             .iter()
-            .filter(|change| !planned.contains(&change.package.name))
+            .filter(|change| !planned.contains(&change.package))
             .cloned()
             .collect();
         self.record_batch_skips(report.skipped);
 
-        if applied.is_empty() {
-            // Nothing landed: roll the (unchanged or partial) lock back to the captured state.
+        if !planned_applied {
+            // No requested target landed: roll any incidental resolver movement back to the captured
+            // state instead of committing a collateral-only mutation.
             return self.restore_journal(&journal);
         }
 
@@ -581,17 +587,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 // recording the failure against each applied change (never committing an unverified
                 // lock).
                 let restored = self.restore_journal(&journal);
-                for change in &changes {
-                    if applied.contains(&change.package.name) {
-                        let diag = diag_from_error(
-                            &error,
-                            self.ctx.pctx.tool,
-                            self.project_label(),
-                            Some(&change.package.name),
-                        );
-                        self.record_change_error(change, diag);
-                    }
-                }
+                self.record_change_errors(
+                    &error,
+                    changes
+                        .iter()
+                        .filter(|change| applied.contains(&change_target_key(change))),
+                );
                 return restored;
             }
         };
@@ -602,7 +603,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
         state.baseline_violations = after_keys;
         for change in &changes {
-            if applied.contains(&change.package.name) {
+            if applied.contains(&change_target_key(change)) {
                 self.record_change_applied(change);
             }
         }
@@ -610,6 +611,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.record_change_applied(change);
         }
         true
+    }
+
+    async fn verify_apply_report(
+        &self,
+        report: ApplyReport,
+        planned: &[Change],
+    ) -> cooldown_core::Result<ApplyReport> {
+        let deps = self
+            .ctx
+            .reader
+            .dependencies(&self.ctx.pctx.project, DepScope::Graph)
+            .await?;
+        Ok(verify_applied_targets(report, planned, &deps))
     }
 
     /// Record each held candidate (uv lowered it below its ceiling, or the resolve rejected it) as a
@@ -650,7 +664,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         after: &HashMap<(String, String), bool>,
         after_keys: &HashSet<(String, String)>,
         changes: &[Change],
-        applied: &HashSet<String>,
+        applied: &HashSet<ChangeTargetKey>,
         state: &TrialState,
     ) -> bool {
         let new_violations: Vec<&(String, String)> =
@@ -682,7 +696,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 };
                 self.acc.strict_incomplete = true;
                 for change in changes {
-                    if applied.contains(&change.package.name) {
+                    if applied.contains(&change_target_key(change)) {
                         self.record_change_skip(
                             change,
                             Some(SkippedInfo {
@@ -739,17 +753,32 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             Ok(report) => {
-                self.acc.lock_verified = Some(self.acc.lock_verified.unwrap_or(true) && report.ok);
-                if !report.ok {
-                    self.acc.errors.push(
-                        Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
+                self.record_lock_status(report.status);
+                match report.status {
+                    LockStatus::Current => {}
+                    LockStatus::Stale => {
+                        let diag = Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
                             .with_tool(self.ctx.tool_name())
                             .with_project(self.project_label())
-                            .with_path(self.ctx.pctx.project.manifest.as_str()),
-                    );
+                            .with_path(self.ctx.pctx.project.manifest.as_str());
+                        if self.ctx.opts.allow_stale_lock {
+                            self.acc.warnings.push(diag);
+                        } else {
+                            self.acc.errors.push(diag);
+                        }
+                    }
+                    LockStatus::Unknown => {
+                        self.acc.warnings.push(
+                            Diagnostic::new(DiagnosticKind::LockUnknown, report.detail)
+                                .with_tool(self.ctx.tool_name())
+                                .with_project(self.project_label())
+                                .with_path(self.ctx.pctx.project.manifest.as_str()),
+                        );
+                    }
                 }
             }
             Err(error) => {
+                self.record_lock_status(LockStatus::Stale);
                 self.acc.lock_verified = Some(false);
                 self.record_project_error(&error, None);
             }
@@ -774,6 +803,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
             }
         }
+    }
+
+    fn record_lock_status(&mut self, status: LockStatus) {
+        self.acc.lock_status = Some(combine_lock_status(self.acc.lock_status, status));
+        self.acc.lock_verified = self.acc.lock_status.and_then(LockStatus::verified);
     }
 
     /// The graph's too-fresh, non-baselined violations, each mapped to whether it is *reconcilable* —
@@ -841,6 +875,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.project_label(),
             package,
         ));
+    }
+
+    fn record_change_errors<'c>(
+        &mut self,
+        error: &cooldown_core::CoreError,
+        changes: impl IntoIterator<Item = &'c Change>,
+    ) {
+        for change in changes {
+            let diag = diag_from_error(
+                error,
+                self.ctx.pctx.tool,
+                self.project_label(),
+                Some(&change.package.name),
+            );
+            self.record_change_error(change, diag);
+        }
     }
 
     fn record_change_applied(&mut self, change: &Change) {
@@ -948,6 +998,76 @@ fn target_package(
     PackageId::new(package.tool, name, package.registry.clone())
 }
 
+fn verify_applied_targets(
+    report: ApplyReport,
+    planned: &[Change],
+    deps: &[Dependency],
+) -> ApplyReport {
+    let planned: HashSet<ChangeTargetKey> = planned.iter().map(change_target_key).collect();
+    let mut skipped_keys: HashSet<ChangeTargetKey> = report
+        .skipped
+        .iter()
+        .map(|skip| change_target_key(&skip.change))
+        .collect();
+    let mut verified = ApplyReport {
+        applied: Vec::new(),
+        skipped: report.skipped,
+    };
+
+    for change in report.applied {
+        let key = change_target_key(&change);
+        if !planned.contains(&key) {
+            verified.applied.push(change);
+            continue;
+        }
+
+        if target_reached(deps, &change) {
+            verified.applied.push(change);
+            continue;
+        }
+
+        if skipped_keys.insert(key) {
+            verified.skipped.push(resolver_conflict(&change));
+        }
+    }
+    verified
+}
+
+fn target_reached(deps: &[Dependency], change: &Change) -> bool {
+    deps.iter()
+        .any(|dep| dep.package == change.package && dep.current == change.to)
+}
+
+fn change_target_key(change: &Change) -> ChangeTargetKey {
+    (
+        change.package.name.clone(),
+        change.package.registry.clone(),
+        change.to.as_str().to_string(),
+    )
+}
+
+fn resolver_conflict(change: &Change) -> Skipped {
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(change.package.clone()),
+    }
+}
+
+fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeTargetKey>) -> bool {
+    changes
+        .iter()
+        .any(|change| applied.contains(&change_target_key(change)))
+}
+
+fn combine_lock_status(current: Option<LockStatus>, next: LockStatus) -> LockStatus {
+    match (current, next) {
+        (Some(LockStatus::Stale), _) | (_, LockStatus::Stale) => LockStatus::Stale,
+        (Some(LockStatus::Unknown), _) | (_, LockStatus::Unknown) => LockStatus::Unknown,
+        _ => LockStatus::Current,
+    }
+}
+
 /// The user-facing skip message. A resolver conflict caused by a *different* package — adopting the
 /// candidate would have regressed it (a mutually-exclusive requirement) — names that package, so the
 /// report says which dependency is holding the candidate back rather than the generic "the resolver
@@ -1013,12 +1133,16 @@ fn record_skip_item(
 
 #[cfg(test)]
 mod tests {
-    use super::{PlanMode, candidate_scope, conflict_skip_message, is_downgrade, target_package};
+    use super::{
+        PlanMode, candidate_scope, combine_lock_status, conflict_skip_message, is_downgrade,
+        planned_changes_landed, target_package, verify_applied_targets,
+    };
     use crate::app::TransitiveGate;
     use cooldown_core::{
-        DepScope, MajorKey, PackageId, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId,
-        Version,
+        ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, PackageId, Release,
+        ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn upgrade_scopes_candidates_to_direct_requires() {
@@ -1099,6 +1223,105 @@ mod tests {
             yanked: false,
             quality: ReleaseQuality::Stable,
         }
+    }
+
+    fn dep(name: &str, version: &str) -> Dependency {
+        Dependency {
+            package: PackageId::new(ToolId("mock"), name, None),
+            current: Version::new(version),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            members: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    fn change(name: &str, from: &str, to: &str) -> Change {
+        Change {
+            package: PackageId::new(ToolId("mock"), name, None),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verify_applied_targets_turns_unreached_planned_success_into_skip() {
+        let planned = vec![change("serde", "1.0.0", "1.0.1")];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+
+        let verified = verify_applied_targets(report, &planned, &[dep("serde", "1.0.0")]);
+
+        assert!(verified.applied.is_empty());
+        assert_eq!(verified.skipped.len(), 1);
+        assert_eq!(verified.skipped[0].reason, SkipReason::ResolverConflict);
+        assert_eq!(verified.skipped[0].change.package.name, "serde");
+    }
+
+    #[test]
+    fn verify_applied_targets_keys_same_package_by_target_version() {
+        let landed = change("serde", "1.0.0", "1.0.1");
+        let missed = change("serde", "1.0.0", "1.0.2");
+        let planned = vec![landed.clone(), missed.clone()];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+
+        let verified = verify_applied_targets(report, &planned, &[dep("serde", "1.0.1")]);
+
+        assert_eq!(verified.applied, vec![landed]);
+        assert_eq!(verified.skipped.len(), 1);
+        assert_eq!(verified.skipped[0].change, missed);
+    }
+
+    #[test]
+    fn verify_applied_targets_keeps_lock_diff_collateral_outside_dependency_graph() {
+        let planned_change = change("serde", "1.0.0", "1.0.1");
+        let collateral = change("itoa", "1.0.0", "1.0.1");
+        let report = ApplyReport {
+            applied: vec![planned_change.clone(), collateral.clone()],
+            skipped: Vec::new(),
+        };
+
+        let verified = verify_applied_targets(
+            report,
+            std::slice::from_ref(&planned_change),
+            &[dep("serde", "1.0.1")],
+        );
+
+        assert_eq!(verified.applied, vec![planned_change, collateral]);
+        assert!(verified.skipped.is_empty());
+    }
+
+    #[test]
+    fn planned_changes_landed_rejects_collateral_only_results() {
+        let planned = change("serde", "1.0.0", "1.0.1");
+        let collateral = change("itoa", "1.0.0", "1.0.1");
+        let applied = HashSet::from([super::change_target_key(&collateral)]);
+
+        assert!(!planned_changes_landed(&[planned], &applied));
+    }
+
+    #[test]
+    fn lock_status_aggregation_keeps_unknown_distinct_from_verified_current() {
+        let current_then_unknown =
+            combine_lock_status(Some(LockStatus::Current), LockStatus::Unknown);
+        assert_eq!(current_then_unknown, LockStatus::Unknown);
+        assert_eq!(current_then_unknown.verified(), None);
+
+        let unknown_then_stale = combine_lock_status(Some(LockStatus::Unknown), LockStatus::Stale);
+        assert_eq!(unknown_then_stale, LockStatus::Stale);
+        assert_eq!(unknown_then_stale.verified(), Some(false));
     }
 
     #[test]

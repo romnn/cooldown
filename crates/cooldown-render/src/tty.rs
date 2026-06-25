@@ -541,10 +541,15 @@ fn render_mutation(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
-    let lock = match meta.lock_verified {
-        Some(true) => "lock re-verified",
-        Some(false) => "lock verification FAILED",
-        None => "dry-run (lock untouched)",
+    let lock = match meta.lock_status {
+        Some(cooldown_core::LockStatus::Current) => "lock re-verified",
+        Some(cooldown_core::LockStatus::Stale) => "lock stale",
+        Some(cooldown_core::LockStatus::Unknown) => "lock currency unknown",
+        None => match meta.lock_verified {
+            Some(true) => "lock re-verified",
+            Some(false) => "lock verification FAILED",
+            None => "dry-run (lock untouched)",
+        },
     };
     // The held-back `needs --major` rows are counted in `skipped`; break out how many so the user
     // sees what is merely a flag away.
@@ -1176,6 +1181,7 @@ mod tests {
             &UpgradeMeta {
                 applied: false,
                 lock_verified: None,
+                lock_status: None,
                 build: BuildInfo {
                     requested: false,
                     ok: None,
@@ -1275,6 +1281,7 @@ mod tests {
             &UpgradeMeta {
                 applied: false,
                 lock_verified: None,
+                lock_status: None,
                 build: BuildInfo {
                     requested: false,
                     ok: None,
@@ -1336,6 +1343,7 @@ mod tests {
             &UpgradeMeta {
                 applied: false,
                 lock_verified: None,
+                lock_status: None,
                 build: BuildInfo {
                     requested: false,
                     ok: None,
@@ -1375,6 +1383,7 @@ mod tests {
             &UpgradeMeta {
                 applied: false,
                 lock_verified: Some(true),
+                lock_status: Some(cooldown_core::LockStatus::Current),
                 build: BuildInfo {
                     requested: false,
                     ok: None,

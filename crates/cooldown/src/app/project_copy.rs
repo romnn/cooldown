@@ -8,6 +8,20 @@
 
 use cooldown_core::{CoreError, Project, ResolveInputs};
 
+const SKIP_DIRS: &[&str] = &[
+    ".venv",
+    "venv",
+    ".git",
+    ".jj",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "vendor",
+    "testdata",
+];
+
 /// A project copied into a throwaway temp directory. The copy is deleted when this value drops, so
 /// the real project tree is never read for mutation or written. Hold it for as long as the copied
 /// [`Project`] is in use.
@@ -59,26 +73,25 @@ impl ProjectCopy {
 ///
 /// Directories that the resolver never needs and that would make even a skeleton walk expensive or
 /// self-referential are pruned outright: virtualenvs, VCS metadata, bytecode caches, `node_modules`,
-/// build `target`, `vendor`/`testdata`, plus any dotfile-prefixed (`.git`, `.jj`, `.venv`, …) or
-/// underscore-prefixed (`_data`, `_cache`, …) directory — the same set Go's own package discovery
-/// skips. This keeps the walk off non-source trees that may be huge or unreadable (e.g. a `_data`
-/// Docker volume owned by another user). Any entry that is unreadable (`PermissionDenied`) is skipped
-/// quietly instead of failing the whole probe.
+/// build `target`, and vendored/testdata trees. Dot-prefixed config directories are traversed only
+/// when they are ancestors of explicit [`ResolveInputs::path_prefixes`] entries such as
+/// `.cargo/config.toml`; underscore-prefixed source directories are not pruned generically because
+/// they are legitimate module/package locations in several ecosystems. Any entry that is unreadable
+/// (`PermissionDenied`) is skipped quietly instead of failing the whole probe.
 fn copy_project_tree(
     src: &std::path::Path,
     dest: &std::path::Path,
     inputs: &ResolveInputs,
 ) -> std::io::Result<()> {
-    const SKIP_DIRS: &[&str] = &[
-        ".venv",
-        "venv",
-        ".git",
-        "__pycache__",
-        "node_modules",
-        "target",
-        "vendor",
-        "testdata",
-    ];
+    copy_project_tree_inner(src, dest, std::path::Path::new(""), inputs)
+}
+
+fn copy_project_tree_inner(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    rel: &std::path::Path,
+    inputs: &ResolveInputs,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     let entries = match std::fs::read_dir(src) {
         Ok(entries) => entries,
@@ -101,19 +114,15 @@ fn copy_project_tree(
         let name = entry.file_name();
         let from = entry.path();
         let to = dest.join(&name);
+        let child_rel = rel.join(&name);
         if file_type.is_dir() {
-            // Prune the resolver-irrelevant set: named skip dirs plus any dotfile/underscore-prefixed
-            // directory (the latter is where container-owned `_data` volumes live).
-            let pruned = name
-                .to_str()
-                .is_none_or(|n| SKIP_DIRS.contains(&n) || n.starts_with('.') || n.starts_with('_'));
-            if pruned {
+            if should_prune_dir(&name, &child_rel, inputs) {
                 continue;
             }
-            copy_project_tree(&from, &to, inputs)?;
+            copy_project_tree_inner(&from, &to, &child_rel, inputs)?;
         } else if file_type.is_file() {
             // Copy ONLY resolver inputs — never the full source/data tree.
-            if !is_resolver_input(&name, inputs) {
+            if !is_resolver_input(&child_rel, &name, inputs) {
                 continue;
             }
             match std::fs::copy(&from, &to) {
@@ -134,9 +143,29 @@ fn copy_project_tree(
     Ok(())
 }
 
+fn should_prune_dir(name: &std::ffi::OsStr, rel: &std::path::Path, inputs: &ResolveInputs) -> bool {
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    if SKIP_DIRS.contains(&name) {
+        return true;
+    }
+    if rel_is_under_dot_dir(rel) {
+        return !path_prefix_relevant(rel, inputs);
+    }
+    false
+}
+
 /// Whether a file is one the resolver reads: an exact manifest/lock/config basename, or a source file
 /// whose extension a resolver validates against (`rs`, `go`). Everything else is skipped.
-fn is_resolver_input(name: &std::ffi::OsStr, inputs: &ResolveInputs) -> bool {
+fn is_resolver_input(
+    rel: &std::path::Path,
+    name: &std::ffi::OsStr,
+    inputs: &ResolveInputs,
+) -> bool {
+    if path_prefix_matches(rel, inputs) {
+        return true;
+    }
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -147,6 +176,48 @@ fn is_resolver_input(name: &std::ffi::OsStr, inputs: &ResolveInputs) -> bool {
         return inputs.source_extensions.contains(&extension);
     }
     false
+}
+
+fn rel_is_under_dot_dir(rel: &std::path::Path) -> bool {
+    rel.components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn path_prefix_relevant(rel: &std::path::Path, inputs: &ResolveInputs) -> bool {
+    let Some(rel) = rel_slash(rel) else {
+        return false;
+    };
+    inputs.path_prefixes.iter().any(|prefix| {
+        rel == *prefix
+            || rel
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+            || prefix
+                .strip_prefix(rel.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+fn path_prefix_matches(rel: &std::path::Path, inputs: &ResolveInputs) -> bool {
+    let Some(rel) = rel_slash(rel) else {
+        return false;
+    };
+    inputs.path_prefixes.iter().any(|prefix| {
+        rel == *prefix
+            || rel
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+fn rel_slash(rel: &std::path::Path) -> Option<String> {
+    Some(
+        rel.to_str()?
+            .trim_start_matches(std::path::MAIN_SEPARATOR)
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
 }
 
 #[cfg(test)]
@@ -178,6 +249,8 @@ mod tests {
         // Pruned dirs — never descended into.
         std::fs::create_dir_all(s.join("node_modules/foo")).expect("mkdir");
         std::fs::write(s.join("node_modules/foo/package.json"), "{}").expect("write");
+        // Underscore dirs are legitimate package/source locations in several ecosystems, so they are
+        // no longer pruned generically; bulk files inside them still do not match resolver inputs.
         std::fs::create_dir_all(s.join("_data/vol")).expect("mkdir");
         std::fs::write(s.join("_data/vol/blob"), vec![0u8; 4096]).expect("write");
 
@@ -201,9 +274,42 @@ mod tests {
         assert!(!d.join("model.bin").exists(), "data blob not copied");
         assert!(!d.join("README.md").exists(), "docs not copied");
 
-        // Pruned dirs are not reproduced at all.
+        // Pruned dirs are not reproduced at all; underscore data is walked but bulk files are skipped.
         assert!(!d.join("node_modules").exists(), "node_modules pruned");
-        assert!(!d.join("_data").exists(), "underscore data dir pruned");
+        assert!(
+            !d.join("_data/vol/blob").exists(),
+            "underscore data blob skipped"
+        );
+    }
+
+    #[test]
+    fn copies_resolver_config_below_pruned_dot_dirs() {
+        let src = tempfile::tempdir().expect("src");
+        let dest = tempfile::tempdir().expect("dest");
+        let s = src.path();
+        std::fs::create_dir_all(s.join(".cargo")).expect("mkdir");
+        std::fs::write(s.join(".cargo/config.toml"), "[source.crates-io]\n").expect("write");
+        std::fs::create_dir_all(s.join(".cargo/bin")).expect("mkdir");
+        std::fs::write(s.join(".cargo/bin/cargo-helper"), "binary").expect("write");
+        std::fs::create_dir_all(s.join(".yarn/releases")).expect("mkdir");
+        std::fs::write(s.join(".yarn/releases/yarn-4.0.0.cjs"), "yarn").expect("write");
+        std::fs::create_dir_all(s.join(".yarn/cache")).expect("mkdir");
+        std::fs::write(s.join(".yarn/cache/left-pad.zip"), "cache").expect("write");
+        std::fs::create_dir_all(s.join(".swiftpm/configuration")).expect("mkdir");
+        std::fs::write(
+            s.join(".swiftpm/configuration/registries.json"),
+            "{\"registries\":{}}\n",
+        )
+        .expect("write");
+
+        copy_project_tree(s, dest.path(), &ResolveInputs::DEFAULT).expect("copy");
+        let d = dest.path();
+
+        assert!(d.join(".cargo/config.toml").exists());
+        assert!(!d.join(".cargo/bin/cargo-helper").exists());
+        assert!(d.join(".yarn/releases/yarn-4.0.0.cjs").exists());
+        assert!(!d.join(".yarn/cache/left-pad.zip").exists());
+        assert!(d.join(".swiftpm/configuration/registries.json").exists());
     }
 
     /// `source_extensions` is opt-in per tool: Cargo/Go include their source (their resolve validates
@@ -215,6 +321,8 @@ mod tests {
         std::fs::write(s.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
         std::fs::create_dir_all(s.join("src")).expect("mkdir");
         std::fs::write(s.join("src/lib.rs"), "").expect("write");
+        std::fs::create_dir_all(s.join("_internal")).expect("mkdir");
+        std::fs::write(s.join("_internal/helper.rs"), "").expect("write");
 
         // Cargo opts into `.rs`, so its source is copied.
         let cargo_inputs = ResolveInputs {
@@ -228,6 +336,10 @@ mod tests {
             dest.path().join("src/lib.rs").exists(),
             "cargo copies .rs source so the resolve sees crate targets"
         );
+        assert!(
+            dest.path().join("_internal/helper.rs").exists(),
+            "underscore source dirs are valid resolver input locations"
+        );
 
         // The default (no source extensions) skips it.
         let dest_default = tempfile::tempdir().expect("dest");
@@ -235,6 +347,10 @@ mod tests {
         assert!(
             !dest_default.path().join("src/lib.rs").exists(),
             "the declaration-only default never copies source"
+        );
+        assert!(
+            !dest_default.path().join("_internal/helper.rs").exists(),
+            "underscore source still requires an opted-in source extension"
         );
     }
 }

@@ -5,11 +5,11 @@
 //! removal/retype/semantic change does. Consumers ignore unknown fields. The `status` and
 //! `minAgeSource` enums are part of the contract.
 
-use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status, UpdateKind};
+use cooldown_core::{Diagnostic, LockStatus, MemberRef, SkipReason, Status, UpdateKind};
 use serde::Serialize;
 
 /// The JSON schema version. Bumped only on a removal/retype/semantic change.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -401,8 +401,10 @@ pub struct BuildInfo {
 pub struct UpgradeMeta {
     /// Whether any change was applied (`false` for a dry run).
     pub applied: bool,
-    /// Re-lock result; `null` for `--dry-run` (which never mutates).
+    /// Legacy re-lock result; `null` for `--dry-run` and for adapters whose currency is unknown.
     pub lock_verified: Option<bool>,
+    /// Re-lock status; `null` for `--dry-run` (which never mutates).
+    pub lock_status: Option<LockStatus>,
     /// The post-mutation build result.
     pub build: BuildInfo,
 }

@@ -679,8 +679,10 @@ pub enum CandidateScope {
 pub struct ProjectMarker {
     /// The lock/manifest filename whose presence marks a project root (e.g. `"Cargo.lock"`).
     pub lockfile: &'static str,
-    /// The manifest filename recorded on the detected [`Project`] (e.g. `"Cargo.toml"`).
+    /// The primary manifest filename recorded on the detected [`Project`] (e.g. `"Cargo.toml"`).
     pub manifest: &'static str,
+    /// Alternate manifest names for tools that accept more than one root config filename.
+    pub alternate_manifests: &'static [&'static str],
     /// When `true`, a marked root's descendants are not also reported — a workspace root already
     /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
     pub workspace_root: bool,
@@ -693,6 +695,39 @@ pub struct FetchContext<'a> {
     pub project: &'a Project,
     /// Which artifacts to gate.
     pub artifacts: ArtifactScope,
+}
+
+/// The outcome of a lock-currency probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockStatus {
+    /// The lock is current relative to the manifest/config the tool reads.
+    Current,
+    /// The lock is known to be stale or absent.
+    Stale,
+    /// The adapter cannot currently prove whether the lock is current.
+    Unknown,
+}
+
+impl LockStatus {
+    /// Returns the legacy boolean representation when one exists.
+    #[must_use]
+    pub fn verified(self) -> Option<bool> {
+        match self {
+            LockStatus::Current => Some(true),
+            LockStatus::Stale => Some(false),
+            LockStatus::Unknown => None,
+        }
+    }
+}
+
+/// The result of a lock-currency verification step.
+#[derive(Debug, Clone)]
+pub struct LockVerifyReport {
+    /// The lock-currency outcome.
+    pub status: LockStatus,
+    /// Human-readable detail describing the probe result.
+    pub detail: String,
 }
 
 /// The result of an opt-in `build`/`sync` verification step.

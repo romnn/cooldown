@@ -7,11 +7,11 @@ use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_adapter_util::{
-    Driver, build_registry_releases, skipped_on_apply_error, verify_current_report,
+    Driver, build_registry_releases, skipped_on_apply_error, verify_current_unknown,
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
     ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
 };
@@ -83,6 +83,7 @@ impl ToolRead for BundlerTool {
         ProjectMarker {
             lockfile: "Gemfile.lock",
             manifest: "Gemfile",
+            alternate_manifests: &[],
             workspace_root: false,
         }
     }
@@ -123,12 +124,8 @@ impl ToolRead for BundlerTool {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<VerifyReport> {
-        Ok(verify_current_report(
-            true,
-            "Gemfile.lock taken as current",
-            "Gemfile.lock is stale",
-        ))
+    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
+        Ok(verify_current_unknown("Gemfile.lock"))
     }
 }
 

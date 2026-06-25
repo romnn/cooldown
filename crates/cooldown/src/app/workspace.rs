@@ -258,17 +258,27 @@ impl AdapterSet {
         Self::default()
     }
 
-    /// Register one concrete adapter as both a read-side and a mutation-side port.
-    pub fn register<T>(&mut self, adapter: Arc<T>)
+    /// Register one concrete adapter as read-side and registry-fetch ports only.
+    pub fn register_read<T>(&mut self, adapter: Arc<T>)
+    where
+        T: ToolRead + ReleaseFetcher + 'static,
+    {
+        let id = adapter.id();
+        let reader: Arc<dyn ToolRead> = adapter.clone();
+        let fetcher: Arc<dyn ReleaseFetcher> = adapter;
+        self.readers.push(reader);
+        self.fetchers.insert(id, fetcher);
+    }
+
+    /// Register one concrete adapter as read/fetch ports plus a mutator whose writes are verified
+    /// by the application layer's post-apply graph proof before they are committed.
+    pub fn register_target_verified_mutator<T>(&mut self, adapter: Arc<T>)
     where
         T: cooldown_core::Tool + 'static,
     {
         let id = adapter.id();
-        let reader: Arc<dyn ToolRead> = adapter.clone();
-        let fetcher: Arc<dyn ReleaseFetcher> = adapter.clone();
+        self.register_read(adapter.clone());
         let writer: Arc<dyn ToolWrite> = adapter;
-        self.readers.push(reader);
-        self.fetchers.insert(id, fetcher);
         self.writers.insert(id, writer);
     }
 

@@ -531,6 +531,7 @@ dependencies = [
  "cooldown-core",
  "cooldown-registry",
  "cooldown-uv",
+ "indoc",
  "serde",
  "tempfile",
  "tokio",
