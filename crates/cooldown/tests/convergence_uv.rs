@@ -262,6 +262,119 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
     );
 }
 
+/// A project whose build backend is declared with a deliberately old floor in
+/// `[build-system].requires`, alongside one ordinary dependency. uv resolves the build backend in an
+/// isolated environment and never records it in `uv.lock`, so only cooldown's manifest-constraint
+/// path can surface it — these tests exercise that path end to end against the real resolver.
+const BUILD_BACKEND_PYPROJECT: &str = r#"[project]
+name = "cooldown-build-backend-fixture"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "certifi>=2024.1.1",
+]
+
+[build-system]
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
+"#;
+
+/// Seed the lock at `FREEZE` so the ordinary dependency (`certifi`) is already at its newest matured
+/// version: the only thing left to move is the build-backend floor, isolating the manifest-constraint
+/// path (no lock change at all).
+fn build_backend_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", BUILD_BACKEND_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, FREEZE);
+    fixture
+}
+
+/// The `name>=X` lower-bound version declared anywhere in a `pyproject.toml`, as a list of numeric
+/// components for order-correct comparison (`1.30.1` > `1.18.0`, which a string compare misorders).
+fn requirement_floor(pyproject: &str, name: &str) -> Option<Vec<u64>> {
+    let needle = format!("{name}>=");
+    let start = pyproject.find(&needle)? + needle.len();
+    let rest = &pyproject[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    Some(
+        rest[..end]
+            .split('.')
+            .map(|component| component.parse().unwrap_or(0))
+            .collect(),
+    )
+}
+
+#[test]
+fn outdated_surfaces_a_build_backend_requirement() {
+    skip_if_missing!("uv");
+    let fixture = build_backend_fixture();
+
+    // hatchling lives only in `[build-system].requires` and is absent from `uv.lock`, yet `outdated`
+    // must report it adoptable — the local flow now sees the same update Dependabot opens a PR for.
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    assert!(
+        adoptable.contains("hatchling"),
+        "outdated must surface the build-backend requirement as adoptable, got {adoptable:?}"
+    );
+}
+
+#[test]
+fn upgrade_raises_the_build_backend_floor_without_touching_the_lock() {
+    skip_if_missing!("uv");
+    let fixture = build_backend_fixture();
+    let seed_floor =
+        requirement_floor(BUILD_BACKEND_PYPROJECT, "hatchling").expect("seed floor parses");
+    let lock_before = fixture.read_bytes("uv.lock");
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        upgrade.held_conflict_names().len()
+    );
+    assert!(
+        upgrade.applied_names().contains("hatchling"),
+        "upgrade must report the build-backend floor as applied, got {:?}",
+        upgrade.applied_names()
+    );
+
+    // The floor was raised in pyproject.toml…
+    let after = String::from_utf8(fixture.read_bytes("pyproject.toml")).expect("utf8 pyproject");
+    let new_floor = requirement_floor(&after, "hatchling").expect("new floor parses");
+    assert!(
+        new_floor > seed_floor,
+        "build-backend floor must be raised above the seed {seed_floor:?}, got {new_floor:?}"
+    );
+
+    // …and the lock is byte-identical: uv never records the build backend, so adopting a newer one
+    // is a manifest-only change with no resolution to redo.
+    assert_eq!(
+        lock_before,
+        fixture.read_bytes("uv.lock"),
+        "raising a build-backend floor must not touch uv.lock"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fixture.read_bytes("uv.lock")).contains("hatchling"),
+        "the build backend is never locked"
+    );
+
+    // Re-running is idempotent: the floor is already current, so nothing moves.
+    let again = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        !again.applied_names().contains("hatchling"),
+        "a second upgrade must not move the already-current build-backend floor"
+    );
+    assert_eq!(
+        after,
+        String::from_utf8(fixture.read_bytes("pyproject.toml")).expect("utf8 pyproject"),
+        "a converged build-backend floor leaves pyproject.toml byte-identical"
+    );
+}
+
 /// A uv workspace whose dependency is declared in a MEMBER (`packages/app`), never the virtual root.
 /// uv resolves the whole workspace into one shared `uv.lock` (a single flat environment — unlike
 /// cargo/pnpm it cannot hold two versions of one package), so the upgrade must reach the member's
