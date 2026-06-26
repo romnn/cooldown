@@ -82,29 +82,26 @@ pub trait NodeLock: Send + Sync + 'static {
     }
 
     /// The single command that re-resolves the whole graph under cooldown's window, pinning each
-    /// planned candidate to its EXACT per-package target — pnpm's
+    /// eligible candidate to its exact per-package target — pnpm's
     /// `update <pkg>@<target> … --lockfile-only --no-save --config.minimumReleaseAge=<minutes>`
-    /// (the forward `upgrade` and the `fix` rollback both pass their `change.to` targets) or, with no
-    /// `pins`, a plain `install --lockfile-only --config.minimumReleaseAge=<minutes>` reconcile.
+    /// (the forward `upgrade` and the `fix` rollback both pass their `change.to` targets).
     ///
-    /// Each `pin` is `(name, target)`. A `Some(target)` is an EXACT pin — the per-package target the
-    /// core computed for that candidate's own window — so the resolve lands it at exactly that version,
-    /// never overshooting a package whose stricter per-package window admits an older version than the
-    /// global one (the gap a bare `--latest` left, since pnpm's `minimumReleaseAge` is a single global
-    /// value). A `None` target floats the candidate by its declared range under the window instead of
-    /// pinning it: a name held at several versions across the workspace's importers (the v4/v5 split
-    /// pnpm allows, like cargo) cannot be exact-pinned without collapsing every other copy onto the one
-    /// target, so it is updated by name and each importer's range re-resolves independently.
-    /// `minimumReleaseAge` is still passed as the *transitive* floor: a fresh transitive the pins drag
-    /// in is capped to the project-default window, so the uniform-window case lands the same lock as
-    /// before while the per-package targets are honored exactly. Transitives the pins float past the
-    /// global window are reconciled down by the caller's transitive-cooldown gate, exactly as for
-    /// cargo/go (which have no global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json`
-    /// and `node_modules` untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap.
-    /// `None` for managers without a joint resolve.
+    /// Each `pin` is `(name, target)`: the per-package target the core computed for that candidate's
+    /// own window. The resolve lands it at exactly that version, never overshooting a package whose
+    /// stricter per-package window admits an older version than the global one (the gap a bare
+    /// `--latest` left, since pnpm's `minimumReleaseAge` is a single global value). Multi-version
+    /// candidates must be held out by the caller before this point: pnpm's bare `update <name>` can
+    /// write out-of-range lock entries while `--no-save` leaves manifests unchanged. `minimumReleaseAge`
+    /// is still passed as the *transitive* floor: a fresh transitive the pins drag in is capped to the
+    /// project-default window, so the uniform-window case lands the same lock as before while the
+    /// per-package targets are honored exactly. Transitives the pins float past the global window are
+    /// reconciled down by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no
+    /// global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json` and `node_modules`
+    /// untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap. `None` for managers
+    /// without a joint resolve or when there are no exact pins to apply.
     #[must_use]
     fn whole_graph_args(
-        _pins: &[(String, Option<String>)],
+        _pins: &[(String, String)],
         _window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         None
@@ -156,8 +153,8 @@ pub struct MemberIndex {
     exact_name: HashSet<String>,
     /// The distinct declared *range specifiers* per name across importers (pnpm records a `specifier:`
     /// per importer). A name two members declare with different ranges (`~7.3.0` vs `^7.0.0`, `<4` vs
-    /// `^4`) is a version split even when the lock happens to resolve both to one version, so it must
-    /// be range-floated — exact-pinning one target would drag the narrower member off its own range.
+    /// `^4`) is a version split even when the lock happens to resolve both to one version, so cooldown
+    /// must not exact-pin it across the workspace.
     declared_specifiers: HashMap<String, HashSet<String>>,
     authoritative: bool,
 }
@@ -222,12 +219,13 @@ impl MemberIndex {
     }
 
     /// Names that workspace importers DECLARE at more than one distinct line — a genuine split that
-    /// must be range-floated, NOT a transitive duplicate. A name splits when importers either resolve
-    /// it to different versions (one member on `chalk@4.1.2`, another on `chalk@5.3.0`) OR declare it
-    /// with different *range specifiers* (`semver@~7.3.0` vs `semver@^7.0.0`, `tailwindcss@"<4"` vs
-    /// `@^4`) — the latter even when the lock happens to resolve both to one version. Either way an
-    /// exact pin would collapse every copy onto a single target, dragging the narrower member off its
-    /// own declared range; the whole-graph resolve range-floats these instead and exact-pins the rest.
+    /// must be held out of the joint update, NOT a transitive duplicate. A name splits when importers
+    /// either resolve it to different versions (one member on `chalk@4.1.2`, another on `chalk@5.3.0`)
+    /// OR declare it with different *range specifiers* (`semver@~7.3.0` vs `semver@^7.0.0`,
+    /// `tailwindcss@"<4"` vs `@^4`) — the latter even when the lock happens to resolve both to one
+    /// version. Either way an exact pin would collapse every copy onto a single target, dragging the
+    /// narrower member off its own declared range; the whole-graph resolve skips these and exact-pins
+    /// the rest.
     ///
     /// Derived from per-importer declarations only, so a direct dependency that merely shares a name
     /// with a transitive copy resolved at another version is single-declared and excluded. Only the
@@ -405,16 +403,15 @@ impl NodeLock for Pnpm {
     }
 
     fn whole_graph_args(
-        pins: &[(String, Option<String>)],
+        pins: &[(String, String)],
         window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         // `pnpm update <name>@<target> …` pins each planned candidate to its EXACT per-package target
         // in one joint re-resolve, so a package whose stricter per-package window admits an older
         // version than the project default lands at its own target rather than overshooting onto the
-        // global-window-newest (the gap a bare `--latest` left). With no pins (the `fix` reconcile with
-        // an empty plan), a plain `install --lockfile-only` re-settles the graph without floating
-        // versions up. `--no-save` keeps `package.json` ranges as the author wrote them (the caller
-        // widens an out-of-range manifest itself first); `--lockfile-only` skips `node_modules`.
+        // global-window-newest (the gap a bare `--latest` left). `--no-save` keeps `package.json` ranges
+        // as the author wrote them (the caller widens an out-of-range manifest itself first);
+        // `--lockfile-only` skips `node_modules`.
         // `--recursive` is mandatory in a workspace: a bare `pnpm update <name>@<target>` run at the
         // workspace root only re-pins dependencies the ROOT `package.json` declares, leaving every
         // member-declared dependency untouched — so a candidate owned by a member never moves in the
@@ -424,22 +421,15 @@ impl NodeLock for Pnpm {
         // capped to the project-default window, so the uniform-window case lands the same lock as
         // before. Transitives floated past the window are reconciled down by the caller's
         // transitive-cooldown gate, exactly as for cargo/go.
-        let mut args = if pins.is_empty() {
-            vec!["install".to_string(), "--lockfile-only".to_string()]
-        } else {
-            let mut args = vec!["update".to_string(), "--recursive".to_string()];
-            for (name, target) in pins {
-                // `Some(target)` pins the lock to the exact per-package target; `None` floats the name
-                // by its declared range (a multi-version dep that an exact pin would collapse).
-                match target {
-                    Some(target) => args.push(format!("{name}@{target}")),
-                    None => args.push(name.clone()),
-                }
-            }
-            args.push("--lockfile-only".to_string());
-            args.push("--no-save".to_string());
-            args
-        };
+        if pins.is_empty() {
+            return None;
+        }
+        let mut args = vec!["update".to_string(), "--recursive".to_string()];
+        for (name, target) in pins {
+            args.push(format!("{name}@{target}"));
+        }
+        args.push("--lockfile-only".to_string());
+        args.push("--no-save".to_string());
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
         }
@@ -626,8 +616,8 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
 /// Maps each dependency name to the set of distinct range *specifiers* its workspace-member importers
 /// declare, read from `pnpm-lock.yaml`'s `importers:` section (each dependency records a `specifier:`
 /// line — the declared range). A name two importers declare with different specifiers (`~7.3.0` vs
-/// `^7.0.0`, `"<4"` vs `^4`) is a version split that must be range-floated, even when both currently
-/// resolve to the same version.
+/// `^7.0.0`, `"<4"` vs `^4`) is a version split that must be held out of the joint update, even when
+/// both currently resolve to the same version.
 ///
 /// Only plain registry ranges count. A specifier carrying a protocol (`link:`, `file:`, `workspace:`,
 /// `catalog:`, `npm:` aliases, `git+…`, a URL) is skipped — a semver range never contains a `:`, so
@@ -1094,7 +1084,7 @@ packages:
     #[test]
     fn names_declared_at_multiple_versions_ignores_transitive_duplicates() {
         // `bar` is a genuine workspace split: apps/b declares 2.0.0, apps/c declares 3.0.0 — it must be
-        // flagged (range-floated, so neither line is collapsed). `foo` is declared at a SINGLE version
+        // flagged, so neither line is collapsed. `foo` is declared at a SINGLE version
         // by importers but ALSO appears as a transitive copy at 2.0.0 in `packages:` — it must NOT be
         // flagged, so it stays exact-pinned and keeps its per-package window and any out-of-range
         // widen. Counting the whole resolved graph (the old behavior) would wrongly float `foo`.
@@ -1146,7 +1136,7 @@ packages:
     fn names_declared_at_multiple_specifiers_are_a_split_even_at_one_resolved_version() {
         // `semver` is declared with DIFFERENT ranges (`~7.3.0` and `^7.0.0`) by two importers that the
         // lock resolves to the SAME `7.3.8` — a specifier split that exact-pinning would collapse,
-        // dragging the `~7.3.0` member off its own range. It must be flagged for range-floating even
+        // dragging the `~7.3.0` member off its own range. It must be flagged as a split even
         // though `by_version` sees a single resolved version. `chalk` is the control: both importers
         // declare the SAME `^5.0.0` at the same resolved version, so it stays exact-pinnable.
         let lock = indoc! {"

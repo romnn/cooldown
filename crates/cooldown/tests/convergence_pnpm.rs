@@ -1,10 +1,9 @@
 //! End-to-end convergence tests that drive the REAL `pnpm` resolver against fixtures generated on
-//! the fly in temp dirs. These guard the pnpm adapter's whole-graph re-resolve: the adapter now
-//! floats the entire importer graph — direct and transitive — to the newest-within-window fixed point
-//! in one joint `pnpm update --latest --lockfile-only --config.minimumReleaseAge=<m>` pass, then
-//! builds the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can never
-//! silently move another package, mutually-exclusive peers settle at a single fixed point, and a
-//! converged graph re-applies to a byte-stable lock.
+//! the fly in temp dirs. These guard the pnpm adapter's whole-graph re-resolve: the adapter pins each
+//! eligible candidate to cooldown's exact target in one joint recursive update, then builds the report
+//! from the full before/after `pnpm-lock.yaml` diff. So a candidate can never silently move another
+//! package, mutually-exclusive peers settle at a single fixed point, and a converged graph re-applies
+//! to a byte-stable lock.
 //!
 //! # The old bug
 //!

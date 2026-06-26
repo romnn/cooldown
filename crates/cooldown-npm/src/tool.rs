@@ -412,18 +412,15 @@ fn collateral_change<L: NodeLock>(name: &str, from: &str, to: &str) -> Change {
 /// Whether a planned candidate landed at or beyond its target, respecting the move's direction (a
 /// forward move must reach at/above its target, a downgrade at/below it).
 ///
-/// Checked **per declaring member**, not against the name's newest copy: a multi-version dependency is
-/// range-floated, so a cross-line candidate (one member on `@types/node@^22` while the target is `25`,
-/// or a peer-only dep the resolver will not move) leaves *its* member short of the target even though
-/// the name's newest copy — a higher line owned by another member — already sits at it. Checking only
-/// the newest copy would falsely report such a candidate as landed.
+/// Checked **per declaring member**, not against the name's newest copy: a multi-version dependency can
+/// leave one member short of the target even though the name's newest copy — a higher line owned by
+/// another member — already sits at it. Checking only the newest copy would falsely report such a
+/// candidate as landed.
 ///
-/// A candidate landed when *at least one* of its declaring members reached the target — the bump took
-/// for that member, even if a sibling on a tighter range stayed behind (so partial float progress is
-/// committed and reported, not rolled back). It is held only when *no* declaring member reached it,
-/// which is exactly the cross-line / peer-only hold `outdated` must not call adoptable. Falls back to
-/// the newest copy when the change carries no member attribution (a collateral move) or the lock has
-/// no per-member version data.
+/// A candidate landed when *at least one* of its declaring members reached the target. It is held only
+/// when *no* declaring member reached it, which is exactly the cross-line / peer-only hold `outdated`
+/// must not call adoptable. Falls back to the newest copy when the change carries no member attribution
+/// (a collateral move) or the lock has no per-member version data.
 fn reached(
     after_newest: &HashMap<String, String>,
     after_members: &crate::lock::MemberIndex,
@@ -636,11 +633,10 @@ impl<L: NodeLock> NpmTool<L> {
                 // Reached its target without a net lock move — already satisfied (a duplicate copy of
                 // the same name is at the target). A no-op, neither applied nor held.
             } else if multi_version.contains(name) {
-                // A dependency declared at multiple versions across the workspace is range-floated, so
-                // a candidate whose target is out of this member's line — a cross-line bump, or a
-                // peer-only dep `pnpm update` will not move — is deliberately kept in range, not pinned
-                // to the target. That is a conservative hold, not a resolver conflict, and it must not
-                // be advertised as adoptable: `outdated`'s verify reclassifies it blocked.
+                // A dependency declared at multiple versions across the workspace is deliberately kept
+                // in range, not pinned to the target. That is a conservative hold, not a resolver
+                // conflict, and it must not be advertised as adoptable: `outdated`'s verify
+                // reclassifies it blocked.
                 report.skipped.push(Skipped {
                     change: change.clone(),
                     reason: SkipReason::MultiVersionHeld,
@@ -674,25 +670,24 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Build the per-candidate pins (exact target vs range-floated), widen the manifests the exact
-    /// pins need, then run the single joint `--recursive` resolve.
+    /// Build the per-candidate pins, widen the manifests the exact pins need, then run the single
+    /// joint `--recursive` resolve.
     ///
     /// A candidate held at a single version across the workspace is **exact-pinned** to its
     /// per-package target (`name@target`): the resolve lands it at exactly that version, honoring a
     /// stricter-than-global per-package window with no overshoot. A candidate a member declares at a
     /// version *other* members also hold at a different version (a v4/v5 split, which pnpm keeps like
-    /// cargo) is **range-floated** by name instead: exact-pinning one target would collapse every other
-    /// copy onto it, so the bare name lets each importer's range re-resolve to its own newest-within-
-    /// window line. The pre-apply lock identifies those multi-version names; a missing/unparsable lock
-    /// means nothing is multi-version yet, so every pin is exact.
+    /// cargo) is skipped instead: exact-pinning one target would collapse every other copy onto it, and
+    /// pnpm's bare `update <name>` can write an out-of-range lock entry while `--no-save` leaves the
+    /// manifest unchanged. The pre-apply lock identifies those multi-version names; a missing/unparsable
+    /// lock means nothing is multi-version yet, so every pin is exact.
     ///
     /// Widen is for the exact pins only, and only when their target is out of the declared range
     /// (`Auto`) or always (`Always`). It is mandatory there: `pnpm update <pkg>@<target> --no-save`
     /// re-pins the lock to an out-of-range target but leaves the manifest as written, so the next
     /// resolve (which re-resolves any package it is not pinning, against its manifest range) snaps the
-    /// candidate back into range and breaks the fixed point. A range-floated candidate is never widened
-    /// — widening would let it cross its own range boundary, the very line we are preserving — and it
-    /// stays in range by construction, so it re-applies byte-stable.
+    /// candidate back into range and breaks the fixed point. A multi-version candidate is never widened
+    /// — widening would let it cross its own range boundary, the very line we are preserving.
     ///
     /// `--recursive` is what makes the resolve span the whole workspace: a bare `pnpm update` at the
     /// root only re-pins root-declared dependencies, so a candidate a member declares would never move.
@@ -703,13 +698,12 @@ impl<L: NodeLock> NpmTool<L> {
         multi_version: &HashSet<String>,
         window_minutes: Option<i64>,
     ) -> Result<()> {
-        let mut pins: Vec<(String, Option<String>)> = Vec::with_capacity(plan.changes.len());
+        let mut pins: Vec<(String, String)> = Vec::with_capacity(plan.changes.len());
         for change in &plan.changes {
             let name = change.package.name.clone();
             if multi_version.contains(&name) {
-                // Range-float: preserve every distinct line; never widen (that would cross the range
-                // boundary we are keeping).
-                pins.push((name, None));
+                // Preserve every distinct line. A bare pnpm update can write an out-of-range lock
+                // entry while leaving package.json untouched.
                 continue;
             }
             // Exact-pin: widen the owning manifest when the target is out of range so the exact lock
@@ -728,7 +722,10 @@ impl<L: NodeLock> NpmTool<L> {
                     change.to.as_str(),
                 )?;
             }
-            pins.push((name, Some(change.to.as_str().to_string())));
+            pins.push((name, change.to.as_str().to_string()));
+        }
+        if pins.is_empty() {
+            return Ok(());
         }
         self.joint_resolve(project, &pins, window_minutes).await?;
         // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
@@ -741,7 +738,7 @@ impl<L: NodeLock> NpmTool<L> {
     async fn joint_resolve(
         &self,
         project: &Project,
-        pins: &[(String, Option<String>)],
+        pins: &[(String, String)],
         window_minutes: Option<i64>,
     ) -> Result<()> {
         let Some(args) = L::whole_graph_args(pins, window_minutes) else {
@@ -752,8 +749,8 @@ impl<L: NodeLock> NpmTool<L> {
 }
 
 /// Names workspace importers DECLARE on more than one distinct line — a genuine split that must be
-/// range-floated (exact-pinning one target would collapse the other line), unlike everything else
-/// which is exact-pinned. A name splits when importers resolve it to different versions (a v4/v5
+/// skipped (exact-pinning one target would collapse the other line), unlike everything else which is
+/// exact-pinned. A name splits when importers resolve it to different versions (a v4/v5
 /// split) OR declare it with different range specifiers (`~7.3.0` vs `^7.0.0`, `"<4"` vs `^4`) — the
 /// latter even at one resolved version, since exact-pinning would still drag the narrower member off
 /// its declared range.
@@ -1053,18 +1050,17 @@ mod tests {
         // stricter-windowed package lands at its own (possibly older) target rather than overshooting.
         // The window rides inline as `minimumReleaseAge`, the floor for any fresh transitive the pins
         // drag in.
-        // An exact pin (`Some`) becomes `name@target`; a range-floated multi-version candidate (`None`)
-        // becomes the bare name, so each importer's range re-resolves instead of collapsing onto one
-        // target. `--recursive` so a candidate a workspace member declares (not the root `package.json`)
-        // is actually re-pinned; a bare `pnpm update` at the root would skip it.
+        // Each exact pin becomes `name@target`. Multi-version candidates stay out of this command
+        // before construction because bare `pnpm update <name>` can write an out-of-range lock entry
+        // while `--no-save` leaves the manifest unchanged. `--recursive` so a candidate a workspace
+        // member declares (not the root `package.json`) is actually re-pinned; a bare `pnpm update` at
+        // the root would skip it.
         let pins = vec![
-            ("eslint".to_string(), Some("9.5.0".to_string())),
+            ("eslint".to_string(), "9.5.0".to_string()),
             (
                 "@typescript-eslint/eslint-plugin".to_string(),
-                Some("8.0.0".to_string()),
+                "8.0.0".to_string(),
             ),
-            // Held at several versions across importers, so floated by range rather than pinned.
-            ("chalk".to_string(), None),
         ];
         assert_eq!(
             Pnpm::whole_graph_args(&pins, Some(20160)),
@@ -1073,18 +1069,12 @@ mod tests {
                 "--recursive".to_string(),
                 "eslint@9.5.0".to_string(),
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
-                "chalk".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
             ])
         );
-        // No pins (the `fix` reconcile with an empty plan) is a plain re-lock; a true Latest opt-out
-        // drops the min-age flag.
-        assert_eq!(
-            Pnpm::whole_graph_args(&[], None),
-            Some(vec!["install".to_string(), "--lockfile-only".to_string()])
-        );
+        assert_eq!(Pnpm::whole_graph_args(&[], None), None);
         // npm/yarn/bun have no joint resolve, so they keep the per-package path.
         assert!(!Npm::supports_whole_graph_resolve());
         assert!(Pnpm::supports_whole_graph_resolve());

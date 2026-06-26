@@ -2,11 +2,10 @@
 //! members at DIFFERENT version lines — the case that surfaced two real defects against the luup
 //! monorepo:
 //!
-//! 1. **Convergence.** After a single `upgrade`, every importer of a multi-line dependency must reach
-//!    the newest-within-window version its own declared range admits. The earlier adapter left a
-//!    lower line stuck below its in-range latest (`vite ^6` pinned at `6.4.1` while `6.4.3` was
-//!    adoptable; `zustand` at `5.0.10` while `5.0.14` was), so a converged `upgrade` still reported
-//!    adoptable leftovers — non-convergence.
+//! 1. **Conservative holds.** A dependency split across workspace members must be reported as held
+//!    rather than passed to pnpm as a bare package name. Bare `pnpm update <name> --recursive
+//!    --no-save` can write an out-of-range lock entry while leaving the declaring `package.json`
+//!    untouched, which makes the final frozen-lock verification fail.
 //!
 //! 2. **Caret preservation.** The resolve must never move an importer's lock OUT of the range that
 //!    importer declares. The earlier adapter's exact-pin (`pnpm update <name>@<target> --recursive
@@ -17,7 +16,7 @@
 //!
 //! Both are exercised with the REAL pnpm resolver against the npm registry's immutable history, frozen
 //! at an absolute cutoff (see `convergence_pnpm.rs` for the determinism argument). Assertions check
-//! INVARIANTS (convergence, in-range, byte-stable re-run), never the absolute registry-newest.
+//! INVARIANTS (held classification, in-range, byte-stable re-run), never the absolute registry-newest.
 
 #![allow(
     clippy::unwrap_used,
@@ -45,7 +44,7 @@ const WORKSPACE_YAML: &str = "packages:\n  - \"pkgs/*\"\n";
 
 /// The member on the `semver` v6 line. `semver`'s v6 line has exactly one release after `6.3.0`
 /// (`6.3.1`, 2023-07-10), so seeding below the freeze gives this importer a single, unambiguous
-/// in-range forward move — the lower line a non-converging resolve leaves behind.
+/// in-range forward move for cooldown to hold conservatively.
 const MEMBER_V6_PACKAGE_JSON: &str = r#"{
   "name": "@cooldown/app-v6",
   "version": "0.1.0",
@@ -56,7 +55,7 @@ const MEMBER_V6_PACKAGE_JSON: &str = r#"{
 "#;
 
 /// The member on the `semver` v7 line. Has its own forward move (`7.3.8` → `7.5.4` within the freeze
-/// window), so the resolve must advance BOTH lines, not just one.
+/// window), so the split fixture has eligible updates on both lines.
 const MEMBER_V7_PACKAGE_JSON: &str = r#"{
   "name": "@cooldown/app-v7",
   "version": "0.1.0",
@@ -71,12 +70,8 @@ const MEMBER_V7_PACKAGE_JSON: &str = r#"{
 const SEED: &str = "2023-01-01T00:00:00Z";
 
 /// The resolution freeze: `^6` admits `6.3.1` (2023-07-10) and `^7` admits up to `7.5.4` (2023-07-07);
-/// `7.6.0` (2024-02-05) stays excluded. So the converged lock is `6.3.1` + `7.5.4`.
+/// `7.6.0` (2024-02-05) stays excluded.
 const FREEZE: &str = "2023-12-01T00:00:00Z";
-
-/// The version each line must converge to under `FREEZE`.
-const V6_TARGET: &str = "6.3.1";
-const V7_TARGET: &str = "7.5.4";
 
 fn minimum_release_age_minutes(cutoff: &str) -> i64 {
     let cutoff: jiff::Timestamp = cutoff.parse().expect("cutoff parses");
@@ -183,11 +178,12 @@ fn importer_resolved(lock: &[u8], member: &str, dep: &str) -> Option<String> {
 }
 
 #[test]
-fn upgrade_converges_every_line_of_a_multi_version_dependency() {
+fn upgrade_holds_multi_version_dependency_without_mutating_lock() {
     skip_if_missing!("pnpm");
     let fixture = multiline_fixture();
 
-    // Sanity: the seed sits below both targets, so each line has a genuine in-range forward move.
+    // Sanity: the seed sits below both lines' newest-within-window targets, so cooldown has a real
+    // candidate it must hold conservatively.
     let seed = fixture.read_bytes("pnpm-lock.yaml");
     assert_eq!(
         importer_resolved(&seed, "pkgs/v6", "semver").as_deref(),
@@ -209,28 +205,31 @@ fn upgrade_converges_every_line_of_a_multi_version_dependency() {
             .stderr_str()
     );
     assert_pnpm_lock_current(&upgrade);
+    assert_eq!(
+        upgrade.summary_applied(),
+        0,
+        "multi-version dependency must not be applied via bare pnpm update"
+    );
+    assert!(
+        upgrade
+            .skipped_reasons_for("semver")
+            .contains("multi_version_held"),
+        "semver must be reported as a multi-version hold: {:?}",
+        upgrade.skipped_reasons_for("semver")
+    );
 
-    // Convergence: BOTH importers reach the newest-within-window version their OWN range admits. The
-    // non-converging adapter left the lower line (`pkgs/v6`) below its in-range latest.
     let after = fixture.read_bytes("pnpm-lock.yaml");
     assert_eq!(
-        importer_resolved(&after, "pkgs/v6", "semver").as_deref(),
-        Some(V6_TARGET),
-        "the v6 importer must converge to {V6_TARGET}, not stay below its in-range latest"
-    );
-    assert_eq!(
-        importer_resolved(&after, "pkgs/v7", "semver").as_deref(),
-        Some(V7_TARGET),
-        "the v7 importer must converge to {V7_TARGET}"
+        seed, after,
+        "held multi-version candidates must leave the lock byte-identical"
     );
 
-    // Fixed point: a second upgrade moves nothing and the lock is byte-identical (no leftover
-    // adoptable, no ping-pong).
+    // Fixed point: a second upgrade also moves nothing and the lock is byte-identical.
     let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
     assert_eq!(
         second.summary_applied(),
         0,
-        "second upgrade must be a no-op (converged fixed point), no adoptable leftover"
+        "second upgrade must be a no-op"
     );
     assert_eq!(
         after,
@@ -282,10 +281,10 @@ fn tilde_fixture() -> Fixture {
 /// single resolved version, a resolved-version-only "multi-version" test misclassifies the dep as
 /// uniform and exact-pins it (`pnpm update semver@7.5.4 --recursive`), collapsing the `~7.3.0` member
 /// onto `7.5.4` and widening its manifest off `~7.3.0` — overriding the author's deliberate narrow
-/// cap. The whole-graph resolve must instead range-float the dep so each member stays within its OWN
-/// declared range: the tilde member at `7.3.x`, the caret member free to advance.
+/// cap. The whole-graph resolve must instead hold the dep so each member stays within its OWN declared
+/// range and the lock remains current.
 #[test]
-fn upgrade_respects_a_narrow_range_when_a_sibling_declares_a_wider_one() {
+fn upgrade_holds_a_narrow_range_when_a_sibling_declares_a_wider_one() {
     skip_if_missing!("pnpm");
     let fixture = tilde_fixture();
 
@@ -303,9 +302,22 @@ fn upgrade_respects_a_narrow_range_when_a_sibling_declares_a_wider_one() {
         "seed must hold the caret member at the same {TILDE_MAX}"
     );
 
-    fixture
-        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
-        .expect_success();
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+    assert!(
+        upgrade
+            .skipped_reasons_for("semver")
+            .contains("multi_version_held"),
+        "semver must be reported as a multi-version hold: {:?}",
+        upgrade.skipped_reasons_for("semver")
+    );
 
     let after = fixture.read_bytes("pnpm-lock.yaml");
     // The tilde member must stay on the 7.3.x line its `~7.3.0` admits — never dragged onto the
@@ -322,11 +334,12 @@ fn upgrade_respects_a_narrow_range_when_a_sibling_declares_a_wider_one() {
         manifest.contains("\"~7.3.0\""),
         "the tilde member's manifest must stay ~7.3.0 (its deliberate cap), not be widened: {manifest}"
     );
-    // The caret member, on its own wider range, still advances.
+    // The caret member is held too; the important invariant is that cooldown never asks pnpm to write
+    // an out-of-range lock entry while the manifest stays unchanged.
     let caret = importer_resolved(&after, "pkgs/caret", "semver").expect("caret resolves semver");
     assert_eq!(
-        caret, V7_TARGET,
-        "the ^7.0.0 member must still advance to {V7_TARGET} (got {caret})"
+        caret, TILDE_MAX,
+        "the ^7.0.0 member must remain at {TILDE_MAX} when the split is held (got {caret})"
     );
 }
 
@@ -335,6 +348,7 @@ fn upgrade_never_moves_an_importer_out_of_its_declared_range() {
     skip_if_missing!("pnpm");
     let fixture = multiline_fixture();
 
+    let before = fixture.read_bytes("pnpm-lock.yaml");
     fixture
         .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
         .expect_success();
@@ -361,6 +375,10 @@ fn upgrade_never_moves_an_importer_out_of_its_declared_range() {
         manifest.contains("\"^6.0.0\""),
         "the v6 member's manifest must stay ^6.0.0 (never widened across the major): {manifest}"
     );
+    assert_eq!(
+        before, after,
+        "held multi-version candidates must not mutate the lock"
+    );
 }
 
 #[test]
@@ -368,29 +386,21 @@ fn outdated_marks_a_cross_line_multi_version_bump_blocked_not_adoptable() {
     skip_if_missing!("pnpm");
     let fixture = multiline_fixture();
 
-    // Converge both lines within their own major: v6 → 6.3.1, v7 → 7.5.4. The only move left for the
-    // `^6` line is a cross-major bump onto v7 — which `upgrade` floats in-range and never takes.
-    fixture
-        .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
-        .expect_success();
-
-    // `outdated --major` must AGREE with what `upgrade --major` does: the cross-line bump the resolve
-    // floats in-range is reported `blocked`, never `adoptable`. Before the per-member `reached` fix the
-    // resolve judged it landed (the name's newest copy, v7, already sat at the target), so `outdated`
-    // advertised an adoptable update `upgrade` would silently hold — the classification bug.
+    // `outdated --major` must AGREE with what `upgrade --major` does: the split-line bump is reported
+    // `blocked`, never `adoptable`.
     let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
     let adoptable = outdated.outdated_with_status("adoptable");
     let blocked = outdated.outdated_with_status("blocked");
     assert!(
         !adoptable.contains("semver"),
-        "the cross-line ^6→v7 bump must NOT be adoptable (upgrade floats v6 within ^6): adoptable={adoptable:?}"
+        "the cross-line multi-version bump must NOT be adoptable: adoptable={adoptable:?}"
     );
     assert!(
         blocked.contains("semver"),
         "the cross-line multi-version bump must be reported blocked: blocked={blocked:?}"
     );
 
-    // `upgrade --major` agrees: it never applies the held cross-line bump (the v6 line stays in ^6).
+    // `upgrade --major` agrees: it never applies the held multi-version bump.
     let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE, "--dry-run"]);
     assert!(
         !upgrade.applied_names().contains("semver"),
