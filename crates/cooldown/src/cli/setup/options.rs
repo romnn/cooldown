@@ -108,6 +108,8 @@ pub(super) fn resolve_invocation(
             all_artifacts: merged.all_artifacts.unwrap_or(false),
             allow_stale_lock: merged.allow_stale_lock.unwrap_or(false),
             fail_on_unknown_age: merged.fail_on_unknown_age.unwrap_or(false),
+            // A CLI-only mutating convenience for read-only commands; intentionally not config-backed.
+            lock: overrides.lock.unwrap_or(false),
             strict: merged.strict.unwrap_or(false),
             build: merged.build.unwrap_or(false),
             dry_run: merged.dry_run.unwrap_or(false),

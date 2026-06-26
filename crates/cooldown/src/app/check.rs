@@ -7,8 +7,8 @@ use super::{
     Workspace, age_days, diag_from_error, render_window,
 };
 use cooldown_core::{
-    DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, Origin, Resolution, ResolveKind,
-    ResolveQuery, Status, check_pin, resolve,
+    DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport, Origin,
+    Resolution, ResolveKind, ResolveQuery, Status, check_pin, resolve,
 };
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
@@ -171,12 +171,15 @@ impl<'a> CheckRunner<'a> {
             return;
         };
 
-        match self
-            .probe_lock(read.adapter, pctx, &read.project_label)
-            .await
-        {
-            LockProbe::Continue => {}
-            LockProbe::Skip => return,
+        let lock_probe = match self.refresh_lock(pctx, &read.project_label).await {
+            Some(probe) => probe,
+            None => {
+                self.probe_lock(read.adapter, pctx, &read.project_label)
+                    .await
+            }
+        };
+        if matches!(lock_probe, LockProbe::Skip) {
+            return;
         }
 
         let deps = match self
@@ -222,39 +225,71 @@ impl<'a> CheckRunner<'a> {
         project_label: &str,
     ) -> LockProbe {
         match adapter.verify_lock_current(&pctx.project).await {
-            Ok(v) if v.status == LockStatus::Current => LockProbe::Continue,
-            Ok(v) => {
-                let kind = match v.status {
-                    LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
-                    LockStatus::Unknown => DiagnosticKind::LockUnknown,
-                };
-                let diag = Diagnostic::new(kind, v.detail)
-                    .with_tool(pctx.tool.as_str())
-                    .with_project(project_label)
-                    .with_path(pctx.project.manifest.as_str());
-                if self.opts.allow_stale_lock && v.status == LockStatus::Stale {
-                    self.acc.warnings.push(diag);
-                    LockProbe::Continue
-                } else {
-                    self.acc.errors.push(diag);
-                    LockProbe::Skip // cannot soundly evaluate a stale lock
-                }
-            }
-            Err(e) => {
-                let diag = diag_from_error(&e, pctx.tool, project_label, None)
-                    .with_path(pctx.project.manifest.as_str());
-                let downgradable = matches!(
-                    diag.kind,
-                    DiagnosticKind::StaleLock | DiagnosticKind::NotFound
-                );
-                if self.opts.allow_stale_lock && downgradable {
-                    self.acc.warnings.push(diag);
-                    LockProbe::Continue
-                } else {
-                    self.acc.errors.push(diag);
-                    LockProbe::Skip
-                }
-            }
+            Ok(report) => self.handle_lock_report(report, pctx, project_label),
+            Err(err) => self.handle_lock_error(&err, pctx, project_label),
+        }
+    }
+
+    async fn refresh_lock(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+    ) -> Option<LockProbe> {
+        match self
+            .ws
+            .refresh_project_lock(pctx, self.opts, project_label)
+            .await
+        {
+            Ok(Some(report)) => Some(self.handle_lock_report(report, pctx, project_label)),
+            Ok(None) => None,
+            Err(err) => Some(self.handle_lock_error(&err, pctx, project_label)),
+        }
+    }
+
+    fn handle_lock_report(
+        &mut self,
+        report: LockVerifyReport,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+    ) -> LockProbe {
+        if report.status == LockStatus::Current {
+            return LockProbe::Continue;
+        }
+        let kind = match report.status {
+            LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
+            LockStatus::Unknown => DiagnosticKind::LockUnknown,
+        };
+        let diag = Diagnostic::new(kind, report.detail)
+            .with_tool(pctx.tool.as_str())
+            .with_project(project_label)
+            .with_path(pctx.project.manifest.as_str());
+        if self.opts.allow_stale_lock && report.status == LockStatus::Stale {
+            self.acc.warnings.push(diag);
+            LockProbe::Continue
+        } else {
+            self.acc.errors.push(diag);
+            LockProbe::Skip
+        }
+    }
+
+    fn handle_lock_error(
+        &mut self,
+        err: &cooldown_core::CoreError,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+    ) -> LockProbe {
+        let diag = diag_from_error(err, pctx.tool, project_label, None)
+            .with_path(pctx.project.manifest.as_str());
+        let downgradable = matches!(
+            diag.kind,
+            DiagnosticKind::StaleLock | DiagnosticKind::NotFound
+        );
+        if self.opts.allow_stale_lock && downgradable {
+            self.acc.warnings.push(diag);
+            LockProbe::Continue
+        } else {
+            self.acc.errors.push(diag);
+            LockProbe::Skip
         }
     }
 

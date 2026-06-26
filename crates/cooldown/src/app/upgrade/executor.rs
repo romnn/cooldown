@@ -83,6 +83,7 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     project_label: String,
     mode: PlanMode,
     acc: &'a mut UpgradeAccum,
+    lock_refreshed_by_apply: bool,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -98,6 +99,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             mode,
             ctx,
             acc,
+            lock_refreshed_by_apply: false,
         }
     }
 
@@ -656,6 +658,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         after_keys: HashSet<(String, String)>,
         state: &mut TrialState,
     ) {
+        self.lock_refreshed_by_apply |= self.ctx.writer.successful_apply_proves_lock_current();
         state.baseline_violations = after_keys;
         for change in changes {
             if applied.contains(&change_target_key(change)) {
@@ -812,22 +815,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .verify_lock_current(&self.ctx.pctx.project)
             .await
         {
-            Ok(report) => {
-                self.record_lock_status(report.status);
-                match report.status {
-                    LockStatus::Current => {}
-                    LockStatus::Stale => {
-                        let diag = Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
-                            .with_tool(self.ctx.tool_name())
-                            .with_project(self.project_label())
-                            .with_path(self.ctx.pctx.project.manifest.as_str());
-                        if self.ctx.opts.allow_stale_lock {
-                            self.acc.warnings.push(diag);
-                        } else {
-                            self.acc.errors.push(diag);
-                        }
+            Ok(report) => match report.status {
+                LockStatus::Current => {
+                    self.record_lock_status(LockStatus::Current);
+                }
+                LockStatus::Stale => {
+                    self.record_lock_status(LockStatus::Stale);
+                    let diag = Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
+                        .with_tool(self.ctx.tool_name())
+                        .with_project(self.project_label())
+                        .with_path(self.ctx.pctx.project.manifest.as_str());
+                    if self.ctx.opts.allow_stale_lock {
+                        self.acc.warnings.push(diag);
+                    } else {
+                        self.acc.errors.push(diag);
                     }
-                    LockStatus::Unknown => {
+                }
+                LockStatus::Unknown => {
+                    if self.lock_refreshed_by_apply {
+                        self.record_lock_status(LockStatus::Current);
+                    } else {
+                        self.record_lock_status(LockStatus::Unknown);
                         self.acc.warnings.push(
                             Diagnostic::new(DiagnosticKind::LockUnknown, report.detail)
                                 .with_tool(self.ctx.tool_name())
@@ -836,7 +844,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         );
                     }
                 }
-            }
+            },
             Err(error) => {
                 self.record_lock_status(LockStatus::Stale);
                 self.acc.lock_verified = Some(false);

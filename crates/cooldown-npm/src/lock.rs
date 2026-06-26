@@ -44,6 +44,30 @@ pub trait NodeLock: Send + Sync + 'static {
     /// `package.json` range itself.
     fn relock_args() -> Vec<String>;
 
+    /// The read-only driver args that prove the existing lock matches the current manifests.
+    ///
+    /// `None` means this manager has no supported frozen/check mode wired yet, so `check` must keep
+    /// failing closed with an unknown lock-currency result.
+    #[must_use]
+    fn verify_current_args() -> Option<Vec<String>> {
+        None
+    }
+
+    /// The mutating driver args that refresh the lock before a read-only command evaluates it.
+    ///
+    /// `window_minutes` carries the project-default cooldown floor when the package manager can
+    /// express one during resolve. `None` means no resolver floor should be passed.
+    #[must_use]
+    fn refresh_lock_args(_window_minutes: Option<i64>) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Whether this manager supports a standalone lock refresh before a read-only command.
+    #[must_use]
+    fn supports_lock_refresh() -> bool {
+        false
+    }
+
     /// Whether this manager re-resolves the whole importer graph jointly in a single pass, so cooldown
     /// drives the whole-graph re-resolve/diff path rather than the per-package relock loop.
     ///
@@ -354,6 +378,26 @@ impl NodeLock for Pnpm {
 
     fn relock_args() -> Vec<String> {
         vec!["install".into(), "--lockfile-only".into()]
+    }
+
+    fn verify_current_args() -> Option<Vec<String>> {
+        Some(vec![
+            "install".into(),
+            "--lockfile-only".into(),
+            "--frozen-lockfile".into(),
+        ])
+    }
+
+    fn refresh_lock_args(window_minutes: Option<i64>) -> Option<Vec<String>> {
+        let mut args = vec!["install".into(), "--lockfile-only".into()];
+        if let Some(minutes) = window_minutes {
+            args.push(format!("--config.minimumReleaseAge={minutes}"));
+        }
+        Some(args)
+    }
+
+    fn supports_lock_refresh() -> bool {
+        true
     }
 
     fn supports_whole_graph_resolve() -> bool {
@@ -1247,6 +1291,14 @@ packages:
         // yarn/bun and the unparsable case: no attribution, so the column stays blank.
         let index = MemberIndex::default();
         assert!(index.members_for("anything", "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn only_pnpm_supports_standalone_lock_refresh() {
+        assert!(!Npm::supports_lock_refresh());
+        assert!(Pnpm::supports_lock_refresh());
+        assert!(!Yarn::supports_lock_refresh());
+        assert!(!Bun::supports_lock_refresh());
     }
 
     #[test]

@@ -152,6 +152,9 @@ pub(in crate::cli) enum Command {
             default_missing_value = "1"
         )]
         exit_code: Option<u8>,
+        /// Refresh lockfiles before reading them. Mutates lockfiles and is ignored under `--dry-run`.
+        #[arg(long)]
+        lock: bool,
     },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
@@ -200,6 +203,9 @@ pub(in crate::cli) enum Command {
         /// Fail (not just warn) on deps with no publish time.
         #[arg(long = "fail-on-unknown-age")]
         fail_on_unknown_age: bool,
+        /// Refresh lockfiles before checking them. Mutates lockfiles and is ignored under `--dry-run`.
+        #[arg(long)]
+        lock: bool,
         #[command(flatten)]
         strict_native: StrictNativeArgs,
     },
@@ -462,6 +468,8 @@ pub struct CliOverrides {
     pub(crate) fail_on_stricter_native: Option<bool>,
     /// `check`/`config --no-fail-on-stricter-native` — CLI-only override of a config `strict-native`.
     pub(crate) no_fail_on_stricter_native: Option<bool>,
+    /// `check`/`outdated --lock` — CLI-only pre-read lock refresh.
+    pub(crate) lock: Option<bool>,
     pub(crate) dry_run: Option<bool>,
     pub(crate) offline: Option<bool>,
     pub(crate) fresh: Option<bool>,
@@ -523,6 +531,9 @@ impl CliOverrides {
                 "config",
                 "no_fail_on_stricter_native",
             ))
+            .then_some(true),
+            lock: (set_on_subcommand(matches, "check", "lock")
+                || set_on_subcommand(matches, "outdated", "lock"))
             .then_some(true),
             // `outdated --transitive` is a bool (list indirect deps in the report).
             transitive: set_on_subcommand(matches, "outdated", "transitive").then_some(true),
@@ -647,6 +658,11 @@ mod tests {
             overrides(&["cooldown", "check", "--fail-on-stricter-native"]).fail_on_stricter_native,
             Some(true)
         );
+        assert_eq!(overrides(&["cooldown", "check", "--lock"]).lock, Some(true));
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--lock"]).lock,
+            Some(true)
+        );
     }
 
     #[test]
@@ -657,6 +673,10 @@ mod tests {
         assert!(parsed.is_err());
         // `--strict` belongs to the mutating commands, not `outdated`.
         let parsed = Cli::command().try_get_matches_from(["cooldown", "outdated", "--strict"]);
+        assert!(parsed.is_err());
+        // `--lock` belongs to read-only commands that can refresh before reading, not mutating
+        // commands that already lock as part of their operation.
+        let parsed = Cli::command().try_get_matches_from(["cooldown", "upgrade", "--lock"]);
         assert!(parsed.is_err());
     }
 

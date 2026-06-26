@@ -3,7 +3,9 @@
 //! drivers merely re-pin a dependency and (optionally) install the resolved graph.
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, Result, ToolTermination, VerifyReport};
+use cooldown_core::{
+    CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, VerifyReport,
+};
 use tokio::process::Command;
 
 /// A handle to one package manager binary. The binary defaults to its canonical name on `PATH`
@@ -77,4 +79,47 @@ impl NodeCmd {
             },
         })
     }
+
+    /// Runs the driver as a lock-currency proof/refresh, folding resolver failure into a
+    /// [`LockVerifyReport`] so callers can report a stale lock without treating it as a subprocess
+    /// infrastructure error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] only if the binary cannot be spawned at all.
+    pub async fn lock_report(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        ok_detail: &str,
+    ) -> Result<LockVerifyReport> {
+        let out = self.output(dir, args).await?;
+        Ok(LockVerifyReport {
+            status: if out.status.success() {
+                LockStatus::Current
+            } else {
+                LockStatus::Stale
+            },
+            detail: if out.status.success() {
+                ok_detail.to_string()
+            } else {
+                failure_detail(&out)
+            },
+        })
+    }
+}
+
+fn failure_detail(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!(
+        "package manager exited with {}",
+        ToolTermination::from_exit_status(out.status)
+    )
 }

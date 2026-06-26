@@ -104,12 +104,110 @@ fn seed_lock(fixture: &Fixture, cutoff: &str) {
         .expect_success();
 }
 
+fn assert_pnpm_lock_current(report: &support::Envelope) {
+    assert_eq!(
+        report.lock_status(),
+        Some("current"),
+        "pnpm should prove pnpm-lock.yaml current for this run"
+    );
+    assert_eq!(
+        report.lock_verified(),
+        Some(true),
+        "the legacy lockVerified field should agree with lockStatus=current"
+    );
+    assert!(
+        !report.warning_kinds().contains("lock_unknown"),
+        "successful pnpm mutations must not emit the pre-existing-lock warning"
+    );
+}
+
 fn conflict_fixture(seed_cutoff: &str) -> Fixture {
     let fixture = Fixture::new();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     seed_lock(&fixture, seed_cutoff);
     fixture
+}
+
+fn add_root_dependency(fixture: &Fixture, name: &str, spec: &str) {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package.json")).expect("package.json parses");
+    let deps = manifest
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("fixture has dependencies");
+    deps.insert(
+        name.to_string(),
+        serde_json::Value::String(spec.to_string()),
+    );
+    let body = serde_json::to_string_pretty(&manifest).expect("manifest serializes");
+    fixture.write("package.json", &format!("{body}\n"));
+}
+
+#[test]
+fn check_accepts_a_current_pnpm_lock() {
+    skip_if_missing!("pnpm");
+    let fixture = conflict_fixture(FREEZE);
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(check.ok(), "current pnpm lock should pass check");
+    assert_eq!(check.summary_errors(), 0);
+    assert!(
+        !check.error_kinds().contains("lock_unknown"),
+        "pnpm frozen verification must not fall back to unknown lock currency"
+    );
+    assert!(
+        !check.error_kinds().contains("stale_lock"),
+        "current pnpm lock must not be reported stale"
+    );
+}
+
+#[test]
+fn check_reports_a_stale_pnpm_lock_from_frozen_verification() {
+    skip_if_missing!("pnpm");
+    let fixture = conflict_fixture(FREEZE);
+    add_root_dependency(&fixture, "is-number", "^7.0.0");
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(!check.ok(), "stale pnpm lock should fail the check gate");
+    assert!(
+        check.error_kinds().contains("stale_lock"),
+        "stale manifest/lock mismatch must be a stale_lock error, got {:?}",
+        check.error_kinds()
+    );
+    assert!(
+        !check.error_kinds().contains("lock_unknown"),
+        "pnpm should prove staleness, not report unknown lock currency"
+    );
+}
+
+#[test]
+fn check_lock_refreshes_a_stale_pnpm_lock_before_evaluation() {
+    skip_if_missing!("pnpm");
+    let fixture = conflict_fixture(FREEZE);
+    let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+    add_root_dependency(&fixture, "is-number", "^7.0.0");
+
+    let check = fixture.cooldown_json(&["check", "--lock", "--freeze", FREEZE]);
+    assert!(check.ok(), "check --lock should refresh and then evaluate");
+    assert_eq!(check.summary_errors(), 0);
+    assert!(
+        !check.error_kinds().contains("stale_lock")
+            && !check.error_kinds().contains("lock_unknown"),
+        "refreshed pnpm lock should not emit lock-currency errors: {:?}",
+        check.error_kinds()
+    );
+
+    let lock_after = fixture.read_bytes("pnpm-lock.yaml");
+    assert_ne!(
+        lock_before, lock_after,
+        "check --lock should rewrite the stale lock"
+    );
+    let lock_text = String::from_utf8(lock_after).expect("lock is utf8");
+    assert!(
+        lock_text.contains("is-number"),
+        "refreshed lock should include the newly declared dependency"
+    );
 }
 
 #[test]
@@ -128,11 +226,7 @@ fn upgrade_converges_to_a_fixed_point() {
             .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(
-        first.lock_status(),
-        Some("unknown"),
-        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
-    );
+    assert_pnpm_lock_current(&first);
     assert!(
         first.summary_applied() >= 2,
         "first upgrade should apply the matured eslint/typescript-eslint line, got {}",
@@ -263,11 +357,7 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "fix should succeed: {}",
         fixture.cooldown(&["fix", "--freeze", FREEZE]).stderr_str()
     );
-    assert_eq!(
-        fixed.lock_status(),
-        Some("unknown"),
-        "pnpm fix re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
-    );
+    assert_pnpm_lock_current(&fixed);
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
 
     let lock_after_fix = fixture.read_bytes("pnpm-lock.yaml");
@@ -370,11 +460,7 @@ fn upgrade_honors_a_stricter_per_package_window() {
         "upgrade should succeed: {}",
         fixture.cooldown(&["upgrade"]).stderr_str()
     );
-    assert_eq!(
-        upgrade.lock_status(),
-        Some("unknown"),
-        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
-    );
+    assert_pnpm_lock_current(&upgrade);
 
     let (from, to) = upgrade
         .change_for("eslint")

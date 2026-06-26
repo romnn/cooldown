@@ -100,6 +100,23 @@ fn seed_lock(fixture: &Fixture, cutoff: &str) {
         .expect_success();
 }
 
+fn assert_pnpm_lock_current(report: &support::Envelope) {
+    assert_eq!(
+        report.lock_status(),
+        Some("current"),
+        "pnpm should prove pnpm-lock.yaml current for this run"
+    );
+    assert_eq!(
+        report.lock_verified(),
+        Some(true),
+        "the legacy lockVerified field should agree with lockStatus=current"
+    );
+    assert!(
+        !report.warning_kinds().contains("lock_unknown"),
+        "successful pnpm mutations must not emit the pre-existing-lock warning"
+    );
+}
+
 fn multiline_fixture() -> Fixture {
     let fixture = Fixture::new();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
@@ -191,11 +208,7 @@ fn upgrade_converges_every_line_of_a_multi_version_dependency() {
             .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(
-        upgrade.lock_status(),
-        Some("unknown"),
-        "pnpm applies and re-locks, but cooldown cannot prove pnpm-lock.yaml currency yet"
-    );
+    assert_pnpm_lock_current(&upgrade);
 
     // Convergence: BOTH importers reach the newest-within-window version their OWN range admits. The
     // non-converging adapter left the lower line (`pkgs/v6`) below its in-range latest.

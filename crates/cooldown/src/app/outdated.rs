@@ -4,8 +4,9 @@
 use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, PackageId, Plan, Project, Release, ResolveKind,
-    ResolveQuery, UpdateKind, Version, evaluate, resolve,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport,
+    PackageId, Plan, Project, Release, ResolveKind, ResolveQuery, UpdateKind, Version, evaluate,
+    resolve,
 };
 
 /// The result of `outdated`: every reported dependency split by status, plus diagnostics.
@@ -90,6 +91,10 @@ impl<'a> OutdatedRunner<'a> {
         let Some(read) = self.ws.read_project_ctx(pctx, self.opts) else {
             return;
         };
+
+        if !self.refresh_lock(pctx, &read.project_label).await {
+            return;
+        }
 
         self.opts.progress.say(&format!(
             "Resolving {} dependencies ({})…",
@@ -206,6 +211,50 @@ impl<'a> OutdatedRunner<'a> {
             }
         };
         apply_held(items, &held);
+    }
+
+    async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
+        match self
+            .ws
+            .refresh_project_lock(pctx, self.opts, project_label)
+            .await
+        {
+            Ok(Some(report)) => self.handle_lock_report(report, pctx, project_label),
+            Ok(None) => true,
+            Err(error) => {
+                self.errors.push(
+                    diag_from_error(&error, pctx.tool, project_label, None)
+                        .with_path(pctx.project.manifest.as_str()),
+                );
+                false
+            }
+        }
+    }
+
+    fn handle_lock_report(
+        &mut self,
+        report: LockVerifyReport,
+        pctx: &'a super::ProjectCtx,
+        project_label: &str,
+    ) -> bool {
+        if report.status == LockStatus::Current {
+            return true;
+        }
+        let kind = match report.status {
+            LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
+            LockStatus::Unknown => DiagnosticKind::LockUnknown,
+        };
+        let diag = Diagnostic::new(kind, report.detail)
+            .with_tool(pctx.tool.as_str())
+            .with_project(project_label)
+            .with_path(pctx.project.manifest.as_str());
+        if self.opts.allow_stale_lock && report.status == LockStatus::Stale {
+            self.warnings.push(diag);
+            true
+        } else {
+            self.errors.push(diag);
+            false
+        }
     }
 
     /// Fetch release metadata for every in-scope dependency of one project, bounded by the

@@ -246,6 +246,38 @@ pub trait ToolWrite: Send + Sync {
     /// a failed build is reported in the [`VerifyReport`].
     async fn build(&self, project: &Project) -> Result<VerifyReport>;
 
+    /// Refreshes the lockfile before a read-only command evaluates it.
+    ///
+    /// This is opt-in for commands such as `check --lock` and `outdated --lock`: the caller has
+    /// explicitly allowed a pre-read lockfile mutation so the following graph read can rely on the
+    /// package manager's own resolver instead of merely probing a pre-existing lock. Adapters that
+    /// cannot refresh locks independently return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned. A resolver
+    /// failure is represented as a non-current [`LockVerifyReport`].
+    async fn refresh_lock(&self, _project: &Project) -> Result<Option<LockVerifyReport>> {
+        Ok(None)
+    }
+
+    /// Whether [`refresh_lock`](ToolWrite::refresh_lock) can perform a standalone lock refresh.
+    ///
+    /// The application uses this to avoid taking a project mutation lock and printing refresh
+    /// progress for adapters whose default implementation is a no-op.
+    fn supports_lock_refresh(&self) -> bool {
+        false
+    }
+
+    /// Whether a successful [`apply`](ToolWrite::apply) run proves the adapter's lockfile is current.
+    ///
+    /// Some adapters cannot independently verify an arbitrary existing lock, but their mutating path
+    /// delegates to the package manager's own lock refresh command. After that command succeeds, the
+    /// lock is current for this run even if `check` must still fail closed on a pre-existing lock.
+    fn successful_apply_proves_lock_current(&self) -> bool {
+        false
+    }
+
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
     /// The default implementation returns [`SyncReport::Unsupported`]; adapters that can sync

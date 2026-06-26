@@ -1,11 +1,12 @@
 use super::baseline::Baseline;
+use super::lock::ProjectLock;
 use super::model::Window;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext, PatternGlob,
-    PolicyLayer, PolicyStack, Project, Release, ReleaseFetcher, ResolveContext, ResolvedWindow,
-    ToolId, ToolRead, ToolWrite,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext,
+    LockVerifyReport, PatternGlob, PolicyLayer, PolicyStack, Project, Release, ReleaseFetcher,
+    ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
@@ -179,6 +180,8 @@ pub struct RunOpts {
     pub allow_stale_lock: bool,
     /// `--fail-on-unknown-age`: make `check` fail on deps with no publish time.
     pub fail_on_unknown_age: bool,
+    /// `--lock` (check/outdated): refresh the lock before reading it. No-op under `--dry-run`.
+    pub lock: bool,
     /// `--strict` (upgrade/fix): fail if the mutation could not complete cleanly.
     pub strict: bool,
     /// `--build` (upgrade): compile/sync after re-locking.
@@ -371,6 +374,33 @@ impl Workspace {
 
     pub(crate) fn mutator(&self, id: ToolId) -> Option<&dyn ToolWrite> {
         self.adapters.writer(id)
+    }
+
+    /// Refreshes one project's lock under the same per-project guard used by mutating commands.
+    ///
+    /// Returns `None` when the current run did not request `--lock`, when it is a dry-run, or when
+    /// the tool has no standalone lock refresh operation.
+    pub(crate) async fn refresh_project_lock(
+        &self,
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        project_label: &str,
+    ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+        if !opts.lock || opts.dry_run {
+            return Ok(None);
+        }
+        let Some(writer) = self.mutator(pctx.tool) else {
+            return Ok(None);
+        };
+        if !writer.supports_lock_refresh() {
+            return Ok(None);
+        }
+        opts.progress.say(&format!(
+            "Refreshing lock in {} ({})…",
+            project_label, pctx.tool
+        ));
+        let _guard = ProjectLock::acquire(&pctx.project.root)?;
+        writer.refresh_lock(&pctx.project).await
     }
 
     /// Projects in scope for this run (filtered by `--tool`).

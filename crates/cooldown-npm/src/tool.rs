@@ -244,8 +244,13 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
-        Ok(verify_current_unknown(L::LOCKFILE))
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        let Some(args) = L::verify_current_args() else {
+            return Ok(verify_current_unknown(L::LOCKFILE));
+        };
+        self.cmd
+            .lock_report(&project.root, &args, &format!("{} is current", L::LOCKFILE))
+            .await
     }
 }
 
@@ -793,6 +798,26 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         self.cmd
             .verify(&project.root, &L::build_args(), "install succeeded")
             .await
+    }
+
+    async fn refresh_lock(&self, project: &Project) -> Result<Option<LockVerifyReport>> {
+        let window_minutes =
+            window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
+        let Some(args) = L::refresh_lock_args(window_minutes) else {
+            return Ok(None);
+        };
+        self.cmd
+            .lock_report(&project.root, &args, &format!("{} refreshed", L::LOCKFILE))
+            .await
+            .map(Some)
+    }
+
+    fn supports_lock_refresh(&self) -> bool {
+        L::supports_lock_refresh()
+    }
+
+    fn successful_apply_proves_lock_current(&self) -> bool {
+        true
     }
 
     fn sync_scope(&self) -> SyncScope {
