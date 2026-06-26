@@ -84,6 +84,10 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     mode: PlanMode,
     acc: &'a mut UpgradeAccum,
     lock_refreshed_by_apply: bool,
+    /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
+    /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
+    /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
+    manifest_only: HashSet<PackageId>,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -100,6 +104,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             ctx,
             acc,
             lock_refreshed_by_apply: false,
+            manifest_only: HashSet::new(),
         }
     }
 
@@ -161,11 +166,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
     /// `upgrade` ends gate-clean — no separate `fix` needed.
     async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) {
+        let planned = self.plan_upgrade_changes(&deps).await;
+        // Build-backend floor raises ([build-system].requires) have no lock interaction, so apply them
+        // in their own batch: a transitive-cooldown rollback of the lock batch must not revert (or
+        // mislabel as a conflict) an independent, valid build-backend adoption.
+        let (build_changes, lock_changes): (Vec<Change>, Vec<Change>) = planned
+            .into_iter()
+            .partition(|change| self.manifest_only.contains(&change.package));
+        if !build_changes.is_empty() {
+            self.apply_batch(build_changes, state).await;
+        }
+
+        // Measure progress for the reconcile decision over the *lock* batch only — a build-only batch
+        // floats no transitive up, so it must not trigger (or suppress) reconciliation.
         let applied_before = self.applied_count();
         let errored_before = self.errored_count();
-        let planned = self.plan_upgrade_changes(&deps).await;
-        self.apply_batch(planned, state).await;
-        // Skip reconciliation when the upgrade made no clean forward progress: nothing floated up,
+        self.apply_batch(lock_changes, state).await;
+        // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated up,
         // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
             self.applied_count() > applied_before && self.errored_count() == errored_before;
@@ -179,17 +196,46 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
         let scope = candidate_scope(self.mode);
-        match self
+        let mut deps = match self
             .ws
             .dependencies_in_scope(self.ctx.reader, self.ctx.pctx, scope, self.ctx.opts)
             .await
         {
-            Ok(deps) => Some(deps),
+            Ok(deps) => deps,
             Err(error) => {
                 self.record_project_error(&error, None);
-                None
+                return None;
+            }
+        };
+        // Build-backend requirements (`[build-system].requires`) have no lock entry; `upgrade` adopts
+        // them by raising the requirement floor like Dependabot. `fix` leaves them alone — it
+        // remediates the resolved lock graph, which never contains the build backend, so there is
+        // nothing to downgrade.
+        if matches!(self.mode, PlanMode::Upgrade) {
+            match self
+                .ws
+                .manifest_constraints_in_scope(self.ctx.reader, self.ctx.pctx, self.ctx.opts)
+                .await
+            {
+                Ok(constraints) => {
+                    // Remember which packages are manifest-only so `run_upgrade` applies them in their
+                    // own batch: their floor raise has no lock interaction and must not be rolled back
+                    // by an unrelated lock-resolve conflict in the same run.
+                    self.manifest_only
+                        .extend(constraints.iter().map(|dep| dep.package.clone()));
+                    deps.extend(constraints);
+                }
+                // A build-system read failure is non-fatal: the build backend is an optional additive
+                // surface, so warn and continue with the resolved deps rather than failing the project
+                // — matching `outdated`, which records the identical failure as a warning.
+                Err(error) => tracing::warn!(
+                    project = %self.project_label,
+                    error = %error,
+                    "could not read build-system requirements; skipping build-backend candidates"
+                ),
             }
         }
+        Some(deps)
     }
 
     async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
@@ -675,11 +721,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         report: ApplyReport,
         planned: &[Change],
     ) -> cooldown_core::Result<ApplyReport> {
-        let deps = self
+        let mut deps = self
             .ctx
             .reader
             .dependencies(&self.ctx.pctx.project, DepScope::Graph)
             .await?;
+        // A build-backend requirement ([build-system].requires) is adopted by raising its floor in the
+        // manifest, never by a lock move, so the lock-driven graph never shows the new version. Re-read
+        // it from the now-rewritten manifest — its `current` is the raised floor — so a build-backend
+        // bump verifies as reached instead of being mistaken for a resolver conflict. Only `upgrade`
+        // plans build changes, and the read is best-effort: an unreadable build-system table must not
+        // roll back an otherwise-valid batch (`dependencies` tolerates the same parse failure), so the
+        // call is gated to upgrade mode and its error swallowed.
+        if matches!(self.mode, PlanMode::Upgrade)
+            && let Ok(constraints) = self
+                .ctx
+                .reader
+                .manifest_constraints(&self.ctx.pctx.project)
+                .await
+        {
+            deps.extend(constraints);
+        }
         Ok(verify_applied_targets(report, planned, &deps))
     }
 

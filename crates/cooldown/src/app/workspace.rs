@@ -445,6 +445,31 @@ impl Workspace {
         opts: &RunOpts,
     ) -> cooldown_core::Result<Vec<Dependency>> {
         let deps = adapter.dependencies(&pctx.project, scope).await?;
+        Self::scope_dependencies(pctx, opts, deps)
+    }
+
+    /// The build-backend requirements (`[build-system].requires`) the lockfile never records, scoped
+    /// the same way as the resolved deps. Merged into `outdated`/`upgrade` so the local flow surfaces
+    /// and raises the build-backend floor exactly as Dependabot does. The lock-based `check`/`fix`
+    /// gate never calls this — there is no locked version to gate.
+    pub(crate) async fn manifest_constraints_in_scope(
+        &self,
+        adapter: &dyn ToolRead,
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+    ) -> cooldown_core::Result<Vec<Dependency>> {
+        let deps = adapter.manifest_constraints(&pctx.project).await?;
+        Self::scope_dependencies(pctx, opts, deps)
+    }
+
+    /// Apply `--package` scoping and the `exclude` policy (excluded members dropped, then deps with no
+    /// member left removed), then sort deterministically. Shared by the lock-driven dependency list
+    /// and the manifest-constraint list so both reach reports through the same scoping chokepoint.
+    fn scope_dependencies(
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        deps: Vec<Dependency>,
+    ) -> cooldown_core::Result<Vec<Dependency>> {
         let mut deps: Vec<Dependency> = deps
             .into_iter()
             .filter(|dep| Self::package_in_scope(opts, &dep.package.name))

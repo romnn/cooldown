@@ -100,7 +100,7 @@ impl<'a> OutdatedRunner<'a> {
             "Resolving {} dependencies ({})…",
             read.project_label, pctx.tool
         ));
-        let deps = match self
+        let mut deps = match self
             .ws
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
@@ -122,6 +122,31 @@ impl<'a> OutdatedRunner<'a> {
                 return;
             }
         };
+        // Build-backend requirements (`[build-system].requires`, e.g. hatchling) the lockfile never
+        // records: merge them in so `outdated` surfaces a build-backend update the same way Dependabot
+        // does. They are direct, so they belong in both the direct and the transitive view. A failure
+        // to read them is a non-fatal warning — the resolved deps still report.
+        match self
+            .ws
+            .manifest_constraints_in_scope(read.adapter, pctx, self.opts)
+            .await
+        {
+            Ok(constraints) => deps.extend(constraints),
+            Err(error) => {
+                tracing::warn!(
+                    project = read.project_label,
+                    tool = pctx.tool.as_str(),
+                    error = %error,
+                    "could not read build-system requirements"
+                );
+                self.warnings.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
+            }
+        }
         let fetched = self
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
