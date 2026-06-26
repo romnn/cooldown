@@ -71,6 +71,8 @@ type ChangeTargetKey = (String, Option<String>, String);
 struct TrialState {
     /// In-cooldown, non-baselined pins present before the next trial.
     baseline_violations: HashSet<(String, String)>,
+    /// Whether the last committed batch introduced reconcilable transitive cooldown violations.
+    reconcile_needed: bool,
 }
 
 /// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
@@ -122,6 +124,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         };
 
+        self.ctx.opts.progress.say(&format!(
+            "Checking current resolved graph cooldown in {} ({})…",
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         let baseline_violations = match self.graph_violations().await {
             Ok(violations) => violations.into_keys().collect(),
             Err(error) => {
@@ -132,6 +139,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
         let mut state = TrialState {
             baseline_violations,
+            reconcile_needed: false,
         };
         match self.mode {
             PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
@@ -159,7 +167,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
             self.applied_count() > applied_before && self.errored_count() == errored_before;
-        if self.transitive_mode() == TransitiveGate::Enforce && upgraded_cleanly {
+        if self.transitive_mode() == TransitiveGate::Enforce
+            && upgraded_cleanly
+            && state.reconcile_needed
+        {
             self.reconcile_to_fixpoint(state).await;
         }
     }
@@ -180,6 +191,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
+        self.ctx.opts.progress.say(&format!(
+            "Fetching release metadata for {} upgrade candidate(s) in {} ({})…",
+            deps.len(),
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
@@ -313,6 +330,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         transitive: TransitiveGate,
         downgrade_pinned: bool,
     ) -> FixPlan {
+        self.ctx.opts.progress.say(&format!(
+            "Fetching release metadata for {} cooldown fix candidate(s) in {} ({})…",
+            deps.len(),
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
@@ -456,6 +479,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// applied, re-locked, and verified like any other.
     async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) {
         for _ in 0..MAX_FIX_ROUNDS {
+            if !state.reconcile_needed {
+                return;
+            }
+            state.reconcile_needed = false;
+            self.ctx.opts.progress.say(&format!(
+                "Reconciling transitive cooldown violations in {} ({})…",
+                self.project_label(),
+                self.ctx.pctx.tool
+            ));
             let Some(deps) = self.reconcile_deps().await else {
                 return;
             };
@@ -510,6 +542,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .first()
             .map(|change| change.package.name.clone())
             .unwrap_or_default();
+        self.ctx.opts.progress.say(&format!(
+            "Applying {} planned change(s) in {} ({})…",
+            changes.len(),
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         let journal = match self
             .ctx
             .writer
@@ -580,6 +618,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return self.restore_journal(&journal);
         }
 
+        self.ctx.opts.progress.say(&format!(
+            "Checking resolved graph cooldown after apply in {} ({})…",
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         let after = match self.graph_violations().await {
             Ok(after) => after,
             Err(error) => {
@@ -601,16 +644,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return self.restore_journal(&journal);
         }
 
+        self.commit_batch_report(&changes, &collateral, &applied, after_keys, state);
+        true
+    }
+
+    fn commit_batch_report(
+        &mut self,
+        changes: &[Change],
+        collateral: &[Change],
+        applied: &HashSet<ChangeTargetKey>,
+        after_keys: HashSet<(String, String)>,
+        state: &mut TrialState,
+    ) {
         state.baseline_violations = after_keys;
-        for change in &changes {
+        for change in changes {
             if applied.contains(&change_target_key(change)) {
                 self.record_change_applied(change);
             }
         }
-        for change in &collateral {
+        for change in collateral {
             self.record_change_applied(change);
         }
-        true
     }
 
     async fn verify_apply_report(
@@ -665,7 +719,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         after_keys: &HashSet<(String, String)>,
         changes: &[Change],
         applied: &HashSet<ChangeTargetKey>,
-        state: &TrialState,
+        state: &mut TrialState,
     ) -> bool {
         let new_violations: Vec<&(String, String)> =
             after_keys.difference(&state.baseline_violations).collect();
@@ -692,6 +746,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 else {
                     // Every new violation is reconcilable; keep the lock and let the reconcile pass
                     // (after the upgrade loop) downgrade the floated-up transitives.
+                    state.reconcile_needed = true;
                     return false;
                 };
                 self.acc.strict_incomplete = true;
@@ -746,6 +801,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn finalize(&mut self) {
+        self.ctx.opts.progress.say(&format!(
+            "Verifying lock state in {} ({})…",
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
         match self
             .ctx
             .reader

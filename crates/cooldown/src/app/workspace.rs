@@ -847,10 +847,7 @@ mod tests {
         let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
         let reader = FakeReader {
             id: UV,
-            deps: vec![
-                dep("left-dep", "left", "."),
-                dep("right-dep", "right", "."),
-            ],
+            deps: vec![dep("left-dep", "left", "."), dep("right-dep", "right", ".")],
         };
 
         let deps = ws

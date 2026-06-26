@@ -4,7 +4,12 @@ use cooldown_core::{
     CandidateScope, Dependency, MajorKey, PackageId, PackageRegistry, RawRelease, Release,
     ReleaseOrder, ReleaseQuality, Result, UpdateKind, Version,
 };
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Duration};
+
+#[cfg(not(test))]
+const MAJOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MAJOR_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Classify a version string into a [`ReleaseQuality`].
 #[must_use]
@@ -240,23 +245,12 @@ async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<Strin
     let mut next_major = current_major + 1;
     while misses < 2 && next_major <= current_major + 8 {
         let path = semver::major_path(&prefix, next_major);
-        // A next-major probe is best-effort discovery: cooldown does not know whether `vN+1` exists,
-        // so it speculatively lists it. A genuine absence (404/410 → empty list) is a miss, and a
-        // transient failure (timeout / 429 / 5xx under the concurrent burst) is indistinguishable
-        // from absence for discovery, so it degrades to a miss too rather than failing the whole
-        // dependency's release fetch. Only a non-transient fault (e.g. an unparsable list) is a real
-        // error worth surfacing.
-        match proxy.list(&path).await {
-            Ok(list) if !list.is_empty() => {
+        match list_major_discovery_path(proxy, &path).await? {
+            Some(list) if !list.is_empty() => {
                 found.push(path);
                 misses = 0;
             }
-            Ok(_) => misses += 1,
-            Err(err) if err.is_transient() => {
-                tracing::debug!(%path, %err, "next-major probe failed transiently; treating as no newer major");
-                misses += 1;
-            }
-            Err(err) => return Err(err),
+            _ => misses += 1,
         }
         next_major += 1;
     }
@@ -280,17 +274,32 @@ async fn discover_lower_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec
         } else {
             semver::major_path(&prefix, major)
         };
-        // Like the upward walk, a lower-major probe is best-effort discovery: an absent major (empty
-        // list) is skipped, and a transient failure degrades to "skip this path" rather than failing
-        // the dependency. Only a non-transient fault propagates.
-        match proxy.list(&path).await {
-            Ok(list) if !list.is_empty() => found.push(path),
-            Ok(_) => {}
-            Err(err) if err.is_transient() => {
-                tracing::debug!(%path, %err, "lower-major probe failed transiently; skipping this major");
-            }
-            Err(err) => return Err(err),
+        match list_major_discovery_path(proxy, &path).await? {
+            Some(list) if !list.is_empty() => found.push(path),
+            _ => {}
         }
     }
     Ok(found)
+}
+
+async fn list_major_discovery_path(proxy: &GoProxy, path: &str) -> Result<Option<Vec<String>>> {
+    // Major-path discovery is speculative: cooldown does not know whether `vN+1` exists. A genuine
+    // absence and a transient failure both mean "do not include this path", so these probes should
+    // not be allowed to consume the full registry request timeout.
+    match tokio::time::timeout(MAJOR_DISCOVERY_TIMEOUT, proxy.list(path)).await {
+        Ok(Ok(list)) => Ok(Some(list)),
+        Ok(Err(err)) if err.is_transient() => {
+            tracing::debug!(%path, %err, "major-path discovery probe failed transiently; treating as absent");
+            Ok(None)
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            tracing::debug!(
+                %path,
+                timeout_ms = MAJOR_DISCOVERY_TIMEOUT.as_millis(),
+                "major-path discovery probe timed out; treating as absent"
+            );
+            Ok(None)
+        }
+    }
 }
