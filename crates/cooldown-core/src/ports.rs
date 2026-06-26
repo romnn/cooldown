@@ -105,6 +105,22 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
+    /// Returns direct dependency-like requirements that exist only as manifest constraints, with no
+    /// entry in the resolved lock graph. These are opt-in command inputs for flows that can evaluate
+    /// and mutate a manifest floor directly (`outdated`/`upgrade`), not lock-gate inputs: commands
+    /// that verify or fix the resolved graph read only [`dependencies`](ToolRead::dependencies).
+    ///
+    /// Each returned [`Dependency`] carries the requirement's lower-bound floor as its
+    /// [`current`](Dependency::current), with empty `artifacts` and no graph floor/ceiling. The
+    /// default is empty for tools whose actionable packages are all lock-backed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the manifest cannot be read or parsed.
+    async fn manifest_constraints(&self, _project: &Project) -> Result<Vec<Dependency>> {
+        Ok(Vec::new())
+    }
+
     /// Returns the tool's native cooldown config translated into the unified rule model.
     ///
     /// Each window is left RAW (see [`RawWindow`]) so the core normalises absolute-vs-rolling

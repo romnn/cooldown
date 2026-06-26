@@ -303,21 +303,28 @@ pub struct Release {
     pub quality: ReleaseQuality,
 }
 
-/// A resolved dependency to be evaluated. `current_quality` lets `evaluate` apply the prerelease
-/// rule in the core. INVARIANT: `current_quality == locked_release(dep, ctx).quality` (the adapter
-/// derives both from the same lock entry). `graph_floor` is the lowest version the resolved graph
-/// permits (MVS floor / a `=` pin), read from the lock.
+/// A dependency candidate to be evaluated. Most candidates are resolved lock entries. Adapters may
+/// also expose manifest-only constraints through an explicit port method for commands that can
+/// mutate that manifest floor directly; those candidates use the declared floor as `current`, have no
+/// locked artifacts, and never participate in lock-gating commands.
+///
+/// `current_quality` lets `evaluate` apply the prerelease rule in the core. For lock-backed
+/// dependencies, `current_quality == locked_release(dep, ctx).quality` (the adapter derives both from
+/// the same lock entry). `graph_floor` is the lowest version the resolved graph permits (MVS floor /
+/// a `=` pin), read from the lock.
 #[derive(Debug, Clone)]
 pub struct Dependency {
     /// The dependency's package identity.
     pub package: PackageId,
-    /// The currently-locked version.
+    /// The currently-locked version, or the declared floor for an explicit manifest-only candidate.
     pub current: Version,
-    /// The quality of the currently-locked release; mirrors `locked_release(dep, ctx).quality`.
+    /// The quality of `current`; for lock-backed dependencies this mirrors
+    /// `locked_release(dep, ctx).quality`.
     pub current_quality: ReleaseQuality,
     /// Whether this is a direct dependency (as opposed to transitive).
     pub direct: bool,
-    /// The locked artifacts for this dependency; empty for version-granular tools.
+    /// The locked artifacts for this dependency; empty for version-granular tools and manifest-only
+    /// candidates.
     pub artifacts: Vec<ArtifactId>,
     /// The lowest version the resolved graph permits (MVS floor or a `=` pin), read from the
     /// lock; `None` when unconstrained.
