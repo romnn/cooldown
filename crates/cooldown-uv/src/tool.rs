@@ -102,6 +102,48 @@ fn read_lock(project: &Project) -> Result<UvLock> {
     UvLock::parse(&content)
 }
 
+/// The project itself as the single declaring member, for attributing a manifest-only requirement
+/// (a build backend) in reports and for `--package`/exclude scoping. Prefers the lock's recorded
+/// project-root package name, falling back to the manifest's `[project].name`; an unnameable project
+/// yields no member (the dependency is still reported, just without a "used by").
+fn project_member(project: &Project, lock: &UvLock) -> Result<Vec<MemberRef>> {
+    let name = match lock
+        .packages
+        .iter()
+        .find(|pkg| {
+            pkg.source
+                .as_ref()
+                .is_some_and(crate::lock::Source::is_project_root)
+        })
+        .map(|pkg| pkg.name.clone())
+    {
+        Some(name) => Some(name),
+        None => project_name(&project.manifest)?,
+    };
+    Ok(name
+        .map(|name| {
+            vec![MemberRef {
+                name,
+                path: ".".to_string(),
+            }]
+        })
+        .unwrap_or_default())
+}
+
+/// The `[project].name` declared in a `pyproject.toml`, or `None` when absent.
+fn project_name(manifest: &Utf8Path) -> Result<Option<String>> {
+    let Some(value) =
+        cooldown_toml_util::read_toml_file::<toml::Value>(manifest, "pyproject.toml")?
+    else {
+        return Ok(None);
+    };
+    Ok(value
+        .get("project")
+        .and_then(|project| project.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string))
+}
+
 #[async_trait]
 impl ToolRead for UvTool {
     fn id(&self) -> ToolId {
@@ -139,22 +181,7 @@ impl ToolRead for UvTool {
         let ceilings = lock.graph_ceilings();
         let exact_pins = crate::native::exact_pinned_names(&project.manifest);
         // A uv project is a single package, so it is the source for every dependency it declares.
-        // The lock's root package carries the project's package name.
-        let project_member: Vec<MemberRef> = lock
-            .packages
-            .iter()
-            .find(|pkg| {
-                pkg.source
-                    .as_ref()
-                    .is_some_and(crate::lock::Source::is_project_root)
-            })
-            .map(|pkg| {
-                vec![MemberRef {
-                    name: pkg.name.clone(),
-                    path: ".".to_string(),
-                }]
-            })
-            .unwrap_or_default();
+        let project_member = project_member(project, &lock)?;
 
         let mut deps = Vec::new();
         for pkg in &lock.packages {
@@ -202,6 +229,47 @@ impl ToolRead for UvTool {
                 pinned,
             });
         }
+        Ok(deps)
+    }
+
+    async fn manifest_constraints(&self, project: &Project) -> Result<Vec<Dependency>> {
+        let build_requires = crate::build_requires::build_requires(&project.manifest)?;
+        if build_requires.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A build backend that is also a normal locked dependency is already reported by
+        // `dependencies`; skip it here so it surfaces once, through the lock-driven path.
+        let lock = read_lock(project)?;
+        let locked: std::collections::HashSet<String> = lock
+            .packages
+            .iter()
+            .map(|pkg| crate::native::normalize_name(&pkg.name))
+            .collect();
+        let members = project_member(project, &lock)?;
+        let deps = build_requires
+            .into_iter()
+            .filter(|req| !locked.contains(&req.name))
+            .map(|req| {
+                let crate::build_requires::BuildRequire {
+                    name,
+                    floor,
+                    pinned,
+                } = req;
+                Dependency {
+                    package: PackageId::new(UV_ID, name, Some(PYPI.to_string())),
+                    current_quality: classify_quality(&floor),
+                    current: Version::new(floor),
+                    direct: true,
+                    // The build backend has no `uv.lock` entry, so there are no locked artifacts and
+                    // no graph-imposed floor/ceiling: the requirement floor is the only anchor.
+                    artifacts: Vec::new(),
+                    graph_floor: None,
+                    graph_ceiling: None,
+                    members: members.clone(),
+                    pinned,
+                }
+            })
+            .collect();
         Ok(deps)
     }
 
@@ -469,7 +537,7 @@ impl UvTool {
     ) -> Result<()> {
         if matches!(plan.rewrite, RewriteMode::Always) {
             for change in &plan.changes {
-                manifest::widen_constraint(
+                manifest::widen_dependency_constraint(
                     &project.manifest,
                     &change.package.name,
                     change.to.as_str(),
@@ -492,7 +560,7 @@ impl UvTool {
                     if reached {
                         continue;
                     }
-                    if manifest::widen_constraint(
+                    if manifest::widen_dependency_constraint(
                         &project.manifest,
                         &change.package.name,
                         change.to.as_str(),
@@ -587,6 +655,56 @@ impl ToolWrite for UvTool {
             return Ok(report);
         }
 
+        // Partition the plan. A build-backend requirement (`[build-system].requires`) has no `uv.lock`
+        // entry, so it is adopted by raising its requirement floor in `pyproject.toml` directly
+        // (mirroring Dependabot) — never by a lock move. Everything else goes through the whole-graph
+        // lock resolve below. A name that is both a build requirement and a locked package is treated
+        // as the locked dependency (matching `manifest_constraints`, which omits it).
+        let build_names = crate::build_requires::build_require_names(&project.manifest)?;
+        let locked_now: std::collections::HashSet<String> = read_lock(project)?
+            .packages
+            .iter()
+            .map(|pkg| crate::native::normalize_name(&pkg.name))
+            .collect();
+        let is_build_change = |change: &Change| {
+            let name = crate::native::normalize_name(&change.package.name);
+            build_names.contains(&name) && !locked_now.contains(&name)
+        };
+
+        // Adopt each build-backend floor by rewriting its requirement; that rewrite is the whole change
+        // (there is no lock to move). A successful raise is `applied`; a no-op floor (already current,
+        // or carrying no rewritable specifier) is a benign skip rather than a silent drop.
+        for change in plan.changes.iter().filter(|change| is_build_change(change)) {
+            if manifest::widen_build_requirement(
+                &project.manifest,
+                &change.package.name,
+                change.to.as_str(),
+            )? {
+                report.applied.push(change.clone());
+            } else {
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::NotEligible,
+                    offending: None,
+                });
+            }
+        }
+
+        let lock_changes: Vec<Change> = plan
+            .changes
+            .iter()
+            .filter(|change| !is_build_change(change))
+            .cloned()
+            .collect();
+        if lock_changes.is_empty() {
+            // Only build-backend floors moved; there is no lock graph to re-resolve.
+            return Ok(report);
+        }
+        let lock_plan = Plan {
+            changes: lock_changes,
+            rewrite: plan.rewrite,
+        };
+
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `uv.lock` before the
         // re-resolve). The whole-graph resolve emits one consistent lock; the report is the diff of this
         // snapshot against the result, so *every* net version change is surfaced. A missing/unparsable
@@ -606,8 +724,8 @@ impl ToolWrite for UvTool {
         // mature only the too-fresh pins). uv settles every conflict itself, so the result is the unique
         // fixed point under the window — no per-package pins for the bulk of the graph, no oscillation,
         // and no package left to drift unreported because *every* package is re-resolved under the cutoff.
-        let upgrade = !plan.changes.iter().all(|change| change.downgrade);
-        match self.whole_graph_resolve(project, plan, upgrade).await {
+        let upgrade = !lock_plan.changes.iter().all(|change| change.downgrade);
+        match self.whole_graph_resolve(project, &lock_plan, upgrade).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The whole resolve is unsatisfiable (no consistent lock under the window). Propagate so
@@ -619,7 +737,7 @@ impl ToolWrite for UvTool {
 
         let after_lock = read_lock(project)?;
         let after = locked_versions(&after_lock);
-        let planned: std::collections::HashSet<&str> = plan
+        let planned: std::collections::HashSet<&str> = lock_plan
             .changes
             .iter()
             .map(|change| change.package.name.as_str())
@@ -629,7 +747,7 @@ impl ToolWrite for UvTool {
         // applied — or fell short because a mutually-exclusive requirement won — reported held, naming
         // the blocker. "Reached" respects the move's direction: a forward candidate must land at or
         // above its target, a downgrade at or below it.
-        for change in &plan.changes {
+        for change in &lock_plan.changes {
             let landed = after.get(change.package.name.as_str());
             let reached = landed.is_some_and(|version| {
                 let ordering = version::compare(version, change.to.as_str());

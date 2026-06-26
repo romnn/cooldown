@@ -4,6 +4,7 @@
 //! a native config layer.
 
 mod artifact;
+mod build_requires;
 pub mod lock;
 mod manifest;
 mod native;

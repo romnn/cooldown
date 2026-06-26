@@ -13,8 +13,11 @@ use cooldown_core::CoreError;
 use cooldown_toml_util::{parse_document, write_document};
 use toml_edit::{Array, DocumentMut, Formatted, Item, TableLike, Value};
 
-/// Widen the requirement on `crate_name` in `manifest` so it admits `target`, across every PEP 621
-/// dependency array.
+/// Widen a PEP 621 *dependency* requirement on `crate_name` so it admits `target`, across every
+/// dependency array (`[project.dependencies]`, `[project.optional-dependencies]`, and PEP 735
+/// `[dependency-groups]`). Deliberately does **not** touch `[build-system].requires`: the build
+/// backend is an independent surface raised by [`widen_build_requirement`], so a runtime-dependency
+/// upgrade never silently bumps a same-named build-backend floor as a side effect.
 ///
 /// Returns whether the manifest was modified. `false` means the dependency was declared with no
 /// version specifier (a bare name or path/URL source) or is not declared in this manifest — there
@@ -23,16 +26,43 @@ use toml_edit::{Array, DocumentMut, Formatted, Item, TableLike, Value};
 /// # Errors
 ///
 /// Returns a [`CoreError`] if the manifest exists but cannot be read, parsed, or written back.
-pub fn widen_constraint(
+pub fn widen_dependency_constraint(
     manifest: &Utf8Path,
     crate_name: &str,
     target: &str,
+) -> Result<bool, CoreError> {
+    widen_in(manifest, crate_name, target, rewrite_dependency_sections)
+}
+
+/// Widen the `[build-system].requires` floor on `crate_name` so it admits `target`. uv resolves the
+/// PEP 517 build backend in an isolated environment and never records it in `uv.lock`, so raising the
+/// floor here is the only way to adopt a newer build backend (mirroring Dependabot). Touches only the
+/// build-system table, never PEP 621 dependency arrays.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] if the manifest exists but cannot be read, parsed, or written back.
+pub fn widen_build_requirement(
+    manifest: &Utf8Path,
+    crate_name: &str,
+    target: &str,
+) -> Result<bool, CoreError> {
+    widen_in(manifest, crate_name, target, rewrite_build_requires)
+}
+
+/// Parse the manifest, apply `rewrite` (a section-scoped requirement rewriter), and write it back
+/// only when something changed.
+fn widen_in(
+    manifest: &Utf8Path,
+    crate_name: &str,
+    target: &str,
+    rewrite: impl Fn(&mut DocumentMut, &str, &str) -> bool,
 ) -> Result<bool, CoreError> {
     let Some(mut doc) = parse_document(manifest)? else {
         return Ok(false);
     };
     let normalized = native::normalize_name(crate_name);
-    if rewrite_document(&mut doc, &normalized, target) {
+    if rewrite(&mut doc, &normalized, target) {
         write_document(manifest, &doc)?;
         Ok(true)
     } else {
@@ -40,7 +70,7 @@ pub fn widen_constraint(
     }
 }
 
-fn rewrite_document(doc: &mut DocumentMut, name: &str, target: &str) -> bool {
+fn rewrite_dependency_sections(doc: &mut DocumentMut, name: &str, target: &str) -> bool {
     let mut changed = false;
     if let Some(array) = doc
         .get_mut("project")
@@ -52,6 +82,13 @@ fn rewrite_document(doc: &mut DocumentMut, name: &str, target: &str) -> bool {
     changed |= rewrite_group_tables(doc, &["project", "optional-dependencies"], name, target);
     changed |= rewrite_group_tables(doc, &["dependency-groups"], name, target);
     changed
+}
+
+fn rewrite_build_requires(doc: &mut DocumentMut, name: &str, target: &str) -> bool {
+    doc.get_mut("build-system")
+        .and_then(|table| table.get_mut("requires"))
+        .and_then(Item::as_array_mut)
+        .is_some_and(|array| rewrite_array(array, name, target))
 }
 
 /// Rewrite the matching entry in every requirement array of a table-of-arrays section
@@ -80,8 +117,14 @@ fn rewrite_array(array: &mut Array, name: &str, target: &str) -> bool {
             continue;
         }
         if let Some(rewritten) = bump_requirement(requirement, target) {
-            set_string_preserving_decor(value, rewritten);
-            changed = true;
+            // Only count a rewrite that actually changes the string. An idempotent rewrite (the
+            // requirement already admits `target`) reports no change, so a build-backend floor the
+            // resolve cannot move never loops the `Auto` widen pass forever.
+            let differs = rewritten != requirement;
+            if differs {
+                set_string_preserving_decor(value, rewritten);
+                changed = true;
+            }
         }
     }
     changed
@@ -230,7 +273,7 @@ mod tests {
             "[project]\ndependencies = [\n  # keep me\n  \"httpx>=0.27\",\n  \"protobuf==6.0\",\n]\n\n[project.optional-dependencies]\ngrpc = [\"httpx>=0.27\"]\n\n[dependency-groups]\ndev = [\"ruff>=0.1\", \"httpx>=0.27\"]\n",
         );
 
-        let changed = widen_constraint(&manifest, "httpx", "0.30.0").expect("widen");
+        let changed = widen_dependency_constraint(&manifest, "httpx", "0.30.0").expect("widen");
         assert!(changed);
         let after = std::fs::read_to_string(&manifest).expect("read");
         assert_eq!(
@@ -247,12 +290,68 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_build_system_requires_floor() {
+        let (_dir, manifest) = write_manifest(
+            "[project]\ndependencies = [\"httpx>=0.27\"]\n\n[build-system]\nrequires = [\"hatchling>=1.28.0\"]\nbuild-backend = \"hatchling.build\"\n",
+        );
+
+        let changed = widen_build_requirement(&manifest, "hatchling", "1.30.1").expect("widen");
+        assert!(changed);
+        let after = std::fs::read_to_string(&manifest).expect("read");
+        assert!(
+            after.contains("hatchling>=1.30.1"),
+            "build-backend floor raised: {after}"
+        );
+        assert!(
+            after.contains("build-backend = \"hatchling.build\""),
+            "the build-backend key is untouched: {after}"
+        );
+
+        // A second widen to the same target is a no-op: the floor already admits it.
+        assert!(
+            !widen_build_requirement(&manifest, "hatchling", "1.30.1").expect("idempotent widen"),
+            "an already-current floor reports no change"
+        );
+    }
+
+    #[test]
+    fn dependency_and_build_requirement_widens_stay_in_their_own_section() {
+        // A package declared as BOTH a runtime dependency and the build backend, each with its own
+        // floor. Widening one surface must never touch the other — they are independent constraints.
+        let manifest_text = "[project]\ndependencies = [\"setuptools>=60\"]\n\n[build-system]\nrequires = [\"setuptools>=70\"]\nbuild-backend = \"setuptools.build_meta\"\n";
+
+        let (_dir, manifest) = write_manifest(manifest_text);
+        widen_dependency_constraint(&manifest, "setuptools", "75.0").expect("widen dep");
+        let after = std::fs::read_to_string(&manifest).expect("read");
+        assert!(
+            after.contains("setuptools>=75.0"),
+            "runtime floor raised: {after}"
+        );
+        assert!(
+            after.contains("setuptools>=70"),
+            "build-backend floor untouched by a dependency widen: {after}"
+        );
+
+        let (_dir, manifest) = write_manifest(manifest_text);
+        widen_build_requirement(&manifest, "setuptools", "75.0").expect("widen build");
+        let after = std::fs::read_to_string(&manifest).expect("read");
+        assert!(
+            after.contains("setuptools>=75.0"),
+            "build floor raised: {after}"
+        );
+        assert!(
+            after.contains("setuptools>=60"),
+            "dependency floor untouched by a build-requirement widen: {after}"
+        );
+    }
+
+    #[test]
     fn unconstrained_or_absent_dependency_reports_no_change() {
         let (_dir, manifest) =
             write_manifest("[project]\ndependencies = [\"proto-shared\", \"httpx>=0.27\"]\n");
         // A bare workspace dep has no specifier to widen.
-        assert!(!widen_constraint(&manifest, "proto-shared", "1.0.0").expect("widen"));
+        assert!(!widen_dependency_constraint(&manifest, "proto-shared", "1.0.0").expect("widen"));
         // A dependency declared nowhere here.
-        assert!(!widen_constraint(&manifest, "tokio", "1.0.0").expect("widen"));
+        assert!(!widen_dependency_constraint(&manifest, "tokio", "1.0.0").expect("widen"));
     }
 }
