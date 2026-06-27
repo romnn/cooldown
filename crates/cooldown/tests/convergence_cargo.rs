@@ -13,8 +13,9 @@
 //! resolution clock with `--freeze <FREEZE>` (an absolute cutoff the core applies to the index
 //! publish times), so the set of matured versions — and therefore the precise targets cooldown
 //! computes — is reproducible from crates.io's immutable history. The starting lock is seeded with
-//! the real `cargo` against live crates.io; the assertions check INVARIANTS (convergence,
-//! no-silent-change, cross-command agreement), never hard-coded versions.
+//! the real `cargo` against live crates.io; most assertions check INVARIANTS (convergence,
+//! no-silent-change, cross-command agreement). The focused `clap` regression below hard-pins
+//! historical immutable crates.io versions to recreate a specific float-up/hold-back failure.
 //!
 //! # The conflict
 //!
@@ -101,6 +102,42 @@ fn conflict_fixture() -> Fixture {
     fixture
 }
 
+const FLOATED_TRANSITIVE_FREEZE: &str = "2026-06-20T00:00:00Z";
+
+const FLOATED_TRANSITIVE_MANIFEST: &str = r#"[package]
+name = "cargo-floated-transitive"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+"#;
+
+fn floated_transitive_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", FLOATED_TRANSITIVE_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &["update", "-p", "clap", "--precise", "4.5.55"],
+            &[],
+        )
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &["update", "-p", "quote", "--precise", "1.0.44"],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
 #[test]
 fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("cargo");
@@ -150,6 +187,63 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     assert_eq!(
         reported, moved_in_lock,
         "report set must equal the lock-diff set (no silent change)\nreported={reported:?}\nlock-diff={moved_in_lock:?}"
+    );
+}
+
+#[test]
+fn upgrade_holds_back_a_cargo_floated_transitive_instead_of_skipping() {
+    skip_if_missing!("cargo");
+    let fixture = floated_transitive_fixture();
+    let lock_before = fixture.read_bytes("Cargo.lock");
+
+    assert_eq!(
+        cargo_lock_versions_of("clap", &lock_before),
+        vec!["4.5.55".to_owned()],
+        "fixture must start with a cooled clap that can move forward"
+    );
+    assert_eq!(
+        cargo_lock_versions_of("quote", &lock_before),
+        vec!["1.0.44".to_owned()],
+        "fixture must start with the older cooled transitive from the regression"
+    );
+
+    let upgrade = fixture.cooldown_json(&[
+        "upgrade",
+        "--freeze",
+        FLOATED_TRANSITIVE_FREEZE,
+        "--package",
+        "clap",
+    ]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should adopt clap and reconcile quote instead of rolling back"
+    );
+    assert!(
+        upgrade.applied_names().contains("clap"),
+        "clap should be applied, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        upgrade.applied_names().contains("quote"),
+        "quote's held-back net move should be reported, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        !upgrade.skipped_reasons().contains("transitive_in_cooldown"),
+        "a reducible floated transitive must not skip the batch: {:?}",
+        upgrade.skipped_reasons()
+    );
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    assert_eq!(
+        cargo_lock_versions_of("clap", &lock_after),
+        vec!["4.6.1".to_owned()],
+        "freeze cutoff admits clap 4.6.1 as the newest mature compatible release"
+    );
+    assert_eq!(
+        cargo_lock_versions_of("quote", &lock_after),
+        vec!["1.0.45".to_owned()],
+        "cargo floats quote to latest semver-compatible, but cooldown must hold it at the newest mature version"
     );
 }
 

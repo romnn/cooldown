@@ -316,6 +316,18 @@ impl Envelope {
             .collect()
     }
 
+    pub fn skipped_reasons(&self) -> BTreeSet<String> {
+        self.items()
+            .iter()
+            .filter_map(|item| {
+                item.get("skipped")
+                    .and_then(|skipped| skipped.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     /// Names of `outdated` items with the given status string (e.g. `"blocked"`, `"adoptable"`).
     pub fn outdated_with_status(&self, status: &str) -> BTreeSet<String> {
         self.filter_names(|item| {
