@@ -1,10 +1,12 @@
-//! Shared mutation flow for `upgrade` and `fix`: plan one version change, apply it, re-lock, verify,
-//! and roll back if the resulting graph would fail the cooldown gate.
+//! Shared mutation flow for `upgrade` and `fix`: plan the version changes, apply them as one batch,
+//! re-lock, verify the resolved graph against the cooldown gate, and reconcile or roll back.
 //!
-//! The app applies changes **one at a time**: capture a narrow mutation journal for the pending
-//! change, apply the single-change plan, and if the re-lock leaves a new too-fresh
-//! (non-baselined) dependency in the graph, restore that journal and skip the change as
-//! `TransitiveInCooldown` — never committing a lock a subsequent `check` would reject.
+//! `upgrade` is optimistic about transitives: a forward move that floats a too-fresh transitive up is
+//! kept (a cooled parent cannot require a child newer than the window, so an older satisfying version
+//! exists by construction), and a reconcile pass matures the floated-up nodes back down to their
+//! newest matured version. Only a violation the reconcile genuinely cannot clear rolls the lock batch
+//! back — restored from a pre-batch snapshot — and reports the change as `TransitiveInCooldown`, never
+//! committing a lock a subsequent `check` would reject. `fix` is the dual, downgrading too-fresh pins.
 
 mod executor;
 

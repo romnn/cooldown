@@ -71,8 +71,25 @@ type ChangeTargetKey = (String, Option<String>, String);
 struct TrialState {
     /// In-cooldown, non-baselined pins present before the next trial.
     baseline_violations: HashSet<(String, String)>,
-    /// Whether the last committed batch introduced reconcilable transitive cooldown violations.
+    /// Whether the last committed batch introduced transitive cooldown violations to reconcile.
     reconcile_needed: bool,
+}
+
+/// A restore point captured before the optimistic `upgrade` lock batch, so a transitive the reconcile
+/// pass cannot mature down rolls the accumulator and trial state back to exactly here — the lock files
+/// themselves are restored from a separate mutation journal.
+struct Checkpoint {
+    /// `acc.items` length: the optimistically-recorded applied/collateral rows are truncated back to it.
+    items_len: usize,
+    /// `acc.warnings` length: reconcile's deferred warnings are truncated back to it.
+    warnings_len: usize,
+    /// `acc.errors` length: a project-level error recorded during the rolled-back lock/reconcile batch
+    /// is truncated back to it, so a reverted batch never leaves a stale error (and a flipped exit).
+    errors_len: usize,
+    /// The graph violations present before the lock batch — the baseline a residual is measured against.
+    baseline_violations: HashSet<(String, String)>,
+    /// Whether an apply had already proven the lock current before the lock batch.
+    lock_refreshed: bool,
 }
 
 /// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
@@ -176,12 +193,40 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if !build_changes.is_empty() {
             self.apply_batch(build_changes, state).await;
         }
+        if lock_changes.is_empty() {
+            return;
+        }
+
+        // Snapshot the lock *after* the independent build batch and *before* the optimistic lock
+        // batch. The upgrade gate keeps the lock even when a forward move floats a too-fresh transitive
+        // up, trusting the reconcile pass to mature it down; if a violation turns out irreducible, the
+        // final gate below restores this snapshot — reverting the lock batch and its reconcile
+        // downgrades while leaving the build-backend adoption intact. Capturing it must succeed: with
+        // no safety net the optimistic commit could not be undone, so a capture failure skips the lock
+        // batch as an error rather than risking an unverifiable graph.
+        let lock_plan = Plan {
+            changes: lock_changes.clone(),
+            rewrite: self.ctx.opts.rewrite,
+        };
+        let snapshot = match self
+            .ctx
+            .writer
+            .mutation_journal(&self.ctx.pctx.project, &lock_plan)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.record_change_errors(&error, &lock_changes);
+                return;
+            }
+        };
+        let checkpoint = self.checkpoint(state);
 
         // Measure progress for the reconcile decision over the *lock* batch only — a build-only batch
         // floats no transitive up, so it must not trigger (or suppress) reconciliation.
         let applied_before = self.applied_count();
         let errored_before = self.errored_count();
-        self.apply_batch(lock_changes, state).await;
+        self.apply_batch(lock_changes.clone(), state).await;
         // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated up,
         // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
@@ -191,6 +236,85 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             && state.reconcile_needed
         {
             self.reconcile_to_fixpoint(state).await;
+        }
+
+        // Final gate: a too-fresh transitive newly forced in that the reconcile pass could not mature
+        // down — none matured below it, or a requirer pins it there — is a residual the optimistic
+        // commit must not keep. A pre-existing dirty package may float to a different fresh version
+        // without rollback, but an additional fresh version line for that package is still new.
+        if self.transitive_mode() == TransitiveGate::Enforce {
+            let residual = newly_introduced_violations(
+                &checkpoint.baseline_violations,
+                &state.baseline_violations,
+            );
+            if !residual.is_empty() {
+                self.roll_back_unreconciled(
+                    &snapshot,
+                    &checkpoint,
+                    &lock_changes,
+                    &residual,
+                    state,
+                );
+            }
+        }
+
+        self.collapse_collateral(&checkpoint.baseline_violations);
+    }
+
+    /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
+    fn collapse_collateral(&mut self, prior_violations: &HashSet<(String, String)>) {
+        let project = self.project_label.clone();
+        let tool = self.ctx.tool_name();
+        collapse_applied_legs(&mut self.acc.items, &project, tool, prior_violations);
+    }
+
+    /// Capture the accumulator and trial-state restore point before the optimistic lock batch.
+    fn checkpoint(&self, state: &TrialState) -> Checkpoint {
+        Checkpoint {
+            items_len: self.acc.items.len(),
+            warnings_len: self.acc.warnings.len(),
+            errors_len: self.acc.errors.len(),
+            baseline_violations: state.baseline_violations.clone(),
+            lock_refreshed: self.lock_refreshed_by_apply,
+        }
+    }
+
+    /// Undo an optimistic lock batch whose floated-up transitive the reconcile pass could not clear:
+    /// restore the snapshotted lock, rewind the accumulator/trial state to `checkpoint`, and re-report
+    /// each planned lock change as held by the still-too-fresh transitive it would force in.
+    fn roll_back_unreconciled(
+        &mut self,
+        snapshot: &cooldown_core::ProjectMutationJournal,
+        checkpoint: &Checkpoint,
+        lock_changes: &[Change],
+        residual: &[(String, String)],
+        state: &mut TrialState,
+    ) {
+        // Rewind the accumulator to the checkpoint BEFORE restoring the lock: a restore failure records
+        // its own project error, which must survive the truncation (the on-disk lock is then in an
+        // unknown state the user has to see). acc.errors is rewound alongside items/warnings so a
+        // project error from the now-reverted lock/reconcile batch does not flip the exit.
+        self.acc.items.truncate(checkpoint.items_len);
+        self.acc.warnings.truncate(checkpoint.warnings_len);
+        self.acc.errors.truncate(checkpoint.errors_len);
+        self.lock_refreshed_by_apply = checkpoint.lock_refreshed;
+        state
+            .baseline_violations
+            .clone_from(&checkpoint.baseline_violations);
+        state.reconcile_needed = false;
+        self.restore_journal(snapshot);
+        self.acc.strict_incomplete = true;
+        // Name one stuck transitive as the offender (sorted for a stable report).
+        let offender = residual.iter().map(|(name, _)| name.clone()).min();
+        for change in lock_changes {
+            self.record_change_skip(
+                change,
+                Some(SkippedInfo {
+                    reason: SkipReason::TransitiveInCooldown,
+                    message: SkipReason::TransitiveInCooldown.message().to_string(),
+                    offending: offender.clone(),
+                }),
+            );
         }
     }
 
@@ -773,11 +897,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// The transitive-cooldown gate over a committed batch. The joint resolve may drag a fresh
     /// transitive into the graph; how we react follows the transitive mode: `Hide` ignores
-    /// transitives; `Allow` keeps the lock and reports them; `Enforce` (default) keeps it only when
-    /// every new violation is *reconcilable* (the reconcile pass can downgrade it later). Returns
-    /// `true` when `Enforce` found a fresh, irreducible dep the resolve forced in — the caller rolls
-    /// the whole batch back, since committing a version that requires a too-fresh transitive defeats
-    /// the cooldown. Records the applied changes as `TransitiveInCooldown` skips in that case.
+    /// transitives; `Allow` keeps the lock and reports them; `Enforce` reconciles forward `upgrade`
+    /// batches optimistically, while backward `fix` batches still roll back immediately when a new
+    /// violation has no lower graph floor to try. Returns `true` when the caller should restore the
+    /// batch journal.
     fn gate_batch_transitives(
         &mut self,
         after: &HashMap<(String, String), bool>,
@@ -805,12 +928,24 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 false
             }
             TransitiveGate::Enforce => {
+                // `upgrade` is optimistic: a forward move that floats a too-fresh transitive up is
+                // never rolled back on a per-node prediction, because a cooled parent cannot require a
+                // child newer than the cooldown window — an older version every requirer already
+                // accepts exists by construction. Keep the lock and let the reconcile pass mature the
+                // floated-up transitives down; `run_upgrade` makes a final gate check and rolls the
+                // lock back only for a violation reconcile genuinely could not clear. `fix` stays
+                // conservative: it moves *backward*, so a fresh transitive it cannot reduce here is a
+                // real, unrecoverable conflict that must roll the batch back immediately.
+                if matches!(self.mode, PlanMode::Upgrade) {
+                    state.reconcile_needed = true;
+                    return false;
+                }
                 let Some((forced_pkg, _)) = new_violations
                     .iter()
                     .find(|key| !after.get(**key).copied().unwrap_or(false))
                 else {
                     // Every new violation is reconcilable; keep the lock and let the reconcile pass
-                    // (after the upgrade loop) downgrade the floated-up transitives.
+                    // (after the fix loop) downgrade the floated-up transitives.
                     state.reconcile_needed = true;
                     return false;
                 };
@@ -837,17 +972,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn reconcile_deps(&mut self) -> Option<Vec<Dependency>> {
+        // A scoped upgrade can float transitives that do not match `--package`; reconcile is the
+        // safety pass over the post-apply graph, so it must see the raw graph like `graph_violations`.
         match self
-            .ws
-            .dependencies_in_scope(
-                self.ctx.reader,
-                self.ctx.pctx,
-                DepScope::Graph,
-                self.ctx.opts,
-            )
+            .ctx
+            .reader
+            .dependencies(&self.ctx.pctx.project, DepScope::Graph)
             .await
         {
-            Ok(deps) => Some(deps),
+            Ok(mut deps) => {
+                deps.sort_by(|a, b| {
+                    a.package
+                        .name
+                        .cmp(&b.package.name)
+                        .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
+                });
+                Some(deps)
+            }
             Err(error) => {
                 self.record_project_error(&error, None);
                 None
@@ -940,10 +1081,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.acc.lock_verified = self.acc.lock_status.and_then(LockStatus::verified);
     }
 
-    /// The graph's too-fresh, non-baselined violations, each mapped to whether it is *reconcilable* —
-    /// the graph floor sits below the locked version, so a `fix` downgrade could roll it back. A
-    /// violation the graph pins at the fresh version (floor equals current, or no floor is known) is
-    /// not reconcilable: nothing lower satisfies its requirers.
+    /// The graph's too-fresh, non-baselined violations, each mapped to whether a conservative `fix`
+    /// gate can prove it is reducible: the graph floor sits below the locked version, so a downgrade
+    /// can try to roll it back without violating known lower bounds. `upgrade` uses this same set for
+    /// the final residual check, but it no longer relies on the boolean prediction before attempting
+    /// reconciliation.
     async fn graph_violations(&self) -> cooldown_core::Result<HashMap<(String, String), bool>> {
         // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
         // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
@@ -1190,6 +1332,127 @@ fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeTargetKey>
         .any(|change| applied.contains(&change_target_key(change)))
 }
 
+fn newly_introduced_violations(
+    before: &HashSet<(String, String)>,
+    after: &HashSet<(String, String)>,
+) -> Vec<(String, String)> {
+    let before_counts = violation_counts_by_name(before);
+    let after_counts = violation_counts_by_name(after);
+    let mut residual: Vec<(String, String)> = after
+        .difference(before)
+        .filter(|(name, _)| {
+            after_counts.get(name.as_str()).copied().unwrap_or(0)
+                > before_counts.get(name.as_str()).copied().unwrap_or(0)
+        })
+        .cloned()
+        .collect();
+    residual.sort();
+    residual
+}
+
+fn violation_counts_by_name(violations: &HashSet<(String, String)>) -> HashMap<&str, usize> {
+    let mut counts = HashMap::new();
+    for (name, _) in violations {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    counts
+}
+
+/// Collapse the several applied rows one package accrues across the optimistic forward batch and the
+/// reconcile pass of an `upgrade` into a single net row, in place. A transitive the upgrade floats up
+/// and then matures back down records a leg for each (`quote 1.0.44→1.0.46`, then `1.0.46→1.0.45`);
+/// the report must show only the net change against the committed lock (`quote 1.0.44→1.0.45`), never
+/// the phantom intermediate.
+///
+/// Legs are linked into **contiguous chains** — a leg extends a chain whose tail `to` equals this
+/// leg's `from` — so only the legs of one moving node fold together. Two coexisting version lines of a
+/// crate (cargo keeps e.g. `serde 0.9` and `serde 1.0`) share a `(name, registry)` key but their
+/// versions do not chain, so each stays its own row. A chain that lands exactly back where it started
+/// is dropped (no net move). The net row's direction is recomputed: the move is a downgrade if its
+/// first leg already moved backward (a forced collateral downgrade) or if its start version was an
+/// unacknowledged too-fresh violation before this batch (`prior_violations`) — in which case the
+/// reconcile, which only matures *down*, settled the line below the start. Otherwise the start was
+/// matured and the reconcile lands at or above it, so the net is a forward move. Scoped to one
+/// `(project, tool)`; only applied (non-skipped, non-errored) rows merge. Runs before the report is
+/// sorted, so the rows are still in chronological leg order.
+fn collapse_applied_legs(
+    items: &mut Vec<UpgradeItem>,
+    project: &str,
+    tool: &str,
+    prior_violations: &HashSet<(String, String)>,
+) {
+    let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
+    for (idx, item) in items.iter().enumerate() {
+        let applied = item.applied && item.skipped.is_none() && item.error.is_none();
+        if applied && item.project == project && item.tool == tool {
+            groups
+                .entry((item.name.clone(), item.registry.clone()))
+                .or_default()
+                .push(idx);
+        }
+    }
+    let mut remove: HashSet<usize> = HashSet::new();
+    // (first_leg_idx, net_to, net_is_downgrade) for each chain that folds into a net row.
+    let mut retarget: Vec<(usize, String, bool)> = Vec::new();
+    for indices in groups.values() {
+        // Link legs into contiguous chains: a leg joins the chain whose tail `to` equals its `from`.
+        let mut chains: Vec<Vec<usize>> = Vec::new();
+        for &idx in indices {
+            let Some(from) = items.get(idx).map(|item| item.from.clone()) else {
+                continue;
+            };
+            let slot = chains.iter_mut().find(|chain| {
+                chain
+                    .last()
+                    .and_then(|&tail| items.get(tail))
+                    .is_some_and(|tail| tail.to == from)
+            });
+            match slot {
+                Some(chain) => chain.push(idx),
+                None => chains.push(vec![idx]),
+            }
+        }
+        for chain in &chains {
+            let (Some(&first), Some(&last)) = (chain.first(), chain.last()) else {
+                continue;
+            };
+            if first == last {
+                continue; // a single-leg chain keeps its row untouched
+            }
+            let (Some(head), Some(net_to)) = (
+                items.get(first),
+                items.get(last).map(|item| item.to.clone()),
+            ) else {
+                continue;
+            };
+            if head.from == net_to {
+                // Floated out and back: no net move, drop the whole chain.
+                remove.extend(chain.iter().copied());
+                continue;
+            }
+            let downgrade = head.downgrade
+                || prior_violations.contains(&(head.name.clone(), head.from.clone()));
+            retarget.push((first, net_to, downgrade));
+            remove.extend(chain.iter().skip(1).copied());
+        }
+    }
+    for (first, net_to, downgrade) in retarget {
+        if let Some(head) = items.get_mut(first) {
+            head.to = net_to;
+            head.downgrade = downgrade;
+        }
+    }
+    if remove.is_empty() {
+        return;
+    }
+    *items = std::mem::take(items)
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !remove.contains(idx))
+        .map(|(_, item)| item)
+        .collect();
+}
+
 fn combine_lock_status(current: Option<LockStatus>, next: LockStatus) -> LockStatus {
     match (current, next) {
         (Some(LockStatus::Stale), _) | (_, LockStatus::Stale) => LockStatus::Stale,
@@ -1264,10 +1527,11 @@ fn record_skip_item(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanMode, candidate_scope, combine_lock_status, conflict_skip_message, is_downgrade,
-        planned_changes_landed, target_package, verify_applied_targets,
+        PlanMode, candidate_scope, collapse_applied_legs, combine_lock_status,
+        conflict_skip_message, is_downgrade, newly_introduced_violations, planned_changes_landed,
+        target_package, verify_applied_targets,
     };
-    use crate::app::TransitiveGate;
+    use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
         ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, PackageId, Release,
         ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
@@ -1440,6 +1704,167 @@ mod tests {
         let applied = HashSet::from([super::change_target_key(&collateral)]);
 
         assert!(!planned_changes_landed(&[planned], &applied));
+    }
+
+    fn applied_item(name: &str, from: &str, to: &str, downgrade: bool) -> UpgradeItem {
+        UpgradeItem {
+            name: name.to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            direct: false,
+            downgrade,
+            members: Vec::new(),
+            registry: Some("crates.io".to_string()),
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: UpdateKind::Minor,
+            applied: true,
+            skipped: None,
+            error: None,
+        }
+    }
+
+    fn no_prior() -> HashSet<(String, String)> {
+        HashSet::new()
+    }
+
+    fn violations(items: &[(&str, &str)]) -> HashSet<(String, String)> {
+        items
+            .iter()
+            .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn residual_gate_allows_a_pre_existing_violation_to_float_versions() {
+        let before = violations(&[("t", "0.5.0")]);
+        let after = violations(&[("t", "0.6.0")]);
+
+        assert!(
+            newly_introduced_violations(&before, &after).is_empty(),
+            "one dirty version line stayed one dirty version line"
+        );
+    }
+
+    #[test]
+    fn residual_gate_flags_an_added_version_line_for_a_dirty_package() {
+        let before = violations(&[("t", "0.5.0")]);
+        let after = violations(&[("t", "0.5.0"), ("t", "1.0.0")]);
+
+        assert_eq!(
+            newly_introduced_violations(&before, &after),
+            vec![("t".to_string(), "1.0.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn residual_gate_flags_a_new_dirty_package() {
+        let before = violations(&[("t", "0.5.0")]);
+        let after = violations(&[("other", "2.0.0"), ("t", "0.5.0")]);
+
+        assert_eq!(
+            newly_introduced_violations(&before, &after),
+            vec![("other".to_string(), "2.0.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
+        // The forward batch floats `quote` up (collateral); the reconcile pass matures it back down.
+        let mut items = vec![
+            applied_item("quote", "1.0.44", "1.0.46", false),
+            applied_item("quote", "1.0.46", "1.0.45", true),
+        ];
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        assert_eq!(items.len(), 1, "the two legs collapse to one net row");
+        assert_eq!(items[0].from, "1.0.44");
+        assert_eq!(items[0].to, "1.0.45");
+        assert!(
+            !items[0].downgrade,
+            "the net move (1.0.44 → 1.0.45) is forward"
+        );
+    }
+
+    #[test]
+    fn collapse_drops_a_package_that_floats_up_then_fully_back() {
+        let mut items = vec![
+            applied_item("quote", "1.0.44", "1.0.46", false),
+            applied_item("quote", "1.0.46", "1.0.44", true),
+        ];
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        assert!(
+            items.is_empty(),
+            "no net move: the package is dropped from the report"
+        );
+    }
+
+    #[test]
+    fn collapse_keeps_single_leg_rows_including_a_genuine_downgrade() {
+        // A direct forward bump and a pre-existing too-fresh transitive matured down in one leg each
+        // stay as they are — only multi-leg float-then-reconcile chains merge.
+        let mut a = applied_item("a", "1.0.0", "1.1.0", false);
+        a.direct = true;
+        let mut items = vec![a, applied_item("referencing", "0.46.6", "0.46.5", true)];
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        assert_eq!(items.len(), 2);
+        let refr = items
+            .iter()
+            .find(|item| item.name == "referencing")
+            .expect("referencing row");
+        assert_eq!((refr.from.as_str(), refr.to.as_str()), ("0.46.6", "0.46.5"));
+        assert!(refr.downgrade, "a single-leg downgrade is preserved");
+    }
+
+    #[test]
+    fn collapse_does_not_merge_across_projects() {
+        let mut first = applied_item("quote", "1.0.44", "1.0.46", false);
+        first.project = "a".to_string();
+        let mut second = applied_item("quote", "1.0.46", "1.0.45", true);
+        second.project = "b".to_string();
+        let mut items = vec![first, second];
+        collapse_applied_legs(&mut items, "a", "cargo", &no_prior());
+        // Only project `a` is in scope, and it has a single leg there, so nothing merges.
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
+        // A pre-existing too-fresh `quote 1.0.5` floats up to 1.0.7, then the reconcile pass matures
+        // its line down past the start to 1.0.4 — a genuine net downgrade, not a forward move.
+        let mut items = vec![
+            applied_item("quote", "1.0.5", "1.0.7", false),
+            applied_item("quote", "1.0.7", "1.0.4", true),
+        ];
+        let prior: HashSet<(String, String)> =
+            HashSet::from([("quote".to_string(), "1.0.5".to_string())]);
+        collapse_applied_legs(&mut items, ".", "cargo", &prior);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            (items[0].from.as_str(), items[0].to.as_str()),
+            ("1.0.5", "1.0.4")
+        );
+        assert!(
+            items[0].downgrade,
+            "a net move below a too-fresh start is a downgrade, not an upgrade"
+        );
+    }
+
+    #[test]
+    fn collapse_does_not_merge_two_coexisting_majors_of_one_crate() {
+        // cargo keeps two majors of `serde` in the lock; both bump in one run. They share the
+        // (name, registry) key but their versions do not chain, so neither row is merged or dropped.
+        let mut items = vec![
+            applied_item("serde", "0.9.1", "0.9.3", false),
+            applied_item("serde", "1.0.0", "1.0.5", false),
+        ];
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        assert_eq!(items.len(), 2, "independent version lines stay distinct");
+        let lines: HashSet<(String, String)> = items
+            .iter()
+            .map(|item| (item.from.clone(), item.to.clone()))
+            .collect();
+        assert!(lines.contains(&("0.9.1".to_string(), "0.9.3".to_string())));
+        assert!(lines.contains(&("1.0.0".to_string(), "1.0.5".to_string())));
     }
 
     #[test]

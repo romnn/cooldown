@@ -1875,8 +1875,10 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
     let ws = workspace(fake, Baseline::default());
     let out = ws.upgrade(&opts()).await;
 
-    // The change is skipped (not committed) because it would force in an irreducible too-fresh
-    // transitive (`t` has no graph floor below its fresh version, so it can't be rolled back).
+    // The optimistic upgrade keeps the lock and tries to mature the floated-up transitive down, but
+    // `t` has no older release to fall back to, so the reconcile pass cannot clear it. The final gate
+    // restores the pre-lock snapshot and reports the change held, naming `t` — never committing a
+    // graph `check` would reject.
     assert_eq!(out.summary.applied, 0);
     assert_eq!(out.summary.skipped, 1);
     let sk = out.items[0].skipped.as_ref().expect("a skip");
@@ -1944,6 +1946,66 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
 }
 
 #[tokio::test]
+async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
+    // The optimistic upgrade gate does not roll back solely because the first graph probe lacks a
+    // per-node floor prediction. It keeps the forward move, lets the adapter try the reconcile
+    // downgrade, and rolls back only if the final graph still has a newly introduced violation.
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_releases = too_fresh_fix_releases(); // v1.0.1 matured, v1.0.2 too fresh
+    releases.insert("t".to_string(), t_releases.clone());
+
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&t_releases, "v1.0.2"));
+
+    // No `graph_floor` is set on the floated-up transitive — the old pessimistic gate would have
+    // treated it as irreducible before giving the writer a chance to place a valid downgrade.
+    let floated = dep("t", "v1.0.2", false);
+    assert!(floated.graph_floor.is_none());
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 2);
+    let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
+    assert_eq!(upgraded.to, "v1.1.0");
+    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
+    assert_eq!(reconciled.to, "v1.0.1");
+}
+
+#[tokio::test]
 async fn upgrade_checks_full_graph_even_when_package_filtered() {
     let (_g, root) = tmp_root();
     let mut releases = HashMap::new();
@@ -1996,6 +2058,96 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
     let skipped = out.items[0].skipped.as_ref().expect("skip recorded");
     assert_eq!(skipped.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(skipped.offending.as_deref(), Some("t"));
+}
+
+#[tokio::test]
+async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_floats() {
+    // The repo is already dirty: `t@v0.5.0` is an unacknowledged too-fresh transitive before the run
+    // (a standing `check` violation). Upgrading unrelated `a` re-resolves `t` to another fresh version
+    // `v0.6.0` that the reconcile pass cannot mature down. Because `t` was ALREADY violating, floating
+    // it is not a newly-introduced offender — the optimistic gate must keep the valid `a` upgrade
+    // rather than roll it back (one dirty version line stayed one dirty version line).
+    let (_g, root) = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    // Both `t` versions are too fresh and there is no matured older release, so reconcile cannot fix it.
+    releases.insert(
+        "t".to_string(),
+        vec![
+            rel("v0.5.0", 0, Some("2026-06-16T00:00:00Z"), None),
+            rel("v0.6.0", 1, Some("2026-06-18T00:00:00Z"), None),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v0.5.0", 0, Some("2026-06-16T00:00:00Z"), None),
+    );
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: Some(dep("t", "v0.5.0", false)),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        // The re-resolve floats the already-violating `t` from v0.5.0 to v0.6.0 (still too fresh).
+        collateral_on_apply: vec![Change {
+            package: PackageId::new(GO, "t", None),
+            from: Version::new("v0.5.0"),
+            to: Version::new("v0.6.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: false,
+            members: Vec::new(),
+        }],
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        // `t@v0.5.0` is a violation already present in the baseline graph, before any apply.
+        state: Mutex::new(State {
+            fresh_transitive_present: true,
+            ..State::default()
+        }),
+        root,
+    };
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    // The unrelated `a` upgrade is kept (not rolled back); only `t` is reported as a leftover violation.
+    let a = out
+        .items
+        .iter()
+        .find(|item| item.name == "a")
+        .expect("a row");
+    assert!(
+        a.applied,
+        "the valid `a` upgrade survives a pre-existing violation"
+    );
+    assert_eq!(a.to, "v1.1.0");
+    assert!(
+        out.items
+            .iter()
+            .all(|item| item.skipped.as_ref().map(|s| s.reason)
+                != Some(SkipReason::TransitiveInCooldown)),
+        "nothing is rolled back as TransitiveInCooldown for a pre-existing violation"
+    );
 }
 
 #[tokio::test]
