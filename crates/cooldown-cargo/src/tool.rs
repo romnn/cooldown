@@ -129,11 +129,13 @@ impl ToolRead for CargoTool {
             if scope == DepScope::Direct && !direct {
                 continue;
             }
-            let graph_floor = if graph.is_graph_held(id) {
-                Some(Version::new(info.version.clone()))
-            } else {
-                None
-            };
+            // The demanded minimum across this node's active non-root requirers, read from the
+            // resolved graph. A re-resolve picks the newest version each requirer's range admits, so a
+            // transitive node can float far above this floor; recording it lets `fix`/reconcile mature
+            // a too-fresh node back down to the newest release still at or above the floor.
+            let graph_floor = graph
+                .graph_floor(&info.name, &info.version)
+                .map(|floor| Version::new(floor.to_string()));
             // A workspace member's own exact pin is `pinned` (held, with a repin target shown); the
             // ceiling is reserved for *transitive* caps a requirer imposes that the project cannot
             // repin away, so it is only set when the node is not already pinned.

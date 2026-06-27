@@ -30,6 +30,15 @@ pub struct ResolvedGraph {
     /// single-major pin. A node may have several requirers all pinning the same version; the consumer
     /// names one. Keyed by the same `(name, version)` as [`graph_ceilings`](Self::graph_ceilings).
     pub ceiling_requirers: HashMap<(String, String), Vec<String>>,
+    /// The graph floor per resolved `(crate, version)` node: the highest lower bound any active
+    /// non-root requirer's version requirement imposes on it. Cargo picks the *newest* version
+    /// satisfying every requirer's range, so a resolved node can sit far above the floor the ranges
+    /// actually demand — e.g. a `quote` every crate requires as `^1.0` resolves to the latest `1.0.x`
+    /// even though `1.0.0` satisfies them all. The floor records that demanded minimum so a too-fresh
+    /// node a re-resolve floats up can be matured *down* to the newest version still at or above it.
+    /// Workspace-member requirements are project-owned constraints that cooldown can rewrite for
+    /// direct deps, so they are tracked as `pinned`/members instead of immutable graph floors.
+    pub graph_floors: HashMap<(String, String), String>,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -98,13 +107,14 @@ impl ResolvedGraph {
         requirers.into_iter().next().map(str::to_string)
     }
 
-    /// Is `id` required by a non-root node (held by the graph)?
+    /// The graph floor for the `crate_name`@`version` node — the highest lower bound its active
+    /// non-root requirers' ranges demand — or `None` when no such requirer imposes a parseable one.
+    /// Keyed per node because Cargo coexists multiple versions of a crate.
     #[must_use]
-    pub fn is_graph_held(&self, id: &str) -> bool {
-        self.edges
-            .iter()
-            .filter(|(node, _)| !self.roots.contains(*node))
-            .any(|(_, deps)| deps.iter().any(|d| d == id))
+    pub fn graph_floor(&self, crate_name: &str, version: &str) -> Option<&str> {
+        self.graph_floors
+            .get(&(crate_name.to_string(), version.to_string()))
+            .map(String::as_str)
     }
 
     /// Resolve a graph node id to its workspace-member `(name, path)`, or `None` for a node that is
@@ -167,6 +177,43 @@ fn exact_req_version(req: &str) -> Option<String> {
         .map(str::trim)
         .filter(|version| semver::Version::parse(version).is_ok())
         .map(str::to_string)
+}
+
+/// The lowest concrete version a Cargo requirement admits — the floor its lower-bound comparators
+/// demand — as a `major.minor.patch` string, or `None` when the requirement names no floor we can
+/// safely assert. `^1.0`/`~1.2`/`>=1.2.3`/`=1.2.3`/`1.*` all floor at the stated version with missing
+/// components zeroed (`^1.0` → `1.0.0`); within a multi-comparator range the tightest (highest) lower
+/// bound wins. These contribute nothing: an upper bound (`<`/`<=`); a strict `>` (whose real floor is
+/// the *next* release, which the requirement alone does not name); and a prerelease-qualified bound
+/// (its true floor sits below its stable base, and a too-high floor could exceed the version a node
+/// actually resolved to). Omitting an unnamable bound only makes a node look *more* reducible, which
+/// the apply-time resolve re-checks, so erring low is the safe direction.
+fn req_floor(req: &str) -> Option<String> {
+    let parsed = semver::VersionReq::parse(req).ok()?;
+    let mut best: Option<(u64, u64, u64)> = None;
+    for comparator in &parsed.comparators {
+        // `>` excludes the stated version (its real floor is the next release, unnamable from the
+        // requirement alone) and a prerelease bound floors below its stable base — neither yields a
+        // floor we can assert without risking floor > resolved version, so skip them.
+        let imposes_lower_bound = matches!(
+            comparator.op,
+            semver::Op::Exact
+                | semver::Op::GreaterEq
+                | semver::Op::Tilde
+                | semver::Op::Caret
+                | semver::Op::Wildcard
+        );
+        if !imposes_lower_bound || !comparator.pre.is_empty() {
+            continue;
+        }
+        let candidate = (
+            comparator.major,
+            comparator.minor.unwrap_or(0),
+            comparator.patch.unwrap_or(0),
+        );
+        best = Some(best.map_or(candidate, |current| current.max(candidate)));
+    }
+    best.map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
 }
 
 /// The crate's directory relative to the workspace root (`.` for a crate at the root). Cargo reports
@@ -331,20 +378,32 @@ impl Cargo {
         // non-matching `target` cfg is not a real edge and must not cap, so this is a candidate list,
         // not the final ceiling set.
         let mut exact_edges: Vec<(String, String, String)> = Vec::new();
+        // `(requirer id, dep name, floor)` for every non-root, non-dev requirement with a parseable
+        // lower bound. Like `exact_edges`, a candidate list resolved against the activated graph
+        // below: a requirement behind a disabled feature or non-matching `target` is not a real edge
+        // and demands no floor. Root requirements are intentionally excluded: they are direct project
+        // constraints cooldown may rewrite, not structural third-party graph floors.
+        let mut floor_edges: Vec<(String, String, String)> = Vec::new();
         for p in raw.packages {
             for dep in &p.dependencies {
-                let Some(version) = exact_req_version(&dep.req) else {
-                    continue;
-                };
-                // A workspace member's own exact pin is the project's choice: it surfaces as
-                // `pinned` (held, but with an adoptable target showing what it could be repinned to).
-                if roots.contains(&p.id) {
-                    exact_pins.insert((dep.name.clone(), version.clone()));
-                }
                 // A dev dependency of a transitive crate is not in the resolved build graph and caps
                 // nothing; normal and build dependencies do, once confirmed active below.
-                if dep.kind.as_deref() != Some("dev") {
-                    exact_edges.push((p.id.clone(), dep.name.clone(), version));
+                let is_dev = dep.kind.as_deref() == Some("dev");
+                if let Some(version) = exact_req_version(&dep.req) {
+                    // A workspace member's own exact pin is the project's choice: it surfaces as
+                    // `pinned` (held, but with an adoptable target showing what it could be repinned to).
+                    if roots.contains(&p.id) {
+                        exact_pins.insert((dep.name.clone(), version.clone()));
+                    }
+                    if !is_dev {
+                        exact_edges.push((p.id.clone(), dep.name.clone(), version));
+                    }
+                }
+                if !is_dev
+                    && !roots.contains(&p.id)
+                    && let Some(floor) = req_floor(&dep.req)
+                {
+                    floor_edges.push((p.id.clone(), dep.name.clone(), floor));
                 }
             }
             packages.insert(
@@ -388,6 +447,34 @@ impl Cargo {
                 }
             }
         }
+        // A non-root requirement floors a node only at the version its edge actually resolved to: walk
+        // each active requirer edge to the depended node of that name and record the highest lower
+        // bound demanded of it. An inactive (optional/target-gated) edge is absent from
+        // `resolve.nodes`, so it contributes no floor — mirroring the ceiling's active-edge
+        // intersection above.
+        let mut graph_floors: HashMap<(String, String), String> = HashMap::new();
+        for (requirer, name, floor) in floor_edges {
+            let Some(dep_ids) = edges.get(&requirer) else {
+                continue;
+            };
+            for id in dep_ids {
+                let Some(info) = packages.get(id) else {
+                    continue;
+                };
+                if info.name != name {
+                    continue;
+                }
+                let key = (info.name.clone(), info.version.clone());
+                graph_floors
+                    .entry(key)
+                    .and_modify(|current| {
+                        if crate::version::compare(&floor, current).is_gt() {
+                            current.clone_from(&floor);
+                        }
+                    })
+                    .or_insert_with(|| floor.clone());
+            }
+        }
         ResolvedGraph {
             packages,
             roots,
@@ -395,6 +482,7 @@ impl Cargo {
             exact_pins,
             graph_ceilings,
             ceiling_requirers,
+            graph_floors,
         }
     }
 
@@ -513,6 +601,141 @@ mod tests {
     }
 
     #[test]
+    fn req_floor_extracts_the_lower_bound_per_operator() {
+        // Caret/tilde/exact/`>=`/wildcard all floor at the stated version, missing components zeroed.
+        assert_eq!(req_floor("^1.0").as_deref(), Some("1.0.0"));
+        assert_eq!(req_floor("^1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(req_floor("1").as_deref(), Some("1.0.0")); // bare == caret
+        assert_eq!(req_floor("~1.2").as_deref(), Some("1.2.0"));
+        assert_eq!(req_floor(">=1.5.0").as_deref(), Some("1.5.0"));
+        assert_eq!(req_floor("=1.0.197").as_deref(), Some("1.0.197"));
+        assert_eq!(req_floor("1.*").as_deref(), Some("1.0.0"));
+        // A multi-comparator range takes the tightest (highest) lower bound; an upper bound alone
+        // imposes none.
+        assert_eq!(req_floor(">=1.2.0, <2.0.0").as_deref(), Some("1.2.0"));
+        assert_eq!(req_floor("<2.0.0"), None);
+        assert_eq!(req_floor("not a req"), None);
+        // A strict `>` excludes the stated version (its real floor is the next, unnamable release), and
+        // a prerelease bound floors below its stable base — both name no safe floor.
+        assert_eq!(req_floor(">1.2.3"), None);
+        assert_eq!(req_floor(">=1.2.3-rc1"), None);
+        assert_eq!(req_floor("^1.2.3-beta.1"), None);
+        // A `>` paired with an inclusive lower bound still honors the inclusive one.
+        assert_eq!(req_floor(">1.0.0, >=1.5.0").as_deref(), Some("1.5.0"));
+    }
+
+    #[test]
+    fn graph_floor_records_the_demanded_minimum_below_the_resolved_version() {
+        // `quote` resolves to the latest 1.0.46, but every requirer only asks `^1.0` — so the floor is
+        // 1.0.0 and the node is freely reducible down to any matured 1.0.x.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "syn", "req": "^2.0"}]},
+                {"id": "syn", "name": "syn", "version": "2.0.50",
+                 "dependencies": [{"name": "quote", "req": "^1.0"}]},
+                {"id": "quote", "name": "quote", "version": "1.0.46", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "syn"}]},
+                {"id": "syn", "deps": [{"pkg": "quote"}]},
+                {"id": "quote", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("quote", "1.0.46"), Some("1.0.0"));
+        // The workspace root's own `syn` requirement is project-owned and editable, not a structural
+        // graph floor.
+        assert_eq!(graph.graph_floor("syn", "2.0.50"), None);
+        // A node no edge floors has none.
+        assert_eq!(graph.graph_floor("quote", "9.9.9"), None);
+    }
+
+    #[test]
+    fn graph_floor_ignores_workspace_member_requirements() {
+        // Root lower bounds and exact pins are project-owned constraints: direct deps can be
+        // rewritten by cooldown, so they must not become immutable graph floors that make
+        // `fix --downgrade-pinned` impossible.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [
+                    {"name": "serde", "req": "=1.0.228"},
+                    {"name": "syn", "req": "^2.0"}
+                 ]},
+                {"id": "serde", "name": "serde", "version": "1.0.228", "dependencies": []},
+                {"id": "syn", "name": "syn", "version": "2.0.50", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "serde"}, {"pkg": "syn"}]},
+                {"id": "serde", "deps": []},
+                {"id": "syn", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("serde", "1.0.228"), None);
+        assert_eq!(graph.graph_floor("syn", "2.0.50"), None);
+        assert!(graph.is_exact_pinned("serde", "1.0.228"));
+    }
+
+    #[test]
+    fn graph_floor_takes_the_tightest_requirer() {
+        // Two requirers floor `quote`: `^1.0` and `^1.0.40`. The graph must hold the highest (1.0.40).
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "syn", "req": "^2.0"}, {"name": "newer", "req": "^1.0"}]},
+                {"id": "syn", "name": "syn", "version": "2.0.50",
+                 "dependencies": [{"name": "quote", "req": "^1.0"}]},
+                {"id": "newer", "name": "newer", "version": "1.0.0",
+                 "dependencies": [{"name": "quote", "req": "^1.0.40"}]},
+                {"id": "quote", "name": "quote", "version": "1.0.46", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "syn"}, {"pkg": "newer"}]},
+                {"id": "syn", "deps": [{"pkg": "quote"}]},
+                {"id": "newer", "deps": [{"pkg": "quote"}]},
+                {"id": "quote", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("quote", "1.0.46"), Some("1.0.40"));
+    }
+
+    #[test]
+    fn graph_floor_ignores_inactive_requirer_edges() {
+        // `ghost` declares `quote ^1.5` but resolves no edge to it (an inactive optional/target dep),
+        // so it must not raise the floor; only the active `^1.0` from `syn` counts.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "syn", "req": "^2.0"}, {"name": "ghost", "req": "^1.0"}]},
+                {"id": "syn", "name": "syn", "version": "2.0.50",
+                 "dependencies": [{"name": "quote", "req": "^1.0"}]},
+                {"id": "ghost", "name": "ghost", "version": "0.1.0",
+                 "dependencies": [{"name": "quote", "req": "^1.5"}]},
+                {"id": "quote", "name": "quote", "version": "1.0.46", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "syn"}, {"pkg": "ghost"}]},
+                {"id": "syn", "deps": [{"pkg": "quote"}]},
+                {"id": "ghost", "deps": []},
+                {"id": "quote", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("quote", "1.0.46"), Some("1.0.0"));
+    }
+
+    #[test]
     fn exact_pin_is_version_specific() {
         let graph = ResolvedGraph {
             packages: HashMap::new(),
@@ -521,6 +744,7 @@ mod tests {
             exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            graph_floors: HashMap::new(),
         };
 
         assert!(graph.is_exact_pinned("serde", "1.0.197"));
@@ -538,6 +762,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
             ceiling_requirers: HashMap::new(),
+            graph_floors: HashMap::new(),
         };
 
         assert!(graph.is_graph_capped("serde_derive", "1.0.228"));
@@ -619,6 +844,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            graph_floors: HashMap::new(),
         };
 
         assert_eq!(
@@ -658,6 +884,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            graph_floors: HashMap::new(),
         };
 
         let names = |members: Vec<MemberRef>| {
