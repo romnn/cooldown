@@ -10,7 +10,7 @@
 use crate::error::Result;
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, FetchContext, LockVerifyReport,
-    Plan, Project, ProjectMarker, Release, ToolId, VerifyReport, Version,
+    Plan, Project, ProjectMarker, Release, ToolId, UpdateKind, VerifyReport, Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -86,6 +86,16 @@ pub trait ToolRead: Send + Sync {
     /// adapter neither walks the tree nor decides `.gitignore`/exclude policy itself — that concern
     /// lives in one agnostic place and is enforced by this interface.
     fn project_marker(&self) -> ProjectMarker;
+
+    /// Classifies a version-to-version movement using the adapter's native version semantics.
+    ///
+    /// The core normally carries [`UpdateKind`] from registry release metadata. This hook is only for
+    /// net rows synthesized after several lock movements collapse into one report row; adapters that
+    /// cannot classify arbitrary version strings cheaply can return `None` and the caller will keep
+    /// the original leg's kind.
+    fn classify_update_kind(&self, _from: &str, _to: &str) -> Option<UpdateKind> {
+        None
+    }
 
     /// Returns the **raw, unscoped** resolved dependencies for `project`.
     ///

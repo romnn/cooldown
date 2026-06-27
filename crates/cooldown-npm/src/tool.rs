@@ -19,7 +19,8 @@ use cooldown_core::{
     FetchContext, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
     Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
     ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version, WindowSpec,
+    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    WindowSpec,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -178,6 +179,10 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             alternate_manifests: &[],
             workspace_root: true,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

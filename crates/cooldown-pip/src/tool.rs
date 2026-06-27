@@ -13,7 +13,8 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -165,6 +166,10 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
             alternate_manifests: &[],
             workspace_root: false,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

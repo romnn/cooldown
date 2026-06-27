@@ -17,7 +17,7 @@ use cooldown_core::{
     LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
     ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
     ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -172,6 +172,10 @@ impl ToolRead for UvTool {
             alternate_manifests: &[],
             workspace_root: false,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

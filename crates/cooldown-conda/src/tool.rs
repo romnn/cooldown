@@ -15,7 +15,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -193,6 +193,10 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             alternate_manifests: &[],
             workspace_root: false,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

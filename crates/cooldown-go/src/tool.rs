@@ -15,7 +15,8 @@ use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal,
-    Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport,
+    Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -106,6 +107,10 @@ impl ToolRead for GoTool {
             alternate_manifests: &[],
             workspace_root: false,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        releases::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

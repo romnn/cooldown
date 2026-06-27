@@ -384,6 +384,10 @@ impl ToolRead for DenoTool {
         }
     }
 
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
+    }
+
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         DenoTool::read_deps(project, scope)
     }

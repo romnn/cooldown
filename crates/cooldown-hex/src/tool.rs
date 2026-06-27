@@ -14,7 +14,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -87,6 +87,10 @@ impl ToolRead for HexTool {
             alternate_manifests: &[],
             workspace_root: false,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

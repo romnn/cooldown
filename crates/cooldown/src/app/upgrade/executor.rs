@@ -265,7 +265,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn collapse_collateral(&mut self, prior_violations: &HashSet<(String, String)>) {
         let project = self.project_label.clone();
         let tool = self.ctx.tool_name();
-        collapse_applied_legs(&mut self.acc.items, &project, tool, prior_violations);
+        let classifier = self.ctx.reader;
+        collapse_applied_legs(
+            &mut self.acc.items,
+            &project,
+            tool,
+            prior_violations,
+            |from, to| classifier.classify_update_kind(from, to),
+        );
     }
 
     /// Capture the accumulator and trial-state restore point before the optimistic lock batch.
@@ -1372,14 +1379,17 @@ fn violation_counts_by_name(violations: &HashSet<(String, String)>) -> HashMap<&
 /// first leg already moved backward (a forced collateral downgrade) or if its start version was an
 /// unacknowledged too-fresh violation before this batch (`prior_violations`) — in which case the
 /// reconcile, which only matures *down*, settled the line below the start. Otherwise the start was
-/// matured and the reconcile lands at or above it, so the net is a forward move. Scoped to one
-/// `(project, tool)`; only applied (non-skipped, non-errored) rows merge. Runs before the report is
-/// sorted, so the rows are still in chronological leg order.
+/// matured and the reconcile lands at or above it, so the net is a forward move. The net row's kind is
+/// reclassified through the adapter when it can classify the collapsed `from -> to` pair; otherwise
+/// the first leg's kind is kept. Scoped to one `(project, tool)`; only applied (non-skipped,
+/// non-errored) rows merge. Runs before the report is sorted, so the rows are still in chronological
+/// leg order.
 fn collapse_applied_legs(
     items: &mut Vec<UpgradeItem>,
     project: &str,
     tool: &str,
     prior_violations: &HashSet<(String, String)>,
+    classify_update_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
 ) {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for (idx, item) in items.iter().enumerate() {
@@ -1392,8 +1402,8 @@ fn collapse_applied_legs(
         }
     }
     let mut remove: HashSet<usize> = HashSet::new();
-    // (first_leg_idx, net_to, net_is_downgrade) for each chain that folds into a net row.
-    let mut retarget: Vec<(usize, String, bool)> = Vec::new();
+    // (first_leg_idx, net_to, net_is_downgrade, net_kind) for each chain that folds into a net row.
+    let mut retarget: Vec<(usize, String, bool, UpdateKind)> = Vec::new();
     for indices in groups.values() {
         // Link legs into contiguous chains: a leg joins the chain whose tail `to` equals its `from`.
         let mut chains: Vec<Vec<usize>> = Vec::new();
@@ -1432,14 +1442,16 @@ fn collapse_applied_legs(
             }
             let downgrade = head.downgrade
                 || prior_violations.contains(&(head.name.clone(), head.from.clone()));
-            retarget.push((first, net_to, downgrade));
+            let kind = classify_update_kind(&head.from, &net_to).unwrap_or(head.kind);
+            retarget.push((first, net_to, downgrade, kind));
             remove.extend(chain.iter().skip(1).copied());
         }
     }
-    for (first, net_to, downgrade) in retarget {
+    for (first, net_to, downgrade, kind) in retarget {
         if let Some(head) = items.get_mut(first) {
             head.to = net_to;
             head.downgrade = downgrade;
+            head.kind = kind;
         }
     }
     if remove.is_empty() {
@@ -1735,6 +1747,10 @@ mod tests {
             .collect()
     }
 
+    fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
+        None
+    }
+
     #[test]
     fn residual_gate_allows_a_pre_existing_violation_to_float_versions() {
         let before = violations(&[("t", "0.5.0")]);
@@ -1775,7 +1791,7 @@ mod tests {
             applied_item("quote", "1.0.44", "1.0.46", false),
             applied_item("quote", "1.0.46", "1.0.45", true),
         ];
-        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
         assert_eq!(items.len(), 1, "the two legs collapse to one net row");
         assert_eq!(items[0].from, "1.0.44");
         assert_eq!(items[0].to, "1.0.45");
@@ -1786,12 +1802,36 @@ mod tests {
     }
 
     #[test]
+    fn collapse_reclassifies_kind_against_the_net_target_when_available() {
+        // The first leg is a minor float-up, but the committed net row is only a patch move. The
+        // report kind should describe the collapsed row, not the phantom intermediate.
+        let mut items = vec![
+            applied_item("quote", "1.0.0", "1.1.0", false),
+            applied_item("quote", "1.1.0", "1.0.1", true),
+        ];
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), |from, to| {
+            if from == "1.0.0" && to == "1.0.1" {
+                Some(UpdateKind::Patch)
+            } else {
+                None
+            }
+        });
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            (items[0].from.as_str(), items[0].to.as_str()),
+            ("1.0.0", "1.0.1")
+        );
+        assert_eq!(items[0].kind, UpdateKind::Patch);
+        assert!(!items[0].downgrade);
+    }
+
+    #[test]
     fn collapse_drops_a_package_that_floats_up_then_fully_back() {
         let mut items = vec![
             applied_item("quote", "1.0.44", "1.0.46", false),
             applied_item("quote", "1.0.46", "1.0.44", true),
         ];
-        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
         assert!(
             items.is_empty(),
             "no net move: the package is dropped from the report"
@@ -1805,7 +1845,7 @@ mod tests {
         let mut a = applied_item("a", "1.0.0", "1.1.0", false);
         a.direct = true;
         let mut items = vec![a, applied_item("referencing", "0.46.6", "0.46.5", true)];
-        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
         assert_eq!(items.len(), 2);
         let refr = items
             .iter()
@@ -1822,7 +1862,7 @@ mod tests {
         let mut second = applied_item("quote", "1.0.46", "1.0.45", true);
         second.project = "b".to_string();
         let mut items = vec![first, second];
-        collapse_applied_legs(&mut items, "a", "cargo", &no_prior());
+        collapse_applied_legs(&mut items, "a", "cargo", &no_prior(), no_kind);
         // Only project `a` is in scope, and it has a single leg there, so nothing merges.
         assert_eq!(items.len(), 2);
     }
@@ -1837,7 +1877,7 @@ mod tests {
         ];
         let prior: HashSet<(String, String)> =
             HashSet::from([("quote".to_string(), "1.0.5".to_string())]);
-        collapse_applied_legs(&mut items, ".", "cargo", &prior);
+        collapse_applied_legs(&mut items, ".", "cargo", &prior, no_kind);
         assert_eq!(items.len(), 1);
         assert_eq!(
             (items[0].from.as_str(), items[0].to.as_str()),
@@ -1857,7 +1897,7 @@ mod tests {
             applied_item("serde", "0.9.1", "0.9.3", false),
             applied_item("serde", "1.0.0", "1.0.5", false),
         ];
-        collapse_applied_legs(&mut items, ".", "cargo", &no_prior());
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
         assert_eq!(items.len(), 2, "independent version lines stay distinct");
         let lines: HashSet<(String, String)> = items
             .iter()

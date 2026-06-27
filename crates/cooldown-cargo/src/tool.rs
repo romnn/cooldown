@@ -24,7 +24,8 @@ use cooldown_core::{
     ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext, LockVerifyReport,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, VerifyReport, Version,
+    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,6 +117,10 @@ impl ToolRead for CargoTool {
             alternate_manifests: &[],
             workspace_root: true,
         }
+    }
+
+    fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
+        version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
