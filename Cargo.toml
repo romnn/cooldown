@@ -44,21 +44,21 @@ struct_excessive_bools = "allow"
 
 [workspace.dependencies]
 # Internal crates
-cooldown-core = { path = "crates/cooldown-core", version = "0.1.0" }
-cooldown-toml-util = { path = "crates/cooldown-toml-util", version = "0.1.0" }
-cooldown-registry = { path = "crates/cooldown-registry", version = "0.1.0" }
-cooldown-render = { path = "crates/cooldown-render", version = "0.1.0" }
-cooldown-adapter-util = { path = "crates/cooldown-adapter-util", version = "0.1.0" }
-cooldown-go = { path = "crates/cooldown-go", version = "0.1.0" }
-cooldown-cargo = { path = "crates/cooldown-cargo", version = "0.1.0" }
-cooldown-uv = { path = "crates/cooldown-uv", version = "0.1.0" }
-cooldown-npm = { path = "crates/cooldown-npm", version = "0.1.0" }
-cooldown-rubygems = { path = "crates/cooldown-rubygems", version = "0.1.0" }
-cooldown-hex = { path = "crates/cooldown-hex", version = "0.1.0" }
-cooldown-maven = { path = "crates/cooldown-maven", version = "0.1.0" }
-cooldown-pip = { path = "crates/cooldown-pip", version = "0.1.0" }
-cooldown-conda = { path = "crates/cooldown-conda", version = "0.1.0" }
-cooldown-swift = { path = "crates/cooldown-swift", version = "0.1.0" }
+cooldown-core = { path = "crates/cooldown-core" }
+cooldown-toml-util = { path = "crates/cooldown-toml-util" }
+cooldown-registry = { path = "crates/cooldown-registry" }
+cooldown-render = { path = "crates/cooldown-render" }
+cooldown-adapter-util = { path = "crates/cooldown-adapter-util" }
+cooldown-go = { path = "crates/cooldown-go" }
+cooldown-cargo = { path = "crates/cooldown-cargo" }
+cooldown-uv = { path = "crates/cooldown-uv" }
+cooldown-npm = { path = "crates/cooldown-npm" }
+cooldown-rubygems = { path = "crates/cooldown-rubygems" }
+cooldown-hex = { path = "crates/cooldown-hex" }
+cooldown-maven = { path = "crates/cooldown-maven" }
+cooldown-pip = { path = "crates/cooldown-pip" }
+cooldown-conda = { path = "crates/cooldown-conda" }
+cooldown-swift = { path = "crates/cooldown-swift" }
 
 # External
 jiff = { version = "0.2", features = ["serde"] }
