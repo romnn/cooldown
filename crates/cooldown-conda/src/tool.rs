@@ -220,7 +220,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             // version: the ceiling is honored only when some pin equals it, so a fuzzy prefix spec
             // holds only when resolution landed exactly on it. The match is by string equality, not
             // `version::compare`: conda versions are routinely not PEP 440 (calver `2022g`, R-style
-            // `r4.1.2`), and `compare` treats two unparseable strings as equal — that would falsely
+            // `r4.1.2`), and `compare` treats two unparsable strings as equal — that would falsely
             // cap a dep whose pin and resolved version merely both fail to parse. The ceilings come
             // from conda match-specs, so they apply only to conda packages: a same-named PyPI package
             // (both ecosystems coexist in one lock) must not be held by a conda constraint.

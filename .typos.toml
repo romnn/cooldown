@@ -16,3 +16,6 @@ extend-ignore-re = [
   # ignores any text within "spellcheck:ignore-start" and "spellcheck:ignore-end"
   "(?s)(#|//|--|<!--)\\s*spellcheck:ignore-start.*?\\n.*?(#|//|--|<!--)\\s*spellcheck:ignore-end",
 ]
+
+[default.extend-words]
+certifi = "certifi"
