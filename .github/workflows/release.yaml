@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish crates
         uses: romnn/publish-crates@main
@@ -31,7 +31,7 @@ jobs:
     outputs:
       precompiled-binaries: ${{ steps.upload.outputs.artifact-path }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -46,7 +46,7 @@ jobs:
           TAP_GITHUB_TOKEN: "${{ secrets.TAP_GITHUB_TOKEN }}"
       - name: Upload precompiled binaries
         id: upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: goreleaser-dist
           path: goreleaser-dist

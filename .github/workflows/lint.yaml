@@ -9,13 +9,9 @@ on:
 
 jobs:
   lint:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-24.04]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -26,6 +22,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: x86_64-pc-windows-msvc
       - run: |
           brew install ast-grep
           brew install cargo-audit
@@ -38,11 +35,16 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
       - name: Lint
         run: task lint --output group --output-group-error-only
+      # The only platform-divergent code is a cfg(unix) block in cooldown-core;
+      # cross-check the Windows cfg view from Linux (clippy is check-only, so no
+      # Windows runner or MSVC linker is needed).
+      - name: Lint (windows target cross-check)
+        run: cargo lint --workspace --all-features --target x86_64-pc-windows-msvc
 
   goreleaser:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -54,7 +56,7 @@ jobs:
   spellcheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
