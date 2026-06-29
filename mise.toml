@@ -10,8 +10,9 @@
 # under cooldown's own `cargo build`. The second, `nightly`, exists only so `task unused`
 # (`cargo udeps`) has a nightly compiler to run under — udeps needs `-Z binary-dep-depinfo`,
 # which stable rejects. The task selects it with `MISE_RUST_VERSION=nightly`; everything else
-# keeps using the primary `1.96.0`. Every other version below is an exact `mise ls-remote
-# <tool>` hit (verified), not an invented tag.
+# keeps using the primary `1.96.0`. The integration-test versions below are each an exact
+# `mise ls-remote <tool>` hit (verified), not an invented tag; the cross-compile lint tooling
+# (`zig`, `cargo-zigbuild`) instead tracks `latest`, pinned exactly by the committed `mise.lock`.
 #
 # conda is intentionally omitted: it has no clean mise-managed backend here (`mise ls-remote
 # conda` returns nothing), so pinning it would be a ghost. A real-tool conda integration test
@@ -31,3 +32,10 @@ java = "26.0.1"
 maven = "3.9.16"
 deno = "2.8.3"
 swift = "6.3.2"
+
+# Cross-compile tooling for `task lint:targets` (clippy every release target) and the
+# goreleaser build. cargo-zigbuild uses the `github:` backend so mise fetches the prebuilt
+# release binary instead of compiling it from source (the `cargo:` backend would). Both
+# track `latest` and are pinned exactly by the committed mise.lock.
+zig = "latest"
+"github:rust-cross/cargo-zigbuild" = "latest"
