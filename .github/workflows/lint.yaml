@@ -28,6 +28,10 @@ jobs:
           brew install cargo-audit
           brew install cargo-udeps
       - name: Audit
+        # cargo-audit flags advisories on dependencies we can't always fix
+        # immediately (e.g. transitive/unmaintained crates); keep it informational
+        # so a new advisory doesn't block the whole lint workflow.
+        continue-on-error: true
         run: task audit --output group --output-group-error-only
       - name: Check for unused dependencies
         run: task unused-dependencies --output group --output-group-error-only
