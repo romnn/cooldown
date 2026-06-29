@@ -24,6 +24,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Test
         run: task test --output group --output-group-error-only
 
@@ -33,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Publish crates (dry-run)
         uses: romnn/publish-crates@main
         with:

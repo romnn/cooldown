@@ -29,6 +29,12 @@ jobs:
           brew install cargo-audit
           brew install cargo-udeps
           brew install zig cargo-zigbuild
+      # Cache the cross-target dependency artifacts — the per-target aws-lc-sys C
+      # build is the expensive part. cache-on-failure keeps it even when clippy
+      # fails, so a lint finding doesn't throw away the cross-compiled deps.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Audit
         # cargo-audit flags advisories on dependencies we can't always fix
         # immediately (e.g. transitive/unmaintained crates); keep it informational
