@@ -77,7 +77,7 @@ tasks:
     desc: "check cargo workspace for all combinations of features"
     dir: "{{.ROOT_DIR}}"
     cmds:
-      - cargo fc check --workspace --all-targets {{.CLI_ARGS}}
+      - cargo-zigbuild fc check --workspace --all-targets {{.CLI_ARGS}}
 
   clean:
     desc: "clean cargo workspace"
@@ -173,7 +173,7 @@ tasks:
   lint:fc:
     desc: "lint cargo workspace for all combinations of features"
     cmds:
-      - cargo fc lint {{.CLI_ARGS}}
+      - cargo-zigbuild fc lint {{.CLI_ARGS}}
       - task: lint:ast-grep
 
   lint:targets:

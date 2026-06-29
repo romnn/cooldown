@@ -14,6 +14,14 @@ authors = ["romnn <roman@airtype.de>"]
 keywords = ["supply-chain", "security", "dependencies", "cooldown", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
+[workspace.metadata.cargo-fc]
+install_missing_targets = true
+targets = [
+	"x86_64-unknown-linux-gnu",
+	"x86_64-pc-windows-msvc",
+	"aarch64-apple-darwin"
+]
+
 [profile.release]
 opt-level = 3
 lto = true
