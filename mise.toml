@@ -33,9 +33,24 @@ maven = "3.9.16"
 deno = "2.8.3"
 swift = "6.3.2"
 
-# Cross-compile tooling for `task lint:targets` (clippy every release target) and the
-# goreleaser build. cargo-zigbuild uses the `github:` backend so mise fetches the prebuilt
-# release binary instead of compiling it from source (the `cargo:` backend would). Both
-# track `latest` and are pinned exactly by the committed mise.lock.
+# Developer tools
 zig = "latest"
+task = "latest"
+ast-grep = "latest"
+typos = "latest"
+actionlint = "latest"
+# charmbracelet/freeze renders the README screenshots (`task screenshots`); no
+# mise short name, so use the prebuilt aqua backend.
+"aqua:charmbracelet/freeze" = "latest"
+
+# Cargo plugins
 "github:rust-cross/cargo-zigbuild" = "latest"
+"github:romnn/cargo-watchdoc" = "latest"
+"aqua:rustsec/rustsec/cargo-audit" = "latest"
+"github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc" }
+"cargo:cargo-udeps" = "latest"
+"cargo:cargo-outdated" = "latest"
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+
+[settings]
+lockfile = true
