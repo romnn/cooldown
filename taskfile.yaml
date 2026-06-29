@@ -176,6 +176,24 @@ tasks:
       - cargo fc lint {{.CLI_ARGS}}
       - task: lint:ast-grep
 
+  lint:targets:
+    desc: "clippy the full workspace for every release target (needs zig + cargo-zigbuild on PATH)"
+    # Targets mirror .goreleaser.yaml. cargo-zigbuild drives clippy with zig as the
+    # cross C compiler, so native build-script deps (reqwest's aws-lc-sys) actually
+    # cross-compile per target instead of failing the way a plain `clippy --target`
+    # does on the Linux runner. cfg(windows)/cfg(unix) coverage comes for free; the
+    # gnu ABI matches what we ship (we never build windows-msvc).
+    cmds:
+      - >-
+        cargo-zigbuild clippy --workspace --all-features --all-targets --no-deps
+        --target x86_64-pc-windows-gnu
+        --target aarch64-pc-windows-gnullvm
+        --target x86_64-unknown-linux-musl
+        --target aarch64-unknown-linux-musl
+        --target x86_64-apple-darwin
+        --target aarch64-apple-darwin
+        {{.CLI_ARGS}}
+
   lint:fix:
     desc: "lint and fix cargo workspace"
     aliases: [fix]

@@ -22,11 +22,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          targets: x86_64-pc-windows-msvc
+          # Release targets (mirror .goreleaser.yaml); linted from Linux via zig.
+          targets: x86_64-pc-windows-gnu, aarch64-pc-windows-gnullvm, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
       - run: |
           brew install ast-grep
           brew install cargo-audit
           brew install cargo-udeps
+          brew install zig cargo-zigbuild
       - name: Audit
         # cargo-audit flags advisories on dependencies we can't always fix
         # immediately (e.g. transitive/unmaintained crates); keep it informational
@@ -39,14 +41,14 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
       - name: Lint
         run: task lint --output group --output-group-error-only
-      # The only platform-divergent code is the cfg(unix) block in
-      # cooldown-core::error, so scope the Windows cfg cross-check to that crate.
-      # A --workspace check would drag in reqwest's aws-lc-sys, whose build script
-      # compiles bundled C/asm and cannot cross-compile to windows-msvc on the
-      # Linux runner. cooldown-core pulls no native-C deps, so clippy (check-only)
-      # needs no Windows runner or MSVC linker.
-      - name: Lint (windows target cross-check)
-        run: cargo lint -p cooldown-core --all-features --target x86_64-pc-windows-msvc
+      # Cross-lint the full workspace for every release target from Linux. A plain
+      # `clippy --target` can't do this: reqwest's aws-lc-sys compiles bundled
+      # C/asm in its build script and won't cross-compile without a target
+      # toolchain. cargo-zigbuild uses zig as the cross C compiler (bundled MinGW /
+      # libc headers, no MSVC SDK or Xcode needed), so the C actually builds per
+      # target and clippy checks every cfg(target_os)/cfg(unix) view.
+      - name: Lint (all release targets)
+        run: task lint:targets --output group --output-group-error-only
 
   goreleaser:
     runs-on: ubuntu-24.04
