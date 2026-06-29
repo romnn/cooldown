@@ -39,11 +39,14 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
       - name: Lint
         run: task lint --output group --output-group-error-only
-      # The only platform-divergent code is a cfg(unix) block in cooldown-core;
-      # cross-check the Windows cfg view from Linux (clippy is check-only, so no
-      # Windows runner or MSVC linker is needed).
+      # The only platform-divergent code is the cfg(unix) block in
+      # cooldown-core::error, so scope the Windows cfg cross-check to that crate.
+      # A --workspace check would drag in reqwest's aws-lc-sys, whose build script
+      # compiles bundled C/asm and cannot cross-compile to windows-msvc on the
+      # Linux runner. cooldown-core pulls no native-C deps, so clippy (check-only)
+      # needs no Windows runner or MSVC linker.
       - name: Lint (windows target cross-check)
-        run: cargo lint --workspace --all-features --target x86_64-pc-windows-msvc
+        run: cargo lint -p cooldown-core --all-features --target x86_64-pc-windows-msvc
 
   goreleaser:
     runs-on: ubuntu-24.04
