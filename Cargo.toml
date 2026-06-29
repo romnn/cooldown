@@ -7,7 +7,7 @@ exclude = ["examples"]
 [workspace.package]
 version = "0.0.2"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/romnn/cooldown"
 homepage = "https://github.com/romnn/cooldown"
 authors = ["romnn <roman@airtype.de>"]
