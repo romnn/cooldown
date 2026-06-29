@@ -39,8 +39,6 @@ task = "latest"
 ast-grep = "latest"
 typos = "latest"
 actionlint = "latest"
-# charmbracelet/freeze renders the README screenshots (`task screenshots`); no
-# mise short name, so use the prebuilt aqua backend.
 "aqua:charmbracelet/freeze" = "latest"
 
 # Cargo plugins
@@ -48,8 +46,8 @@ actionlint = "latest"
 "github:romnn/cargo-watchdoc" = "latest"
 "aqua:rustsec/rustsec/cargo-audit" = "latest"
 "github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc" }
-"cargo:cargo-udeps" = "latest"
-"cargo:cargo-outdated" = "latest"
+"github:est31/cargo-udeps" = "latest"
+"github:kbknapp/cargo-outdated" = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
 
 [settings]

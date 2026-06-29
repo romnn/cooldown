@@ -20,14 +20,6 @@ backend = "aqua:rustsec/rustsec/cargo-audit"
 version = "0.44.0"
 backend = "aqua:ast-grep/ast-grep"
 
-[[tools."cargo:cargo-outdated"]]
-version = "0.19.0"
-backend = "cargo:cargo-outdated"
-
-[[tools."cargo:cargo-udeps"]]
-version = "0.1.61"
-backend = "cargo:cargo-udeps"
-
 [[tools.deno]]
 version = "2.8.3"
 backend = "core:deno"
@@ -42,6 +34,14 @@ backend = "core:erlang"
 
 [tools.erlang.options]
 precompiled = "if_available"
+
+[[tools."github:est31/cargo-udeps"]]
+version = "0.1.61"
+backend = "github:est31/cargo-udeps"
+
+[[tools."github:kbknapp/cargo-outdated"]]
+version = "0.19.0"
+backend = "github:kbknapp/cargo-outdated"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
 version = "0.0.54"
