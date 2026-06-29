@@ -85,6 +85,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indoc = "2"
 
 # Dev
-insta = { version = "1", features = ["json", "redactions"] }
 tempfile = "3"
-pretty_assertions = "1"

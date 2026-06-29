@@ -23,7 +23,6 @@ thiserror.workspace = true
 camino.workspace = true
 
 [dev-dependencies]
-pretty_assertions.workspace = true
 jiff.workspace = true
 camino.workspace = true
 indoc.workspace = true

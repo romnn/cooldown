@@ -24,7 +24,6 @@ toml_edit.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 camino.workspace = true
-futures.workspace = true
 semver.workspace = true
 tracing.workspace = true
 

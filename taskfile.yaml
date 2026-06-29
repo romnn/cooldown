@@ -114,8 +114,13 @@ tasks:
   unused:
     desc: "check for unused cargo workspace dependencies"
     aliases: [unused-dependencies]
+    # udeps needs a nightly compiler (-Z binary-dep-depinfo); MISE_RUST_VERSION
+    # selects the nightly toolchain from mise.toml for every nested cargo shim
+    # udeps spawns, instead of the pinned-stable primary.
+    env:
+      MISE_RUST_VERSION: nightly
     cmds:
-      - cargo +nightly udeps {{.CLI_ARGS}}
+      - cargo +nightly udeps --workspace --all-targets {{.CLI_ARGS}}
 
   audit:
     desc: "audit cargo workspace dependencies"

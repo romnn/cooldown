@@ -5,16 +5,20 @@
 # generate fixtures on the fly and run the actual resolver, so the toolchain must be pinned
 # to keep runs reproducible across machines and over time.
 #
-# `rust` is pinned to the version already active on this machine (`rustc 1.96.0`), so adding
-# this file does NOT switch the toolchain under cooldown's own `cargo build`. Every other
-# version below is an exact `mise ls-remote <tool>` hit (verified), not an invented tag.
+# `rust` lists two toolchains. The first, `1.96.0`, is the primary: it is the version already
+# active on this machine, so it stays first and adding this file does NOT switch the toolchain
+# under cooldown's own `cargo build`. The second, `nightly`, exists only so `task unused`
+# (`cargo udeps`) has a nightly compiler to run under — udeps needs `-Z binary-dep-depinfo`,
+# which stable rejects. The task selects it with `MISE_RUST_VERSION=nightly`; everything else
+# keeps using the primary `1.96.0`. Every other version below is an exact `mise ls-remote
+# <tool>` hit (verified), not an invented tag.
 #
 # conda is intentionally omitted: it has no clean mise-managed backend here (`mise ls-remote
 # conda` returns nothing), so pinning it would be a ghost. A real-tool conda integration test
 # would need a conda provisioned some other way; the cooldown-conda adapter is otherwise covered
 # by the network-free conformance tests.
 [tools]
-rust = "1.96.0"
+rust = ["1.96.0", "nightly"]
 uv = "0.11.23"
 go = "1.26.4"
 node = "26.3.1"
