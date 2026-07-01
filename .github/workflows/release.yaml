@@ -17,7 +17,15 @@ jobs:
     needs: [tests]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve Rust toolchain from rust-toolchain.toml
+        id: rust
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -38,10 +46,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - uses: arduino/setup-task@v2
+      - uses: jdx/mise-action@v4
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          version: "3.42.1"
+          install: false
+          cache: true
+      - run: mise install task
       - name: Release
         run: task release
         env:

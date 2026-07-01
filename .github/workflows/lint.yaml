@@ -12,59 +12,48 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: arduino/setup-task@v2
+      - uses: jdx/mise-action@v4
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Homebrew/actions/setup-homebrew@master
+          install: false
+          cache: true
+      - run: mise install task ast-grep zig github:romnn/cargo-feature-combinations aqua:rustsec/rustsec/cargo-audit github:est31/cargo-udeps github:rust-cross/cargo-zigbuild
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
+      - name: Resolve Rust toolchain from rust-toolchain.toml
+        id: rust
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust.outputs.channel }}
           components: clippy
-          # Release targets (mirror .goreleaser.yaml); linted from Linux via zig.
-          targets: x86_64-pc-windows-gnu, aarch64-pc-windows-gnullvm, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
-      - run: |
-          brew install ast-grep
-          brew install cargo-audit
-          brew install cargo-udeps
-          brew install zig cargo-zigbuild
-      # Cache the cross-target dependency artifacts — the per-target aws-lc-sys C
-      # build is the expensive part. cache-on-failure keeps it even when clippy
-      # fails, so a lint finding doesn't throw away the cross-compiled deps.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
       - name: Audit
-        # cargo-audit flags advisories on dependencies we can't always fix
-        # immediately (e.g. transitive/unmaintained crates); keep it informational
-        # so a new advisory doesn't block the whole lint workflow.
         continue-on-error: true
         run: task audit --output group --output-group-error-only
       - name: Check for unused dependencies
         run: task unused-dependencies --output group --output-group-error-only
-        env:
-          RUSTUP_TOOLCHAIN: nightly
-      - name: Lint
-        run: task lint --output group --output-group-error-only
-      # Cross-lint the full workspace for every release target from Linux. A plain
-      # `clippy --target` can't do this: reqwest's aws-lc-sys compiles bundled
-      # C/asm in its build script and won't cross-compile without a target
-      # toolchain. cargo-zigbuild uses zig as the cross C compiler (bundled MinGW /
-      # libc headers, no MSVC SDK or Xcode needed), so the C actually builds per
-      # target and clippy checks every cfg(target_os)/cfg(unix) view.
-      - name: Lint (all release targets)
-        run: task lint:targets --output group --output-group-error-only
+      - name: Lint (all feature combinations × targets)
+        run: task lint:fc --output group --output-group-error-only
 
   goreleaser:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: arduino/setup-task@v2
+      - uses: jdx/mise-action@v4
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Homebrew/actions/setup-homebrew@master
-      - run: brew install goreleaser
+          install: false
+          cache: true
+      - run: mise install goreleaser
       - name: Check goreleaser config
         run: goreleaser check
 
@@ -72,12 +61,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: arduino/setup-task@v2
+      - uses: jdx/mise-action@v4
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Homebrew/actions/setup-homebrew@master
-      - uses: dtolnay/rust-toolchain@stable
-      - run: |
-          brew install typos-cli
+          install: false
+          cache: true
+      - run: mise install task typos
       - name: Spellcheck
         run: task spellcheck --output group --output-group-error-only
