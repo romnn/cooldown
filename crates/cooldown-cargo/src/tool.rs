@@ -12,7 +12,7 @@
 //! and the candidates a mutually-exclusive `=`-pin or single-major shared transitive leaves held),
 //! and a converged graph re-applies to a byte-stable fixed point.
 
-use crate::cargocmd::Cargo;
+use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::manifest;
 use crate::native::parse_native;
@@ -357,12 +357,22 @@ impl CargoTool {
             // own declared requirement caps them, then re-pin. A candidate still short after a no-op
             // widen round is blocked by another crate (a real conflict the diff reports), so the loop
             // stops widening.
+            // The member-aware reach check is the only thing in this loop that needs the resolved
+            // graph, so skip the `cargo metadata` spawn entirely when no candidate is a direct
+            // member dep. When it is needed, fail closed: falling back to the lock-slot check is the
+            // false positive this loop exists to avoid.
+            let needs_graph = plan.changes.iter().any(needs_member_graph);
             for _ in 0..plan.changes.len() {
                 let after = locked_versions(&read_lock(project)?);
+                let graph = if needs_graph {
+                    Some(self.cargo.metadata(&project.root).await?)
+                } else {
+                    None
+                };
                 let mut widened_any = false;
                 let mut short = Vec::new();
                 for change in &plan.changes {
-                    if reached(&after, change) {
+                    if reached_after(&after, graph.as_ref(), change) {
                         continue;
                     }
                     short.push(change.clone());
@@ -444,6 +454,28 @@ fn reached(after: &BTreeMap<SlotKey, String>, change: &Change) -> bool {
     })
 }
 
+fn needs_member_graph(change: &Change) -> bool {
+    change.direct && !change.members.is_empty()
+}
+
+fn reached_after(
+    after: &BTreeMap<SlotKey, String>,
+    graph: Option<&ResolvedGraph>,
+    change: &Change,
+) -> bool {
+    if needs_member_graph(change) {
+        return graph.is_some_and(|graph| {
+            graph.direct_members_reach(
+                &change.members,
+                &change.package.name,
+                change.to.as_str(),
+                change.downgrade,
+            )
+        });
+    }
+    reached(after, change)
+}
+
 #[async_trait]
 impl ToolWrite for CargoTool {
     fn resolve_inputs(&self) -> ResolveInputs {
@@ -522,8 +554,14 @@ impl ToolWrite for CargoTool {
         }
 
         let after = locked_versions(&read_lock(project)?);
-        // The resolved graph, used to name the crate whose `=`-pin holds a short candidate back.
-        let graph = self.cargo.metadata(&project.root).await.ok();
+        // The resolved graph proves direct member changes reached the target and names the crate
+        // whose `=`-pin holds a short candidate back.
+        let needs_graph = plan.changes.iter().any(needs_member_graph);
+        let graph = if needs_graph {
+            Some(self.cargo.metadata(&project.root).await?)
+        } else {
+            self.cargo.metadata(&project.root).await.ok()
+        };
         let planned: BTreeSet<&str> = plan
             .changes
             .iter()
@@ -534,7 +572,7 @@ impl ToolWrite for CargoTool {
         // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
         // transitive won — reported held, naming the blocker.
         for change in &plan.changes {
-            if reached(&after, change) {
+            if reached_after(&after, graph.as_ref(), change) {
                 report.applied.push(change.clone());
             } else {
                 let offender = graph
@@ -692,6 +730,84 @@ mod tests {
         assert!(!reached(&after, &change("syn", "2.0.60", "2.0.40", true)));
         // A candidate absent from the lock did not reach its target.
         assert!(!reached(&after, &change("tokio", "1.0.0", "1.5.0", false)));
+    }
+
+    #[test]
+    fn target_gated_workspace_duplicate_requires_member_aware_rewrite() {
+        let after = locked_versions(&lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]));
+        let graph = crate::cargocmd::Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "mcp", "name": "micromux-mcp", "version": "0.1.0",
+                     "manifest_path": "/repo/crates/micromux-mcp/Cargo.toml",
+                     "dependencies": [{"name": "nix", "req": "^0.28", "target": "cfg(unix)"}]},
+                    {"id": "core", "name": "micromux", "version": "0.1.0",
+                     "manifest_path": "/repo/crates/micromux/Cargo.toml",
+                     "dependencies": [{"name": "nix", "req": "^0.31"}]},
+                    {"id": "nix-old", "name": "nix", "version": "0.28.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "nix-new", "name": "nix", "version": "0.31.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["mcp", "core"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "mcp", "deps": [{"pkg": "nix-old"}]},
+                    {"id": "core", "deps": [{"pkg": "nix-new"}]},
+                    {"id": "nix-old", "deps": []},
+                    {"id": "nix-new", "deps": []}
+                ]}
+            }"#,
+        );
+        let mcp_member = cooldown_core::MemberRef {
+            name: "micromux-mcp".to_string(),
+            path: "crates/micromux-mcp".to_string(),
+        };
+        let mut change = change("nix", "0.28.0", "0.31.3", false);
+        change.members = vec![mcp_member.clone()];
+
+        assert!(
+            reached(&after, &change),
+            "the lock has nix 0.31.3 for a different workspace member"
+        );
+        assert!(
+            !reached_after(&after, None, &change),
+            "a direct member change must not fall back to the member-blind lock slot"
+        );
+        assert!(
+            !reached_after(&after, Some(&graph), &change),
+            "micromux-mcp still resolves nix 0.28.0, so Auto mode must widen its manifest"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("crates/micromux-mcp")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/micromux-mcp/Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "micromux-mcp"
+
+                [target.'cfg(unix)'.dependencies]
+                nix = { version = "0.28", features = ["signal"] }
+            "#},
+        )
+        .expect("write manifest");
+
+        let rewrite =
+            manifest::widen_constraint(&root, std::slice::from_ref(&mcp_member), "nix", "0.31.3")
+                .expect("rewrite target-gated dep");
+
+        assert_eq!(
+            rewrite.modified,
+            vec![Utf8PathBuf::from("crates/micromux-mcp/Cargo.toml")]
+        );
+        let manifest =
+            std::fs::read_to_string(root.join("crates/micromux-mcp/Cargo.toml")).expect("read");
+        assert!(manifest.contains(r#"version = "0.31.3""#), "{manifest}");
+        assert!(manifest.contains(r#"features = ["signal"]"#), "{manifest}");
     }
 
     #[test]

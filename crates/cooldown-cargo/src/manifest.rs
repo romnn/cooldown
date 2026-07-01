@@ -340,6 +340,38 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_target_gated_dependency_in_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/mcp")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/mcp/Cargo.toml"),
+            indoc::indoc! {r#"
+                [package]
+                name = "mcp"
+
+                [target.'cfg(unix)'.dependencies]
+                nix = { version = "0.28", features = ["signal"] }
+            "#},
+        )
+        .expect("write");
+
+        let rewrite =
+            widen_constraint(root, &[member("mcp", "crates/mcp")], "nix", "0.31.3").expect("widen");
+
+        assert_eq!(
+            rewrite.modified,
+            vec![Utf8PathBuf::from("crates/mcp/Cargo.toml")]
+        );
+        let after = std::fs::read_to_string(root.join("crates/mcp/Cargo.toml")).expect("read");
+        assert!(after.contains(r#"version = "0.31.3""#), "{after}");
+        assert!(
+            after.contains(r#"features = ["signal"]"#),
+            "features kept: {after}"
+        );
+    }
+
+    #[test]
     fn transitive_only_dependency_is_not_editable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");

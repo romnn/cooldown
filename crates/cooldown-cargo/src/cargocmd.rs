@@ -126,6 +126,64 @@ impl ResolvedGraph {
         })
     }
 
+    /// Whether every listed workspace member directly resolves `crate_name` at the requested target.
+    ///
+    /// Cargo can keep several versions of the same crate in one workspace. A lock-level check that
+    /// only asks whether `crate_name@target` exists can therefore confuse another member's dependency
+    /// for this member's unresolved one.
+    #[must_use]
+    pub fn direct_members_reach(
+        &self,
+        members: &[MemberRef],
+        crate_name: &str,
+        target: &str,
+        downgrade: bool,
+    ) -> bool {
+        if members.is_empty() {
+            return false;
+        }
+
+        let target_major = crate::version::major_key(target);
+        for member in members {
+            let Some(root) = self.roots.iter().find(|root| {
+                self.packages
+                    .get(*root)
+                    .is_some_and(|info| info.name == member.name && info.path == member.path)
+            }) else {
+                return false;
+            };
+            let Some(dep_ids) = self.edges.get(root) else {
+                return false;
+            };
+            let reached = dep_ids
+                .iter()
+                .filter_map(|id| self.packages.get(id))
+                .any(|info| {
+                    if info.name != crate_name || !info.is_crates_io() {
+                        return false;
+                    }
+                    // Scope to the target's own compatibility slot, like `reached` does via its
+                    // `(name, major)` key. One member can resolve several majors of a crate at once
+                    // (a normal `nix = "0.28"` beside a target-gated `nix = "0.31"`); without this a
+                    // sibling major that satisfies the bound would mask the slot we are moving.
+                    if crate::version::major_key(&info.version) != target_major {
+                        return false;
+                    }
+                    let ordering = crate::version::compare(&info.version, target);
+                    if downgrade {
+                        ordering.is_le()
+                    } else {
+                        ordering.is_ge()
+                    }
+                });
+            if !reached {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// The workspace member crates that directly depend on `id` — the source packages a dependency
     /// is attributed to in reports. Sorted by name and deduplicated for stable output.
     #[must_use]
@@ -855,6 +913,119 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("app-a", "apps/a")]
         );
+    }
+
+    #[test]
+    fn direct_members_reach_checks_the_declaring_member_not_any_matching_crate() {
+        let graph = Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "root-a", "name": "app-a", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/a/Cargo.toml"},
+                    {"id": "root-b", "name": "app-b", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/b/Cargo.toml"},
+                    {"id": "nix-old", "name": "nix", "version": "0.28.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"},
+                    {"id": "nix-new", "name": "nix", "version": "0.31.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"}
+                ],
+                "workspace_members": ["root-a", "root-b"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "root-a", "deps": [{"pkg": "nix-old"}]},
+                    {"id": "root-b", "deps": [{"pkg": "nix-new"}]},
+                    {"id": "nix-old", "deps": []},
+                    {"id": "nix-new", "deps": []}
+                ]}
+            }"#,
+        );
+
+        assert!(!graph.direct_members_reach(
+            &[MemberRef {
+                name: "app-a".to_string(),
+                path: "apps/a".to_string(),
+            }],
+            "nix",
+            "0.31.3",
+            false,
+        ));
+        assert!(graph.direct_members_reach(
+            &[MemberRef {
+                name: "app-b".to_string(),
+                path: "apps/b".to_string(),
+            }],
+            "nix",
+            "0.31.3",
+            false,
+        ));
+    }
+
+    #[test]
+    fn direct_members_reach_ignores_a_sibling_major_under_the_same_member() {
+        // `app` resolves two majors of `foo` at once (e.g. a normal `foo = "1"` beside a
+        // target-gated `foo = "2"`). A bump of the 1.x slot to 1.5.0 has not landed; `app` still
+        // holds foo 1.4.0, so the coexisting 2.1.0 edge must not be read as "reached".
+        let graph = Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/app/Cargo.toml"},
+                    {"id": "foo-1", "name": "foo", "version": "1.4.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"},
+                    {"id": "foo-2", "name": "foo", "version": "2.1.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"pkg": "foo-1"}, {"pkg": "foo-2"}]},
+                    {"id": "foo-1", "deps": []},
+                    {"id": "foo-2", "deps": []}
+                ]}
+            }"#,
+        );
+
+        assert!(!graph.direct_members_reach(
+            &[MemberRef {
+                name: "app".to_string(),
+                path: "apps/app".to_string(),
+            }],
+            "foo",
+            "1.5.0",
+            false,
+        ));
+    }
+
+    #[test]
+    fn direct_members_reach_ignores_non_registry_same_name() {
+        let graph = Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/app/Cargo.toml",
+                     "dependencies": [{"name": "foo", "req": "^1.0"}]},
+                    {"id": "foo-path", "name": "foo", "version": "1.5.0",
+                     "manifest_path": "/repo/vendor/foo/Cargo.toml",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"pkg": "foo-path"}]},
+                    {"id": "foo-path", "deps": []}
+                ]}
+            }"#,
+        );
+
+        assert!(!graph.direct_members_reach(
+            &[MemberRef {
+                name: "app".to_string(),
+                path: "apps/app".to_string(),
+            }],
+            "foo",
+            "1.5.0",
+            false,
+        ));
     }
 
     #[test]

@@ -65,7 +65,8 @@ struct FixPlan {
     warnings: Vec<FixWarning>,
 }
 
-type ChangeTargetKey = (String, Option<String>, String);
+type MemberTargetKey = (String, String);
+type ChangeTargetKey = (String, Option<String>, String, Vec<MemberTargetKey>);
 
 /// The evolving per-project state during one-change upgrade trials.
 struct TrialState {
@@ -1313,15 +1314,42 @@ fn verify_applied_targets(
 }
 
 fn target_reached(deps: &[Dependency], change: &Change) -> bool {
+    if change.direct && !change.members.is_empty() {
+        return change.members.iter().all(|member| {
+            deps.iter().any(|dep| {
+                dep.package == change.package
+                    && dep.current == change.to
+                    && dep.members.iter().any(|dep_member| dep_member == member)
+            })
+        });
+    }
+
     deps.iter()
         .any(|dep| dep.package == change.package && dep.current == change.to)
 }
 
 fn change_target_key(change: &Change) -> ChangeTargetKey {
+    // Two members upgrading the same crate to the same target from different current versions are
+    // distinct direct changes that share `(name, registry, to)`. Keying them member-blind lets the
+    // member-aware `target_reached` collapse them, masking a held member behind an applied one or
+    // recording the held one as both applied and skipped. Transitive members are attribution context,
+    // not separate editable targets, so only direct changes include members in the key.
+    let mut members: Vec<MemberTargetKey> = if change.direct {
+        change
+            .members
+            .iter()
+            .map(|member| (member.name.clone(), member.path.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    members.sort();
+    members.dedup();
     (
         change.package.name.clone(),
         change.package.registry.clone(),
         change.to.as_str().to_string(),
+        members,
     )
 }
 
@@ -1545,8 +1573,8 @@ mod tests {
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
-        ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, PackageId, Release,
-        ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
+        ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, MemberRef, PackageId,
+        Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
     };
     use std::collections::HashSet;
 
@@ -1645,6 +1673,13 @@ mod tests {
         }
     }
 
+    fn member(name: &str, path: &str) -> MemberRef {
+        MemberRef {
+            name: name.to_string(),
+            path: path.to_string(),
+        }
+    }
+
     fn change(name: &str, from: &str, to: &str) -> Change {
         Change {
             package: PackageId::new(ToolId("mock"), name, None),
@@ -1688,6 +1723,76 @@ mod tests {
         assert_eq!(verified.applied, vec![landed]);
         assert_eq!(verified.skipped.len(), 1);
         assert_eq!(verified.skipped[0].change, missed);
+    }
+
+    #[test]
+    fn verify_applied_targets_requires_the_planned_direct_member_to_land() {
+        let mut planned_change = change("nix", "0.28.0", "0.31.3");
+        planned_change.members = vec![member("micromux-mcp", "crates/micromux-mcp")];
+        let planned = vec![planned_change.clone()];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+        let mut old_dep = dep("nix", "0.28.0");
+        old_dep.members = vec![member("micromux-mcp", "crates/micromux-mcp")];
+        let mut other_member_dep = dep("nix", "0.31.3");
+        other_member_dep.members = vec![member("micromux", "crates/micromux")];
+
+        let verified = verify_applied_targets(report, &planned, &[old_dep, other_member_dep]);
+
+        assert!(verified.applied.is_empty());
+        assert_eq!(verified.skipped.len(), 1);
+        assert_eq!(verified.skipped[0].change, planned_change);
+    }
+
+    #[test]
+    fn verify_applied_targets_keeps_each_held_member_when_targets_collide() {
+        // Two members bump the same crate to the same target from different current versions, so the
+        // changes share (name, registry, to) and differ only by member. Both are held; neither may
+        // be dropped by a member-blind key collapsing them into a single skip.
+        let mut held_a = change("nix", "0.28.0", "0.31.3");
+        held_a.members = vec![member("app-a", "crates/app-a")];
+        let mut held_b = change("nix", "0.30.0", "0.31.3");
+        held_b.members = vec![member("app-b", "crates/app-b")];
+        let planned = vec![held_a.clone(), held_b.clone()];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+        let mut a_dep = dep("nix", "0.28.0");
+        a_dep.members = vec![member("app-a", "crates/app-a")];
+        let mut b_dep = dep("nix", "0.30.0");
+        b_dep.members = vec![member("app-b", "crates/app-b")];
+
+        let verified = verify_applied_targets(report, &planned, &[a_dep, b_dep]);
+
+        assert!(verified.applied.is_empty());
+        assert_eq!(verified.skipped.len(), 2);
+        let held: Vec<&Change> = verified.skipped.iter().map(|skip| &skip.change).collect();
+        assert!(held.contains(&&held_a));
+        assert!(held.contains(&&held_b));
+    }
+
+    #[test]
+    fn verify_applied_targets_does_not_split_transitive_attribution_by_member() {
+        let mut held_a = change("shared", "1.0.0", "1.2.0");
+        held_a.direct = false;
+        held_a.members = vec![member("app-a", "crates/app-a")];
+        let mut held_b = change("shared", "1.1.0", "1.2.0");
+        held_b.direct = false;
+        held_b.members = vec![member("app-b", "crates/app-b")];
+        let planned = vec![held_a.clone(), held_b];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+
+        let verified = verify_applied_targets(report, &planned, &[dep("shared", "1.0.0")]);
+
+        assert!(verified.applied.is_empty());
+        assert_eq!(verified.skipped.len(), 1);
+        assert_eq!(verified.skipped[0].change, held_a);
     }
 
     #[test]
