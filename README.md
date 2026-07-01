@@ -39,7 +39,10 @@ resolution/apply engines, never as the source of policy.
 ## Install
 
 ```bash
-cargo install --path crates/cooldown   # or: cargo build --release
+brew install --cask romnn/tap/cooldown
+
+# Or install from source
+cargo install --locked cooldown
 ```
 
 ## Usage
