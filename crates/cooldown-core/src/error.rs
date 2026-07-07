@@ -2,7 +2,7 @@
 //! [`CoreError`] at the port boundary via `From`; non-fatal apply skips are `Ok` data, never `Err`.
 
 use std::fmt;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Output};
 
 /// A [`Result`](std::result::Result) specialized to [`CoreError`].
 ///
@@ -54,6 +54,27 @@ impl fmt::Display for ToolTermination {
     }
 }
 
+/// The canonical human-readable detail for a non-zero tool exit.
+///
+/// Package managers split their diagnostics inconsistently — some write the actionable error to
+/// stderr, others to stdout — so every tool driver surfaces both streams: stderr, then stdout when
+/// both carry text, falling back to a synthesised termination note when the process wrote nothing.
+/// This gives [`CoreError::is_local_environment_failure`] the same detail regardless of stream.
+#[must_use]
+pub fn failure_detail(out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("{stderr}\n{stdout}"),
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => format!(
+            "package manager exited with {}",
+            ToolTermination::from_exit_status(out.status)
+        ),
+    }
+}
+
 /// Errors raised at or below the port boundary.
 ///
 /// The variants separate *classes* of failure so the app can decide retry/exit behaviour without
@@ -77,7 +98,9 @@ pub enum CoreError {
         tool: String,
         /// The way the process terminated.
         termination: ToolTermination,
-        /// The captured standard-error output, used as the failure detail.
+        /// The captured failure detail: the tool's standard-error output, or — when a driver merges
+        /// the streams — stderr followed by stdout, or a synthesised termination note when the
+        /// process wrote nothing. Named for the common case; not guaranteed to be stderr alone.
         stderr: String,
     },
 
@@ -149,6 +172,36 @@ impl CoreError {
         matches!(self, CoreError::ToolSpawn { .. })
     }
 
+    /// Whether this error reflects a broken **local environment** rather than the resolver reporting
+    /// the requested dependency graph unsatisfiable.
+    ///
+    /// Resilient apply uses this to decide whether an `apply` failure is a per-candidate resolver
+    /// conflict — isolate the culprit and apply the rest — or a whole-environment fault that must
+    /// propagate, so a missing binary, full disk, read-only tree, or corrupt package-manager store is
+    /// never misreported as "every candidate held".
+    ///
+    /// The structured variants (a tool that could not be spawned, or a filesystem/lock/serialization
+    /// fault cooldown itself raised) are an exact, locale-independent signal. A [`CoreError::Tool`]
+    /// carries only the subprocess's own free-form failure detail, which cooldown cannot introspect
+    /// structurally, so that case falls back to a best-effort match against well-known
+    /// broken-environment phrases — necessarily incomplete and locale-sensitive, but the only signal
+    /// a subprocess exposes. A plain non-zero exit whose detail does not name a broken environment
+    /// stays a resolver conflict, so a single unfetchable/conflicting candidate is still isolated.
+    #[must_use]
+    pub fn is_local_environment_failure(&self) -> bool {
+        match self {
+            CoreError::ToolSpawn { .. }
+            | CoreError::Filesystem(_)
+            | CoreError::LockUnreadable(_)
+            | CoreError::PathEncoding(_)
+            | CoreError::Serialization(_)
+            | CoreError::System(_)
+            | CoreError::LockConflict(_) => true,
+            CoreError::Tool { stderr, .. } => detail_indicates_broken_environment(stderr),
+            _ => false,
+        }
+    }
+
     /// Convenience constructor for a transient cause from any error type.
     pub fn transient(e: impl Into<BoxError>) -> Self {
         CoreError::Transient(e.into())
@@ -174,6 +227,32 @@ impl CoreError {
             CoreError::System(_) => DiagnosticKind::System,
         }
     }
+}
+
+/// Best-effort match of a spawned tool's failure detail against well-known broken-environment
+/// phrases, for the [`CoreError::Tool`] case where no structured signal is available. Incomplete and
+/// locale-sensitive by nature — a subprocess exposes only free-form text, and localized OS messages
+/// will not match; the structured [`CoreError`] variants are the reliable signal, this is the
+/// fallback for failures that only surface as a non-zero tool exit. `"permission denied"`
+/// deliberately also matches auth failures (git's `Permission denied (publickey)`, registries that
+/// phrase a 403 that way): missing credentials are an environment fault, and aborting with the real
+/// message beats misreporting the candidate as a resolver conflict.
+fn detail_indicates_broken_environment(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "unable to open database file",
+        "read-only file system",
+        "permission denied",
+        "no space left on device",
+        "disk quota exceeded",
+        "database is locked",
+        "eacces",
+        "enospc",
+        "erofs",
+        "sqlite_cantopen",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
 }
 
 impl From<std::io::Error> for CoreError {
@@ -385,6 +464,57 @@ mod tests {
             DiagnosticKind::ToolSpawnFailed.to_string(),
             "tool_spawn_failed"
         );
+    }
+
+    #[test]
+    fn local_environment_failures_are_classified_separately() {
+        let sqlite = CoreError::Tool {
+            tool: "pnpm".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "pnpm: unable to open database file".into(),
+        };
+        let readonly = CoreError::Tool {
+            tool: "pnpm".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "Read-only file system (os error 30)".into(),
+        };
+        let disk_full = CoreError::Tool {
+            tool: "cargo".into(),
+            termination: ToolTermination::ExitCode(101),
+            stderr: "error: failed to write Cargo.lock: No space left on device".into(),
+        };
+        // Auth failures are deliberately environmental: credentials are machine state, not a
+        // property of the candidate set.
+        let git_auth = CoreError::Tool {
+            tool: "cargo".into(),
+            termination: ToolTermination::ExitCode(101),
+            stderr: "git@github.com: Permission denied (publickey).".into(),
+        };
+        let resolver = CoreError::Tool {
+            tool: "pnpm".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "No matching version found for colors@999.0.0".into(),
+        };
+
+        // Structured local faults are an exact, locale-independent signal — no string match needed.
+        assert!(
+            CoreError::ToolSpawn {
+                tool: "pnpm".into(),
+                detail: "binary missing".into(),
+            }
+            .is_local_environment_failure()
+        );
+        assert!(CoreError::Filesystem("disk full".into()).is_local_environment_failure());
+        assert!(CoreError::LockUnreadable("corrupt lock".into()).is_local_environment_failure());
+        // A spawned tool whose only signal is stderr text is matched best-effort.
+        assert!(sqlite.is_local_environment_failure());
+        assert!(readonly.is_local_environment_failure());
+        assert!(disk_full.is_local_environment_failure());
+        assert!(git_auth.is_local_environment_failure());
+        // A genuine resolver rejection and a plain not-found stay isolatable (bisected, not fatal).
+        assert!(!resolver.is_local_environment_failure());
+        assert!(!CoreError::StaleLock("lock is stale".into()).is_local_environment_failure());
+        assert!(!CoreError::NotFound("colors@999.0.0".into()).is_local_environment_failure());
     }
 
     #[test]

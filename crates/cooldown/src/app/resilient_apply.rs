@@ -2,9 +2,9 @@
 //!
 //! A tool that re-resolves the whole graph in one native command (pnpm, cargo, go, deno, uv) applies
 //! its candidates **atomically**: if a single candidate is unsatisfiable — an unpublished/yanked
-//! version the manager cannot fetch, or one side of a mutually-exclusive conflict — the whole command
-//! fails and the adapter's `apply` returns an error. Reporting that as "every candidate is held" is
-//! wrong: one bad candidate would block every other.
+//! version the manager cannot fetch, one side of a mutually-exclusive conflict, or a candidate set
+//! that produces a stale lock — the whole command fails and the adapter's `apply` returns an error.
+//! Reporting that as "every candidate is held" is wrong: one bad candidate would block every other.
 //!
 //! [`apply_resilient`] wraps `apply` so that, on such a failure, it isolates the offending candidates
 //! by **delta-debugging partitioning** (the ddmin idea) and applies the maximal satisfiable subset,
@@ -27,9 +27,10 @@ use cooldown_core::{
 ///
 /// Returns the committed [`ApplyReport`]: the applied changes (plus any the resolve genuinely held)
 /// and, appended, every candidate the recovery dropped — so one unfetchable or conflicting candidate
-/// never blocks the rest. A tool-spawn failure (the binary is missing) is not a candidate conflict
-/// and propagates unchanged. `journal` is the caller's pre-apply snapshot; it is restored before each
-/// recovery trial and before the final commit, so no partial widen or lock leaks.
+/// never blocks the rest. A local environment failure (missing binary, read-only tree, full disk) is
+/// not a candidate conflict and propagates unchanged. `journal` is the caller's pre-apply snapshot;
+/// it is restored before each recovery trial and before the final commit, so no partial widen or lock
+/// leaks.
 pub(crate) async fn apply_resilient(
     writer: &dyn ToolWrite,
     project: &Project,
@@ -38,7 +39,10 @@ pub(crate) async fn apply_resilient(
 ) -> Result<ApplyReport> {
     match writer.apply(project, plan, journal).await {
         Ok(report) => return Ok(report),
-        Err(err) if err.is_tool_spawn_failure() => return Err(err),
+        // A broken local environment (missing binary, full disk, read-only tree, corrupt store, an
+        // unreadable lock) is not a per-candidate conflict — propagate it rather than bisecting the
+        // plan and misreporting every candidate as held.
+        Err(err) if err.is_local_environment_failure() => return Err(err),
         // The set is unsatisfiable as a whole. Fall through to isolate the culprits and apply the rest.
         Err(_) => {}
     }
@@ -103,7 +107,9 @@ async fn maximal_satisfiable_subset(
         };
         match writer.apply(project, &trial, journal).await {
             Ok(_) => accepted.extend(group),
-            Err(err) if err.is_tool_spawn_failure() => return Err(err),
+            // A broken local environment surfacing mid-recovery must propagate, not be charged to
+            // whichever candidates happen to be in this trial group.
+            Err(err) if err.is_local_environment_failure() => return Err(err),
             // The group cannot join `accepted`: split it, or drop it if it is a single culprit.
             Err(_) if group.len() > 1 => push_halves(&mut work, group),
             Err(_) => {}
@@ -182,13 +188,28 @@ mod tests {
         (dir, project)
     }
 
+    /// A local fault the mock injects before consulting the resolve oracle, so a test can assert it
+    /// propagates as-is rather than being bisected into a held report.
+    enum Fault {
+        Spawn,
+        Environment,
+        Filesystem,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RejectError {
+        Tool,
+        StaleLock,
+    }
+
     /// A `ToolWrite` whose joint resolve (`apply`) is unsatisfiable iff the plan contains any package
     /// in `unsatisfiable_with` AND the `requires` rule (a conflict): the closure decides per plan.
     /// `apply` reports every change applied on success; the journal is empty so restore is a no-op.
     /// `apply_calls` counts invocations so a test can assert the happy path adds no overhead.
     struct MockWriter {
         resolves: ResolveOracle,
-        spawn_fails: bool,
+        fault: Option<Fault>,
+        reject_error: RejectError,
         apply_calls: AtomicUsize,
     }
 
@@ -196,9 +217,21 @@ mod tests {
         fn new(resolves: impl Fn(&[String]) -> bool + Send + Sync + 'static) -> Self {
             MockWriter {
                 resolves: Box::new(resolves),
-                spawn_fails: false,
+                fault: None,
+                reject_error: RejectError::Tool,
                 apply_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn stale_lock(resolves: impl Fn(&[String]) -> bool + Send + Sync + 'static) -> Self {
+            MockWriter {
+                reject_error: RejectError::StaleLock,
+                ..MockWriter::new(resolves)
+            }
+        }
+
+        fn apply_calls(&self) -> usize {
+            self.apply_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -219,10 +252,20 @@ mod tests {
             _journal: &ProjectMutationJournal,
         ) -> Result<ApplyReport> {
             self.apply_calls.fetch_add(1, Ordering::SeqCst);
-            if self.spawn_fails {
-                return Err(CoreError::ToolSpawn {
-                    tool: "mock".into(),
-                    detail: "binary missing".into(),
+            if let Some(fault) = &self.fault {
+                return Err(match fault {
+                    Fault::Spawn => CoreError::ToolSpawn {
+                        tool: "mock".into(),
+                        detail: "binary missing".into(),
+                    },
+                    Fault::Environment => CoreError::Tool {
+                        tool: "pnpm".into(),
+                        termination: ToolTermination::ExitCode(1),
+                        stderr: "pnpm: unable to open database file".into(),
+                    },
+                    Fault::Filesystem => {
+                        CoreError::Filesystem("manifest is read-only (os error 30)".into())
+                    }
                 });
             }
             let names: Vec<String> = plan
@@ -236,10 +279,15 @@ mod tests {
                     skipped: Vec::new(),
                 })
             } else {
-                Err(CoreError::Tool {
-                    tool: "mock".into(),
-                    termination: ToolTermination::ExitCode(1),
-                    stderr: "unsatisfiable".into(),
+                Err(match self.reject_error {
+                    RejectError::Tool => CoreError::Tool {
+                        tool: "mock".into(),
+                        termination: ToolTermination::ExitCode(1),
+                        stderr: "unsatisfiable".into(),
+                    },
+                    RejectError::StaleLock => CoreError::StaleLock(
+                        "pnpm-lock.yaml importer apps/admin dependency vite: version 7.3.5 does not satisfy range ^6".into(),
+                    ),
                 })
             }
         }
@@ -281,7 +329,7 @@ mod tests {
 
         assert_eq!(names(&report.applied), names(&plan.changes));
         assert!(report.skipped.is_empty());
-        assert_eq!(writer.apply_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.apply_calls(), 1);
     }
 
     #[tokio::test]
@@ -311,6 +359,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_lock_candidate_is_isolated_and_the_rest_apply() {
+        // A stale lock from a trial resolve is a property of that candidate set, not the local machine.
+        // The recovery oracle must bisect it just like an unsatisfiable resolve, so one pnpm importer
+        // mismatch does not turn the whole workspace into held candidates.
+        let writer = MockWriter::stale_lock(|names| !names.iter().any(|name| name == "vite"));
+        let (_dir, project) = temp_project();
+        let plan = plan(&["a", "vite", "b"]);
+        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
+
+        let report = apply_resilient(&writer, &project, &plan, &journal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            names(&report.applied),
+            ["a", "b"].iter().map(ToString::to_string).collect()
+        );
+        assert_eq!(
+            skipped_names(&report),
+            std::iter::once("vite".to_string()).collect()
+        );
+        assert!(
+            writer.apply_calls() > 1,
+            "stale lock must be bisected, not propagated as a local fault"
+        );
+    }
+
+    #[tokio::test]
     async fn multiple_unfetchable_candidates_are_all_isolated() {
         let writer =
             MockWriter::new(|names| !names.iter().any(|n| n == "colors" || n == "left-pad"));
@@ -332,6 +408,38 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_resolving_half_is_not_displaced_by_a_later_conflicting_candidate() {
+        // The left half (`a`, `b`) resolves together. The right half contains one candidate (`r`) that
+        // is valid alone but conflicts with the accepted left half, plus one irreducible failure
+        // (`bad`). A recovery scheduler that isolates `bad` before accepting the known-good left half
+        // can wrongly keep `r` and hold both `a` and `b`; a real-workspace run surfaced exactly that
+        // as many false `blocked` rows. The left half must keep priority so the larger satisfiable
+        // subset lands.
+        let writer = MockWriter::new(|names| {
+            let contains_bad = names.iter().any(|name| name == "bad");
+            let contains_r = names.iter().any(|name| name == "r");
+            let contains_left = names.iter().any(|name| name == "a" || name == "b");
+            !(contains_bad || contains_r && contains_left)
+        });
+        let (_dir, project) = temp_project();
+        let plan = plan(&["a", "b", "r", "bad"]);
+        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
+
+        let report = apply_resilient(&writer, &project, &plan, &journal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            names(&report.applied),
+            ["a", "b"].into_iter().map(String::from).collect()
+        );
+        assert_eq!(
+            skipped_names(&report),
+            ["bad", "r"].into_iter().map(String::from).collect()
         );
     }
 
@@ -379,10 +487,14 @@ mod tests {
         assert_eq!(skipped_names(&report), names(&plan.changes));
     }
 
-    #[tokio::test]
-    async fn a_spawn_failure_propagates_without_bisecting() {
-        let mut writer = MockWriter::new(|_| true);
-        writer.spawn_fails = true;
+    /// Drive `writer` (pre-configured with one injected fault) through `apply_resilient` and assert
+    /// the error propagates verbatim in exactly one apply — no bisection. `apply` returns the injected
+    /// fault before it consults the resolve oracle, so `apply_calls() == 1` is what proves recovery
+    /// never ran.
+    async fn assert_propagates_without_bisecting(
+        writer: MockWriter,
+        expected: impl Fn(&CoreError) -> bool,
+    ) {
         let (_dir, project) = temp_project();
         let plan = plan(&["a", "b"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
@@ -390,10 +502,45 @@ mod tests {
         let result = apply_resilient(&writer, &project, &plan, &journal).await;
 
         assert!(
-            result.is_err(),
-            "a missing binary must propagate, not bisect"
+            matches!(&result, Err(err) if expected(err)),
+            "a local failure must propagate, not mark candidates held: {result:?}"
         );
-        // Exactly one apply: the first attempt errored as a spawn failure, no recovery trials.
-        assert_eq!(writer.apply_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.apply_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_failure_propagates_without_bisecting() {
+        let mut writer = MockWriter::new(|_| true);
+        writer.fault = Some(Fault::Spawn);
+        assert_propagates_without_bisecting(writer, |err| {
+            matches!(err, CoreError::ToolSpawn { .. })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_tool_environment_failure_propagates_without_bisecting() {
+        let mut writer = MockWriter::new(|_| {
+            panic!("environment failure should not consult the resolve oracle")
+        });
+        writer.fault = Some(Fault::Environment);
+        assert_propagates_without_bisecting(writer, |err| {
+            matches!(err, CoreError::Tool { stderr, .. } if stderr.contains("unable to open database file"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_structured_local_failure_propagates_without_bisecting() {
+        // A typed local fault (a read-only manifest surfacing as `CoreError::Filesystem`) is not a
+        // resolver-graph decision, so it must propagate rather than be bisected into an all-held report.
+        let mut writer =
+            MockWriter::new(|_| panic!("a filesystem fault should not consult the resolve oracle"));
+        writer.fault = Some(Fault::Filesystem);
+        assert_propagates_without_bisecting(
+            writer,
+            |err| matches!(err, CoreError::Filesystem(detail) if detail.contains("read-only")),
+        )
+        .await;
     }
 }

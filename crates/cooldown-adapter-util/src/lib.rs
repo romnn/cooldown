@@ -109,15 +109,19 @@ pub fn build_registry_releases(
     releases
 }
 
-/// Map a non-spawn apply error to a resolver-conflict skip.
+/// Map an apply error to a resolver-conflict skip, unless it reflects a broken local environment.
 ///
-/// Spawn failures stay fatal because the adapter could not even run the underlying tool.
+/// A broken environment — the tool could not be spawned, a filesystem/lock fault, or a spawned tool
+/// that failed because its runtime/storage is broken — stays fatal, because the adapter could not
+/// reliably ask the underlying resolver for a dependency-graph decision. Only a genuine resolver
+/// rejection becomes a per-candidate [`SkipReason::ResolverConflict`].
 ///
 /// # Errors
 ///
-/// Returns the original [`CoreError`] when the underlying tool could not be spawned at all.
+/// Returns the original [`CoreError`] when it is a [local environment
+/// failure](CoreError::is_local_environment_failure) rather than a resolver conflict.
 pub fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipped> {
-    if error.is_tool_spawn_failure() {
+    if error.is_local_environment_failure() {
         return Err(error);
     }
     Ok(Skipped {
@@ -168,8 +172,23 @@ pub fn verify_current_unknown(lockfile: &str) -> LockVerifyReport {
 
 #[cfg(test)]
 mod reaching_tests {
-    use super::reaching_roots;
+    use super::{reaching_roots, skipped_on_apply_error};
+    use cooldown_core::{
+        Change, CoreError, PackageId, ToolId, ToolTermination, UpdateKind, Version,
+    };
     use std::collections::HashSet;
+
+    fn change() -> Change {
+        Change {
+            package: PackageId::new(ToolId("mock"), "dep".to_string(), None),
+            from: Version::new("1.0.0"),
+            to: Version::new("2.0.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        }
+    }
 
     #[test]
     fn finds_roots_that_reach_a_transitive_target() {
@@ -188,5 +207,19 @@ mod reaching_tests {
         // Cycles are handled (the visited set bounds the walk).
         let cyclic = [("a", "b"), ("b", "c"), ("c", "b")];
         assert_eq!(reaching_roots(cyclic, &roots, "c"), vec!["a"]);
+    }
+
+    #[test]
+    fn local_tool_environment_failures_do_not_become_resolver_skips() {
+        let err = CoreError::Tool {
+            tool: "pnpm".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "pnpm: unable to open database file".into(),
+        };
+
+        assert!(matches!(
+            skipped_on_apply_error(&change(), err),
+            Err(CoreError::Tool { .. })
+        ));
     }
 }

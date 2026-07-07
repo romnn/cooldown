@@ -3,7 +3,7 @@
 //! merely re-pins a dependency and (optionally) installs/locks the resolved graph.
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, Result, ToolTermination, VerifyReport};
+use cooldown_core::{CoreError, Result, ToolTermination, VerifyReport, failure_detail};
 use tokio::process::Command;
 
 /// A handle to one package manager binary (e.g. `bundle`, `mix`, `mvn`). The binary defaults to
@@ -57,7 +57,7 @@ impl Driver {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -80,7 +80,7 @@ impl Driver {
             detail: if out.status.success() {
                 ok_detail.to_string()
             } else {
-                String::from_utf8_lossy(&out.stderr).into_owned()
+                failure_detail(&out)
             },
         })
     }

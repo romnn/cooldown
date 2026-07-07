@@ -4,7 +4,7 @@
 
 use camino::Utf8Path;
 use cooldown_core::{
-    CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, VerifyReport,
+    CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, VerifyReport, failure_detail,
 };
 use tokio::process::Command;
 
@@ -52,7 +52,7 @@ impl NodeCmd {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -75,7 +75,7 @@ impl NodeCmd {
             detail: if out.status.success() {
                 ok_detail.to_string()
             } else {
-                String::from_utf8_lossy(&out.stderr).into_owned()
+                failure_detail(&out)
             },
         })
     }
@@ -107,19 +107,4 @@ impl NodeCmd {
             },
         })
     }
-}
-
-fn failure_detail(out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !stdout.is_empty() {
-        return stdout;
-    }
-    format!(
-        "package manager exited with {}",
-        ToolTermination::from_exit_status(out.status)
-    )
 }

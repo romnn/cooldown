@@ -608,6 +608,9 @@ impl<L: NodeLock> NpmTool<L> {
         }
 
         let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
+            return Err(CoreError::StaleLock(detail));
+        }
         let after = locked_versions::<L>(&after_content);
         // Per-importer resolved versions, so a candidate's landing is judged at *its* member rather
         // than the name's newest copy — the multi-version float leaves a lower line short of a
@@ -751,6 +754,21 @@ impl<L: NodeLock> NpmTool<L> {
         };
         self.cmd.run(&project.root, &args).await
     }
+}
+
+/// The post-resolve lock inconsistency, but only when this resolve introduced it.
+///
+/// A mismatch already present in the pre-apply lock (e.g. a pnpm `overrides` entry that legally pins
+/// a direct dependency outside its declared range — `--frozen-lockfile` accepts that via the lock's
+/// `overrides:` section, which the cheap check does not read) must not fail apply: every recovery
+/// trial would fail identically and the run would misreport all candidates as held. The before/after
+/// gate also absorbs any node-semver vs rust-semver divergence: whatever the check mis-judges, it
+/// mis-judges identically on both sides.
+fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Option<String> {
+    let detail = L::lock_consistency_error(after)?;
+    before
+        .is_none_or(|content| L::lock_consistency_error(content).is_none())
+        .then_some(detail)
 }
 
 /// Names workspace importers DECLARE on more than one distinct line — a genuine split that must be
@@ -1094,6 +1112,42 @@ mod tests {
         let versions = locked_versions::<Pnpm>(lock);
         assert_eq!(versions.get("foo").map(String::as_str), Some("2.0.0"));
         assert_eq!(versions.get("bar").map(String::as_str), Some("3.1.0"));
+    }
+
+    #[test]
+    fn lock_inconsistency_pre_existing_before_the_resolve_is_not_charged_to_it() {
+        // `vite` resolved at 7.3.5 against a `^6` specifier — inconsistent.
+        let stale = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/admin:
+                dependencies:
+                  vite:
+                    specifier: ^6
+                    version: 7.3.5(@types/node@22.19.20)
+        "};
+        // Same importer, consistent.
+        let clean = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/admin:
+                dependencies:
+                  vite:
+                    specifier: ^6
+                    version: 6.4.3(@types/node@22.19.20)
+        "};
+
+        // The resolve introduced the mismatch (clean or absent before) -> surfaces.
+        assert!(new_lock_inconsistency::<Pnpm>(Some(clean), stale).is_some());
+        assert!(new_lock_inconsistency::<Pnpm>(None, stale).is_some());
+        // The mismatch predates the resolve (e.g. an overrides-pinned direct dep) -> suppressed.
+        assert_eq!(new_lock_inconsistency::<Pnpm>(Some(stale), stale), None);
+        // A consistent after-lock is never an error.
+        assert_eq!(new_lock_inconsistency::<Pnpm>(Some(stale), clean), None);
     }
 
     #[test]

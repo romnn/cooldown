@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `uv` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, ToolTermination, VerifyReport};
+use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use tokio::process::Command;
 
 /// The `--exclude-newer <window>` argument pair for a resolution cutoff, or empty when `None`. The
@@ -87,7 +87,7 @@ impl Uv {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -124,7 +124,7 @@ impl Uv {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: stderr.into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -199,7 +199,7 @@ impl Uv {
             detail: if out.status.success() {
                 "uv sync succeeded".into()
             } else {
-                String::from_utf8_lossy(&out.stderr).into_owned()
+                failure_detail(&out)
             },
         })
     }

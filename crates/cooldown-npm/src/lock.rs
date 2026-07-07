@@ -107,6 +107,15 @@ pub trait NodeLock: Send + Sync + 'static {
         None
     }
 
+    /// A cheap lockfile self-consistency check after a mutating resolve.
+    ///
+    /// `None` means the adapter has no local check beyond the package manager's final frozen-lock
+    /// verification.
+    #[must_use]
+    fn lock_consistency_error(_content: &str) -> Option<String> {
+        None
+    }
+
     /// The driver args that move **only** the lock to an exact, already-in-range `version`, leaving
     /// the declared `package.json` range untouched — the lock-only path for `RewriteMode::Auto`.
     ///
@@ -436,6 +445,10 @@ impl NodeLock for Pnpm {
         Some(args)
     }
 
+    fn lock_consistency_error(content: &str) -> Option<String> {
+        pnpm_lock_consistency_error(content)
+    }
+
     fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {
         // `pnpm update <name>@<version>` re-pins the lock to exactly that version; `--no-save` keeps
         // the `package.json` range as the author wrote it, and `--lockfile-only` skips node_modules.
@@ -551,17 +564,22 @@ const DIRECT_GROUPS: [&str; 4] = [
     "peerDependencies",
 ];
 
-/// Maps each resolved `(name, version)` dependency to the workspace member importers that declare it,
-/// read from `pnpm-lock.yaml`'s `importers:` section. The resolved `version:` line under each
-/// dependency gives the exact version (its `(peer)` suffix stripped to match the `packages:` keys);
-/// internal `link:`/`file:`/`workspace:` versions are skipped — they are not registry packages.
-/// Importer paths (the workspace root is `.`) name the source packages.
-fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<String>> {
-    let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
+/// Walks the `importers:` section of a pnpm lockfile and calls `visit` once per direct-dependency
+/// entry with `(importer_path, dep_name, specifier, version)`, in file order. `specifier`/`version`
+/// are the entry's unquoted scalar values (`None` when the entry lacks that line). Entry-level
+/// delivery is order-agnostic within the entry, so consumers need no specifier-before-version
+/// assumption. The four importer parsers share this so the indentation state machine lives once.
+fn walk_pnpm_importer_entries<'a>(
+    content: &'a str,
+    mut visit: impl FnMut(&'a str, &'a str, Option<&'a str>, Option<&'a str>),
+) {
     let mut in_importers = false;
-    let mut member: Option<String> = None;
+    let mut member: Option<&str> = None;
     let mut in_group = false;
-    let mut dep_name: Option<String> = None;
+    let mut dep_name: Option<&str> = None;
+    let mut specifier: Option<&str> = None;
+    let mut version: Option<&str> = None;
+
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -570,46 +588,85 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
         let trimmed = line.trim();
         match indent {
             0 => {
+                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
                 in_importers = trimmed == "importers:";
                 member = None;
                 in_group = false;
                 dep_name = None;
+                specifier = None;
+                version = None;
             }
             2 if in_importers => {
-                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')).to_string());
+                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')));
                 in_group = false;
                 dep_name = None;
+                specifier = None;
+                version = None;
             }
             4 if in_importers => {
+                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
                 in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
                 dep_name = None;
+                specifier = None;
+                version = None;
             }
             6 if in_importers && in_group => {
+                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
                 let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
-                dep_name = (!name.is_empty()).then(|| name.to_string());
+                dep_name = (!name.is_empty()).then_some(name);
+                specifier = None;
+                version = None;
             }
             8 if in_importers && in_group => {
-                if let (Some(member), Some(name)) = (member.as_ref(), dep_name.as_ref())
-                    && let Some(raw) = trimmed.strip_prefix("version:")
-                {
-                    let value = unquote_yaml_scalar(raw);
-                    if !value.starts_with("link:")
-                        && !value.starts_with("file:")
-                        && !value.starts_with("workspace:")
-                    {
-                        // Strip the `(peer@x)` suffix so the version matches the `packages:` keys.
-                        let version = unquote_yaml_scalar(value.split('(').next().unwrap_or(value));
-                        if !version.is_empty() {
-                            map.entry((name.clone(), version.to_string()))
-                                .or_default()
-                                .push(member.clone());
-                        }
-                    }
+                if let Some(raw) = trimmed.strip_prefix("specifier:") {
+                    specifier = Some(unquote_yaml_scalar(raw));
+                } else if let Some(raw) = trimmed.strip_prefix("version:") {
+                    version = Some(unquote_yaml_scalar(raw));
                 }
             }
             _ => {}
         }
     }
+    flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+}
+
+fn flush_pnpm_importer_entry<'a>(
+    member: Option<&'a str>,
+    dep_name: Option<&'a str>,
+    specifier: Option<&'a str>,
+    version: Option<&'a str>,
+    visit: &mut impl FnMut(&'a str, &'a str, Option<&'a str>, Option<&'a str>),
+) {
+    if let (Some(member), Some(name)) = (member, dep_name) {
+        visit(member, name, specifier, version);
+    }
+}
+
+/// Maps each resolved `(name, version)` dependency to the workspace member importers that declare it,
+/// read from `pnpm-lock.yaml`'s `importers:` section. The resolved `version:` line under each
+/// dependency gives the exact version (its `(peer)` suffix stripped to match the `packages:` keys);
+/// internal `link:`/`file:`/`workspace:` versions are skipped — they are not registry packages.
+/// Importer paths (the workspace root is `.`) name the source packages.
+fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<String>> {
+    let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    walk_pnpm_importer_entries(content, |member, name, _specifier, version| {
+        let Some(value) = version else {
+            return;
+        };
+        if !value.starts_with("link:")
+            && !value.starts_with("file:")
+            && !value.starts_with("workspace:")
+        {
+            // Strip the `(peer@x)` suffix so the version matches the `packages:` keys.
+            let version = value.split('(').next().unwrap_or(value);
+            if !version.is_empty() {
+                map.entry((name.to_string(), version.to_string()))
+                    .or_default()
+                    .push(member.to_string());
+            }
+        }
+    });
     map
 }
 
@@ -632,57 +689,71 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
 fn parse_pnpm_importer_specifiers(content: &str) -> HashMap<String, HashSet<String>> {
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     let mut recorded: HashSet<(String, String)> = HashSet::new();
-    let mut in_importers = false;
-    let mut member: Option<String> = None;
-    let mut in_group = false;
-    let mut dep_name: Option<String> = None;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
+    walk_pnpm_importer_entries(content, |member, name, specifier, _version| {
+        let Some(specifier) = specifier else {
+            return;
+        };
+        // A semver range never contains `:`; every protocol/alias form (`workspace:`, `catalog:`,
+        // `npm:`, `git+…`, a URL) does, so the colon test keeps only ranges.
+        if !specifier.is_empty()
+            && !specifier.contains(':')
+            && recorded.insert((member.to_string(), name.to_string()))
+        {
+            map.entry(name.to_string())
+                .or_default()
+                .insert(specifier.to_string());
         }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => {
-                in_importers = trimmed == "importers:";
-                member = None;
-                in_group = false;
-                dep_name = None;
-            }
-            2 if in_importers => {
-                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')).to_string());
-                in_group = false;
-                dep_name = None;
-            }
-            4 if in_importers => {
-                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
-                dep_name = None;
-            }
-            6 if in_importers && in_group => {
-                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
-                dep_name = (!name.is_empty()).then(|| name.to_string());
-            }
-            8 if in_importers && in_group => {
-                if let (Some(member), Some(name)) = (member.as_ref(), dep_name.as_ref())
-                    && let Some(raw) = trimmed.strip_prefix("specifier:")
-                {
-                    let specifier = unquote_yaml_scalar(raw);
-                    // A semver range never contains `:`; every protocol/alias form (`workspace:`,
-                    // `catalog:`, `npm:`, `git+…`, a URL) does, so the colon test keeps only ranges.
-                    if !specifier.is_empty()
-                        && !specifier.contains(':')
-                        && recorded.insert((member.clone(), name.clone()))
-                    {
-                        map.entry(name.clone())
-                            .or_default()
-                            .insert(specifier.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    });
     map
+}
+
+fn pnpm_lock_consistency_error(content: &str) -> Option<String> {
+    let mut error = None;
+    walk_pnpm_importer_entries(content, |member, name, specifier, version| {
+        if error.is_none() {
+            error = pnpm_importer_entry_error(member, name, specifier, version);
+        }
+    });
+    error
+}
+
+/// Validates one pnpm importer entry with a deliberately one-way semver approximation.
+///
+/// The Rust `semver` crate is not node-semver. Forms it cannot parse (`||` unions, hyphen ranges
+/// `1.2 - 3.4`, space-separated comparator sets, dist tags like `latest`) fail
+/// `VersionReq::parse` and skip the check, never causing a false flag. The one known semantic
+/// divergence is a bare `6.0.0`: node-semver treats it as exact, while Rust semver treats it as
+/// caret, so a real mismatch can be missed. Overall, divergences can only under-report stale locks;
+/// they must never mark a healthy lock stale.
+fn pnpm_importer_entry_error(
+    member: &str,
+    name: &str,
+    specifier: Option<&str>,
+    version: Option<&str>,
+) -> Option<String> {
+    let specifier = specifier?.trim();
+    let raw_version = version?.trim();
+    if specifier.is_empty()
+        || specifier.contains(':')
+        || raw_version.starts_with("link:")
+        || raw_version.starts_with("file:")
+        || raw_version.starts_with("workspace:")
+    {
+        return None;
+    }
+    let version = raw_version.split('(').next().unwrap_or(raw_version);
+    let Ok(requirement) = semver::VersionReq::parse(specifier) else {
+        return None;
+    };
+    let Ok(version) = semver::Version::parse(version) else {
+        return None;
+    };
+    if requirement.matches(&version) {
+        return None;
+    }
+    Some(format!(
+        "pnpm-lock.yaml importer {member} dependency {name}: version {version} does not satisfy range {specifier}"
+    ))
 }
 
 /// Maps each dependency name to the workspace member packages that declare it, read from
@@ -731,63 +802,24 @@ fn is_exact_npm_specifier(specifier: &str) -> bool {
 fn parse_pnpm_exact_pins(content: &str) -> HashSet<(String, String)> {
     let mut total: HashMap<(String, String), usize> = HashMap::new();
     let mut exact: HashMap<(String, String), usize> = HashMap::new();
-    let mut in_importers = false;
-    let mut in_group = false;
-    let mut dep_name: Option<String> = None;
-    let mut specifier: Option<String> = None;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => {
-                in_importers = trimmed == "importers:";
-                in_group = false;
-                dep_name = None;
-                specifier = None;
-            }
-            2 if in_importers => {
-                in_group = false;
-                dep_name = None;
-                specifier = None;
-            }
-            4 if in_importers => {
-                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
-                dep_name = None;
-                specifier = None;
-            }
-            6 if in_importers && in_group => {
-                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
-                dep_name = (!name.is_empty()).then(|| name.to_string());
-                specifier = None;
-            }
-            8 if in_importers && in_group => {
-                if let Some(raw) = trimmed.strip_prefix("specifier:") {
-                    specifier = Some(unquote_yaml_scalar(raw).to_string());
-                } else if let Some(raw) = trimmed.strip_prefix("version:")
-                    && let Some(name) = dep_name.as_ref()
-                {
-                    let value = unquote_yaml_scalar(raw);
-                    if !value.starts_with("link:")
-                        && !value.starts_with("file:")
-                        && !value.starts_with("workspace:")
-                    {
-                        let version = unquote_yaml_scalar(value.split('(').next().unwrap_or(value));
-                        if !version.is_empty() {
-                            let key = (name.clone(), version.to_string());
-                            *total.entry(key.clone()).or_insert(0) += 1;
-                            if specifier.as_deref().is_some_and(is_exact_npm_specifier) {
-                                *exact.entry(key).or_insert(0) += 1;
-                            }
-                        }
-                    }
+    walk_pnpm_importer_entries(content, |_member, name, specifier, version| {
+        let Some(value) = version else {
+            return;
+        };
+        if !value.starts_with("link:")
+            && !value.starts_with("file:")
+            && !value.starts_with("workspace:")
+        {
+            let version = value.split('(').next().unwrap_or(value);
+            if !version.is_empty() {
+                let key = (name.to_string(), version.to_string());
+                *total.entry(key.clone()).or_insert(0) += 1;
+                if specifier.is_some_and(is_exact_npm_specifier) {
+                    *exact.entry(key).or_insert(0) += 1;
                 }
             }
-            _ => {}
         }
-    }
+    });
     total
         .into_iter()
         .filter(|(key, count)| exact.get(key) == Some(count))
@@ -996,6 +1028,55 @@ mod tests {
                 ("chalk".into(), "4.0.0".into()),
             ])
         );
+    }
+
+    #[test]
+    fn pnpm_lock_consistency_flags_importer_versions_outside_their_specifier() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/admin:
+                peerDependencies:
+                  vite:
+                    specifier: ^6
+                    version: 7.3.5(@types/node@22.19.20)
+
+            packages:
+
+              vite@7.3.5:
+                resolution: {integrity: sha512-x}
+        "};
+
+        let error = pnpm_lock_consistency_error(lock).expect("stale importer");
+
+        assert!(error.contains("apps/admin"), "{error}");
+        assert!(error.contains("vite"), "{error}");
+        assert!(error.contains("7.3.5"), "{error}");
+        assert!(error.contains("^6"), "{error}");
+    }
+
+    #[test]
+    fn pnpm_lock_consistency_accepts_matching_peer_suffixed_versions() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/admin:
+                peerDependencies:
+                  vite:
+                    specifier: ^6
+                    version: 6.4.3(@types/node@22.19.20)
+
+            packages:
+
+              vite@6.4.3:
+                resolution: {integrity: sha512-x}
+        "};
+
+        assert_eq!(pnpm_lock_consistency_error(lock), None);
     }
 
     #[test]

@@ -401,8 +401,8 @@ impl CargoTool {
     /// `cargo update -p A -p B --precise V` call (cargo's `--precise` takes one version but multiple
     /// `[SPEC]`s), and issue the distinct-version groups together. A group cargo rejects (a `=`-pin or
     /// resolver conflict blocks the precise move) is not fatal — the candidate simply stays where the
-    /// resolver placed it, and the before/after lock diff reports it as held. Only a `cargo` spawn
-    /// failure aborts.
+    /// resolver placed it, and the before/after lock diff reports it as held. Only a spawn failure or
+    /// a broken local environment (full disk, read-only tree) aborts.
     async fn pin_batch(&self, project: &Project, changes: &[Change]) -> Result<()> {
         let mut by_target: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for change in changes {
@@ -417,12 +417,13 @@ impl CargoTool {
         for (target, specs) in by_target {
             // A precise group cargo rejected (a `=`-pin or resolver conflict blocked the move) is not
             // fatal: the candidates stay where the resolver placed them and the full-lock diff reports
-            // each as held. Only a `cargo` spawn failure aborts.
+            // each as held. A broken local environment (spawn failure, full disk, read-only tree)
+            // aborts — swallowing it here would misreport a disk-full run as "every candidate held".
             if let Err(err) = self
                 .cargo
                 .update_precise_many(&project.root, &specs, &target)
                 .await
-                && err.is_tool_spawn_failure()
+                && err.is_local_environment_failure()
             {
                 return Err(err);
             }
@@ -546,10 +547,11 @@ impl ToolWrite for CargoTool {
         match self.whole_graph_resolve(project, plan).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict, an unfetchable
-            // version, an unreadable lock between rounds). Propagate so the caller's `apply_resilient`
-            // can isolate the offending candidate(s) and apply the rest, instead of holding every
-            // candidate. The caller restores the journal, so no partial lock is kept.
+            // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
+            // version). Propagate so the caller's `apply_resilient` can isolate the offending
+            // candidate(s) and apply the rest, instead of holding every candidate. Local environment
+            // failures propagate through `apply_resilient` without bisection. The caller restores the
+            // journal, so no partial lock is kept.
             Err(err) => return Err(err),
         }
 

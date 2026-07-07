@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `cargo` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport};
+use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure_detail};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
@@ -393,7 +393,7 @@ impl Cargo {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -571,7 +571,7 @@ impl Cargo {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
                 termination: ToolTermination::from_exit_status(out.status),
-                stderr: stderr.into_owned(),
+                stderr: failure_detail(&out),
             })
         }
     }
@@ -610,7 +610,7 @@ impl Cargo {
     /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].
     ///
     /// A failed build is **not** an error: it is surfaced as `VerifyReport { ok: false, .. }` with
-    /// the compiler's stderr in `detail`.
+    /// the compiler's failure detail in `detail`.
     ///
     /// # Errors
     ///
@@ -622,7 +622,7 @@ impl Cargo {
             detail: if out.status.success() {
                 "cargo build succeeded".into()
             } else {
-                String::from_utf8_lossy(&out.stderr).into_owned()
+                failure_detail(&out)
             },
         })
     }

@@ -34,7 +34,6 @@ strip = true
 warnings = { level = "warn", priority = -1 }
 unsafe_code = "deny"
 unused_must_use = "deny"
-# Warn-only: keep iteration fast during development; CI/review still adds the docs.
 missing_docs = "warn"
 
 [workspace.lints.clippy]
@@ -47,13 +46,17 @@ unreachable = "deny"
 unimplemented = "deny"
 todo = "deny"
 indexing_slicing = "deny"
+missing_errors_doc = "warn"
+await_holding_lock = "deny"
 # Every `#[allow(...)]` must carry a `reason = "..."` justifying the escape hatch.
 allow_attributes_without_reason = "deny"
 
+# Allowed
+map_unwrap_or = "allow"
+assigning_clones = "allow"
 struct_excessive_bools = "allow"
 
 [workspace.dependencies]
-# Internal crates
 cooldown-core = { path = "crates/cooldown-core" }
 cooldown-toml-util = { path = "crates/cooldown-toml-util" }
 cooldown-registry = { path = "crates/cooldown-registry" }
@@ -70,7 +73,6 @@ cooldown-pip = { path = "crates/cooldown-pip" }
 cooldown-conda = { path = "crates/cooldown-conda" }
 cooldown-swift = { path = "crates/cooldown-swift" }
 
-# External
 jiff = { version = "0.2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
