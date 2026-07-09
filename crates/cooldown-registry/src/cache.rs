@@ -5,6 +5,7 @@
 //! trusted — the stored value only ever ratchets later (younger), the conservative direction.
 
 use cooldown_core::CoreError;
+use cooldown_core::fs::{atomic_write, fnv1a_64};
 use jiff::Timestamp;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,21 +39,10 @@ impl CacheEntry {
     }
 }
 
-/// A deterministic 64-bit FNV-1a hash, used to derive stable cache filenames across runs (the std
-/// `DefaultHasher` is deterministic but we keep our own to be explicit and version-independent).
-fn fnv1a(s: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 fn entry_path(cache_dir: &Path, url: &str) -> PathBuf {
     cache_dir
         .join("http")
-        .join(format!("{:016x}.json", fnv1a(url)))
+        .join(format!("{:016x}.json", fnv1a_64(url)))
 }
 
 /// Reads the cached [`CacheEntry`] for `url` under `cache_dir`, if present and parseable.
@@ -63,7 +53,18 @@ fn entry_path(cache_dir: &Path, url: &str) -> PathBuf {
 pub fn read_entry(cache_dir: &Path, url: &str) -> Option<CacheEntry> {
     let path = entry_path(cache_dir, url);
     let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let entry: CacheEntry = serde_json::from_slice(&bytes).ok()?;
+    if entry.url == url {
+        Some(entry)
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            requested_url = url,
+            cached_url = entry.url,
+            "ignoring cache entry with mismatched URL provenance"
+        );
+        None
+    }
 }
 
 /// Writes `entry` to the cache under `cache_dir`, creating the `http` subdirectory as needed.
@@ -79,8 +80,7 @@ pub fn write_entry(cache_dir: &Path, entry: &CacheEntry) -> Result<(), CoreError
     }
     let bytes = serde_json::to_vec_pretty(entry)
         .map_err(|e| CoreError::Serialization(format!("serialize cache entry: {e}")))?;
-    std::fs::write(&path, bytes)?;
-    Ok(())
+    atomic_write(&path, &bytes)
 }
 
 /// The outcome of guarding an observed publish time against the monotonic floor.
@@ -134,10 +134,27 @@ impl PublishStore {
     #[must_use]
     pub fn load(cache_dir: &Path) -> Self {
         let path = cache_dir.join("publish-times.json");
-        let inner = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
-            .unwrap_or_default();
+        let inner = match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice::<HashMap<String, String>>(&bytes).unwrap_or_else(|error| {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "discarding corrupt publish-time store"
+                    );
+                    HashMap::new()
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "discarding unreadable publish-time store"
+                );
+                HashMap::new()
+            }
+        };
         PublishStore {
             path,
             inner: Mutex::new(inner),
@@ -192,8 +209,7 @@ impl PublishStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = serde_json::to_vec_pretty(&*map)
             .map_err(|e| CoreError::Serialization(format!("serialize publish store: {e}")))?;
-        std::fs::write(&self.path, bytes)?;
-        Ok(())
+        atomic_write(&self.path, &bytes)
     }
 }
 
@@ -244,5 +260,23 @@ mod tests {
         let got = read_entry(dir.path(), "https://example.com/x").unwrap();
         assert_eq!(got.body, "hello");
         assert_eq!(got.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn cache_read_rejects_mismatched_url_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = "https://example.com/victim";
+        let path = entry_path(dir.path(), requested);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let e = CacheEntry {
+            url: "https://example.com/attacker".into(),
+            fetched_at: "2026-06-17T00:00:00Z".into(),
+            etag: None,
+            status: 200,
+            body: "poison".into(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&e).unwrap()).unwrap();
+
+        assert!(read_entry(dir.path(), requested).is_none());
     }
 }

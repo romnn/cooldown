@@ -1,16 +1,18 @@
+use super::Window;
 use super::baseline::Baseline;
 use super::lock::ProjectLock;
-use super::model::Window;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
+use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, FetchContext,
-    LockVerifyReport, PatternGlob, PolicyLayer, PolicyStack, Project, Release, ReleaseFetcher,
-    ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext,
+    LockStatus, LockVerifyReport, PatternGlob, PolicyLayer, PolicyStack, Project, Release,
+    ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::sync::Arc;
 
 /// Per-project context: which tool, the detected project, its path relative to the repo root
@@ -42,6 +44,22 @@ pub enum Exit {
     /// `outdated --exit-code N` gate tripped (adoptable updates exist); the process exits with the
     /// caller-supplied code `N`. Distinct from the fixed taxonomy so CI can pick its own code.
     Gated(u8),
+}
+
+/// Whether a lock-refresh diagnostic lets the command continue or should skip the project.
+pub(crate) enum LockReportAction {
+    /// Continue evaluating the project.
+    Continue,
+    /// Skip this project after recording the diagnostic as an error.
+    Skip,
+}
+
+/// The shared classification of a lock-refresh report for read commands.
+pub(crate) struct LockReportOutcome {
+    /// The diagnostic to surface, absent only when the lock is current.
+    pub(crate) diagnostic: Option<Diagnostic>,
+    /// Whether the caller can keep evaluating this project.
+    pub(crate) action: LockReportAction,
 }
 
 impl Exit {
@@ -78,13 +96,11 @@ impl Exit {
 ///
 /// These are coarse "still working" lines, not the structured `tracing` log: they exist so a plain
 /// `cooldown outdated` isn't silent for ten seconds. They are suppressed entirely when `--log-level`
-/// is on (the log already narrates progress), routed to stderr under `--json` (so stdout stays pure
-/// JSON), and to stdout otherwise (alongside the pretty report).
+/// is on (the log already narrates progress) and otherwise routed to stderr so stdout stays the
+/// command report in every output mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Progress {
-    /// Emit to stdout (default human/pretty mode).
-    Stdout,
-    /// Emit to stderr (`--json` mode, to keep stdout machine-readable).
+    /// Emit to stderr.
     Stderr,
     /// Emit nothing (`--log-level` is on, so `tracing` covers it).
     #[default]
@@ -94,10 +110,14 @@ pub enum Progress {
 impl Progress {
     /// Print one progress note to the configured stream (a no-op when [`Progress::Silent`]).
     pub fn say(self, message: &str) {
-        match self {
-            Progress::Stdout => println!("{message}"),
-            Progress::Stderr => eprintln!("{message}"),
-            Progress::Silent => {}
+        let result = match self {
+            Progress::Stderr => writeln!(std::io::stderr().lock(), "{message}"),
+            Progress::Silent => return,
+        };
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            tracing::debug!(error = %error, "could not write progress message");
         }
     }
 }
@@ -150,6 +170,10 @@ pub struct RunOpts {
     /// Additional `[tool.<name>].exclude-packages` globs, keyed by canonical tool name — where the
     /// ecosystem's package-name format is known (`my-pkg` vs `@scope/my-pkg`).
     pub exclude_packages_by_tool: BTreeMap<String, Vec<String>>,
+    /// Compiled member-exclude globs populated by CLI setup; tests that mutate the raw fields
+    /// directly leave this empty and use the compile-on-demand fallback in `scope_dependencies`.
+    #[doc(hidden)]
+    pub compiled_excludes: Option<CompiledExcludes>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
     /// `--hide-pinned` (outdated): omit held rows (exact `==`/`=` pins and commit pins) from the
@@ -188,6 +212,9 @@ pub struct RunOpts {
     pub build: bool,
     /// `--dry-run`: resolve and print the plan; never mutate.
     pub dry_run: bool,
+    /// `--offline`: cache-only mode. Registry fetches are already constrained by the HTTP client;
+    /// app-layer probes that would spawn native resolvers also consult this.
+    pub offline: bool,
     /// `--exit-code N` (outdated): exit with `N` when adoptable updates exist (CI gate). `None`
     /// keeps `outdated` informational (always exit 0).
     pub outdated_exit_code: Option<u8>,
@@ -231,6 +258,105 @@ impl RunOpts {
             CandidateScope::CurrentMajorOnly
         }
     }
+
+    pub(crate) fn compile_excludes(&mut self) -> cooldown_core::Result<()> {
+        self.compiled_excludes = Some(CompiledExcludes::compile(
+            &self.exclude_folders,
+            &self.exclude_folders_by_tool,
+            &self.exclude_packages,
+            &self.exclude_packages_by_tool,
+        )?);
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct CompiledExcludes {
+    global_folders: Option<FolderExcludeSet>,
+    global_packages: Option<PackageExcludeSet>,
+    folders_by_tool: BTreeMap<String, FolderExcludeSet>,
+    packages_by_tool: BTreeMap<String, PackageExcludeSet>,
+}
+
+impl CompiledExcludes {
+    fn compile(
+        global_folders: &[String],
+        folders_by_tool: &BTreeMap<String, Vec<String>>,
+        global_packages: &[String],
+        packages_by_tool: &BTreeMap<String, Vec<String>>,
+    ) -> cooldown_core::Result<Self> {
+        let global_folders = compile_folder_excludes(global_folders)?;
+        let global_packages = compile_package_excludes(global_packages)?;
+        let folders_by_tool = folders_by_tool
+            .iter()
+            .map(|(tool, patterns)| {
+                compile_folder_excludes(patterns).map(|set| set.map(|set| (tool.clone(), set)))
+            })
+            .filter_map(transpose_some)
+            .collect::<cooldown_core::Result<BTreeMap<_, _>>>()?;
+        let packages_by_tool = packages_by_tool
+            .iter()
+            .map(|(tool, patterns)| {
+                compile_package_excludes(patterns).map(|set| set.map(|set| (tool.clone(), set)))
+            })
+            .filter_map(transpose_some)
+            .collect::<cooldown_core::Result<BTreeMap<_, _>>>()?;
+        Ok(Self {
+            global_folders,
+            global_packages,
+            folders_by_tool,
+            packages_by_tool,
+        })
+    }
+
+    fn has_for_tool(&self, tool: &str) -> bool {
+        self.global_folders.is_some()
+            || self.global_packages.is_some()
+            || self.folders_by_tool.contains_key(tool)
+            || self.packages_by_tool.contains_key(tool)
+    }
+
+    fn excludes_member(&self, tool: &str, member: &cooldown_core::MemberRef) -> bool {
+        let path = camino::Utf8Path::new(&member.path);
+        self.global_folders
+            .as_ref()
+            .is_some_and(|set| set.excludes_path(path))
+            || self
+                .folders_by_tool
+                .get(tool)
+                .is_some_and(|set| set.excludes_path(path))
+            || self
+                .global_packages
+                .as_ref()
+                .is_some_and(|set| set.excludes_name(&member.name))
+            || self
+                .packages_by_tool
+                .get(tool)
+                .is_some_and(|set| set.excludes_name(&member.name))
+    }
+}
+
+fn compile_folder_excludes(patterns: &[String]) -> cooldown_core::Result<Option<FolderExcludeSet>> {
+    if patterns.is_empty() {
+        Ok(None)
+    } else {
+        FolderExcludeSet::compile(patterns).map(Some)
+    }
+}
+
+fn compile_package_excludes(
+    patterns: &[String],
+) -> cooldown_core::Result<Option<PackageExcludeSet>> {
+    if patterns.is_empty() {
+        Ok(None)
+    } else {
+        PackageExcludeSet::compile(patterns).map(Some)
+    }
+}
+
+fn transpose_some<T, E>(result: Result<Option<T>, E>) -> Option<Result<T, E>> {
+    result.transpose()
 }
 
 /// The detected adapters, per-project policy, and the run's single `now`.
@@ -479,25 +605,28 @@ impl Workspace {
         // declaring member was excluded. Pruning the members before anything reads them means a kept
         // dep is attributed only to non-excluded packages — so its "used by" representative is never
         // an excluded package. A dep with no attributable members is left untouched.
-        let mut folders = opts.exclude_folders.clone();
-        let mut packages = opts.exclude_packages.clone();
-        if let Some(per_tool) = opts.exclude_folders_by_tool.get(pctx.tool.as_str()) {
-            folders.extend(per_tool.iter().cloned());
-        }
-        if let Some(per_tool) = opts.exclude_packages_by_tool.get(pctx.tool.as_str()) {
-            packages.extend(per_tool.iter().cloned());
-        }
-        if !folders.is_empty() || !packages.is_empty() {
-            let folder_excludes = crate::scan::FolderExcludeSet::compile(&folders)?;
-            let package_excludes = crate::scan::PackageExcludeSet::compile(&packages)?;
+        let compiled_fallback;
+        let excludes = if let Some(compiled) = &opts.compiled_excludes {
+            compiled
+        } else {
+            // Test-constructed RunOpts set the raw lists without calling `compile_excludes()`;
+            // compiling here keeps a single filtering algorithm instead of a duplicate branch.
+            compiled_fallback = CompiledExcludes::compile(
+                &opts.exclude_folders,
+                &opts.exclude_folders_by_tool,
+                &opts.exclude_packages,
+                &opts.exclude_packages_by_tool,
+            )?;
+            &compiled_fallback
+        };
+        let tool = pctx.tool.as_str();
+        if excludes.has_for_tool(tool) {
             deps.retain_mut(|dep| {
                 if dep.members.is_empty() {
                     return true;
                 }
-                dep.members.retain(|member| {
-                    !folder_excludes.excludes_path(camino::Utf8Path::new(&member.path))
-                        && !package_excludes.excludes_name(&member.name)
-                });
+                dep.members
+                    .retain(|member| !excludes.excludes_member(tool, member));
                 !dep.members.is_empty()
             });
         }
@@ -682,6 +811,38 @@ pub(crate) fn diag_from_error(
         diagnostic = diagnostic.with_package(package);
     }
     diagnostic
+}
+
+pub(crate) fn lock_report_outcome(
+    report: LockVerifyReport,
+    tool: ToolId,
+    project_label: &str,
+    manifest: &camino::Utf8Path,
+    allow_stale_lock: bool,
+) -> LockReportOutcome {
+    let kind = match report.status {
+        LockStatus::Current => {
+            return LockReportOutcome {
+                diagnostic: None,
+                action: LockReportAction::Continue,
+            };
+        }
+        LockStatus::Stale => DiagnosticKind::StaleLock,
+        LockStatus::Unknown => DiagnosticKind::LockUnknown,
+    };
+    let diagnostic = Diagnostic::new(kind, report.detail)
+        .with_tool(tool.as_str())
+        .with_project(project_label)
+        .with_path(manifest.as_str());
+    let action = if allow_stale_lock && report.status == LockStatus::Stale {
+        LockReportAction::Continue
+    } else {
+        LockReportAction::Skip
+    };
+    LockReportOutcome {
+        diagnostic: Some(diagnostic),
+        action,
+    }
 }
 
 #[cfg(test)]

@@ -248,9 +248,9 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
         "--dry-run must leave the lock byte-identical"
     );
     assert_eq!(
-        dry.lock_verified(),
+        dry.lock_status(),
         None,
-        "--dry-run never re-locks, so lockVerified is null"
+        "--dry-run never re-locks, so lockStatus is null"
     );
 }
 

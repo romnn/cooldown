@@ -8,6 +8,7 @@ pub mod config;
 pub mod duration;
 pub mod error;
 pub mod evaluate;
+pub mod fs;
 pub mod model;
 pub mod policy;
 pub mod ports;

@@ -1,13 +1,16 @@
 //! `outdated` — what could update, split into "adoptable now" vs "in cooldown". Reasons over the
 //! candidate set; informational, so per-dep failures never change the exit code.
 
-use super::{Exit, RunOpts, Workspace, age_days, diag_from_error, render_window};
+use super::{
+    Exit, LockReportAction, RunOpts, Workspace, age_days, diag_from_error, lock_report_outcome,
+    render_window,
+};
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport,
-    PackageId, Plan, Project, Release, ResolveKind, ResolveQuery, UpdateKind, Version, evaluate,
-    resolve,
+    Change, DepScope, Dependency, Diagnostic, LockVerifyReport, PackageId, Plan, Project, Release,
+    ResolveKind, ResolveQuery, UpdateKind, Version, evaluate, resolve,
 };
+use std::collections::HashMap;
 
 /// The result of `outdated`: every reported dependency split by status, plus diagnostics.
 ///
@@ -210,6 +213,14 @@ impl<'a> OutdatedRunner<'a> {
         if changes.is_empty() {
             return;
         }
+        if self.opts.offline {
+            tracing::debug!(
+                project = project_label,
+                tool = pctx.tool.as_str(),
+                "skipping upgrade-resolve verification in offline mode"
+            );
+            return;
+        }
         let Some(writer) = self.ws.mutator(pctx.tool) else {
             return;
         };
@@ -262,23 +273,26 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &'a super::ProjectCtx,
         project_label: &str,
     ) -> bool {
-        if report.status == LockStatus::Current {
-            return true;
-        }
-        let kind = match report.status {
-            LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
-            LockStatus::Unknown => DiagnosticKind::LockUnknown,
-        };
-        let diag = Diagnostic::new(kind, report.detail)
-            .with_tool(pctx.tool.as_str())
-            .with_project(project_label)
-            .with_path(pctx.project.manifest.as_str());
-        if self.opts.allow_stale_lock && report.status == LockStatus::Stale {
-            self.warnings.push(diag);
-            true
-        } else {
-            self.errors.push(diag);
-            false
+        let outcome = lock_report_outcome(
+            report,
+            pctx.tool,
+            project_label,
+            &pctx.project.manifest,
+            self.opts.allow_stale_lock,
+        );
+        match outcome.action {
+            LockReportAction::Continue => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.warnings.push(diagnostic);
+                }
+                true
+            }
+            LockReportAction::Skip => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.errors.push(diagnostic);
+                }
+                false
+            }
         }
     }
 
@@ -493,9 +507,32 @@ fn adoptable_change(tool: cooldown_core::ToolId, item: &OutdatedItem) -> Option<
     })
 }
 
+type HeldKey = (String, Option<String>, String);
+
+fn held_key(name: String, registry: Option<String>, current: String) -> HeldKey {
+    (name, registry, current)
+}
+
+fn held_key_for_change(change: &Change) -> HeldKey {
+    held_key(
+        change.package.name.clone(),
+        change.package.registry.clone(),
+        change.from.to_string(),
+    )
+}
+
+fn held_key_for_item(item: &OutdatedItem) -> HeldKey {
+    held_key(
+        item.name.clone(),
+        item.registry.clone(),
+        item.current.clone(),
+    )
+}
+
 /// Run the whole-graph upgrade resolve for `changes` against a throwaway copy of the project, and
 /// return the candidates the resolve could **not** land — `upgrade`'s held set — keyed by package
-/// name, each mapped to the blocker the resolve named (when distinct from the candidate itself).
+/// name, registry, and current version, each mapped to the blocker the resolve named (when distinct
+/// from the candidate itself).
 ///
 /// The resolve reuses [`ToolWrite::apply`] (the same path `upgrade` commits), so the held set matches
 /// `upgrade` by construction. It runs entirely inside a temporary directory copied from the project,
@@ -505,7 +542,7 @@ async fn resolve_held(
     project: &Project,
     changes: Vec<Change>,
     rewrite: cooldown_core::RewriteMode,
-) -> cooldown_core::Result<std::collections::HashMap<String, Option<String>>> {
+) -> cooldown_core::Result<HashMap<HeldKey, Option<String>>> {
     let copy = super::project_copy::ProjectCopy::create(project, &writer.resolve_inputs())?;
     let temp_project = &copy.project;
 
@@ -516,16 +553,16 @@ async fn resolve_held(
     let report =
         super::resilient_apply::apply_resilient(writer, temp_project, &plan, &journal).await?;
 
-    let mut held = std::collections::HashMap::new();
+    let mut held = HashMap::new();
     for skipped in report.skipped {
-        let candidate = skipped.change.package.name;
+        let candidate = skipped.change.package.name.clone();
         // Mirror the held-message policy: a blocker distinct from the candidate is named; the
         // candidate blaming itself is the generic "resolver rejected" form, so no blocker is surfaced.
         let blocker = skipped
             .offending
             .map(|package| package.name)
             .filter(|offender| *offender != candidate);
-        held.insert(candidate, blocker);
+        held.insert(held_key_for_change(&skipped.change), blocker);
     }
     Ok(held)
 }
@@ -533,15 +570,12 @@ async fn resolve_held(
 /// Re-classify every `adoptable` item the upgrade resolve could not land (`held`) as `blocked`,
 /// carrying the blocker the resolve named. An item the resolve landed (absent from `held`) keeps its
 /// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set.
-fn apply_held(
-    items: &mut [OutdatedItem],
-    held: &std::collections::HashMap<String, Option<String>>,
-) {
+fn apply_held(items: &mut [OutdatedItem], held: &HashMap<HeldKey, Option<String>>) {
     for item in items.iter_mut() {
         if item.status != OutdatedStatus::Adoptable {
             continue;
         }
-        if let Some(blocker) = held.get(&item.name) {
+        if let Some(blocker) = held.get(&held_key_for_item(item)) {
             item.status = OutdatedStatus::Blocked;
             item.blocked_by = blocker.clone();
         }
@@ -579,7 +613,7 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{adoptable_change, apply_held, resolve_held};
+    use super::{adoptable_change, apply_held, held_key_for_item, resolve_held};
     use crate::app::{OutdatedItem, OutdatedStatus, Window};
     use async_trait::async_trait;
     use cooldown_core::{
@@ -617,6 +651,7 @@ mod tests {
     /// without spawning a real resolver. It holds `held` (offending `holder`) and lands everything else.
     struct FakeWriter {
         held: &'static str,
+        held_current: &'static str,
         holder: &'static str,
     }
 
@@ -638,7 +673,7 @@ mod tests {
         ) -> Result<ApplyReport> {
             let mut report = ApplyReport::default();
             for change in &plan.changes {
-                if change.package.name == self.held {
+                if change.package.name == self.held && change.from.as_str() == self.held_current {
                     report.skipped.push(Skipped {
                         change: change.clone(),
                         reason: SkipReason::ResolverConflict,
@@ -703,6 +738,7 @@ mod tests {
         // stays adoptable: only the candidate the resolve could not place is re-classified.
         let writer = FakeWriter {
             held: "typer",
+            held_current: "0.25.1",
             holder: "huggingface-hub",
         };
         let (_dir, project) = temp_project();
@@ -720,10 +756,10 @@ mod tests {
 
         // The held set is exactly the candidate the resolve could not land, naming the blocker.
         assert_eq!(
-            held.get("typer"),
+            held.get(&held_key_for_item(&items[0])),
             Some(&Some("huggingface-hub".to_string()))
         );
-        assert!(!held.contains_key("requests"));
+        assert!(!held.contains_key(&held_key_for_item(&items[1])));
 
         apply_held(&mut items, &held);
         let typer = items.iter().find(|i| i.name == "typer").expect("typer");
@@ -737,5 +773,36 @@ mod tests {
             .expect("requests");
         assert_eq!(requests.status, OutdatedStatus::Adoptable);
         assert_eq!(requests.blocked_by, None);
+    }
+
+    #[tokio::test]
+    async fn held_candidate_does_not_block_same_package_at_a_different_current_version() {
+        let writer = FakeWriter {
+            held: "serde",
+            held_current: "0.9.0",
+            holder: "legacy-framework",
+        };
+        let (_dir, project) = temp_project();
+        let mut items = vec![
+            adoptable("serde", "0.9.0", "0.9.15"),
+            adoptable("serde", "1.0.188", "1.0.190"),
+        ];
+        let changes: Vec<_> = items
+            .iter()
+            .filter_map(|item| adoptable_change(UV, item))
+            .collect();
+        let held = resolve_held(&writer, &project, changes, RewriteMode::Auto)
+            .await
+            .expect("resolve");
+
+        assert!(held.contains_key(&held_key_for_item(&items[0])));
+        assert!(!held.contains_key(&held_key_for_item(&items[1])));
+
+        apply_held(&mut items, &held);
+
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        assert_eq!(items[0].blocked_by.as_deref(), Some("legacy-framework"));
+        assert_eq!(items[1].status, OutdatedStatus::Adoptable);
+        assert_eq!(items[1].blocked_by, None);
     }
 }

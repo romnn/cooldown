@@ -48,7 +48,7 @@ use serde::Serialize;
 ///     Vec::<OutdatedItem>::new(),
 /// );
 /// let json = to_json(&env)?;
-/// assert!(json.contains("\"schemaVersion\": 2"));
+/// assert!(json.contains("\"schemaVersion\": 3"));
 /// # Ok::<(), serde_json::Error>(())
 /// ```
 pub fn to_json<M: Serialize, S: Serialize, I: Serialize>(
@@ -107,7 +107,7 @@ mod tests {
         );
         let json = to_json(&env).expect("envelope serializes");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schemaVersion"], 2);
+        assert_eq!(v["schemaVersion"], 3);
         assert_eq!(v["command"], "outdated");
         assert_eq!(v["ok"], true);
         assert_eq!(v["items"][0]["adoptableTarget"], "v0.18.0");

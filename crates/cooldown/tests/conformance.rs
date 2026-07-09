@@ -1226,7 +1226,6 @@ async fn upgrade_warns_when_final_lock_currency_is_unknown() {
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.summary.errors, 0);
-    assert_eq!(out.meta.lock_verified, None);
     assert_eq!(out.meta.lock_status, Some(LockStatus::Unknown));
     assert!(
         out.warnings
@@ -1280,7 +1279,6 @@ async fn upgrade_honors_allow_stale_lock_after_apply() {
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.summary.errors, 0);
-    assert_eq!(out.meta.lock_verified, Some(false));
     assert_eq!(out.meta.lock_status, Some(LockStatus::Stale));
     assert!(
         out.warnings
@@ -2935,7 +2933,7 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
         !real_sentinel.as_std_path().exists(),
         "dry-run mutated the real project root"
     );
-    assert_eq!(dry.meta.lock_verified, None);
+    assert_eq!(dry.meta.lock_status, None);
 
     // The real run produces the identical held/blocked set — the two agree by construction.
     let (_real_dir2, real_root2) = tmp_root();

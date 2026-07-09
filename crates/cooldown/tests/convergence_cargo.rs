@@ -153,7 +153,11 @@ fn upgrade_converges_to_a_fixed_point() {
             .cooldown(&["upgrade", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
+    assert_eq!(
+        first.lock_status(),
+        Some("current"),
+        "first upgrade re-locks"
+    );
     let lock_after_first = fixture.read_bytes("Cargo.lock");
 
     // Second upgrade: already at the fixed point, so nothing moves and the lock is byte-identical.
@@ -308,9 +312,9 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
         "--dry-run must leave the lock byte-identical"
     );
     assert_eq!(
-        dry.lock_verified(),
+        dry.lock_status(),
         None,
-        "--dry-run never re-locks, so lockVerified is null"
+        "--dry-run never re-locks, so lockStatus is null"
     );
 }
 
@@ -431,7 +435,7 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         "fix should succeed: {}",
         fixture.cooldown(&["fix", "--freeze", FREEZE]).stderr_str()
     );
-    assert_eq!(fixed.lock_verified(), Some(true), "fix re-locks cleanly");
+    assert_eq!(fixed.lock_status(), Some("current"), "fix re-locks cleanly");
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
     assert!(
         fixed.summary_applied() >= 1,

@@ -9,7 +9,7 @@ use cooldown_core::{Diagnostic, LockStatus, MemberRef, SkipReason, Status, Updat
 use serde::Serialize;
 
 /// The JSON schema version. Bumped only on a removal/retype/semantic change.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -71,7 +71,7 @@ impl<M: Serialize, S: Serialize, I: Serialize> Envelope<M, S, I> {
 
 /// The resolved window block on an item: `{ minAgeDays, source, clampedBy? }`. Days are
 /// display-only float days; the boundary comparison is on the underlying instant.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
     /// The resolved minimum age in (fractional) days the dependency must reach.
@@ -84,7 +84,7 @@ pub struct Window {
 }
 
 /// The `latest` block on an [`OutdatedItem`]: the newest existing version and its age.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatestInfo {
     /// The newest existing version string, adoptable or not.
@@ -144,8 +144,27 @@ impl From<Status> for OutdatedStatus {
     }
 }
 
+impl OutdatedStatus {
+    /// Ordering key for the report: things needing attention first, the ready-to-adopt updates
+    /// last (so the actionable "what's still cooling / stuck" rows lead).
+    #[must_use]
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            OutdatedStatus::Error => 0,
+            OutdatedStatus::UnknownAge => 1,
+            OutdatedStatus::Held => 2,
+            OutdatedStatus::Blocked => 3,
+            OutdatedStatus::CurrentInCooldown => 4,
+            OutdatedStatus::InCooldown => 5,
+            OutdatedStatus::Exempt => 6,
+            OutdatedStatus::UpToDate => 7,
+            OutdatedStatus::Adoptable => 8,
+        }
+    }
+}
+
 /// One row in an `outdated` report: a dependency and its newest adoptable/latest versions.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutdatedItem {
     /// The package name (tool-native identifier).
@@ -197,7 +216,7 @@ pub struct OutdatedItem {
 }
 
 /// The aggregate counts for an `outdated` report, keyed by [`OutdatedStatus`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutdatedSummary {
     /// The total number of dependencies evaluated.
@@ -222,7 +241,7 @@ pub struct OutdatedSummary {
 }
 
 /// The flattened top-level `meta` for `outdated`. The command has no extra top-level fields.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutdatedMeta {}
 
 /// The status of a `check` finding. Passing (mature/exempt) deps are not findings; they are counted
@@ -247,8 +266,39 @@ pub enum CheckStatus {
     Error,
 }
 
+impl CheckStatus {
+    /// Maps a core pin status to the `check` finding row status. Passing statuses return `None`.
+    #[must_use]
+    pub fn from_pin_status(status: Status, acknowledged: bool) -> Option<Self> {
+        if acknowledged {
+            return Some(CheckStatus::Acknowledged);
+        }
+        match status {
+            Status::CurrentInCooldown => Some(CheckStatus::Violation),
+            Status::UnknownAge => Some(CheckStatus::UnknownAge),
+            Status::UpToDate
+            | Status::Exempt
+            | Status::Adoptable
+            | Status::InCooldown
+            | Status::Held => None,
+        }
+    }
+
+    /// Ordering key for the report: gate failures first, the acknowledged rows last.
+    #[must_use]
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            CheckStatus::Violation => 0,
+            CheckStatus::Error => 1,
+            CheckStatus::UnknownAge => 2,
+            CheckStatus::Acknowledged => 3,
+            CheckStatus::Allowed => 4,
+        }
+    }
+}
+
 /// One finding in a `check` report: a dependency that did not pass the cooldown gate cleanly.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckItem {
     /// The package name (tool-native identifier).
@@ -288,7 +338,7 @@ pub struct CheckItem {
 }
 
 /// The aggregate counts for a `check` report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckSummary {
     /// The total number of dependencies checked.
@@ -311,7 +361,7 @@ pub struct CheckSummary {
 }
 
 /// The flattened top-level `meta` for `check`: the scope of the run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckMeta {
     /// The graph scope: `"lockfile-graph"` (the full resolved graph) or `"direct-only"`.
@@ -321,7 +371,7 @@ pub struct CheckMeta {
 }
 
 /// Why a planned mutation was not applied. Mirrors a [`cooldown_core::SkipReason`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedInfo {
     /// The structured reason the change was skipped.
@@ -334,7 +384,7 @@ pub struct SkippedInfo {
 }
 
 /// One row in an `upgrade` or `fix` report: a planned version change and its outcome.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeItem {
     /// The package name (tool-native identifier).
@@ -373,8 +423,29 @@ pub struct UpgradeItem {
     pub error: Option<Diagnostic>,
 }
 
+impl UpgradeItem {
+    /// Ordering key for the report: errored/skipped changes first, planned rows next, and applied
+    /// rows last.
+    #[must_use]
+    pub fn sort_rank(&self) -> u8 {
+        if let Some(skip) = &self.skipped {
+            if skip.reason == SkipReason::NeedsMajor {
+                2
+            } else {
+                1
+            }
+        } else if self.error.is_some() {
+            0
+        } else if self.applied {
+            4
+        } else {
+            3
+        }
+    }
+}
+
 /// The aggregate counts for an `upgrade` or `fix` report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeSummary {
     /// The number of changes that were applied.
@@ -386,7 +457,7 @@ pub struct UpgradeSummary {
 }
 
 /// The post-mutation build result reported in [`UpgradeMeta`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
     /// Whether a build was requested (e.g. via `--build`).
@@ -396,13 +467,11 @@ pub struct BuildInfo {
 }
 
 /// The flattened top-level `meta` for `upgrade` or `fix`: apply/lock/build outcomes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeMeta {
     /// Whether any change was applied (`false` for a dry run).
     pub applied: bool,
-    /// Legacy re-lock result; `null` for `--dry-run` and for adapters whose currency is unknown.
-    pub lock_verified: Option<bool>,
     /// Re-lock status; `null` for `--dry-run` (which never mutates).
     pub lock_status: Option<LockStatus>,
     /// The post-mutation build result.
@@ -414,7 +483,7 @@ pub struct UpgradeMeta {
 /// The steps form an ordered trace, lowest-precedence first; the last
 /// [`applied`](ExplainStep::applied) step is the one that decided the effective
 /// window (see [`EffectiveInfo`]).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainStep {
     /// The config layer, e.g. `"default"`, `"workspace"`, or `"project"`.
@@ -434,7 +503,7 @@ pub struct ExplainStep {
 }
 
 /// The resolved effective window in an `explain` report, after all layers are applied.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveInfo {
     /// The effective minimum age in (fractional) days.
@@ -444,7 +513,7 @@ pub struct EffectiveInfo {
 }
 
 /// The flattened top-level `meta` for `explain`: the subject and its effective window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainMeta {
     /// The project the explained dependency belongs to.
@@ -457,11 +526,11 @@ pub struct ExplainMeta {
 }
 
 /// The `summary` for `explain`. The command has no aggregate counts.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExplainSummary {}
 
 /// One row in a `config` report: the resolved default policy for one project.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigItem {
     /// The project root relative to the repo root.
@@ -479,7 +548,7 @@ pub struct ConfigItem {
 }
 
 /// The aggregate counts for a `config` report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSummary {
     /// The number of projects included in the resolved config report.
@@ -487,11 +556,11 @@ pub struct ConfigSummary {
 }
 
 /// The flattened top-level `meta` for `config`. The command has no extra top-level fields.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfigMeta {}
 
 /// One acknowledged baseline entry written by `cooldown baseline`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineItem {
     /// The tool token.
@@ -508,7 +577,7 @@ pub struct BaselineItem {
 }
 
 /// The aggregate counts for a `baseline` report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineSummary {
     /// The number of acknowledged entries after the write.
@@ -518,7 +587,7 @@ pub struct BaselineSummary {
 }
 
 /// The flattened top-level `meta` for `baseline`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineMeta {
     /// The path of the baseline file to write.

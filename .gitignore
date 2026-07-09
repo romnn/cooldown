@@ -1,7 +1,6 @@
 .DS_Store
 /target
 **/*.rs.bk
-.cooldown.lock
 /plan
 
 # goreleaser + zig files
@@ -14,3 +13,7 @@ examples/*/target/
 node_modules/
 .deno/
 vendor/
+
+# cooldown
+.cooldown.lock
+.cooldown-versions-*

@@ -7,11 +7,11 @@
 //! each project, so sibling projects never leak policy into one another.
 
 pub mod baseline;
+mod change_key;
 mod check;
 mod clock;
 mod explain;
 mod lock;
-mod model;
 mod outdated;
 mod project_copy;
 mod read;
@@ -23,7 +23,7 @@ mod workspace;
 
 pub use baseline::Baseline;
 pub use clock::{Clock, FixedClock, SystemClock};
-pub use model::{
+pub use cooldown_render::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
     OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
@@ -31,4 +31,6 @@ pub use model::{
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{AdapterSet, Exit, Progress, ProjectCtx, RunOpts, TransitiveGate, Workspace};
 
-pub(crate) use workspace::{age_days, diag_from_error, render_window, round2};
+pub(crate) use workspace::{
+    LockReportAction, age_days, diag_from_error, lock_report_outcome, render_window, round2,
+};

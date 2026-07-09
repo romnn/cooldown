@@ -3,6 +3,7 @@
 
 mod args;
 mod commands;
+mod output;
 mod present;
 mod runtime;
 mod setup;

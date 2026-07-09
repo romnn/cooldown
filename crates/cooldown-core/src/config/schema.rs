@@ -104,27 +104,50 @@ impl CommandConfig {
     /// List-valued fields concatenate so lower-precedence defaults are preserved, while scalar
     /// fields take the higher-precedence value when set.
     #[must_use]
-    pub fn merge_layer(mut self, mut other: CommandConfig) -> CommandConfig {
-        self.exclude_folders.append(&mut other.exclude_folders);
-        self.exclude_packages.append(&mut other.exclude_packages);
-        self.tool.append(&mut other.tool);
-        self.package.append(&mut other.package);
-        self.gitignore = other.gitignore.or(self.gitignore);
-        self.major = other.major.or(self.major);
-        self.all = other.all.or(self.all);
-        self.all_artifacts = other.all_artifacts.or(self.all_artifacts);
-        self.allow_stale_lock = other.allow_stale_lock.or(self.allow_stale_lock);
-        self.fail_on_unknown_age = other.fail_on_unknown_age.or(self.fail_on_unknown_age);
-        self.strict = other.strict.or(self.strict);
-        self.build = other.build.or(self.build);
-        self.transitive = other.transitive.or(self.transitive);
-        self.downgrade_pinned = other.downgrade_pinned.or(self.downgrade_pinned);
-        self.dry_run = other.dry_run.or(self.dry_run);
-        self.offline = other.offline.or(self.offline);
-        self.fresh = other.fresh.or(self.fresh);
-        self.json = other.json.or(self.json);
-        self.exit_code = other.exit_code.or(self.exit_code);
-        self.concurrency = other.concurrency.or(self.concurrency);
+    pub fn merge_layer(mut self, other: CommandConfig) -> CommandConfig {
+        let CommandConfig {
+            mut exclude_folders,
+            mut exclude_packages,
+            mut tool,
+            mut package,
+            gitignore,
+            major,
+            all,
+            all_artifacts,
+            allow_stale_lock,
+            fail_on_unknown_age,
+            strict,
+            build,
+            transitive,
+            downgrade_pinned,
+            dry_run,
+            offline,
+            fresh,
+            json,
+            exit_code,
+            concurrency,
+        } = other;
+
+        self.exclude_folders.append(&mut exclude_folders);
+        self.exclude_packages.append(&mut exclude_packages);
+        self.tool.append(&mut tool);
+        self.package.append(&mut package);
+        self.gitignore = gitignore.or(self.gitignore);
+        self.major = major.or(self.major);
+        self.all = all.or(self.all);
+        self.all_artifacts = all_artifacts.or(self.all_artifacts);
+        self.allow_stale_lock = allow_stale_lock.or(self.allow_stale_lock);
+        self.fail_on_unknown_age = fail_on_unknown_age.or(self.fail_on_unknown_age);
+        self.strict = strict.or(self.strict);
+        self.build = build.or(self.build);
+        self.transitive = transitive.or(self.transitive);
+        self.downgrade_pinned = downgrade_pinned.or(self.downgrade_pinned);
+        self.dry_run = dry_run.or(self.dry_run);
+        self.offline = offline.or(self.offline);
+        self.fresh = fresh.or(self.fresh);
+        self.json = json.or(self.json);
+        self.exit_code = exit_code.or(self.exit_code);
+        self.concurrency = concurrency.or(self.concurrency);
         self
     }
 
@@ -134,28 +157,54 @@ impl CommandConfig {
     /// rather than concatenating with them.
     #[must_use]
     pub fn apply_explicit(mut self, explicit: &CommandConfig) -> CommandConfig {
-        if !explicit.tool.is_empty() {
-            self.tool.clone_from(&explicit.tool);
+        let CommandConfig {
+            // CLI `--exclude-folders`/`--exclude-packages` flow through `override_excludes` on the
+            // resolved config — project detection reads them from there before RunOpts exists — and
+            // explicit layers never carry them, so they are deliberately not merged here.
+            exclude_folders: _,
+            exclude_packages: _,
+            tool,
+            package,
+            gitignore,
+            major,
+            all,
+            all_artifacts,
+            allow_stale_lock,
+            fail_on_unknown_age,
+            strict,
+            build,
+            transitive,
+            downgrade_pinned,
+            dry_run,
+            offline,
+            fresh,
+            json,
+            exit_code,
+            concurrency,
+        } = explicit;
+
+        if !tool.is_empty() {
+            self.tool.clone_from(tool);
         }
-        if !explicit.package.is_empty() {
-            self.package.clone_from(&explicit.package);
+        if !package.is_empty() {
+            self.package.clone_from(package);
         }
-        self.gitignore = explicit.gitignore.or(self.gitignore);
-        self.major = explicit.major.or(self.major);
-        self.all = explicit.all.or(self.all);
-        self.all_artifacts = explicit.all_artifacts.or(self.all_artifacts);
-        self.allow_stale_lock = explicit.allow_stale_lock.or(self.allow_stale_lock);
-        self.fail_on_unknown_age = explicit.fail_on_unknown_age.or(self.fail_on_unknown_age);
-        self.strict = explicit.strict.or(self.strict);
-        self.build = explicit.build.or(self.build);
-        self.transitive = explicit.transitive.or(self.transitive);
-        self.downgrade_pinned = explicit.downgrade_pinned.or(self.downgrade_pinned);
-        self.dry_run = explicit.dry_run.or(self.dry_run);
-        self.offline = explicit.offline.or(self.offline);
-        self.fresh = explicit.fresh.or(self.fresh);
-        self.json = explicit.json.or(self.json);
-        self.exit_code = explicit.exit_code.or(self.exit_code);
-        self.concurrency = explicit.concurrency.or(self.concurrency);
+        self.gitignore = (*gitignore).or(self.gitignore);
+        self.major = (*major).or(self.major);
+        self.all = (*all).or(self.all);
+        self.all_artifacts = (*all_artifacts).or(self.all_artifacts);
+        self.allow_stale_lock = (*allow_stale_lock).or(self.allow_stale_lock);
+        self.fail_on_unknown_age = (*fail_on_unknown_age).or(self.fail_on_unknown_age);
+        self.strict = (*strict).or(self.strict);
+        self.build = (*build).or(self.build);
+        self.transitive = (*transitive).or(self.transitive);
+        self.downgrade_pinned = (*downgrade_pinned).or(self.downgrade_pinned);
+        self.dry_run = (*dry_run).or(self.dry_run);
+        self.offline = (*offline).or(self.offline);
+        self.fresh = (*fresh).or(self.fresh);
+        self.json = (*json).or(self.json);
+        self.exit_code = (*exit_code).or(self.exit_code);
+        self.concurrency = (*concurrency).or(self.concurrency);
         self
     }
 

@@ -106,7 +106,11 @@ fn upgrade_converges_to_a_fixed_point() {
             .cooldown(&["upgrade", "--freeze", FREEZE])
             .stderr_str()
     );
-    assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
+    assert_eq!(
+        first.lock_status(),
+        Some("current"),
+        "first upgrade re-locks"
+    );
     assert!(
         first.summary_applied() >= 2,
         "first upgrade should apply the k8s lockstep moves, got {}",
@@ -222,9 +226,9 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
         "--dry-run must leave go.mod byte-identical"
     );
     assert_eq!(
-        dry.lock_verified(),
+        dry.lock_status(),
         None,
-        "--dry-run never re-locks, so lockVerified is null"
+        "--dry-run never re-locks, so lockStatus is null"
     );
 }
 
@@ -246,7 +250,7 @@ fn fix_is_idempotent_and_does_not_error() {
             .cooldown(&["fix", "--freeze", FREEZE_FIX])
             .stderr_str()
     );
-    assert_eq!(fixed.lock_verified(), Some(true), "fix re-locks cleanly");
+    assert_eq!(fixed.lock_status(), Some("current"), "fix re-locks cleanly");
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
 
     let mod_after_fix = fixture.read_bytes("go.mod");
@@ -310,8 +314,8 @@ fn build_gate_rejects_an_api_incompatible_joint_resolve() {
     // finalize) must report the failure rather than declaring success on an uncompilable lock.
     let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--build"]);
     assert_eq!(
-        report.lock_verified(),
-        Some(true),
+        report.lock_status(),
+        Some("current"),
         "the resolve itself re-locks; the failure is the compile gate, not the lock"
     );
     assert!(

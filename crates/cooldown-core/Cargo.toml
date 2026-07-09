@@ -24,5 +24,6 @@ camino.workspace = true
 
 [dev-dependencies]
 jiff.workspace = true
+tempfile.workspace = true
 camino.workspace = true
 indoc.workspace = true

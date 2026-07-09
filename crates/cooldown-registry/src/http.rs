@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(750);
+const MAX_RETRY_AFTER: Duration = Duration::from_mins(1);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Configuration knobs for a [`SharedHttp`] client.
 #[derive(Debug, Clone)]
 pub struct HttpOptions {
@@ -306,6 +310,7 @@ impl SharedHttp {
                     }
                     return Err(CoreError::transient(e));
                 }
+                Err(FetchError::Fatal(error)) => return Err(error),
                 Err(FetchError::Backoff(_)) => {
                     return Err(CoreError::Transient(
                         format!(
@@ -349,12 +354,11 @@ impl SharedHttp {
         }
 
         if status == 429 || (500..600).contains(&status) {
-            let delay = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map_or_else(|| Duration::from_millis(750), Duration::from_secs);
+            let delay = retry_after_delay(
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok()),
+            );
             return Err(FetchError::Backoff(delay));
         }
 
@@ -363,10 +367,7 @@ impl SharedHttp {
             .get(reqwest::header::ETAG)
             .and_then(|h| h.to_str().ok())
             .map(str::to_string);
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| FetchError::Transient(e.to_string()))?;
+        let body = read_limited_body(resp, url).await?;
 
         if (200..300).contains(&status) {
             let entry = CacheEntry {
@@ -390,6 +391,39 @@ impl SharedHttp {
 enum FetchError {
     Transient(String),
     Backoff(Duration),
+    Fatal(CoreError),
+}
+
+fn retry_after_delay(value: Option<&str>) -> Duration {
+    // RFC 9110 also allows an HTTP-date here. Treat that form as the short default rather than
+    // adding clock-dependent parsing; only explicit second counts extend the delay, and they are
+    // capped so one hostile response cannot stall the whole host queue for hours.
+    value
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .map_or(DEFAULT_RETRY_DELAY, |delay| delay.min(MAX_RETRY_AFTER))
+}
+
+async fn read_limited_body(mut resp: reqwest::Response, url: &str) -> Result<String, FetchError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| FetchError::Transient(e.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(FetchError::Fatal(CoreError::Parse(format!(
+                "response body for {url} exceeds {} MiB",
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ))));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|error| {
+        FetchError::Fatal(CoreError::Parse(format!(
+            "response body for {url} is not valid UTF-8: {error}"
+        )))
+    })
 }
 
 fn cache_is_fresh(entry: &CacheEntry, ttl: Duration) -> bool {
@@ -475,5 +509,16 @@ mod tests {
         // The built-in default paces GitHub (strict budget) but leaves CDN-backed registries free.
         assert!(http.pacer_for("api.github.com").is_some());
         assert!(http.pacer_for("index.crates.io").is_none());
+    }
+
+    #[test]
+    fn retry_after_seconds_are_capped_and_dates_use_default_delay() {
+        assert_eq!(retry_after_delay(Some("3")), Duration::from_secs(3));
+        assert_eq!(retry_after_delay(Some("100000")), MAX_RETRY_AFTER);
+        assert_eq!(
+            retry_after_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            DEFAULT_RETRY_DELAY
+        );
+        assert_eq!(retry_after_delay(None), DEFAULT_RETRY_DELAY);
     }
 }

@@ -49,8 +49,6 @@ pub(super) struct UpgradeAccum {
     /// `None` until lock currency is probed; tracks the strongest non-current outcome across
     /// projects.
     pub(super) lock_status: Option<LockStatus>,
-    /// `None` until the lock is verified; `Some(false)` once any project's lock is known stale.
-    pub(super) lock_verified: Option<bool>,
 }
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
@@ -240,11 +238,6 @@ fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
 fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, applied: usize) -> UpgradeMeta {
     UpgradeMeta {
         applied: applied > 0,
-        lock_verified: if opts.dry_run {
-            None
-        } else {
-            acc.lock_verified
-        },
         lock_status: if opts.dry_run { None } else { acc.lock_status },
         build: BuildInfo {
             requested: acc.build_requested,

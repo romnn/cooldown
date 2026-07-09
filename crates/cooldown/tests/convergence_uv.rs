@@ -94,7 +94,11 @@ fn upgrade_converges_to_a_fixed_point() {
     // collateral huggingface-hub downgrade — both reported.
     let first = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
     assert!(first.ok(), "first upgrade should succeed");
-    assert_eq!(first.lock_verified(), Some(true), "first upgrade re-locks");
+    assert_eq!(
+        first.lock_status(),
+        Some("current"),
+        "first upgrade re-locks"
+    );
     assert!(
         first.summary_applied() >= 2,
         "first upgrade should apply the conflict moves, got {}",
@@ -216,9 +220,9 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
         "--dry-run must leave the lock byte-identical"
     );
     assert_eq!(
-        dry.lock_verified(),
+        dry.lock_status(),
         None,
-        "--dry-run never re-locks, so lockVerified is null"
+        "--dry-run never re-locks, so lockStatus is null"
     );
 }
 
@@ -233,7 +237,7 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
     // `fix` matures the too-fresh deps down to versions at or before the freeze cutoff and re-locks.
     let fixed = fixture.cooldown_json(&["fix", "--freeze", FREEZE]);
     assert!(fixed.ok(), "fix should succeed");
-    assert_eq!(fixed.lock_verified(), Some(true), "fix re-locks cleanly");
+    assert_eq!(fixed.lock_status(), Some("current"), "fix re-locks cleanly");
     assert!(
         fixed.summary_applied() >= 1,
         "fix should downgrade at least one too-fresh dep, got {}",

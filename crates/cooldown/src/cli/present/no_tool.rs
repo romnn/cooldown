@@ -81,7 +81,6 @@ fn no_tool_mutation(
             generated_at,
             render::UpgradeMeta {
                 applied: false,
-                lock_verified: None,
                 lock_status: None,
                 build: render::BuildInfo {
                     requested: false,

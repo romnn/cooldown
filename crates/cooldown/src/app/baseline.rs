@@ -154,8 +154,7 @@ impl Baseline {
     /// Returns [`CoreError::Serialization`] if serialization fails, or
     /// [`CoreError::Filesystem`] if the file cannot be written.
     pub fn save(&self, path: &camino::Utf8Path) -> Result<(), CoreError> {
-        std::fs::write(path, self.to_toml()?)?;
-        Ok(())
+        cooldown_core::fs::atomic_write(path.as_std_path(), self.to_toml()?.as_bytes())
     }
 }
 

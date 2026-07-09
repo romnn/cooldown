@@ -3,12 +3,13 @@
 //! resolved graph (direct + transitive) by default.
 
 use super::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, RunOpts, TransitiveGate, Window,
-    Workspace, age_days, diag_from_error, render_window,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, LockReportAction, RunOpts,
+    TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
+    render_window,
 };
 use cooldown_core::{
-    DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport, Origin,
-    Resolution, ResolveKind, ResolveQuery, Status, check_pin, resolve,
+    DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, Origin, Resolution,
+    ResolveKind, ResolveQuery, Status, check_pin, resolve,
 };
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
@@ -252,23 +253,26 @@ impl<'a> CheckRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
     ) -> LockProbe {
-        if report.status == LockStatus::Current {
-            return LockProbe::Continue;
-        }
-        let kind = match report.status {
-            LockStatus::Current | LockStatus::Stale => DiagnosticKind::StaleLock,
-            LockStatus::Unknown => DiagnosticKind::LockUnknown,
-        };
-        let diag = Diagnostic::new(kind, report.detail)
-            .with_tool(pctx.tool.as_str())
-            .with_project(project_label)
-            .with_path(pctx.project.manifest.as_str());
-        if self.opts.allow_stale_lock && report.status == LockStatus::Stale {
-            self.acc.warnings.push(diag);
-            LockProbe::Continue
-        } else {
-            self.acc.errors.push(diag);
-            LockProbe::Skip
+        let outcome = lock_report_outcome(
+            report,
+            pctx.tool,
+            project_label,
+            &pctx.project.manifest,
+            self.opts.allow_stale_lock,
+        );
+        match outcome.action {
+            LockReportAction::Continue => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.acc.warnings.push(diagnostic);
+                }
+                LockProbe::Continue
+            }
+            LockReportAction::Skip => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.acc.errors.push(diagnostic);
+                }
+                LockProbe::Skip
+            }
         }
     }
 

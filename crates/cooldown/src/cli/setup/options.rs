@@ -31,6 +31,10 @@ impl ResolvedInvocation {
         self.offline
     }
 
+    pub(super) fn dry_run(&self) -> bool {
+        self.run.dry_run
+    }
+
     pub(super) fn fresh(&self) -> bool {
         self.fresh
     }
@@ -60,6 +64,24 @@ impl ResolvedInvocation {
     }
 }
 
+/// `--dry-run` stages the plan by running the real resolver against a project copy, which
+/// necessarily resolves online; `--offline` promises no network. Reject the combination for the
+/// mutating commands instead of letting the native tool quietly violate that promise.
+pub(super) fn reject_offline_dry_run(
+    command_key: &str,
+    dry_run: bool,
+    offline: bool,
+) -> Result<(), CoreError> {
+    if matches!(command_key, "upgrade" | "fix") && dry_run && offline {
+        return Err(CoreError::Config(
+            "--dry-run previews the plan with the real resolver, which needs the network; \
+             it cannot be combined with --offline"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
@@ -84,6 +106,7 @@ pub(super) fn resolve_invocation(
             exclude_folders_by_tool: BTreeMap::default(),
             exclude_packages: Vec::new(),
             exclude_packages_by_tool: BTreeMap::default(),
+            compiled_excludes: None,
             allow_major: merged.major.unwrap_or(default_major),
             // A display filter, read straight from the CLI (not config-file backed).
             hide_pinned: overrides.hide_pinned.unwrap_or(false),
@@ -113,6 +136,7 @@ pub(super) fn resolve_invocation(
             strict: merged.strict.unwrap_or(false),
             build: merged.build.unwrap_or(false),
             dry_run: merged.dry_run.unwrap_or(false),
+            offline: merged.offline.unwrap_or(false),
             outdated_exit_code: merged.exit_code,
             show_all: merged.all.unwrap_or(false),
             // Pure presentation flags, read straight from the CLI (not config-file backed).
@@ -121,7 +145,7 @@ pub(super) fn resolve_invocation(
             show_projects: global.show_projects,
             no_suggestions: global.no_suggestions,
             json,
-            progress: progress_mode(json, global.log_level),
+            progress: progress_mode(global.log_level),
             // `--concurrency` (CLI/env) wins over a `[<command>]`/`[global]` config value, then the
             // built-in default. Sets both the fan-out width and the per-host HTTP cap downstream.
             concurrency: global
@@ -141,6 +165,10 @@ pub(super) fn resolve_invocation(
 
 fn builtin_command_config(default_major: bool) -> CommandConfig {
     CommandConfig {
+        exclude_folders: Vec::new(),
+        exclude_packages: Vec::new(),
+        tool: Vec::new(),
+        package: Vec::new(),
         gitignore: Some(true),
         major: Some(default_major),
         all: Some(false),
@@ -155,8 +183,8 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         offline: Some(false),
         fresh: Some(false),
         json: Some(false),
+        exit_code: None,
         concurrency: Some(16),
-        ..CommandConfig::default()
     }
 }
 
@@ -167,6 +195,8 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         global.tool.clone()
     };
     CommandConfig {
+        exclude_folders: Vec::new(),
+        exclude_packages: Vec::new(),
         tool,
         package: global.package.clone(),
         gitignore: overrides.gitignore,
@@ -184,7 +214,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         fresh: overrides.fresh,
         json: overrides.json,
         exit_code: overrides.exit_code,
-        ..CommandConfig::default()
+        concurrency: None,
     }
 }
 
@@ -224,14 +254,12 @@ fn resolve_globs(cfg: &CommandConfig) -> Result<Vec<PatternGlob>, CoreError> {
 }
 
 /// Route coarse progress notes: silent when `--log-level` already narrates the run, to stderr
-/// under `--json` (keep stdout pure), to stdout otherwise (next to the pretty report).
-fn progress_mode(json: bool, log_level: LogLevel) -> Progress {
-    if log_level != LogLevel::Off {
-        Progress::Silent
-    } else if json {
+/// otherwise so stdout stays reserved for the report.
+fn progress_mode(log_level: LogLevel) -> Progress {
+    if log_level == LogLevel::Off {
         Progress::Stderr
     } else {
-        Progress::Stdout
+        Progress::Silent
     }
 }
 
@@ -271,7 +299,8 @@ fn env_window_fields() -> WindowFields {
 
 #[cfg(test)]
 mod tests {
-    use super::builtin_command_config;
+    use super::{builtin_command_config, reject_offline_dry_run};
+    use cooldown_core::CoreError;
     use cooldown_core::config::CommandConfig;
 
     #[test]
@@ -303,5 +332,19 @@ mod tests {
         assert_eq!(resolved.package, vec!["serde"]);
         assert_eq!(resolved.major, Some(true));
         assert_eq!(resolved.transitive, Some(true));
+    }
+
+    #[test]
+    fn offline_dry_run_is_rejected_for_mutating_commands_only() {
+        for command in ["upgrade", "fix"] {
+            let err = reject_offline_dry_run(command, true, true)
+                .expect_err("offline dry-run must be a usage error");
+            assert!(matches!(err, CoreError::Config(_)), "command `{command}`");
+        }
+        // Non-mutating commands and non-conflicting flag combinations pass through.
+        assert!(reject_offline_dry_run("outdated", true, true).is_ok());
+        assert!(reject_offline_dry_run("upgrade", true, false).is_ok());
+        assert!(reject_offline_dry_run("upgrade", false, true).is_ok());
+        assert!(reject_offline_dry_run("fix", false, false).is_ok());
     }
 }

@@ -293,7 +293,7 @@ pub fn json_schema() -> Value {
 
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://github.com/romnn/cooldown/schema/v1",
+        "$id": format!("https://github.com/romnn/cooldown/schema/v{SCHEMA_VERSION}"),
         "title": "cooldown --json envelope",
         "$defs": defs,
         "oneOf": [
@@ -312,7 +312,6 @@ pub fn json_schema() -> Value {
                 "upgrade",
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
-                    ("lockVerified", json!({ "type": ["boolean", "null"] })),
                     ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
@@ -324,7 +323,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockVerified", "lockStatus", "build"],
+                vec!["applied", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),
@@ -332,7 +331,6 @@ pub fn json_schema() -> Value {
                 "fix",
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
-                    ("lockVerified", json!({ "type": ["boolean", "null"] })),
                     ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
@@ -344,7 +342,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockVerified", "lockStatus", "build"],
+                vec!["applied", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),
@@ -453,4 +451,397 @@ fn map(entries: &[(&str, Value)]) -> Map<String, Value> {
 /// ```
 pub fn json_schema_string() -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&json_schema())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_schema;
+    use crate::model::{
+        BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
+        CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
+        ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
+        OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+    };
+    use cooldown_core::{
+        Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
+    };
+    use serde::Serialize;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn schema_properties_match_serialized_models() {
+        let schema = json_schema();
+        assert_definition_keys_match(&schema);
+        assert_envelope_keys_match(&schema);
+    }
+
+    fn assert_definition_keys_match(schema: &Value) {
+        assert_def_keys(schema, "diagnostic", diagnostic());
+        assert_def_keys(schema, "window", window());
+        assert_def_keys(schema, "latestInfo", latest_info());
+        assert_def_keys(schema, "memberRef", member());
+        assert_def_keys(schema, "skippedInfo", skipped_info());
+        assert_def_keys(schema, "effectiveInfo", effective_info());
+        assert_def_keys(schema, "outdatedSummary", outdated_summary());
+        assert_def_keys(schema, "outdatedItem", outdated_item());
+        assert_def_keys(schema, "checkSummary", check_summary());
+        assert_def_keys(schema, "checkItem", check_item());
+        assert_def_keys(schema, "upgradeSummary", upgrade_summary());
+        assert_def_keys(schema, "upgradeItem", upgrade_item());
+        assert_def_keys(schema, "explainSummary", ExplainSummary {});
+        assert_def_keys(schema, "explainStep", explain_step());
+        assert_def_keys(schema, "configSummary", config_summary());
+        assert_def_keys(schema, "configItem", config_item());
+        assert_def_keys(schema, "baselineSummary", baseline_summary());
+        assert_def_keys(schema, "baselineItem", baseline_item());
+    }
+
+    fn assert_envelope_keys_match(schema: &Value) {
+        assert_envelope_keys(
+            schema,
+            "outdated",
+            Envelope::new(
+                "outdated",
+                true,
+                generated_at(),
+                OutdatedMeta {},
+                outdated_summary(),
+                vec![outdated_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "check",
+            Envelope::new(
+                "check",
+                false,
+                generated_at(),
+                check_meta(),
+                check_summary(),
+                vec![check_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "upgrade",
+            Envelope::new(
+                "upgrade",
+                true,
+                generated_at(),
+                upgrade_meta(),
+                upgrade_summary(),
+                vec![upgrade_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "fix",
+            Envelope::new(
+                "fix",
+                true,
+                generated_at(),
+                upgrade_meta(),
+                upgrade_summary(),
+                vec![upgrade_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "explain",
+            Envelope::new(
+                "explain",
+                true,
+                generated_at(),
+                explain_meta(),
+                ExplainSummary {},
+                vec![explain_step()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "config",
+            Envelope::new(
+                "config",
+                true,
+                generated_at(),
+                ConfigMeta {},
+                config_summary(),
+                vec![config_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "baseline",
+            Envelope::new(
+                "baseline",
+                true,
+                generated_at(),
+                baseline_meta(),
+                baseline_summary(),
+                vec![baseline_item()],
+            ),
+        );
+    }
+
+    fn assert_def_keys<T: Serialize>(schema: &Value, def_name: &str, value: T) {
+        let actual = serialized_keys(value);
+        let expected = schema_keys(&schema["$defs"][def_name]);
+        assert_eq!(actual, expected, "$defs.{def_name} is out of sync");
+    }
+
+    fn assert_envelope_keys<M, S, I>(schema: &Value, command: &'static str, env: Envelope<M, S, I>)
+    where
+        M: Serialize,
+        S: Serialize,
+        I: Serialize,
+    {
+        let actual = serialized_keys(env);
+        let one_of = schema["oneOf"].as_array().expect("schema oneOf");
+        let command_schema = one_of
+            .iter()
+            .find(|entry| entry["properties"]["command"]["const"] == command)
+            .unwrap_or_else(|| panic!("schema for {command}"));
+        let expected = schema_keys(command_schema);
+        assert_eq!(actual, expected, "{command} envelope is out of sync");
+    }
+
+    fn serialized_keys<T: Serialize>(value: T) -> BTreeSet<String> {
+        let value = serde_json::to_value(value).expect("sample serializes");
+        value
+            .as_object()
+            .expect("sample object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn schema_keys(schema: &Value) -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .expect("schema properties")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn generated_at() -> String {
+        "2026-06-17T13:00:00Z".to_string()
+    }
+
+    fn diagnostic() -> Diagnostic {
+        Diagnostic::new(DiagnosticKind::Held, "held")
+            .with_tool("cargo")
+            .with_project(".")
+            .with_package("serde")
+            .with_version("1.0.0")
+            .with_registry("crates.io")
+            .with_path("Cargo.toml")
+    }
+
+    fn member() -> MemberRef {
+        MemberRef {
+            name: "app".to_string(),
+            path: "crates/app".to_string(),
+        }
+    }
+
+    fn window() -> Window {
+        Window {
+            min_age_days: 7.0,
+            source: "default".to_string(),
+            clamped_by: Some("native".to_string()),
+        }
+    }
+
+    fn latest_info() -> LatestInfo {
+        LatestInfo {
+            version: "1.2.3".to_string(),
+            published_at: Some(generated_at()),
+            age_days: Some(12.5),
+        }
+    }
+
+    fn skipped_info() -> SkippedInfo {
+        SkippedInfo {
+            reason: SkipReason::ResolverConflict,
+            message: "held: conflicts with typer".to_string(),
+            offending: Some("typer".to_string()),
+        }
+    }
+
+    fn effective_info() -> EffectiveInfo {
+        EffectiveInfo {
+            min_age_days: 7.0,
+            decided_by: "default".to_string(),
+        }
+    }
+
+    fn outdated_summary() -> OutdatedSummary {
+        OutdatedSummary {
+            total: 1,
+            adoptable: 1,
+            blocked: 0,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        }
+    }
+
+    fn outdated_item() -> OutdatedItem {
+        OutdatedItem {
+            name: "serde".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            registry: Some("crates.io".to_string()),
+            direct: true,
+            current: "1.0.0".to_string(),
+            members: vec![member()],
+            window: window(),
+            candidate_age_days: Some(12.5),
+            cooldown_version: Some("1.2.0".to_string()),
+            status: OutdatedStatus::Adoptable,
+            adoptable_target: Some("1.2.3".to_string()),
+            blocked_by: Some("typer".to_string()),
+            latest: Some(latest_info()),
+            error: Some(diagnostic()),
+        }
+    }
+
+    fn check_meta() -> CheckMeta {
+        CheckMeta {
+            scope: "lockfile-graph".to_string(),
+            artifact_scope: "environment".to_string(),
+        }
+    }
+
+    fn check_summary() -> CheckSummary {
+        CheckSummary {
+            checked: 1,
+            direct: 1,
+            exempt: 0,
+            acknowledged: 0,
+            allowed: 0,
+            unknown_age: 0,
+            errors: 0,
+            violations: 1,
+        }
+    }
+
+    fn check_item() -> CheckItem {
+        CheckItem {
+            name: "serde".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            members: vec![member()],
+            registry: Some("crates.io".to_string()),
+            direct: true,
+            current: "1.0.0".to_string(),
+            published_at: Some(generated_at()),
+            age_days: Some(1.0),
+            window: window(),
+            status: CheckStatus::Violation,
+            graph_held: true,
+            graph_floor: Some("1.0.0".to_string()),
+            error: Some(diagnostic()),
+        }
+    }
+
+    fn upgrade_meta() -> UpgradeMeta {
+        UpgradeMeta {
+            applied: true,
+            lock_status: Some(LockStatus::Current),
+            build: BuildInfo {
+                requested: true,
+                ok: Some(true),
+            },
+        }
+    }
+
+    fn upgrade_summary() -> UpgradeSummary {
+        UpgradeSummary {
+            applied: 1,
+            skipped: 1,
+            errors: 0,
+        }
+    }
+
+    fn upgrade_item() -> UpgradeItem {
+        UpgradeItem {
+            name: "serde".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            direct: true,
+            downgrade: false,
+            members: vec![member()],
+            registry: Some("crates.io".to_string()),
+            from: "1.0.0".to_string(),
+            to: "1.2.3".to_string(),
+            kind: UpdateKind::Minor,
+            applied: false,
+            skipped: Some(skipped_info()),
+            error: Some(diagnostic()),
+        }
+    }
+
+    fn explain_meta() -> ExplainMeta {
+        ExplainMeta {
+            project: ".".to_string(),
+            registry: Some("crates.io".to_string()),
+            effective: effective_info(),
+        }
+    }
+
+    fn explain_step() -> ExplainStep {
+        ExplainStep {
+            layer: "default".to_string(),
+            field: "minAge".to_string(),
+            selector: Some("serde".to_string()),
+            min_age_days: Some(7.0),
+            applied: true,
+            note: "default window".to_string(),
+        }
+    }
+
+    fn config_summary() -> ConfigSummary {
+        ConfigSummary { projects: 1 }
+    }
+
+    fn config_item() -> ConfigItem {
+        ConfigItem {
+            project: ".".to_string(),
+            tool: "cargo".to_string(),
+            effective_default_min_age_days: 7.0,
+            source: "default".to_string(),
+            strict_native: true,
+            layers: vec!["default".to_string(), "workspace".to_string()],
+        }
+    }
+
+    fn baseline_meta() -> BaselineMeta {
+        BaselineMeta {
+            path: ".cooldown-baseline.toml".to_string(),
+            dry_run: true,
+        }
+    }
+
+    fn baseline_summary() -> BaselineSummary {
+        BaselineSummary {
+            acknowledged: 1,
+            pruned: 0,
+        }
+    }
+
+    fn baseline_item() -> BaselineItem {
+        BaselineItem {
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            package: "serde".to_string(),
+            version: "1.0.0".to_string(),
+            registry: Some("crates.io".to_string()),
+        }
+    }
 }

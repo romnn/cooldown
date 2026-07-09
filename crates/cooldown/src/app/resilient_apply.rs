@@ -22,6 +22,8 @@ use cooldown_core::{
     ToolWrite,
 };
 
+use super::change_key::{ChangeTargetKey, change_target_key};
+
 /// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the
 /// candidates that actually make the set unsatisfiable.
 ///
@@ -49,13 +51,10 @@ pub(crate) async fn apply_resilient(
 
     let accepted =
         maximal_satisfiable_subset(writer, project, &plan.changes, plan.rewrite, journal).await?;
-    // Each change in a plan is uniquely keyed by (name, target): the planner never emits two moves of
-    // the same package to the same version (a multi-version dep keeps distinct targets per line). Keyed
-    // by owned strings so the accepted subset can be moved into the commit plan below.
-    let accepted_keys: HashSet<(String, String)> = accepted
-        .iter()
-        .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
-        .collect();
+    // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
+    // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
+    // accepted one. Transitive members remain attribution context, not distinct editable targets.
+    let accepted_keys: HashSet<ChangeTargetKey> = accepted.iter().map(change_target_key).collect();
 
     // Commit exactly the accepted subset (restore first so the failed full-set attempt leaves nothing).
     journal.restore(&project.root)?;
@@ -71,7 +70,7 @@ pub(crate) async fn apply_resilient(
 
     // Every candidate the subset excluded is held: the resolve could not place it.
     for change in &plan.changes {
-        let key = (change.package.name.clone(), change.to.as_str().to_string());
+        let key = change_target_key(change);
         if !accepted_keys.contains(&key) {
             report.skipped.push(held(change));
         }
@@ -157,14 +156,25 @@ mod tests {
     type ResolveOracle = Box<dyn Fn(&[String]) -> bool + Send + Sync>;
 
     fn change(name: &str) -> Change {
+        change_from(name, "1.0.0", "2.0.0")
+    }
+
+    fn change_from(name: &str, from: &str, to: &str) -> Change {
         Change {
             package: PackageId::new(TOOL, name.to_string(), None),
-            from: Version::new("1.0.0"),
-            to: Version::new("2.0.0"),
+            from: Version::new(from),
+            to: Version::new(to),
             kind: UpdateKind::Minor,
             downgrade: false,
             direct: true,
             members: Vec::new(),
+        }
+    }
+
+    fn member(name: &str, path: &str) -> cooldown_core::MemberRef {
+        cooldown_core::MemberRef {
+            name: name.to_string(),
+            path: path.to_string(),
         }
     }
 
@@ -315,6 +325,14 @@ mod tests {
             .collect()
     }
 
+    fn skipped_from_versions(report: &ApplyReport) -> BTreeSet<String> {
+        report
+            .skipped
+            .iter()
+            .map(|skipped| skipped.change.from.to_string())
+            .collect()
+    }
+
     #[tokio::test]
     async fn happy_path_is_a_single_apply_with_no_bisection() {
         // Everything resolves: exactly one `apply`, every change applied, nothing held.
@@ -408,6 +426,39 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn target_collision_reports_excluded_direct_sibling_as_held() {
+        // Two workspace members can bump the same package to the same target from different current
+        // lines. If recovery accepts one member and excludes the other, the excluded sibling must not
+        // disappear behind a `(name, to)` key collision.
+        let writer = MockWriter::new(|names| {
+            !names
+                .iter()
+                .any(|name| name == "nix" && names.iter().filter(|n| *n == "nix").count() > 1)
+        });
+        let (_dir, project) = temp_project();
+        let mut app_a = change_from("nix", "0.28.0", "0.31.3");
+        app_a.members = vec![member("app-a", "crates/app-a")];
+        let mut app_b = change_from("nix", "0.30.0", "0.31.3");
+        app_b.members = vec![member("app-b", "crates/app-b")];
+        let plan = Plan {
+            changes: vec![app_a, app_b],
+            rewrite: RewriteMode::Auto,
+        };
+        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
+
+        let report = apply_resilient(&writer, &project, &plan, &journal)
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(
+            skipped_from_versions(&report),
+            std::iter::once("0.30.0".to_string()).collect()
         );
     }
 

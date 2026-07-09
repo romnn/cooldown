@@ -25,8 +25,8 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
         Some(code) if code != 0 && out.summary.adoptable > 0 => Exit::Gated(code),
         _ => out.exit,
     };
-    let summary = present::outdated_summary(&out.summary);
-    let items = present::outdated_items(&out.items);
+    let summary = out.summary.clone();
+    let items = out.items.clone();
     let env = with_diags(
         render::Envelope::new(
             "outdated",
@@ -62,9 +62,9 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
 
 pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.check(ctx.opts).await;
-    let meta = present::check_meta(&out.meta);
-    let summary = present::check_summary(&out.summary);
-    let items = present::check_items(&out.items);
+    let meta = out.meta.clone();
+    let summary = out.summary.clone();
+    let items = out.items.clone();
     let env = with_diags(
         render::Envelope::new(
             "check",
@@ -92,9 +92,9 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
 
 pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.upgrade(ctx.opts).await;
-    let meta = present::upgrade_meta(&out.meta);
-    let summary = present::upgrade_summary(&out.summary);
-    let items = present::upgrade_items(&out.items);
+    let meta = out.meta.clone();
+    let summary = out.summary.clone();
+    let items = out.items.clone();
     let env = with_diags(
         render::Envelope::new(
             "upgrade",
@@ -122,9 +122,9 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
 
 pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.fix(ctx.opts).await;
-    let meta = present::upgrade_meta(&out.meta);
-    let summary = present::upgrade_summary(&out.summary);
-    let items = present::upgrade_items(&out.items);
+    let meta = out.meta.clone();
+    let summary = out.summary.clone();
+    let items = out.items.clone();
     let env = with_diags(
         render::Envelope::new(
             "fix",
@@ -155,8 +155,8 @@ pub(super) async fn run_explain(
     package: &str,
 ) -> Result<Exit, CoreError> {
     let out = ctx.ws.explain(package, ctx.opts).await;
-    let meta = present::explain_meta(&out.meta);
-    let steps = present::explain_steps(&out.steps);
+    let meta = out.meta.clone();
+    let steps = out.steps.clone();
     let env = render::Envelope::new(
         "explain",
         out.exit.is_ok(),
@@ -195,8 +195,8 @@ pub(super) async fn run_sync(ctx: &CommandContext<'_>) -> Result<Exit, CoreError
 
 pub(super) fn run_config(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.config(ctx.opts);
-    let summary = present::config_summary(&out.summary);
-    let items = present::config_items(&out.items);
+    let summary = out.summary.clone();
+    let items = out.items.clone();
     let env = render::Envelope::new(
         "config",
         out.exit.is_ok(),

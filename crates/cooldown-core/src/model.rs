@@ -716,18 +716,6 @@ pub enum LockStatus {
     Unknown,
 }
 
-impl LockStatus {
-    /// Returns the legacy boolean representation when one exists.
-    #[must_use]
-    pub fn verified(self) -> Option<bool> {
-        match self {
-            LockStatus::Current => Some(true),
-            LockStatus::Stale => Some(false),
-            LockStatus::Unknown => None,
-        }
-    }
-}
-
 /// The result of a lock-currency verification step.
 #[derive(Debug, Clone)]
 pub struct LockVerifyReport {

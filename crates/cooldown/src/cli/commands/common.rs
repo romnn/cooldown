@@ -16,9 +16,9 @@ where
     if json {
         let json = render::to_json(env)
             .map_err(|error| CoreError::Serialization(format!("serialize JSON output: {error}")))?;
-        println!("{json}");
+        crate::cli::output::stdout_line(&json)?;
     } else {
-        print!("{}", render_tty());
+        crate::cli::output::stdout(&render_tty())?;
     }
     Ok(())
 }

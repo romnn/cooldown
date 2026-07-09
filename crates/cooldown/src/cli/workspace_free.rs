@@ -19,9 +19,9 @@ pub(in crate::cli) fn run_workspace_free(
         Command::Schema => Some(
             render::json_schema_string()
                 .map_err(|error| CoreError::Serialization(format!("serialize schema: {error}")))
-                .map(|schema| {
-                    println!("{schema}");
-                    Exit::Ok
+                .and_then(|schema| {
+                    super::output::stdout_line(&schema)?;
+                    Ok(Exit::Ok)
                 }),
         ),
         Command::Init => Some(cmd_init(global)),
@@ -38,11 +38,11 @@ fn cmd_init(global: &GlobalArgs) -> Result<Exit, CoreError> {
     }
     // `--dry-run`: report the file that would be scaffolded without creating it.
     if global.dry_run {
-        println!("would write {path}");
+        super::output::stdout_line(&format!("would write {path}"))?;
         return Ok(Exit::Ok);
     }
     std::fs::write(&path, STARTER_CONFIG)?;
-    println!("wrote {path}");
+    super::output::stdout_line(&format!("wrote {path}"))?;
     Ok(Exit::Ok)
 }
 

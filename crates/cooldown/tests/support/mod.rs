@@ -227,15 +227,6 @@ impl Envelope {
             .expect("envelope.ok")
     }
 
-    /// `meta.lockVerified` (flattened at the top level): `Some(bool)` after a real mutation with a
-    /// concrete lock-currency probe, `None` under `--dry-run` or for adapters that report
-    /// `lockStatus = "unknown"`.
-    pub fn lock_verified(&self) -> Option<bool> {
-        self.value
-            .get("lockVerified")
-            .and_then(serde_json::Value::as_bool)
-    }
-
     /// `meta.lockStatus` (flattened at the top level): `current`/`stale`/`unknown` after a real
     /// mutation, `None` under `--dry-run`.
     pub fn lock_status(&self) -> Option<&str> {

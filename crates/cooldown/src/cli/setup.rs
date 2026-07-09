@@ -33,6 +33,7 @@ pub(crate) async fn prepare_run(
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
     let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
+    options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
     let adapters = detect::adapter_set(
         invocation.offline(),
         invocation.fresh(),
@@ -88,6 +89,7 @@ pub(crate) async fn prepare_run(
     opts.exclude_packages = cfg.exclude_packages;
     opts.exclude_folders_by_tool = scan.tool_exclude_folders;
     opts.exclude_packages_by_tool = scan.tool_exclude_packages;
+    opts.compile_excludes()?;
     Ok(PreparedRun {
         repo_root,
         ws,

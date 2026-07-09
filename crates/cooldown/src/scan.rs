@@ -123,6 +123,7 @@ fn keep_topmost(dirs: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
 /// `exclude-folders` compiled for filtering workspace members by *location*. A member is excluded
 /// when its path — or any ancestor, so `packages/ts/luup` also excludes `packages/ts/luup/api` —
 /// matches a folder glob (`.gitignore` semantics; see [`compile_folder_globset`]).
+#[derive(Debug, Clone)]
 pub(crate) struct FolderExcludeSet(GlobSet);
 
 impl FolderExcludeSet {
@@ -150,6 +151,7 @@ impl FolderExcludeSet {
 /// `exclude-packages` compiled for filtering workspace members by *package name*. A scoped glob like
 /// `@luup/*` excludes every `@luup/...` member regardless of where it lives in the tree (see
 /// [`compile_package_globset`]).
+#[derive(Debug, Clone)]
 pub(crate) struct PackageExcludeSet(GlobSet);
 
 impl PackageExcludeSet {

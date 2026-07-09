@@ -594,6 +594,57 @@ mod tests {
         CliOverrides::from_matches(&matches)
     }
 
+    fn exhaustively_destructure_overrides(overrides: CliOverrides) {
+        let CliOverrides {
+            major,
+            gitignore,
+            all,
+            all_artifacts,
+            allow_stale_lock,
+            fail_on_unknown_age,
+            strict,
+            build,
+            transitive,
+            downgrade_pinned,
+            transitive_mode,
+            exit_code,
+            hide_pinned,
+            countdown,
+            rewrite,
+            fail_on_stricter_native,
+            no_fail_on_stricter_native,
+            lock,
+            dry_run,
+            offline,
+            fresh,
+            json,
+        } = overrides;
+        let _ = (
+            major,
+            gitignore,
+            all,
+            all_artifacts,
+            allow_stale_lock,
+            fail_on_unknown_age,
+            strict,
+            build,
+            transitive,
+            downgrade_pinned,
+            transitive_mode,
+            exit_code,
+            hide_pinned,
+            countdown,
+            rewrite,
+            fail_on_stricter_native,
+            no_fail_on_stricter_native,
+            lock,
+            dry_run,
+            offline,
+            fresh,
+            json,
+        );
+    }
+
     #[test]
     fn unset_flags_have_no_override() {
         let ov = overrides(&["cooldown", "outdated"]);
@@ -663,6 +714,98 @@ mod tests {
             overrides(&["cooldown", "outdated", "--lock"]).lock,
             Some(true)
         );
+    }
+
+    #[test]
+    fn every_override_field_is_captured_when_its_flag_is_passed() {
+        exhaustively_destructure_overrides(CliOverrides::default());
+
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--major"]).major,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--no-gitignore"]).gitignore,
+            Some(false)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--all"]).all,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--all-artifacts"]).all_artifacts,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--allow-stale-lock"]).allow_stale_lock,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--fail-on-unknown-age"]).fail_on_unknown_age,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--strict"]).strict,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--build"]).build,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--transitive"]).transitive,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "fix", "--downgrade-pinned"]).downgrade_pinned,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--transitive", "allow"]).transitive_mode,
+            Some(super::TransitiveMode::Allow)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--exit-code=7"]).exit_code,
+            Some(7)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--hide-pinned"]).hide_pinned,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--countdown", "latest"]).countdown,
+            Some(super::Countdown::Latest)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--rewrite"]).rewrite,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--fail-on-stricter-native"]).fail_on_stricter_native,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "config", "--no-fail-on-stricter-native"])
+                .no_fail_on_stricter_native,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--lock"]).lock,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--dry-run"]).dry_run,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--offline"]).offline,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--fresh"]).fresh,
+            Some(true)
+        );
+        assert_eq!(overrides(&["cooldown", "check", "--json"]).json, Some(true));
     }
 
     #[test]

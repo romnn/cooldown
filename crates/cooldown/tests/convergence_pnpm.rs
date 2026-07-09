@@ -109,11 +109,6 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
         Some("current"),
         "pnpm should prove pnpm-lock.yaml current for this run"
     );
-    assert_eq!(
-        report.lock_verified(),
-        Some(true),
-        "the legacy lockVerified field should agree with lockStatus=current"
-    );
     assert!(
         !report.warning_kinds().contains("lock_unknown"),
         "successful pnpm mutations must not emit the pre-existing-lock warning"
@@ -335,9 +330,9 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
         "--dry-run must leave the lock byte-identical"
     );
     assert_eq!(
-        dry.lock_verified(),
+        dry.lock_status(),
         None,
-        "--dry-run never re-locks, so lockVerified is null"
+        "--dry-run never re-locks, so lockStatus is null"
     );
 }
 

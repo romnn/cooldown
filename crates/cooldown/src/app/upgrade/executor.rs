@@ -1,4 +1,5 @@
 use super::{UpgradeAccum, UpgradeCtx};
+use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
@@ -65,8 +66,65 @@ struct FixPlan {
     warnings: Vec<FixWarning>,
 }
 
-type MemberTargetKey = (String, String);
-type ChangeTargetKey = (String, Option<String>, String, Vec<MemberTargetKey>);
+/// The report and state delta produced by one native resolver batch.
+#[derive(Default)]
+struct BatchOutcome {
+    items: Vec<UpgradeItem>,
+    warnings: Vec<Diagnostic>,
+    errors: Vec<Diagnostic>,
+    strict_incomplete: bool,
+    lock_refreshed: bool,
+    /// Present iff the batch's mutation was kept: the lock landed and the post-apply graph
+    /// verification ran. `None` means the journal was restored (or nothing was attempted).
+    committed: Option<CommittedBatch>,
+}
+
+/// What a kept batch changes about the trial state.
+struct CommittedBatch {
+    /// The graph's non-baselined violations after this batch (the next trial baseline).
+    violations_after: HashSet<(String, String)>,
+    /// Whether the batch floated up violations the reconcile pass should mature down.
+    reconcile_needed: bool,
+}
+
+/// The transitive-cooldown gate's decision over a freshly-applied batch.
+enum TransitiveGateVerdict {
+    /// Restore the journal; the batch must not be kept.
+    RollBack,
+    /// Keep the batch; `reconcile_needed` says whether a reconcile pass should follow.
+    Keep {
+        /// Whether a reconcile pass should follow to mature floated-up violations down.
+        reconcile_needed: bool,
+    },
+}
+
+struct VerifiedBatchReport {
+    applied: HashSet<ChangeTargetKey>,
+    collateral: Vec<Change>,
+    planned_applied: bool,
+}
+
+impl BatchOutcome {
+    fn applied_count(&self) -> usize {
+        self.items.iter().filter(|item| item.applied).count()
+    }
+
+    fn errored_count(&self) -> usize {
+        self.errors.len()
+            + self
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count()
+    }
+
+    fn merge_into(self, acc: &mut UpgradeAccum) {
+        acc.items.extend(self.items);
+        acc.warnings.extend(self.warnings);
+        acc.errors.extend(self.errors);
+        acc.strict_incomplete |= self.strict_incomplete;
+    }
+}
 
 /// The evolving per-project state during one-change upgrade trials.
 struct TrialState {
@@ -74,23 +132,6 @@ struct TrialState {
     baseline_violations: HashSet<(String, String)>,
     /// Whether the last committed batch introduced transitive cooldown violations to reconcile.
     reconcile_needed: bool,
-}
-
-/// A restore point captured before the optimistic `upgrade` lock batch, so a transitive the reconcile
-/// pass cannot mature down rolls the accumulator and trial state back to exactly here — the lock files
-/// themselves are restored from a separate mutation journal.
-struct Checkpoint {
-    /// `acc.items` length: the optimistically-recorded applied/collateral rows are truncated back to it.
-    items_len: usize,
-    /// `acc.warnings` length: reconcile's deferred warnings are truncated back to it.
-    warnings_len: usize,
-    /// `acc.errors` length: a project-level error recorded during the rolled-back lock/reconcile batch
-    /// is truncated back to it, so a reverted batch never leaves a stale error (and a flipped exit).
-    errors_len: usize,
-    /// The graph violations present before the lock batch — the baseline a residual is measured against.
-    baseline_violations: HashSet<(String, String)>,
-    /// Whether an apply had already proven the lock current before the lock batch.
-    lock_refreshed: bool,
 }
 
 /// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
@@ -192,7 +233,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .into_iter()
             .partition(|change| self.manifest_only.contains(&change.package));
         if !build_changes.is_empty() {
-            self.apply_batch(build_changes, state).await;
+            let outcome = self.apply_batch(build_changes, state).await;
+            Self::advance_trial_state(&outcome, state);
+            self.merge_batch_outcome(outcome);
         }
         if lock_changes.is_empty() {
             return;
@@ -221,22 +264,26 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
-        let checkpoint = self.checkpoint(state);
+        let baseline_before_lock = state.baseline_violations.clone();
 
-        // Measure progress for the reconcile decision over the *lock* batch only — a build-only batch
-        // floats no transitive up, so it must not trigger (or suppress) reconciliation.
-        let applied_before = self.applied_count();
-        let errored_before = self.errored_count();
-        self.apply_batch(lock_changes.clone(), state).await;
+        let mut pending = Vec::new();
+        let lock_outcome = self.apply_batch(lock_changes.clone(), state).await;
         // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated up,
         // and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
-            self.applied_count() > applied_before && self.errored_count() == errored_before;
+            lock_outcome.applied_count() > 0 && lock_outcome.errored_count() == 0;
+        Self::advance_trial_state(&lock_outcome, state);
+        let lock_committed = lock_outcome.committed.is_some();
+        pending.push(lock_outcome);
+        if !lock_committed {
+            self.merge_batch_outcomes(pending);
+            return;
+        }
         if self.transitive_mode() == TransitiveGate::Enforce
             && upgraded_cleanly
             && state.reconcile_needed
         {
-            self.reconcile_to_fixpoint(state).await;
+            pending.extend(self.reconcile_to_fixpoint(state).await);
         }
 
         // Final gate: a too-fresh transitive newly forced in that the reconcile pass could not mature
@@ -244,22 +291,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // commit must not keep. A pre-existing dirty package may float to a different fresh version
         // without rollback, but an additional fresh version line for that package is still new.
         if self.transitive_mode() == TransitiveGate::Enforce {
-            let residual = newly_introduced_violations(
-                &checkpoint.baseline_violations,
-                &state.baseline_violations,
-            );
+            let residual =
+                newly_introduced_violations(&baseline_before_lock, &state.baseline_violations);
             if !residual.is_empty() {
                 self.roll_back_unreconciled(
                     &snapshot,
-                    &checkpoint,
+                    &baseline_before_lock,
                     &lock_changes,
                     &residual,
                     state,
                 );
+                return;
             }
         }
 
-        self.collapse_collateral(&checkpoint.baseline_violations);
+        self.merge_batch_outcomes(pending);
+        self.collapse_collateral(&baseline_before_lock);
     }
 
     /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
@@ -276,39 +323,44 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         );
     }
 
-    /// Capture the accumulator and trial-state restore point before the optimistic lock batch.
-    fn checkpoint(&self, state: &TrialState) -> Checkpoint {
-        Checkpoint {
-            items_len: self.acc.items.len(),
-            warnings_len: self.acc.warnings.len(),
-            errors_len: self.acc.errors.len(),
-            baseline_violations: state.baseline_violations.clone(),
-            lock_refreshed: self.lock_refreshed_by_apply,
+    /// Fold a batch's report into the run accumulator. Report-only: trial state advances exactly
+    /// once, via [`advance_trial_state`](Self::advance_trial_state) right after the batch runs, so
+    /// merging (which may happen later, after buffering) can never re-apply or clobber it.
+    fn merge_batch_outcome(&mut self, outcome: BatchOutcome) {
+        self.lock_refreshed_by_apply |= outcome.lock_refreshed;
+        outcome.merge_into(self.acc);
+    }
+
+    fn merge_batch_outcomes(&mut self, outcomes: impl IntoIterator<Item = BatchOutcome>) {
+        for outcome in outcomes {
+            self.merge_batch_outcome(outcome);
+        }
+    }
+
+    /// Advance the trial state with a committed batch's after-graph. Called exactly once per
+    /// outcome, immediately after [`apply_batch`](Self::apply_batch) returns; a rolled-back run
+    /// resets the state explicitly instead of un-applying outcomes.
+    fn advance_trial_state(outcome: &BatchOutcome, state: &mut TrialState) {
+        if let Some(committed) = &outcome.committed {
+            state
+                .baseline_violations
+                .clone_from(&committed.violations_after);
+            state.reconcile_needed = committed.reconcile_needed;
         }
     }
 
     /// Undo an optimistic lock batch whose floated-up transitive the reconcile pass could not clear:
-    /// restore the snapshotted lock, rewind the accumulator/trial state to `checkpoint`, and re-report
-    /// each planned lock change as held by the still-too-fresh transitive it would force in.
+    /// restore the snapshotted lock, discard the unmerged batch outcomes, and re-report each planned
+    /// lock change as held by the still-too-fresh transitive it would force in.
     fn roll_back_unreconciled(
         &mut self,
         snapshot: &cooldown_core::ProjectMutationJournal,
-        checkpoint: &Checkpoint,
+        baseline_violations: &HashSet<(String, String)>,
         lock_changes: &[Change],
         residual: &[(String, String)],
         state: &mut TrialState,
     ) {
-        // Rewind the accumulator to the checkpoint BEFORE restoring the lock: a restore failure records
-        // its own project error, which must survive the truncation (the on-disk lock is then in an
-        // unknown state the user has to see). acc.errors is rewound alongside items/warnings so a
-        // project error from the now-reverted lock/reconcile batch does not flip the exit.
-        self.acc.items.truncate(checkpoint.items_len);
-        self.acc.warnings.truncate(checkpoint.warnings_len);
-        self.acc.errors.truncate(checkpoint.errors_len);
-        self.lock_refreshed_by_apply = checkpoint.lock_refreshed;
-        state
-            .baseline_violations
-            .clone_from(&checkpoint.baseline_violations);
+        state.baseline_violations.clone_from(baseline_violations);
         state.reconcile_needed = false;
         self.restore_journal(snapshot);
         self.acc.strict_incomplete = true;
@@ -636,14 +688,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.emit_fix_warnings(plan.warnings);
                 return;
             }
-            let applied_before = self.applied_count();
-            if !self.apply_batch(plan.changes, state).await {
-                self.emit_fix_warnings(plan.warnings);
-                return;
-            }
-            // No forward progress despite a non-empty plan (e.g. every downgrade was held): stop
-            // rather than spin, and surface what is left.
-            if self.applied_count() == applied_before {
+            let outcome = self.apply_batch(plan.changes, state).await;
+            let applied = outcome.applied_count();
+            Self::advance_trial_state(&outcome, state);
+            self.merge_batch_outcome(outcome);
+            if applied == 0 {
                 self.emit_fix_warnings(plan.warnings);
                 return;
             }
@@ -657,10 +706,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Downgrade any too-fresh transitive a forward `upgrade` move floated up, to a fixpoint — the
     /// `fix` half of a single-pass `upgrade`. Reuses the per-change trial so each downgrade is
     /// applied, re-locked, and verified like any other.
-    async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) {
+    async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) -> Vec<BatchOutcome> {
+        let mut outcomes = Vec::new();
         for _ in 0..MAX_FIX_ROUNDS {
             if !state.reconcile_needed {
-                return;
+                return outcomes;
             }
             state.reconcile_needed = false;
             self.ctx.opts.progress.say(&format!(
@@ -668,51 +718,70 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.project_label(),
                 self.ctx.pctx.tool
             ));
-            let Some(deps) = self.reconcile_deps().await else {
-                return;
+            let deps = match self.read_reconcile_deps().await {
+                Ok(deps) => deps,
+                Err(error) => {
+                    let mut outcome = BatchOutcome::default();
+                    outcome.errors.push(self.project_diag(&error, None));
+                    outcomes.push(outcome);
+                    return outcomes;
+                }
             };
             let plan = self
                 .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
                 .await;
             if plan.changes.is_empty() {
-                self.emit_fix_warnings(plan.warnings);
-                return;
+                outcomes.push(self.fix_warnings_outcome(plan.warnings));
+                return outcomes;
             }
-            let applied_before = self.applied_count();
-            if !self.apply_batch(plan.changes, state).await {
-                self.emit_fix_warnings(plan.warnings);
-                return;
-            }
-            if self.applied_count() == applied_before {
-                self.emit_fix_warnings(plan.warnings);
-                return;
+            let outcome = self.apply_batch(plan.changes, state).await;
+            let applied = outcome.applied_count();
+            Self::advance_trial_state(&outcome, state);
+            outcomes.push(outcome);
+            if applied == 0 {
+                outcomes.push(self.fix_warnings_outcome(plan.warnings));
+                return outcomes;
             }
         }
+        outcomes
     }
 
     fn emit_fix_warnings(&mut self, warnings: Vec<FixWarning>) {
-        for warning in warnings {
-            self.record_fix_warning(&warning.message, &warning.package);
-        }
+        self.fix_warnings_outcome(warnings).merge_into(self.acc);
     }
 
-    fn record_fix_warning(&mut self, message: &str, package: &str) {
-        let diag = Diagnostic::new(DiagnosticKind::Held, message.to_string())
+    fn fix_warnings_outcome(&self, warnings: Vec<FixWarning>) -> BatchOutcome {
+        let mut outcome = BatchOutcome::default();
+        for warning in warnings {
+            self.add_fix_warning_to_outcome(&mut outcome, &warning.message, &warning.package);
+        }
+        outcome
+    }
+
+    fn add_fix_warning_to_outcome(&self, outcome: &mut BatchOutcome, message: &str, package: &str) {
+        outcome.strict_incomplete = true;
+        outcome
+            .warnings
+            .push(self.fix_warning_diag(message, package));
+    }
+
+    fn fix_warning_diag(&self, message: &str, package: &str) -> Diagnostic {
+        Diagnostic::new(DiagnosticKind::Held, message.to_string())
             .with_tool(self.ctx.tool_name())
             .with_project(self.project_label.clone())
-            .with_package(package);
-        self.acc.strict_incomplete = true;
-        self.acc.warnings.push(diag);
+            .with_package(package)
     }
 
     /// Apply a round's planned changes as **one** atomic plan, so a tool that re-resolves jointly
     /// (uv's ceiling resolve) settles conflicts between candidates in a single pass and produces one
     /// consistent lock. The whole batch shares a single journal: the resulting lock is indivisible, so
     /// if it drags in an irreducible fresh transitive the entire batch is rolled back rather than a
-    /// single change. Returns whether the round made forward progress worth continuing the fixpoint.
-    async fn apply_batch(&mut self, changes: Vec<Change>, state: &mut TrialState) -> bool {
+    /// single change. The returned outcome is the only side effect visible to the report until its
+    /// caller merges it.
+    async fn apply_batch(&mut self, changes: Vec<Change>, state: &TrialState) -> BatchOutcome {
+        let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
-            return false;
+            return outcome;
         }
         let plan = Plan {
             changes: changes.clone(),
@@ -736,8 +805,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(journal) => journal,
             Err(error) => {
-                self.record_project_error(&error, Some(&primary));
-                return false;
+                outcome
+                    .errors
+                    .push(self.project_diag(&error, Some(&primary)));
+                return outcome;
             }
         };
 
@@ -753,29 +824,65 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(report) => report,
             Err(error) => {
-                let restored = self.restore_journal(&journal);
-                self.record_change_errors(&error, &changes);
-                return restored;
+                self.restore_journal_into_outcome(&journal, &mut outcome);
+                self.add_change_errors(&mut outcome, &error, &changes);
+                return outcome;
             }
         };
         if report.applied.is_empty() {
-            self.record_batch_skips(report.skipped);
-            return self.restore_journal(&journal);
+            self.add_batch_skips(&mut outcome, report.skipped);
+            self.restore_journal_into_outcome(&journal, &mut outcome);
+            return outcome;
         }
         let report = match self.verify_apply_report(report, &changes).await {
             Ok(report) => report,
             Err(error) => {
-                let restored = self.restore_journal(&journal);
-                self.record_change_errors(&error, &changes);
-                return restored;
+                self.restore_journal_into_outcome(&journal, &mut outcome);
+                self.add_change_errors(&mut outcome, &error, &changes);
+                return outcome;
             }
         };
 
-        // A held candidate (the resolve could not place it at its target without breaking the lock) is
-        // reported as a skip naming the package that blocks it.
+        let report = self.classify_batch_report(report, &changes, &mut outcome);
+        if !report.planned_applied {
+            // No requested target landed: roll any incidental resolver movement back to the captured
+            // state instead of committing a collateral-only mutation.
+            self.restore_journal_into_outcome(&journal, &mut outcome);
+            return outcome;
+        }
+
+        let Some(committed) = self
+            .verify_batch_graph(
+                &mut outcome,
+                &changes,
+                &report.applied,
+                &state.baseline_violations,
+            )
+            .await
+        else {
+            self.restore_journal_into_outcome(&journal, &mut outcome);
+            return outcome;
+        };
+
+        self.commit_batch_report(
+            &mut outcome,
+            &changes,
+            &report.collateral,
+            &report.applied,
+            committed,
+        );
+        outcome
+    }
+
+    fn classify_batch_report(
+        &self,
+        report: ApplyReport,
+        changes: &[Change],
+        outcome: &mut BatchOutcome,
+    ) -> VerifiedBatchReport {
         let applied: HashSet<ChangeTargetKey> =
             report.applied.iter().map(change_target_key).collect();
-        let planned_applied = planned_changes_landed(&changes, &applied);
+        let planned_applied = planned_changes_landed(changes, &applied);
         let planned: HashSet<PackageId> = changes
             .iter()
             .map(|change| change.package.clone())
@@ -784,20 +891,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // pushed backward for consistency, or matured down by a downgrade). These are part of the
         // committed lock and must be surfaced, never silent — the whole point of the full-lock-diff
         // report. They are recorded as applied rows once the batch commits below.
-        let collateral: Vec<Change> = report
+        let collateral = report
             .applied
             .iter()
             .filter(|change| !planned.contains(&change.package))
             .cloned()
             .collect();
-        self.record_batch_skips(report.skipped);
-
-        if !planned_applied {
-            // No requested target landed: roll any incidental resolver movement back to the captured
-            // state instead of committing a collateral-only mutation.
-            return self.restore_journal(&journal);
+        self.add_batch_skips(outcome, report.skipped);
+        VerifiedBatchReport {
+            applied,
+            collateral,
+            planned_applied,
         }
+    }
 
+    async fn verify_batch_graph(
+        &self,
+        outcome: &mut BatchOutcome,
+        changes: &[Change],
+        applied: &HashSet<ChangeTargetKey>,
+        baseline_violations: &HashSet<(String, String)>,
+    ) -> Option<CommittedBatch> {
         self.ctx.opts.progress.say(&format!(
             "Checking resolved graph cooldown after apply in {} ({})…",
             self.project_label(),
@@ -806,45 +920,50 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let after = match self.graph_violations().await {
             Ok(after) => after,
             Err(error) => {
-                // The post-apply gate probe failed: fail closed by rolling the batch back and
-                // recording the failure against each applied change (never committing an unverified
-                // lock).
-                let restored = self.restore_journal(&journal);
-                self.record_change_errors(
+                self.add_change_errors(
+                    outcome,
                     &error,
                     changes
                         .iter()
                         .filter(|change| applied.contains(&change_target_key(change))),
                 );
-                return restored;
+                return None;
             }
         };
         let after_keys: HashSet<(String, String)> = after.keys().cloned().collect();
-        if self.gate_batch_transitives(&after, &after_keys, &changes, &applied, state) {
-            return self.restore_journal(&journal);
+        match self.gate_batch_transitives(
+            outcome,
+            &after,
+            &after_keys,
+            changes,
+            applied,
+            baseline_violations,
+        ) {
+            TransitiveGateVerdict::RollBack => None,
+            TransitiveGateVerdict::Keep { reconcile_needed } => Some(CommittedBatch {
+                violations_after: after_keys,
+                reconcile_needed,
+            }),
         }
-
-        self.commit_batch_report(&changes, &collateral, &applied, after_keys, state);
-        true
     }
 
     fn commit_batch_report(
-        &mut self,
+        &self,
+        outcome: &mut BatchOutcome,
         changes: &[Change],
         collateral: &[Change],
         applied: &HashSet<ChangeTargetKey>,
-        after_keys: HashSet<(String, String)>,
-        state: &mut TrialState,
+        committed: CommittedBatch,
     ) {
-        self.lock_refreshed_by_apply |= self.ctx.writer.successful_apply_proves_lock_current();
-        state.baseline_violations = after_keys;
+        outcome.lock_refreshed = self.ctx.writer.successful_apply_proves_lock_current();
+        outcome.committed = Some(committed);
         for change in changes {
             if applied.contains(&change_target_key(change)) {
-                self.record_change_applied(change);
+                outcome.items.push(self.change_applied_item(change));
             }
         }
         for change in collateral {
-            self.record_change_applied(change);
+            outcome.items.push(self.change_applied_item(change));
         }
     }
 
@@ -879,16 +998,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// Record each held candidate (uv lowered it below its ceiling, or the resolve rejected it) as a
     /// skip, naming the package that blocks it via [`conflict_skip_message`].
-    fn record_batch_skips(&mut self, skipped: Vec<cooldown_core::Skipped>) {
+    fn add_batch_skips(&self, outcome: &mut BatchOutcome, skipped: Vec<cooldown_core::Skipped>) {
         for skipped in skipped {
             let offending = skipped.offending.map(|package| package.name);
             // A multi-version dependency held within its own line is conservative-correct, not a
             // failed upgrade — like `NeedsMajor` it must not fail a `--strict` run.
             if skipped.reason != SkipReason::MultiVersionHeld {
-                self.acc.strict_incomplete = true;
+                outcome.strict_incomplete = true;
             }
             let change = skipped.change;
-            self.record_change_skip(
+            outcome.items.push(self.change_skip_item(
                 &change,
                 Some(SkippedInfo {
                     reason: skipped.reason,
@@ -899,7 +1018,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     ),
                     offending,
                 }),
-            );
+            ));
         }
     }
 
@@ -907,33 +1026,36 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// transitive into the graph; how we react follows the transitive mode: `Hide` ignores
     /// transitives; `Allow` keeps the lock and reports them; `Enforce` reconciles forward `upgrade`
     /// batches optimistically, while backward `fix` batches still roll back immediately when a new
-    /// violation has no lower graph floor to try. Returns `true` when the caller should restore the
-    /// batch journal.
+    /// violation has no lower graph floor to try. `outcome` receives only report rows (warnings and
+    /// skip items); the state consequences travel in the returned [`TransitiveGateVerdict`].
     fn gate_batch_transitives(
-        &mut self,
+        &self,
+        outcome: &mut BatchOutcome,
         after: &HashMap<(String, String), bool>,
         after_keys: &HashSet<(String, String)>,
         changes: &[Change],
         applied: &HashSet<ChangeTargetKey>,
-        state: &mut TrialState,
-    ) -> bool {
+        baseline_violations: &HashSet<(String, String)>,
+    ) -> TransitiveGateVerdict {
+        let keep = |reconcile_needed| TransitiveGateVerdict::Keep { reconcile_needed };
         let new_violations: Vec<&(String, String)> =
-            after_keys.difference(&state.baseline_violations).collect();
+            after_keys.difference(baseline_violations).collect();
         if new_violations.is_empty() {
-            return false;
+            return keep(false);
         }
         match self.transitive_mode() {
-            TransitiveGate::Hide => false,
+            TransitiveGate::Hide => keep(false),
             TransitiveGate::Allow => {
                 for (package, version) in &new_violations {
-                    self.record_fix_warning(
+                    self.add_fix_warning_to_outcome(
+                        outcome,
                         &format!(
                             "{package}@{version} is younger than its cooldown; left in place by --transitive allow"
                         ),
                         package,
                     );
                 }
-                false
+                keep(false)
             }
             TransitiveGate::Enforce => {
                 // `upgrade` is optimistic: a forward move that floats a too-fresh transitive up is
@@ -945,8 +1067,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 // conservative: it moves *backward*, so a fresh transitive it cannot reduce here is a
                 // real, unrecoverable conflict that must roll the batch back immediately.
                 if matches!(self.mode, PlanMode::Upgrade) {
-                    state.reconcile_needed = true;
-                    return false;
+                    return keep(true);
                 }
                 let Some((forced_pkg, _)) = new_violations
                     .iter()
@@ -954,23 +1075,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 else {
                     // Every new violation is reconcilable; keep the lock and let the reconcile pass
                     // (after the fix loop) downgrade the floated-up transitives.
-                    state.reconcile_needed = true;
-                    return false;
+                    return keep(true);
                 };
-                self.acc.strict_incomplete = true;
+                outcome.strict_incomplete = true;
                 for change in changes {
                     if applied.contains(&change_target_key(change)) {
-                        self.record_change_skip(
+                        outcome.items.push(self.change_skip_item(
                             change,
                             Some(SkippedInfo {
                                 reason: SkipReason::TransitiveInCooldown,
                                 message: SkipReason::TransitiveInCooldown.message().to_string(),
                                 offending: Some(forced_pkg.clone()),
                             }),
-                        );
+                        ));
                     }
                 }
-                true
+                TransitiveGateVerdict::RollBack
             }
         }
     }
@@ -979,38 +1099,36 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.ctx.opts.transitive_mode
     }
 
-    async fn reconcile_deps(&mut self) -> Option<Vec<Dependency>> {
+    async fn read_reconcile_deps(&self) -> cooldown_core::Result<Vec<Dependency>> {
         // A scoped upgrade can float transitives that do not match `--package`; reconcile is the
         // safety pass over the post-apply graph, so it must see the raw graph like `graph_violations`.
-        match self
+        let mut deps = self
             .ctx
             .reader
             .dependencies(&self.ctx.pctx.project, DepScope::Graph)
-            .await
-        {
-            Ok(mut deps) => {
-                deps.sort_by(|a, b| {
-                    a.package
-                        .name
-                        .cmp(&b.package.name)
-                        .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
-                });
-                Some(deps)
-            }
-            Err(error) => {
-                self.record_project_error(&error, None);
-                None
-            }
+            .await?;
+        deps.sort_by(|a, b| {
+            a.package
+                .name
+                .cmp(&b.package.name)
+                .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
+        });
+        Ok(deps)
+    }
+
+    fn restore_journal(&mut self, journal: &cooldown_core::ProjectMutationJournal) {
+        if let Err(error) = journal.restore(&self.ctx.pctx.project.root) {
+            self.record_project_error(&error, None);
         }
     }
 
-    fn restore_journal(&mut self, journal: &cooldown_core::ProjectMutationJournal) -> bool {
-        match journal.restore(&self.ctx.pctx.project.root) {
-            Ok(()) => true,
-            Err(error) => {
-                self.record_project_error(&error, None);
-                false
-            }
+    fn restore_journal_into_outcome(
+        &self,
+        journal: &cooldown_core::ProjectMutationJournal,
+        outcome: &mut BatchOutcome,
+    ) {
+        if let Err(error) = journal.restore(&self.ctx.pctx.project.root) {
+            outcome.errors.push(self.project_diag(&error, None));
         }
     }
 
@@ -1058,7 +1176,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             },
             Err(error) => {
                 self.record_lock_status(LockStatus::Stale);
-                self.acc.lock_verified = Some(false);
                 self.record_project_error(&error, None);
             }
         }
@@ -1086,7 +1203,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     fn record_lock_status(&mut self, status: LockStatus) {
         self.acc.lock_status = Some(combine_lock_status(self.acc.lock_status, status));
-        self.acc.lock_verified = self.acc.lock_status.and_then(LockStatus::verified);
     }
 
     /// The graph's too-fresh, non-baselined violations, each mapped to whether a conservative `fix`
@@ -1148,13 +1264,24 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &self.project_label
     }
 
+    fn project_diag(&self, error: &cooldown_core::CoreError, package: Option<&str>) -> Diagnostic {
+        diag_from_error(error, self.ctx.pctx.tool, self.project_label(), package)
+    }
+
     fn record_project_error(&mut self, error: &cooldown_core::CoreError, package: Option<&str>) {
-        self.acc.errors.push(diag_from_error(
-            error,
-            self.ctx.pctx.tool,
-            self.project_label(),
-            package,
-        ));
+        self.acc.errors.push(self.project_diag(error, package));
+    }
+
+    fn add_change_errors<'c>(
+        &self,
+        outcome: &mut BatchOutcome,
+        error: &cooldown_core::CoreError,
+        changes: impl IntoIterator<Item = &'c Change>,
+    ) {
+        for change in changes {
+            let diag = self.project_diag(error, Some(&change.package.name));
+            outcome.items.push(self.change_error_item(change, diag));
+        }
     }
 
     fn record_change_errors<'c>(
@@ -1163,52 +1290,51 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: impl IntoIterator<Item = &'c Change>,
     ) {
         for change in changes {
-            let diag = diag_from_error(
-                error,
-                self.ctx.pctx.tool,
-                self.project_label(),
-                Some(&change.package.name),
-            );
+            let diag = self.project_diag(error, Some(&change.package.name));
             self.record_change_error(change, diag);
         }
     }
 
-    fn record_change_applied(&mut self, change: &Change) {
-        let project_label = self.project_label.clone();
-        let tool = self.ctx.tool_name();
-        self.acc
-            .items
-            .push(plan_item(change, &project_label, tool, true, None));
+    fn change_applied_item(&self, change: &Change) -> UpgradeItem {
+        plan_item(
+            change,
+            &self.project_label,
+            self.ctx.tool_name(),
+            true,
+            None,
+        )
     }
 
-    /// Changes applied so far this run (across projects) — used as a before/after delta to detect
-    /// whether the current project's upgrade loop made forward progress worth reconciling.
-    fn applied_count(&self) -> usize {
-        self.acc.items.iter().filter(|item| item.applied).count()
+    fn change_error_item(&self, change: &Change, diag: Diagnostic) -> UpgradeItem {
+        let mut item = plan_item(
+            change,
+            &self.project_label,
+            self.ctx.tool_name(),
+            false,
+            None,
+        );
+        item.error = Some(diag);
+        item
     }
 
-    /// Errors recorded so far this run (project-level plus per-change) — the before/after delta tells
-    /// `reconcile_graph` whether the upgrade loop hit a failure it must not re-trigger.
-    fn errored_count(&self) -> usize {
-        self.acc.errors.len()
-            + self
-                .acc
-                .items
-                .iter()
-                .filter(|item| item.error.is_some())
-                .count()
+    fn change_skip_item(&self, change: &Change, skipped: Option<SkippedInfo>) -> UpgradeItem {
+        plan_item(
+            change,
+            &self.project_label,
+            self.ctx.tool_name(),
+            false,
+            skipped,
+        )
     }
 
     fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {
-        let project_label = self.project_label.clone();
-        let tool = self.ctx.tool_name();
-        record_error_item(self.acc, change, &project_label, tool, diag);
+        let item = self.change_error_item(change, diag);
+        self.acc.items.push(item);
     }
 
     fn record_change_skip(&mut self, change: &Change, skipped: Option<SkippedInfo>) {
-        let project_label = self.project_label.clone();
-        let tool = self.ctx.tool_name();
-        record_skip_item(self.acc, change, &project_label, tool, skipped);
+        let item = self.change_skip_item(change, skipped);
+        self.acc.items.push(item);
     }
 }
 
@@ -1326,31 +1452,6 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
 
     deps.iter()
         .any(|dep| dep.package == change.package && dep.current == change.to)
-}
-
-fn change_target_key(change: &Change) -> ChangeTargetKey {
-    // Two members upgrading the same crate to the same target from different current versions are
-    // distinct direct changes that share `(name, registry, to)`. Keying them member-blind lets the
-    // member-aware `target_reached` collapse them, masking a held member behind an applied one or
-    // recording the held one as both applied and skipped. Transitive members are attribution context,
-    // not separate editable targets, so only direct changes include members in the key.
-    let mut members: Vec<MemberTargetKey> = if change.direct {
-        change
-            .members
-            .iter()
-            .map(|member| (member.name.clone(), member.path.clone()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    members.sort();
-    members.dedup();
-    (
-        change.package.name.clone(),
-        change.package.registry.clone(),
-        change.to.as_str().to_string(),
-        members,
-    )
 }
 
 fn resolver_conflict(change: &Change) -> Skipped {
@@ -1539,29 +1640,6 @@ fn plan_item(
         skipped,
         error: None,
     }
-}
-
-fn record_error_item(
-    acc: &mut UpgradeAccum,
-    change: &Change,
-    project: &str,
-    tool: &str,
-    diag: Diagnostic,
-) {
-    let mut item = plan_item(change, project, tool, false, None);
-    item.error = Some(diag);
-    acc.items.push(item);
-}
-
-fn record_skip_item(
-    acc: &mut UpgradeAccum,
-    change: &Change,
-    project: &str,
-    tool: &str,
-    skipped: Option<SkippedInfo>,
-) {
-    acc.items
-        .push(plan_item(change, project, tool, false, skipped));
 }
 
 #[cfg(test)]
@@ -2017,11 +2095,9 @@ mod tests {
         let current_then_unknown =
             combine_lock_status(Some(LockStatus::Current), LockStatus::Unknown);
         assert_eq!(current_then_unknown, LockStatus::Unknown);
-        assert_eq!(current_then_unknown.verified(), None);
 
         let unknown_then_stale = combine_lock_status(Some(LockStatus::Unknown), LockStatus::Stale);
         assert_eq!(unknown_then_stale, LockStatus::Stale);
-        assert_eq!(unknown_then_stale.verified(), Some(false));
     }
 
     #[test]

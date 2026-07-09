@@ -424,6 +424,7 @@ dependencies = [
  "indoc",
  "jiff",
  "serde",
+ "tempfile",
  "thiserror",
  "toml",
 ]

@@ -101,11 +101,6 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
         Some("current"),
         "pnpm should prove pnpm-lock.yaml current for this run"
     );
-    assert_eq!(
-        report.lock_verified(),
-        Some(true),
-        "the legacy lockVerified field should agree with lockStatus=current"
-    );
     assert!(
         !report.warning_kinds().contains("lock_unknown"),
         "successful pnpm mutations must not emit the pre-existing-lock warning"

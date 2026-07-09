@@ -76,7 +76,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     if ws.is_empty() {
         let workdir = global.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
         if opts.json {
-            println!("{}", commands::no_tool_json(command_name(&cli.command))?);
+            super::output::stdout_line(&commands::no_tool_json(command_name(&cli.command))?)?;
         } else {
             eprintln!("no supported tool detected under {workdir}");
         }
