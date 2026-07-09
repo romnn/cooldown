@@ -371,7 +371,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 change,
                 Some(SkippedInfo {
                     reason: SkipReason::TransitiveInCooldown,
-                    message: SkipReason::TransitiveInCooldown.message().to_string(),
+                    message: conflict_skip_message(
+                        SkipReason::TransitiveInCooldown,
+                        offender.as_deref(),
+                        &change.package.name,
+                    ),
                     offending: offender.clone(),
                 }),
             );
@@ -1091,7 +1095,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                             change,
                             Some(SkippedInfo {
                                 reason: SkipReason::TransitiveInCooldown,
-                                message: SkipReason::TransitiveInCooldown.message().to_string(),
+                                message: conflict_skip_message(
+                                    SkipReason::TransitiveInCooldown,
+                                    Some(forced_pkg),
+                                    &change.package.name,
+                                ),
                                 offending: Some(forced_pkg.clone()),
                             }),
                         ));
@@ -1620,6 +1628,11 @@ fn conflict_skip_message(reason: SkipReason, offending: Option<&str>, changed: &
         // so it keeps the generic message.
         (SkipReason::ResolverConflict, Some(offending)) if offending != changed => {
             format!("held: conflicts with {offending}")
+        }
+        // Name the stuck transitive: without it the report says only that *some* dependency is too
+        // fresh, leaving no lead on what to baseline or wait out.
+        (SkipReason::TransitiveInCooldown, Some(offending)) => {
+            format!("{} ({offending})", reason.message())
         }
         _ => reason.message().to_string(),
     }
