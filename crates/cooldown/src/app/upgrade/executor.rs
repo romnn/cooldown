@@ -1457,11 +1457,24 @@ fn verify_applied_targets(
 fn target_reached(deps: &[Dependency], change: &Change) -> bool {
     if change.direct && !change.members.is_empty() {
         return change.members.iter().all(|member| {
-            deps.iter().any(|dep| {
+            let reached = deps.iter().any(|dep| {
                 dep.package == change.package
                     && dep.current == change.to
                     && dep.members.iter().any(|dep_member| dep_member == member)
-            })
+            });
+            // The planned line must actually have moved. A member that declares the crate twice
+            // (`[dependencies] toml = "1"` beside `[build-dependencies] toml = "0.5"`) reaches the
+            // target through the sibling entry while the planned old-major line sits untouched;
+            // counting that as applied reports an upgrade the lock never took, forever. A direct
+            // node still at the from version attributed to this member is that untouched line (a
+            // from node the member only *reaches* transitively is fine — its own edges moved).
+            let from_line_remains = deps.iter().any(|dep| {
+                dep.direct
+                    && dep.package == change.package
+                    && dep.current == change.from
+                    && dep.members.iter().any(|dep_member| dep_member == member)
+            });
+            reached && !from_line_remains
         });
     }
 
@@ -1842,6 +1855,44 @@ mod tests {
         assert!(verified.applied.is_empty());
         assert_eq!(verified.skipped.len(), 1);
         assert_eq!(verified.skipped[0].change, planned_change);
+    }
+
+    #[test]
+    fn verify_applied_targets_rejects_a_target_reached_through_a_sibling_entry() {
+        // A member that declares the crate twice ([dependencies] toml = "1" beside
+        // [build-dependencies] toml = "0.5") resolves the target version before the planned 0.5.x
+        // move is even attempted. As long as the member's old direct line survives, the change has
+        // not landed — the sibling edge must not verify it as applied (it would report an upgrade
+        // the lock never took, on every run, forever).
+        let mut planned_change = change("toml", "0.5.11", "1.1.2");
+        planned_change.members = vec![member("rawloader", "rawloader")];
+        let planned = vec![planned_change.clone()];
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+        let mut old_line = dep("toml", "0.5.11");
+        old_line.members = vec![member("rawloader", "rawloader")];
+        let mut new_line = dep("toml", "1.1.2");
+        new_line.members = vec![member("rawloader", "rawloader")];
+
+        let verified =
+            verify_applied_targets(report, &planned, &[old_line.clone(), new_line.clone()]);
+
+        assert!(verified.applied.is_empty());
+        assert_eq!(verified.skipped.len(), 1);
+        assert_eq!(verified.skipped[0].change, planned_change);
+
+        // Once the old line is gone — or survives only transitively (another crate's requirement,
+        // not the member's own entry) — the member's move has landed.
+        let report = ApplyReport {
+            applied: planned.clone(),
+            skipped: Vec::new(),
+        };
+        old_line.direct = false;
+        let verified = verify_applied_targets(report, &planned, &[old_line, new_line]);
+        assert_eq!(verified.applied.len(), 1);
+        assert!(verified.skipped.is_empty());
     }
 
     #[test]

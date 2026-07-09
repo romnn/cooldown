@@ -126,16 +126,22 @@ impl ResolvedGraph {
         })
     }
 
-    /// Whether every listed workspace member directly resolves `crate_name` at the requested target.
+    /// Whether every listed workspace member directly resolves `crate_name` at the requested
+    /// target, having actually left the `from` line behind.
     ///
     /// Cargo can keep several versions of the same crate in one workspace. A lock-level check that
-    /// only asks whether `crate_name@target` exists can therefore confuse another member's dependency
-    /// for this member's unresolved one.
+    /// only asks whether `crate_name@target` exists can therefore confuse another member's
+    /// dependency for this member's unresolved one. And a member can itself hold the target through
+    /// a *different* manifest entry: with `[dependencies] toml = "1"` beside `[build-dependencies]
+    /// toml = "0.5"`, an edge into the target major exists before the planned `0.5.x` move is even
+    /// attempted, so a cross-major move additionally requires the member to have no remaining edge
+    /// into `from`'s major — otherwise the untouched old line masquerades as an applied move.
     #[must_use]
     pub fn direct_members_reach(
         &self,
         members: &[MemberRef],
         crate_name: &str,
+        from: &str,
         target: &str,
         downgrade: bool,
     ) -> bool {
@@ -143,6 +149,7 @@ impl ResolvedGraph {
             return false;
         }
 
+        let from_major = crate::version::major_key(from);
         let target_major = crate::version::major_key(target);
         for member in members {
             let Some(root) = self.roots.iter().find(|root| {
@@ -155,27 +162,32 @@ impl ResolvedGraph {
             let Some(dep_ids) = self.edges.get(root) else {
                 return false;
             };
-            let reached = dep_ids
-                .iter()
-                .filter_map(|id| self.packages.get(id))
-                .any(|info| {
-                    if info.name != crate_name || !info.is_crates_io() {
-                        return false;
-                    }
-                    // Scope to the target's own compatibility slot, like `reached` does via its
-                    // `(name, major)` key. One member can resolve several majors of a crate at once
-                    // (a normal `nix = "0.28"` beside a target-gated `nix = "0.31"`); without this a
-                    // sibling major that satisfies the bound would mask the slot we are moving.
-                    if crate::version::major_key(&info.version) != target_major {
-                        return false;
-                    }
-                    let ordering = crate::version::compare(&info.version, target);
-                    if downgrade {
-                        ordering.is_le()
-                    } else {
-                        ordering.is_ge()
-                    }
-                });
+            let mut reached = false;
+            for info in dep_ids.iter().filter_map(|id| self.packages.get(id)) {
+                if info.name != crate_name || !info.is_crates_io() {
+                    continue;
+                }
+                let major = crate::version::major_key(&info.version);
+                // A cross-major move must vacate the old slot: any surviving member edge into
+                // `from`'s major means the planned line never moved, no matter what other entries
+                // already resolve in the target major.
+                if from_major != target_major && major == from_major {
+                    return false;
+                }
+                // Scope to the target's own compatibility slot, like `reached` does via its
+                // `(name, major)` key. One member can resolve several majors of a crate at once
+                // (a normal `nix = "0.28"` beside a target-gated `nix = "0.31"`); without this a
+                // sibling major that satisfies the bound would mask the slot we are moving.
+                if major != target_major {
+                    continue;
+                }
+                let ordering = crate::version::compare(&info.version, target);
+                reached |= if downgrade {
+                    ordering.is_le()
+                } else {
+                    ordering.is_ge()
+                };
+            }
             if !reached {
                 return false;
             }
@@ -939,6 +951,7 @@ mod tests {
                 path: "apps/a".to_string(),
             }],
             "nix",
+            "0.28.0",
             "0.31.3",
             false,
         ));
@@ -948,6 +961,7 @@ mod tests {
                 path: "apps/b".to_string(),
             }],
             "nix",
+            "0.28.0",
             "0.31.3",
             false,
         ));
@@ -984,9 +998,65 @@ mod tests {
                 path: "apps/app".to_string(),
             }],
             "foo",
+            "1.4.0",
             "1.5.0",
             false,
         ));
+    }
+
+    #[test]
+    fn direct_members_reach_requires_a_cross_major_move_to_vacate_the_old_slot() {
+        // `app` declares `foo` twice (e.g. `[dependencies] foo = "1"` beside `[dev-dependencies]
+        // foo = "0.4"`), so an edge into the target major exists before the planned 0.4.8 -> 1.0.11
+        // move is attempted. As long as the member still edges the 0.4 line, the move has not
+        // happened — the pre-existing 1.x edge must not read as "reached".
+        let graph = Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/app/Cargo.toml"},
+                    {"id": "foo-old", "name": "foo", "version": "0.4.8",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"},
+                    {"id": "foo-new", "name": "foo", "version": "1.0.11",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"pkg": "foo-old"}, {"pkg": "foo-new"}]},
+                    {"id": "foo-old", "deps": []},
+                    {"id": "foo-new", "deps": []}
+                ]}
+            }"#,
+        );
+        let member = [MemberRef {
+            name: "app".to_string(),
+            path: "apps/app".to_string(),
+        }];
+
+        assert!(
+            !graph.direct_members_reach(&member, "foo", "0.4.8", "1.0.11", false),
+            "the surviving 0.4 edge means the planned line never moved"
+        );
+
+        // Once the old slot is vacated (both entries resolve in the target major), it is reached.
+        let moved = Cargo::build_graph_from_json(
+            r#"{
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "manifest_path": "/repo/apps/app/Cargo.toml"},
+                    {"id": "foo-new", "name": "foo", "version": "1.0.11",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index"}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "/repo",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"pkg": "foo-new"}]},
+                    {"id": "foo-new", "deps": []}
+                ]}
+            }"#,
+        );
+        assert!(moved.direct_members_reach(&member, "foo", "0.4.8", "1.0.11", false));
     }
 
     #[test]
@@ -1016,6 +1086,7 @@ mod tests {
                 path: "apps/app".to_string(),
             }],
             "foo",
+            "1.4.0",
             "1.5.0",
             false,
         ));

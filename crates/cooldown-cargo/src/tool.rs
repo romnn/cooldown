@@ -511,6 +511,7 @@ fn reached_after(
             graph.direct_members_reach(
                 &change.members,
                 &change.package.name,
+                change.from.as_str(),
                 change.to.as_str(),
                 change.downgrade,
             )
