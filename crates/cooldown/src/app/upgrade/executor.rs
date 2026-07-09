@@ -706,13 +706,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Downgrade any too-fresh transitive a forward `upgrade` move floated up, to a fixpoint — the
     /// `fix` half of a single-pass `upgrade`. Reuses the per-change trial so each downgrade is
     /// applied, re-locked, and verified like any other.
+    ///
+    /// `reconcile_needed` gates only **entry**; the rounds then run to a fixpoint on progress, like
+    /// [`fix_to_fixpoint`](Self::fix_to_fixpoint). A round's downgrades can make a violation that
+    /// was graph-held plannable (maturing `zbus_macros` down lowers the floor its `^` requirement
+    /// put under `zbus_names`), and that unblocking raises no *new* violation — so re-arming on new
+    /// violations alone would stop after one round and leave the now-plannable violation fresh, for
+    /// the final residual gate to then roll the whole batch back.
     async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) -> Vec<BatchOutcome> {
         let mut outcomes = Vec::new();
+        if !state.reconcile_needed {
+            return outcomes;
+        }
+        state.reconcile_needed = false;
         for _ in 0..MAX_FIX_ROUNDS {
-            if !state.reconcile_needed {
-                return outcomes;
-            }
-            state.reconcile_needed = false;
             self.ctx.opts.progress.say(&format!(
                 "Reconciling transitive cooldown violations in {} ({})…",
                 self.project_label(),
