@@ -430,6 +430,45 @@ impl CargoTool {
             {
                 return Err(err);
             }
+            self.repin_cross_major(project, change).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-pin a cross-major move that cargo landed in the target's major but not *at* the target.
+    /// `cargo update -p <name>@<from> --precise <to>` silently drops the pin when `from` and `to`
+    /// are semver-incompatible: the old version line is replaced during the re-resolve, the pin
+    /// dies with it, and the new line resolves to the newest version the (widened) requirement
+    /// admits — exit 0, no diagnostic. The slot then sits in the right major, so a follow-up
+    /// same-major pin from the landed version is honored. A rejected or impossible re-pin follows
+    /// the same tolerance as the first pin: the diff reports the candidate held.
+    async fn repin_cross_major(&self, project: &Project, change: &Change) -> Result<()> {
+        if version::major_key(change.from.as_str()) == version::major_key(change.to.as_str()) {
+            return Ok(());
+        }
+        let after = locked_versions(&read_lock(project)?);
+        let slot = (
+            change.package.name.clone(),
+            version::major_key(change.to.as_str()).0,
+        );
+        let Some(landed) = after
+            .get(&slot)
+            .filter(|landed| *landed != change.to.as_str())
+        else {
+            return Ok(());
+        };
+        if let Err(err) = self
+            .cargo
+            .update_precise(
+                &project.root,
+                &change.package.name,
+                landed,
+                change.to.as_str(),
+            )
+            .await
+            && err.is_local_environment_failure()
+        {
+            return Err(err);
         }
         Ok(())
     }
