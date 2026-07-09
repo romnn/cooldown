@@ -762,8 +762,8 @@ impl<L: NodeLock> NpmTool<L> {
 /// a direct dependency outside its declared range — `--frozen-lockfile` accepts that via the lock's
 /// `overrides:` section, which the cheap check does not read) must not fail apply: every recovery
 /// trial would fail identically and the run would misreport all candidates as held. The before/after
-/// gate also absorbs any node-semver vs rust-semver divergence: whatever the check mis-judges, it
-/// mis-judges identically on both sides.
+/// gate also absorbs any node-semver vs rust-semver divergence: whatever the check misjudges, it
+/// misjudges identically on both sides.
 fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Option<String> {
     let detail = L::lock_consistency_error(after)?;
     before
