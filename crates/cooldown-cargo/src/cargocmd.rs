@@ -576,35 +576,28 @@ impl Cargo {
         }
     }
 
-    /// Pins every `(name, from)` in `specs` to the single shared version `to` in one whole-graph
-    /// re-resolve via `cargo update -p A@<from> -p B@<from> … --precise <to>`. `--precise` accepts a
-    /// single version but multiple `[SPEC]`s, so crates that share a target version are batched into
-    /// one re-resolve; the caller groups distinct targets and calls this once per group. Each
+    /// Pins `name@from` to exactly `to` via `cargo update -p <name>@<from> --precise <to>`. One
+    /// spec per invocation, never several: cargo accepts multiple `-p` specs alongside `--precise`
+    /// but silently applies the pin to only the first spec and exits 0 (observed on cargo 1.96),
+    /// so batching crates that share a target version into one call loses every pin but the first.
     /// `@<from>` disambiguates a crate name that resolves to multiple versions in the graph.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if the
     /// update is rejected (e.g. a `=`-pin or resolver conflict blocks the precise move). A rejection
-    /// is the caller's signal that the candidates stay where the resolver placed them.
-    pub async fn update_precise_many(
+    /// is the caller's signal that the candidate stays where the resolver placed it.
+    pub async fn update_precise(
         &self,
         dir: &Utf8Path,
-        specs: &[(String, String)],
+        name: &str,
+        from: &str,
         to: &str,
     ) -> Result<(), CoreError> {
-        if specs.is_empty() {
-            return Ok(());
-        }
-        let mut args: Vec<String> = vec!["update".to_string()];
-        for (name, from) in specs {
-            args.push("-p".to_string());
-            args.push(format!("{name}@{from}"));
-        }
-        args.push("--precise".to_string());
-        args.push(to.to_string());
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(dir, &arg_refs).await.map(|_| ())
+        let spec = format!("{name}@{from}");
+        self.run(dir, &["update", "-p", &spec, "--precise", to])
+            .await
+            .map(|_| ())
     }
 
     /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].

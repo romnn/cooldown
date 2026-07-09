@@ -4,13 +4,13 @@
 //! Cargo has no publish-date cutoff flag (no `--exclude-newer` equivalent), so the cooldown window
 //! is realized entirely in [`cooldown_core`]: the crates.io sparse index supplies publish times, the
 //! core computes each crate's newest-within-window target, and this adapter applies those as concrete
-//! `cargo update --precise <version>` pins. Apply re-resolves the **whole** graph by batching all of
-//! a project's planned pins (one `cargo update -p … --precise V` per distinct target version, since
-//! `--precise` takes a single version) into one logical unit, then builds the report from the FULL
-//! before/after `Cargo.lock` diff — not from per-change outcomes. So every net version change is
-//! surfaced (the planned moves, the collateral moves the re-resolve forces on non-candidate crates,
-//! and the candidates a mutually-exclusive `=`-pin or single-major shared transitive leaves held),
-//! and a converged graph re-applies to a byte-stable fixed point.
+//! `cargo update --precise <version>` pins. Apply re-resolves the **whole** graph by issuing all of
+//! a project's planned pins (one `cargo update -p <spec> --precise V` per pin — cargo silently drops
+//! all but the first spec when several share one `--precise`) as one logical unit, then builds the
+//! report from the FULL before/after `Cargo.lock` diff — not from per-change outcomes. So every net
+//! version change is surfaced (the planned moves, the collateral moves the re-resolve forces on
+//! non-candidate crates, and the candidates a mutually-exclusive `=`-pin or single-major shared
+//! transitive leaves held), and a converged graph re-applies to a byte-stable fixed point.
 
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::index::{CRATES_IO, CratesIoIndex};
@@ -397,31 +397,34 @@ impl CargoTool {
         Ok(())
     }
 
-    /// Apply all `changes` as one logical unit: collapse those sharing a target version into a single
-    /// `cargo update -p A -p B --precise V` call (cargo's `--precise` takes one version but multiple
-    /// `[SPEC]`s), and issue the distinct-version groups together. A group cargo rejects (a `=`-pin or
-    /// resolver conflict blocks the precise move) is not fatal — the candidate simply stays where the
-    /// resolver placed it, and the before/after lock diff reports it as held. Only a spawn failure or
-    /// a broken local environment (full disk, read-only tree) aborts.
+    /// Apply all `changes` as one logical unit, issuing one `cargo update -p <name>@<from>
+    /// --precise <to>` per change. Never batch several `-p` specs into one `--precise` call: cargo
+    /// silently applies the pin to only the first spec and exits 0, so a shared-target batch (e.g.
+    /// the wgpu family all moving to one version) would lose every pin but the first without any
+    /// error to catch. A pin cargo rejects (a `=`-pin or resolver conflict blocks the precise move)
+    /// is not fatal — the candidate simply stays where the resolver placed it, and the before/after
+    /// lock diff reports it as held. Only a spawn failure or a broken local environment (full disk,
+    /// read-only tree) aborts.
     async fn pin_batch(&self, project: &Project, changes: &[Change]) -> Result<()> {
-        let mut by_target: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        // Direct workspace members can emit sibling changes sharing `(name, from, to)`; those are
+        // one lock move, so issue each distinct spec once.
+        let mut seen = BTreeSet::new();
         for change in changes {
-            by_target
-                .entry(change.to.as_str().to_string())
-                .or_default()
-                .push((
-                    change.package.name.clone(),
-                    change.from.as_str().to_string(),
-                ));
-        }
-        for (target, specs) in by_target {
-            // A precise group cargo rejected (a `=`-pin or resolver conflict blocked the move) is not
-            // fatal: the candidates stay where the resolver placed them and the full-lock diff reports
-            // each as held. A broken local environment (spawn failure, full disk, read-only tree)
+            let spec = (
+                change.package.name.as_str(),
+                change.from.as_str(),
+                change.to.as_str(),
+            );
+            if !seen.insert(spec) {
+                continue;
+            }
+            // A precise pin cargo rejected (a `=`-pin or resolver conflict blocked the move) is not
+            // fatal: the candidate stays where the resolver placed it and the full-lock diff reports
+            // it as held. A broken local environment (spawn failure, full disk, read-only tree)
             // aborts — swallowing it here would misreport a disk-full run as "every candidate held".
             if let Err(err) = self
                 .cargo
-                .update_precise_many(&project.root, &specs, &target)
+                .update_precise(&project.root, spec.0, spec.1, spec.2)
                 .await
                 && err.is_local_environment_failure()
             {
