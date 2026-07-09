@@ -1,8 +1,8 @@
 //! End-to-end convergence tests that drive the REAL `cargo` resolver against fixtures generated on
-//! the fly in temp dirs. These guard the cargo adapter's whole-graph re-resolve: the adapter now
-//! applies all of a project's planned `--precise` pins as one batched re-resolve and builds the
-//! report from the full before/after `Cargo.lock` diff, so a candidate can never silently move
-//! another node and a converged graph re-applies to a byte-stable fixed point.
+//! the fly in temp dirs. These guard the cargo adapter's whole-graph re-resolve: the adapter
+//! applies all of a project's planned `--precise` pins as one logical unit (one `cargo update` per
+//! pin) and builds the report from the full before/after `Cargo.lock` diff, so a candidate can
+//! never silently move another node and a converged graph re-applies to a byte-stable fixed point.
 //!
 //! # Determinism
 //!
@@ -34,6 +34,7 @@
 
 mod support;
 
+use indoc::indoc;
 use support::{Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
@@ -570,4 +571,210 @@ fn upgrade_preserves_distinct_versions_across_members() {
         after.iter().any(|v| v.starts_with("2.")),
         "bitflags v2 line must survive the upgrade, got {after:?}"
     );
+}
+
+/// Two independent direct deps whose planned targets share one version string. `futures-core` and
+/// `futures-io` release in lockstep (identical version numbers and publish dates) but neither
+/// depends on the other, so nothing cascades one pin into the other: each crate only lands if its
+/// own `cargo update --precise` pin is issued. Together with the wgpu-family fixture below this
+/// guards the one-command-per-pin apply: cargo applies `--precise` to only one spec when several
+/// dependency-connected `-p` specs share a single invocation.
+const SHARED_TARGET_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-shared-target"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    futures-core = "0.3"
+    futures-io = "0.3"
+"#};
+
+fn shared_target_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", SHARED_TARGET_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Seed both at 0.3.29 (2023-10-26) so the FREEZE cutoff (2024-06-01) plans the same matured
+    // target for both: 0.3.30 (2023-12-24) — one shared target-version string.
+    for spec in ["futures-core", "futures-io"] {
+        fixture
+            .run_tool("cargo", &["update", "-p", spec, "--precise", "0.3.29"], &[])
+            .expect_success();
+    }
+    fixture
+}
+
+#[test]
+fn upgrade_moves_every_crate_sharing_a_target_version() {
+    skip_if_missing!("cargo");
+    let fixture = shared_target_fixture();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    let applied = upgrade.applied_names();
+    assert!(
+        applied.contains("futures-core") && applied.contains("futures-io"),
+        "both crates sharing the target version must be applied, got {applied:?}"
+    );
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    for crate_name in ["futures-core", "futures-io"] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock_after),
+            vec!["0.3.30".to_owned()],
+            "{crate_name} must land on the shared matured target, not stay at the seed"
+        );
+    }
+}
+
+/// The freeze the two float-and-reconcile regressions below pin: it falls between the wgpu family's
+/// matured 29.0.3 (2026-05-02) / zbus family's matured 5.16.0+4.3.2 (2026-05-29 / 2026-04-26) and
+/// the too-fresh 29.0.4 / 5.17.0+4.3.3 wave (2026-07-02 / 2026-07-07), so a re-lock floats the
+/// families to versions the gate rejects while a matured target exists for every floated node.
+const FAMILY_FREEZE: &str = "2026-06-20T00:00:00Z";
+
+/// The real-world shape behind the "0 applied · 58 skipped" regression: a cross-major bump of one
+/// direct dep (`wgpu 26 → 29`) drags a whole family of same-versioned, dependency-connected
+/// transitives (`wgpu-core`, `wgpu-hal`, `wgpu-types`, `naga`, …) into the lock at the newest
+/// in-range version — too fresh under the freeze — and the reconcile pass must mature every one of
+/// them down to the shared 29.0.3. Each downgrade must be its own `cargo update` invocation: with
+/// the family batched into one multi-`-p --precise` call, cargo silently pinned only the first
+/// crate, the residual gate saw the rest still fresh, and the entire upgrade rolled back.
+const WGPU_FAMILY_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-wgpu-family"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    wgpu = "26"
+"#};
+
+#[test]
+fn upgrade_reconciles_a_cross_major_family_float_instead_of_rolling_back() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", WGPU_FAMILY_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FAMILY_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--major", "--freeze", FAMILY_FREEZE])
+            .stderr_str()
+    );
+    assert!(
+        upgrade.applied_names().contains("wgpu"),
+        "the cross-major wgpu bump must land, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        !upgrade.skipped_reasons().contains("transitive_in_cooldown"),
+        "a fully reconcilable family float must not roll the batch back: {:?}",
+        upgrade.skipped_reasons()
+    );
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    for crate_name in ["wgpu", "wgpu-core", "wgpu-hal", "wgpu-types"] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock_after),
+            vec!["29.0.3".to_owned()],
+            "{crate_name} must mature to the newest release under the freeze"
+        );
+    }
+}
+
+/// A graph-held violation that only becomes fixable after an earlier reconcile round: upgrading
+/// `zbus` 5.12.0 → 5.16.0 floats `zbus_macros` to the too-fresh 5.17.0 (newest satisfying
+/// `^5.16.0`), which in turn demands `zbus_names ^4.3.3` — also too fresh, and graph-held at its
+/// floor, so round one can only mature `zbus_macros` down. Only once macros sits at 5.16.0 (whose
+/// requirement is `^4.3.2`) does `zbus_names` gain a matured target. The reconcile loop must keep
+/// re-planning while rounds make progress — terminating on "no new violations" strands
+/// `zbus_names` at 4.3.3 and the final gate rolls the whole upgrade back.
+const ZBUS_CHAIN_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-zbus-chain"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    zbus = "5"
+"#};
+
+fn zbus_chain_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", ZBUS_CHAIN_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Seed a fully matured (pre-freeze) zbus line: zbus 5.12.0 admits macros ^5.12 / names ^4.2, so
+    // the seed holds no violation. The upgrade to 5.16.0 (`zbus_macros ^5.16.0`) then floats macros
+    // to 5.17.0 and, through it, names to 4.3.3 — both past the freeze.
+    for (spec, precise) in [
+        ("zbus", "5.12.0"),
+        ("zbus_macros", "5.15.0"),
+        ("zbus_names", "4.3.2"),
+        ("zvariant", "5.12.0"),
+    ] {
+        fixture
+            .run_tool("cargo", &["update", "-p", spec, "--precise", precise], &[])
+            .expect_success();
+    }
+    fixture
+}
+
+#[test]
+fn upgrade_reconciles_a_violation_unblocked_by_an_earlier_round() {
+    skip_if_missing!("cargo");
+    let fixture = zbus_chain_fixture();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FAMILY_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FAMILY_FREEZE])
+            .stderr_str()
+    );
+    assert!(
+        upgrade.applied_names().contains("zbus"),
+        "the zbus upgrade must land, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        !upgrade.skipped_reasons().contains("transitive_in_cooldown"),
+        "a chain reconcilable across rounds must not roll the batch back: {:?}",
+        upgrade.skipped_reasons()
+    );
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    for (crate_name, expected) in [
+        ("zbus", "5.16.0"),
+        ("zbus_macros", "5.16.0"),
+        ("zbus_names", "4.3.2"),
+    ] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock_after),
+            vec![expected.to_owned()],
+            "{crate_name} must settle on the newest matured version under the freeze"
+        );
+    }
 }
