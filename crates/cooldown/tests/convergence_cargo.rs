@@ -778,3 +778,96 @@ fn upgrade_reconciles_a_violation_unblocked_by_an_earlier_round() {
         );
     }
 }
+
+/// One crate declared twice in a member — `[dependencies] itoa = "1"` beside `[dev-dependencies]
+/// itoa = "0.4"` — so the lock holds two version lines and the member has a direct edge into the
+/// target major *before* the planned `0.4.8 → 1.0.11` move is attempted (the 1.x line is seeded at
+/// exactly the freeze target to recreate the masking shape). The apply must widen *both* manifest
+/// entries (stopping at the first leaves `"0.4"` capping the old line forever) and the reach check
+/// must demand the old line actually vacates (the pre-existing 1.x edge must not verify the move
+/// as applied while the 0.4.8 line sits untouched — a phantom "upgraded" the lock never took,
+/// re-reported on every subsequent run).
+const DUAL_ENTRY_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-dual-entry"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    itoa = "1"
+
+    [dev-dependencies]
+    itoa = "0.4"
+"#};
+
+fn dual_entry_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", DUAL_ENTRY_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Pin the 1.x line to the exact version the freeze will target (itoa 1.0.11, 2024-03-26), so
+    // the sibling edge sits precisely at the planned target — the masking shape. The seed version
+    // is whatever generate-lockfile picked, so read it back rather than hard-coding it.
+    let seeded = cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock"))
+        .into_iter()
+        .find(|version| version.starts_with("1."))
+        .expect("the [dependencies] itoa entry seeds a 1.x line");
+    fixture
+        .run_tool(
+            "cargo",
+            &[
+                "update",
+                "-p",
+                &format!("itoa@{seeded}"),
+                "--precise",
+                "1.0.11",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+#[test]
+fn upgrade_moves_a_dual_entry_crate_for_real_and_converges() {
+    skip_if_missing!("cargo");
+    let fixture = dual_entry_fixture();
+
+    let first = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(
+        first.ok(),
+        "first upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    assert!(
+        first.applied_names().contains("itoa"),
+        "the dual-entry crate must land, got {:?}",
+        first.applied_names()
+    );
+    assert_eq!(
+        cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock")),
+        vec!["1.0.11".to_owned()],
+        "the 0.4 line must vacate: both entries settle on the single matured 1.x line"
+    );
+
+    // The move must persist: a second run has nothing left to do and the lock stays byte-stable.
+    // (The masked variant reported the same phantom "upgraded" row on every run while the lock
+    // never changed.)
+    let lock_after_first = fixture.read_bytes("Cargo.lock");
+    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a no-op (fixed point)"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("Cargo.lock"),
+        "lock must be byte-identical across the two converged runs"
+    );
+}
