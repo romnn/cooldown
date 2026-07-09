@@ -2,11 +2,14 @@
 //!
 //! `cargo update --precise` can only move the lock *within* a manifest's existing requirement, so a
 //! cross-major bump (past a caret range) or any move outside the declared constraint needs the
-//! `Cargo.toml` itself rewritten. This module finds the one manifest entry that owns a crate's
-//! requirement — a member's `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` entry (or
-//! the `[target.<cfg>.*]` variants), or, when the member inherits with `workspace = true`, the root
-//! `[workspace.dependencies]` entry — and rewrites just that requirement via `toml_edit`, leaving
-//! comments, key order, and every other field of the entry untouched.
+//! `Cargo.toml` itself rewritten. This module finds every manifest entry that declares a crate's
+//! requirement — a member's `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` entries
+//! (and the `[target.<cfg>.*]` variants), or, when the member inherits with `workspace = true`, the
+//! root `[workspace.dependencies]` entry — and rewrites just those requirements via `toml_edit`,
+//! leaving comments, key order, and every other field of each entry untouched. Every section is
+//! visited, not just the first that declares the crate: a member can declare one crate twice (e.g.
+//! `[dependencies] toml = "1"` beside `[build-dependencies] toml = "0.5"`), and an untouched second
+//! entry would keep the old-major line in the lock no matter how the first is widened.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, MemberRef};
@@ -53,14 +56,12 @@ pub fn widen_constraint(
         let Some(mut doc) = parse_document(&abs)? else {
             continue;
         };
-        match rewrite_member(&mut doc, crate_name, target) {
-            Edit::Done => {
-                write_document(&abs, &doc)?;
-                rewrite.modified.push(rel);
-            }
-            Edit::Inherited => needs_workspace = true,
-            Edit::NoVersion | Edit::NotFound => {}
+        let edits = rewrite_member(&mut doc, crate_name, target);
+        if edits.edited {
+            write_document(&abs, &doc)?;
+            rewrite.modified.push(rel);
         }
+        needs_workspace |= edits.inherited;
     }
 
     // An inherited entry lives in the root `[workspace.dependencies]`; the members-empty / nothing-
@@ -73,7 +74,7 @@ pub fn widen_constraint(
                 rewrite_workspace(&mut doc, crate_name, target)
             } else {
                 rewrite_workspace(&mut doc, crate_name, target)
-                    || matches!(rewrite_member(&mut doc, crate_name, target), Edit::Done)
+                    || rewrite_member(&mut doc, crate_name, target).edited
             };
             if changed && !rewrite.modified.iter().any(|path| path == &rel) {
                 write_document(&abs, &doc)?;
@@ -106,16 +107,30 @@ enum Edit {
     Done,
 }
 
-/// Try every dependency section of a member manifest, returning the first decisive outcome.
-fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Edit {
+/// What rewriting one member manifest changed, aggregated across all of its dependency sections.
+#[derive(Default)]
+struct MemberEdits {
+    /// At least one requirement was rewritten in place.
+    edited: bool,
+    /// At least one entry inherits from the workspace (`crate = { workspace = true }`).
+    inherited: bool,
+}
+
+/// Rewrite the crate's requirement in **every** dependency section of a member manifest that
+/// declares it. Stopping at the first hit is not enough: a crate declared twice (`[dependencies]
+/// toml = "1"` beside `[build-dependencies] toml = "0.5"`) keeps its old-major lock line alive
+/// through the second, untouched entry, so the planned move can never complete.
+fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> MemberEdits {
+    let mut edits = MemberEdits::default();
     for section in dependency_section_paths(doc) {
         let keys: Vec<&str> = section.iter().map(String::as_str).collect();
         match rewrite_entry(doc, &keys, crate_name, target) {
-            Edit::NotFound => {}
-            decisive => return decisive,
+            Edit::Done => edits.edited = true,
+            Edit::Inherited => edits.inherited = true,
+            Edit::NoVersion | Edit::NotFound => {}
         }
     }
-    Edit::NotFound
+    edits
 }
 
 /// Rewrite a crate's requirement in the root `[workspace.dependencies]` table, if present.
@@ -287,6 +302,40 @@ mod tests {
         assert!(
             after.contains("# pinned for a reason"),
             "comment kept: {after}"
+        );
+    }
+
+    #[test]
+    fn rewrites_every_section_declaring_the_crate() {
+        // A crate declared in `[dependencies]` and again in `[build-dependencies]` (rawloader's
+        // `toml = "1"` beside `toml = "0.5"`) needs both entries widened: stopping at the first
+        // leaves the second demanding the old major, and the stale lock line it owns can then never
+        // move — while masking the failure behind the already-satisfied first entry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\ntoml = \"1\"\n\n[build-dependencies]\ntoml = \"0.5\"\n",
+        )
+        .expect("write");
+
+        let rewrite =
+            widen_constraint(root, &[member("app", "crates/app")], "toml", "1.1.2").expect("widen");
+
+        assert_eq!(
+            rewrite.modified,
+            vec![Utf8PathBuf::from("crates/app/Cargo.toml")]
+        );
+        let after = std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read");
+        assert!(
+            !after.contains("\"0.5\""),
+            "build-dependencies entry must be widened too: {after}"
+        );
+        assert_eq!(
+            after.matches("toml = \"1.1.2\"").count(),
+            2,
+            "both entries land on the target: {after}"
         );
     }
 
