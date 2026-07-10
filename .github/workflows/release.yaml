@@ -6,7 +6,6 @@ on:
 
 env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
-  MISE_LOCKED: "1"
 
 permissions:
   contents: write
