@@ -4,6 +4,10 @@ on:
     tags:
       - "*"
 
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_LOCKED: "1"
+
 permissions:
   contents: write
   packages: write
@@ -54,8 +58,6 @@ jobs:
           )
           git update-index --skip-worktree -- "${allowed_dirty_files[@]}"
       - uses: jdx/mise-action@v4
-        env:
-          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           install: false
           cache: true
