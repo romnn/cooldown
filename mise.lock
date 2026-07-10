@@ -131,26 +131,32 @@ backend = "aqua:rustsec/rustsec/cargo-audit"
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.linux-arm64"]
 checksum = "sha256:c6603814ddaa45e51263dafd31c0ac98808f688d26f7395804f9670b0fd599dd"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-aarch64-unknown-linux-gnu-v0.22.2.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292355"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.linux-x64"]
 checksum = "sha256:7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292222"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.linux-x64-musl"]
 checksum = "sha256:7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292222"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.macos-arm64"]
 checksum = "sha256:847831323de932155b226ab60ee4a180e13e5d007a019f0d4b7b4d89a6de2ab2"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-apple-darwin-v0.22.2.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292734"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.macos-x64"]
 checksum = "sha256:847831323de932155b226ab60ee4a180e13e5d007a019f0d4b7b4d89a6de2ab2"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-apple-darwin-v0.22.2.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292734"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.windows-x64"]
 checksum = "sha256:0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be2710ab"
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-pc-windows-msvc-v0.22.2.zip"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439294720"
 
 [[tools.ast-grep]]
 version = "0.44.1"
@@ -252,6 +258,21 @@ backend = "core:erlang"
 [tools.erlang.options]
 precompiled = "if_available"
 
+[tools.erlang."platforms.macos-arm64"]
+checksum = "sha256:ec6e09dee496adf646b0a22eef26b769e7f8032c83dd10292c58d50fb38e2210"
+url = "https://github.com/erlef/otp_builds/releases/download/OTP-29.0.2/otp-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/443541329"
+
+[tools.erlang."platforms.macos-x64"]
+checksum = "sha256:3da4495ce6372f5fda002ed1ae45832a11e05aaa9928790e0bf1d14e3ee84657"
+url = "https://github.com/erlef/otp_builds/releases/download/OTP-29.0.2/otp-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/443557769"
+
+[tools.erlang."platforms.windows-x64"]
+checksum = "sha256:dffd5fca2e841267bfb4e961c38bb18436a4b55548deae727d5691a984f7b80f"
+url = "https://github.com/erlang/otp/releases/download/OTP-29.0.2/otp_win64_29.0.2.zip"
+url_api = "https://api.github.com/repos/erlang/otp/releases/assets/443733928"
+
 [[tools."github:est31/cargo-udeps"]]
 version = "0.1.61"
 backend = "github:est31/cargo-udeps"
@@ -342,6 +363,11 @@ checksum = "sha256:fa662dd648fdbb15d29a488c1d1f2eb41008bc15510c1db51d41da4812929
 url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_linux_arm64.tar.gz"
 url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739163"
 
+[tools."github:romnn/cargo-feature-combinations"."platforms.linux-arm64-musl"]
+checksum = "sha256:fa662dd648fdbb15d29a488c1d1f2eb41008bc15510c1db51d41da48129294c9"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739163"
+
 [tools."github:romnn/cargo-feature-combinations"."platforms.linux-x64"]
 checksum = "sha256:bb639219bf36c2ebba4bec6b97023e8cde20545059bceadeb7556675a3bd83d5"
 url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_linux_amd64.tar.gz"
@@ -361,6 +387,11 @@ url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/release
 checksum = "sha256:db4fc8c42c294071a67d1b8c51bf47ce3734a16e5d2325e1a385ed30ca8e0a30"
 url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_darwin_amd64.tar.gz"
 url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739155"
+
+[tools."github:romnn/cargo-feature-combinations"."platforms.windows-x64"]
+checksum = "sha256:59a4c8d3b95155f422aedbd429acae0ac27dbe4dde1d86f92c227b02e9526fd9"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739156"
 
 [[tools."github:romnn/cargo-watchdoc"]]
 version = "0.3.10"
@@ -729,14 +760,6 @@ backend = "core:ruby"
 checksum = "sha256:74e31613fc71e6e23431dfc4d8b6ec2818a4dc1fd16e0983b074144c16719c8b"
 url = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-4.0.5-1/rubyinstaller-4.0.5-1-x64.7z"
 
-[[tools.rust]]
-version = "1.96.0"
-backend = "core:rust"
-
-[[tools.rust]]
-version = "nightly"
-backend = "core:rust"
-
 [[tools.swift]]
 version = "6.3.2"
 backend = "core:swift"
@@ -748,30 +771,37 @@ backend = "aqua:go-task/task"
 [tools.task."platforms.linux-arm64"]
 checksum = "sha256:7e0044108830cec0534577b289564e3b7c83e6df276feb631a1edc63d04e4ebe"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613352"
 
 [tools.task."platforms.linux-arm64-musl"]
 checksum = "sha256:7e0044108830cec0534577b289564e3b7c83e6df276feb631a1edc63d04e4ebe"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613352"
 
 [tools.task."platforms.linux-x64"]
 checksum = "sha256:02c679ffae53dca791804847d78b31731615894e292948397c971c87ac9e95bd"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613330"
 
 [tools.task."platforms.linux-x64-musl"]
 checksum = "sha256:02c679ffae53dca791804847d78b31731615894e292948397c971c87ac9e95bd"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613330"
 
 [tools.task."platforms.macos-arm64"]
 checksum = "sha256:debfa9a3bc06fcb5d5550b44725ecd22bb305499ce057bd6d7a774db5cdaa7b8"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613319"
 
 [tools.task."platforms.macos-x64"]
 checksum = "sha256:416348147bc2f1c729417249d932add7894fb01a126128778195942c249d7c0b"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_darwin_amd64.tar.gz"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613314"
 
 [tools.task."platforms.windows-x64"]
 checksum = "sha256:e3bd4439b445f4f135758a2666ec8b33ccde789f7f615309c58f116b0e566e79"
 url = "https://github.com/go-task/task/releases/download/v3.52.0/task_windows_amd64.zip"
+url_api = "https://api.github.com/repos/go-task/task/releases/assets/464613286"
 
 [[tools.typos]]
 version = "1.48.0"
@@ -780,30 +810,37 @@ backend = "aqua:crate-ci/typos"
 [tools.typos."platforms.linux-arm64"]
 checksum = "sha256:2960ae07bc1ffe19e4895e4359394dd349c9c31de78aac3a124b6e4aeb206698"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462429655"
 
 [tools.typos."platforms.linux-arm64-musl"]
 checksum = "sha256:2960ae07bc1ffe19e4895e4359394dd349c9c31de78aac3a124b6e4aeb206698"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462429655"
 
 [tools.typos."platforms.linux-x64"]
 checksum = "sha256:72a930c9a94fc3914aa56835c5b859c892a797d40c1c42638b98d93f16ff519c"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462429902"
 
 [tools.typos."platforms.linux-x64-musl"]
 checksum = "sha256:72a930c9a94fc3914aa56835c5b859c892a797d40c1c42638b98d93f16ff519c"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462429902"
 
 [tools.typos."platforms.macos-arm64"]
 checksum = "sha256:7dcaf386ec255995dcbaf629641f961574b7e8785203921115eab75cbf1ca107"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462430254"
 
 [tools.typos."platforms.macos-x64"]
 checksum = "sha256:f4335c255db3d57374484e0e96505c8910c0e2fa6d8813b15de529c98f93b1a9"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462431306"
 
 [tools.typos."platforms.windows-x64"]
 checksum = "sha256:ce018a2352da7c1b23bd2684019ee279d2080dc063087020e80c1247d11b0743"
 url = "https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/crate-ci/typos/releases/assets/462430871"
 
 [[tools.uv]]
 version = "0.11.23"

@@ -50,3 +50,8 @@ goreleaser = "latest"
 
 [settings]
 lockfile = true
+lockfile_platforms = [
+  "linux-x64",
+  "macos-arm64",
+  "windows-x64",
+]
