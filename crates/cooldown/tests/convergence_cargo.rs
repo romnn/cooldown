@@ -139,6 +139,133 @@ fn floated_transitive_fixture() -> Fixture {
     fixture
 }
 
+/// The cutoff admits the paired `jsonschema` / `referencing` 0.46.6 releases from 2026-06-23,
+/// while excluding their paired 0.46.7 releases from 2026-06-30.
+const INVALIDATED_PIN_FREEZE: &str = "2026-06-29T00:00:00Z";
+
+const INVALIDATED_PIN_SEED_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-invalidated-pin"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    jsonschema = { version = "=0.46.5", default-features = false }
+    referencing = "=0.46.5"
+"#};
+
+const INVALIDATED_PIN_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-invalidated-pin"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    jsonschema = { version = "0.46", default-features = false }
+    referencing = "0.46"
+"#};
+
+fn invalidated_pin_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", INVALIDATED_PIN_SEED_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Widening the exact seed requirements keeps the lock current while making both packages
+    // eligible direct upgrade candidates.
+    fixture.write("Cargo.toml", INVALIDATED_PIN_MANIFEST);
+    fixture
+}
+
+#[test]
+fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
+    skip_if_missing!("cargo");
+    let fixture = invalidated_pin_fixture();
+    let seeded = fixture.read_bytes("Cargo.lock");
+    for crate_name in ["jsonschema", "referencing"] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &seeded),
+            vec!["0.46.5".to_owned()],
+            "the fixture must seed {crate_name} at the shared source version"
+        );
+    }
+
+    // A single fetch at a time preserves the sorted jsonschema-before-referencing plan order. The
+    // jsonschema pin makes Cargo float referencing before its own planned pin is attempted.
+    let upgrade = fixture.cooldown_json(&[
+        "upgrade",
+        "--strict",
+        "--freeze",
+        INVALIDATED_PIN_FREEZE,
+        "--concurrency",
+        "1",
+        "--package",
+        "jsonschema",
+        "--package",
+        "referencing",
+    ]);
+
+    assert_eq!(
+        upgrade.changes_for("jsonschema"),
+        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        "jsonschema must have one baseline-to-final report row"
+    );
+    assert_eq!(
+        upgrade.changes_for("referencing"),
+        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        "referencing must not retain a false skip or its transient 0.46.10 position"
+    );
+    assert_eq!(
+        upgrade.applied_names(),
+        ["jsonschema".to_owned(), "referencing".to_owned()]
+            .into_iter()
+            .collect(),
+        "both planned targets must be applied"
+    );
+    assert!(
+        upgrade.downgraded_names().is_empty(),
+        "both baseline-to-final changes are upgrades"
+    );
+    assert!(
+        upgrade.skipped_reasons_for("referencing").is_empty(),
+        "a target present in the final graph is not a resolver conflict"
+    );
+    assert_eq!(upgrade.summary_applied(), 2);
+    assert_eq!(upgrade.summary_skipped(), 0);
+    assert_eq!(upgrade.summary_errors(), 0);
+    assert!(
+        upgrade.ok(),
+        "--strict must succeed when every planned target reached the final graph"
+    );
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    for crate_name in ["jsonschema", "referencing"] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock_after),
+            vec!["0.46.6".to_owned()],
+            "{crate_name} must land exactly on the newest release admitted by the freeze"
+        );
+    }
+
+    // The stabilized result is a fixed point, not a report-only correction.
+    let second = fixture.cooldown_json(&[
+        "upgrade",
+        "--strict",
+        "--freeze",
+        INVALIDATED_PIN_FREEZE,
+        "--package",
+        "jsonschema",
+        "--package",
+        "referencing",
+    ]);
+    assert!(second.ok(), "the fixed-point strict run must succeed");
+    assert_eq!(second.summary_applied(), 0);
+    assert_eq!(second.summary_skipped(), 0);
+    assert_eq!(lock_after, fixture.read_bytes("Cargo.lock"));
+}
+
 #[test]
 fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("cargo");

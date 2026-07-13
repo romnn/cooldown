@@ -12,7 +12,7 @@
 //! non-candidate crates, and the candidates a mutually-exclusive `=`-pin or single-major shared
 //! transitive leaves held), and a converged graph re-applies to a byte-stable fixed point.
 
-use crate::cargocmd::{Cargo, ResolvedGraph};
+use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::manifest;
 use crate::native::parse_native;
@@ -219,6 +219,31 @@ impl ReleaseFetcher for CargoTool {
 /// diff ignores (a consequence of a reported move, not a silent version change).
 type SlotKey = (String, String);
 
+/// Every registry version present in each Cargo compatibility slot.
+type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
+
+fn locked_slots(lock: &CargoLock) -> LockedSlots {
+    matching_locked_slots(lock, LockPackage::is_registry)
+}
+
+fn crates_io_locked_slots(lock: &CargoLock) -> LockedSlots {
+    matching_locked_slots(lock, LockPackage::is_crates_io)
+}
+
+fn matching_locked_slots(lock: &CargoLock, include: impl Fn(&LockPackage) -> bool) -> LockedSlots {
+    let mut slots: LockedSlots = BTreeMap::new();
+    for package in &lock.package {
+        let (Some(version), true) = (package.version.as_deref(), include(package)) else {
+            continue;
+        };
+        slots
+            .entry((package.name.clone(), version::major_key(version).0))
+            .or_default()
+            .insert(version.to_string());
+    }
+    slots
+}
+
 /// The resolved registry-crate versions of a `Cargo.lock`, keyed per `(name, major)` slot — the
 /// snapshot `apply` diffs before/after the whole-graph re-resolve to report *every* net version
 /// change (the planned moves, the collateral moves the resolve forced for consistency, and the
@@ -226,22 +251,23 @@ type SlotKey = (String, String);
 /// version and are skipped. When two nodes share a `(name, major)` slot (rare; only via distinct
 /// `source` registries), the highest version wins so the slot is single-valued.
 fn locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
-    let mut slots: BTreeMap<SlotKey, String> = BTreeMap::new();
-    for package in &lock.package {
-        let (Some(version), true) = (package.version.as_deref(), package.is_registry()) else {
-            continue;
-        };
-        let key = (package.name.clone(), version::major_key(version).0);
-        slots
-            .entry(key)
-            .and_modify(|existing| {
-                if version::compare(version, existing).is_gt() {
-                    *existing = version.to_string();
-                }
-            })
-            .or_insert_with(|| version.to_string());
-    }
+    highest_locked_versions(locked_slots(lock))
+}
+
+fn crates_io_locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
+    highest_locked_versions(crates_io_locked_slots(lock))
+}
+
+fn highest_locked_versions(slots: LockedSlots) -> BTreeMap<SlotKey, String> {
     slots
+        .into_iter()
+        .filter_map(|(key, versions)| {
+            versions
+                .into_iter()
+                .max_by(|left, right| version::compare(left, right))
+                .map(|version| (key, version))
+        })
+        .collect()
 }
 
 /// The `Cargo.lock`'s `[[package]]` array, parsed for the before/after version diff. Only the
@@ -272,6 +298,10 @@ impl LockPackage {
             .as_deref()
             .is_some_and(|source| source.starts_with("registry+"))
     }
+
+    fn is_crates_io(&self) -> bool {
+        self.source.as_deref() == Some(CRATES_IO_SOURCE)
+    }
 }
 
 impl CargoLock {
@@ -281,8 +311,87 @@ impl CargoLock {
     }
 }
 
-/// A net version change `apply` derived from the before/after lock diff for a crate the plan did not
-/// itself name — collateral movement the whole-graph re-resolve forced. Reported so no crate's
+/// Selects the currently resolved node that represents a planned change without changing the
+/// change's immutable baseline `from` version.
+///
+/// The original crates.io node wins while it exists. Once another planned pin has moved it, the
+/// retry may address a unique off-target crates.io node in the target slot. Multiple candidates are
+/// ambiguous Cargo version lines, so the adapter leaves them untouched for the final held
+/// classification instead of risking a pin against the wrong line.
+fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
+    if change.package.registry.as_deref() != Some(CRATES_IO) {
+        return None;
+    }
+    let slots = crates_io_locked_slots(lock);
+    let source_key = (
+        change.package.name.clone(),
+        version::major_key(change.from.as_str()).0,
+    );
+    let target_key = (
+        change.package.name.clone(),
+        version::major_key(change.to.as_str()).0,
+    );
+    let source_versions = slots.get(&source_key);
+    if source_versions.is_some_and(|versions| versions.contains(change.from.as_str())) {
+        return Some(change.from.to_string());
+    }
+
+    let target_versions = slots.get(&target_key);
+    if target_versions.is_some_and(|versions| versions.contains(change.to.as_str())) {
+        return None;
+    }
+    if let Some(version) = target_versions
+        .filter(|versions| versions.len() == 1)
+        .and_then(|versions| versions.first())
+    {
+        return Some(version.clone());
+    }
+
+    if source_key != target_key {
+        return source_versions
+            .filter(|versions| versions.len() == 1)
+            .and_then(|versions| versions.first())
+            .cloned();
+    }
+    None
+}
+
+/// The net version changes of the before/after lock diff that `applied` does not already report,
+/// as sorted collateral rows.
+///
+/// Exclusion is by exact `(name, from, to)` move, not by planned package name: a planned candidate
+/// the resolve *held* can still have been floated off its baseline by a sibling pin, and that real
+/// movement must surface beside its held skip row instead of being silently dropped.
+fn collateral_changes(
+    before: &BTreeMap<SlotKey, String>,
+    after: &BTreeMap<SlotKey, String>,
+    applied: &[Change],
+) -> Vec<Change> {
+    let reported: BTreeSet<(&str, &str, &str)> = applied
+        .iter()
+        .map(|change| {
+            (
+                change.package.name.as_str(),
+                change.from.as_str(),
+                change.to.as_str(),
+            )
+        })
+        .collect();
+    let mut changes: Vec<Change> = before
+        .iter()
+        .filter_map(|((name, _), from)| {
+            let to = after.get(&(name.clone(), version::major_key(from).0))?;
+            (version::compare(from, to).is_ne()
+                && !reported.contains(&(name.as_str(), from.as_str(), to.as_str())))
+            .then(|| collateral_change(name, from, to))
+        })
+        .collect();
+    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    changes
+}
+
+/// A net version change `apply` derived from the before/after lock diff that no planned row
+/// reports — collateral movement the whole-graph re-resolve forced. Reported so no crate's
 /// version change is ever silent: a transitive pushed backward to keep the lock consistent, or
 /// matured down by `fix`, surfaces as its own report row.
 fn collateral_change(name: &str, from: &str, to: &str) -> Change {
@@ -332,10 +441,6 @@ impl CargoTool {
     /// full before/after `Cargo.lock` diff. `upgrade` is informational for the rewrite policy; cargo
     /// has no date cutoff, so every move is expressed as a concrete `--precise` pin computed by the
     /// core. Widening for `Always`/`Auto` happens before pinning so a cross-major target is admitted.
-    ///
-    /// Returns the set of planned candidates that the resolve could place at their target (`reached`).
-    /// A candidate left short is a real conflict the diff then reports; widening is bounded so a
-    /// candidate held by *another* crate's requirement (not its own declared cap) stops the loop.
     async fn whole_graph_resolve(&self, project: &Project, plan: &Plan) -> Result<()> {
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
@@ -363,7 +468,7 @@ impl CargoTool {
             // false positive this loop exists to avoid.
             let needs_graph = plan.changes.iter().any(needs_member_graph);
             for _ in 0..plan.changes.len() {
-                let after = locked_versions(&read_lock(project)?);
+                let after = crates_io_locked_versions(&read_lock(project)?);
                 let graph = if needs_graph {
                     Some(self.cargo.metadata(&project.root).await?)
                 } else {
@@ -397,74 +502,69 @@ impl CargoTool {
         Ok(())
     }
 
-    /// Apply all `changes` as one logical unit, issuing one `cargo update -p <name>@<from>
-    /// --precise <to>` per change. Never batch several `-p` specs into one `--precise` call: cargo
-    /// silently applies the pin to only the first spec and exits 0, so a shared-target batch (e.g.
-    /// the wgpu family all moving to one version) would lose every pin but the first without any
-    /// error to catch. A pin cargo rejects (a `=`-pin or resolver conflict blocks the precise move)
-    /// is not fatal — the candidate simply stays where the resolver placed it, and the before/after
-    /// lock diff reports it as held. Only a spawn failure or a broken local environment (full disk,
-    /// read-only tree) aborts.
+    /// Applies all `changes` as one logical unit, driving each to its exact target.
+    ///
+    /// Cargo accepts several `-p` specs beside one `--precise` but silently applies only the first
+    /// spec, so every planned pin needs its own command. Those commands are still graph-wide: one
+    /// pin can move another planned node, or remove the lock entry a later pin would have
+    /// addressed. Each pass therefore re-reads the lock before every pin and pins the node
+    /// [`current_selector`] picks (the planned `from` line while it exists, the unique off-target
+    /// node once another pin moved it); passes repeat until one makes no progress or the lock
+    /// revisits an earlier state. Resolver rejections remain non-fatal held candidates the final
+    /// diff reports; local environment failures abort.
     async fn pin_batch(&self, project: &Project, changes: &[Change]) -> Result<()> {
-        // Direct workspace members can emit sibling changes sharing `(name, from, to)`; those are
-        // one lock move, so issue each distinct spec once.
+        // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
+        // are one lock move, so issue each distinct spec once, in a deterministic order.
+        let mut worklist: Vec<&Change> = changes.iter().collect();
+        worklist.sort_by(|a, b| {
+            a.package
+                .name
+                .cmp(&b.package.name)
+                .then_with(|| a.package.registry.cmp(&b.package.registry))
+                .then_with(|| a.from.as_str().cmp(b.from.as_str()))
+                .then_with(|| a.to.as_str().cmp(b.to.as_str()))
+        });
+        worklist.dedup_by(|a, b| a.package == b.package && a.from == b.from && a.to == b.to);
+
         let mut seen = BTreeSet::new();
-        for change in changes {
-            let spec = (
-                change.package.name.as_str(),
-                change.from.as_str(),
-                change.to.as_str(),
-            );
-            if !seen.insert(spec) {
-                continue;
+        for _ in 0..worklist.len().saturating_add(1) {
+            let before = locked_slots(&read_lock(project)?);
+            if !seen.insert(before.clone()) {
+                break;
             }
-            // A precise pin cargo rejected (a `=`-pin or resolver conflict blocked the move) is not
-            // fatal: the candidate stays where the resolver placed it and the full-lock diff reports
-            // it as held. A broken local environment (spawn failure, full disk, read-only tree)
-            // aborts — swallowing it here would misreport a disk-full run as "every candidate held".
-            if let Err(err) = self
-                .cargo
-                .update_precise(&project.root, spec.0, spec.1, spec.2)
-                .await
-                && err.is_local_environment_failure()
-            {
-                return Err(err);
+            let mut attempted = false;
+            for change in &worklist {
+                let lock = read_lock(project)?;
+                let Some(current) = current_selector(&lock, change) else {
+                    continue;
+                };
+                attempted = true;
+                self.update_precise(project, &change.package.name, &current, change.to.as_str())
+                    .await?;
             }
-            self.repin_cross_major(project, change).await?;
+            let after = locked_slots(&read_lock(project)?);
+            if !attempted || after == before {
+                break;
+            }
         }
         Ok(())
     }
 
-    /// Re-pin a cross-major move that cargo landed in the target's major but not *at* the target.
-    /// `cargo update -p <name>@<from> --precise <to>` silently drops the pin when `from` and `to`
-    /// are semver-incompatible: the old version line is replaced during the re-resolve, the pin
-    /// dies with it, and the new line resolves to the newest version the (widened) requirement
-    /// admits — exit 0, no diagnostic. The slot then sits in the right major, so a follow-up
-    /// same-major pin from the landed version is honored. A rejected or impossible re-pin follows
-    /// the same tolerance as the first pin: the diff reports the candidate held.
-    async fn repin_cross_major(&self, project: &Project, change: &Change) -> Result<()> {
-        if version::major_key(change.from.as_str()) == version::major_key(change.to.as_str()) {
-            return Ok(());
-        }
-        let after = locked_versions(&read_lock(project)?);
-        let slot = (
-            change.package.name.clone(),
-            version::major_key(change.to.as_str()).0,
-        );
-        let Some(landed) = after
-            .get(&slot)
-            .filter(|landed| *landed != change.to.as_str())
-        else {
-            return Ok(());
-        };
+    /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
+    ///
+    /// A rejected precise pin is a resolver outcome, so the final lock diff reports the candidate
+    /// held. Broken local state must propagate; otherwise disk-full or spawn failures would
+    /// masquerade as a conflict in the candidate set.
+    async fn update_precise(
+        &self,
+        project: &Project,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
         if let Err(err) = self
             .cargo
-            .update_precise(
-                &project.root,
-                &change.package.name,
-                landed,
-                change.to.as_str(),
-            )
+            .update_precise_crates_io(&project.root, name, from, to)
             .await
             && err.is_local_environment_failure()
         {
@@ -479,22 +579,19 @@ fn read_lock(project: &Project) -> Result<CargoLock> {
     CargoLock::parse(&content)
 }
 
-/// Whether a planned candidate landed at or beyond its target in `after`, respecting direction: a
-/// forward move must reach the slot at/above its target, a downgrade at/below it. Keyed per
-/// `(name, major)` slot; a cross-major move is checked against the target's own major slot.
+/// Whether a planned candidate landed at its exact target in `after`.
+///
+/// Cargo receives a concrete `--precise` target, so an overshoot is not success: it may be inside
+/// the manifest range but still younger than cooldown permits. Keyed per `(name, major)` slot; a
+/// cross-major move is checked against the target's own major slot.
 fn reached(after: &BTreeMap<SlotKey, String>, change: &Change) -> bool {
     let key = (
         change.package.name.clone(),
         version::major_key(change.to.as_str()).0,
     );
-    after.get(&key).is_some_and(|landed| {
-        let ordering = version::compare(landed, change.to.as_str());
-        if change.downgrade {
-            ordering.is_le()
-        } else {
-            ordering.is_ge()
-        }
-    })
+    after
+        .get(&key)
+        .is_some_and(|landed| landed == change.to.as_str())
 }
 
 fn needs_member_graph(change: &Change) -> bool {
@@ -513,7 +610,6 @@ fn reached_after(
                 &change.package.name,
                 change.from.as_str(),
                 change.to.as_str(),
-                change.downgrade,
             )
         });
     }
@@ -582,11 +678,9 @@ impl ToolWrite for CargoTool {
             .map(|lock| locked_versions(&lock))
             .unwrap_or_default();
 
-        // The whole graph is re-resolved in one batched pass: all planned `--precise` pins are applied
-        // together (grouped by shared target version), so the resolver settles every conflict in one
-        // consistent lock. A converged graph re-pins to a byte-stable fixed point — no per-package
-        // sequential re-locks, no oscillation, and no crate left to drift unreported because the diff
-        // below surfaces *every* moved node.
+        // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
+        // invocation, repeated to a bounded fixed point because one invocation may move a package
+        // another planned pin still needs to address. The diff below surfaces every net move.
         match self.whole_graph_resolve(project, plan).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
@@ -598,7 +692,9 @@ impl ToolWrite for CargoTool {
             Err(err) => return Err(err),
         }
 
-        let after = locked_versions(&read_lock(project)?);
+        let after_lock = read_lock(project)?;
+        let after = locked_versions(&after_lock);
+        let crates_io_after = crates_io_locked_versions(&after_lock);
         // The resolved graph proves direct member changes reached the target and names the crate
         // whose `=`-pin holds a short candidate back.
         let needs_graph = plan.changes.iter().any(needs_member_graph);
@@ -607,17 +703,11 @@ impl ToolWrite for CargoTool {
         } else {
             self.cargo.metadata(&project.root).await.ok()
         };
-        let planned: BTreeSet<&str> = plan
-            .changes
-            .iter()
-            .map(|change| change.package.name.as_str())
-            .collect();
-
         // Each planned candidate either reached cooldown's target (its newest-within-window) —
         // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
         // transitive won — reported held, naming the blocker.
         for change in &plan.changes {
-            if reached_after(&after, graph.as_ref(), change) {
+            if reached_after(&crates_io_after, graph.as_ref(), change) {
                 report.applied.push(change.clone());
             } else {
                 let offender = graph
@@ -638,19 +728,12 @@ impl ToolWrite for CargoTool {
             }
         }
 
-        // The hard requirement: no net version change to *any* crate may be omitted. A crate the plan
-        // did not name that the whole-graph resolve moved (a transitive pushed backward for
-        // consistency, or matured down by `fix`) is surfaced as its own collateral applied row — the
-        // silent, unreported drift the earlier per-precise-pin design allowed.
-        let mut collateral: Vec<Change> = before
-            .iter()
-            .filter(|((name, _), _)| !planned.contains(name.as_str()))
-            .filter_map(|((name, _), from)| {
-                let to = after.get(&(name.clone(), version::major_key(from).0))?;
-                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
-            })
-            .collect();
-        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        // The hard requirement: no net version change to *any* crate may be omitted. Every moved
+        // slot the applied rows above do not already report is surfaced as its own collateral
+        // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
+        // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
+        // would hide that real move).
+        let collateral = collateral_changes(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
     }
@@ -693,29 +776,6 @@ mod tests {
         }
     }
 
-    /// The collateral net version changes the diff surfaces for crates the plan did not name — the
-    /// before/after pairs that differ, excluding the planned set. Mirrors `apply`'s collateral pass.
-    fn collateral_changes(
-        before: &BTreeMap<SlotKey, String>,
-        after: &BTreeMap<SlotKey, String>,
-        planned: &BTreeSet<&str>,
-    ) -> Vec<Change> {
-        let mut changes: Vec<Change> = before
-            .iter()
-            .filter(|((name, _), _)| !planned.contains(name.as_str()))
-            .filter_map(|((name, _), from)| {
-                let to = after.get(&(name.clone(), version::major_key(from).0))?;
-                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
-            })
-            .collect();
-        changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
-        changes
-    }
-
-    fn planned_set<'a>(names: &'a [&'a str]) -> BTreeSet<&'a str> {
-        names.iter().copied().collect()
-    }
-
     #[test]
     fn locked_versions_skips_non_registry_and_keys_per_major() {
         let lock = CargoLock::parse(indoc! {r#"
@@ -732,6 +792,11 @@ mod tests {
 
             [[package]]
             name = "serde"
+            version = "1.0.99"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "serde"
             version = "0.9.15"
             source = "registry+https://github.com/rust-lang/crates.io-index"
 
@@ -743,7 +808,7 @@ mod tests {
         .expect("lock parses");
         let slots = locked_versions(&lock);
         // The path/workspace member `demo` and the git source are excluded; the two serde majors are
-        // distinct slots.
+        // distinct slots, and semantic ordering chooses 1.0.197 over lexically-greater 1.0.99.
         assert_eq!(
             slots.get(&("serde".into(), "1".into())).map(String::as_str),
             Some("1.0.197")
@@ -759,22 +824,92 @@ mod tests {
     }
 
     #[test]
-    fn reached_respects_direction_and_major_slot() {
+    fn reached_requires_the_exact_target_in_its_major_slot() {
         let after = locked_versions(&lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]));
-        // A forward candidate must land at/above its target in the target's major slot.
+        // A concrete Cargo `--precise` target must land exactly; an overshoot remains off-policy.
         assert!(reached(
             &after,
             &change("serde", "1.0.100", "1.0.200", false)
         ));
         assert!(!reached(
             &after,
-            &change("serde", "1.0.100", "1.0.250", false)
+            &change("serde", "1.0.100", "1.0.150", false)
         ));
-        // A downgrade must land at/below its target.
+        // The same exactness applies to downgrades; undershooting the matured target is not success.
         assert!(reached(&after, &change("syn", "2.0.60", "2.0.50", true)));
-        assert!(!reached(&after, &change("syn", "2.0.60", "2.0.40", true)));
+        assert!(!reached(&after, &change("syn", "2.0.70", "2.0.60", true)));
         // A candidate absent from the lock did not reach its target.
         assert!(!reached(&after, &change("tokio", "1.0.0", "1.5.0", false)));
+
+        let private_target = CargoLock::parse(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "serde"
+            version = "1.0.100"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "serde"
+            version = "1.0.200"
+            source = "registry+https://packages.example.invalid/index"
+        "#})
+        .expect("mixed-registry lock parses");
+        assert!(
+            !reached(
+                &crates_io_locked_versions(&private_target),
+                &change("serde", "1.0.100", "1.0.200", false),
+            ),
+            "an alternate-registry target does not satisfy a crates.io plan"
+        );
+    }
+
+    #[test]
+    fn current_selector_tracks_a_unique_node_moved_by_an_earlier_pin() {
+        let planned = change("referencing", "0.46.5", "0.46.6", false);
+
+        let floated = lock_with(&[("referencing", "0.46.10")]);
+        assert_eq!(
+            current_selector(&floated, &planned).as_deref(),
+            Some("0.46.10")
+        );
+
+        let landed = lock_with(&[("referencing", "0.46.6")]);
+        assert_eq!(current_selector(&landed, &planned), None);
+    }
+
+    #[test]
+    fn current_selector_keeps_the_original_line_and_rejects_ambiguity() {
+        let planned = change("referencing", "0.46.5", "0.46.6", false);
+        let original_and_target =
+            lock_with(&[("referencing", "0.46.5"), ("referencing", "0.46.6")]);
+        assert_eq!(
+            current_selector(&original_and_target, &planned).as_deref(),
+            Some("0.46.5"),
+            "a sibling target must not mask the original planned line"
+        );
+
+        let ambiguous = lock_with(&[("referencing", "0.46.7"), ("referencing", "0.46.10")]);
+        assert_eq!(
+            current_selector(&ambiguous, &planned),
+            None,
+            "the adapter must not guess between coexisting off-target lines"
+        );
+
+        let alternate_registry = CargoLock::parse(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "referencing"
+            version = "0.46.10"
+            source = "registry+https://packages.example.invalid/index"
+        "#})
+        .expect("alternate-registry lock parses");
+        assert_eq!(
+            current_selector(&alternate_registry, &planned),
+            None,
+            "a private-registry namesake is not the moved crates.io node"
+        );
     }
 
     #[test]
@@ -858,11 +993,12 @@ mod tests {
     #[test]
     fn collateral_change_surfaces_a_forced_non_candidate_downgrade() {
         // Raising `a` forces the shared transitive `shared` from 1.1.0 down to 1.0.0 as a consistency
-        // move. `shared` is not planned, so the diff must surface it as its own collateral row — the
-        // silent drift the earlier per-precise-pin design allowed.
+        // move. No applied row reports `shared`, so the diff must surface it as its own collateral
+        // row — the silent drift the earlier per-precise-pin design allowed.
         let before = locked_versions(&lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]));
         let after = locked_versions(&lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]));
-        let collateral = collateral_changes(&before, &after, &planned_set(&["a"]));
+        let applied = [change("a", "1.0.0", "2.0.0", false)];
+        let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
         let shared = &collateral[0];
         assert_eq!(shared.package.name, "shared");
@@ -875,9 +1011,9 @@ mod tests {
     }
 
     #[test]
-    fn collateral_change_excludes_planned_and_unchanged_packages() {
-        // `a` is planned (its own row, not collateral), `b` is unchanged (no row), `c` is an unplanned
-        // forward move (a real collateral change). Only `c` is surfaced.
+    fn collateral_change_excludes_applied_and_unchanged_packages() {
+        // `a`'s move is already told by its applied row (no duplicate), `b` is unchanged (no row),
+        // `c` is an unplanned forward move (a real collateral change). Only `c` is surfaced.
         let before = locked_versions(&lock_with(&[
             ("a", "2.0.0"),
             ("b", "2.0.0"),
@@ -888,10 +1024,31 @@ mod tests {
             ("b", "2.0.0"),
             ("c", "1.5.0"),
         ]));
-        let collateral = collateral_changes(&before, &after, &planned_set(&["a"]));
+        let applied = [change("a", "2.0.0", "1.0.0", true)];
+        let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "c");
         assert!(!collateral[0].downgrade);
+    }
+
+    #[test]
+    fn collateral_changes_surface_a_held_candidates_real_movement() {
+        // A held planned candidate has no applied row, yet a sibling pin still floated it off its
+        // baseline. That net move must surface as a collateral row beside the held skip instead of
+        // being silently dropped behind the planned name.
+        let before = locked_versions(&lock_with(&[("referencing", "0.46.5")]));
+        let after = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let collateral = collateral_changes(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "referencing");
+        assert_eq!(collateral[0].from.as_str(), "0.46.5");
+        assert_eq!(collateral[0].to.as_str(), "0.46.10");
+
+        // Once the candidate reaches its target, its applied row already tells the move: no
+        // duplicate collateral row.
+        let landed = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let applied = [change("referencing", "0.46.5", "0.46.10", false)];
+        assert!(collateral_changes(&before, &landed, &applied).is_empty());
     }
 
     #[test]

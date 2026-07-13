@@ -277,6 +277,19 @@ impl Envelope {
         })
     }
 
+    /// Names of applied changes reported as version downgrades.
+    pub fn downgraded_names(&self) -> BTreeSet<String> {
+        self.filter_names(|item| {
+            item.get("applied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && item
+                    .get("downgrade")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+        })
+    }
+
     /// Names of items `upgrade`/`fix` held back because the whole-graph re-resolve rejected the move
     /// (skipped with reason `resolver_conflict`). This is the "held" set the agreement invariants
     /// compare against `outdated`'s `blocked` set.
@@ -336,6 +349,19 @@ impl Envelope {
             let to = item.get("to")?.as_str()?.to_owned();
             Some((from, to))
         })
+    }
+
+    /// Every `from -> to` row reported for a package, preserving report order.
+    pub fn changes_for(&self, name: &str) -> Vec<(String, String)> {
+        self.items()
+            .iter()
+            .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .filter_map(|item| {
+                let from = item.get("from")?.as_str()?.to_owned();
+                let to = item.get("to")?.as_str()?.to_owned();
+                Some((from, to))
+            })
+            .collect()
     }
 
     pub fn warning_kinds(&self) -> BTreeSet<String> {

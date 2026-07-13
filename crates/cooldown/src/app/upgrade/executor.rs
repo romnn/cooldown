@@ -496,6 +496,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 members: dep.members.clone(),
             });
         }
+        sort_planned_changes(&mut planned);
         planned
     }
 
@@ -668,6 +669,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 members: dep.members.clone(),
             });
         }
+        sort_planned_changes(&mut planned);
         FixPlan {
             changes: planned,
             warnings,
@@ -894,20 +896,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let applied: HashSet<ChangeTargetKey> =
             report.applied.iter().map(change_target_key).collect();
         let planned_applied = planned_changes_landed(changes, &applied);
-        let planned: HashSet<PackageId> = changes
-            .iter()
-            .map(|change| change.package.clone())
-            .collect();
-        // Net version changes the resolve forced on packages the plan did not name (a transitive
-        // pushed backward for consistency, or matured down by a downgrade). These are part of the
-        // committed lock and must be surfaced, never silent — the whole point of the full-lock-diff
-        // report. They are recorded as applied rows once the batch commits below.
-        let collateral = report
-            .applied
-            .iter()
-            .filter(|change| !planned.contains(&change.package))
-            .cloned()
-            .collect();
+        // Net version changes the resolve forced beyond the plan's own claimed rows (a transitive
+        // pushed backward for consistency, matured down by a downgrade, or a held candidate's real
+        // float off its baseline). These are part of the committed lock and must be surfaced, never
+        // silent — the whole point of the full-lock-diff report. They are recorded as applied rows
+        // once the batch commits below.
+        let collateral = collateral_rows(&report.applied, changes);
         self.add_batch_skips(outcome, report.skipped);
         VerifiedBatchReport {
             applied,
@@ -1364,6 +1358,25 @@ fn dep_resolve_ctx<'a>(rctx: &ResolveContext<'a>, dep: &Dependency) -> ResolveCo
     }
 }
 
+/// Restores deterministic mutation order after concurrent registry fetches return in completion
+/// order. Adapters must tolerate any order, but a stable plan keeps conflict winners reproducible.
+fn sort_planned_changes(changes: &mut [Change]) {
+    changes.sort_by(|a, b| {
+        a.package
+            .name
+            .cmp(&b.package.name)
+            .then_with(|| a.package.registry.cmp(&b.package.registry))
+            .then_with(|| a.from.as_str().cmp(b.from.as_str()))
+            .then_with(|| a.to.as_str().cmp(b.to.as_str()))
+            .then_with(|| {
+                a.members
+                    .iter()
+                    .map(|member| (&member.name, &member.path))
+                    .cmp(b.members.iter().map(|member| (&member.name, &member.path)))
+            })
+    });
+}
+
 /// Whether `to` is an older release than `from` — i.e. the move is a cooldown rollback, not a forward
 /// upgrade. Compares the releases' [`ReleaseOrder`] tokens (the canonical ordering the rest of the
 /// module uses), so it is independent of slice order. Unknown versions compare as not-a-downgrade.
@@ -1494,6 +1507,21 @@ fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeTargetKey>
     changes
         .iter()
         .any(|change| applied.contains(&change_target_key(change)))
+}
+
+/// The applied rows the plan did not itself claim — the collateral movement recorded as its own
+/// applied rows when the batch commits.
+///
+/// Filtered by exact change identity ([`change_target_key`]), not by package: a held candidate's
+/// package is planned, but the row reporting its real off-target float is not, and a package-level
+/// filter would silently drop that movement behind the held skip.
+fn collateral_rows(applied: &[Change], planned: &[Change]) -> Vec<Change> {
+    let planned: HashSet<ChangeTargetKey> = planned.iter().map(change_target_key).collect();
+    applied
+        .iter()
+        .filter(|change| !planned.contains(&change_target_key(change)))
+        .cloned()
+        .collect()
 }
 
 fn newly_introduced_violations(
@@ -1678,9 +1706,9 @@ fn plan_item(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanMode, candidate_scope, collapse_applied_legs, combine_lock_status,
+        PlanMode, candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status,
         conflict_skip_message, is_downgrade, newly_introduced_violations, planned_changes_landed,
-        target_package, verify_applied_targets,
+        sort_planned_changes, target_package, verify_applied_targets,
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
@@ -1801,6 +1829,48 @@ mod tests {
             direct: true,
             members: Vec::new(),
         }
+    }
+
+    #[test]
+    fn planned_changes_restore_stable_order_after_concurrent_fetches() {
+        let mut changes = vec![
+            change("referencing", "0.46.5", "0.46.6"),
+            change("jsonschema", "0.46.5", "0.46.6"),
+        ];
+
+        sort_planned_changes(&mut changes);
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["jsonschema", "referencing"]
+        );
+    }
+
+    #[test]
+    fn collateral_rows_keep_a_held_candidates_real_movement() {
+        let planned = vec![change("referencing", "0.46.5", "0.46.6")];
+        // The adapter reported the held candidate's real float (an off-target row for a planned
+        // package) and an unplanned transitive move; the plan's own claimed row is the only one
+        // excluded from collateral.
+        let applied = vec![
+            change("referencing", "0.46.5", "0.46.6"),
+            change("referencing", "0.46.5", "0.46.10"),
+            change("quote", "1.0.44", "1.0.45"),
+        ];
+
+        let collateral = collateral_rows(&applied, &planned);
+
+        assert_eq!(
+            collateral
+                .iter()
+                .map(|change| (change.package.name.as_str(), change.to.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("referencing", "0.46.10"), ("quote", "1.0.45")],
+            "a package-level filter would drop the held candidate's movement row"
+        );
     }
 
     #[test]

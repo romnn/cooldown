@@ -5,6 +5,13 @@ use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
+/// The `source` string a `Cargo.lock` entry and `cargo metadata` carry for crates.io packages.
+pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// The crates.io index in Cargo package-ID-spec form (`<url>#<name>@<version>`) — the same
+/// source as [`CRATES_IO_SOURCE`] without the `registry+` kind prefix.
+const CRATES_IO_SPEC_SOURCE: &str = "https://github.com/rust-lang/crates.io-index";
+
 /// The resolved dependency graph, distilled from `cargo metadata`.
 pub struct ResolvedGraph {
     /// package id → (name, version, source).
@@ -61,7 +68,7 @@ impl PkgInfo {
     /// gates which dependencies the cooldown policy can evaluate.
     #[must_use]
     pub fn is_crates_io(&self) -> bool {
-        self.source.as_deref() == Some("registry+https://github.com/rust-lang/crates.io-index")
+        self.source.as_deref() == Some(CRATES_IO_SOURCE)
     }
 }
 
@@ -126,7 +133,7 @@ impl ResolvedGraph {
         })
     }
 
-    /// Whether every listed workspace member directly resolves `crate_name` at the requested
+    /// Whether every listed workspace member directly resolves `crate_name` at the exact requested
     /// target, having actually left the `from` line behind.
     ///
     /// Cargo can keep several versions of the same crate in one workspace. A lock-level check that
@@ -143,7 +150,6 @@ impl ResolvedGraph {
         crate_name: &str,
         from: &str,
         target: &str,
-        downgrade: bool,
     ) -> bool {
         if members.is_empty() {
             return false;
@@ -181,12 +187,7 @@ impl ResolvedGraph {
                 if major != target_major {
                     continue;
                 }
-                let ordering = crate::version::compare(&info.version, target);
-                reached |= if downgrade {
-                    ordering.is_le()
-                } else {
-                    ordering.is_ge()
-                };
+                reached |= info.version == target;
             }
             if !reached {
                 return false;
@@ -588,25 +589,29 @@ impl Cargo {
         }
     }
 
-    /// Pins `name@from` to exactly `to` via `cargo update -p <name>@<from> --precise <to>`. One
-    /// spec per invocation, never several: cargo accepts multiple `-p` specs alongside `--precise`
-    /// but silently applies the pin to only the first spec and exits 0 (observed on cargo 1.96),
-    /// so batching crates that share a target version into one call loses every pin but the first.
-    /// `@<from>` disambiguates a crate name that resolves to multiple versions in the graph.
+    /// Pins the crates.io `name@from` node to exactly `to` via `cargo update -p <spec>
+    /// --precise <to>`, with the spec source-qualified as [`CRATES_IO_SPEC_SOURCE`].
+    ///
+    /// The qualified spec cannot address a same-name package from another registry, and
+    /// `@<from>` disambiguates a crate resolved at multiple versions. One spec per invocation,
+    /// never several: cargo accepts multiple `-p` specs alongside `--precise` but silently
+    /// applies the pin to only the first spec and exits 0 (observed on cargo 1.96), so batching
+    /// crates that share a target version into one call loses every pin but the first.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if the
-    /// update is rejected (e.g. a `=`-pin or resolver conflict blocks the precise move). A rejection
-    /// is the caller's signal that the candidate stays where the resolver placed it.
-    pub async fn update_precise(
+    /// update is rejected (e.g. a `=`-pin or resolver conflict blocks the precise move, or `from`
+    /// no longer names a locked node). A rejection is the caller's signal that the candidate stays
+    /// where the resolver placed it.
+    pub(crate) async fn update_precise_crates_io(
         &self,
         dir: &Utf8Path,
         name: &str,
         from: &str,
         to: &str,
     ) -> Result<(), CoreError> {
-        let spec = format!("{name}@{from}");
+        let spec = format!("{CRATES_IO_SPEC_SOURCE}#{name}@{from}");
         self.run(dir, &["update", "-p", &spec, "--precise", to])
             .await
             .map(|_| ())
@@ -953,7 +958,6 @@ mod tests {
             "nix",
             "0.28.0",
             "0.31.3",
-            false,
         ));
         assert!(graph.direct_members_reach(
             &[MemberRef {
@@ -963,8 +967,19 @@ mod tests {
             "nix",
             "0.28.0",
             "0.31.3",
-            false,
         ));
+        assert!(
+            !graph.direct_members_reach(
+                &[MemberRef {
+                    name: "app-b".to_string(),
+                    path: "apps/b".to_string(),
+                }],
+                "nix",
+                "0.28.0",
+                "0.31.2",
+            ),
+            "a Cargo precise target must not verify through an overshoot"
+        );
     }
 
     #[test]
@@ -1000,7 +1015,6 @@ mod tests {
             "foo",
             "1.4.0",
             "1.5.0",
-            false,
         ));
     }
 
@@ -1035,7 +1049,7 @@ mod tests {
         }];
 
         assert!(
-            !graph.direct_members_reach(&member, "foo", "0.4.8", "1.0.11", false),
+            !graph.direct_members_reach(&member, "foo", "0.4.8", "1.0.11"),
             "the surviving 0.4 edge means the planned line never moved"
         );
 
@@ -1056,7 +1070,7 @@ mod tests {
                 ]}
             }"#,
         );
-        assert!(moved.direct_members_reach(&member, "foo", "0.4.8", "1.0.11", false));
+        assert!(moved.direct_members_reach(&member, "foo", "0.4.8", "1.0.11"));
     }
 
     #[test]
@@ -1088,7 +1102,6 @@ mod tests {
             "foo",
             "1.4.0",
             "1.5.0",
-            false,
         ));
     }
 
