@@ -160,6 +160,38 @@ fn collateral_change(registry: &'static str, name: &str, from: &str, to: &str) -
 /// imposes no transitive `==` ceiling (the npm family floats a transitive up unless a manifest pins
 /// it), so there is no structural blocker to attribute — the candidate names itself, yielding the
 /// generic "the resolver rejected this change" message.
+/// The net version changes of the before/after lock diff that `applied` does not already report,
+/// as sorted collateral rows.
+///
+/// Exclusion is by landing spot — an applied row for the same name whose target semantically
+/// equals the movement's destination — not by planned package name: a planned candidate the
+/// resolve *held* can still have been floated off its baseline, and that real movement must
+/// surface beside its held skip row instead of being silently dropped. An applied row claiming a
+/// *different* landing (a directional overshoot the executor re-verifies into a skip) does not
+/// suppress the movement row either. Matching the destination rather than the exact `(from, to)`
+/// pair keeps a candidate planned off a stale duplicate copy from double-reporting its move.
+fn collateral_changes(
+    before: &HashMap<String, (&'static str, String)>,
+    after: &HashMap<String, (&'static str, String)>,
+    applied: &[Change],
+) -> Vec<Change> {
+    let reported = |name: &str, to: &str| {
+        applied.iter().any(|change| {
+            change.package.name == name && version::compare(change.to.as_str(), to).is_eq()
+        })
+    };
+    let mut changes: Vec<Change> = before
+        .iter()
+        .filter_map(|(name, (_, from))| {
+            let (registry, to) = after.get(name)?;
+            (version::compare(from, to).is_ne() && !reported(name, to))
+                .then(|| collateral_change(registry, name, from, to))
+        })
+        .collect();
+    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    changes
+}
+
 fn resolver_conflict(change: &Change) -> Skipped {
     Skipped {
         change: change.clone(),
@@ -512,11 +544,6 @@ impl ToolWrite for DenoTool {
         }
 
         let after = locked_versions(&std::fs::read_to_string(project.root.join("deno.lock"))?);
-        let planned: HashSet<&str> = plan
-            .changes
-            .iter()
-            .map(|change| change.package.name.as_str())
-            .collect();
 
         for change in &plan.changes {
             let name = change.package.name.as_str();
@@ -537,16 +564,11 @@ impl ToolWrite for DenoTool {
             }
         }
 
-        let mut collateral: Vec<Change> = before
-            .iter()
-            .filter(|(name, _)| !planned.contains(name.as_str()))
-            .filter_map(|(name, (_, from))| {
-                let (registry, to) = after.get(name)?;
-                (version::compare(from, to).is_ne())
-                    .then(|| collateral_change(registry, name, from, to))
-            })
-            .collect();
-        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        // The hard requirement: no net version change to *any* package may be omitted. Every moved
+        // package the applied rows above do not already report is surfaced as its own collateral
+        // applied row — including a *held* candidate the resolve still floated off its baseline
+        // (whose skip row alone would hide that real move).
+        let collateral = collateral_changes(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
     }
@@ -674,6 +696,28 @@ mod tests {
         let down = collateral_change(JSR, "@std/path", "1.0.3", "1.0.2");
         assert_eq!(down.package.registry.as_deref(), Some(JSR));
         assert!(down.downgrade);
+    }
+
+    #[test]
+    fn collateral_changes_surface_a_held_candidates_real_movement() {
+        let before = HashMap::from([("debug".to_string(), (NPM, "4.3.5".to_string()))]);
+        let after = HashMap::from([("debug".to_string(), (NPM, "4.3.7".to_string()))]);
+
+        // A held planned candidate has no applied row, yet the resolve still floated it off its
+        // baseline. That net move must surface as a collateral row beside the held skip instead of
+        // being silently dropped behind the planned name.
+        let collateral = collateral_changes(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "debug");
+        assert_eq!(collateral[0].from.as_str(), "4.3.5");
+        assert_eq!(collateral[0].to.as_str(), "4.3.7");
+
+        // An applied row claiming a *different* landing (a directional overshoot the executor
+        // re-verifies into a skip) does not mask the movement; a row landing exactly there does.
+        let overshoot = [change("debug", NPM, "4.3.6", false)];
+        assert_eq!(collateral_changes(&before, &after, &overshoot).len(), 1);
+        let exact = [change("debug", NPM, "4.3.7", false)];
+        assert!(collateral_changes(&before, &after, &exact).is_empty());
     }
 
     #[test]

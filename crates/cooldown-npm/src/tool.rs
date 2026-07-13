@@ -414,6 +414,39 @@ fn collateral_change<L: NodeLock>(name: &str, from: &str, to: &str) -> Change {
     }
 }
 
+/// The net version changes of the before/after lock diff that `applied` does not already report,
+/// as sorted collateral rows.
+///
+/// Exclusion is by landing spot — an applied row for the same name whose target semantically
+/// equals the movement's destination — not by planned package name: a planned candidate the
+/// resolve *held* can still have been floated off its baseline, and that real movement must
+/// surface beside its held skip row instead of being silently dropped. An applied row claiming a
+/// *different* landing (a directional overshoot the executor re-verifies into a skip) does not
+/// suppress the movement row either. Matching the destination rather than the exact `(from, to)`
+/// pair keeps a candidate planned off a stale duplicate copy — whose newest-copy baseline differs
+/// from the planned `from` — from double-reporting its move.
+fn collateral_changes<L: NodeLock>(
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+    applied: &[Change],
+) -> Vec<Change> {
+    let reported = |name: &str, to: &str| {
+        applied.iter().any(|change| {
+            change.package.name == name && version::compare(change.to.as_str(), to).is_eq()
+        })
+    };
+    let mut changes: Vec<Change> = before
+        .iter()
+        .filter_map(|(name, from)| {
+            let to = after.get(name)?;
+            (version::compare(from, to).is_ne() && !reported(name, to))
+                .then(|| collateral_change::<L>(name, from, to))
+        })
+        .collect();
+    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    changes
+}
+
 /// Whether a planned candidate landed at or beyond its target, respecting the move's direction (a
 /// forward move must reach at/above its target, a downgrade at/below it).
 ///
@@ -616,11 +649,6 @@ impl<L: NodeLock> NpmTool<L> {
         // than the name's newest copy — the multi-version float leaves a lower line short of a
         // cross-line target the higher line already satisfies.
         let after_members = L::member_sources(&after_content);
-        let planned: HashSet<&str> = plan
-            .changes
-            .iter()
-            .map(|change| change.package.name.as_str())
-            .collect();
 
         for change in &plan.changes {
             let name = change.package.name.as_str();
@@ -665,15 +693,11 @@ impl<L: NodeLock> NpmTool<L> {
             }
         }
 
-        let mut collateral: Vec<Change> = before
-            .iter()
-            .filter(|(name, _)| !planned.contains(name.as_str()))
-            .filter_map(|(name, from)| {
-                let to = after.get(name)?;
-                (version::compare(from, to).is_ne()).then(|| collateral_change::<L>(name, from, to))
-            })
-            .collect();
-        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        // The hard requirement: no net version change to *any* package may be omitted. Every moved
+        // package the applied rows above do not already report is surfaced as its own collateral
+        // applied row — including a *held* candidate the resolve still floated off its baseline
+        // (whose skip row alone would hide that real move).
+        let collateral = collateral_changes::<L>(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
     }
@@ -1231,6 +1255,32 @@ packages:
         assert!(!down.direct);
         let up = collateral_change::<Pnpm>("shared", "1.4.0", "2.0.1");
         assert!(!up.downgrade);
+    }
+
+    #[test]
+    fn collateral_changes_surface_a_held_candidates_real_movement() {
+        let before = HashMap::from([("shared".to_string(), "1.4.0".to_string())]);
+        let after = HashMap::from([("shared".to_string(), "1.4.3".to_string())]);
+
+        // A held planned candidate has no applied row, yet the resolve still floated it off its
+        // baseline. That net move must surface as a collateral row beside the held skip instead of
+        // being silently dropped behind the planned name.
+        let collateral = collateral_changes::<Pnpm>(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "shared");
+        assert_eq!(collateral[0].from.as_str(), "1.4.0");
+        assert_eq!(collateral[0].to.as_str(), "1.4.3");
+
+        // An applied row claiming a *different* landing (a directional overshoot the executor
+        // re-verifies into a skip) does not mask the movement; a row landing exactly there does —
+        // even when its planned `from` is a stale duplicate copy's baseline, not the newest copy's.
+        let overshoot = [change("shared", "1.4.0", "1.4.1")];
+        assert_eq!(
+            collateral_changes::<Pnpm>(&before, &after, &overshoot).len(),
+            1
+        );
+        let stale_duplicate_baseline = [change("shared", "1.3.9", "1.4.3")];
+        assert!(collateral_changes::<Pnpm>(&before, &after, &stale_duplicate_baseline).is_empty());
     }
 
     #[test]

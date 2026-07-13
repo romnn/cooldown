@@ -517,6 +517,39 @@ fn collateral_change(name: &str, from: &str, to: &str) -> Change {
     }
 }
 
+/// The net version changes of the before/after lock diff that `applied` does not already report,
+/// as sorted collateral rows.
+///
+/// Exclusion is by exact `(name, from, to)` move, not by planned package name: a planned candidate
+/// the resolve *held* can still have been floated off its baseline, and that real movement must
+/// surface beside its held skip row instead of being silently dropped. The same applies to a
+/// directionally-"reached" candidate whose row claims the planned target while the lock landed
+/// beyond it — the executor re-verifies that row into a skip, leaving the movement row as the only
+/// truthful record. Versions compare semantically so an equivalent spelling never double-reports.
+fn collateral_changes(
+    before: &std::collections::HashMap<String, String>,
+    after: &std::collections::HashMap<String, String>,
+    applied: &[Change],
+) -> Vec<Change> {
+    let reported = |name: &str, from: &str, to: &str| {
+        applied.iter().any(|change| {
+            change.package.name == name
+                && version::compare(change.from.as_str(), from).is_eq()
+                && version::compare(change.to.as_str(), to).is_eq()
+        })
+    };
+    let mut changes: Vec<Change> = before
+        .iter()
+        .filter_map(|(name, from)| {
+            let to = after.get(name)?;
+            (version::compare(from, to).is_ne() && !reported(name, from, to))
+                .then(|| collateral_change(name, from, to))
+        })
+        .collect();
+    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    changes
+}
+
 impl UvTool {
     /// Re-resolve the **whole** graph once under cooldown's window, honoring [`RewriteMode`] for the
     /// planned candidates and any per-package ceilings cooldown's verdict imposes.
@@ -741,11 +774,6 @@ impl ToolWrite for UvTool {
 
         let after_lock = read_lock(project)?;
         let after = locked_versions(&after_lock);
-        let planned: std::collections::HashSet<&str> = lock_plan
-            .changes
-            .iter()
-            .map(|change| change.package.name.as_str())
-            .collect();
 
         // Each planned candidate either reached cooldown's target (its newest-within-window) — reported
         // applied — or fell short because a mutually-exclusive requirement won — reported held, naming
@@ -779,19 +807,12 @@ impl ToolWrite for UvTool {
             }
         }
 
-        // The hard requirement: no net version change to *any* package may be omitted. A package the
-        // plan did not name that the whole-graph resolve moved (a transitive forced backward to keep the
-        // lock consistent, or a transitive matured down by `fix`) is surfaced as its own collateral
-        // applied row — the silent, unreported drift that earlier per-candidate designs allowed.
-        let mut collateral: Vec<Change> = before
-            .iter()
-            .filter(|(name, _)| !planned.contains(name.as_str()))
-            .filter_map(|(name, from)| {
-                let to = after.get(name)?;
-                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
-            })
-            .collect();
-        collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+        // The hard requirement: no net version change to *any* package may be omitted. Every moved
+        // package the applied rows above do not already report is surfaced as its own collateral
+        // applied row: a transitive forced backward to keep the lock consistent, a transitive
+        // matured down by `fix`, or a *held* candidate the resolve still floated off its baseline
+        // (whose skip row alone would hide that real move).
+        let collateral = collateral_changes(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
     }
@@ -862,30 +883,23 @@ mod tests {
         UvLock::parse(&content).expect("lock parses")
     }
 
-    /// The collateral net version changes the diff surfaces for packages the plan did not name — the
-    /// before/after pairs that differ, excluding the planned set. Mirrors `apply`'s collateral pass.
-    fn collateral_changes(
-        before: &std::collections::HashMap<String, String>,
-        after: &std::collections::HashMap<String, String>,
-        planned: &std::collections::HashSet<&str>,
-    ) -> Vec<Change> {
-        let mut changes: Vec<Change> = before
-            .iter()
-            .filter(|(name, _)| !planned.contains(name.as_str()))
-            .filter_map(|(name, from)| {
-                let to = after.get(name)?;
-                (version::compare(from, to).is_ne()).then(|| collateral_change(name, from, to))
-            })
-            .collect();
-        changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
-        changes
+    fn change(name: &str, from: &str, to: &str) -> Change {
+        Change {
+            package: PackageId::new(UV_ID, name.to_string(), Some(PYPI.to_string())),
+            from: Version::new(from.to_string()),
+            to: Version::new(to.to_string()),
+            kind: cooldown_core::UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        }
     }
 
     #[test]
     fn collateral_change_surfaces_a_forced_non_candidate_downgrade() {
         // Raising `huggingface-hub` forces `typer` from 0.26.7 down to 0.25.1 as a consistency move.
-        // `typer` is not planned, so the diff must surface it as its own collateral row — the silent,
-        // unreported drift earlier per-candidate designs allowed.
+        // No applied row reports `typer`, so the diff must surface it as its own collateral row — the
+        // silent, unreported drift earlier per-candidate designs allowed.
         let before = locked_versions(&lock_with(&[
             ("huggingface-hub", "1.16.1"),
             ("typer", "0.26.7"),
@@ -894,7 +908,8 @@ mod tests {
             ("huggingface-hub", "1.18.0"),
             ("typer", "0.25.1"),
         ]));
-        let collateral = collateral_changes(&before, &after, &planned_set(&["huggingface-hub"]));
+        let applied = [change("huggingface-hub", "1.16.1", "1.18.0")];
+        let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
         let typer = &collateral[0];
         assert_eq!(typer.package.name, "typer");
@@ -907,9 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn collateral_change_excludes_planned_and_unchanged_packages() {
-        // `a` is planned (its own row, not collateral), `b` is unchanged (no row at all), and `c` is an
-        // unplanned forward move (a real collateral change). Only `c` is surfaced.
+    fn collateral_change_excludes_applied_and_unchanged_packages() {
+        // `a`'s move is already told by its applied row (no duplicate), `b` is unchanged (no row at
+        // all), and `c` is an unplanned forward move (a real collateral change). Only `c` is surfaced.
         let before = locked_versions(&lock_with(&[
             ("a", "2.0.0"),
             ("b", "2.0.0"),
@@ -920,14 +935,33 @@ mod tests {
             ("b", "2.0.0"),
             ("c", "1.5.0"),
         ]));
-        let collateral = collateral_changes(&before, &after, &planned_set(&["a"]));
+        let applied = [change("a", "2.0.0", "1.0.0")];
+        let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "c");
         assert!(!collateral[0].downgrade);
     }
 
-    fn planned_set<'a>(names: &'a [&'a str]) -> std::collections::HashSet<&'a str> {
-        names.iter().copied().collect()
+    #[test]
+    fn collateral_changes_surface_a_held_candidates_real_movement() {
+        // A held planned candidate has no applied row, yet the resolve still floated it off its
+        // baseline. That net move must surface as a collateral row beside the held skip instead of
+        // being silently dropped behind the planned name.
+        let before = locked_versions(&lock_with(&[("referencing", "0.36.1")]));
+        let after = locked_versions(&lock_with(&[("referencing", "0.36.4")]));
+        let collateral = collateral_changes(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "referencing");
+        assert_eq!(collateral[0].from.as_str(), "0.36.1");
+        assert_eq!(collateral[0].to.as_str(), "0.36.4");
+
+        // The same movement surfaces when the applied row claims a *different* landing spot (a
+        // directionally-"reached" overshoot the executor re-verifies into a skip): only the row
+        // matching the real move suppresses the collateral duplicate.
+        let overshoot = [change("referencing", "0.36.1", "0.36.2")];
+        assert_eq!(collateral_changes(&before, &after, &overshoot).len(), 1);
+        let exact = [change("referencing", "0.36.1", "0.36.4")];
+        assert!(collateral_changes(&before, &after, &exact).is_empty());
     }
 
     #[test]
