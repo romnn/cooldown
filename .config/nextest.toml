@@ -44,7 +44,7 @@ test-group = 'go-registry'
 retries = 3
 
 [[profile.integration.overrides]]
-filter = 'binary(/^(convergence_deno|convergence_pnpm|convergence_pnpm_multiline)$/)'
+filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm|convergence_pnpm_multiline)$/)'
 test-group = 'npm-registry'
 retries = 3
 
@@ -72,7 +72,7 @@ test-group = 'go-registry'
 retries = 3
 
 [[profile.ci.overrides]]
-filter = 'binary(/^(convergence_deno|convergence_pnpm|convergence_pnpm_multiline)$/)'
+filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm|convergence_pnpm_multiline)$/)'
 test-group = 'npm-registry'
 retries = 3
 

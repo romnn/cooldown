@@ -139,7 +139,7 @@ tasks:
       - cargo fc nextest run -P default --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 
   test:integration:
-    desc: "run the real-tool integration tests (drive uv/cargo/go/pnpm against live registries; needs the mise.toml toolchain + network)"
+    desc: "run the real-tool integration tests (drive uv/cargo/go/npm/pnpm against live registries; needs the mise.toml toolchain + network)"
     cmds:
       - cargo nextest run -P integration --workspace --all-targets --no-tests "warn" {{.CLI_ARGS}}
 

@@ -4,8 +4,8 @@ use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
     ApplyReport, Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, MajorKey,
-    PackageId, Plan, Release, ResolveContext, SkipReason, Skipped, Status, UpdateKind, Version,
-    check_pin, evaluate, evaluate_fix,
+    PackageId, Plan, ProjectMutationJournal, Release, ResolveContext, SkipReason, Skipped, Status,
+    UpdateKind, Version, check_pin, evaluate, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -60,10 +60,11 @@ struct FixWarning {
     message: String,
 }
 
-/// One round of `fix` planning: the downgrades to apply and the unfixable violations to report.
+/// One round of `fix` planning: downgrades, unfixable violations, and metadata failures.
 struct FixPlan {
     changes: Vec<Change>,
     warnings: Vec<FixWarning>,
+    errors: Vec<Diagnostic>,
 }
 
 /// The report and state delta produced by one native resolver batch.
@@ -98,6 +99,26 @@ enum TransitiveGateVerdict {
     },
 }
 
+/// One policy trial's verdict over a candidate group: committed outcomes to keep, the residual
+/// cooldown violations that reject the group, or an error that aborts recovery entirely.
+enum UpgradeTrialResult {
+    Settled(Vec<BatchOutcome>),
+    PolicyBlocked(Vec<(String, String)>),
+    Aborted(BatchOutcome),
+}
+
+/// A candidate isolation rejected, with the residual violations its trial forced into the graph.
+type RejectedUpgrade = (Change, Vec<(String, String)>);
+
+/// The outcome of isolating a policy-blocked batch into safe and unsafe candidates.
+enum UpgradeSelectionResult {
+    Selected {
+        accepted: Vec<Change>,
+        rejected: Vec<RejectedUpgrade>,
+    },
+    Aborted(BatchOutcome),
+}
+
 struct VerifiedBatchReport {
     applied: HashSet<ChangeTargetKey>,
     collateral: Vec<Change>,
@@ -126,7 +147,8 @@ impl BatchOutcome {
     }
 }
 
-/// The evolving per-project state during one-change upgrade trials.
+/// The evolving per-project state during upgrade trials.
+#[derive(Clone)]
 struct TrialState {
     /// In-cooldown, non-baselined pins present before the next trial.
     baseline_violations: HashSet<(String, String)>,
@@ -134,8 +156,8 @@ struct TrialState {
     reconcile_needed: bool,
 }
 
-/// The cohesive per-project upgrade state machine: dependency discovery, planning, one-change
-/// trials, rollback, and final verification.
+/// The cohesive per-project upgrade state machine: dependency discovery, planning, group trials,
+/// rollback, and final verification.
 pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     ws: &'a Workspace,
     ctx: UpgradeCtx<'b>,
@@ -241,72 +263,249 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return;
         }
 
-        // Snapshot the lock *after* the independent build batch and *before* the optimistic lock
-        // batch. The upgrade gate keeps the lock even when a forward move floats a too-fresh transitive
-        // up, trusting the reconcile pass to mature it down; if a violation turns out irreducible, the
-        // final gate below restores this snapshot — reverting the lock batch and its reconcile
-        // downgrades while leaving the build-backend adoption intact. Capturing it must succeed: with
-        // no safety net the optimistic commit could not be undone, so a capture failure skips the lock
-        // batch as an error rather than risking an unverifiable graph.
-        let lock_plan = Plan {
-            changes: lock_changes.clone(),
-            rewrite: self.ctx.opts.rewrite,
-        };
-        let snapshot = match self
-            .ctx
-            .writer
-            .mutation_journal(&self.ctx.pctx.project, &lock_plan)
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.record_change_errors(&error, &lock_changes);
+        self.run_lock_upgrades(lock_changes, state).await;
+    }
+
+    /// Applies the lock batch, isolating candidates when the joint result violates cooldown policy.
+    ///
+    /// The fast path is one trial of the complete batch: settled outcomes commit as-is. A policy
+    /// residual restores the fixed pre-lock baseline and — for more than one candidate —
+    /// partitions the batch to find the maximal safe subset, which is then replayed jointly from
+    /// that same baseline; only the replay commits. Errors abort recovery and restore the
+    /// baseline: an infrastructure failure must surface as an error, never as a cooldown skip.
+    async fn run_lock_upgrades(&mut self, lock_changes: Vec<Change>, state: &mut TrialState) {
+        let baseline_before_lock = state.clone();
+        let mut rollback = ProjectMutationJournal::default();
+        let initial = self
+            .try_upgrade_group(
+                lock_changes.clone(),
+                &baseline_before_lock.baseline_violations,
+                state,
+                &mut rollback,
+            )
+            .await;
+        match initial {
+            UpgradeTrialResult::Settled(outcomes) => {
+                self.merge_batch_outcomes(outcomes);
+                self.collapse_collateral(&baseline_before_lock.baseline_violations);
                 return;
             }
-        };
-        let baseline_before_lock = state.baseline_violations.clone();
+            UpgradeTrialResult::Aborted(mut outcome) => {
+                self.restore_upgrade_trial(&rollback, &baseline_before_lock, state, &mut outcome);
+                self.merge_batch_outcome(outcome);
+                self.collapse_collateral(&baseline_before_lock.baseline_violations);
+                return;
+            }
+            UpgradeTrialResult::PolicyBlocked(violations) => {
+                let mut outcome = BatchOutcome::default();
+                if !self.restore_upgrade_trial(
+                    &rollback,
+                    &baseline_before_lock,
+                    state,
+                    &mut outcome,
+                ) {
+                    self.merge_batch_outcome(outcome);
+                    return;
+                }
+                // A singleton batch has nothing to isolate: the lone candidate is the culprit.
+                if lock_changes.len() == 1 {
+                    self.record_unreconciled_skips(&lock_changes, &violations);
+                    self.collapse_collateral(&baseline_before_lock.baseline_violations);
+                    return;
+                }
+            }
+        }
 
+        self.recover_policy_blocked_upgrade(
+            lock_changes,
+            &baseline_before_lock,
+            state,
+            &mut rollback,
+        )
+        .await;
+        self.collapse_collateral(&baseline_before_lock.baseline_violations);
+    }
+
+    /// Isolates a policy-blocked multi-candidate batch, then commits its safe subset via one joint
+    /// replay. With no safe candidate every rejection is reported held; a selection abort merges
+    /// only the failing trial's errors.
+    async fn recover_policy_blocked_upgrade(
+        &mut self,
+        lock_changes: Vec<Change>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut ProjectMutationJournal,
+    ) {
+        let selection = self
+            .select_safe_upgrade_changes(lock_changes, baseline, state, rollback)
+            .await;
+        match selection {
+            UpgradeSelectionResult::Selected { accepted, rejected } if accepted.is_empty() => {
+                self.record_rejected_upgrade_changes(rejected);
+            }
+            UpgradeSelectionResult::Selected { accepted, rejected } => {
+                self.replay_selected_upgrade_changes(accepted, rejected, baseline, state, rollback)
+                    .await;
+            }
+            UpgradeSelectionResult::Aborted(outcome) => self.merge_batch_outcome(outcome),
+        }
+    }
+
+    /// Partitions a policy-blocked batch into the maximal safe subset and rejected singletons —
+    /// delta-debugging partitioning over `accepted + group` trials, like `apply_resilient`, with
+    /// the tool's whole pipeline (apply, reconcile, residual gate) as the oracle.
+    async fn select_safe_upgrade_changes(
+        &mut self,
+        lock_changes: Vec<Change>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut ProjectMutationJournal,
+    ) -> UpgradeSelectionResult {
+        // Selection trials always start from the same pre-lock graph and include every previously
+        // accepted candidate. A later whole-graph resolve therefore cannot silently displace an
+        // earlier target; only the final joint replay contributes rows to the report.
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        let mut work = Vec::new();
+        push_upgrade_halves(&mut work, lock_changes);
+        while let Some(group) = work.pop() {
+            let mut trial_changes = accepted.clone();
+            trial_changes.extend(group.iter().cloned());
+            let result = self
+                .try_upgrade_group(
+                    trial_changes,
+                    &baseline.baseline_violations,
+                    state,
+                    rollback,
+                )
+                .await;
+            match result {
+                UpgradeTrialResult::Settled(_) => {
+                    let mut outcome = BatchOutcome::default();
+                    if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                        return UpgradeSelectionResult::Aborted(outcome);
+                    }
+                    accepted.extend(group);
+                }
+                UpgradeTrialResult::PolicyBlocked(violations) => {
+                    let mut outcome = BatchOutcome::default();
+                    if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                        return UpgradeSelectionResult::Aborted(outcome);
+                    }
+                    if group.len() > 1 {
+                        push_upgrade_halves(&mut work, group);
+                    } else {
+                        rejected
+                            .extend(group.into_iter().map(|change| (change, violations.clone())));
+                    }
+                }
+                UpgradeTrialResult::Aborted(mut outcome) => {
+                    self.restore_upgrade_trial(rollback, baseline, state, &mut outcome);
+                    return UpgradeSelectionResult::Aborted(outcome);
+                }
+            }
+        }
+
+        UpgradeSelectionResult::Selected { accepted, rejected }
+    }
+
+    /// Replays the accepted candidates jointly from the restored baseline — the only trial whose
+    /// outcomes reach the report and the committed lock.
+    ///
+    /// The accepted set's final composition always equals the last settled selection trial, so the
+    /// replay normally settles too. A replay that still blocks (the registry moved between trials)
+    /// fails closed: the baseline is restored and the accepted candidates report as held rather
+    /// than committing a lock no trial verified.
+    async fn replay_selected_upgrade_changes(
+        &mut self,
+        accepted: Vec<Change>,
+        rejected: Vec<RejectedUpgrade>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut ProjectMutationJournal,
+    ) {
+        match self
+            .try_upgrade_group(
+                accepted.clone(),
+                &baseline.baseline_violations,
+                state,
+                rollback,
+            )
+            .await
+        {
+            UpgradeTrialResult::Settled(outcomes) => {
+                self.merge_batch_outcomes(outcomes);
+                self.record_rejected_upgrade_changes(rejected);
+            }
+            UpgradeTrialResult::PolicyBlocked(violations) => {
+                let mut outcome = BatchOutcome::default();
+                if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                    self.merge_batch_outcome(outcome);
+                    return;
+                }
+                self.record_unreconciled_skips(&accepted, &violations);
+                self.record_rejected_upgrade_changes(rejected);
+            }
+            UpgradeTrialResult::Aborted(mut outcome) => {
+                self.restore_upgrade_trial(rollback, baseline, state, &mut outcome);
+                self.merge_batch_outcome(outcome);
+                self.record_rejected_upgrade_changes(rejected);
+            }
+        }
+    }
+
+    /// Runs one policy trial: applies `changes` as one resolver batch, reconciles the floated
+    /// transitives, then judges the residual violations against the fixed `policy_baseline`.
+    ///
+    /// Every mutation is captured into `rollback` (first snapshot per path), so the caller can
+    /// restore the pre-trial worktree no matter how far the trial got. A settled trial's outcomes
+    /// stay unmerged — the caller decides whether this trial is the one that commits — and an
+    /// aborted trial surfaces only its errors, because its other rows describe a lock the restore
+    /// discards.
+    async fn try_upgrade_group(
+        &mut self,
+        changes: Vec<Change>,
+        policy_baseline: &HashSet<(String, String)>,
+        state: &mut TrialState,
+        rollback: &mut ProjectMutationJournal,
+    ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
-        let lock_outcome = self.apply_batch(lock_changes.clone(), state).await;
-        // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated up,
-        // and a broken re-lock probe must not be re-hit.
+        let lock_outcome = self
+            .apply_batch_with_rollback(changes, state, Some(rollback))
+            .await;
+        // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated
+        // up, and a broken re-lock probe must not be re-hit.
         let upgraded_cleanly =
             lock_outcome.applied_count() > 0 && lock_outcome.errored_count() == 0;
         Self::advance_trial_state(&lock_outcome, state);
         let lock_committed = lock_outcome.committed.is_some();
         pending.push(lock_outcome);
+        if pending.iter().any(|outcome| outcome.errored_count() > 0) {
+            return UpgradeTrialResult::Aborted(trial_errors(pending));
+        }
         if !lock_committed {
-            self.merge_batch_outcomes(pending);
-            return;
+            return UpgradeTrialResult::Settled(pending);
         }
         if self.transitive_mode() == TransitiveGate::Enforce
             && upgraded_cleanly
             && state.reconcile_needed
         {
-            pending.extend(self.reconcile_to_fixpoint(state).await);
+            pending.extend(self.reconcile_to_fixpoint(state, rollback).await);
+        }
+        if pending.iter().any(|outcome| outcome.errored_count() > 0) {
+            return UpgradeTrialResult::Aborted(trial_errors(pending));
         }
 
-        // Final gate: a too-fresh transitive newly forced in that the reconcile pass could not mature
-        // down — none matured below it, or a requirer pins it there — is a residual the optimistic
-        // commit must not keep. A pre-existing dirty package may float to a different fresh version
-        // without rollback, but an additional fresh version line for that package is still new.
-        if self.transitive_mode() == TransitiveGate::Enforce {
-            let residual =
-                newly_introduced_violations(&baseline_before_lock, &state.baseline_violations);
-            if !residual.is_empty() {
-                self.roll_back_unreconciled(
-                    &snapshot,
-                    &baseline_before_lock,
-                    &lock_changes,
-                    &residual,
-                    state,
-                );
-                return;
-            }
+        if self.transitive_mode() != TransitiveGate::Enforce {
+            return UpgradeTrialResult::Settled(pending);
         }
-
-        self.merge_batch_outcomes(pending);
-        self.collapse_collateral(&baseline_before_lock);
+        // A pre-existing dirty package may move between fresh versions, but an additional fresh
+        // version line for that package is still a new residual.
+        let residual = newly_introduced_violations(policy_baseline, &state.baseline_violations);
+        if residual.is_empty() {
+            return UpgradeTrialResult::Settled(pending);
+        }
+        UpgradeTrialResult::PolicyBlocked(residual)
     }
 
     /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
@@ -349,24 +548,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    /// Undo an optimistic lock batch whose floated-up transitive the reconcile pass could not clear:
-    /// restore the snapshotted lock, discard the unmerged batch outcomes, and re-report each planned
-    /// lock change as held by the still-too-fresh transitive it would force in.
-    fn roll_back_unreconciled(
-        &mut self,
-        snapshot: &cooldown_core::ProjectMutationJournal,
-        baseline_violations: &HashSet<(String, String)>,
-        lock_changes: &[Change],
-        residual: &[(String, String)],
-        state: &mut TrialState,
-    ) {
-        state.baseline_violations.clone_from(baseline_violations);
-        state.reconcile_needed = false;
-        self.restore_journal(snapshot);
+    /// Reports each change of a policy-blocked trial as held by the transitive it would force
+    /// into the graph.
+    fn record_unreconciled_skips(&mut self, changes: &[Change], residual: &[(String, String)]) {
         self.acc.strict_incomplete = true;
         // Name one stuck transitive as the offender (sorted for a stable report).
         let offender = residual.iter().map(|(name, _)| name.clone()).min();
-        for change in lock_changes {
+        for change in changes {
             self.record_change_skip(
                 change,
                 Some(SkippedInfo {
@@ -379,6 +567,35 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     offending: offender.clone(),
                 }),
             );
+        }
+    }
+
+    fn record_rejected_upgrade_changes(&mut self, rejected: Vec<(Change, Vec<(String, String)>)>) {
+        for (change, violations) in rejected {
+            self.record_unreconciled_skips(std::slice::from_ref(&change), &violations);
+        }
+    }
+
+    /// Restores the fixed pre-lock worktree snapshot and executor baseline after a trial.
+    ///
+    /// A restore failure leaves the worktree in no known state, so it is pushed as an error and
+    /// the caller must stop recovering instead of running further trials.
+    fn restore_upgrade_trial(
+        &self,
+        snapshot: &ProjectMutationJournal,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        outcome: &mut BatchOutcome,
+    ) -> bool {
+        match snapshot.restore(&self.ctx.pctx.project.root) {
+            Ok(()) => {
+                state.clone_from(baseline);
+                true
+            }
+            Err(error) => {
+                outcome.errors.push(self.project_diag(&error, None));
+                false
+            }
         }
     }
 
@@ -587,11 +804,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
         let mut planned = Vec::new();
         let mut warnings = Vec::new();
+        let mut errors = Vec::new();
         for (dep, releases) in fetched {
             let releases = match releases {
                 Ok(releases) => releases,
                 Err(error) => {
-                    self.record_project_error(&error, Some(&dep.package.name));
+                    errors.push(self.project_diag(&error, Some(&dep.package.name)));
                     continue;
                 }
             };
@@ -655,24 +873,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|release| release.version == target)
                 .and_then(|release| release.kind_from_current)
                 .unwrap_or(UpdateKind::Minor);
-            // A cross-major downgrade (Go `/v3` → `/v2`, or `/v2` → the v1 base path) changes the
-            // import path; `target_package_for` reconstructs it (a no-op for same-major moves and for
-            // tools whose name is stable across majors).
-            planned.push(Change {
-                package: target_package_for(&releases, &dep, &target),
-                from: dep.current.clone(),
-                to: target,
-                kind,
-                // `fix` only ever rolls a too-fresh pin back.
-                downgrade: true,
-                direct: dep.direct,
-                members: dep.members.clone(),
-            });
+            planned.push(fix_change(&releases, &dep, target, kind));
         }
         sort_planned_changes(&mut planned);
         FixPlan {
             changes: planned,
             warnings,
+            errors,
         }
     }
 
@@ -687,19 +894,24 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
     ) {
         for _ in 0..MAX_FIX_ROUNDS {
-            let plan = self
+            let FixPlan {
+                changes,
+                warnings,
+                errors,
+            } = self
                 .plan_fix_changes(&deps, transitive, downgrade_pinned)
                 .await;
-            if plan.changes.is_empty() {
-                self.emit_fix_warnings(plan.warnings);
+            self.acc.errors.extend(errors);
+            if changes.is_empty() {
+                self.emit_fix_warnings(warnings);
                 return;
             }
-            let outcome = self.apply_batch(plan.changes, state).await;
+            let outcome = self.apply_batch(changes, state).await;
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
             if applied == 0 {
-                self.emit_fix_warnings(plan.warnings);
+                self.emit_fix_warnings(warnings);
                 return;
             }
             let Some(next) = self.scoped_deps().await else {
@@ -710,8 +922,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Downgrade any too-fresh transitive a forward `upgrade` move floated up, to a fixpoint — the
-    /// `fix` half of a single-pass `upgrade`. Reuses the per-change trial so each downgrade is
-    /// applied, re-locked, and verified like any other.
+    /// `fix` half of a single-pass `upgrade`. Each downgrade batch is applied, re-locked, and
+    /// verified like the forward batch that made it necessary.
     ///
     /// `reconcile_needed` gates only **entry**; the rounds then run to a fixpoint on progress, like
     /// [`fix_to_fixpoint`](Self::fix_to_fixpoint). A round's downgrades can make a violation that
@@ -719,7 +931,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// put under `zbus_names`), and that unblocking raises no *new* violation — so re-arming on new
     /// violations alone would stop after one round and leave the now-plannable violation fresh, for
     /// the final residual gate to then roll the whole batch back.
-    async fn reconcile_to_fixpoint(&mut self, state: &mut TrialState) -> Vec<BatchOutcome> {
+    async fn reconcile_to_fixpoint(
+        &mut self,
+        state: &mut TrialState,
+        rollback: &mut ProjectMutationJournal,
+    ) -> Vec<BatchOutcome> {
         let mut outcomes = Vec::new();
         if !state.reconcile_needed {
             return outcomes;
@@ -740,19 +956,33 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     return outcomes;
                 }
             };
-            let plan = self
+            let FixPlan {
+                changes,
+                warnings,
+                errors,
+            } = self
                 .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
                 .await;
-            if plan.changes.is_empty() {
-                outcomes.push(self.fix_warnings_outcome(plan.warnings));
+            if !errors.is_empty() {
+                outcomes.push(BatchOutcome {
+                    errors,
+                    strict_incomplete: true,
+                    ..BatchOutcome::default()
+                });
                 return outcomes;
             }
-            let outcome = self.apply_batch(plan.changes, state).await;
+            if changes.is_empty() {
+                outcomes.push(self.fix_warnings_outcome(warnings));
+                return outcomes;
+            }
+            let outcome = self
+                .apply_batch_with_rollback(changes, state, Some(rollback))
+                .await;
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
             outcomes.push(outcome);
             if applied == 0 {
-                outcomes.push(self.fix_warnings_outcome(plan.warnings));
+                outcomes.push(self.fix_warnings_outcome(warnings));
                 return outcomes;
             }
         }
@@ -785,13 +1015,21 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .with_package(package)
     }
 
-    /// Apply a round's planned changes as **one** atomic plan, so a tool that re-resolves jointly
-    /// (uv's ceiling resolve) settles conflicts between candidates in a single pass and produces one
-    /// consistent lock. The whole batch shares a single journal: the resulting lock is indivisible, so
-    /// if it drags in an irreducible fresh transitive the entire batch is rolled back rather than a
-    /// single change. The returned outcome is the only side effect visible to the report until its
-    /// caller merges it.
+    /// Applies one trial's planned changes as one resolver batch under one rollback journal.
+    ///
+    /// A whole-graph resolver settles candidate interactions in one consistent lock. The caller may
+    /// restore and partition a policy-rejected multi-change trial, but this method's outcome remains
+    /// invisible to the report until the caller keeps and merges it.
     async fn apply_batch(&mut self, changes: Vec<Change>, state: &TrialState) -> BatchOutcome {
+        self.apply_batch_with_rollback(changes, state, None).await
+    }
+
+    async fn apply_batch_with_rollback(
+        &mut self,
+        changes: Vec<Change>,
+        state: &TrialState,
+        rollback: Option<&mut ProjectMutationJournal>,
+    ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
             return outcome;
@@ -824,6 +1062,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcome;
             }
         };
+        if let Some(rollback) = rollback {
+            preserve_rollback_entries(rollback, &journal);
+        }
 
         // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
         // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
@@ -1125,12 +1366,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         Ok(deps)
     }
 
-    fn restore_journal(&mut self, journal: &cooldown_core::ProjectMutationJournal) {
-        if let Err(error) = journal.restore(&self.ctx.pctx.project.root) {
-            self.record_project_error(&error, None);
-        }
-    }
-
     fn restore_journal_into_outcome(
         &self,
         journal: &cooldown_core::ProjectMutationJournal,
@@ -1293,17 +1528,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    fn record_change_errors<'c>(
-        &mut self,
-        error: &cooldown_core::CoreError,
-        changes: impl IntoIterator<Item = &'c Change>,
-    ) {
-        for change in changes {
-            let diag = self.project_diag(error, Some(&change.package.name));
-            self.record_change_error(change, diag);
-        }
-    }
-
     fn change_applied_item(&self, change: &Change) -> UpgradeItem {
         plan_item(
             change,
@@ -1336,11 +1560,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         )
     }
 
-    fn record_change_error(&mut self, change: &Change, diag: Diagnostic) {
-        let item = self.change_error_item(change, diag);
-        self.acc.items.push(item);
-    }
-
     fn record_change_skip(&mut self, change: &Change, skipped: Option<SkippedInfo>) {
         let item = self.change_skip_item(change, skipped);
         self.acc.items.push(item);
@@ -1355,6 +1574,54 @@ fn dep_resolve_ctx<'a>(rctx: &ResolveContext<'a>, dep: &Dependency) -> ResolveCo
     ResolveContext {
         allow_major: dep.direct && rctx.allow_major,
         ..*rctx
+    }
+}
+
+/// Splits `changes` in two and pushes the halves so the left half is processed first (LIFO).
+fn push_upgrade_halves(work: &mut Vec<Vec<Change>>, mut changes: Vec<Change>) {
+    let right = changes.split_off(changes.len() / 2);
+    if !right.is_empty() {
+        work.push(right);
+    }
+    if !changes.is_empty() {
+        work.push(changes);
+    }
+}
+
+/// Distills an aborted trial's outcomes down to their errors — the only rows that may outlive
+/// the rollback, since applied or skipped rows would describe a lock the restore discards.
+fn trial_errors(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
+    let mut errors = BatchOutcome::default();
+    for outcome in outcomes {
+        errors.errors.extend(outcome.errors);
+        errors.items.extend(
+            outcome
+                .items
+                .into_iter()
+                .filter(|item| item.error.is_some()),
+        );
+    }
+    errors.strict_incomplete = errors.errored_count() > 0;
+    errors
+}
+
+/// Folds a batch journal into the trial-wide rollback journal, keeping the first snapshot per
+/// path.
+fn preserve_rollback_entries(
+    rollback: &mut ProjectMutationJournal,
+    journal: &ProjectMutationJournal,
+) {
+    for file in &journal.files {
+        if rollback
+            .files
+            .iter()
+            .all(|captured| captured.path != file.path)
+        {
+            // By the mutation-journal contract, an earlier plan could not have changed a path it did
+            // not capture. Its first appearance therefore still contains the pre-trial bytes even
+            // when a reconciliation plan expands the write set.
+            rollback.files.push(file.clone());
+        }
     }
 }
 
@@ -1404,6 +1671,23 @@ fn target_package_for(releases: &[Release], dep: &Dependency, target: &Version) 
         .map(|release| release.major.clone())
         .unwrap_or(current_major.clone());
     target_package(&dep.package, &current_major, &target_major)
+}
+
+/// The `fix` downgrade maturing `dep` back to `target`.
+fn fix_change(releases: &[Release], dep: &Dependency, target: Version, kind: UpdateKind) -> Change {
+    // A cross-major downgrade (Go `/v3` → `/v2`, or `/v2` → the v1 base path) changes the import
+    // path; `target_package_for` reconstructs it (a no-op for same-major moves and for tools whose
+    // name is stable across majors).
+    Change {
+        package: target_package_for(releases, dep, &target),
+        from: dep.current.clone(),
+        to: target,
+        kind,
+        // `fix` only ever rolls a too-fresh pin back.
+        downgrade: true,
+        direct: dep.direct,
+        members: dep.members.clone(),
+    }
 }
 
 /// Reconstruct the target `PackageId`, handling Go-style `/vN` path-major changes (the `MajorKey`
@@ -1708,12 +1992,13 @@ mod tests {
     use super::{
         PlanMode, candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status,
         conflict_skip_message, is_downgrade, newly_introduced_violations, planned_changes_landed,
-        sort_planned_changes, target_package, verify_applied_targets,
+        preserve_rollback_entries, sort_planned_changes, target_package, verify_applied_targets,
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
         ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, MemberRef, PackageId,
-        Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
+        ProjectMutationFile, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality,
+        SkipReason, ToolId, UpdateKind, Version,
     };
     use std::collections::HashSet;
 
@@ -1749,6 +2034,37 @@ mod tests {
             }),
             DepScope::Direct
         );
+    }
+
+    #[test]
+    fn rollback_journal_keeps_the_first_snapshot_for_each_path() {
+        let mut rollback = ProjectMutationJournal {
+            files: vec![ProjectMutationFile {
+                path: "package-lock.json".into(),
+                contents: Some(b"baseline lock".to_vec()),
+            }],
+        };
+        let later = ProjectMutationJournal {
+            files: vec![
+                ProjectMutationFile {
+                    path: "package-lock.json".into(),
+                    contents: Some(b"trial lock".to_vec()),
+                },
+                ProjectMutationFile {
+                    path: "package.json".into(),
+                    contents: Some(b"baseline manifest".to_vec()),
+                },
+            ],
+        };
+
+        preserve_rollback_entries(&mut rollback, &later);
+
+        assert_eq!(rollback.files.len(), 2);
+        assert_eq!(
+            rollback.files[0].contents.as_deref(),
+            Some(b"baseline lock".as_slice())
+        );
+        assert_eq!(rollback.files[1].path, "package.json");
     }
 
     #[test]

@@ -61,6 +61,10 @@ struct State {
     apply_attempted: bool,
     /// Package versions pinned by a successful fake apply, surfaced by the next graph probe.
     applied_versions: HashMap<String, Version>,
+    /// Release metadata failure armed only after the forward batch reaches the fake lock.
+    fail_releases_after_apply_for: Option<String>,
+    /// Make the fake mutate `fake.lock` so rollback can be asserted against real bytes.
+    write_lock_on_apply: bool,
 }
 
 #[allow(
@@ -177,6 +181,19 @@ impl ReleaseFetcher for FakeEco {
         _fetch: &cooldown_core::FetchContext<'_>,
         _candidates: cooldown_core::CandidateScope,
     ) -> Result<Vec<Release>> {
+        let fail_after_apply = {
+            let state = self.state.lock().unwrap();
+            state.apply_attempted
+                && state
+                    .fail_releases_after_apply_for
+                    .as_deref()
+                    .is_some_and(|name| name == dep.package.name)
+        };
+        if fail_after_apply {
+            return Err(CoreError::Transient(
+                format!("reconcile release probe failed for {}", dep.package.name).into(),
+            ));
+        }
         Ok(self
             .releases
             .get(&dep.package.name)
@@ -223,18 +240,29 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
-    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+    async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        if self.state.lock().unwrap().write_lock_on_apply {
+            return Ok(ProjectMutationJournal {
+                files: vec![ProjectMutationJournal::capture_file(
+                    &p.root,
+                    camino::Utf8Path::new("fake.lock"),
+                )?],
+            });
+        }
         Ok(ProjectMutationJournal::default())
     }
 
     async fn apply(
         &self,
-        _p: &Project,
+        p: &Project,
         plan: &Plan,
         _journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
+        if state.write_lock_on_apply {
+            std::fs::write(p.root.join("fake.lock"), b"mutated lock")?;
+        }
         if self.inject_fresh_on_apply {
             state.fresh_transitive_present = true;
         }
@@ -1882,6 +1910,85 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
     let sk = out.items[0].skipped.as_ref().expect("a skip");
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(sk.offending.as_deref(), Some("t"));
+}
+
+#[tokio::test]
+async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
+    let (_g, root) = tmp_root();
+    std::fs::write(root.join("fake.lock"), b"baseline lock").expect("seed fake lock");
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_releases = too_fresh_fix_releases();
+    releases.insert("t".to_string(), t_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&t_releases, "v1.0.2"));
+    locked.insert(
+        "x".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+
+    let mut floated = dep("t", "v1.0.2", false);
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        // `x` is absent from forward planning but included when reconciliation fetches graph metadata.
+        transitive: vec![dep("x", "v1.0.0", false)],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State {
+            fail_releases_after_apply_for: Some("x".to_string()),
+            write_lock_on_apply: true,
+            ..State::default()
+        }),
+        root: root.clone(),
+    };
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 0);
+    assert_eq!(out.summary.errors, 1);
+    assert!(out.items.is_empty());
+    assert_eq!(
+        out.errors.len(),
+        1,
+        "the provisional error must not leak twice"
+    );
+    assert_eq!(out.errors[0].kind, DiagnosticKind::Transient);
+    assert_eq!(out.errors[0].package.as_deref(), Some("x"));
+    assert!(
+        out.errors[0]
+            .message
+            .contains("reconcile release probe failed for x")
+    );
+    assert_eq!(
+        std::fs::read(root.join("fake.lock")).expect("read restored fake lock"),
+        b"baseline lock"
+    );
 }
 
 #[tokio::test]

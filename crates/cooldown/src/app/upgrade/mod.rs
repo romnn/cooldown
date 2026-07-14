@@ -4,9 +4,10 @@
 //! `upgrade` is optimistic about transitives: a forward move that floats a too-fresh transitive up is
 //! kept (a cooled parent cannot require a child newer than the window, so an older satisfying version
 //! exists by construction), and a reconcile pass matures the floated-up nodes back down to their
-//! newest matured version. Only a violation the reconcile genuinely cannot clear rolls the lock batch
-//! back — restored from a pre-batch snapshot — and reports the change as `TransitiveInCooldown`, never
-//! committing a lock a subsequent `check` would reject. `fix` is the dual, downgrading too-fresh pins.
+//! newest matured version. A trial whose violation cannot be cleared is restored and partitioned;
+//! the safe subset is replayed and committed together while unsafe singletons report
+//! `TransitiveInCooldown`. No committed lock can make a subsequent `check` reject. `fix` is the dual,
+//! downgrading too-fresh pins.
 
 mod executor;
 
