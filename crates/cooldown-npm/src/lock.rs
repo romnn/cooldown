@@ -42,7 +42,10 @@ pub trait NodeLock: Send + Sync + 'static {
 
     /// The driver args that refresh the lock after cooldown has rewritten the declaring
     /// `package.json` range itself.
-    fn relock_args() -> Vec<String>;
+    ///
+    /// `before` is the project's absolute publish-time cutoff when the manager can constrain the
+    /// complete resolved graph by release date. `None` omits that constraint.
+    fn relock_args(_before: Option<&str>) -> Vec<String>;
 
     /// The read-only driver args that prove the existing lock matches the current manifests.
     ///
@@ -139,12 +142,18 @@ pub trait NodeLock: Send + Sync + 'static {
     /// rewrite just widened); for a member-only dependency it would add a spurious root dependency.
     /// `None` (the default) means the manager has no exact-pin install, so the caller re-resolves.
     #[must_use]
-    fn pinned_relock_args(_name: &str, _version: &str) -> Option<Vec<String>> {
+    fn pinned_relock_args(
+        _name: &str,
+        _version: &str,
+        _before: Option<&str>,
+    ) -> Option<Vec<String>> {
         None
     }
 
     /// The driver args that install/verify the resolved graph (the opt-in `--build` step).
-    fn build_args() -> Vec<String>;
+    ///
+    /// `before` has the same meaning as in [`NodeLock::relock_args`].
+    fn build_args(_before: Option<&str>) -> Vec<String>;
 }
 
 /// Maps a resolved dependency to the workspace member packages that declare it.
@@ -339,31 +348,43 @@ impl NodeLock for Npm {
             .unwrap_or_default()
     }
 
-    fn relock_args() -> Vec<String> {
+    fn relock_args(before: Option<&str>) -> Vec<String> {
         // `--package-lock-only` re-resolves the lock without touching node_modules, keeping apply
         // fast and side-effect-light.
-        vec![
+        let mut args = vec![
             "install".into(),
             "--package-lock-only".into(),
             "--no-audit".into(),
             "--no-fund".into(),
-        ]
+        ];
+        if let Some(before) = before {
+            args.push(format!("--before={before}"));
+        }
+        args
     }
 
-    fn pinned_relock_args(name: &str, version: &str) -> Option<Vec<String>> {
+    fn pinned_relock_args(name: &str, version: &str, before: Option<&str>) -> Option<Vec<String>> {
         // `npm install <name>@<version>` pins the lock to exactly that version (and saves the range
         // to the root `package.json` — the caller gates this on the root declaring the dependency).
-        Some(vec![
+        let mut args = vec![
             "install".into(),
             format!("{name}@{version}"),
             "--package-lock-only".into(),
             "--no-audit".into(),
             "--no-fund".into(),
-        ])
+        ];
+        if let Some(before) = before {
+            args.push(format!("--before={before}"));
+        }
+        Some(args)
     }
 
-    fn build_args() -> Vec<String> {
-        vec!["install".into(), "--no-audit".into(), "--no-fund".into()]
+    fn build_args(before: Option<&str>) -> Vec<String> {
+        let mut args = vec!["install".into(), "--no-audit".into(), "--no-fund".into()];
+        if let Some(before) = before {
+            args.push(format!("--before={before}"));
+        }
+        args
     }
 }
 
@@ -383,7 +404,7 @@ impl NodeLock for Pnpm {
             .with_declared_specifiers(parse_pnpm_importer_specifiers(content))
     }
 
-    fn relock_args() -> Vec<String> {
+    fn relock_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into(), "--lockfile-only".into()]
     }
 
@@ -460,7 +481,7 @@ impl NodeLock for Pnpm {
         ])
     }
 
-    fn build_args() -> Vec<String> {
+    fn build_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
     }
 }
@@ -474,11 +495,11 @@ impl NodeLock for Yarn {
         Ok(parse_yarn(content))
     }
 
-    fn relock_args() -> Vec<String> {
+    fn relock_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
     }
 
-    fn build_args() -> Vec<String> {
+    fn build_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
     }
 }
@@ -492,11 +513,11 @@ impl NodeLock for Bun {
         parse_bun(content)
     }
 
-    fn relock_args() -> Vec<String> {
+    fn relock_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
     }
 
-    fn build_args() -> Vec<String> {
+    fn build_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
     }
 }

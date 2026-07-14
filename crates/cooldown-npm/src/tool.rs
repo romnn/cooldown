@@ -327,15 +327,17 @@ fn lockonly_command<L: NodeLock>(
 fn rewrite_relock<L: NodeLock>(project: &Project, change: &Change) -> Result<Vec<String>> {
     let name = &change.package.name;
     let version = change.to.as_str();
+    let before =
+        absolute_cutoff_from_project(project.exclude_newer.as_deref(), jiff::Timestamp::now());
     if let Some(args) = L::lockonly_update_args(name, version) {
         return Ok(args);
     }
-    if let Some(args) = L::pinned_relock_args(name, version)
+    if let Some(args) = L::pinned_relock_args(name, version, before.as_deref())
         && manifest::declared_range(&project.manifest, name)?.is_some()
     {
         return Ok(args);
     }
-    Ok(L::relock_args())
+    Ok(L::relock_args(before.as_deref()))
 }
 
 /// Whether the change's target satisfies every range declared for it in the manifests that could own
@@ -394,6 +396,65 @@ fn window_minutes_from_cutoff(cutoff: Option<&str>, now: jiff::Timestamp) -> Opt
     let instant: jiff::Timestamp = cutoff.parse().ok()?;
     let minutes = now.duration_since(instant).as_secs() / 60;
     (minutes > 0).then_some(minutes)
+}
+
+/// Converts the application's stable project cutoff into the absolute instant npm's `--before`
+/// option requires.
+///
+/// Age windows are stored as relative spans so they remain stable between runs. npm delegates
+/// `--before` to JavaScript date parsing, which does not understand those spans, so each command
+/// realizes the span against its current instant. Freeze and latest cutoffs are already absolute.
+fn absolute_cutoff_from_project(cutoff: Option<&str>, now: jiff::Timestamp) -> Option<String> {
+    let cutoff = cutoff?.trim();
+    if let Ok(instant) = cutoff.parse::<jiff::Timestamp>() {
+        return Some(instant.to_string());
+    }
+    let duration = cooldown_core::duration::parse_duration(cutoff).ok()?;
+    now.checked_sub(duration)
+        .ok()
+        .map(|instant| instant.to_string())
+}
+
+/// The same command with its `--before=` cutoff removed, or `None` when no cutoff was present —
+/// the retry the caller may attempt when the historical-tree resolve is unsatisfiable.
+fn without_before(args: &[String]) -> Option<Vec<String>> {
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|arg| !arg.starts_with("--before="))
+        .cloned()
+        .collect();
+    (filtered.len() != args.len()).then_some(filtered)
+}
+
+/// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
+/// member when the lock carries member-scoped entries and by the name's newest copy otherwise.
+///
+/// A successful install command is not proof: `npm install <name>@<version> --before=<cutoff>`
+/// exits 0 yet lands the newest pre-cutoff version when the requested one is newer than the
+/// cutoff, so the landing must be read back from the lock.
+fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Result<bool> {
+    let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+    let newest = locked_versions::<L>(&content);
+    let target = change.to.as_str();
+    if change.members.is_empty() {
+        return Ok(newest
+            .get(&change.package.name)
+            .is_some_and(|version| version == target));
+    }
+    let members = L::member_sources(&content);
+    let member_versions: Vec<Option<&str>> = change
+        .members
+        .iter()
+        .map(|member| members.resolved_version(&member.path, &change.package.name))
+        .collect();
+    if member_versions.iter().any(Option::is_some) {
+        return Ok(member_versions
+            .into_iter()
+            .all(|version| version == Some(target)));
+    }
+    Ok(newest
+        .get(&change.package.name)
+        .is_some_and(|version| version == target))
 }
 
 /// A net version change `apply` derived from the before/after lock diff for a package the plan did not
@@ -540,13 +601,36 @@ fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<(String, String)> {
 }
 
 impl<L: NodeLock> NpmTool<L> {
-    /// The original per-package apply: for each change, move the lock with a lock-only update (pnpm)
-    /// or, after widening the declaring `package.json`, a pinned/bare relock. Kept for npm/yarn/bun,
-    /// which have neither a window flag nor a single joint resolve, so a batched whole-graph pass would
-    /// gain nothing over moving each change in turn.
-    async fn apply_per_package(&self, project: &Project, plan: &Plan) -> Result<ApplyReport> {
+    /// For each change, moves the lock with a lock-only update or, after widening the declaring
+    /// `package.json`, a pinned/bare relock, then reports collateral lock movements.
+    ///
+    /// npm's `--before` constrains the complete resolved tree, so even a per-package command can move
+    /// transitives. Diffing the journaled lock against the final lock keeps those movements visible.
+    async fn apply_per_package(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        baseline_journal: &ProjectMutationJournal,
+    ) -> Result<ApplyReport> {
+        let before = baseline_journal
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
+            .and_then(|file| file.contents.as_deref())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(locked_versions::<L>)
+            .unwrap_or_default();
         let mut report = ApplyReport::default();
         for change in &plan.changes {
+            // A failed later candidate must not leak its widened manifest when an earlier sibling
+            // succeeded and makes the outer batch committable. Capture the state after those earlier
+            // successes so this candidate can be restored independently.
+            let candidate_plan = Plan {
+                changes: vec![change.clone()],
+                rewrite: plan.rewrite,
+            };
+            let candidate_journal = journal::<L>(project, &candidate_plan)?;
+            let mut rewrote_manifest = false;
             let args = if let Some(args) = lockonly_command::<L>(project, change, plan.rewrite)? {
                 args
             } else {
@@ -564,13 +648,64 @@ impl<L: NodeLock> NpmTool<L> {
                     });
                     continue;
                 }
+                rewrote_manifest = true;
                 rewrite_relock::<L>(project, change)?
             };
-            match self.cmd.run(&project.root, &args).await {
-                Ok(()) => report.applied.push(change.clone()),
-                Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
+            let result = match self.cmd.run(&project.root, &args).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let fallback = matches!(&error, CoreError::Tool { .. })
+                        .then(|| without_before(&args))
+                        .flatten();
+                    if let Some(fallback) = fallback {
+                        // An existing, baselined post-cutoff package can make npm's historical-tree
+                        // resolve impossible. Retry from a clean candidate snapshot without the
+                        // native cutoff and let the application policy gate accept, reconcile, or
+                        // roll back the resulting graph against that baseline.
+                        candidate_journal.restore(&project.root)?;
+                        if rewrote_manifest {
+                            manifest::widen_constraints(
+                                &project.root,
+                                &change.members,
+                                &change.package.name,
+                                change.to.as_str(),
+                            )?;
+                        }
+                        self.cmd.run(&project.root, &fallback).await
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
+            match result {
+                Ok(()) if exact_target_reached::<L>(project, change)? => {
+                    report.applied.push(change.clone());
+                }
+                Ok(()) => {
+                    candidate_journal.restore(&project.root)?;
+                    report.skipped.push(Skipped {
+                        change: change.clone(),
+                        reason: SkipReason::ResolverConflict,
+                        offending: Some(change.package.clone()),
+                    });
+                }
+                Err(error) => {
+                    candidate_journal.restore(&project.root)?;
+                    report.skipped.push(skipped_on_apply_error(change, error)?);
+                }
             }
         }
+        let after_content = match std::fs::read_to_string(project.root.join(L::LOCKFILE)) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let after = after_content
+            .as_deref()
+            .map(locked_versions::<L>)
+            .unwrap_or_default();
+        let collateral = collateral_changes::<L>(&before, &after, &report.applied);
+        report.applied.extend(collateral);
         Ok(report)
     }
 
@@ -834,13 +969,19 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         if L::supports_whole_graph_resolve() {
             self.apply_whole_graph(project, plan, journal).await
         } else {
-            self.apply_per_package(project, plan).await
+            self.apply_per_package(project, plan, journal).await
         }
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
+        let before =
+            absolute_cutoff_from_project(project.exclude_newer.as_deref(), jiff::Timestamp::now());
         self.cmd
-            .verify(&project.root, &L::build_args(), "install succeeded")
+            .verify(
+                &project.root,
+                &L::build_args(before.as_deref()),
+                "install succeeded",
+            )
             .await
     }
 
@@ -1089,6 +1230,49 @@ mod tests {
             None
         );
         assert_eq!(window_minutes_from_cutoff(None, now), None);
+    }
+
+    #[test]
+    fn absolute_cutoff_from_project_realizes_relative_windows_for_npm() {
+        let now: jiff::Timestamp = "2024-08-15T12:34:56Z".parse().unwrap();
+
+        assert_eq!(
+            absolute_cutoff_from_project(Some("14 days"), now).as_deref(),
+            Some("2024-08-01T12:34:56Z")
+        );
+        assert_eq!(
+            absolute_cutoff_from_project(Some("90 seconds"), now).as_deref(),
+            Some("2024-08-15T12:33:26Z")
+        );
+        assert_eq!(
+            absolute_cutoff_from_project(Some("2024-07-01T00:00:00Z"), now).as_deref(),
+            Some("2024-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            absolute_cutoff_from_project(Some("0 days"), now).as_deref(),
+            Some("2024-08-15T12:34:56Z")
+        );
+        assert_eq!(absolute_cutoff_from_project(None, now), None);
+    }
+
+    #[test]
+    fn cutoff_fallback_removes_only_the_before_argument() {
+        let args = vec![
+            "install".to_string(),
+            "eslint@10.6.0".to_string(),
+            "--before=2026-06-30T00:00:00Z".to_string(),
+            "--package-lock-only".to_string(),
+        ];
+
+        assert_eq!(
+            without_before(&args),
+            Some(vec![
+                "install".to_string(),
+                "eslint@10.6.0".to_string(),
+                "--package-lock-only".to_string(),
+            ])
+        );
+        assert_eq!(without_before(&["install".to_string()]), None);
     }
 
     #[test]
@@ -1745,7 +1929,7 @@ packages:
                 .is_none()
         );
         assert_eq!(
-            crate::lock::Pnpm::relock_args(),
+            crate::lock::Pnpm::relock_args(None),
             ["install", "--lockfile-only"]
         );
     }
@@ -1753,22 +1937,59 @@ packages:
     #[test]
     fn relock_commands_refresh_locks_without_adding_dependencies() {
         assert_eq!(
-            crate::lock::Npm::relock_args(),
+            crate::lock::Npm::relock_args(None),
             ["install", "--package-lock-only", "--no-audit", "--no-fund"]
         );
         assert_eq!(
-            crate::lock::Pnpm::relock_args(),
+            crate::lock::Pnpm::relock_args(None),
             ["install", "--lockfile-only"]
         );
-        assert_eq!(crate::lock::Yarn::relock_args(), ["install"]);
-        assert_eq!(crate::lock::Bun::relock_args(), ["install"]);
+        assert_eq!(crate::lock::Yarn::relock_args(None), ["install"]);
+        assert_eq!(crate::lock::Bun::relock_args(None), ["install"]);
+    }
+
+    #[test]
+    fn npm_install_commands_apply_the_absolute_before_cutoff() {
+        let before = Some("2024-08-01T00:00:00Z");
+
+        assert_eq!(
+            Npm::relock_args(before),
+            [
+                "install",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund",
+                "--before=2024-08-01T00:00:00Z"
+            ]
+        );
+        assert_eq!(
+            Npm::pinned_relock_args("eslint", "10.6.0", before).expect("npm supports exact pins"),
+            [
+                "install",
+                "eslint@10.6.0",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund",
+                "--before=2024-08-01T00:00:00Z"
+            ]
+        );
+        assert_eq!(
+            Npm::build_args(before),
+            [
+                "install",
+                "--no-audit",
+                "--no-fund",
+                "--before=2024-08-01T00:00:00Z"
+            ]
+        );
     }
 
     #[test]
     fn rewrite_relock_pins_exact_target_where_supported() {
         // Root declares `nanoid`, so the post-widen relock lands the lock on exactly the
         // cooldown-approved version instead of re-resolving the widened range to a newer member.
-        let (_dir, project) = project_declaring("^3.0.0");
+        let (_dir, mut project) = project_declaring("^3.0.0");
+        project.exclude_newer = Some("2024-08-01T00:00:00Z".to_string());
         let change = change("nanoid", "3.1.0", "5.1.11");
 
         // pnpm pins the exact target without touching the manifest.
@@ -1784,7 +2005,8 @@ packages:
                 "nanoid@5.1.11",
                 "--package-lock-only",
                 "--no-audit",
-                "--no-fund"
+                "--no-fund",
+                "--before=2024-08-01T00:00:00Z"
             ]
         );
     }

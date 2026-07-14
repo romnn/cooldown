@@ -9,22 +9,40 @@ pub(crate) type MemberTargetKey = (String, String);
 pub(crate) type ChangeTargetKey = (String, Option<String>, String, Vec<MemberTargetKey>);
 
 pub(crate) fn change_target_key(change: &Change) -> ChangeTargetKey {
+    change_target_key_parts(
+        &change.package.name,
+        change.package.registry.as_deref(),
+        change.to.as_str(),
+        change.direct,
+        &change.members,
+    )
+}
+
+/// [`change_target_key`] over borrowed parts, for callers holding a report row (e.g. an
+/// `UpgradeItem`) rather than a [`Change`] value.
+pub(crate) fn change_target_key_parts(
+    name: &str,
+    registry: Option<&str>,
+    target: &str,
+    direct: bool,
+    source_members: &[MemberRef],
+) -> ChangeTargetKey {
     // Two members upgrading the same crate to the same target from different current versions are
     // distinct direct changes that share `(name, registry, to)`. Keying them member-blind lets the
     // member-aware `target_reached` collapse them, masking a held member behind an applied one or
     // recording the held one as both applied and skipped. Transitive members are attribution context,
     // not separate editable targets, so only direct changes include members in the key.
-    let mut members: Vec<MemberTargetKey> = if change.direct {
-        change.members.iter().map(member_key).collect()
+    let mut members: Vec<MemberTargetKey> = if direct {
+        source_members.iter().map(member_key).collect()
     } else {
         Vec::new()
     };
     members.sort();
     members.dedup();
     (
-        change.package.name.clone(),
-        change.package.registry.clone(),
-        change.to.as_str().to_string(),
+        name.to_string(),
+        registry.map(str::to_string),
+        target.to_string(),
         members,
     )
 }

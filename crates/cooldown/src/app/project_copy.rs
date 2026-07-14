@@ -1,10 +1,9 @@
 //! Throwaway recursive copies of a project tree, used by the non-mutating resolve probes.
 //!
-//! Both `outdated`'s blocked-verification (`resolve_held`) and the dependency-mutating `--dry-run`
-//! preview need to run the real resolver against a project without touching its real
-//! `uv.lock`/`pyproject.toml`. They copy the project into a temp directory, run the mutating apply
-//! there, and discard the copy — so a single implementation of the copy lives here and is shared by
-//! both paths.
+//! Both `outdated`'s policy-complete upgrade preview and the dependency-mutating `--dry-run` need to
+//! run the real resolver against a project without touching its real lockfiles or manifests.
+//! They copy the project into a temp directory, run the mutating policy flow there, and discard the
+//! copy — so a single implementation of the copy lives here and is shared by both paths.
 
 use cooldown_core::{CoreError, Project, ResolveInputs};
 

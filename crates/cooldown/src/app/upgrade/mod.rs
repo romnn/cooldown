@@ -11,11 +11,16 @@
 
 mod executor;
 
+pub(super) use self::executor::target_package_for;
 use self::executor::{PlanMode, ProjectUpgradeExecutor};
 use super::{
-    BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
+    BuildInfo, Exit, Progress, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace,
+    diag_from_error,
 };
-use cooldown_core::{Diagnostic, DiagnosticKind, LockStatus, ToolRead, ToolWrite};
+use cooldown_core::{
+    Change, Diagnostic, DiagnosticKind, LockStatus, PackageId, ToolRead, ToolWrite,
+};
+use std::collections::HashSet;
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
 /// be), plus the re-lock/build status and the exit it implies.
@@ -220,6 +225,59 @@ impl Workspace {
             errors: acc.errors,
             exit,
         }
+    }
+
+    /// Runs preselected upgrade targets through the complete policy trial in a project copy.
+    pub(super) async fn preview_project_upgrade(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        changes: Vec<Change>,
+        manifest_only: HashSet<PackageId>,
+    ) -> UpgradeAccum {
+        let mut acc = UpgradeAccum::default();
+        let Some(reader) = self.adapter(pctx.tool) else {
+            return acc;
+        };
+        let Some(writer) = self.mutator(pctx.tool) else {
+            acc.errors.push(read_only_mutator_diag(pctx));
+            return acc;
+        };
+        let copy =
+            match super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
+            {
+                Ok(copy) => copy,
+                Err(error) => {
+                    acc.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        pctx.rel_path.as_str(),
+                        None,
+                    ));
+                    return acc;
+                }
+            };
+        let copied_pctx = super::ProjectCtx {
+            tool: pctx.tool,
+            project: copy.project.clone(),
+            rel_path: pctx.rel_path.clone(),
+            policy: pctx.policy.clone(),
+        };
+        let mut preview_opts = opts.clone();
+        preview_opts.build = false;
+        preview_opts.dry_run = false;
+        preview_opts.lock = false;
+        preview_opts.progress = Progress::Silent;
+
+        ProjectUpgradeExecutor::new(
+            self,
+            UpgradeCtx::new(reader, writer, &copied_pctx, &preview_opts),
+            PlanMode::Upgrade,
+            &mut acc,
+        )
+        .run_policy(changes, manifest_only)
+        .await;
+        acc
     }
 }
 

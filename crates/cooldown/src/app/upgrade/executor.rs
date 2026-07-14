@@ -211,23 +211,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
-
-        self.ctx.opts.progress.say(&format!(
-            "Checking current resolved graph cooldown in {} ({})…",
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
-        let baseline_violations = match self.graph_violations().await {
-            Ok(violations) => violations.into_keys().collect(),
-            Err(error) => {
-                self.record_project_error(&error, None);
-                return;
-            }
-        };
-
-        let mut state = TrialState {
-            baseline_violations,
-            reconcile_needed: false,
+        let Some(mut state) = self.initial_trial_state().await else {
+            return;
         };
         match self.mode {
             PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
@@ -243,11 +228,55 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.finalize().await;
     }
 
+    /// Runs the upgrade policy state machine for targets selected by another read path.
+    ///
+    /// This deliberately stops before final lock/build reporting: candidate eligibility is decided
+    /// by the apply, graph gate, reconciliation, and residual-isolation phases. The caller owns a
+    /// throwaway project copy, so every settled mutation is discarded with that copy.
+    pub(super) async fn run_policy(
+        &mut self,
+        mut changes: Vec<Change>,
+        manifest_only: HashSet<PackageId>,
+    ) {
+        self.manifest_only = manifest_only;
+        sort_planned_changes(&mut changes);
+        let Some(mut state) = self.initial_trial_state().await else {
+            return;
+        };
+        self.apply_upgrade_changes(changes, &mut state).await;
+    }
+
+    async fn initial_trial_state(&mut self) -> Option<TrialState> {
+        self.ctx.opts.progress.say(&format!(
+            "Checking current resolved graph cooldown in {} ({})…",
+            self.project_label(),
+            self.ctx.pctx.tool
+        ));
+        let baseline_violations = match self.graph_violations().await {
+            Ok(violations) => violations.into_keys().collect(),
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return None;
+            }
+        };
+
+        Some(TrialState {
+            baseline_violations,
+            reconcile_needed: false,
+        })
+    }
+
     /// Apply the forward moves, then (under the default transitive mode) reconcile the graph the
     /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
     /// `upgrade` ends gate-clean — no separate `fix` needed.
     async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) {
         let planned = self.plan_upgrade_changes(&deps).await;
+        self.apply_upgrade_changes(planned, state).await;
+    }
+
+    /// Applies planned changes: manifest-only build-backend floors in their own batch, then the
+    /// lock batch through the policy trials. Shared by the real `upgrade` and the policy preview.
+    async fn apply_upgrade_changes(&mut self, planned: Vec<Change>, state: &mut TrialState) {
         // Build-backend floor raises ([build-system].requires) have no lock interaction, so apply them
         // in their own batch: a transitive-cooldown rollback of the lock batch must not revert (or
         // mislabel as a conflict) an independent, valid build-backend adoption.
@@ -1660,7 +1689,11 @@ fn is_downgrade(releases: &[Release], from: &Version, to: &Version) -> bool {
 /// The target [`PackageId`] for a move from `dep.current` to `target`, derived from the matching
 /// releases' major keys — rewriting a Go `/vN` path-major and keeping the name stable otherwise.
 /// Shared by the upgrade and fix planners.
-fn target_package_for(releases: &[Release], dep: &Dependency, target: &Version) -> PackageId {
+pub(crate) fn target_package_for(
+    releases: &[Release],
+    dep: &Dependency,
+    target: &Version,
+) -> PackageId {
     let current_major = releases
         .iter()
         .find(|release| release.version == dep.current)

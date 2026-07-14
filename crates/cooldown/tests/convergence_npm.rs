@@ -15,6 +15,7 @@ use support::Fixture;
 
 const SEED_BEFORE: &str = "2025-05-20T00:00:00Z";
 const FREEZE: &str = "2026-06-30T00:00:00Z";
+const ESLINT_SEED_BEFORE: &str = "2024-12-01T00:00:00Z";
 
 const PACKAGE_JSON: &str = indoc! {r#"
     {
@@ -34,6 +35,25 @@ const NPMRC: &str = indoc! {"
     fund=false
 "};
 
+const RESIDUAL_POLICY: &str = indoc! {r#"
+    freeze = "2026-06-30T00:00:00Z"
+
+    [package."@typescript-eslint/types"]
+    freeze = "2025-05-20T00:00:00Z"
+"#};
+
+const ESLINT_PACKAGE_JSON: &str = indoc! {r#"
+    {
+      "name": "cooldown-npm-eslint-cutoff",
+      "version": "0.1.0",
+      "private": true,
+      "devDependencies": {
+        "eslint": "^9.16.0",
+        "eslint-config-treesitter": "^1.0.2"
+      }
+    }
+"#};
+
 fn package_lock_version(fixture: &Fixture, name: &str) -> Option<String> {
     let lock: serde_json::Value =
         serde_json::from_slice(&fixture.read_bytes("package-lock.json")).expect("lock parses");
@@ -48,6 +68,7 @@ fn residual_isolation_fixture() -> Fixture {
     let fixture = Fixture::new();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
+    fixture.write("cooldown.toml", RESIDUAL_POLICY);
     fixture
         .run_tool(
             "npm",
@@ -65,8 +86,29 @@ fn residual_isolation_fixture() -> Fixture {
     fixture
 }
 
+fn eslint_cutoff_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", ESLINT_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                &format!("--before={ESLINT_SEED_BEFORE}"),
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
 #[test]
-fn upgrade_keeps_a_safe_sibling_when_another_candidate_forces_a_fresh_transitive() {
+fn upgrade_keeps_a_safe_sibling_when_another_candidate_has_no_mature_transitive() {
     skip_if_missing!("npm");
     let fixture = residual_isolation_fixture();
     assert_eq!(
@@ -80,23 +122,24 @@ fn upgrade_keeps_a_safe_sibling_when_another_candidate_forces_a_fresh_transitive
         "the fixture must seed the independent safe candidate"
     );
 
-    // The two direct targets mature before the cutoff, but jsdoccomment's new range resolves a
-    // post-cutoff @typescript-eslint/types. The safe tree-sitter-cli target has no such edge.
-    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    // Both direct targets mature under the project cutoff, but jsdoccomment requires a types release
+    // newer than that transitive's stricter package cutoff. The independent tree-sitter target must
+    // still commit when residual policy isolation holds jsdoccomment back.
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major"]);
 
     assert_eq!(
         upgrade.changes_for("tree-sitter-cli"),
         vec![("0.25.4".to_owned(), "0.26.10".to_owned())],
-        "the safe sibling must retain its baseline-to-target applied row"
+        "the safe sibling must retain its baseline-to-target applied row: {upgrade:?}"
     );
     assert!(
         upgrade.skipped_reasons_for("tree-sitter-cli").is_empty(),
-        "the unsafe sibling must not make tree-sitter-cli look policy-blocked"
+        "the blocked sibling must not make tree-sitter-cli look policy-blocked"
     );
     assert_eq!(
         upgrade.skipped_reasons_for("@es-joy/jsdoccomment"),
         ["transitive_in_cooldown".to_owned()].into_iter().collect(),
-        "only the candidate that forces the fresh transitive is held"
+        "only the candidate with no satisfying mature transitive is held"
     );
     assert_eq!(upgrade.summary_applied(), 1);
     assert_eq!(upgrade.summary_skipped(), 1);
@@ -113,8 +156,54 @@ fn upgrade_keeps_a_safe_sibling_when_another_candidate_forces_a_fresh_transitive
     );
 
     let lock_after = fixture.read_bytes("package-lock.json");
-    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    let second = fixture.cooldown_json(&["upgrade", "--major"]);
     assert_eq!(second.summary_applied(), 0);
     assert_eq!(second.summary_skipped(), 1);
+    assert_eq!(lock_after, fixture.read_bytes("package-lock.json"));
+}
+
+#[test]
+fn outdated_and_upgrade_resolve_eslint_with_mature_transitives() {
+    skip_if_missing!("npm");
+    let fixture = eslint_cutoff_fixture();
+    assert_eq!(
+        package_lock_version(&fixture, "eslint").as_deref(),
+        Some("9.16.0")
+    );
+
+    let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
+    let adoptable = outdated.outdated_with_status("adoptable");
+    let blocked = outdated.outdated_with_status("blocked");
+    assert!(
+        adoptable.contains("eslint"),
+        "outdated must call eslint adoptable: adoptable={adoptable:?}, blocked={blocked:?}, envelope={outdated:?}"
+    );
+    assert!(
+        !blocked.contains("eslint"),
+        "outdated must not call eslint blocked: adoptable={adoptable:?}, blocked={blocked:?}"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert_eq!(
+        upgrade.changes_for("eslint"),
+        vec![("9.16.0".to_owned(), "10.6.0".to_owned())]
+    );
+    assert!(upgrade.skipped_reasons_for("eslint").is_empty());
+    assert!(upgrade.summary_applied() >= 1);
+    assert_eq!(upgrade.summary_skipped(), 0);
+    assert_eq!(upgrade.summary_errors(), 0);
+    assert_eq!(
+        package_lock_version(&fixture, "eslint").as_deref(),
+        Some("10.6.0")
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "@typescript-eslint/types").as_deref(),
+        Some("8.62.1")
+    );
+
+    let lock_after = fixture.read_bytes("package-lock.json");
+    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert_eq!(second.summary_applied(), 0);
+    assert_eq!(second.summary_skipped(), 0);
     assert_eq!(lock_after, fixture.read_bytes("package-lock.json"));
 }

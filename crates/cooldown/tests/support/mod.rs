@@ -200,6 +200,7 @@ impl CapturedOutput {
 }
 
 /// A parsed `cooldown --json` envelope with typed accessors for the fields the invariants check.
+#[derive(Debug)]
 pub struct Envelope {
     value: serde_json::Value,
 }

@@ -1,16 +1,17 @@
 //! `outdated` — what could update, split into "adoptable now" vs "in cooldown". Reasons over the
 //! candidate set; informational, so per-dep failures never change the exit code.
 
+use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
 use super::{
     Exit, LockReportAction, RunOpts, Workspace, age_days, diag_from_error, lock_report_outcome,
     render_window,
 };
-use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
+use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, LockVerifyReport, PackageId, Plan, Project, Release,
-    ResolveKind, ResolveQuery, UpdateKind, Version, evaluate, resolve,
+    Change, DepScope, Dependency, Diagnostic, LockVerifyReport, PackageId, Release, ResolveKind,
+    ResolveQuery, UpdateKind, Version, evaluate, resolve,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The result of `outdated`: every reported dependency split by status, plus diagnostics.
 ///
@@ -129,12 +130,16 @@ impl<'a> OutdatedRunner<'a> {
         // records: merge them in so `outdated` surfaces a build-backend update the same way Dependabot
         // does. They are direct, so they belong in both the direct and the transitive view. A failure
         // to read them is a non-fatal warning — the resolved deps still report.
+        let mut manifest_only = HashSet::new();
         match self
             .ws
             .manifest_constraints_in_scope(read.adapter, pctx, self.opts)
             .await
         {
-            Ok(constraints) => deps.extend(constraints),
+            Ok(constraints) => {
+                manifest_only.extend(constraints.iter().map(|dep| dep.package.clone()));
+                deps.extend(constraints);
+            }
             Err(error) => {
                 tracing::warn!(
                     project = read.project_label,
@@ -154,63 +159,79 @@ impl<'a> OutdatedRunner<'a> {
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
 
-        let mut project_items = Vec::new();
-        for (dep, result) in fetched {
-            match result {
-                Ok(releases) => {
-                    if is_yanked_locked(&releases, &dep) {
-                        self.warnings
-                            .push(yanked_warning(pctx, &read.project_label, &dep));
-                    }
-                    project_items.push(self.outdated_item(
-                        pctx,
-                        &read.project_label,
-                        &dep,
-                        &releases,
-                        &read.resolve,
-                    ));
-                }
-                Err(error) => {
-                    let diag = diag_from_error(
-                        &error,
-                        pctx.tool,
-                        &read.project_label,
-                        Some(&dep.package.name),
-                    );
-                    project_items.push(error_item(pctx, &read.project_label, &dep, diag));
-                }
-            }
-        }
+        let (mut project_items, verification_candidates) =
+            self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
 
         // Reconcile the per-package "adoptable" verdicts with what the whole-graph upgrade resolve would
         // actually land. A matured candidate the resolve cannot place (a conflicting requirement wins) is
         // re-classified `blocked`, so `outdated` predicts `upgrade` exactly instead of promising an
         // upgrade that would silently be held. Runs only when there is something to verify.
-        self.verify_blocked(pctx, &read.project_label, &mut project_items)
-            .await;
+        self.verify_blocked(
+            pctx,
+            &read.project_label,
+            &mut project_items,
+            verification_candidates,
+            manifest_only,
+        )
+        .await;
         self.items.extend(project_items);
+    }
+
+    fn classify_fetched(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+        rctx: &cooldown_core::ResolveContext<'_>,
+        fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)>,
+    ) -> (Vec<OutdatedItem>, Vec<VerificationCandidate>) {
+        let mut items = Vec::new();
+        let mut candidates = Vec::new();
+        for (dep, result) in fetched {
+            match result {
+                Ok(releases) => {
+                    if is_yanked_locked(&releases, &dep) {
+                        self.warnings
+                            .push(yanked_warning(pctx, project_label, &dep));
+                    }
+                    let item = self.outdated_item(pctx, project_label, &dep, &releases, rctx);
+                    if item.status == OutdatedStatus::Adoptable
+                        && let Some(change) = adoptable_change(&dep, &releases, &item)
+                    {
+                        candidates.push(VerificationCandidate {
+                            item_index: items.len(),
+                            change,
+                        });
+                    }
+                    items.push(item);
+                }
+                Err(error) => {
+                    let diag =
+                        diag_from_error(&error, pctx.tool, project_label, Some(&dep.package.name));
+                    items.push(error_item(pctx, project_label, &dep, diag));
+                }
+            }
+        }
+        (items, candidates)
     }
 
     /// Re-classify any `adoptable` item the whole-graph upgrade resolve would not actually land as
     /// `blocked`, carrying the matured target it cannot reach and the blocker holding it out.
     ///
-    /// Reuses the upgrade's own resolve ([`ToolWrite::apply`], which drives the whole-graph
-    /// `--upgrade` re-lock) over a temporary copy of the project so the real `uv.lock`/`pyproject.toml`
-    /// are never touched. The resolve's `skipped` set is exactly `upgrade`'s held set, so the two
-    /// commands agree by construction. Skips entirely when no candidate is adoptable (no resolve cost)
-    /// or the tool has no mutator (nothing to verify against).
+    /// Runs the upgrade executor's complete policy trial over a temporary project copy: native
+    /// resolve, post-apply graph gate, transitive reconciliation, and residual candidate isolation.
+    /// When that trial completes, its skipped set is exactly what `upgrade` would hold, while the
+    /// real project is never read for mutation or written. An incomplete trial fails open and leaves
+    /// the per-package verdicts unchanged. Skips entirely when no candidate is adoptable or the tool
+    /// has no mutator.
     async fn verify_blocked(
         &mut self,
         pctx: &'a super::ProjectCtx,
         project_label: &str,
         items: &mut [OutdatedItem],
+        candidates: Vec<VerificationCandidate>,
+        manifest_only: HashSet<PackageId>,
     ) {
-        let changes: Vec<Change> = items
-            .iter()
-            .filter(|item| item.status == OutdatedStatus::Adoptable)
-            .filter_map(|item| adoptable_change(pctx.tool, item))
-            .collect();
-        if changes.is_empty() {
+        if candidates.is_empty() {
             return;
         }
         if self.opts.offline {
@@ -221,32 +242,39 @@ impl<'a> OutdatedRunner<'a> {
             );
             return;
         }
-        let Some(writer) = self.ws.mutator(pctx.tool) else {
+        if self.ws.mutator(pctx.tool).is_none() {
             return;
-        };
+        }
 
         self.opts.progress.say(&format!(
-            "Verifying {} adoptable update(s) in {} against the upgrade resolve…",
-            changes.len(),
+            "Verifying {} adoptable update(s) in {} against the upgrade policy…",
+            candidates.len(),
             project_label,
         ));
-        let held = match resolve_held(writer, &pctx.project, changes, self.opts.rewrite).await {
-            Ok(held) => held,
-            Err(error) => {
-                // A failed verification probe must not turn an adoptable into a false `blocked`: leave
-                // the per-package verdicts intact and surface the failure as a warning.
-                tracing::warn!(
-                    project = project_label,
-                    tool = pctx.tool.as_str(),
-                    error = %error,
-                    "could not verify adoptable updates against the upgrade resolve"
-                );
-                self.warnings
-                    .push(diag_from_error(&error, pctx.tool, project_label, None));
-                return;
-            }
-        };
-        apply_held(items, &held);
+        let changes = candidates
+            .iter()
+            .map(|candidate| candidate.change.clone())
+            .collect();
+        let preview = self
+            .ws
+            .preview_project_upgrade(pctx, self.opts, changes, manifest_only)
+            .await;
+        let mut verification_errors = preview.errors;
+        verification_errors.extend(preview.items.iter().filter_map(|item| item.error.clone()));
+        self.warnings.extend(preview.warnings);
+        if !verification_errors.is_empty() {
+            // An incomplete probe cannot turn an adoptable candidate into a false `blocked` row.
+            tracing::warn!(
+                project = project_label,
+                tool = pctx.tool.as_str(),
+                errors = verification_errors.len(),
+                "could not verify adoptable updates against the complete upgrade policy"
+            );
+            self.warnings.extend(verification_errors);
+            return;
+        }
+        let held = held_from_preview(preview.items);
+        apply_held(items, &candidates, &held);
     }
 
     async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
@@ -488,18 +516,26 @@ fn error_item(
     }
 }
 
+/// An `adoptable` item paired (by position in the project's item list) with the forward [`Change`]
+/// the policy preview verifies for it.
+struct VerificationCandidate {
+    item_index: usize,
+    change: Change,
+}
+
 /// The forward [`Change`] an `adoptable` item would take — its matured target. `None` when the item
 /// has no target or the target equals the current pin (nothing to verify). The kind is informational
 /// for verification (only landed-or-held matters), so the neutral [`UpdateKind::Minor`] is used.
-fn adoptable_change(tool: cooldown_core::ToolId, item: &OutdatedItem) -> Option<Change> {
+fn adoptable_change(dep: &Dependency, releases: &[Release], item: &OutdatedItem) -> Option<Change> {
     let target = item.adoptable_target.as_ref()?;
     if *target == item.current {
         return None;
     }
+    let target = Version::new(target.clone());
     Some(Change {
-        package: PackageId::new(tool, item.name.clone(), item.registry.clone()),
+        package: super::upgrade::target_package_for(releases, dep, &target),
         from: Version::new(item.current.clone()),
-        to: Version::new(target.clone()),
+        to: target,
         kind: UpdateKind::Minor,
         downgrade: false,
         direct: item.direct,
@@ -507,75 +543,46 @@ fn adoptable_change(tool: cooldown_core::ToolId, item: &OutdatedItem) -> Option<
     })
 }
 
-type HeldKey = (String, Option<String>, String);
-
-fn held_key(name: String, registry: Option<String>, current: String) -> HeldKey {
-    (name, registry, current)
-}
-
-fn held_key_for_change(change: &Change) -> HeldKey {
-    held_key(
-        change.package.name.clone(),
-        change.package.registry.clone(),
-        change.from.to_string(),
+/// The change identity of a preview report row — [`change_target_key`] over the row's fields, so
+/// preview outcomes and verification candidates key identically.
+fn held_key_for_upgrade(item: &UpgradeItem) -> ChangeTargetKey {
+    change_target_key_parts(
+        &item.name,
+        item.registry.as_deref(),
+        &item.to,
+        item.direct,
+        &item.members,
     )
 }
 
-fn held_key_for_item(item: &OutdatedItem) -> HeldKey {
-    held_key(
-        item.name.clone(),
-        item.registry.clone(),
-        item.current.clone(),
-    )
-}
-
-/// Run the whole-graph upgrade resolve for `changes` against a throwaway copy of the project, and
-/// return the candidates the resolve could **not** land — `upgrade`'s held set — keyed by package
-/// name, registry, and current version, each mapped to the blocker the resolve named (when distinct
-/// from the candidate itself).
-///
-/// The resolve reuses [`ToolWrite::apply`] (the same path `upgrade` commits), so the held set matches
-/// `upgrade` by construction. It runs entirely inside a temporary directory copied from the project,
-/// so the real `uv.lock`/`pyproject.toml` are never read for mutation or written.
-async fn resolve_held(
-    writer: &dyn cooldown_core::ToolWrite,
-    project: &Project,
-    changes: Vec<Change>,
-    rewrite: cooldown_core::RewriteMode,
-) -> cooldown_core::Result<HashMap<HeldKey, Option<String>>> {
-    let copy = super::project_copy::ProjectCopy::create(project, &writer.resolve_inputs())?;
-    let temp_project = &copy.project;
-
-    let plan = Plan { changes, rewrite };
-    let journal = writer.mutation_journal(temp_project, &plan).await?;
-    // Resilient apply: one unfetchable/conflicting candidate must not poison the whole verify resolve
-    // and make every adoptable candidate look blocked — it is isolated and the rest still resolve.
-    let report =
-        super::resilient_apply::apply_resilient(writer, temp_project, &plan, &journal).await?;
-
+/// The preview's held set: every skipped row keyed by change identity, mapped to the named
+/// blocker (`None` when the row blames itself — the generic "resolver rejected" form).
+fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Option<String>> {
     let mut held = HashMap::new();
-    for skipped in report.skipped {
-        let candidate = skipped.change.package.name.clone();
-        // Mirror the held-message policy: a blocker distinct from the candidate is named; the
-        // candidate blaming itself is the generic "resolver rejected" form, so no blocker is surfaced.
-        let blocker = skipped
-            .offending
-            .map(|package| package.name)
-            .filter(|offender| *offender != candidate);
-        held.insert(held_key_for_change(&skipped.change), blocker);
+    for item in preview {
+        let key = held_key_for_upgrade(&item);
+        let Some(skipped) = item.skipped else {
+            continue;
+        };
+        let blocker = skipped.offending.filter(|offender| *offender != item.name);
+        held.insert(key, blocker);
     }
-    Ok(held)
+    held
 }
 
 /// Re-classify every `adoptable` item the upgrade resolve could not land (`held`) as `blocked`,
 /// carrying the blocker the resolve named. An item the resolve landed (absent from `held`) keeps its
 /// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set.
-fn apply_held(items: &mut [OutdatedItem], held: &HashMap<HeldKey, Option<String>>) {
-    for item in items.iter_mut() {
-        if item.status != OutdatedStatus::Adoptable {
-            continue;
-        }
-        if let Some(blocker) = held.get(&held_key_for_item(item)) {
+fn apply_held(
+    items: &mut [OutdatedItem],
+    candidates: &[VerificationCandidate],
+    held: &HashMap<ChangeTargetKey, Option<String>>,
+) {
+    for candidate in candidates {
+        if let Some(blocker) = held.get(&change_target_key(&candidate.change))
+            && let Some(item) = items.get_mut(candidate.item_index)
+            && item.status == OutdatedStatus::Adoptable
+        {
             item.status = OutdatedStatus::Blocked;
             item.blocked_by = blocker.clone();
         }
@@ -613,15 +620,17 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{adoptable_change, apply_held, held_key_for_item, resolve_held};
-    use crate::app::{OutdatedItem, OutdatedStatus, Window};
-    use async_trait::async_trait;
+    use super::{
+        VerificationCandidate, adoptable_change, apply_held, change_target_key, held_from_preview,
+    };
+    use crate::app::{OutdatedItem, OutdatedStatus, SkippedInfo, UpgradeItem, Window};
     use cooldown_core::{
-        ApplyReport, PackageId, Plan, Project, ProjectMutationJournal, Result, RewriteMode,
-        SkipReason, Skipped, ToolId, ToolWrite, VerifyReport, Version,
+        Dependency, MajorKey, MemberRef, PackageId, Release, ReleaseOrder, ReleaseQuality,
+        SkipReason, ToolId, UpdateKind, Version,
     };
 
     const UV: ToolId = ToolId("uv");
+    const GO: ToolId = ToolId("go");
 
     fn adoptable(name: &str, current: &str, target: &str) -> OutdatedItem {
         OutdatedItem {
@@ -647,121 +656,107 @@ mod tests {
         }
     }
 
-    /// A `ToolWrite` whose `apply` reports a fixed held set, so the verification path can be exercised
-    /// without spawning a real resolver. It holds `held` (offending `holder`) and lands everything else.
-    struct FakeWriter {
-        held: &'static str,
-        held_current: &'static str,
-        holder: &'static str,
-    }
-
-    #[async_trait]
-    impl ToolWrite for FakeWriter {
-        async fn mutation_journal(
-            &self,
-            _project: &Project,
-            _plan: &Plan,
-        ) -> Result<ProjectMutationJournal> {
-            Ok(ProjectMutationJournal::default())
-        }
-
-        async fn apply(
-            &self,
-            _project: &Project,
-            plan: &Plan,
-            _journal: &ProjectMutationJournal,
-        ) -> Result<ApplyReport> {
-            let mut report = ApplyReport::default();
-            for change in &plan.changes {
-                if change.package.name == self.held && change.from.as_str() == self.held_current {
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
-                        offending: Some(PackageId::new(
-                            UV,
-                            self.holder.to_string(),
-                            Some("https://pypi.org/simple".to_string()),
-                        )),
-                    });
-                } else {
-                    report.applied.push(change.clone());
-                }
-            }
-            Ok(report)
-        }
-
-        async fn build(&self, _project: &Project) -> Result<VerifyReport> {
-            Ok(VerifyReport {
-                ok: true,
-                detail: String::new(),
-            })
+    fn skipped(name: &str, current: &str, target: &str, blocker: &str) -> UpgradeItem {
+        UpgradeItem {
+            name: name.to_string(),
+            tool: "uv".to_string(),
+            project: ".".to_string(),
+            direct: true,
+            downgrade: false,
+            members: Vec::new(),
+            registry: Some("https://pypi.org/simple".to_string()),
+            from: current.to_string(),
+            to: target.to_string(),
+            kind: UpdateKind::Minor,
+            applied: false,
+            skipped: Some(SkippedInfo {
+                reason: SkipReason::ResolverConflict,
+                message: format!("conflicts with {blocker}"),
+                offending: Some(blocker.to_string()),
+            }),
+            error: None,
         }
     }
 
-    fn temp_project() -> (tempfile::TempDir, Project) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
-        let manifest = root.join("pyproject.toml");
-        std::fs::write(
-            &manifest,
-            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("write manifest");
-        std::fs::write(root.join("uv.lock"), "version = 1\nrevision = 3\n").expect("write lock");
-        let project = Project {
-            root,
-            kind: UV,
-            manifest,
-            exclude_newer: None,
-        };
-        (dir, project)
+    fn dependency(item: &OutdatedItem) -> Dependency {
+        Dependency {
+            package: PackageId::new(UV, item.name.clone(), item.registry.clone()),
+            current: Version::new(item.current.clone()),
+            current_quality: ReleaseQuality::Stable,
+            direct: item.direct,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            members: item.members.clone(),
+            pinned: false,
+        }
+    }
+
+    fn candidate(item_index: usize, item: &OutdatedItem) -> VerificationCandidate {
+        VerificationCandidate {
+            item_index,
+            change: adoptable_change(&dependency(item), &[], item).expect("a forward change"),
+        }
+    }
+
+    fn release(version: &str, order: u8, major: &str) -> Release {
+        Release {
+            version: Version::new(version),
+            order: ReleaseOrder(vec![order]),
+            major: MajorKey(major.to_string()),
+            kind_from_current: Some(UpdateKind::Major),
+            published_at: None,
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
     }
 
     #[test]
     fn adoptable_change_skips_a_noop_target() {
         // A target equal to the current pin is not a move, so it is never verified.
         let item = adoptable("typer", "0.26.7", "0.26.7");
-        assert!(adoptable_change(UV, &item).is_none());
+        assert!(adoptable_change(&dependency(&item), &[], &item).is_none());
 
         let item = adoptable("typer", "0.25.1", "0.26.7");
-        let change = adoptable_change(UV, &item).expect("a forward change");
+        let change = adoptable_change(&dependency(&item), &[], &item).expect("a forward change");
         assert_eq!(change.from, Version::new("0.25.1"));
         assert_eq!(change.to, Version::new("0.26.7"));
         assert!(!change.downgrade);
     }
 
-    #[tokio::test]
-    async fn conflicting_candidate_is_reclassified_blocked_with_its_blocker() {
-        // typer's matured 0.26.7 is adoptable in isolation, but the whole-graph resolve holds it
-        // because huggingface-hub requires typer<0.26.0. `outdated` must report it `blocked` (named),
-        // matching what `upgrade` reports `held` — not a phantom `adoptable`. `requests` lands, so it
-        // stays adoptable: only the candidate the resolve could not place is re-classified.
-        let writer = FakeWriter {
-            held: "typer",
-            held_current: "0.25.1",
-            holder: "huggingface-hub",
-        };
-        let (_dir, project) = temp_project();
+    #[test]
+    fn adoptable_change_uses_the_target_go_path_major() {
+        let item = adoptable("example.com/foo", "v1.9.0", "v2.0.0");
+        let mut dep = dependency(&item);
+        dep.package = PackageId::new(GO, "example.com/foo", None);
+        let releases = [release("v1.9.0", 1, ""), release("v2.0.0", 2, "/v2")];
+
+        let change = adoptable_change(&dep, &releases, &item).expect("a cross-major change");
+
+        assert_eq!(change.package.name, "example.com/foo/v2");
+    }
+
+    #[test]
+    fn conflicting_candidate_is_reclassified_blocked_with_its_blocker() {
         let mut items = vec![
             adoptable("typer", "0.25.1", "0.26.7"),
             adoptable("requests", "2.34.1", "2.34.2"),
         ];
-        let changes: Vec<_> = items
-            .iter()
-            .filter_map(|item| adoptable_change(UV, item))
-            .collect();
-        let held = resolve_held(&writer, &project, changes, RewriteMode::Auto)
-            .await
-            .expect("resolve");
+        let candidates = vec![candidate(0, &items[0]), candidate(1, &items[1])];
+        let held = held_from_preview(vec![skipped(
+            "typer",
+            "0.25.1",
+            "0.26.7",
+            "huggingface-hub",
+        )]);
 
-        // The held set is exactly the candidate the resolve could not land, naming the blocker.
         assert_eq!(
-            held.get(&held_key_for_item(&items[0])),
+            held.get(&change_target_key(&candidates[0].change)),
             Some(&Some("huggingface-hub".to_string()))
         );
-        assert!(!held.contains_key(&held_key_for_item(&items[1])));
+        assert!(!held.contains_key(&change_target_key(&candidates[1].change)));
 
-        apply_held(&mut items, &held);
+        apply_held(&mut items, &candidates, &held);
         let typer = items.iter().find(|i| i.name == "typer").expect("typer");
         assert_eq!(typer.status, OutdatedStatus::Blocked);
         assert_eq!(typer.adoptable_target.as_deref(), Some("0.26.7"));
@@ -775,34 +770,69 @@ mod tests {
         assert_eq!(requests.blocked_by, None);
     }
 
-    #[tokio::test]
-    async fn held_candidate_does_not_block_same_package_at_a_different_current_version() {
-        let writer = FakeWriter {
-            held: "serde",
-            held_current: "0.9.0",
-            holder: "legacy-framework",
-        };
-        let (_dir, project) = temp_project();
+    #[test]
+    fn held_candidate_does_not_block_same_package_at_a_different_current_version() {
         let mut items = vec![
             adoptable("serde", "0.9.0", "0.9.15"),
             adoptable("serde", "1.0.188", "1.0.190"),
         ];
-        let changes: Vec<_> = items
-            .iter()
-            .filter_map(|item| adoptable_change(UV, item))
-            .collect();
-        let held = resolve_held(&writer, &project, changes, RewriteMode::Auto)
-            .await
-            .expect("resolve");
+        let candidates = vec![candidate(0, &items[0]), candidate(1, &items[1])];
+        let held = held_from_preview(vec![skipped(
+            "serde",
+            "0.9.0",
+            "0.9.15",
+            "legacy-framework",
+        )]);
 
-        assert!(held.contains_key(&held_key_for_item(&items[0])));
-        assert!(!held.contains_key(&held_key_for_item(&items[1])));
+        assert!(held.contains_key(&change_target_key(&candidates[0].change)));
+        assert!(!held.contains_key(&change_target_key(&candidates[1].change)));
 
-        apply_held(&mut items, &held);
+        apply_held(&mut items, &candidates, &held);
 
         assert_eq!(items[0].status, OutdatedStatus::Blocked);
         assert_eq!(items[0].blocked_by.as_deref(), Some("legacy-framework"));
         assert_eq!(items[1].status, OutdatedStatus::Adoptable);
         assert_eq!(items[1].blocked_by, None);
+    }
+
+    #[test]
+    fn held_candidate_does_not_block_a_different_target() {
+        let mut items = vec![adoptable("serde", "1.0.188", "1.0.190")];
+        let candidates = vec![candidate(0, &items[0])];
+        let held = held_from_preview(vec![skipped(
+            "serde",
+            "1.0.188",
+            "1.0.189",
+            "legacy-framework",
+        )]);
+
+        apply_held(&mut items, &candidates, &held);
+
+        assert_eq!(items[0].status, OutdatedStatus::Adoptable);
+        assert_eq!(items[0].blocked_by, None);
+    }
+
+    #[test]
+    fn held_candidate_does_not_block_a_different_workspace_member() {
+        let mut left = adoptable("serde", "1.0.188", "1.0.190");
+        left.members = vec![MemberRef {
+            name: "left".to_string(),
+            path: "packages/left".to_string(),
+        }];
+        let mut right = left.clone();
+        right.members = vec![MemberRef {
+            name: "right".to_string(),
+            path: "packages/right".to_string(),
+        }];
+        let mut items = vec![left, right];
+        let candidates = vec![candidate(0, &items[0]), candidate(1, &items[1])];
+        let mut skipped = skipped("serde", "1.0.188", "1.0.190", "legacy-framework");
+        skipped.members = items[0].members.clone();
+        let held = held_from_preview(vec![skipped]);
+
+        apply_held(&mut items, &candidates, &held);
+
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        assert_eq!(items[1].status, OutdatedStatus::Adoptable);
     }
 }
