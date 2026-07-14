@@ -19,6 +19,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task ast-grep zig github:romnn/cargo-feature-combinations aqua:rustsec/rustsec/cargo-audit github:est31/cargo-udeps github:rust-cross/cargo-zigbuild
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -52,6 +53,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install goreleaser
       - name: Check goreleaser config
         run: goreleaser check
@@ -64,6 +66,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task typos
       - name: Spellcheck
         run: task spellcheck --output group --output-group-error-only

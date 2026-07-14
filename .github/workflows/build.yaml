@@ -21,6 +21,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task
       - name: Release (dry-run)
         run: task build:goreleaser

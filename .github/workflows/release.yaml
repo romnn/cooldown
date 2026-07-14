@@ -60,6 +60,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task
       - name: Release
         run: task release

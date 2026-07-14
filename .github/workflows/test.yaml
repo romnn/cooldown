@@ -25,6 +25,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task aqua:nextest-rs/nextest/cargo-nextest
       - name: Resolve Rust toolchain from rust-toolchain.toml
         id: rust
@@ -53,6 +54,7 @@ jobs:
         with:
           install: false
           cache: true
+          env: false
       - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node pnpm deno
       - name: Resolve Rust toolchain from rust-toolchain.toml
         id: rust
