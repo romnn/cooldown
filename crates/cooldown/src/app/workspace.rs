@@ -225,8 +225,9 @@ pub struct RunOpts {
     pub list_packages: bool,
     /// `--paths`: render the "Used by" column as workspace paths instead of package names.
     pub paths: bool,
-    /// `--show-projects`: add the per-project "Project" column to the dependency tables. Hidden by
-    /// default, since the "Used by" names usually suffice and the path is mostly noise.
+    /// `--show-projects`: add the per-project "Project" column to the dependency tables. Without
+    /// the flag the renderer still adds it when identical rows need project paths to distinguish
+    /// them.
     pub show_projects: bool,
     /// `--no-suggestions`: suppress actionable tips (e.g. the `--major` command after `upgrade`).
     pub no_suggestions: bool,

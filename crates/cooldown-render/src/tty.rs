@@ -7,7 +7,11 @@ use crate::model::{
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status};
-use std::fmt::Write as _;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fmt::Write as _,
+    hash::Hash,
+};
 
 /// The color of the package-name column (every listed dependency is actionable).
 const PACKAGE_COLOR: Color = Color::Cyan;
@@ -26,8 +30,9 @@ pub struct RenderOptions {
     pub list_packages: bool,
     /// Show the "Used by" column as workspace paths instead of package names.
     pub paths: bool,
-    /// Add the "Project" column attributing each row to its project. Hidden by default; even when
-    /// set, the column only appears if some row's project is not the repo root.
+    /// Add the "Project" column attributing each row to its project. Without this flag the column
+    /// still appears when otherwise identical rows come from different projects. The column stays
+    /// hidden when every row belongs to the repo root.
     pub show_projects: bool,
     /// Suppress actionable tips (e.g. the `--major` command after an `upgrade` holds a major back).
     pub no_suggestions: bool,
@@ -38,11 +43,45 @@ fn has_attribution<T>(items: &[T], members: impl Fn(&T) -> &[MemberRef]) -> bool
     items.iter().any(|it| !members(it).is_empty())
 }
 
-/// Whether some row's project is not just the root — a precondition for the opt-in "Project" column
-/// (`--show-projects`). A repo whose only project is the root (`.`) has nothing to attribute, so the
-/// column stays hidden even when the flag is set; multi-project trees (uv packages) can show it.
+/// Whether some row's project is not just the root. A repo whose only project is the root (`.`) has
+/// nothing useful to attribute, so the column stays hidden even when `--show-projects` is set.
 fn has_distinct_project<T>(items: &[T], project: impl Fn(&T) -> &str) -> bool {
     items.iter().any(|it| !is_root_path(project(it)))
+}
+
+/// Determines whether project attribution is needed without collapsing distinct dependency rows.
+///
+/// The key must contain exactly the cells the report would render without "Project". Matching keys
+/// from different projects are visually ambiguous, so their paths appear automatically; an
+/// explicit request still forces attribution for otherwise distinguishable rows.
+fn project_column_needed<T, K>(
+    items: &[T],
+    requested: bool,
+    project: impl Fn(&T) -> &str,
+    visible_row_key: impl Fn(&T) -> K,
+) -> bool
+where
+    K: Eq + Hash,
+{
+    if !has_distinct_project(items, |item| project(item)) {
+        return false;
+    }
+    if requested {
+        return true;
+    }
+
+    let mut projects_by_row = HashMap::new();
+    for item in items {
+        let project = path_label(project(item));
+        match projects_by_row.entry(visible_row_key(item)) {
+            Entry::Vacant(entry) => {
+                entry.insert(project);
+            }
+            Entry::Occupied(entry) if entry.get() != &project => return true,
+            Entry::Occupied(_) => {}
+        }
+    }
+    false
 }
 
 fn is_root_path(path: &str) -> bool {
@@ -129,6 +168,41 @@ fn status_label(s: OutdatedStatus) -> &'static str {
     }
 }
 
+fn outdated_latest_cell(item: &OutdatedItem) -> String {
+    item.latest
+        .as_ref()
+        .map_or_else(|| "—".to_string(), |latest| latest.version.clone())
+}
+
+fn outdated_cooldown_cell(item: &OutdatedItem) -> String {
+    // No upgrade candidate: when the dep is up to date the `latest` column *is* the current pin, so
+    // its age is the pin's — show that over the window for a consistent `age/window` cell instead of
+    // a bare window. Keyed on `latest == current` (the real invariant), so a commit pin (whose
+    // `latest` differs from the pin) and the rare up-to-date-with-an-unclassifiable-newer-release
+    // case (whose `latest` is some other version) both fall through to the bare window rather than
+    // borrowing the wrong version's age.
+    let current_age_days = item.candidate_age_days.or_else(|| {
+        item.latest
+            .as_ref()
+            .filter(|latest| latest.version == item.current)
+            .and_then(|latest| latest.age_days)
+    });
+    cooldown_cell(
+        &item.window,
+        current_age_days,
+        item.cooldown_version.as_deref(),
+    )
+}
+
+fn outdated_status_cell(item: &OutdatedItem) -> String {
+    // A blocked row names the conflicting requirer inline ("blocked by <pkg>") so the matured target
+    // reads as "wanted but held out of the graph by …", mirroring the `upgrade` skip.
+    match (item.status, &item.blocked_by) {
+        (OutdatedStatus::Blocked, Some(blocker)) => format!("blocked by {blocker}"),
+        _ => status_label(item.status).to_string(),
+    }
+}
+
 fn cell_colored(text: impl Into<String>, color: Color, use_color: bool) -> Cell {
     let c = Cell::new(text.into());
     if use_color { c.fg(color) } else { c }
@@ -178,6 +252,30 @@ fn cooldown_cell(
 fn check_cooldown_cell(window: &Window, age_days: Option<f64>) -> String {
     let age = age_days.map_or_else(|| "?".to_string(), fmt_days);
     age_over_window_cell(window, &age)
+}
+
+fn check_status_cell(status: CheckStatus) -> (&'static str, Color) {
+    match status {
+        CheckStatus::Violation => ("violation", Color::Red),
+        CheckStatus::Acknowledged => ("acknowledged", Color::Cyan),
+        CheckStatus::Allowed => ("allowed", Color::Yellow),
+        CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
+        CheckStatus::Error => ("error", Color::Red),
+    }
+}
+
+fn check_notes_cell(item: &CheckItem) -> String {
+    let mut notes = Vec::new();
+    if item.graph_held {
+        notes.push("graph-held".to_string());
+    }
+    if let Some(graph_floor) = &item.graph_floor {
+        notes.push(format!("floor {graph_floor}"));
+    }
+    if let Some(error) = &item.error {
+        notes.push(error.message.clone());
+    }
+    notes.join("; ")
 }
 
 /// Render the "Used by" column for one dependency: the member packages by name (or by path under
@@ -247,7 +345,24 @@ pub fn render_outdated(
         }
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
+        let project = project_column_needed(
+            items,
+            show_projects,
+            |item| item.project.as_str(),
+            |item| {
+                (
+                    item.name.clone(),
+                    used_by.then(|| members_cell(&item.members, list_packages, paths, item.direct)),
+                    item.current.clone(),
+                    item.adoptable_target
+                        .clone()
+                        .unwrap_or_else(|| "—".to_string()),
+                    outdated_latest_cell(item),
+                    outdated_cooldown_cell(item),
+                    outdated_status_cell(item),
+                )
+            },
+        );
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -267,24 +382,8 @@ pub fn render_outdated(
                 Some(version) => cell_colored(version.clone(), ADOPTABLE_COLOR, use_color),
                 None => Cell::new("—"),
             };
-            let latest = it
-                .latest
-                .as_ref()
-                .map_or_else(|| "—".into(), |l| l.version.clone());
-            // No upgrade candidate: when the dep is up to date the `latest` column *is* the current
-            // pin, so its age is the pin's — show that over the window for a consistent `age/window`
-            // cell instead of a bare window. Keyed on `latest == current` (the real invariant), so a
-            // commit pin (whose `latest` differs from the pin) and the rare up-to-date-with-an-
-            // unclassifiable-newer-release case (whose `latest` is some other version) both fall
-            // through to the bare window rather than borrowing the wrong version's age.
-            let current_age_days = it.candidate_age_days.or_else(|| {
-                it.latest
-                    .as_ref()
-                    .filter(|latest| latest.version == it.current)
-                    .and_then(|latest| latest.age_days)
-            });
-            let cooldown =
-                cooldown_cell(&it.window, current_age_days, it.cooldown_version.as_deref());
+            let latest = outdated_latest_cell(it);
+            let cooldown = outdated_cooldown_cell(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -301,12 +400,7 @@ pub fn render_outdated(
             row.push(adoptable);
             row.push(Cell::new(latest));
             row.push(Cell::new(cooldown));
-            // A blocked row names the conflicting requirer inline ("blocked by <pkg>") so the matured
-            // target reads as "wanted but held out of the graph by …", mirroring the `upgrade` skip.
-            let status_text = match (it.status, &it.blocked_by) {
-                (OutdatedStatus::Blocked, Some(blocker)) => format!("blocked by {blocker}"),
-                _ => status_label(it.status).to_string(),
-            };
+            let status_text = outdated_status_cell(it);
             row.push(cell_colored(
                 status_text,
                 status_color(it.status),
@@ -363,7 +457,21 @@ pub fn render_check(
         );
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
+        let project = project_column_needed(
+            items,
+            show_projects,
+            |item| item.project.as_str(),
+            |item| {
+                (
+                    item.name.clone(),
+                    used_by.then(|| members_cell(&item.members, list_packages, paths, item.direct)),
+                    item.current.clone(),
+                    check_cooldown_cell(&item.window, item.age_days),
+                    check_status_cell(item.status).0,
+                    check_notes_cell(item),
+                )
+            },
+        );
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -375,24 +483,9 @@ pub fn render_check(
         header.extend(["Version", "Cooldown", "Status", "Notes"]);
         t.set_header(header);
         for it in items {
-            let (label, color) = match it.status {
-                CheckStatus::Violation => ("violation", Color::Red),
-                CheckStatus::Acknowledged => ("acknowledged", Color::Cyan),
-                CheckStatus::Allowed => ("allowed", Color::Yellow),
-                CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
-                CheckStatus::Error => ("error", Color::Red),
-            };
+            let (label, color) = check_status_cell(it.status);
             let cooldown = check_cooldown_cell(&it.window, it.age_days);
-            let mut notes = Vec::new();
-            if it.graph_held {
-                notes.push("graph-held".to_string());
-            }
-            if let Some(gf) = &it.graph_floor {
-                notes.push(format!("floor {gf}"));
-            }
-            if let Some(e) = &it.error {
-                notes.push(e.message.clone());
-            }
+            let notes = check_notes_cell(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -408,7 +501,7 @@ pub fn render_check(
             row.push(Cell::new(&it.current));
             row.push(Cell::new(cooldown));
             row.push(cell_colored(label, color, use_color));
-            row.push(Cell::new(notes.join("; ")));
+            row.push(Cell::new(notes));
             t.add_row(row);
         }
         out.push_str(&dim_borders(&t.to_string(), use_color));
@@ -482,6 +575,31 @@ fn mutation_status(it: &UpgradeItem) -> (&'static str, String, Color) {
     }
 }
 
+fn mutation_project_column_needed(
+    items: &[UpgradeItem],
+    used_by: bool,
+    opts: RenderOptions,
+) -> bool {
+    project_column_needed(
+        items,
+        opts.show_projects,
+        |item| item.project.as_str(),
+        |item| {
+            let (status, detail, _) = mutation_status(item);
+            (
+                item.name.clone(),
+                used_by.then(|| {
+                    members_cell(&item.members, opts.list_packages, opts.paths, item.direct)
+                }),
+                item.from.clone(),
+                item.to.clone(),
+                status,
+                detail,
+            )
+        },
+    )
+}
+
 fn render_mutation(
     verb: &str,
     meta: &UpgradeMeta,
@@ -495,7 +613,7 @@ fn render_mutation(
         use_color,
         list_packages,
         paths,
-        show_projects,
+        show_projects: _,
         no_suggestions,
     } = opts;
     let mut out = String::new();
@@ -503,7 +621,7 @@ fn render_mutation(
         let _ = writeln!(out, "Nothing to {verb}.");
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = show_projects && has_distinct_project(items, |it| it.project.as_str());
+        let project = mutation_project_column_needed(items, used_by, opts);
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -1048,23 +1166,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn outdated_project_column_is_opt_in() {
-        // Two rows in distinct (non-root) projects: there *is* a project to attribute, but the
-        // column only appears once the user opts in with `--show-projects`.
-        let summary = OutdatedSummary {
-            total: 2,
-            adoptable: 2,
-            blocked: 0,
-            in_cooldown: 0,
-            up_to_date: 0,
-            exempt: 0,
-            held: 0,
-            unknown_age: 0,
-            errors: 0,
-        };
-        let item = |project: &str| OutdatedItem {
-            name: "ruff".into(),
+    fn project_outdated_item(name: &str, project: &str) -> OutdatedItem {
+        OutdatedItem {
+            name: name.into(),
             tool: "uv".into(),
             project: project.into(),
             registry: None,
@@ -1083,10 +1187,62 @@ mod tests {
             blocked_by: None,
             latest: None,
             error: None,
-        };
-        let items = [item("maintenance/rag"), item("packages/api")];
+        }
+    }
 
-        // Hidden by default, even though the projects are distinct.
+    fn two_adoptable_summary() -> OutdatedSummary {
+        OutdatedSummary {
+            total: 2,
+            adoptable: 2,
+            blocked: 0,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        }
+    }
+
+    #[test]
+    fn outdated_project_column_automatically_disambiguates_identical_rows() {
+        // Both dependencies have the same visible cells, so hiding their project paths would make
+        // two distinct findings look like an accidental duplicate.
+        let items = [
+            project_outdated_item("ruff", "maintenance/rag"),
+            project_outdated_item("ruff", "packages/api"),
+        ];
+        let out = render_outdated(
+            &two_adoptable_summary(),
+            &items,
+            &[],
+            &[],
+            &RenderOptions::default(),
+        );
+
+        assert!(
+            out.contains("Project"),
+            "Project column should distinguish identical rows:\n{out}"
+        );
+        assert!(out.contains("maintenance/rag"));
+        assert!(out.contains("packages/api"));
+        assert_eq!(
+            out.matches("ruff").count(),
+            2,
+            "both rows must remain:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outdated_project_column_stays_hidden_for_distinct_rows_unless_requested() {
+        let summary = two_adoptable_summary();
+        let items = [
+            project_outdated_item("ruff", "maintenance/rag"),
+            project_outdated_item("uvicorn", "packages/api"),
+        ];
+
+        // The package names already distinguish these rows, so project paths remain noise by
+        // default.
         let hidden = render_outdated(&summary, &items, &[], &[], &RenderOptions::default());
         assert!(
             !hidden.contains("Project"),
@@ -1094,7 +1250,7 @@ mod tests {
         );
         assert!(!hidden.contains("maintenance/rag"));
 
-        // `--show-projects` brings the column (and the project paths) back.
+        // `--show-projects` still forces attribution for distinguishable rows.
         let shown = render_outdated(
             &summary,
             &items,
@@ -1305,6 +1461,22 @@ mod tests {
             !out.contains("major update available"),
             "the card text must be hidden too:\n{out}"
         );
+    }
+
+    #[test]
+    fn mutation_project_column_automatically_disambiguates_identical_rows() {
+        let items = [
+            needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/a"),
+            needs_major_item("widget", "1.0.0", "2.0.0", UpdateKind::Major, "apps/b"),
+        ];
+        let out = render_upgrade_of(&items);
+
+        assert!(
+            out.contains("Project"),
+            "Project column should distinguish identical mutation rows:\n{out}"
+        );
+        assert!(out.contains("apps/a"));
+        assert!(out.contains("apps/b"));
     }
 
     #[test]
