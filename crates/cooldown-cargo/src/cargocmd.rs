@@ -1,6 +1,7 @@
 //! Thin wrappers around the project's own `cargo` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
+use cooldown_adapter_util::resolve_program;
 use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure_detail};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
@@ -379,7 +380,7 @@ impl Cargo {
     ) -> Result<std::process::Output, CoreError> {
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn cargo");
         let started = std::time::Instant::now();
-        let result = Command::new(&self.bin)
+        let result = Command::new(resolve_program(&self.bin))
             .args(args)
             .current_dir(dir.as_std_path())
             .output()

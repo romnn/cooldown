@@ -338,6 +338,7 @@ dependencies = [
  "camino",
  "clap",
  "color-eyre",
+ "cooldown-adapter-util",
  "cooldown-cargo",
  "cooldown-conda",
  "cooldown-core",
@@ -372,6 +373,7 @@ version = "0.0.8"
 dependencies = [
  "camino",
  "cooldown-core",
+ "tempfile",
  "tokio",
 ]
 
@@ -435,6 +437,7 @@ version = "0.0.8"
 dependencies = [
  "async-trait",
  "camino",
+ "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
  "futures",

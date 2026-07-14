@@ -12,6 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+cooldown-adapter-util.workspace = true
 cooldown-core.workspace = true
 cooldown-registry.workspace = true
 jiff.workspace = true

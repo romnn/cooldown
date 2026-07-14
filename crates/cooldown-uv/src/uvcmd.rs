@@ -1,6 +1,7 @@
 //! Thin wrappers around the project's own `uv` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
+use cooldown_adapter_util::resolve_program;
 use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use tokio::process::Command;
 
@@ -62,7 +63,7 @@ impl Uv {
         args: &[&str],
         cutoff: Option<&str>,
     ) -> Result<std::process::Output, CoreError> {
-        let mut command = Command::new(&self.bin);
+        let mut command = Command::new(resolve_program(&self.bin));
         command.args(args).current_dir(dir.as_std_path());
         match cutoff {
             Some(cutoff) => command.env("UV_EXCLUDE_NEWER", cutoff),

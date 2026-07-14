@@ -25,9 +25,11 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+use cooldown_adapter_util::{program_on_path, resolve_program};
 
 const TOOL_ATTEMPTS: usize = 3;
 
@@ -69,9 +71,10 @@ impl Fixture {
     /// Run a raw command in the project root, returning its captured output. Used to drive the real
     /// package manager when seeding a starting lock (e.g. `uv lock --exclude-newer …`).
     pub fn run_tool(&self, program: &str, args: &[&str], envs: &[(&str, &str)]) -> CapturedOutput {
+        let executable = resolve_program(program);
         let mut attempt = 1;
         loop {
-            let mut command = Command::new(program);
+            let mut command = Command::new(&executable);
             command.current_dir(self.dir.path()).args(args);
             for (key, value) in envs {
                 command.env(key, value);
@@ -409,30 +412,27 @@ impl Envelope {
     }
 }
 
-/// Whether a tool binary is resolvable on `PATH`. Integration tests skip (with a clear message)
-/// when their package manager is absent, so the fast unit run on a bare machine is unaffected.
+/// Whether a tool binary is resolvable on `PATH`. Local integration tests skip with a clear
+/// message when their package manager is absent; CI treats the same condition as a setup failure.
 pub fn tool_on_path(tool: &str) -> bool {
-    which(tool).is_some()
+    program_on_path(tool).is_some()
 }
 
-fn which(tool: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(tool);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-/// Emit a skip notice and return early from a test body. Pairs with the `#[ignore]` gate: when the
-/// suite is opted into (`--run-ignored all`) but the tool is missing, the test prints why instead
-/// of failing.
+/// Emit a skip notice and return early from a local test body when its real package manager is not
+/// installed. CI provisions every required tool, so a missing binary there is an infrastructure
+/// failure rather than a passing skipped test.
 #[macro_export]
 macro_rules! skip_if_missing {
     ($tool:expr) => {
-        if !$crate::support::tool_on_path($tool) {
+        let tool = $tool;
+        if !$crate::support::tool_on_path(tool) {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`{tool}` not found on PATH even though CI must provision every integration tool"
+            );
             eprintln!(
                 "skipping: `{}` not found on PATH (provision it via the repo `mise.toml`)",
-                $tool
+                tool
             );
             return;
         }

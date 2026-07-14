@@ -2,6 +2,7 @@
 //! never as the source of cooldown policy.
 
 use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_adapter_util::resolve_program;
 use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use std::collections::HashMap;
 use tokio::process::Command;
@@ -176,7 +177,7 @@ impl Go {
     ) -> Result<std::process::Output, CoreError> {
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn go");
         let started = std::time::Instant::now();
-        let result = Command::new(&self.bin)
+        let result = Command::new(resolve_program(&self.bin))
             .args(args)
             // Neutralize an ambient GOFLAGS for cooldown's own invocations. Repos commonly set
             // `GOFLAGS=-mod=mod` (via .env, a dotenv loaded by their task runner, or `go env -w`),
