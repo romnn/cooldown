@@ -6,10 +6,7 @@ use cooldown_core::{
 };
 use std::{cmp::Ordering, time::Duration};
 
-#[cfg(not(test))]
 const MAJOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const MAJOR_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Classify a version string into a [`ReleaseQuality`].
 #[must_use]

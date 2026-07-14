@@ -25,16 +25,29 @@ struct TestServer {
 
 impl TestServer {
     fn new(routes: HashMap<String, (u16, &'static str)>) -> Self {
+        Self::spawn(routes, None)
+    }
+
+    fn new_with_delay(
+        routes: HashMap<String, (u16, &'static str)>,
+        path: &'static str,
+        delay: Duration,
+    ) -> Self {
+        Self::spawn(routes, Some((path, delay)))
+    }
+
+    fn spawn(
+        routes: HashMap<String, (u16, &'static str)>,
+        delayed_response: Option<(&'static str, Duration)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        listener
-            .set_nonblocking(true)
-            .expect("listener nonblocking");
         let addr = listener.local_addr().expect("local addr");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let handle = thread::spawn(move || {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
+                    Ok(_) if stop_thread.load(Ordering::Relaxed) => break,
                     Ok((mut stream, _)) => {
                         let mut request_line = String::new();
                         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -44,6 +57,11 @@ impl TestServer {
                             .nth(1)
                             .unwrap_or("/")
                             .to_string();
+                        if let Some((delayed_path, delay)) = delayed_response
+                            && path == delayed_path
+                        {
+                            thread::sleep(delay);
+                        }
                         let (status, body) =
                             routes.get(&path).copied().unwrap_or((404, "not found"));
                         let reason = match status {
@@ -57,9 +75,6 @@ impl TestServer {
                             body.len()
                         );
                         let _ = stream.flush();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
                 }
@@ -434,7 +449,16 @@ async fn releases_skip_cross_major_when_probe_fails_transiently() {
     ]);
     let server = TestServer::new(routes);
     let cache = tempfile::tempdir().expect("tempdir");
-    let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
+    // Exercise discovery's transient classification without spending the HTTP client's retry
+    // budget on the fixture's deliberate 500 response.
+    let http = SharedHttp::new(
+        cache.path(),
+        HttpOptions {
+            max_retries: 0,
+            ..HttpOptions::default()
+        },
+    )
+    .expect("http");
     let tool = GoTool::new(crate::proxy::GoProxy::new(
         http,
         vec![ProxyBase {
@@ -539,7 +563,12 @@ async fn releases_discover_lower_major_paths_for_cross_major_downgrade() {
             (200, r#"{"Version":"v1.9.0","Time":"2026-01-01T00:00:00Z"}"#),
         ),
     ]);
-    let server = TestServer::new(routes);
+    // Discovery must tolerate ordinary scheduling delays below its production timeout.
+    let server = TestServer::new_with_delay(
+        routes,
+        "/example.com/mod/@v/list",
+        Duration::from_millis(250),
+    );
     let cache = tempfile::tempdir().expect("tempdir");
     let http = SharedHttp::new(cache.path(), HttpOptions::default()).expect("http");
     let tool = GoTool::new(crate::proxy::GoProxy::new(
