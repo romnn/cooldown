@@ -45,7 +45,6 @@ goreleaser = "latest"
 "aqua:rustsec/rustsec/cargo-audit" = "latest"
 "github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc", minimum_release_age = "0" }
 "github:est31/cargo-udeps" = "latest"
-"github:kbknapp/cargo-outdated" = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
 
 [settings]
