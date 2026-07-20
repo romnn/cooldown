@@ -500,10 +500,10 @@ fn upgrade_honors_a_stricter_per_package_window() {
     );
 }
 
-/// A workspace whose dependency is declared in a MEMBER (`pkgs/app`), never the root `package.json`.
-/// This is the monorepo-conformance fixture: the earlier adapter ran `pnpm update <pkg>@<target>`
-/// without `--recursive`, which at the workspace root only re-pins root-declared dependencies — so a
-/// member-declared candidate silently stayed put and `outdated` reported it falsely `blocked`.
+/// A workspace whose dependency is declared in a member with YAML quoting, spaces, and filter
+/// metacharacters in its path (`'app [literal]`), never the root `package.json`. The resolver must
+/// select that importer explicitly; a root-only update leaves the candidate in place and makes
+/// `outdated` report it falsely `blocked`.
 const WORKSPACE_ROOT_PACKAGE_JSON: &str = r#"{
   "name": "cooldown-pnpm-workspace-root",
   "version": "0.1.0",
@@ -524,6 +524,7 @@ const WORKSPACE_ROOT_DEP_PACKAGE_JSON: &str = r#"{
 "#;
 
 const WORKSPACE_YAML: &str = "packages:\n  - \"pkgs/*\"\n";
+const COMPLEX_MEMBER_WORKSPACE_YAML: &str = "packages:\n  - \"*\"\n";
 
 /// The member that actually declares `eslint`. Seeded on the old 9.0.0 line (a clear forward move to
 /// the project-default-window newest), declared only here — not in the workspace root.
@@ -551,8 +552,8 @@ const WORKSPACE_UNRELATED_MEMBER_PACKAGE_JSON: &str = r#"{
 fn workspace_member_fixture() -> Fixture {
     let fixture = Fixture::new();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
-    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
-    fixture.write("pkgs/app/package.json", WORKSPACE_MEMBER_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", COMPLEX_MEMBER_WORKSPACE_YAML);
+    fixture.write("'app [literal]/package.json", WORKSPACE_MEMBER_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     // Reuse the per-package fixture's eslint timeline: seed at 9.0.0, resolve at the project-default
     // freeze whose newest matured eslint is 9.5.0 — a forward move the upgrade must land.
@@ -628,9 +629,8 @@ fn upgrade_moves_a_member_declared_dependency() {
             .stderr_str()
     );
 
-    // eslint is declared only in `pkgs/app`, never the root. The whole-graph `--recursive` resolve
-    // MUST reach the member and move it; the pre-fix adapter left it untouched (and never reported it
-    // applied), which is exactly the member-dep regression this guards.
+    // eslint is declared only in the complex-path member, never the root. The location-filtered
+    // resolve must reach the member and report the lock movement.
     assert!(
         upgrade.applied_names().contains("eslint"),
         "member-declared eslint must be upgraded\napplied={:?}\nheld={:?}",
@@ -686,9 +686,8 @@ fn outdated_does_not_falsely_block_a_member_declared_dependency() {
     let adoptable = outdated.outdated_with_status("adoptable");
     let blocked = outdated.outdated_with_status("blocked");
 
-    // The whole-graph verify resolve lands the member-declared eslint, so `outdated` must call it
-    // adoptable — never `blocked`. Before the `--recursive` fix the verify resolve could not move the
-    // member dep, so every member candidate fell into `blocked`.
+    // Policy verification runs in a copied workspace. Its canonical root plus the portable location
+    // selector must identify the same member on every platform, so eslint remains adoptable.
     assert!(
         adoptable.contains("eslint"),
         "member-declared eslint must be adoptable\nadoptable={adoptable:?}\nblocked={blocked:?}"

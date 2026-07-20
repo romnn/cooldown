@@ -33,7 +33,8 @@ pub(crate) struct ProjectCopy {
 
 impl ProjectCopy {
     /// Copy only the files the resolver reads (`inputs`) from `project`'s tree into a fresh temp
-    /// directory and return a [`Project`] rooted there, with its manifest path rebased onto the copy.
+    /// directory and return a [`Project`] with a canonical root and its manifest rebased onto the
+    /// copy.
     ///
     /// Crucially this copies ONLY manifests, lockfiles, workspace/registry config, and (for Cargo/Go)
     /// source — never the full source/data tree. A blind recursive copy is catastrophic in a large
@@ -41,20 +42,31 @@ impl ProjectCopy {
     /// tempdir (often tmpfs/RAM), which the resolver never reads. The real tree is only read (never
     /// written), and the copy is discarded when the returned value drops.
     pub(crate) fn create(project: &Project, inputs: &ResolveInputs) -> cooldown_core::Result<Self> {
-        let scratch = tempfile::tempdir()?;
-        let scratch_root = camino::Utf8Path::from_path(scratch.path()).ok_or_else(|| {
-            CoreError::PathEncoding("temp dir path is not valid utf-8".to_string())
+        let manifest_rel = project.manifest.strip_prefix(&project.root).map_err(|_| {
+            CoreError::System(format!(
+                "project manifest {} is outside project root {}",
+                project.manifest, project.root
+            ))
         })?;
-        copy_project_tree(project.root.as_std_path(), scratch.path(), inputs)?;
+        let scratch = tempfile::tempdir()?;
+        let scratch_path = std::fs::canonicalize(scratch.path())?;
+        let scratch_root = camino::Utf8PathBuf::from_path_buf(scratch_path).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "temp dir path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        copy_project_tree(
+            project.root.as_std_path(),
+            scratch_root.as_std_path(),
+            inputs,
+        )?;
 
-        let manifest_rel = project
-            .manifest
-            .strip_prefix(&project.root)
-            .unwrap_or(&project.manifest);
+        let copied_manifest = scratch_root.join(manifest_rel);
         let copied = Project {
-            root: scratch_root.to_owned(),
+            root: scratch_root,
             kind: project.kind,
-            manifest: scratch_root.join(manifest_rel),
+            manifest: copied_manifest,
             exclude_newer: project.exclude_newer.clone(),
         };
         Ok(ProjectCopy {
@@ -221,8 +233,57 @@ fn rel_slash(rel: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_project_tree;
-    use cooldown_core::ResolveInputs;
+    use super::{ProjectCopy, copy_project_tree};
+    use cooldown_core::{Project, ResolveInputs, ToolId};
+
+    #[test]
+    fn copied_project_uses_a_canonical_root() {
+        let src = tempfile::tempdir().expect("src");
+        std::fs::write(src.path().join("package.json"), "{}").expect("write manifest");
+        let root = camino::Utf8PathBuf::from_path_buf(src.path().to_path_buf())
+            .expect("UTF-8 source path");
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+
+        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT).expect("copy project");
+        let canonical_root = std::fs::canonicalize(copy.project.root.as_std_path())
+            .expect("canonicalize copied root");
+
+        assert_eq!(copy.project.root.as_std_path(), canonical_root.as_path());
+        assert_eq!(
+            copy.project.manifest,
+            copy.project.root.join("package.json")
+        );
+        assert!(copy.project.manifest.exists());
+    }
+
+    #[test]
+    fn copied_project_rejects_a_manifest_outside_its_root() {
+        let src = tempfile::tempdir().expect("src");
+        let outside = tempfile::tempdir().expect("outside");
+        let root = camino::Utf8PathBuf::from_path_buf(src.path().to_path_buf())
+            .expect("UTF-8 source path");
+        let manifest = camino::Utf8PathBuf::from_path_buf(outside.path().join("package.json"))
+            .expect("UTF-8 manifest path");
+        let project = Project {
+            root,
+            kind: ToolId("test"),
+            manifest,
+            exclude_newer: None,
+        };
+
+        let error = ProjectCopy::create(&project, &ResolveInputs::DEFAULT)
+            .err()
+            .expect("an outside-root manifest must be rejected");
+
+        assert!(
+            matches!(error, cooldown_core::CoreError::System(detail) if detail.contains("outside project root"))
+        );
+    }
 
     /// The skeleton copy reproduces the directory structure and the resolver inputs (manifests, locks,
     /// config) but NEVER the bulk source/data tree — the guarantee that keeps the throwaway probe cheap

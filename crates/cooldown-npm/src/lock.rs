@@ -88,8 +88,8 @@ pub trait NodeLock: Send + Sync + 'static {
     /// eligible candidate to its exact per-package target — pnpm's
     /// `update <pkg>@<target> … --lockfile-only --no-save` (the forward `upgrade` and the `fix`
     /// rollback both pass their `change.to` targets). `filters` selects only importers that declare a
-    /// planned candidate; an empty list falls back to recursive resolution when importer attribution
-    /// is unavailable.
+    /// planned candidate and makes an empty selection fail instead of silently doing nothing; an
+    /// empty list falls back to recursive resolution when importer attribution is unavailable.
     ///
     /// Each `pin` is `(name, target)`: the per-package target the core computed for that candidate's
     /// own window. The resolve lands it at exactly that version, never overshooting a package whose
@@ -322,7 +322,32 @@ pub(crate) fn split_name_version(spec: &str) -> Option<(String, String)> {
 }
 
 fn unquote_yaml_scalar(value: &str) -> &str {
-    value.trim().trim_matches('\'').trim_matches('"')
+    let value = value.trim();
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        return inner;
+    }
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        return inner;
+    }
+    value
+}
+
+/// Decodes a pnpm importer ID, whose path may contain a YAML-escaped apostrophe.
+fn decode_pnpm_importer_path(value: &str) -> String {
+    let value = value.trim();
+    let Some(path) = value
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    else {
+        return unquote_yaml_scalar(value).to_string();
+    };
+    path.replace("''", "'")
 }
 
 /// The npm package manager: `package-lock.json` (lockfile v2/v3) backed by the npm registry.
@@ -461,6 +486,11 @@ impl NodeLock for Pnpm {
         for filter in filters {
             args.push("--filter".to_string());
             args.push(filter.clone());
+        }
+        if !filters.is_empty() {
+            // A successful zero-selection update is indistinguishable from a resolver rejection in
+            // the resulting lock diff, so an invalid location selector must fail explicitly.
+            args.push("--fail-if-no-match".to_string());
         }
         args.push("update".to_string());
         if filters.is_empty() {
@@ -601,12 +631,12 @@ const DIRECT_GROUPS: [&str; 4] = [
 /// are the entry's unquoted scalar values (`None` when the entry lacks that line). Entry-level
 /// delivery is order-agnostic within the entry, so consumers need no specifier-before-version
 /// assumption. The four importer parsers share this so the indentation state machine lives once.
-fn walk_pnpm_importer_entries<'a>(
-    content: &'a str,
-    mut visit: impl FnMut(&'a str, &'a str, Option<&'a str>, Option<&'a str>),
+fn walk_pnpm_importer_entries(
+    content: &str,
+    mut visit: impl FnMut(&str, &str, Option<&str>, Option<&str>),
 ) {
     let mut in_importers = false;
-    let mut member: Option<&str> = None;
+    let mut member: Option<String> = None;
     let mut in_group = false;
     let mut dep_name: Option<&str> = None;
     let mut specifier: Option<&str> = None;
@@ -620,7 +650,7 @@ fn walk_pnpm_importer_entries<'a>(
         let trimmed = line.trim();
         match indent {
             0 => {
-                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
                 in_importers = trimmed == "importers:";
                 member = None;
                 in_group = false;
@@ -629,22 +659,23 @@ fn walk_pnpm_importer_entries<'a>(
                 version = None;
             }
             2 if in_importers => {
-                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
-                member = Some(unquote_yaml_scalar(trimmed.trim_end_matches(':')));
+                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
+                let path = decode_pnpm_importer_path(trimmed.trim_end_matches(':'));
+                member = (!path.is_empty()).then_some(path);
                 in_group = false;
                 dep_name = None;
                 specifier = None;
                 version = None;
             }
             4 if in_importers => {
-                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
                 in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
                 dep_name = None;
                 specifier = None;
                 version = None;
             }
             6 if in_importers && in_group => {
-                flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
                 let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
                 dep_name = (!name.is_empty()).then_some(name);
                 specifier = None;
@@ -660,15 +691,15 @@ fn walk_pnpm_importer_entries<'a>(
             _ => {}
         }
     }
-    flush_pnpm_importer_entry(member, dep_name, specifier, version, &mut visit);
+    flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
 }
 
-fn flush_pnpm_importer_entry<'a>(
-    member: Option<&'a str>,
-    dep_name: Option<&'a str>,
-    specifier: Option<&'a str>,
-    version: Option<&'a str>,
-    visit: &mut impl FnMut(&'a str, &'a str, Option<&'a str>, Option<&'a str>),
+fn flush_pnpm_entry(
+    member: Option<&str>,
+    dep_name: Option<&str>,
+    specifier: Option<&str>,
+    version: Option<&str>,
+    visit: &mut impl FnMut(&str, &str, Option<&str>, Option<&str>),
 ) {
     if let (Some(member), Some(name)) = (member, dep_name) {
         visit(member, name, specifier, version);
@@ -1345,7 +1376,7 @@ packages:
         let lock = "\
 importers:
 
-  'apps/a':
+  '''apps/a':
     dependencies:
       '@scope/pkg':
         specifier: '^1.2.3'
@@ -1358,7 +1389,11 @@ packages:
 ";
         let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
 
-        assert_eq!(index.members_for("@scope/pkg", "1.2.3"), vec!["apps/a"]);
+        assert_eq!(index.members_for("@scope/pkg", "1.2.3"), vec!["'apps/a"]);
+        assert_eq!(
+            decode_pnpm_importer_path(r#""apps/has''two""#),
+            "apps/has''two"
+        );
     }
 
     #[test]

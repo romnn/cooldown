@@ -73,6 +73,19 @@ fn member_names(root: &Utf8Path, paths: &HashSet<String>) -> HashMap<String, Str
     names
 }
 
+/// Renders pnpm's location selector for a lockfile importer ID.
+///
+/// Importer IDs are pnpm-owned portable strings, not host paths. Keeping the ID opaque avoids
+/// platform-dependent parsing; the `./` prefix forces location selection. Direct process arguments
+/// need no shell escaping.
+fn pnpm_location_filter(path: &str) -> String {
+    if path == "." {
+        ".".to_string()
+    } else {
+        format!("./{path}")
+    }
+}
+
 /// The JavaScript/TypeScript implementation of the [`Tool`] port, generic over a [`NodeLock`].
 ///
 /// It detects projects by their lockfile, reads the resolved graph from that lock, recovers
@@ -856,9 +869,10 @@ impl<L: NodeLock> NpmTool<L> {
     /// candidate back into range and breaks the fixed point. A multi-version candidate is never widened
     /// — widening would let it cross its own range boundary, the very line we are preserving.
     ///
-    /// Each declaring member becomes a pnpm filter. This reaches root and member importers without
-    /// running the update in unrelated workspace packages, where an unmatched package selector can
-    /// otherwise make pnpm update unrelated direct dependencies.
+    /// Each declaring member becomes a pnpm portable location filter. This reaches root and member
+    /// importers without relying on package names or running the update in unrelated workspace
+    /// packages, where an unmatched package selector can otherwise move unrelated direct
+    /// dependencies.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
@@ -867,8 +881,7 @@ impl<L: NodeLock> NpmTool<L> {
         window_minutes: Option<i64>,
     ) -> Result<()> {
         let mut pins: Vec<(String, String)> = Vec::with_capacity(plan.changes.len());
-        let mut filters = BTreeSet::new();
-        let mut all_pins_have_filters = true;
+        let mut importer_filters = Some(BTreeSet::new());
         for change in &plan.changes {
             let name = change.package.name.clone();
             if multi_version.contains(&name) {
@@ -893,28 +906,23 @@ impl<L: NodeLock> NpmTool<L> {
                 )?;
             }
             if change.members.is_empty() {
-                all_pins_have_filters = false;
-            }
-            for member in &change.members {
-                if member.path == "." {
-                    if member.name == "." {
-                        all_pins_have_filters = false;
-                    } else {
-                        filters.insert(member.name.clone());
-                    }
-                } else {
-                    filters.insert(format!("./{}", member.path));
-                }
+                importer_filters = None;
+            } else if let Some(filters) = &mut importer_filters {
+                filters.extend(
+                    change
+                        .members
+                        .iter()
+                        .map(|member| pnpm_location_filter(&member.path)),
+                );
             }
             pins.push((name, change.to.as_str().to_string()));
         }
         if pins.is_empty() {
             return Ok(());
         }
-        let filters: Vec<String> = if all_pins_have_filters {
-            filters.into_iter().collect()
-        } else {
-            Vec::new()
+        let filters = match importer_filters {
+            Some(filters) => filters.into_iter().collect::<Vec<_>>(),
+            None => Vec::new(),
         };
         self.joint_resolve(project, &pins, &filters, window_minutes)
             .await?;
@@ -1316,23 +1324,32 @@ mod tests {
                 "8.0.0".to_string(),
             ),
         ];
-        let filters = vec![
-            "cooldown-workspace".to_string(),
-            "./packages/app".to_string(),
-        ];
+        let filters = vec![".".to_string(), "./packages/app".to_string()];
         assert_eq!(
             Pnpm::whole_graph_args(&pins, &filters, Some(20160)),
             Some(vec![
                 "--filter".to_string(),
-                "cooldown-workspace".to_string(),
+                ".".to_string(),
                 "--filter".to_string(),
                 "./packages/app".to_string(),
+                "--fail-if-no-match".to_string(),
                 "update".to_string(),
                 "eslint@9.5.0".to_string(),
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
+            ])
+        );
+        assert_eq!(
+            Pnpm::whole_graph_args(&pins, &[], None),
+            Some(vec![
+                "update".to_string(),
+                "--recursive".to_string(),
+                "eslint@9.5.0".to_string(),
+                "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
+                "--lockfile-only".to_string(),
+                "--no-save".to_string(),
             ])
         );
         assert_eq!(Pnpm::whole_graph_args(&[], &filters, None), None);
@@ -1347,6 +1364,16 @@ mod tests {
         assert_eq!(
             crate::lock::Bun::whole_graph_args(&[], &filters, None),
             None
+        );
+    }
+
+    #[test]
+    fn pnpm_importer_filters_use_portable_location_syntax() {
+        assert_eq!(pnpm_location_filter("."), ".");
+        assert_eq!(pnpm_location_filter("pkgs/app"), "./pkgs/app");
+        assert_eq!(
+            pnpm_location_filter("pkgs/space app/[test]/quo'te"),
+            "./pkgs/space app/[test]/quo'te"
         );
     }
 
