@@ -713,8 +713,8 @@ impl<L: NodeLock> NpmTool<L> {
     /// EXACT per-package target, then report the full before/after lock diff — the proven cargo/go
     /// pattern ported to pnpm.
     ///
-    /// One `pnpm update <pkg>@<target> … --lockfile-only --no-save --config.minimumReleaseAge=<minutes>`
-    /// jointly re-resolves every importer, settling mutually-exclusive peer conflicts at a single fixed
+    /// One importer-filtered `pnpm update <pkg>@<target> … --lockfile-only --no-save` jointly
+    /// re-resolves the affected graph, settling mutually-exclusive peer conflicts at a single fixed
     /// point instead of ping-ponging between per-package updates. Each `<pkg>@<target>` is the
     /// candidate's own `change.to`, computed by cooldown-core under that package's window, so a package
     /// with a *stricter* per-package window lands at its older per-package target rather than
@@ -837,8 +837,8 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Build the per-candidate pins, widen the manifests the exact pins need, then run the single
-    /// joint `--recursive` resolve.
+    /// Build the per-candidate pins, widen the manifests the exact pins need, then run one joint
+    /// resolve filtered to the declaring importers.
     ///
     /// A candidate held at a single version across the workspace is **exact-pinned** to its
     /// per-package target (`name@target`): the resolve lands it at exactly that version, honoring a
@@ -856,8 +856,9 @@ impl<L: NodeLock> NpmTool<L> {
     /// candidate back into range and breaks the fixed point. A multi-version candidate is never widened
     /// — widening would let it cross its own range boundary, the very line we are preserving.
     ///
-    /// `--recursive` is what makes the resolve span the whole workspace: a bare `pnpm update` at the
-    /// root only re-pins root-declared dependencies, so a candidate a member declares would never move.
+    /// Each declaring member becomes a pnpm filter. This reaches root and member importers without
+    /// running the update in unrelated workspace packages, where an unmatched package selector can
+    /// otherwise make pnpm update unrelated direct dependencies.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
@@ -866,6 +867,8 @@ impl<L: NodeLock> NpmTool<L> {
         window_minutes: Option<i64>,
     ) -> Result<()> {
         let mut pins: Vec<(String, String)> = Vec::with_capacity(plan.changes.len());
+        let mut filters = BTreeSet::new();
+        let mut all_pins_have_filters = true;
         for change in &plan.changes {
             let name = change.package.name.clone();
             if multi_version.contains(&name) {
@@ -889,12 +892,32 @@ impl<L: NodeLock> NpmTool<L> {
                     change.to.as_str(),
                 )?;
             }
+            if change.members.is_empty() {
+                all_pins_have_filters = false;
+            }
+            for member in &change.members {
+                if member.path == "." {
+                    if member.name == "." {
+                        all_pins_have_filters = false;
+                    } else {
+                        filters.insert(member.name.clone());
+                    }
+                } else {
+                    filters.insert(format!("./{}", member.path));
+                }
+            }
             pins.push((name, change.to.as_str().to_string()));
         }
         if pins.is_empty() {
             return Ok(());
         }
-        self.joint_resolve(project, &pins, window_minutes).await?;
+        let filters: Vec<String> = if all_pins_have_filters {
+            filters.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        self.joint_resolve(project, &pins, &filters, window_minutes)
+            .await?;
         // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
         // still left short of its target is blocked by *another* package's requirement (a peer
         // conflict), which widening its own declared range cannot resolve — the lock diff reports it
@@ -906,9 +929,10 @@ impl<L: NodeLock> NpmTool<L> {
         &self,
         project: &Project,
         pins: &[(String, String)],
+        filters: &[String],
         window_minutes: Option<i64>,
     ) -> Result<()> {
-        let Some(args) = L::whole_graph_args(pins, window_minutes) else {
+        let Some(args) = L::whole_graph_args(pins, filters, window_minutes) else {
             return Ok(());
         };
         self.cmd.run(&project.root, &args).await
@@ -1283,9 +1307,8 @@ mod tests {
         // drag in.
         // Each exact pin becomes `name@target`. Multi-version candidates stay out of this command
         // before construction because bare `pnpm update <name>` can write an out-of-range lock entry
-        // while `--no-save` leaves the manifest unchanged. `--recursive` so a candidate a workspace
-        // member declares (not the root `package.json`) is actually re-pinned; a bare `pnpm update` at
-        // the root would skip it.
+        // while `--no-save` leaves the manifest unchanged. Importer filters cover both root and member
+        // declarations without running the command in unrelated workspace packages.
         let pins = vec![
             ("eslint".to_string(), "9.5.0".to_string()),
             (
@@ -1293,11 +1316,18 @@ mod tests {
                 "8.0.0".to_string(),
             ),
         ];
+        let filters = vec![
+            "cooldown-workspace".to_string(),
+            "./packages/app".to_string(),
+        ];
         assert_eq!(
-            Pnpm::whole_graph_args(&pins, Some(20160)),
+            Pnpm::whole_graph_args(&pins, &filters, Some(20160)),
             Some(vec![
+                "--filter".to_string(),
+                "cooldown-workspace".to_string(),
+                "--filter".to_string(),
+                "./packages/app".to_string(),
                 "update".to_string(),
-                "--recursive".to_string(),
                 "eslint@9.5.0".to_string(),
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
                 "--lockfile-only".to_string(),
@@ -1305,13 +1335,19 @@ mod tests {
                 "--config.minimumReleaseAge=20160".to_string(),
             ])
         );
-        assert_eq!(Pnpm::whole_graph_args(&[], None), None);
+        assert_eq!(Pnpm::whole_graph_args(&[], &filters, None), None);
         // npm/yarn/bun have no joint resolve, so they keep the per-package path.
         assert!(!Npm::supports_whole_graph_resolve());
         assert!(Pnpm::supports_whole_graph_resolve());
-        assert_eq!(Npm::whole_graph_args(&pins, Some(20160)), None);
-        assert_eq!(crate::lock::Yarn::whole_graph_args(&pins, None), None);
-        assert_eq!(crate::lock::Bun::whole_graph_args(&[], None), None);
+        assert_eq!(Npm::whole_graph_args(&pins, &filters, Some(20160)), None);
+        assert_eq!(
+            crate::lock::Yarn::whole_graph_args(&pins, &filters, None),
+            None
+        );
+        assert_eq!(
+            crate::lock::Bun::whole_graph_args(&[], &filters, None),
+            None
+        );
     }
 
     #[test]

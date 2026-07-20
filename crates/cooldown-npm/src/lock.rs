@@ -74,11 +74,11 @@ pub trait NodeLock: Send + Sync + 'static {
     /// Whether this manager re-resolves the whole importer graph jointly in a single pass, so cooldown
     /// drives the whole-graph re-resolve/diff path rather than the per-package relock loop.
     ///
-    /// Only pnpm does: one `pnpm update <pkg>@<target> … --lockfile-only --config.minimumReleaseAge=<m>`
-    /// re-resolves the entire importer graph at once — direct *and* transitive — pinning each planned
-    /// candidate to its exact per-package target, the prerequisite for settling mutually-exclusive peer
-    /// conflicts at a single fixed point instead of ping-ponging between per-package pins. npm/yarn/bun
-    /// have no equivalent joint resolve, so they keep the per-package relock path.
+    /// Only pnpm does: one filtered `pnpm update <pkg>@<target> …` re-resolves the selected importer
+    /// graph at once — direct *and* transitive — pinning each planned candidate to its exact
+    /// per-package target. This is the prerequisite for settling mutually-exclusive peer conflicts
+    /// at a single fixed point instead of ping-ponging between per-package pins. npm/yarn/bun have no
+    /// equivalent joint resolve, so they keep the per-package relock path.
     #[must_use]
     fn supports_whole_graph_resolve() -> bool {
         false
@@ -86,8 +86,10 @@ pub trait NodeLock: Send + Sync + 'static {
 
     /// The single command that re-resolves the whole graph under cooldown's window, pinning each
     /// eligible candidate to its exact per-package target — pnpm's
-    /// `update <pkg>@<target> … --lockfile-only --no-save --config.minimumReleaseAge=<minutes>`
-    /// (the forward `upgrade` and the `fix` rollback both pass their `change.to` targets).
+    /// `update <pkg>@<target> … --lockfile-only --no-save` (the forward `upgrade` and the `fix`
+    /// rollback both pass their `change.to` targets). `filters` selects only importers that declare a
+    /// planned candidate; an empty list falls back to recursive resolution when importer attribution
+    /// is unavailable.
     ///
     /// Each `pin` is `(name, target)`: the per-package target the core computed for that candidate's
     /// own window. The resolve lands it at exactly that version, never overshooting a package whose
@@ -105,6 +107,7 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn whole_graph_args(
         _pins: &[(String, String)],
+        _filters: &[String],
         _window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         None
@@ -434,6 +437,7 @@ impl NodeLock for Pnpm {
 
     fn whole_graph_args(
         pins: &[(String, String)],
+        filters: &[String],
         window_minutes: Option<i64>,
     ) -> Option<Vec<String>> {
         // `pnpm update <name>@<target> …` pins each planned candidate to its EXACT per-package target
@@ -442,11 +446,10 @@ impl NodeLock for Pnpm {
         // global-window-newest (the gap a bare `--latest` left). `--no-save` keeps `package.json` ranges
         // as the author wrote them (the caller widens an out-of-range manifest itself first);
         // `--lockfile-only` skips `node_modules`.
-        // `--recursive` is mandatory in a workspace: a bare `pnpm update <name>@<target>` run at the
-        // workspace root only re-pins dependencies the ROOT `package.json` declares, leaving every
-        // member-declared dependency untouched — so a candidate owned by a member never moves in the
-        // lock and the diff reports it falsely held. `--recursive` re-pins the candidate across every
-        // importer that declares it (the root and all members), which is the whole-graph resolve we want.
+        // A recursive update runs in importers that declare none of the requested packages, where pnpm
+        // treats the unmatched request like an unscoped update and moves unrelated direct dependencies.
+        // Filters restrict the command to the importers known to declare at least one planned pin. The
+        // recursive fallback is reserved for graph-only changes with no declaring-member attribution.
         // `minimumReleaseAge` stays as the *transitive* floor — a fresh transitive the pins drag in is
         // capped to the project-default window, so the uniform-window case lands the same lock as
         // before. Transitives floated past the window are reconciled down by the caller's
@@ -454,7 +457,15 @@ impl NodeLock for Pnpm {
         if pins.is_empty() {
             return None;
         }
-        let mut args = vec!["update".to_string(), "--recursive".to_string()];
+        let mut args = Vec::new();
+        for filter in filters {
+            args.push("--filter".to_string());
+            args.push(filter.clone());
+        }
+        args.push("update".to_string());
+        if filters.is_empty() {
+            args.push("--recursive".to_string());
+        }
         for (name, target) in pins {
             args.push(format!("{name}@{target}"));
         }

@@ -1,9 +1,9 @@
 //! End-to-end convergence tests that drive the REAL `pnpm` resolver against fixtures generated on
 //! the fly in temp dirs. These guard the pnpm adapter's whole-graph re-resolve: the adapter pins each
-//! eligible candidate to cooldown's exact target in one joint recursive update, then builds the report
-//! from the full before/after `pnpm-lock.yaml` diff. So a candidate can never silently move another
-//! package, mutually-exclusive peers settle at a single fixed point, and a converged graph re-applies
-//! to a byte-stable lock.
+//! eligible candidate to cooldown's exact target in one joint importer-filtered update, then builds
+//! the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can never silently
+//! move another package, mutually-exclusive peers settle at a single fixed point, and a converged
+//! graph re-applies to a byte-stable lock.
 //!
 //! # The old bug
 //!
@@ -511,6 +511,18 @@ const WORKSPACE_ROOT_PACKAGE_JSON: &str = r#"{
 }
 "#;
 
+/// A workspace root that alone declares `eslint`, so cooldown must select the root importer without
+/// running the update in unrelated members.
+const WORKSPACE_ROOT_DEP_PACKAGE_JSON: &str = r#"{
+  "name": "cooldown-pnpm-workspace-root-dep",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "eslint": "^9.0.0"
+  }
+}
+"#;
+
 const WORKSPACE_YAML: &str = "packages:\n  - \"pkgs/*\"\n";
 
 /// The member that actually declares `eslint`. Seeded on the old 9.0.0 line (a clear forward move to
@@ -520,6 +532,18 @@ const WORKSPACE_MEMBER_PACKAGE_JSON: &str = r#"{
   "version": "0.1.0",
   "dependencies": {
     "eslint": "^9.0.0"
+  }
+}
+"#;
+
+/// An unrelated member held on the `vite` v4 line while v5 is available at the target cutoff. A
+/// broad recursive update can force it across the declared range and make the lock inconsistent.
+const WORKSPACE_UNRELATED_MEMBER_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/unrelated",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "vite": "^4.0.0"
   }
 }
 "#;
@@ -534,6 +558,60 @@ fn workspace_member_fixture() -> Fixture {
     // freeze whose newest matured eslint is 9.5.0 — a forward move the upgrade must land.
     seed_lock(&fixture, PERPKG_SEED);
     fixture
+}
+
+fn workspace_root_dependency_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", WORKSPACE_ROOT_DEP_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write(
+        "pkgs/unrelated/package.json",
+        WORKSPACE_UNRELATED_MEMBER_PACKAGE_JSON,
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, PERPKG_SEED);
+    fixture
+}
+
+#[test]
+fn upgrade_moves_a_root_declared_dependency_in_a_workspace() {
+    skip_if_missing!("pnpm");
+    let fixture = workspace_root_dependency_fixture();
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", PERPKG_PROJECT_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", PERPKG_PROJECT_FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+
+    // The adapter must select the root importer explicitly so a successful resolver invocation
+    // cannot leave this root-only dependency unchanged.
+    assert!(
+        upgrade.applied_names().contains("eslint"),
+        "root-declared eslint must be upgraded\napplied={:?}\nheld={:?}",
+        upgrade.applied_names(),
+        upgrade.held_conflict_names()
+    );
+    let (from, to) = upgrade
+        .change_for("eslint")
+        .expect("eslint should be in the report");
+    assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
+    assert!(
+        to.starts_with("9.") && to != "9.0.0",
+        "root eslint must move forward within its major, got {to}"
+    );
+
+    // Reading the lock independently proves the reported application reached the root importer.
+    let pins = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        pins.get("eslint").map(String::as_str),
+        Some(to.as_str()),
+        "the lock must hold the root's eslint at the reported target {to}"
+    );
 }
 
 #[test]
