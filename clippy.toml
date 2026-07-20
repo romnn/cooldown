@@ -9,3 +9,7 @@ allow-indexing-slicing-in-tests = true
 # Proper nouns that look like code identifiers but should not be backticked in docs.
 # `..` appends to clippy's built-in list (GitHub, PyTorch, …) rather than replacing it.
 doc-valid-idents = ["PyPI", "GOPROXY", "PEP", ".."]
+
+disallowed-macros = [
+  { path = "std::dbg", reason = "remove before commit" },
+]
