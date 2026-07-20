@@ -9,10 +9,16 @@ on:
 
 env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_AUTO_INSTALL: "0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -45,21 +51,9 @@ jobs:
       - name: Lint (all feature combinations × targets)
         run: task lint:fc --output group --output-group-error-only
 
-  goreleaser:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
-        with:
-          install: false
-          cache: true
-          env: false
-      - run: mise install goreleaser
-      - name: Check goreleaser config
-        run: goreleaser check
-
   spellcheck:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
