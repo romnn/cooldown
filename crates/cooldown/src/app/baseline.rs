@@ -177,6 +177,8 @@ impl crate::app::Workspace {
 
         let mut entries = Vec::new();
         for pctx in self.scoped_projects(opts) {
+            let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+            opts.progress.phase("resolving dependency graph");
             let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
@@ -188,7 +190,7 @@ impl crate::app::Workspace {
             // Route through the cache-backed fetch — the only locked-release path — so a package
             // shared with other commands/projects this run is not re-fetched.
             let fetched = self
-                .fetch_locked_releases(adapter, deps, &fctx, opts.fanout())
+                .fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout())
                 .await;
 
             for (dep, result) in fetched {

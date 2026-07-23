@@ -64,6 +64,13 @@ impl<'a> ExplainService<'a> {
             };
         };
 
+        let _progress = self
+            .opts
+            .progress
+            .project(pctx.tool, pctx.rel_path.as_str());
+        self.opts
+            .progress
+            .phase(format!("resolving dependency context for {pkg}"));
         let registry = self.registry_of(pctx, pkg).await;
         let q = ResolveQuery {
             tool: pctx.tool,
@@ -109,6 +116,11 @@ impl<'a> ExplainService<'a> {
     fn config(&self) -> ConfigOutcome {
         let mut items: Vec<ConfigItem> = Vec::new();
         for pctx in self.ws.scoped_projects(self.opts) {
+            let _progress = self
+                .opts
+                .progress
+                .project(pctx.tool, pctx.rel_path.as_str());
+            self.opts.progress.phase("resolving effective policy");
             let q = ResolveQuery {
                 tool: pctx.tool,
                 package: "",

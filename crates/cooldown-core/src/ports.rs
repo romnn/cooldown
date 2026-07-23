@@ -9,8 +9,9 @@
 
 use crate::error::Result;
 use crate::model::{
-    ApplyReport, ArtifactId, CandidateScope, DepScope, Dependency, FetchContext, LockVerifyReport,
-    Plan, Project, ProjectMarker, Release, ToolId, UpdateKind, VerifyReport, Version,
+    ApplyReport, ArtifactId, CandidateScope, Change, DepScope, Dependency, FetchContext,
+    LockVerifyReport, Plan, Project, ProjectMarker, Release, ToolId, UpdateKind, VerifyReport,
+    Version,
 };
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
@@ -202,6 +203,21 @@ pub trait ReleaseFetcher: Send + Sync {
     /// publish instant cannot be resolved.
     async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release>;
 
+    /// Derives the locked release from a candidate response when both registry operations are
+    /// semantically equivalent.
+    ///
+    /// The default returns `None`: artifact- or project-sensitive registries may need a distinct
+    /// lookup even when the candidate list contains the locked version. A registry adapter should
+    /// opt in only when it can construct exactly the value [`locked_release`](Self::locked_release)
+    /// would return, allowing the application cache to avoid the duplicate lookup.
+    fn locked_release_from_candidates(
+        &self,
+        _dep: &Dependency,
+        _releases: &[Release],
+    ) -> Option<Release> {
+        None
+    }
+
     /// Whether this fetcher's results depend on the *asking project* (its lockfile, module graph, or
     /// resolved environment) rather than being a pure function of the package and version.
     ///
@@ -215,6 +231,18 @@ pub trait ReleaseFetcher: Send + Sync {
         false
     }
 }
+
+/// Observes candidate-level work hidden inside a tool's logical apply operation.
+pub trait ApplyObserver: Send + Sync {
+    /// Reports the candidate whose native resolver operation is about to start.
+    ///
+    /// Batch-oriented adapters may leave this at its no-op default. Adapters that expand one
+    /// logical plan into sequential native commands should call it immediately before each command
+    /// so an application can expose the otherwise-hidden current candidate.
+    fn candidate_started(&self, _change: &Change) {}
+}
+
+impl ApplyObserver for () {}
 
 /// The mutation-side port for tools that can rewrite project state.
 ///
@@ -260,6 +288,25 @@ pub trait ToolWrite: Send + Sync {
         plan: &Plan,
         journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport>;
+
+    /// Applies `plan` while reporting sequential native candidate work through `observer`.
+    ///
+    /// The default delegates to [`apply`](ToolWrite::apply), which is correct for adapters that run
+    /// one native command for the whole plan. An adapter that internally invokes its resolver once
+    /// per candidate should override this method and notify the observer before each invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`apply`](ToolWrite::apply).
+    async fn apply_with_observer(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        _observer: &dyn ApplyObserver,
+    ) -> Result<ApplyReport> {
+        self.apply(project, plan, journal).await
+    }
 
     /// Opt-in compile/sync after re-locking (the `--build` step).
     ///

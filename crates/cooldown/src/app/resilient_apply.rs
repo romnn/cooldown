@@ -6,40 +6,55 @@
 //! that produces a stale lock — the whole command fails and the adapter's `apply` returns an error.
 //! Reporting that as "every candidate is held" is wrong: one bad candidate would block every other.
 //!
-//! [`apply_resilient`] wraps `apply` so that, on such a failure, it isolates the offending candidates
-//! by **delta-debugging partitioning** (the ddmin idea) and applies the maximal satisfiable subset,
-//! reporting only the genuine culprits as held. The oracle is the tool's own `apply` (async, and it
-//! mutates the project), so each trial restores the caller-provided journal first; a generic
-//! binary-search/delta-debugging crate cannot drive that side-effecting async oracle, so the small
-//! partitioning loop lives here. The happy path — the whole set resolves — is a single `apply` with
-//! no extra cost, and the per-package managers (npm/yarn/bun), which never fail atomically, always
-//! take it.
+//! [`apply_resilient_with_observer`] wraps `apply` so that, on such a failure, it isolates the
+//! offending candidates by **delta-debugging partitioning** (the ddmin idea) and applies the maximal
+//! satisfiable subset, reporting only the genuine culprits as held. The oracle is the tool's own
+//! `apply` (async, and it mutates the project), so each trial restores the caller-provided journal
+//! first; a generic binary-search/delta-debugging crate cannot drive that side-effecting async
+//! oracle, so the small partitioning loop lives here. The happy path — the whole set resolves — is a
+//! single `apply` with no extra cost, and the per-package managers (npm/yarn/bun), which never fail
+//! atomically, always take it.
 
 use std::collections::HashSet;
 
 use cooldown_core::{
-    ApplyReport, Change, Plan, Project, ProjectMutationJournal, Result, SkipReason, Skipped,
-    ToolWrite,
+    ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal, Result, SkipReason,
+    Skipped, ToolWrite,
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
 
-/// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the
-/// candidates that actually make the set unsatisfiable.
-///
-/// Returns the committed [`ApplyReport`]: the applied changes (plus any the resolve genuinely held)
-/// and, appended, every candidate the recovery dropped — so one unfetchable or conflicting candidate
-/// never blocks the rest. A local environment failure (missing binary, read-only tree, full disk) is
-/// not a candidate conflict and propagates unchanged. `journal` is the caller's pre-apply snapshot;
-/// it is restored before each recovery trial and before the final commit, so no partial widen or lock
-/// leaks.
-pub(crate) async fn apply_resilient(
+#[cfg(test)]
+async fn apply_resilient(
     writer: &dyn ToolWrite,
     project: &Project,
     plan: &Plan,
     journal: &ProjectMutationJournal,
 ) -> Result<ApplyReport> {
-    match writer.apply(project, plan, journal).await {
+    apply_resilient_with_observer(writer, project, plan, journal, &()).await
+}
+
+/// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the
+/// candidates that actually make the set unsatisfiable.
+///
+/// Returns the committed [`ApplyReport`]: the applied changes (plus any the resolve genuinely held)
+/// and, appended, every candidate the recovery dropped — so one unfetchable or conflicting
+/// candidate never blocks the rest. A local environment failure (missing binary, read-only tree,
+/// full disk) is not a candidate conflict and propagates unchanged. `journal` is the caller's
+/// pre-apply snapshot; it is restored before each recovery trial and before the final commit, so no
+/// partial widen or lock leaks. Native candidate work is forwarded to `observer` across both the
+/// first attempt and any recovery trials.
+pub(crate) async fn apply_resilient_with_observer(
+    writer: &dyn ToolWrite,
+    project: &Project,
+    plan: &Plan,
+    journal: &ProjectMutationJournal,
+    observer: &dyn ApplyObserver,
+) -> Result<ApplyReport> {
+    match writer
+        .apply_with_observer(project, plan, journal, observer)
+        .await
+    {
         Ok(report) => return Ok(report),
         // A broken local environment (missing binary, full disk, read-only tree, corrupt store, an
         // unreadable lock) is not a per-candidate conflict — propagate it rather than bisecting the
@@ -49,8 +64,15 @@ pub(crate) async fn apply_resilient(
         Err(_) => {}
     }
 
-    let accepted =
-        maximal_satisfiable_subset(writer, project, &plan.changes, plan.rewrite, journal).await?;
+    let accepted = maximal_satisfiable_subset(
+        writer,
+        project,
+        &plan.changes,
+        plan.rewrite,
+        journal,
+        observer,
+    )
+    .await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
@@ -65,7 +87,9 @@ pub(crate) async fn apply_resilient(
             changes: accepted,
             rewrite: plan.rewrite,
         };
-        writer.apply(project, &committed, journal).await?
+        writer
+            .apply_with_observer(project, &committed, journal, observer)
+            .await?
     };
 
     // Every candidate the subset excluded is held: the resolve could not place it.
@@ -93,6 +117,7 @@ async fn maximal_satisfiable_subset(
     changes: &[Change],
     rewrite: cooldown_core::RewriteMode,
     journal: &ProjectMutationJournal,
+    observer: &dyn ApplyObserver,
 ) -> Result<Vec<Change>> {
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
@@ -104,7 +129,10 @@ async fn maximal_satisfiable_subset(
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
             rewrite,
         };
-        match writer.apply(project, &trial, journal).await {
+        match writer
+            .apply_with_observer(project, &trial, journal, observer)
+            .await
+        {
             Ok(_) => accepted.extend(group),
             // A broken local environment surfacing mid-recovery must propagate, not be charged to
             // whichever candidates happen to be in this trial group.
@@ -141,11 +169,12 @@ fn held(change: &Change) -> Skipped {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_resilient;
+    use super::{apply_resilient, apply_resilient_with_observer};
     use async_trait::async_trait;
     use cooldown_core::{
-        ApplyReport, Change, CoreError, PackageId, Plan, Project, ProjectMutationJournal, Result,
-        RewriteMode, ToolId, ToolTermination, ToolWrite, UpdateKind, VerifyReport, Version,
+        ApplyObserver, ApplyReport, Change, CoreError, PackageId, Plan, Project,
+        ProjectMutationJournal, Result, RewriteMode, ToolId, ToolTermination, ToolWrite,
+        UpdateKind, VerifyReport, Version,
     };
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -302,6 +331,19 @@ mod tests {
             }
         }
 
+        async fn apply_with_observer(
+            &self,
+            project: &Project,
+            plan: &Plan,
+            journal: &ProjectMutationJournal,
+            observer: &dyn ApplyObserver,
+        ) -> Result<ApplyReport> {
+            for change in &plan.changes {
+                observer.candidate_started(change);
+            }
+            self.apply(project, plan, journal).await
+        }
+
         async fn build(&self, _project: &Project) -> Result<VerifyReport> {
             Ok(VerifyReport {
                 ok: true,
@@ -348,6 +390,29 @@ mod tests {
         assert_eq!(names(&report.applied), names(&plan.changes));
         assert!(report.skipped.is_empty());
         assert_eq!(writer.apply_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_apply_forwards_every_native_candidate() {
+        struct Counter(AtomicUsize);
+
+        impl ApplyObserver for Counter {
+            fn candidate_started(&self, _change: &Change) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let writer = MockWriter::new(|_| true);
+        let observer = Counter(AtomicUsize::new(0));
+        let (_dir, project) = temp_project();
+        let plan = plan(&["a", "b", "c"]);
+        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
+
+        apply_resilient_with_observer(&writer, &project, &plan, &journal, &observer)
+            .await
+            .unwrap();
+
+        assert_eq!(observer.0.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

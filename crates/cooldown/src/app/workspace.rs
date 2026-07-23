@@ -1,6 +1,7 @@
 use super::Window;
 use super::baseline::Baseline;
 use super::lock::ProjectLock;
+use super::progress::Progress;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::Utf8PathBuf;
@@ -12,7 +13,6 @@ use cooldown_core::{
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::sync::Arc;
 
 /// Per-project context: which tool, the detected project, its path relative to the repo root
@@ -89,36 +89,6 @@ impl Exit {
     #[must_use]
     pub fn is_ok(self) -> bool {
         self == Exit::Ok
-    }
-}
-
-/// Where human-facing progress notes go while a slow command runs (detection, registry fan-out).
-///
-/// These are coarse "still working" lines, not the structured `tracing` log: they exist so a plain
-/// `cooldown outdated` isn't silent for ten seconds. They are suppressed entirely when `--log-level`
-/// is on (the log already narrates progress) and otherwise routed to stderr so stdout stays the
-/// command report in every output mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Progress {
-    /// Emit to stderr.
-    Stderr,
-    /// Emit nothing (`--log-level` is on, so `tracing` covers it).
-    #[default]
-    Silent,
-}
-
-impl Progress {
-    /// Print one progress note to the configured stream (a no-op when [`Progress::Silent`]).
-    pub fn say(self, message: &str) {
-        let result = match self {
-            Progress::Stderr => writeln!(std::io::stderr().lock(), "{message}"),
-            Progress::Silent => return,
-        };
-        if let Err(error) = result
-            && error.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            tracing::debug!(error = %error, "could not write progress message");
-        }
     }
 }
 
@@ -233,7 +203,7 @@ pub struct RunOpts {
     pub no_suggestions: bool,
     /// `--json`: machine-readable output (never changes the exit code).
     pub json: bool,
-    /// Where coarse progress notes go while the command runs.
+    /// Human-facing progress while the command runs; defaults to silent for embedded callers.
     pub progress: Progress,
     /// Concurrency for registry fan-out.
     pub concurrency: usize,
@@ -511,7 +481,6 @@ impl Workspace {
         &self,
         pctx: &ProjectCtx,
         opts: &RunOpts,
-        project_label: &str,
     ) -> cooldown_core::Result<Option<LockVerifyReport>> {
         if !opts.lock || opts.dry_run {
             return Ok(None);
@@ -522,10 +491,7 @@ impl Workspace {
         if !writer.supports_lock_refresh() {
             return Ok(None);
         }
-        opts.progress.say(&format!(
-            "Refreshing lock in {} ({})…",
-            project_label, pctx.tool
-        ));
+        opts.progress.phase("refreshing lock state");
         let _guard = ProjectLock::acquire(&pctx.project.root)?;
         writer.refresh_lock(&pctx.project).await
     }
@@ -539,6 +505,12 @@ impl Workspace {
             .iter()
             .filter(move |project| opts.tool.is_empty() || opts.tool.contains(&project.tool))
             .filter(move |project| Self::project_in_source_scope(project, opts))
+    }
+
+    pub(crate) fn progress_projects(&self, opts: &RunOpts) -> Vec<(ToolId, String)> {
+        self.scoped_projects(opts)
+            .map(|project| (project.tool, project.rel_path.to_string()))
+            .collect()
     }
 
     pub(crate) fn package_in_scope(opts: &RunOpts, name: &str) -> bool {
@@ -692,19 +664,26 @@ impl Workspace {
         adapter: &dyn ToolRead,
         deps: Vec<Dependency>,
         fetch: &FetchContext<'_>,
+        progress: &Progress,
         fanout: usize,
     ) -> Vec<(Dependency, cooldown_core::Result<Release>)> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
         };
+        progress.packages(deps.len(), "fetching locked release metadata");
         let results = stream::iter(deps)
-            .map(|dep| async move {
-                let result = self
-                    .release_cache
-                    .locked_release(fetcher, &dep, fetch)
-                    .await;
-                (dep, result)
+            .map(|dep| {
+                let progress = progress.clone();
+                async move {
+                    progress.package_started(&dep.package.name);
+                    let result = self
+                        .release_cache
+                        .locked_release(fetcher, &dep, fetch)
+                        .await;
+                    progress.package_finished(&dep.package.name);
+                    (dep, result)
+                }
             })
             .buffer_unordered(fanout)
             .collect()
@@ -726,19 +705,26 @@ impl Workspace {
         deps: Vec<Dependency>,
         fetch: &FetchContext<'_>,
         candidate_scope: CandidateScope,
+        progress: &Progress,
         fanout: usize,
     ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
         };
+        progress.packages(deps.len(), "fetching release metadata");
         let results = stream::iter(deps)
-            .map(|dep| async move {
-                let result = self
-                    .release_cache
-                    .candidate_releases(fetcher, &dep, fetch, candidate_scope)
-                    .await;
-                (dep, result)
+            .map(|dep| {
+                let progress = progress.clone();
+                async move {
+                    progress.package_started(&dep.package.name);
+                    let result = self
+                        .release_cache
+                        .candidate_releases(fetcher, &dep, fetch, candidate_scope)
+                        .await;
+                    progress.package_finished(&dep.package.name);
+                    (dep, result)
+                }
             })
             .buffer_unordered(fanout)
             .collect()

@@ -74,6 +74,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let color = global.color.resolve(opts.json);
 
     if ws.is_empty() {
+        opts.progress.finish_run();
         let workdir = global.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
         if opts.json {
             super::output::stdout_line(&commands::no_tool_json(command_name(&cli.command))?)?;
@@ -84,6 +85,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     }
 
     if requires_tool_match(&cli.command) && !tool_matches_project(&ws, &opts) {
+        opts.progress.finish_run();
         return Err(CoreError::Config(
             "--tool matched no detected project in scope".to_string(),
         ));
@@ -95,11 +97,12 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     if global.sync && !opts.dry_run && pre_syncs(&cli.command) {
         let synced = ws.sync(&opts).await;
         if !synced.exit.is_ok() {
+            opts.progress.finish_run();
             eprintln!("sync failed before {}", command_name(&cli.command));
             return Ok(synced.exit);
         }
         if synced.summary.written > 0 {
-            opts.progress.say(&format!(
+            opts.progress.phase(format!(
                 "synced policy into {} native config(s)",
                 synced.summary.written
             ));
@@ -107,7 +110,12 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     }
 
     let generated_at = generated_at(ws.now());
-    commands::dispatch(
+    let mut progress_projects = ws.progress_projects(&opts);
+    if matches!(cli.command, Command::Explain { .. }) {
+        progress_projects.truncate(1);
+    }
+    opts.progress.start_run(&progress_projects);
+    let result = commands::dispatch(
         cli.command,
         commands::CommandContext {
             ws: &ws,
@@ -117,7 +125,9 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
             generated_at: &generated_at,
         },
     )
-    .await
+    .await;
+    opts.progress.finish_run();
+    result
 }
 
 /// Whether `--sync` pre-syncs native config before this command (the dependency commands only).

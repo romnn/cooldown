@@ -119,6 +119,12 @@ impl Workspace {
 
         for tool in tools {
             let Some(writer) = self.mutator(tool) else {
+                let _progress: Vec<_> = self
+                    .scoped_projects(opts)
+                    .filter(|project| project.tool == tool)
+                    .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
+                    .collect();
+                opts.progress.phase("checking native policy support");
                 summary.unsupported += 1;
                 items.push(SyncItem {
                     tool: tool.as_str().to_string(),
@@ -134,6 +140,8 @@ impl Workspace {
             match writer.sync_scope() {
                 SyncScope::Project => {
                     for pctx in self.scoped_projects(opts).filter(|pctx| pctx.tool == tool) {
+                        let _progress = opts.progress.project(tool, pctx.rel_path.as_str());
+                        opts.progress.phase("syncing native policy");
                         items.push(
                             self.sync_project(writer, pctx, tool, opts, &mut summary)
                                 .await,
@@ -141,9 +149,21 @@ impl Workspace {
                     }
                 }
                 SyncScope::Repo => {
+                    let _progress: Vec<_> = self
+                        .scoped_projects(opts)
+                        .filter(|project| project.tool == tool)
+                        .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
+                        .collect();
+                    opts.progress.phase("syncing repository-native policy");
                     items.push(self.sync_repo(writer, tool, opts, &mut summary).await);
                 }
                 SyncScope::None => {
+                    let _progress: Vec<_> = self
+                        .scoped_projects(opts)
+                        .filter(|project| project.tool == tool)
+                        .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
+                        .collect();
+                    opts.progress.phase("checking native policy support");
                     summary.unsupported += 1;
                     items.push(SyncItem {
                         tool: tool.as_str().to_string(),

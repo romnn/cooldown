@@ -13,6 +13,7 @@ mod clock;
 mod explain;
 mod lock;
 mod outdated;
+mod progress;
 mod project_copy;
 mod read;
 mod release_cache;
@@ -28,8 +29,9 @@ pub use cooldown_render::{
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
     OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
+pub use progress::Progress;
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
-pub use workspace::{AdapterSet, Exit, Progress, ProjectCtx, RunOpts, TransitiveGate, Workspace};
+pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace};
 
 pub(crate) use workspace::{
     LockReportAction, age_days, diag_from_error, lock_report_outcome, render_window, round2,

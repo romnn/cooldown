@@ -331,13 +331,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
+name = "console"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "unicode-width",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cooldown"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
  "clap",
  "color-eyre",
+ "console",
  "cooldown-adapter-util",
  "cooldown-cargo",
  "cooldown-conda",
@@ -356,6 +369,7 @@ dependencies = [
  "futures",
  "globset",
  "ignore",
+ "indicatif",
  "indoc",
  "jiff",
  "serde",
@@ -369,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-adapter-util"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "camino",
  "cooldown-core",
@@ -379,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-cargo"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -401,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-conda"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -418,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-core"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -433,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-go"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -452,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-hex"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -469,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-maven"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -485,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-npm"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -503,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-pip"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -520,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-registry"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -536,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-render"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "comfy-table",
  "cooldown-core",
@@ -547,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-rubygems"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -563,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-swift"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -581,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-toml-util"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "camino",
  "cooldown-core",
@@ -593,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-uv"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "async-trait",
  "camino",
@@ -710,6 +724,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "equivalent"
@@ -1150,6 +1170,19 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "indicatif"
+version = "0.18.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
+dependencies = [
+ "console",
+ "portable-atomic",
+ "unicode-width",
+ "unit-prefix",
+ "web-time",
 ]
 
 [[package]]
@@ -2358,6 +2391,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unit-prefix"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "unscanny"

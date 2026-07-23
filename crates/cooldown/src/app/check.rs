@@ -114,6 +114,10 @@ impl<'a> CheckRunner<'a> {
 
     async fn run(mut self) -> CheckOutcome {
         for pctx in self.ws.scoped_projects(self.opts) {
+            let _progress = self
+                .opts
+                .progress
+                .project(pctx.tool, pctx.rel_path.as_str());
             self.run_project(pctx).await;
         }
 
@@ -200,15 +204,18 @@ impl<'a> CheckRunner<'a> {
             }
         };
 
-        self.opts.progress.say(&format!(
-            "Checking {} dependencies in {} ({})…",
-            deps.len(),
-            read.project_label,
-            pctx.tool
-        ));
+        self.opts
+            .progress
+            .phase(format!("checking {} resolved dependencies", deps.len()));
         let fetched = self
             .ws
-            .fetch_locked_releases(read.adapter, deps, &read.fetch, self.opts.fanout())
+            .fetch_locked_releases(
+                read.adapter,
+                deps,
+                &read.fetch,
+                &self.opts.progress,
+                self.opts.fanout(),
+            )
             .await;
         for (dep, result) in fetched {
             self.gate_pin(pctx, &read.project_label, &dep, result, &read.resolve);
@@ -236,11 +243,7 @@ impl<'a> CheckRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
     ) -> Option<LockProbe> {
-        match self
-            .ws
-            .refresh_project_lock(pctx, self.opts, project_label)
-            .await
-        {
+        match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(Some(report)) => Some(self.handle_lock_report(report, pctx, project_label)),
             Ok(None) => None,
             Err(err) => Some(self.handle_lock_error(&err, pctx, project_label)),

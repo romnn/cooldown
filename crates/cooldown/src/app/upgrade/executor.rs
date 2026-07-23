@@ -190,6 +190,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     pub(super) async fn run(&mut self) {
+        self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
             return;
         };
@@ -197,12 +198,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             PlanMode::Upgrade => "upgrades",
             PlanMode::Fix { .. } => "downgrades",
         };
-        self.ctx.opts.progress.say(&format!(
-            "Planning {verb} for {} dependencies in {} ({})…",
-            deps.len(),
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
+        self.ctx
+            .opts
+            .progress
+            .phase(format!("planning {verb} for {} dependencies", deps.len()));
 
         let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
             Ok(guard) => guard,
@@ -247,11 +246,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn initial_trial_state(&mut self) -> Option<TrialState> {
-        self.ctx.opts.progress.say(&format!(
-            "Checking current resolved graph cooldown in {} ({})…",
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
+        self.ctx
+            .opts
+            .progress
+            .phase("checking current resolved graph cooldown");
         let baseline_violations = match self.graph_violations().await {
             Ok(violations) => violations.into_keys().collect(),
             Err(error) => {
@@ -284,7 +282,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .into_iter()
             .partition(|change| self.manifest_only.contains(&change.package));
         if !build_changes.is_empty() {
+            self.ctx
+                .opts
+                .progress
+                .candidates(&build_changes, "checking build backend updates");
+            let checked = build_changes.clone();
             let outcome = self.apply_batch(build_changes, state).await;
+            self.ctx.opts.progress.candidates_checked(&checked);
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
         }
@@ -304,6 +308,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// baseline: an infrastructure failure must surface as an error, never as a cooldown skip.
     async fn run_lock_upgrades(&mut self, lock_changes: Vec<Change>, state: &mut TrialState) {
         let baseline_before_lock = state.clone();
+        self.ctx
+            .opts
+            .progress
+            .candidates(&lock_changes, "checking upgrade policy");
         let mut rollback = ProjectMutationJournal::default();
         let initial = self
             .try_upgrade_group(
@@ -315,6 +323,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
         match initial {
             UpgradeTrialResult::Settled(outcomes) => {
+                self.ctx.opts.progress.candidates_checked(&lock_changes);
                 self.merge_batch_outcomes(outcomes);
                 self.collapse_collateral(&baseline_before_lock.baseline_violations);
                 return;
@@ -338,6 +347,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 // A singleton batch has nothing to isolate: the lone candidate is the culprit.
                 if lock_changes.len() == 1 {
+                    self.ctx.opts.progress.candidates_checked(&lock_changes);
                     self.record_unreconciled_skips(&lock_changes, &violations);
                     self.collapse_collateral(&baseline_before_lock.baseline_violations);
                     return;
@@ -414,6 +424,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
                         return UpgradeSelectionResult::Aborted(outcome);
                     }
+                    self.ctx.opts.progress.candidates_checked(&group);
                     accepted.extend(group);
                 }
                 UpgradeTrialResult::PolicyBlocked(violations) => {
@@ -424,6 +435,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     if group.len() > 1 {
                         push_upgrade_halves(&mut work, group);
                     } else {
+                        self.ctx.opts.progress.candidates_checked(&group);
                         rejected
                             .extend(group.into_iter().map(|change| (change, violations.clone())));
                     }
@@ -453,6 +465,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
         rollback: &mut ProjectMutationJournal,
     ) {
+        self.ctx
+            .opts
+            .progress
+            .phase("replaying verified candidates from baseline");
         match self
             .try_upgrade_group(
                 accepted.clone(),
@@ -673,11 +689,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
-        self.ctx.opts.progress.say(&format!(
-            "Fetching release metadata for {} upgrade candidate(s) in {} ({})…",
-            deps.len(),
-            self.project_label(),
-            self.ctx.pctx.tool
+        self.ctx.opts.progress.phase(format!(
+            "fetching metadata for {} upgrade candidates",
+            deps.len()
         ));
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
@@ -688,6 +702,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 deps.to_vec(),
                 &fctx,
                 self.ctx.opts.candidate_scope(),
+                &self.ctx.opts.progress,
                 self.ctx.opts.fanout(),
             )
             .await;
@@ -813,11 +828,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         transitive: TransitiveGate,
         downgrade_pinned: bool,
     ) -> FixPlan {
-        self.ctx.opts.progress.say(&format!(
-            "Fetching release metadata for {} cooldown fix candidate(s) in {} ({})…",
-            deps.len(),
-            self.project_label(),
-            self.ctx.pctx.tool
+        self.ctx.opts.progress.phase(format!(
+            "fetching metadata for {} cooldown fix candidates",
+            deps.len()
         ));
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
@@ -828,6 +841,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 deps.to_vec(),
                 &fctx,
                 self.ctx.opts.candidate_scope(),
+                &self.ctx.opts.progress,
                 self.ctx.opts.fanout(),
             )
             .await;
@@ -935,7 +949,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.emit_fix_warnings(warnings);
                 return;
             }
+            self.ctx
+                .opts
+                .progress
+                .candidates(&changes, "checking cooldown fixes");
+            let checked = changes.clone();
             let outcome = self.apply_batch(changes, state).await;
+            self.ctx.opts.progress.candidates_checked(&checked);
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
@@ -971,11 +991,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
         state.reconcile_needed = false;
         for _ in 0..MAX_FIX_ROUNDS {
-            self.ctx.opts.progress.say(&format!(
-                "Reconciling transitive cooldown violations in {} ({})…",
-                self.project_label(),
-                self.ctx.pctx.tool
-            ));
+            self.ctx
+                .opts
+                .progress
+                .phase("reconciling transitive cooldown violations");
             let deps = match self.read_reconcile_deps().await {
                 Ok(deps) => deps,
                 Err(error) => {
@@ -1071,12 +1090,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .first()
             .map(|change| change.package.name.clone())
             .unwrap_or_default();
-        self.ctx.opts.progress.say(&format!(
-            "Applying {} planned change(s) in {} ({})…",
-            changes.len(),
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
+        self.ctx
+            .opts
+            .progress
+            .phase(format!("applying {} planned changes", changes.len()));
+        self.ctx.opts.progress.candidate_group(&changes);
         let journal = match self
             .ctx
             .writer
@@ -1097,11 +1115,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
         // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
         // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
-        let report = match super::super::resilient_apply::apply_resilient(
+        let report = match super::super::resilient_apply::apply_resilient_with_observer(
             self.ctx.writer,
             &self.ctx.pctx.project,
             &plan,
             &journal,
+            &self.ctx.opts.progress,
         )
         .await
         {
@@ -1187,11 +1206,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         applied: &HashSet<ChangeTargetKey>,
         baseline_violations: &HashSet<(String, String)>,
     ) -> Option<CommittedBatch> {
-        self.ctx.opts.progress.say(&format!(
-            "Checking resolved graph cooldown after apply in {} ({})…",
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
+        self.ctx
+            .opts
+            .progress
+            .phase("checking resolved graph cooldown after apply");
         let after = match self.graph_violations().await {
             Ok(after) => after,
             Err(error) => {
@@ -1406,11 +1424,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn finalize(&mut self) {
-        self.ctx.opts.progress.say(&format!(
-            "Verifying lock state in {} ({})…",
-            self.project_label(),
-            self.ctx.pctx.tool
-        ));
+        self.ctx.opts.progress.phase("verifying final lock state");
         match self
             .ctx
             .reader
@@ -1455,6 +1469,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
         if self.ctx.opts.build {
             self.acc.build_requested = true;
+            self.ctx.opts.progress.phase("building updated project");
             match self.ctx.writer.build(&self.ctx.pctx.project).await {
                 Ok(report) => {
                     self.acc.build_ok = Some(self.acc.build_ok.unwrap_or(true) && report.ok);
@@ -1496,7 +1511,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
             .ws
-            .fetch_locked_releases(self.ctx.reader, deps, &fctx, self.ctx.opts.fanout())
+            .fetch_locked_releases(
+                self.ctx.reader,
+                deps,
+                &fctx,
+                &self.ctx.opts.progress,
+                self.ctx.opts.fanout(),
+            )
             .await;
 
         let mut violations = HashMap::new();

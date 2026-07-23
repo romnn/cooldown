@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{build_registry_releases, verify_current_report};
 use cooldown_core::{
-    ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext, LockVerifyReport,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
     Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
     VerifyReport, Version,
@@ -90,6 +90,21 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
         version::classify_kind,
         classify_quality,
     )
+}
+
+fn derive_locked_release(dep: &Dependency, releases: &[Release]) -> Option<Release> {
+    let candidate = releases
+        .iter()
+        .find(|release| release.version == dep.current)?;
+    Some(Release {
+        version: dep.current.clone(),
+        order: ReleaseOrder(Vec::new()),
+        major: version::major_key(dep.current.as_str()),
+        kind_from_current: None,
+        published_at: candidate.published_at,
+        yanked: false,
+        quality: dep.current_quality,
+    })
 }
 
 #[async_trait]
@@ -209,6 +224,14 @@ impl ReleaseFetcher for CargoTool {
             yanked: false,
             quality: dep.current_quality,
         })
+    }
+
+    fn locked_release_from_candidates(
+        &self,
+        dep: &Dependency,
+        releases: &[Release],
+    ) -> Option<Release> {
+        derive_locked_release(dep, releases)
     }
 }
 
@@ -441,7 +464,12 @@ impl CargoTool {
     /// full before/after `Cargo.lock` diff. `upgrade` is informational for the rewrite policy; cargo
     /// has no date cutoff, so every move is expressed as a concrete `--precise` pin computed by the
     /// core. Widening for `Always`/`Auto` happens before pinning so a cross-major target is admitted.
-    async fn whole_graph_resolve(&self, project: &Project, plan: &Plan) -> Result<()> {
+    async fn whole_graph_resolve(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<()> {
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
@@ -455,7 +483,7 @@ impl CargoTool {
                 )?;
             }
         }
-        self.pin_batch(project, &plan.changes).await?;
+        self.pin_batch(project, &plan.changes, observer).await?;
 
         if matches!(plan.rewrite, RewriteMode::Auto) {
             // Widen only the candidates the pin batch could not place at their target because their
@@ -496,7 +524,7 @@ impl CargoTool {
                 if !widened_any {
                     break;
                 }
-                self.pin_batch(project, &short).await?;
+                self.pin_batch(project, &short, observer).await?;
             }
         }
         Ok(())
@@ -512,7 +540,12 @@ impl CargoTool {
     /// node once another pin moved it); passes repeat until one makes no progress or the lock
     /// revisits an earlier state. Resolver rejections remain non-fatal held candidates the final
     /// diff reports; local environment failures abort.
-    async fn pin_batch(&self, project: &Project, changes: &[Change]) -> Result<()> {
+    async fn pin_batch(
+        &self,
+        project: &Project,
+        changes: &[Change],
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<()> {
         // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
         // are one lock move, so issue each distinct spec once, in a deterministic order.
         let mut worklist: Vec<&Change> = changes.iter().collect();
@@ -539,6 +572,9 @@ impl CargoTool {
                     continue;
                 };
                 attempted = true;
+                if let Some(observer) = observer {
+                    observer.candidate_started(change);
+                }
                 self.update_precise(project, &change.package.name, &current, change.to.as_str())
                     .await?;
             }
@@ -571,6 +607,93 @@ impl CargoTool {
             return Err(err);
         }
         Ok(())
+    }
+
+    async fn apply_plan(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        if plan.changes.is_empty() {
+            return Ok(report);
+        }
+
+        // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
+        // the re-resolve). The batched precise pins emit one consistent lock; the report is the diff
+        // of this snapshot against the result, so *every* net version change is surfaced. A
+        // missing/unparsable snapshot leaves `before` empty, so a crate that moved is still reported
+        // (never silent).
+        let before = journal
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new("Cargo.lock"))
+            .and_then(|file| file.contents.as_deref())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|content| CargoLock::parse(content).ok())
+            .map(|lock| locked_versions(&lock))
+            .unwrap_or_default();
+
+        // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
+        // invocation, repeated to a bounded fixed point because one invocation may move a package
+        // another planned pin still needs to address. The diff below surfaces every net move.
+        match self.whole_graph_resolve(project, plan, observer).await {
+            Ok(()) => {}
+            Err(err) if err.is_tool_spawn_failure() => return Err(err),
+            // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
+            // version). Propagate so the caller's `apply_resilient` can isolate the offending
+            // candidate(s) and apply the rest, instead of holding every candidate. Local environment
+            // failures propagate through `apply_resilient` without bisection. The caller restores the
+            // journal, so no partial lock is kept.
+            Err(err) => return Err(err),
+        }
+
+        let after_lock = read_lock(project)?;
+        let after = locked_versions(&after_lock);
+        let crates_io_after = crates_io_locked_versions(&after_lock);
+        // The resolved graph proves direct member changes reached the target and names the crate
+        // whose `=`-pin holds a short candidate back.
+        let needs_graph = plan.changes.iter().any(needs_member_graph);
+        let graph = if needs_graph {
+            Some(self.cargo.metadata(&project.root).await?)
+        } else {
+            self.cargo.metadata(&project.root).await.ok()
+        };
+        // Each planned candidate either reached cooldown's target (its newest-within-window) —
+        // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
+        // transitive won — reported held, naming the blocker.
+        for change in &plan.changes {
+            if reached_after(&crates_io_after, graph.as_ref(), change) {
+                report.applied.push(change.clone());
+            } else {
+                let offender = graph
+                    .as_ref()
+                    .and_then(|graph| {
+                        blocking_requirer(graph, &change.package.name, change.to.as_str())
+                    })
+                    .unwrap_or_else(|| change.package.name.clone());
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::ResolverConflict,
+                    offending: Some(PackageId::new(
+                        CARGO_ID,
+                        offender,
+                        Some(CRATES_IO.to_string()),
+                    )),
+                });
+            }
+        }
+
+        // The hard requirement: no net version change to *any* crate may be omitted. Every moved
+        // slot the applied rows above do not already report is surfaced as its own collateral
+        // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
+        // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
+        // would hide that real move).
+        let collateral = collateral_changes(&before, &after, &report.applied);
+        report.applied.extend(collateral);
+        Ok(report)
     }
 }
 
@@ -658,84 +781,18 @@ impl ToolWrite for CargoTool {
         plan: &Plan,
         journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
-        let mut report = ApplyReport::default();
-        if plan.changes.is_empty() {
-            return Ok(report);
-        }
+        self.apply_plan(project, plan, journal, None).await
+    }
 
-        // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
-        // the re-resolve). The batched precise pins emit one consistent lock; the report is the diff
-        // of this snapshot against the result, so *every* net version change is surfaced. A
-        // missing/unparsable snapshot leaves `before` empty, so a crate that moved is still reported
-        // (never silent).
-        let before = journal
-            .files
-            .iter()
-            .find(|file| file.path == Utf8Path::new("Cargo.lock"))
-            .and_then(|file| file.contents.as_deref())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|content| CargoLock::parse(content).ok())
-            .map(|lock| locked_versions(&lock))
-            .unwrap_or_default();
-
-        // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
-        // invocation, repeated to a bounded fixed point because one invocation may move a package
-        // another planned pin still needs to address. The diff below surfaces every net move.
-        match self.whole_graph_resolve(project, plan).await {
-            Ok(()) => {}
-            Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
-            // version). Propagate so the caller's `apply_resilient` can isolate the offending
-            // candidate(s) and apply the rest, instead of holding every candidate. Local environment
-            // failures propagate through `apply_resilient` without bisection. The caller restores the
-            // journal, so no partial lock is kept.
-            Err(err) => return Err(err),
-        }
-
-        let after_lock = read_lock(project)?;
-        let after = locked_versions(&after_lock);
-        let crates_io_after = crates_io_locked_versions(&after_lock);
-        // The resolved graph proves direct member changes reached the target and names the crate
-        // whose `=`-pin holds a short candidate back.
-        let needs_graph = plan.changes.iter().any(needs_member_graph);
-        let graph = if needs_graph {
-            Some(self.cargo.metadata(&project.root).await?)
-        } else {
-            self.cargo.metadata(&project.root).await.ok()
-        };
-        // Each planned candidate either reached cooldown's target (its newest-within-window) —
-        // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
-        // transitive won — reported held, naming the blocker.
-        for change in &plan.changes {
-            if reached_after(&crates_io_after, graph.as_ref(), change) {
-                report.applied.push(change.clone());
-            } else {
-                let offender = graph
-                    .as_ref()
-                    .and_then(|graph| {
-                        blocking_requirer(graph, &change.package.name, change.to.as_str())
-                    })
-                    .unwrap_or_else(|| change.package.name.clone());
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: Some(PackageId::new(
-                        CARGO_ID,
-                        offender,
-                        Some(CRATES_IO.to_string()),
-                    )),
-                });
-            }
-        }
-
-        // The hard requirement: no net version change to *any* crate may be omitted. Every moved
-        // slot the applied rows above do not already report is surfaced as its own collateral
-        // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
-        // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
-        // would hide that real move).
-        let collateral = collateral_changes(&before, &after, &report.applied);
-        report.applied.extend(collateral);
-        Ok(report)
+    async fn apply_with_observer(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        observer: &dyn ApplyObserver,
+    ) -> Result<ApplyReport> {
+        self.apply_plan(project, plan, journal, Some(observer))
+            .await
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
@@ -774,6 +831,41 @@ mod tests {
             direct: true,
             members: Vec::new(),
         }
+    }
+
+    #[test]
+    fn candidate_metadata_derives_the_same_locked_release_shape() {
+        let published_at = "2026-01-02T03:04:05Z".parse().expect("valid timestamp");
+        let dep = Dependency {
+            package: PackageId::new(CARGO_ID, "serde", Some(CRATES_IO.to_string())),
+            current: Version::new("1.0.200"),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            members: Vec::new(),
+            pinned: false,
+        };
+        let releases = [Release {
+            version: dep.current.clone(),
+            order: ReleaseOrder(vec![42]),
+            major: version::major_key(dep.current.as_str()),
+            kind_from_current: Some(UpdateKind::Patch),
+            published_at: Some(published_at),
+            yanked: true,
+            quality: ReleaseQuality::Prerelease,
+        }];
+
+        let locked = derive_locked_release(&dep, &releases).expect("current release is present");
+
+        assert_eq!(locked.version, dep.current);
+        assert_eq!(locked.order, ReleaseOrder(Vec::new()));
+        assert_eq!(locked.major, version::major_key(dep.current.as_str()));
+        assert_eq!(locked.kind_from_current, None);
+        assert_eq!(locked.published_at, Some(published_at));
+        assert!(!locked.yanked);
+        assert_eq!(locked.quality, dep.current_quality);
     }
 
     #[test]

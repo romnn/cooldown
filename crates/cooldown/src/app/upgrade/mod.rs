@@ -14,8 +14,7 @@ mod executor;
 pub(super) use self::executor::target_package_for;
 use self::executor::{PlanMode, ProjectUpgradeExecutor};
 use super::{
-    BuildInfo, Exit, Progress, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace,
-    diag_from_error,
+    BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
     Change, Diagnostic, DiagnosticKind, LockStatus, PackageId, ToolRead, ToolWrite,
@@ -125,6 +124,7 @@ impl Workspace {
         };
 
         for pctx in self.scoped_projects(opts) {
+            let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
             let Some(reader) = self.adapter(pctx.tool) else {
                 continue;
             };
@@ -143,6 +143,7 @@ impl Workspace {
             let _dry_copy;
             let dry_pctx;
             let effective_pctx = if opts.dry_run {
+                opts.progress.phase("preparing isolated dry-run project");
                 match super::project_copy::ProjectCopy::create(
                     &pctx.project,
                     &writer.resolve_inputs(),
@@ -267,7 +268,6 @@ impl Workspace {
         preview_opts.build = false;
         preview_opts.dry_run = false;
         preview_opts.lock = false;
-        preview_opts.progress = Progress::Silent;
 
         ProjectUpgradeExecutor::new(
             self,

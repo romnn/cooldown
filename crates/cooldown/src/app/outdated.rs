@@ -68,6 +68,10 @@ impl<'a> OutdatedRunner<'a> {
 
     async fn run(mut self) -> OutdatedOutcome {
         for pctx in self.ws.scoped_projects(self.opts) {
+            let _progress = self
+                .opts
+                .progress
+                .project(pctx.tool, pctx.rel_path.as_str());
             self.run_project(pctx).await;
         }
 
@@ -100,10 +104,7 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
 
-        self.opts.progress.say(&format!(
-            "Resolving {} dependencies ({})…",
-            read.project_label, pctx.tool
-        ));
+        self.opts.progress.phase("resolving dependency graph");
         let mut deps = match self
             .ws
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
@@ -246,15 +247,14 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
 
-        self.opts.progress.say(&format!(
-            "Verifying {} adoptable update(s) in {} against the upgrade policy…",
-            candidates.len(),
-            project_label,
-        ));
+        self.opts.progress.phase("verifying upgrade policy");
         let changes = candidates
             .iter()
             .map(|candidate| candidate.change.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        self.opts
+            .progress
+            .candidates(&changes, "adoptable updates against upgrade policy");
         let preview = self
             .ws
             .preview_project_upgrade(pctx, self.opts, changes, manifest_only)
@@ -278,11 +278,7 @@ impl<'a> OutdatedRunner<'a> {
     }
 
     async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
-        match self
-            .ws
-            .refresh_project_lock(pctx, self.opts, project_label)
-            .await
-        {
+        match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(Some(report)) => self.handle_lock_report(report, pctx, project_label),
             Ok(None) => true,
             Err(error) => {
@@ -343,10 +339,9 @@ impl<'a> OutdatedRunner<'a> {
             fanout = self.opts.fanout(),
             "fetching release metadata"
         );
-        self.opts.progress.say(&format!(
-            "Fetching release metadata for {} dependencies…",
-            deps.len()
-        ));
+        self.opts
+            .progress
+            .phase(format!("fetching metadata for {} dependencies", deps.len()));
         let started = std::time::Instant::now();
         let fetched = self
             .ws
@@ -355,6 +350,7 @@ impl<'a> OutdatedRunner<'a> {
                 deps,
                 fctx,
                 self.opts.candidate_scope(),
+                &self.opts.progress,
                 self.opts.fanout(),
             )
             .await;

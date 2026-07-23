@@ -34,6 +34,7 @@ pub(crate) async fn prepare_run(
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
     let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
     options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
+    invocation.progress().phase("discovering projects");
     let adapters = detect::adapter_set(
         invocation.offline(),
         invocation.fresh(),
@@ -47,6 +48,9 @@ pub(crate) async fn prepare_run(
         invocation.tools(),
         invocation.respect_gitignore(),
     )?;
+    invocation
+        .progress()
+        .phase(format!("loading policy for {} projects", projects.len()));
     let shared = policy::build_shared_layers(&configs, &invocation)?;
     // The evaluation clock is a port (`Clock`): real runs read the system clock, while `--now`
     // (debug builds only) injects a fixed instant so the README screenshots regenerate reproducibly.
@@ -66,6 +70,9 @@ pub(crate) async fn prepare_run(
         now,
     };
     let ctxs = policy::assemble_projects(&assembly, projects).await?;
+    invocation
+        .progress()
+        .phase("loading baseline and run scope");
     // The repo-root cascade (no native layer) lets `sync` resolve a repo-wide window once for
     // repo-scoped adapters (uv's root `uv.toml`) without borrowing any project's layers.
     let repo_layers = policy::repo_layers(&configs, &shared, &repo_root)?;

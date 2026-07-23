@@ -65,6 +65,15 @@ impl ColorMode {
             }
         }
     }
+
+    /// Whether an interactive stderr progress display should use color.
+    pub(in crate::cli) fn progress_colors(self) -> bool {
+        match self {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+        }
+    }
 }
 
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
@@ -336,6 +345,10 @@ pub(in crate::cli) struct GlobalArgs {
         env = "COOLDOWN_LOG"
     )]
     pub(in crate::cli) log_level: LogLevel,
+    /// Suppress human-facing progress. `--quiet` is an alias for agentic callers that only want the
+    /// final report; redirected stderr otherwise receives plain, non-colored progress lines.
+    #[arg(long = "no-progress", visible_alias = "quiet", global = true)]
+    pub(in crate::cli) no_progress: bool,
     /// List every source package on its own line instead of `first (+N others)`.
     #[arg(long = "list-packages", global = true)]
     pub(in crate::cli) list_packages: bool,
@@ -878,5 +891,14 @@ mod tests {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
         assert!(matches!(cli.command, super::Command::Check { .. }));
         assert!(cli.global.json);
+    }
+
+    #[test]
+    fn parser_accepts_both_progress_suppression_names() {
+        let no_progress = Cli::parse_from(["cooldown", "outdated", "--no-progress"]);
+        assert!(no_progress.global.no_progress);
+
+        let quiet = Cli::parse_from(["cooldown", "--quiet", "outdated"]);
+        assert!(quiet.global.no_progress);
     }
 }

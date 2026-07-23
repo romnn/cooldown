@@ -62,6 +62,10 @@ impl ResolvedInvocation {
     pub(super) fn strict_native(&self) -> StrictNativeMode {
         self.strict_native
     }
+
+    pub(super) fn progress(&self) -> &Progress {
+        &self.run.progress
+    }
 }
 
 /// `--dry-run` stages the plan by running the real resolver against a project copy, which
@@ -145,7 +149,7 @@ pub(super) fn resolve_invocation(
             show_projects: global.show_projects,
             no_suggestions: global.no_suggestions,
             json,
-            progress: progress_mode(global.log_level),
+            progress: progress_mode(global),
             // `--concurrency` (CLI/env) wins over a `[<command>]`/`[global]` config value, then the
             // built-in default. Sets both the fan-out width and the per-host HTTP cap downstream.
             concurrency: global
@@ -253,13 +257,18 @@ fn resolve_globs(cfg: &CommandConfig) -> Result<Vec<PatternGlob>, CoreError> {
         .collect()
 }
 
-/// Route coarse progress notes: silent when `--log-level` already narrates the run, to stderr
-/// otherwise so stdout stays reserved for the report.
-fn progress_mode(log_level: LogLevel) -> Progress {
-    if log_level == LogLevel::Off {
-        Progress::Stderr
+/// Select an interactive terminal display or a plain automation-friendly transcript. Diagnostic
+/// logging uses the plain form because tracing writes directly to stderr between progress events.
+fn progress_mode(global: &GlobalArgs) -> Progress {
+    use std::io::IsTerminal;
+
+    if global.no_progress {
+        return Progress::default();
+    }
+    if std::io::stderr().is_terminal() && global.log_level == LogLevel::Off {
+        Progress::interactive(global.color.progress_colors())
     } else {
-        Progress::Silent
+        Progress::plain()
     }
 }
 

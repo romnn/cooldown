@@ -100,6 +100,19 @@ where
             self.resolved.load(Ordering::Relaxed),
         )
     }
+
+    /// Seed a value discovered through an equivalent operation without counting a cache lookup.
+    fn seed(&self, key: K, value: V) {
+        let cell = {
+            let mut cells = self.cells.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                cells
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        let _ = cell.set(value);
+    }
 }
 
 /// Identity of a candidate-release resolution. `package` is the full [`PackageId`] — it carries the
@@ -201,9 +214,19 @@ impl ReleaseResolver for ReleaseCache {
             scope,
             project: project_scope(fetcher, fetch),
         };
-        self.candidates
+        let releases = self
+            .candidates
             .get_or_resolve(key, || fetcher.releases(dep, fetch, scope))
-            .await
+            .await?;
+        if let Some(locked) = fetcher.locked_release_from_candidates(dep, &releases) {
+            let key = LockedKey {
+                package: dep.package.clone(),
+                version: dep.current.clone(),
+                project: project_scope(fetcher, fetch),
+            };
+            self.locked.seed(key, locked);
+        }
+        Ok(releases)
     }
 
     async fn locked_release(
@@ -346,7 +369,7 @@ mod tests {
         assert_eq!(stub.stats().saved(), 0);
     }
 
-    use cooldown_core::{ArtifactScope, Project, ReleaseQuality, ToolId};
+    use cooldown_core::{ArtifactScope, MajorKey, Project, ReleaseOrder, ReleaseQuality, ToolId};
 
     /// A fetcher that counts how many times it actually resolves, with a configurable project-scope.
     struct CountingFetcher {
@@ -398,6 +421,77 @@ mod tests {
             manifest: camino::Utf8PathBuf::from(root),
             exclude_newer: None,
         }
+    }
+
+    fn test_release() -> Release {
+        Release {
+            version: Version::new("1.0.0"),
+            order: ReleaseOrder(vec![1]),
+            major: MajorKey("1".to_string()),
+            kind_from_current: None,
+            published_at: None,
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
+    }
+
+    struct CandidateSeedFetcher {
+        locked_calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ReleaseFetcher for CandidateSeedFetcher {
+        async fn releases(
+            &self,
+            _dep: &Dependency,
+            _fetch: &FetchContext<'_>,
+            _candidates: CandidateScope,
+        ) -> Result<Vec<Release>> {
+            Ok(vec![test_release()])
+        }
+
+        async fn locked_release(
+            &self,
+            _dep: &Dependency,
+            _fetch: &FetchContext<'_>,
+        ) -> Result<Release> {
+            self.locked_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(test_release())
+        }
+
+        fn locked_release_from_candidates(
+            &self,
+            _dep: &Dependency,
+            releases: &[Release],
+        ) -> Option<Release> {
+            releases.first().cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_resolution_can_seed_an_equivalent_locked_release() {
+        let cache = ReleaseCache::new();
+        let fetcher = CandidateSeedFetcher {
+            locked_calls: AtomicU64::new(0),
+        };
+        let project = test_project("/project");
+        let fetch = FetchContext {
+            project: &project,
+            artifacts: ArtifactScope::Environment,
+        };
+        let dep = test_dep();
+
+        cache
+            .candidate_releases(&fetcher, &dep, &fetch, CandidateScope::CurrentMajorOnly)
+            .await
+            .expect("candidate release");
+        let locked = cache
+            .locked_release(&fetcher, &dep, &fetch)
+            .await
+            .expect("seeded locked release");
+
+        assert_eq!(locked.version, dep.current);
+        assert_eq!(fetcher.locked_calls.load(Ordering::Relaxed), 0);
     }
 
     async fn resolve_in(cache: &ReleaseCache, fetcher: &CountingFetcher, project: &Project) {
