@@ -1,11 +1,9 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: lint
 on:
   push: {}
   pull_request:
     types: [opened, synchronize, reopened, edited]
-  schedule:
-    # 8AM first day of the month in JAN and JUNE to keep workflow badges up-to-date
-    - cron: "0 8 1 1,6 *"
 
 env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
@@ -41,11 +39,11 @@ jobs:
           cache-on-failure: true
       - name: Audit
         continue-on-error: true
-        run: task audit --output group --output-group-error-only
+        run: task audit
       - name: Check for unused dependencies
-        run: task unused-dependencies --output group --output-group-error-only
+        run: task unused-dependencies
       - name: Lint (all feature combinations × targets)
-        run: task lint:fc --output group --output-group-error-only
+        run: task lint:fc
 
   spellcheck:
     runs-on: ubuntu-24.04
@@ -59,4 +57,4 @@ jobs:
           env: false
       - run: mise install task typos
       - name: Spellcheck
-        run: task spellcheck --output group --output-group-error-only
+        run: task spellcheck

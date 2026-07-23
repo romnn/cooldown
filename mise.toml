@@ -36,7 +36,7 @@ task = "latest"
 ast-grep = "latest"
 typos = "latest"
 actionlint = "latest"
-goreleaser = "latest"
+"github:romnn/bumpversion" = { version = "latest", matching = "bumpversion", minimum_release_age = "0" }
 "aqua:charmbracelet/freeze" = "latest"
 
 # Documentation site (docs/, Hugo + hugo-book theme). go (above) is shared with the

@@ -336,44 +336,27 @@ checksum = "sha256:6920b6f493f0c13a28e32522ccb7efffcc57c8849d887366b19c599dc2238
 url = "https://github.com/est31/cargo-udeps/releases/download/v0.1.61/cargo-udeps-v0.1.61-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/est31/cargo-udeps/releases/assets/407804338"
 
-[[tools."github:kbknapp/cargo-outdated"]]
-version = "0.19.0"
-backend = "github:kbknapp/cargo-outdated"
+[[tools."github:romnn/bumpversion"]]
+version = "0.0.9"
+backend = "github:romnn/bumpversion"
 
-[tools."github:kbknapp/cargo-outdated"."platforms.linux-arm64"]
-checksum = "sha256:0570cb34034784aa10315aef8cc84d008104f5b60ccc93efcf83b0b08fb585e3"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434763"
+[tools."github:romnn/bumpversion".options]
+matching = "bumpversion"
 
-[tools."github:kbknapp/cargo-outdated"."platforms.linux-arm64-musl"]
-checksum = "sha256:0570cb34034784aa10315aef8cc84d008104f5b60ccc93efcf83b0b08fb585e3"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434763"
+[tools."github:romnn/bumpversion"."platforms.linux-x64"]
+checksum = "sha256:d5c6470eafa5488675f7476885569efc21304802f2c90c78d201f57e794d069a"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.9/bumpversion_0.0.9_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/392595455"
 
-[tools."github:kbknapp/cargo-outdated"."platforms.linux-x64"]
-checksum = "sha256:648021f279e737e11f4be0f5967ae2a01d4d66f7a2e462a0b24ccd6dd5e6b372"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434764"
+[tools."github:romnn/bumpversion"."platforms.macos-arm64"]
+checksum = "sha256:15c18a7073759ae57b8cc1828c54d76c0ee41c0c8f180acb1443b44fa8a75be7"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.9/bumpversion_0.0.9_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/392595477"
 
-[tools."github:kbknapp/cargo-outdated"."platforms.linux-x64-musl"]
-checksum = "sha256:648021f279e737e11f4be0f5967ae2a01d4d66f7a2e462a0b24ccd6dd5e6b372"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434764"
-
-[tools."github:kbknapp/cargo-outdated"."platforms.macos-arm64"]
-checksum = "sha256:c3a3ca56a748d94fdaa1f208c641685d996ee1c4954cd4fbe358b7c06a2186a5"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434761"
-
-[tools."github:kbknapp/cargo-outdated"."platforms.macos-x64"]
-checksum = "sha256:945b64728ae9021be49a70346424da7634d889f181f2d33af64c7bf95265f6d3"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-x86_64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434762"
-
-[tools."github:kbknapp/cargo-outdated"."platforms.windows-x64"]
-checksum = "sha256:f2984f27955dbbe8fd3c1714d461d7cb8a1da3cc97f835e44c38215953833dbd"
-url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo-outdated-0.19.0-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434759"
+[tools."github:romnn/bumpversion"."platforms.windows-x64"]
+checksum = "sha256:ebbff072d3fb0b0be54f245b6378d28fd0d0f73491396c4fe57af295afd0a242"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.9/bumpversion_0.0.9_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/392595454"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
 version = "0.3.0"
@@ -526,52 +509,6 @@ url = "https://dl.google.com/go/go1.26.4.darwin-amd64.tar.gz"
 [tools.go."platforms.windows-x64"]
 checksum = "sha256:3ca8fb4630b07c419cbdd51f754e31363cfcfb83b3a5354d9e895c90be2cc345"
 url = "https://dl.google.com/go/go1.26.4.windows-amd64.zip"
-
-[[tools.goreleaser]]
-version = "2.17.0"
-backend = "aqua:goreleaser/goreleaser"
-
-[tools.goreleaser."platforms.linux-arm64"]
-checksum = "sha256:75f93fc0e25d10d8535ffd0e4abcf39d6784a2467ba453d479ae513729a9ebbf"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714135"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.linux-arm64-musl"]
-checksum = "sha256:75f93fc0e25d10d8535ffd0e4abcf39d6784a2467ba453d479ae513729a9ebbf"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714135"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.linux-x64"]
-checksum = "sha256:dde10e2d5a13cef969c0eec00c74f359c0ac306d702b1bd291ad9337b4e54c1d"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Linux_x86_64.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714136"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.linux-x64-musl"]
-checksum = "sha256:dde10e2d5a13cef969c0eec00c74f359c0ac306d702b1bd291ad9337b4e54c1d"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Linux_x86_64.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714136"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.macos-arm64"]
-checksum = "sha256:4106ff54bcaa1d387d3317047169da28aed6ce36c8e035e76cf35ba349db06ef"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Darwin_all.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714160"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.macos-x64"]
-checksum = "sha256:4106ff54bcaa1d387d3317047169da28aed6ce36c8e035e76cf35ba349db06ef"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Darwin_all.tar.gz"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714160"
-provenance = "github-attestations"
-
-[tools.goreleaser."platforms.windows-x64"]
-checksum = "sha256:427f2928d798f9affa5ddd2412e354f90ecf9e2ba541b3e0767570eb1121482b"
-url = "https://github.com/goreleaser/goreleaser/releases/download/v2.17.0/goreleaser_Windows_x86_64.zip"
-url_api = "https://api.github.com/repos/goreleaser/goreleaser/releases/assets/466714129"
-provenance = "github-attestations"
 
 [[tools.java]]
 version = "26.0.1"

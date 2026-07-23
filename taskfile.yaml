@@ -47,7 +47,7 @@ tasks:
         -v "${PWD}:/workspace" -w /workspace
         {{.ZIGBUILD_IMAGE}}
         bash -euo pipefail -c '
-        fix_perms() { for d in target target-goreleaser goreleaser-dist; do [ -e "$d" ] && chown -R "${HOST_UID}:${HOST_GID}" "$d" || true; done; };
+        fix_perms() { for d in target goreleaser-dist; do [ -e "$d" ] && chown -R "${HOST_UID}:${HOST_GID}" "$d" || true; done; };
         trap fix_perms EXIT;
         case "$(uname -m)" in x86_64) arch=x86_64 ;; aarch64|arm64) arch=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac;
         curl -sSfL "https://github.com/goreleaser/goreleaser/releases/download/v{{.GORELEASER_VERSION}}/goreleaser_Linux_${arch}.tar.gz" | tar -xz -C /usr/local/bin goreleaser;
