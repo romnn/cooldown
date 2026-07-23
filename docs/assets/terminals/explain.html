@@ -1,0 +1,15 @@
+<span class="term-fg32 term-fg1">$</span> cooldown explain itertools --tool cargo
+&nbsp;
+effective window: 0d (decided by repo:.&#47;cooldown.toml:package=itertools)
+project: .
+registry: crates.io
+&nbsp;
+<span class="term-fgx240">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ Layer                                    Field     Selector            Window   Applied   Note
+<span class="term-fgx240">═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════</span>
+ default                                  default                       7d      <span class="term-fgx8">         </span>  considered
+<span class="term-fgx240">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:.&#47;cooldown.toml   default                       7d      <span class="term-fgx10"> ✓       </span>  selected (highest layer, most specific selector)
+<span class="term-fgx240">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:.&#47;cooldown.toml   allow     package=itertools   0d      <span class="term-fgx10"> ✓       </span>  exemption zeroes the window; floors in other layers still bind (residual) [layer 1]
+<span class="term-fgx240">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>

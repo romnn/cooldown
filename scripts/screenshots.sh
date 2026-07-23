@@ -7,12 +7,19 @@
 # tuned so one `outdated` run lands on every status — adoptable, in cooldown, exempt, held, and
 # up-to-date — instead of a wall of "adoptable".
 #
-# Three flags keep the capture faithful and reproducible:
+# These PNG's are for the README only: GitHub markdown can't render the docs site's live HTML
+# terminals, so it needs static images. The docs *site* renders the same `cooldown` output as HTML
+# via scripts/terminals.sh (same inputs, different renderer), so the docs build does not depend on
+# this script — run it by hand (`task docs:screenshots`) to refresh the README shots.
+#
+# Four flags keep the capture faithful and reproducible:
 #   * `--now <date>` pins cooldown's evaluation clock to a fixed instant (a debug-build-only flag), so
 #     the `age/window` countdowns and the in-cooldown row don't drift as the wall clock and the
 #     registry move on. That is why we build and run the DEBUG binary, not `--release`.
 #   * `--color always` forces ANSI: freeze captures through a PTY, but cooldown still probes for a
-#     real terminal. `--log-level error` silences progress notes.
+#     real terminal. `--log-level error` silences the diagnostic log.
+#   * `--no-progress` suppresses the live progress display so freeze captures only the final report,
+#     not the intermediate per-dependency fetch frames (which would render as a very tall image).
 #   * `--language text` stops freeze from syntax-highlighting the captured output — otherwise it
 #     recolors version numbers and identifiers, fighting cooldown's own ANSI colors.
 #
@@ -28,7 +35,7 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cooldown="$repo/target/debug/cooldown"
-docs="$repo/docs"
+docs="$repo/docs/static/images"
 example="$repo/examples/polyglot"
 
 # The fixed "as-of" instant the screenshots are evaluated at. Bump it (and re-pick the example pins in
@@ -54,7 +61,7 @@ shoot() { # <tool-subdir> <output.png> <cooldown args...>
   # `set -o pipefail` inside the inner shell so a cooldown failure surfaces instead of being masked
   # by the trailing perl; the outer `set -e` does not reach freeze's child shell.
   ( cd "$work" && freeze --language text --output "$out" "${frame[@]}" \
-      --execute "bash -c 'set -o pipefail; stty cols 160; $cooldown $* --now $now --color always --log-level error | perl -pe \"s/\e\[39m/\e[0m/g\"'" )
+      --execute "bash -c 'set -o pipefail; stty cols 160; $cooldown $* --now $now --color always --no-progress --log-level error | perl -pe \"s/\e\[39m/\e[0m/g\"'" )
   echo "wrote $out"
 }
 

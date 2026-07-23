@@ -1,7 +1,11 @@
 # cooldown
 
 <p align="center">
-  <img src="docs/outdated.png" alt="cooldown outdated — adoptable updates (green) vs. those still in their cooldown window (yellow)" width="760">
+  <img src="docs/static/images/outdated.png" alt="cooldown outdated — adoptable updates (green) vs. those still in their cooldown window (yellow)" width="760">
+</p>
+
+<p align="center">
+  <a href="https://romnn.github.io/cooldown/"><strong>Documentation</strong></a>
 </p>
 
 A unified, language-agnostic **dependency-cooldown** CLI: refuse to adopt any dependency version

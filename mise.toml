@@ -39,6 +39,14 @@ actionlint = "latest"
 goreleaser = "latest"
 "aqua:charmbracelet/freeze" = "latest"
 
+# Documentation site (docs/, Hugo + hugo-book theme). go (above) is shared with the
+# integration tests; the theme is a Hugo module, so `hugo` shells out to `go` at build
+# time. The theme compiles SCSS, which needs the *extended* Hugo build (the default aqua
+# package is non-extended), so pull extended via asdf. terminal-to-html renders the ANSI
+# terminal snippets to HTML (scripts/terminals.sh).
+"asdf:NeoHsu/asdf-hugo" = "extended-0.163.3"
+"github:buildkite/terminal-to-html" = "latest"
+
 # Cargo plugins
 "github:rust-cross/cargo-zigbuild" = "latest"
 "github:romnn/cargo-watchdoc" = { version = "latest", minimum_release_age = "0" }

@@ -1,0 +1,72 @@
+name: pages
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "examples/**"
+      - "crates/**"
+      - "scripts/terminals.sh"
+      - "rust-toolchain.toml"
+      - "mise.toml"
+      - "mise.lock"
+      - "taskfile.yaml"
+      - ".github/workflows/pages.yaml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+env:
+  MISE_AUTO_INSTALL: "0"
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install go "asdf:NeoHsu/asdf-hugo" task "github:buildkite/terminal-to-html"
+      - name: Resolve Rust toolchain from rust-toolchain.toml
+        id: rust
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build docs
+        run: mise exec -- task docs:build -- --baseURL "${{ steps.pages.outputs.base_url }}/"
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

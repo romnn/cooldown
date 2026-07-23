@@ -158,6 +158,10 @@ checksum = "sha256:0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be271
 url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-pc-windows-msvc-v0.22.2.zip"
 url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439294720"
 
+[[tools."asdf:NeoHsu/asdf-hugo"]]
+version = "extended-0.163.3"
+backend = "asdf:NeoHsu/asdf-hugo"
+
 [[tools.ast-grep]]
 version = "0.44.1"
 backend = "aqua:ast-grep/ast-grep"
@@ -255,23 +259,43 @@ url = "https://builds.hex.pm/builds/elixir/v1.20.1-otp-29.zip"
 version = "29.0.2"
 backend = "core:erlang"
 
-[tools.erlang.options]
-precompiled = "if_available"
+[tools.erlang."platforms.linux-x64"]
+checksum = "sha256:b9a7714fdd282c4a7113651b1e2728a58799e60ffe20e545f5cc94c621527b15"
+url = "https://github.com/erlang/otp/releases/download/OTP-29.0.2/otp_src_29.0.2.tar.gz"
+url_api = "https://api.github.com/repos/erlang/otp/releases/assets/443592302"
+install = "source"
 
 [tools.erlang."platforms.macos-arm64"]
 checksum = "sha256:ec6e09dee496adf646b0a22eef26b769e7f8032c83dd10292c58d50fb38e2210"
 url = "https://github.com/erlef/otp_builds/releases/download/OTP-29.0.2/otp-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/443541329"
 
-[tools.erlang."platforms.macos-x64"]
-checksum = "sha256:3da4495ce6372f5fda002ed1ae45832a11e05aaa9928790e0bf1d14e3ee84657"
-url = "https://github.com/erlef/otp_builds/releases/download/OTP-29.0.2/otp-x86_64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/443557769"
-
 [tools.erlang."platforms.windows-x64"]
 checksum = "sha256:dffd5fca2e841267bfb4e961c38bb18436a4b55548deae727d5691a984f7b80f"
 url = "https://github.com/erlang/otp/releases/download/OTP-29.0.2/otp_win64_29.0.2.zip"
 url_api = "https://api.github.com/repos/erlang/otp/releases/assets/443733928"
+
+[[tools."github:buildkite/terminal-to-html"]]
+version = "3.17.1"
+backend = "github:buildkite/terminal-to-html"
+
+[tools."github:buildkite/terminal-to-html"."platforms.linux-x64"]
+checksum = "sha256:506bf48a06017c6d74903da75f9fd3aea18cc9451cb3ad39103e4c8997c3716f"
+url = "https://github.com/buildkite/terminal-to-html/releases/download/v3.17.1/terminal-to-html-3.17.1-linux-amd64.gz"
+url_api = "https://api.github.com/repos/buildkite/terminal-to-html/releases/assets/469851432"
+provenance = "github-attestations"
+
+[tools."github:buildkite/terminal-to-html"."platforms.macos-arm64"]
+checksum = "sha256:264b131fe7ae4601fc8b65e80bdc3d71e5c2cc32853f3a270c9cbaf47b2d45df"
+url = "https://github.com/buildkite/terminal-to-html/releases/download/v3.17.1/terminal-to-html-3.17.1-darwin-arm64.gz"
+url_api = "https://api.github.com/repos/buildkite/terminal-to-html/releases/assets/469851452"
+provenance = "github-attestations"
+
+[tools."github:buildkite/terminal-to-html"."platforms.windows-x64"]
+checksum = "sha256:5286bcf3d17312af5b354da16731f4bbc9b777a0a15168d6b49562a8b6f6df17"
+url = "https://github.com/buildkite/terminal-to-html/releases/download/v3.17.1/terminal-to-html-3.17.1-windows-amd64.zip"
+url_api = "https://api.github.com/repos/buildkite/terminal-to-html/releases/assets/469851361"
+provenance = "github-attestations"
 
 [[tools."github:est31/cargo-udeps"]]
 version = "0.1.61"
@@ -723,6 +747,14 @@ provenance = "github-attestations"
 version = "4.0.5"
 backend = "core:ruby"
 
+[tools.ruby."platforms.windows-x64"]
+checksum = "sha256:74e31613fc71e6e23431dfc4d8b6ec2818a4dc1fd16e0983b074144c16719c8b"
+url = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-4.0.5-1/rubyinstaller-4.0.5-1-x64.7z"
+
+[[tools.ruby]]
+version = "4.0.5"
+backend = "core:ruby"
+
 [tools.ruby.options]
 compile = "true"
 ruby_build_repo = "https://github.com/rbenv/ruby-build.git"
@@ -751,14 +783,6 @@ url = "https://cache.ruby-lang.org/pub/ruby/4.0/ruby-4.0.5.tar.gz"
 [tools.ruby."platforms.macos-x64"]
 checksum = "sha256:7d6149079a63f8ae1d326c9fa65c6019ba2dc3155eae7b39159817911c88958e"
 url = "https://cache.ruby-lang.org/pub/ruby/4.0/ruby-4.0.5.tar.gz"
-
-[[tools.ruby]]
-version = "4.0.5"
-backend = "core:ruby"
-
-[tools.ruby."platforms.windows-x64"]
-checksum = "sha256:74e31613fc71e6e23431dfc4d8b6ec2818a4dc1fd16e0983b074144c16719c8b"
-url = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-4.0.5-1/rubyinstaller-4.0.5-1-x64.7z"
 
 [[tools.swift]]
 version = "6.3.2"
