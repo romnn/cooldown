@@ -23,7 +23,7 @@ cooldown outdated
 | **Adoptable** | The newest version that has already cleared its cooldown — blank (`—`) if nothing new has matured. |
 | **Latest** | The newest version that exists, cooled down or not. |
 | **Cooldown** | `age/window` for the relevant candidate — how old it is versus the window it must clear. |
-| **Status** | `adoptable`, `in cooldown`, `exempt`, `held`, or `up-to-date`. |
+| **Status** | `adoptable`, `in cooldown`, `exempt`, `held`, or `up-to-date`; held rows show the reason. |
 
 The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default.
 
@@ -32,6 +32,11 @@ The summary line at the bottom counts the **whole resolved graph** (direct + tra
 - **Direct dependencies only** in the table. Add `--transitive` to list indirect dependencies too.
 - **Actionable rows only** — dependencies that are already up-to-date are hidden. Add `--all` to include them.
 - **Cross-major candidates are visible.** Unlike `upgrade`, `outdated` shows a new major so it is discoverable; add `--no-major` (alias `--minor`) to stay within the current major — useful for clean CI output.
+
+An explicit manifest upper comparator is intentional policy: `>=5 <6` holds a dependency below 6,
+while the implicit ceiling in `^5` does not. A package-level config `max-major = 5` likewise holds
+the dependency at 5.x. Held rows name the reason in the table (`bound >=5 <6`, `max-major 5`,
+`pinned`, and so on); JSON reports the same information in the additive `heldBy` field.
 
 ## Flags
 

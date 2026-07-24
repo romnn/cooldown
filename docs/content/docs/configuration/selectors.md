@@ -5,10 +5,11 @@ weight: 3
 
 # Selectors
 
-A selector scopes a policy to part of your dependency graph. The same keys ([`min-age`]({{< relref "basics.md" >}}), `allow`, `floor`, …) work at every level; the level just narrows *what they apply to*. From least to most specific:
+A selector scopes a policy to part of your dependency graph. The level narrows *what a rule applies
+to*. From least to most specific:
 
 ```
-default  <  tool  <  project  <  registry  <  package
+default  <  tool  <  project  <  registry  <  package  <  tool-qualified package
 ```
 
 Within a layer, the most specific selector that matches wins — see [Precedence]({{< relref "precedence.md" >}}).
@@ -39,24 +40,63 @@ Scope policy to a registry or index by host. The natural home for "our own regis
 min-age = "0d"
 ```
 
-## `[package."<glob>"]` — per package
+## Package selectors
 
-The most specific selector: scope policy to package names by glob:
+An unqualified package rule applies to a matching name in every ecosystem:
 
 ```toml
 [package."github.com/acme/*"]
 min-age = "0d"
 
-[package.serde]
-min-age = "3d"
+[package.glob]
+min-age = "14d"
 ```
 
 Package globs use the same flavor as [`allow`]({{< relref "basics.md" >}}) and [`exclude-packages`]({{< relref "excludes.md" >}}): `*` is always a wildcard and crosses `/`, so `@scope/*` covers a whole npm scope and `serde_*` a crate family. No registry permits `*` in a package name, so nothing needs escaping.
+
+When the same name exists in several ecosystems, qualify the package rule by its tool:
+
+```toml
+[tool.uv.package.glob]
+min-age = "30d"
+max-major = 5
+
+[tool.cargo.package.glob]
+min-age = "14d"
+```
+
+`[tool.uv.package.glob]` applies only to the PyPI package named `glob`; it cannot accidentally
+change the Cargo crate or npm package with the same name. A tool-qualified package rule is more
+specific than an unqualified `[package.glob]` rule in the same config layer.
+
+`max-major` is available only on package rules and is an integer. It is an absolute ceiling:
+within-major updates remain eligible, but even `upgrade --major --rewrite` will not cross it. For
+example, keep TypeScript and its Node declarations current within supported lines with:
+
+```toml
+[tool.npm.package.typescript]
+max-major = 5
+
+[tool.npm.package."@types/node"]
+max-major = 24
+```
+
+Raising or removing the value in `cooldown.toml` is the only way to cross a configured
+`max-major`. There is no CLI or environment override.
 
 ## Choosing a level
 
 - Trust a whole **registry** (an internal index)? Use `[registry."…"]`.
 - Loosen or tighten one **ecosystem**? Use `[tool.<name>]`.
 - Pin the policy for one **package or family**? Use `[package."…"]`.
+- Target a package name in one **ecosystem only**? Use `[tool.<name>.package."…"]`.
 
-Because names differ per ecosystem (`my-pkg` vs `@scope/my-pkg`), a package rule that is ecosystem-specific can also live under a tool — the keys nest as you'd expect. When two rules could both apply, [`explain`]({{< relref "../commands/other.md" >}}) shows which one won and why.
+When two rules could both apply, [`explain`]({{< relref "../commands/other.md" >}}) shows which one
+won and why.
+
+## Migration note
+
+`exclude-folders` and `exclude-packages` belong under `[tool.*]`, `[global]`, or a command table,
+not under package, registry, or project selector tables. Older versions accepted those keys under
+non-tool selectors and then silently ignored them. They now fail configuration parsing so a
+misspelled or misplaced exclusion cannot look active when it is not.

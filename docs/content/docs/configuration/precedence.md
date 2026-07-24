@@ -22,7 +22,7 @@ When more than one rule could set a value, `cooldown` resolves it with an **auth
 **Selectors** — most to least specific. Within a single layer, a more specific selector breaks the tie:
 
 ```
-package  >  registry  >  project  >  tool  >  default
+tool-qualified package  >  package  >  registry  >  project  >  tool  >  default
 ```
 
 So a `[package."serde_*"]` block beats a `[tool.cargo]` block beats the bare top-level default — but only *within the same layer*. Across layers, authority comes first: a `[tool.cargo]` value set by a CLI flag still beats a `[package."…"]` value set in a file, because the flag is a higher layer.
@@ -34,10 +34,15 @@ Different fields combine differently — each is resolved on its own:
 | Field | Rule | Meaning |
 |---|---|---|
 | `min-age` | **authority-first** | The highest layer wins; within a layer, the most specific selector breaks the tie. |
+| `max-major` | **authority-first** | Like `min-age`, the highest layer wins and selector specificity breaks a tie. It exists only on package rules and has no CLI or environment form. |
 | `floor` | **max-clamped** | The strictest value across *all* layers wins — it only ever ratchets stricter, never looser. |
 | `allow` | **accumulated union** | Exemptions from every layer are unioned together. |
 
-This is why a `floor` set high in your config can't be weakened by a more specific block lower down: `floor` doesn't follow authority-first, it takes the maximum. And it is why `min-age` *can* be overridden by a more specific or higher-authority rule: that field does follow authority-first.
+This is why a `floor` set high in your config can't be weakened by a more specific block lower down:
+`floor` doesn't follow authority-first, it takes the maximum. `min-age` and `max-major` can be
+replaced by a more specific rule in the same layer or by a rule in a higher-authority layer. A repo
+can therefore deliberately loosen a global `max-major`; it is a compatibility choice, not a
+security floor.
 
 ## How `allow` interacts with `floor`
 

@@ -37,6 +37,19 @@ Yes, to read publish times from each registry — unless you run `--offline` aga
 
 Yes — `freeze = "2026-06-01"` (or `--freeze`) evaluates against a fixed instant, so a run is reproducible no matter when it happens. It's the reproducible counterpart to a rolling `min-age`.
 
+## How do I stay on TypeScript 5.x but keep taking 5.x updates?
+
+Set a package-specific ceiling:
+
+```toml
+[tool.npm.package.typescript]
+max-major = 5
+```
+
+This permits matured 5.x releases and holds 6.x even under `upgrade --major`. Alternatively, write
+an explicit `<6` upper bound in `package.json`; that bound holds by default and can be crossed only
+when you deliberately pass `--rewrite`.
+
 ## Why did `upgrade` also *downgrade* some packages?
 
 When advancing the graph would pull a too-fresh transitive in, `upgrade` reconciles it back down to a matured version so the resulting lock is gate-clean. A single `upgrade` run can therefore show both `upgraded` and `downgraded` rows — that's the whole-graph guarantee at work, not a mistake. See [`upgrade`]({{< relref "commands/upgrade.md" >}}).

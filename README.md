@@ -87,16 +87,16 @@ fall back to is likewise reported (`baseline` it or wait) rather than downgraded
 #### Manifest constraints
 
 By default `upgrade` moves the **lock** within your declared version constraint and leaves the
-manifest alone, so a `^1.4` stays `^1.4` while the lock advances to the newest matured `1.x`. When
-the target falls **outside** the constraint — most commonly a cross-major bump (`--major`) past a
-caret range, or a capped Python range like `>=1,<2` — cooldown rewrites the one owning manifest
-entry so the version can be adopted at all, then re-locks. Edits are format-preserving (comments,
-key order, and spacing are kept) and, for a Cargo workspace, an inherited `dep = { workspace = true }`
-is widened in the root `[workspace.dependencies]`.
+manifest alone, so a `^1.4` stays `^1.4` while the lock advances to the newest matured `1.x`. A
+cross-major bump can widen an implicit caret/tilde ceiling under `--major`, but an author-written
+`<`/`<=` upper bound such as `>=1,<2` holds even then. Pass `--rewrite` to cross and rewrite that
+explicit bound. Edits are format-preserving (comments, key order, and spacing are kept) and, for a
+Cargo workspace, an inherited `dep = { workspace = true }` is widened in the root
+`[workspace.dependencies]`.
 
-Pass `--rewrite` to always rewrite the declared constraint to the adopted version, even for an
-in-range move (so `^1.4` becomes `^1.5`). The lock-only default is honored where the tool can pin an
-exact in-range version without editing the manifest: cargo (`update --precise`), uv
+`--rewrite` also always rewrites an in-range constraint (so `^1.4` becomes `^1.5`). The lock-only
+default is honored where the tool can pin an exact in-range version without editing the manifest:
+cargo (`update --precise`), uv
 (`lock --upgrade-package`), and pnpm (`update --no-save`). npm, yarn, and bun have no such command,
 and Go's `go.mod` *is* the version source, so those always rewrite the manifest regardless of mode.
 
@@ -151,6 +151,9 @@ min-age = "0d"
 [package."github.com/acme/*"]   # per package (glob) — most specific
 min-age = "0d"
 
+[tool.npm.package.typescript]   # disambiguate a package name by ecosystem
+max-major = 5                   # keep taking 5.x, even under --major
+
 allow = ["acme/*"]              # exemption set (audited; shown in `explain`)
 floor = "3d"                    # a hard minimum no nearer config can weaken
 ```
@@ -162,14 +165,14 @@ Durations accept `"7d"`, `"2 weeks"`, ISO-8601 `"P7D"`.
 
 Two orthogonal axes. **Layers** (low → high authority): built-in default → global config → native
 manifest config → repo/project `cooldown.toml` cascade (nearer wins) → `--config` file → `COOLDOWN_*`
-env → CLI flags. **Selectors** (most → least specific): `package` > `registry` > `project` > `tool`
-> default.
+env → CLI flags. **Selectors** (most → least specific): `tool-qualified package` > `package` >
+`registry` > `project` > `tool` > default.
 
-Resolution is per field: `min-age` is **authority-first** (highest layer wins; within a layer the
-most specific selector breaks the tie); `floor` is **max-clamped** across layers (only ratchets
-stricter); `allow` is an **accumulated union** that can bypass a floor only when co-declared with it
-(or via an audited `--latest`/`--allow`). `cooldown explain <pkg>` prints the field-by-field
-derivation.
+Resolution is per field: `min-age` and package-only `max-major` are **authority-first** (highest
+layer wins; within a layer the most specific selector breaks the tie); `floor` is **max-clamped**
+across layers (only ratchets stricter); `allow` is an **accumulated union** that can bypass a floor
+only when co-declared with it (or via an audited `--latest`/`--allow`). `cooldown explain <pkg>`
+prints the field-by-field derivation.
 
 ### Excluding folders and packages
 

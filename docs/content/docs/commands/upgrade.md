@@ -21,9 +21,15 @@ The **From → To** columns show the move; a row can be a `downgraded` as well a
 
 By default `upgrade` moves the **lock** within your declared version constraint and leaves the manifest alone: a `^1.4` stays `^1.4` while the lock advances to the newest matured `1.x`.
 
-When the target falls **outside** the constraint — most commonly a cross-major bump (`--major`) past a caret range, or a capped Python range like `>=1,<2` — `cooldown` rewrites the one owning manifest entry so the version can be adopted at all, then re-locks. Edits are **format-preserving** (comments, key order, and spacing are kept), and for a Cargo workspace an inherited `dep = { workspace = true }` is widened in the root `[workspace.dependencies]`.
+When the target falls outside an **implicit** constraint — most commonly a cross-major bump
+(`--major`) past a caret or compatible-release range such as `^5` or `~=5.9` — `cooldown` rewrites
+the one owning manifest entry so the version can be adopted, then re-locks. Edits are
+**format-preserving** (comments, key order, and spacing are kept), and for a Cargo workspace an
+inherited `dep = { workspace = true }` is widened in the root `[workspace.dependencies]`.
 
-Pass `--rewrite` to always rewrite the declared constraint to the adopted version, even for an in-range move (so `^1.4` becomes `^1.5`).
+An explicit upper comparator written by the author, such as `<6` or `>=5,<6`, is different: it
+holds under the default behavior, even with `--major`. Pass `--rewrite` to cross and rewrite that
+bound. The same flag still always rewrites an in-range constraint (so `^1.4` becomes `^1.5`).
 
 The lock-only default is honored where the tool can pin an exact in-range version without editing the manifest:
 
@@ -50,16 +56,25 @@ A cross-major bump is usually breaking work you opt into, so `--major` is **off*
 cooldown upgrade --major -p 'serde*'
 ```
 
-When `upgrade` holds a cross-major update back, it prints a tip with the `--major` command that would take it (suppress tips with `--no-suggestions`).
+When `upgrade` holds a cross-major update back, it explains the required action:
+
+- `needs --major` means re-run with `--major`.
+- `declared_bound_held` means pass `--rewrite` to cross and rewrite the manifest's explicit
+  `<`/`<=` bound.
+- `max_major_held` means raise the package's `max-major` in `cooldown.toml`; no CLI flag overrides
+  this ceiling.
+
+Only a matured release beyond the hold is reported. A fresh release still in cooldown does not
+produce an action that cannot yet be taken. Suppress command tips with `--no-suggestions`.
 
 ## Flags
 
 | Flag | Effect |
 |---|---|
 | `--transitive <mode>` | `allow` or `hide` — how to treat transitive dependencies (see above). |
-| `--rewrite` | Always rewrite the manifest constraint, even for an in-range move. |
+| `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound. |
 | `--build` | Also compile / sync after re-locking. |
-| `--major` | Allow cross-major bumps (off by default for `upgrade`). |
+| `--major` | Allow cross-major bumps; explicit manifest bounds and config `max-major` ceilings still hold. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
