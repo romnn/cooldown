@@ -2,7 +2,7 @@ use super::CommandContext;
 use super::common::{emit_envelope, with_diags};
 use crate::app::Exit;
 use crate::cli::present;
-use cooldown_core::CoreError;
+use cooldown_core::{CoreError, HeldReason};
 use cooldown_render as render;
 
 /// The shared presentation flags for the dependency-table renderers.
@@ -14,6 +14,10 @@ fn render_options(ctx: &CommandContext<'_>) -> render::tty::RenderOptions {
         show_projects: ctx.opts.show_projects,
         no_suggestions: ctx.opts.no_suggestions,
     }
+}
+
+fn is_pin_hold(held_by: Option<&HeldReason>) -> bool {
+    matches!(held_by, Some(HeldReason::ExactPin | HeldReason::CommitPin))
 }
 
 pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
@@ -40,12 +44,15 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
         out.errors.clone(),
     );
     // The JSON envelope keeps every item (machine consumers filter themselves); the human table
-    // hides up-to-date rows unless `--all`, and held (pinned) rows under `--hide-pinned`, so the
-    // common case is a short, actionable report. The summary line below still reflects every dep.
+    // hides up-to-date rows unless `--all`, and exact/commit pins under `--hide-pinned`, so the
+    // common case is a short, actionable report. Other held rows remain visible because their bound
+    // or policy ceiling is actionable. The summary line below still reflects every dep.
     let table_items: Vec<render::OutdatedItem> = items
         .iter()
         .filter(|i| ctx.opts.show_all || i.status != render::OutdatedStatus::UpToDate)
-        .filter(|i| !(ctx.opts.hide_pinned && i.status == render::OutdatedStatus::Held))
+        .filter(|i| {
+            !(ctx.opts.hide_pinned && is_pin_hold(i.held_by.as_ref().map(render::HeldBy::reason)))
+        })
         .cloned()
         .collect();
     emit_envelope(ctx.opts.json, &env, || {
@@ -209,4 +216,22 @@ pub(super) fn run_config(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
         present::render_config_text(&out.items)
     })?;
     Ok(out.exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_pin_hold;
+    use cooldown_core::HeldReason;
+
+    #[test]
+    fn hide_pinned_recognizes_only_exact_and_commit_pin_holds() {
+        assert!(is_pin_hold(Some(&HeldReason::ExactPin)));
+        assert!(is_pin_hold(Some(&HeldReason::CommitPin)));
+        assert!(!is_pin_hold(Some(&HeldReason::GraphCeiling)));
+        assert!(!is_pin_hold(Some(&HeldReason::DeclaredBound(
+            "<6".to_string()
+        ))));
+        assert!(!is_pin_hold(Some(&HeldReason::MaxMajor(5))));
+        assert!(!is_pin_hold(None));
+    }
 }

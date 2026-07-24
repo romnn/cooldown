@@ -40,7 +40,9 @@ pub fn rel(
         version: Version::new(v),
         order: order(ord),
         major: MajorKey(major.to_string()),
+        major_number: major.parse().ok(),
         kind_from_current: kind,
+        beyond_declared_bound: false,
         published_at: pub_at.map(ts),
         yanked: false,
         quality,
@@ -61,6 +63,7 @@ pub fn dep(name: &str, current: &str, quality: ReleaseQuality) -> Dependency {
         artifacts: Vec::new(),
         graph_floor: None,
         graph_ceiling: None,
+        declared_bound: None,
         members: Vec::new(),
         pinned: false,
     }
@@ -90,6 +93,7 @@ impl CtxHolder {
             tool: GO,
             project: &self.project,
             allow_major: self.allow_major,
+            honor_declared_bounds: true,
         }
     }
 }

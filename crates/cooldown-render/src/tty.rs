@@ -4,6 +4,7 @@
 use crate::model::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
     OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+    held_reason_label,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status};
@@ -197,8 +198,9 @@ fn outdated_cooldown_cell(item: &OutdatedItem) -> String {
 fn outdated_status_cell(item: &OutdatedItem) -> String {
     // A blocked row names the conflicting requirer inline ("blocked by <pkg>") so the matured target
     // reads as "wanted but held out of the graph by …", mirroring the `upgrade` skip.
-    match (item.status, &item.blocked_by) {
-        (OutdatedStatus::Blocked, Some(blocker)) => format!("blocked by {blocker}"),
+    match (item.status, &item.blocked_by, &item.held_by) {
+        (OutdatedStatus::Blocked, Some(blocker), _) => format!("blocked by {blocker}"),
+        (OutdatedStatus::Held, _, Some(reason)) => held_reason_label(reason.reason()),
         _ => status_label(item.status).to_string(),
     }
 }
@@ -881,8 +883,9 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderOptions, check_cooldown_cell, has_distinct_project, members_cell, path_label,
-        render_check, render_fix, render_outdated, render_upgrade,
+        RenderOptions, check_cooldown_cell, has_distinct_project, members_cell,
+        outdated_status_cell, path_label, render_check, render_fix, render_outdated,
+        render_upgrade,
     };
     use crate::{
         BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
@@ -1104,6 +1107,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
             blocked_by: None,
+            held_by: None,
             latest: Some(LatestInfo {
                 version: "0.15.18".into(),
                 published_at: None,
@@ -1152,6 +1156,7 @@ mod tests {
             status: OutdatedStatus::UpToDate,
             adoptable_target: None,
             blocked_by: None,
+            held_by: None,
             latest: Some(LatestInfo {
                 version: "1.21.4".into(),
                 published_at: None,
@@ -1185,9 +1190,21 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
             blocked_by: None,
+            held_by: None,
             latest: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn held_status_cell_shows_the_typed_reason() {
+        let mut item = project_outdated_item("typescript", ".");
+        item.status = OutdatedStatus::Held;
+        item.held_by = Some(cooldown_core::HeldReason::DeclaredBound(">=5 <6".to_string()).into());
+        assert_eq!(outdated_status_cell(&item), "bound >=5 <6");
+
+        item.held_by = Some(cooldown_core::HeldReason::MaxMajor(5).into());
+        assert_eq!(outdated_status_cell(&item), "max-major 5");
     }
 
     fn two_adoptable_summary() -> OutdatedSummary {

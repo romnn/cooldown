@@ -3,7 +3,7 @@
 //! relies on this module for the opaque ordering token, the update kind, and the major key.
 
 use cooldown_core::{MajorKey, UpdateKind};
-use pep440_rs::Version;
+use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::cmp::Ordering;
 use std::str::FromStr;
 
@@ -71,6 +71,70 @@ pub fn major_key(v: &str) -> MajorKey {
         Some(x) => MajorKey(format!("{}!{}", x.epoch(), seg(&x, 0))),
         None => MajorKey(String::new()),
     }
+}
+
+/// Returns the first PEP 440 release segment, ignoring any epoch.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    parse(v).and_then(|version| version.release().first().copied())
+}
+
+#[derive(Clone)]
+struct UpperBound {
+    version: Version,
+    inclusive: bool,
+}
+
+fn explicit_upper_bound(specifier: &str) -> Option<UpperBound> {
+    let parsed = VersionSpecifiers::from_str(specifier).ok()?;
+    parsed
+        .iter()
+        .filter_map(|specifier| {
+            let inclusive = match specifier.operator() {
+                Operator::LessThan => false,
+                Operator::LessThanEqual => true,
+                _ => return None,
+            };
+            Some(UpperBound {
+                version: specifier.version().clone(),
+                inclusive,
+            })
+        })
+        .min_by(|a, b| {
+            a.version
+                .cmp(&b.version)
+                .then_with(|| a.inclusive.cmp(&b.inclusive))
+        })
+}
+
+/// Chooses the most restrictive PEP 440 specifier with an explicit upper comparator.
+#[must_use]
+pub fn most_restrictive_declared_bound(
+    specifiers: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    let mut best: Option<(UpperBound, String)> = None;
+    for specifier in specifiers {
+        let Some(upper) = explicit_upper_bound(&specifier) else {
+            continue;
+        };
+        let stricter = best.as_ref().is_none_or(|(current, _)| {
+            upper.version < current.version
+                || (upper.version == current.version && !upper.inclusive && current.inclusive)
+        });
+        if stricter {
+            best = Some((upper, specifier));
+        }
+    }
+    best.map(|(_, specifier)| specifier)
+}
+
+/// Returns whether `v` satisfies a PEP 440 specifier set.
+#[must_use]
+pub fn version_in_range(specifier: &str, v: &str) -> bool {
+    let (Ok(specifiers), Some(version)) = (VersionSpecifiers::from_str(specifier), parse(v)) else {
+        return false;
+    };
+    specifiers.contains(&version)
 }
 
 /// Classifies the step from `current` to `cand` as an [`UpdateKind`].
@@ -167,5 +231,39 @@ mod tests {
         assert_eq!(major_key("1.2.3"), MajorKey("0!1".into()));
         assert_eq!(major_key("2.0.0"), MajorKey("0!2".into()));
         assert_eq!(major_key("1!1.0"), MajorKey("1!1".into()));
+    }
+
+    #[test]
+    fn declared_bounds_require_an_explicit_upper_comparator() {
+        assert_eq!(
+            most_restrictive_declared_bound(["<6".to_string()]),
+            Some("<6".to_string())
+        );
+        assert_eq!(
+            most_restrictive_declared_bound([">=5,<6".to_string()]),
+            Some(">=5,<6".to_string())
+        );
+        assert_eq!(most_restrictive_declared_bound(["~=5.9".to_string()]), None);
+        assert_eq!(
+            most_restrictive_declared_bound(["==5.9.3".to_string()]),
+            None
+        );
+        assert_eq!(
+            most_restrictive_declared_bound([">=5,<7".to_string(), ">=5,<6".to_string()]),
+            Some(">=5,<6".to_string())
+        );
+    }
+
+    #[test]
+    fn native_specifier_matching_handles_prerelease_bounds() {
+        assert!(version_in_range(">=5,<6", "5.9"));
+        assert!(!version_in_range(">=5,<6", "6.0rc1"));
+    }
+
+    #[test]
+    fn numeric_major_ignores_the_pep440_epoch() {
+        assert_eq!(major_number("2!5.9.0"), Some(5));
+        assert_eq!(classify_kind("5.9.0", "1!5.9.0"), Some(UpdateKind::Major));
+        assert_eq!(major_number("not-a-version"), None);
     }
 }

@@ -66,6 +66,39 @@ pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>>
     Ok(None)
 }
 
+/// Finds the most restrictive explicit upper bound among the manifests declaring this resolved
+/// dependency line.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] if a candidate manifest cannot be read or parsed.
+pub fn declared_bound(
+    root: &Utf8Path,
+    members: &[MemberRef],
+    name: &str,
+) -> Result<Option<String>> {
+    let rels = if members.is_empty() {
+        vec![Utf8PathBuf::from("package.json")]
+    } else {
+        let mut rels = BTreeSet::new();
+        for member in members {
+            rels.insert(if member.path.is_empty() || member.path == "." {
+                Utf8PathBuf::from("package.json")
+            } else {
+                Utf8Path::new(&member.path).join("package.json")
+            });
+        }
+        rels.into_iter().collect()
+    };
+    let mut ranges = Vec::new();
+    for rel in rels {
+        if let Some(range) = declared_range(&root.join(rel), name)? {
+            ranges.push(range);
+        }
+    }
+    Ok(crate::version::most_restrictive_declared_bound(ranges))
+}
+
 /// The manifests that may declare a dependency change, as project-root-relative paths.
 ///
 /// The root manifest is always included for legacy locks without workspace attribution and for root
@@ -388,6 +421,33 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
         }
+    }
+
+    #[test]
+    fn declared_bound_uses_the_strictest_declaring_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 root");
+        std::fs::create_dir_all(root.join("apps/a")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("apps/b")).expect("mkdir b");
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "dependencies": { "typescript": ">=5 <7" } }"#,
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("apps/b/package.json"),
+            r#"{ "dependencies": { "typescript": ">=5 <6" } }"#,
+        )
+        .expect("write b");
+
+        let bound = declared_bound(
+            &root,
+            &[member("a", "apps/a"), member("b", "apps/b")],
+            "typescript",
+        )
+        .expect("read bounds");
+
+        assert_eq!(bound.as_deref(), Some(">=5 <6"));
     }
 
     #[test]

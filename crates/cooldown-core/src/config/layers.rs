@@ -1,5 +1,5 @@
 use super::document::ConfigDocument;
-use super::schema::{ConfigToml, MinAgeToml, SelectorToml, WindowFields};
+use super::schema::{ConfigToml, MinAgeToml, PackageRuleToml, SelectorToml, WindowFields};
 use crate::duration::{parse_duration, parse_freeze};
 use crate::error::CoreError;
 use crate::model::{recognized_tool_names, tool_id};
@@ -113,6 +113,25 @@ fn selector_rule(
     Ok(rule)
 }
 
+fn package_rule(
+    selector: Selector,
+    package_toml: &PackageRuleToml,
+    ctx: &str,
+) -> Result<Rule, CoreError> {
+    let mut rule = Rule::new(selector);
+    rule.window = build_window(
+        package_toml.min_age.as_ref(),
+        package_toml.latest,
+        package_toml.freeze.as_deref(),
+        ctx,
+    )?;
+    if let Some(floor) = &package_toml.floor {
+        rule.floor = Some(parse_duration(floor)?);
+    }
+    rule.max_major = package_toml.max_major;
+    Ok(rule)
+}
+
 /// Parses a `cooldown.toml`'s `content` into a [`PolicyLayer`] tagged with `origin`.
 ///
 /// The top-level `min-age`/`latest`/`freeze`/`floor` keys become a [`Selector::Default`] rule, each
@@ -163,7 +182,10 @@ pub(crate) fn policy_layer_from_config(
 
     // `allow` expands to package-selector exemptions.
     for pattern in config.allow.unwrap_or_default() {
-        let mut rule = Rule::new(Selector::Package(PatternGlob::new(&pattern)?));
+        let mut rule = Rule::new(Selector::Package {
+            glob: PatternGlob::new(&pattern)?,
+            tool: None,
+        });
         rule.allow = true;
         layer.rules.push(rule);
     }
@@ -181,6 +203,18 @@ pub(crate) fn policy_layer_from_config(
                 &selector,
                 &format!("[tool.{name}]"),
             )?);
+            if let Some(packages) = &selector.package {
+                for (pattern, package) in packages {
+                    layer.rules.push(package_rule(
+                        Selector::Package {
+                            glob: PatternGlob::new(pattern)?,
+                            tool: Some(tool),
+                        },
+                        package,
+                        &format!("[tool.{name}.package.{pattern:?}]"),
+                    )?);
+                }
+            }
         }
     }
     if let Some(registries) = config.registry {
@@ -194,8 +228,11 @@ pub(crate) fn policy_layer_from_config(
     }
     if let Some(packages) = config.package {
         for (pattern, selector) in packages {
-            layer.rules.push(selector_rule(
-                Selector::Package(PatternGlob::new(&pattern)?),
+            layer.rules.push(package_rule(
+                Selector::Package {
+                    glob: PatternGlob::new(&pattern)?,
+                    tool: None,
+                },
                 &selector,
                 &format!("[package.{pattern:?}]"),
             )?);
@@ -287,7 +324,10 @@ pub fn layer_from_fields(
         layer.rules.push(rule);
     }
     for pattern in &fields.allow {
-        let mut rule = Rule::new(Selector::Package(PatternGlob::new(pattern)?));
+        let mut rule = Rule::new(Selector::Package {
+            glob: PatternGlob::new(pattern)?,
+            tool: None,
+        });
         rule.allow = true;
         layer.rules.push(rule);
     }

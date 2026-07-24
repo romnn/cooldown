@@ -19,7 +19,9 @@ use crate::native::parse_native;
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_adapter_util::{build_registry_releases, verify_current_report};
+use cooldown_adapter_util::{
+    RegistryVersionClassifier, build_registry_releases, verify_current_report,
+};
 use cooldown_core::{
     ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
@@ -84,11 +86,14 @@ pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec
     build_registry_releases(
         current,
         raw,
-        |value| version::parse(value).is_some(),
-        version::compare,
-        version::major_key,
-        version::classify_kind,
-        classify_quality,
+        RegistryVersionClassifier {
+            is_valid: |value| version::parse(value).is_some(),
+            compare: version::compare,
+            major_key: version::major_key,
+            major_number: version::major_number,
+            classify_kind: version::classify_kind,
+            classify_quality,
+        },
     )
 }
 
@@ -100,7 +105,9 @@ fn derive_locked_release(dep: &Dependency, releases: &[Release]) -> Option<Relea
         version: dep.current.clone(),
         order: ReleaseOrder(Vec::new()),
         major: version::major_key(dep.current.as_str()),
+        major_number: version::major_number(dep.current.as_str()),
         kind_from_current: None,
+        beyond_declared_bound: false,
         published_at: candidate.published_at,
         yanked: false,
         quality: dep.current_quality,
@@ -169,6 +176,9 @@ impl ToolRead for CargoTool {
                 graph_floor,
                 graph_ceiling: (!pinned && graph.is_graph_capped(&info.name, &info.version))
                     .then(|| Version::new(info.version.clone())),
+                declared_bound: graph
+                    .declared_bound(&info.name, &info.version)
+                    .map(str::to_string),
                 // Direct deps are attributed to their declarers; a transitive dep is attributed to
                 // the members that reach it through the graph (rendered as "via …").
                 members: if direct {
@@ -210,6 +220,15 @@ impl ReleaseFetcher for CargoTool {
         Ok(build_releases(dep.current.as_str(), raw))
     }
 
+    fn classify_declared_bound(&self, dep: &Dependency, releases: &mut [Release]) {
+        if let Some(requirement) = dep.declared_bound.as_deref() {
+            for release in releases {
+                release.beyond_declared_bound =
+                    !version::version_in_range(requirement, release.version.as_str());
+            }
+        }
+    }
+
     async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
         let time = self
             .index
@@ -219,7 +238,9 @@ impl ReleaseFetcher for CargoTool {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -844,6 +865,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: Vec::new(),
             pinned: false,
         };
@@ -851,7 +873,9 @@ mod tests {
             version: dep.current.clone(),
             order: ReleaseOrder(vec![42]),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: Some(UpdateKind::Patch),
+            beyond_declared_bound: false,
             published_at: Some(published_at),
             yanked: true,
             quality: ReleaseQuality::Prerelease,

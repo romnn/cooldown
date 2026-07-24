@@ -54,6 +54,12 @@ pub fn major_key(v: &str) -> MajorKey {
     }
 }
 
+/// Returns the numeric `SemVer` major ordinal for `v`.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    parse(v).map(|version| version.major)
+}
+
 /// Classifies the [`UpdateKind`] of moving from `current` to `cand` by `SemVer` axis.
 ///
 /// # Examples

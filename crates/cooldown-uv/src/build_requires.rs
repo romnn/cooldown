@@ -25,6 +25,9 @@ pub(crate) struct BuildRequire {
     /// The requirement is an exact `==`/`===` pin, so it is held (shown but not auto-upgraded), the
     /// same way the lock-driven graph treats a manifest `==` pin.
     pub pinned: bool,
+    /// The verbatim specifier when it carries an explicit `<`/`<=` upper bound (`>=1.2,<2`), so a
+    /// build backend's bound holds under `upgrade --major` exactly like a locked dependency's.
+    pub bound: Option<String>,
 }
 
 /// The build-backend requirements declared in `[build-system].requires`, each reduced to a
@@ -95,6 +98,7 @@ fn parse_build_require(requirement: &str) -> Option<BuildRequire> {
         name: native::normalize_name(name),
         floor,
         pinned,
+        bound: version::most_restrictive_declared_bound([rest.to_string()]),
     })
 }
 
@@ -160,7 +164,24 @@ mod tests {
             name: name.to_string(),
             floor: floor.to_string(),
             pinned,
+            bound: None,
         }
+    }
+
+    #[test]
+    fn parse_build_require_keeps_an_explicit_upper_bound() {
+        let bounded = parse_build_require("hatchling>=1.2,<2").expect("bounded require");
+        assert_eq!(bounded.floor, "1.2");
+        assert_eq!(bounded.bound.as_deref(), Some(">=1.2,<2"));
+        // An implicit compatible-release ceiling and an exact pin are not explicit bounds.
+        assert_eq!(
+            parse_build_require("hatchling~=1.2").and_then(|require| require.bound),
+            None
+        );
+        assert_eq!(
+            parse_build_require("hatchling==1.28.0").and_then(|require| require.bound),
+            None
+        );
     }
 
     #[test]

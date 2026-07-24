@@ -32,7 +32,13 @@ fn rel(v: &str, ord: u32, pub_at: Option<&str>, kind: Option<UpdateKind>) -> Rel
         version: Version::new(v),
         order: ReleaseOrder(ord.to_be_bytes().to_vec()),
         major: MajorKey(String::new()),
+        major_number: v
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .and_then(|major| major.parse().ok()),
         kind_from_current: kind,
+        beyond_declared_bound: false,
         published_at: pub_at.map(ts),
         yanked: false,
         quality: ReleaseQuality::Stable,
@@ -48,6 +54,7 @@ fn dep(name: &str, current: &str, direct: bool) -> Dependency {
         artifacts: Vec::new(),
         graph_floor: None,
         graph_ceiling: None,
+        declared_bound: None,
         members: Vec::new(),
         pinned: false,
     }
@@ -299,13 +306,17 @@ impl ToolWrite for FakeEco {
 }
 
 fn workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
+    workspace_with_layers(fake, baseline, vec![builtin_default_layer()])
+}
+
+fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLayer>) -> Workspace {
     let project = fake.project();
     let ctx = ProjectCtx {
         tool: GO,
         project,
         rel_path: Utf8PathBuf::from("."),
         policy: PolicyStack {
-            layers: vec![builtin_default_layer()],
+            layers,
             strict_native: false,
         },
     };
@@ -1503,6 +1514,151 @@ async fn upgrade_major_adopts_the_update_instead_of_hinting() {
                 .is_some_and(|s| s.reason == SkipReason::NeedsMajor)
         }),
         "no held-back item when --major adopts the update"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_reports_a_matured_target_held_by_a_declared_bound() {
+    let (_g, root) = tmp_root();
+    let mut releases = a_v1_and_matured_v2();
+    releases[1].beyond_declared_bound = true;
+    let mut fake = major_update_fake(root, true, releases);
+    fake.direct[0].declared_bound = Some(">=1, <2".to_string());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            strict: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    let held = out.items.first().expect("bound-held row");
+    assert_eq!(held.to, "v2.0.0");
+    assert_eq!(
+        held.skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::DeclaredBoundHeld)
+    );
+    assert!(!out.items.iter().any(|item| {
+        item.skipped
+            .as_ref()
+            .is_some_and(|skip| skip.reason == SkipReason::NeedsMajor)
+    }));
+}
+
+#[tokio::test]
+async fn upgrade_applies_an_in_bound_update_and_reports_the_bound_held_major() {
+    let (_g, root) = tmp_root();
+    let mut releases = vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v1.1.0",
+            1,
+            Some("2026-01-10T00:00:00Z"),
+            Some(UpdateKind::Minor),
+        ),
+        rel(
+            "v2.0.0",
+            2,
+            Some("2026-01-15T00:00:00Z"),
+            Some(UpdateKind::Major),
+        ),
+    ];
+    releases[2].beyond_declared_bound = true;
+    let mut fake = major_update_fake(root, true, releases);
+    fake.direct[0].declared_bound = Some(">=1, <2".to_string());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..opts()
+        })
+        .await;
+
+    assert!(
+        out.items
+            .iter()
+            .any(|item| item.applied && item.to == "v1.1.0")
+    );
+    assert!(out.items.iter().any(|item| {
+        item.to == "v2.0.0"
+            && item
+                .skipped
+                .as_ref()
+                .is_some_and(|skip| skip.reason == SkipReason::DeclaredBoundHeld)
+    }));
+}
+
+#[tokio::test]
+async fn upgrade_does_not_report_a_bound_without_a_matured_target_beyond_it() {
+    let (_g, root) = tmp_root();
+    let mut releases = a_v1_and_matured_v2();
+    releases[1].published_at = Some(ts("2026-06-16T00:00:00Z"));
+    releases[1].beyond_declared_bound = true;
+    let mut fake = major_update_fake(root, true, releases);
+    fake.direct[0].declared_bound = Some("<2".to_string());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..opts()
+        })
+        .await;
+
+    assert!(out.items.is_empty());
+    assert_eq!(out.summary.skipped, 0);
+}
+
+#[tokio::test]
+async fn upgrade_rewrite_crosses_a_declared_bound() {
+    let (_g, root) = tmp_root();
+    let mut releases = a_v1_and_matured_v2();
+    releases[1].beyond_declared_bound = true;
+    let mut fake = major_update_fake(root, true, releases);
+    fake.direct[0].declared_bound = Some("<2".to_string());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            rewrite: RewriteMode::Always,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].to, "v2.0.0");
+    assert!(out.items[0].skipped.is_none());
+}
+
+#[tokio::test]
+async fn upgrade_reports_a_matured_target_held_by_max_major() {
+    let (_g, root) = tmp_root();
+    let fake = major_update_fake(root, true, a_v1_and_matured_v2());
+    let mut ceiling = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+    let mut rule = Rule::new(Selector::Package {
+        glob: PatternGlob::new("a").expect("glob"),
+        tool: Some(GO),
+    });
+    rule.max_major = Some(1);
+    ceiling.rules.push(rule);
+    let out = workspace_with_layers(
+        fake,
+        Baseline::default(),
+        vec![builtin_default_layer(), ceiling],
+    )
+    .upgrade(&RunOpts {
+        allow_major: true,
+        strict: true,
+        ..opts()
+    })
+    .await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    assert_eq!(out.items[0].to, "v2.0.0");
+    assert_eq!(
+        out.items[0].skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::MaxMajorHeld)
     );
 }
 

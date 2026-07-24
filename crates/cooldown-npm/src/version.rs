@@ -29,10 +29,11 @@ pub fn parse(v: &str) -> Option<Version> {
 /// lock-only move (pnpm `update --no-save`) stays inside the author's constraint or needs a manifest
 /// rewrite instead.
 ///
-/// Conservative by design: a range this `semver`-crate parser cannot represent (npm hyphen ranges,
-/// `||` unions, space-separated `AND`, `x`/`X` wildcards, `workspace:`/`catalog:` protocols) returns
-/// `false`, so the caller falls back to rewriting the manifest — always correct, just less minimal
-/// than a lock-only move would have been.
+/// Conservative by design: whitespace-separated comparator clauses are normalized into the
+/// parser's comma-separated `AND` form, while ranges it still cannot represent (npm hyphen ranges,
+/// `||` unions, `x`/`X` wildcards, `workspace:`/`catalog:` protocols) return `false`. The caller
+/// then falls back to rewriting the manifest — always correct, just less minimal than a lock-only
+/// move would have been.
 ///
 /// # Examples
 ///
@@ -45,11 +46,85 @@ pub fn parse(v: &str) -> Option<Version> {
 /// ```
 #[must_use]
 pub fn version_in_range(spec: &str, target: &str) -> bool {
-    let (Ok(requirement), Ok(version)) = (semver::VersionReq::parse(spec), Version::parse(target))
+    let Some(spec) = normalized_requirement(spec) else {
+        return false;
+    };
+    let (Ok(requirement), Ok(version)) = (semver::VersionReq::parse(&spec), Version::parse(target))
     else {
         return false;
     };
     requirement.matches(&version)
+}
+
+fn normalized_requirement(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.contains("||") || spec.contains(" - ") {
+        return None;
+    }
+    let mut tokens = spec.split_whitespace().peekable();
+    let mut clauses = Vec::new();
+    while let Some(token) = tokens.next() {
+        if matches!(token, "<" | "<=" | ">" | ">=" | "=" | "~" | "^")
+            && let Some(version) = tokens.next()
+        {
+            clauses.push(format!("{token}{version}"));
+        } else {
+            clauses.push(token.to_string());
+        }
+    }
+    Some(clauses.join(", "))
+}
+
+#[derive(Clone)]
+struct UpperBound {
+    version: Version,
+    inclusive: bool,
+}
+
+fn explicit_upper_bound(spec: &str) -> Option<UpperBound> {
+    let normalized = normalized_requirement(spec)?;
+    let parsed = semver::VersionReq::parse(&normalized).ok()?;
+    parsed
+        .comparators
+        .iter()
+        .filter_map(|comparator| {
+            let inclusive = match comparator.op {
+                semver::Op::Less => false,
+                semver::Op::LessEq => true,
+                _ => return None,
+            };
+            let mut version = Version::new(
+                comparator.major,
+                comparator.minor.unwrap_or(0),
+                comparator.patch.unwrap_or(0),
+            );
+            version.pre = comparator.pre.clone();
+            Some(UpperBound { version, inclusive })
+        })
+        .min_by(|a, b| {
+            a.version
+                .cmp(&b.version)
+                .then_with(|| a.inclusive.cmp(&b.inclusive))
+        })
+}
+
+/// Chooses the most restrictive explicit upper-bound range from `ranges`.
+#[must_use]
+pub fn most_restrictive_declared_bound(ranges: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut best: Option<(UpperBound, String)> = None;
+    for range in ranges {
+        let Some(upper) = explicit_upper_bound(&range) else {
+            continue;
+        };
+        let stricter = best.as_ref().is_none_or(|(current, _)| {
+            upper.version < current.version
+                || (upper.version == current.version && !upper.inclusive && current.inclusive)
+        });
+        if stricter {
+            best = Some((upper, range));
+        }
+    }
+    best.map(|(_, range)| range)
 }
 
 /// Returns `true` when `v` carries a prerelease segment (e.g. `1.0.0-rc.1`).
@@ -92,6 +167,12 @@ pub fn major_key(v: &str) -> MajorKey {
         Some(s) => MajorKey(format!("0.{}", s.minor)),
         None => MajorKey(String::new()),
     }
+}
+
+/// Returns the numeric `SemVer` major ordinal for `v`.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    parse(v).map(|version| version.major)
 }
 
 /// Classifies the [`UpdateKind`] of moving from `current` to `cand` by `SemVer` axis.
@@ -173,5 +254,40 @@ mod tests {
         assert_eq!(classify_kind("1.2.3", "1.3.0"), Some(UpdateKind::Minor));
         assert_eq!(classify_kind("1.2.3", "1.2.4"), Some(UpdateKind::Patch));
         assert_eq!(classify_kind("bad", "1.2.4"), None);
+    }
+
+    #[test]
+    fn declared_bounds_require_a_simple_explicit_upper_comparator() {
+        assert_eq!(
+            most_restrictive_declared_bound([">=5 <6".to_string()]),
+            Some(">=5 <6".to_string())
+        );
+        assert_eq!(
+            most_restrictive_declared_bound([">= 5 < 6".to_string()]),
+            Some(">= 5 < 6".to_string())
+        );
+        assert_eq!(most_restrictive_declared_bound(["^5".to_string()]), None);
+        assert_eq!(
+            most_restrictive_declared_bound(["^5 || ^6".to_string()]),
+            None
+        );
+        assert_eq!(
+            most_restrictive_declared_bound([">=5 <7".to_string(), ">=5 <6".to_string(),]),
+            Some(">=5 <6".to_string())
+        );
+    }
+
+    #[test]
+    fn native_range_matching_handles_prerelease_bounds() {
+        assert!(version_in_range(">=5 <6", "5.9.0"));
+        assert!(version_in_range(">= 5 < 6", "5.9.0"));
+        assert!(!version_in_range(">=5 <6", "6.0.0-rc.1"));
+    }
+
+    #[test]
+    fn numeric_major_uses_the_semver_major() {
+        assert_eq!(major_number("0.9.0"), Some(0));
+        assert_eq!(major_number("12.0.0-rc.1"), Some(12));
+        assert_eq!(major_number("not-a-version"), None);
     }
 }

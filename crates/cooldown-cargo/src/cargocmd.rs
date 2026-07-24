@@ -47,6 +47,9 @@ pub struct ResolvedGraph {
     /// Workspace-member requirements are project-owned constraints that cooldown can rewrite for
     /// direct deps, so they are tracked as `pinned`/members instead of immutable graph floors.
     pub graph_floors: HashMap<(String, String), String>,
+    /// The most restrictive explicit upper-bound requirement declared by workspace members for
+    /// each active resolved node.
+    pub declared_bounds: HashMap<(String, String), String>,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -121,6 +124,14 @@ impl ResolvedGraph {
     #[must_use]
     pub fn graph_floor(&self, crate_name: &str, version: &str) -> Option<&str> {
         self.graph_floors
+            .get(&(crate_name.to_string(), version.to_string()))
+            .map(String::as_str)
+    }
+
+    /// The workspace requirement that explicitly upper-bounds `crate_name` at `version`.
+    #[must_use]
+    pub fn declared_bound(&self, crate_name: &str, version: &str) -> Option<&str> {
+        self.declared_bounds
             .get(&(crate_name.to_string(), version.to_string()))
             .map(String::as_str)
     }
@@ -251,6 +262,158 @@ fn exact_req_version(req: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[derive(Clone)]
+struct UpperBound {
+    version: semver::Version,
+    inclusive: bool,
+}
+
+struct DeclaredBoundEdge {
+    requirer: String,
+    dependency_name: String,
+    package_name: String,
+    requirement: String,
+    upper: UpperBound,
+}
+
+struct ActiveEdge {
+    dependency_name: String,
+    package_id: String,
+}
+
+type PackageEdges = HashMap<String, Vec<String>>;
+type NamedPackageEdges = HashMap<String, Vec<ActiveEdge>>;
+type ExactEdge = (String, String, String);
+type ResolvedCeilings = (
+    HashSet<(String, String)>,
+    HashMap<(String, String), Vec<String>>,
+);
+
+fn resolved_edges(resolve: Option<RawResolve>) -> (PackageEdges, NamedPackageEdges) {
+    let mut package_edges = HashMap::new();
+    let mut named_edges = HashMap::new();
+    let Some(resolve) = resolve else {
+        return (package_edges, named_edges);
+    };
+    for node in resolve.nodes {
+        let mut package_ids = Vec::with_capacity(node.deps.len());
+        let mut named = Vec::with_capacity(node.deps.len());
+        for dependency in node.deps {
+            package_ids.push(dependency.pkg.clone());
+            named.push(ActiveEdge {
+                dependency_name: dependency.name,
+                package_id: dependency.pkg,
+            });
+        }
+        package_edges.insert(node.id.clone(), package_ids);
+        named_edges.insert(node.id, named);
+    }
+    (package_edges, named_edges)
+}
+
+fn explicit_upper_bound(req: &str) -> Option<UpperBound> {
+    let parsed = semver::VersionReq::parse(req).ok()?;
+    parsed
+        .comparators
+        .iter()
+        .filter_map(|comparator| {
+            let inclusive = match comparator.op {
+                semver::Op::Less => false,
+                semver::Op::LessEq => true,
+                _ => return None,
+            };
+            let mut version = semver::Version::new(
+                comparator.major,
+                comparator.minor.unwrap_or(0),
+                comparator.patch.unwrap_or(0),
+            );
+            version.pre = comparator.pre.clone();
+            Some(UpperBound { version, inclusive })
+        })
+        .min_by(|a, b| {
+            a.version
+                .cmp(&b.version)
+                .then_with(|| a.inclusive.cmp(&b.inclusive))
+        })
+}
+
+fn upper_bound_is_stricter(candidate: &UpperBound, current: &UpperBound) -> bool {
+    candidate.version < current.version
+        || (candidate.version == current.version && !candidate.inclusive && current.inclusive)
+}
+
+fn resolved_declared_bounds(
+    candidates: Vec<DeclaredBoundEdge>,
+    active_edges: &HashMap<String, Vec<ActiveEdge>>,
+    packages: &HashMap<String, PkgInfo>,
+) -> HashMap<(String, String), String> {
+    let mut picks: HashMap<(String, String), (UpperBound, String)> = HashMap::new();
+    for candidate in candidates {
+        let Some(edges) = active_edges.get(&candidate.requirer) else {
+            continue;
+        };
+        for edge in edges {
+            // Cargo normalizes hyphens to underscores in dependency names used by the resolve graph.
+            // An empty name supports reduced metadata fixtures that omit this disambiguation.
+            let names_match = edge.dependency_name.is_empty()
+                || edge.dependency_name.replace('-', "_")
+                    == candidate.dependency_name.replace('-', "_");
+            if !names_match {
+                continue;
+            }
+            let Some(info) = packages.get(&edge.package_id) else {
+                continue;
+            };
+            if info.name != candidate.package_name
+                || !crate::version::version_in_range(&candidate.requirement, &info.version)
+            {
+                continue;
+            }
+            let key = (info.name.clone(), info.version.clone());
+            picks
+                .entry(key)
+                .and_modify(|current| {
+                    if upper_bound_is_stricter(&candidate.upper, &current.0) {
+                        current
+                            .clone_from(&(candidate.upper.clone(), candidate.requirement.clone()));
+                    }
+                })
+                .or_insert_with(|| (candidate.upper.clone(), candidate.requirement.clone()));
+        }
+    }
+    picks
+        .into_iter()
+        .map(|(key, (_, requirement))| (key, requirement))
+        .collect()
+}
+
+fn resolved_graph_ceilings(
+    candidates: Vec<ExactEdge>,
+    edges: &HashMap<String, Vec<String>>,
+    packages: &HashMap<String, PkgInfo>,
+) -> ResolvedCeilings {
+    let mut ceilings = HashSet::new();
+    let mut requirers: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (requirer, name, version) in candidates {
+        let active = edges.get(&requirer).is_some_and(|dep_ids| {
+            dep_ids.iter().any(|id| {
+                packages
+                    .get(id)
+                    .is_some_and(|info| info.name == name && info.version == version)
+            })
+        });
+        if !active {
+            continue;
+        }
+        let key = (name, version);
+        ceilings.insert(key.clone());
+        if let Some(requirer_name) = packages.get(&requirer).map(|info| info.name.clone()) {
+            requirers.entry(key).or_default().push(requirer_name);
+        }
+    }
+    (ceilings, requirers)
+}
+
 /// The lowest concrete version a Cargo requirement admits — the floor its lower-bound comparators
 /// demand — as a `major.minor.patch` string, or `None` when the requirement names no floor we can
 /// safely assert. `^1.0`/`~1.2`/`>=1.2.3`/`=1.2.3`/`1.*` all floor at the stated version with missing
@@ -323,6 +486,9 @@ struct RawPkg {
 #[derive(serde::Deserialize)]
 struct RawDep {
     name: String,
+    /// The dependency's manifest key when it renames `name`.
+    #[serde(default)]
+    rename: Option<String>,
     /// The semver requirement string, e.g. `^1.0.197` (default caret) or `=1.0.197` (exact pin).
     req: String,
     /// The dependency kind: absent/`null` for a normal dep, `"dev"`, or `"build"`. A transitive
@@ -344,6 +510,9 @@ struct RawNode {
 }
 #[derive(serde::Deserialize)]
 struct RawNodeDep {
+    /// The dependency name used by this edge, including a manifest rename.
+    #[serde(default)]
+    name: String,
     pkg: String,
 }
 
@@ -449,13 +618,14 @@ impl Cargo {
         // Resolved against the activated graph below: a declared pin behind a disabled feature or a
         // non-matching `target` cfg is not a real edge and must not cap, so this is a candidate list,
         // not the final ceiling set.
-        let mut exact_edges: Vec<(String, String, String)> = Vec::new();
+        let mut exact_edges: Vec<ExactEdge> = Vec::new();
         // `(requirer id, dep name, floor)` for every non-root, non-dev requirement with a parseable
         // lower bound. Like `exact_edges`, a candidate list resolved against the activated graph
         // below: a requirement behind a disabled feature or non-matching `target` is not a real edge
         // and demands no floor. Root requirements are intentionally excluded: they are direct project
         // constraints cooldown may rewrite, not structural third-party graph floors.
         let mut floor_edges: Vec<(String, String, String)> = Vec::new();
+        let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
         for p in raw.packages {
             for dep in &p.dependencies {
                 // A dev dependency of a transitive crate is not in the resolved build graph and caps
@@ -477,6 +647,20 @@ impl Cargo {
                 {
                     floor_edges.push((p.id.clone(), dep.name.clone(), floor));
                 }
+                // A member's dev-dependency bound is as deliberate as its normal one, and dev deps
+                // are resolved and upgradeable — the same reasoning that keeps dev pins in
+                // `exact_pins` above.
+                if roots.contains(&p.id)
+                    && let Some(upper) = explicit_upper_bound(&dep.req)
+                {
+                    declared_bound_edges.push(DeclaredBoundEdge {
+                        requirer: p.id.clone(),
+                        dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
+                        package_name: dep.name.clone(),
+                        requirement: dep.req.clone(),
+                        upper,
+                    });
+                }
             }
             packages.insert(
                 p.id.clone(),
@@ -488,37 +672,13 @@ impl Cargo {
                 },
             );
         }
-        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-        if let Some(resolve) = raw.resolve {
-            for node in resolve.nodes {
-                edges.insert(node.id, node.deps.into_iter().map(|d| d.pkg).collect());
-            }
-        }
+        let (edges, active_edges) = resolved_edges(raw.resolve);
         // A `=x.y.z` requirement caps a node only when its edge is actually in the resolved graph:
         // keep an exact pin only if the requirer resolves an edge to a node of that name and version.
         // An inactive (optional/target-gated) edge is declared but absent from `resolve.nodes`, so it
         // contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate.
-        let mut graph_ceilings = HashSet::new();
-        let mut ceiling_requirers: HashMap<(String, String), Vec<String>> = HashMap::new();
-        for (requirer, name, version) in exact_edges {
-            let active = edges.get(&requirer).is_some_and(|dep_ids| {
-                dep_ids.iter().any(|id| {
-                    packages
-                        .get(id)
-                        .is_some_and(|info| info.name == name && info.version == version)
-                })
-            });
-            if active {
-                let key = (name.clone(), version.clone());
-                graph_ceilings.insert(key.clone());
-                if let Some(requirer_name) = packages.get(&requirer).map(|info| info.name.clone()) {
-                    ceiling_requirers
-                        .entry(key)
-                        .or_default()
-                        .push(requirer_name);
-                }
-            }
-        }
+        let (graph_ceilings, ceiling_requirers) =
+            resolved_graph_ceilings(exact_edges, &edges, &packages);
         // A non-root requirement floors a node only at the version its edge actually resolved to: walk
         // each active requirer edge to the depended node of that name and record the highest lower
         // bound demanded of it. An inactive (optional/target-gated) edge is absent from
@@ -547,6 +707,8 @@ impl Cargo {
                     .or_insert_with(|| floor.clone());
             }
         }
+        let declared_bounds =
+            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages);
         ResolvedGraph {
             packages,
             roots,
@@ -555,6 +717,7 @@ impl Cargo {
             graph_ceilings,
             ceiling_requirers,
             graph_floors,
+            declared_bounds,
         }
     }
 
@@ -667,6 +830,158 @@ mod tests {
         assert_eq!(exact_req_version("==1.0.197"), None);
         assert_eq!(exact_req_version("=1"), None);
         assert_eq!(exact_req_version("=1.0.197, <2.0.0"), None);
+    }
+
+    #[test]
+    fn explicit_upper_bound_requires_a_written_less_than_comparator() {
+        assert!(explicit_upper_bound(">=1, <2").is_some());
+        assert!(explicit_upper_bound("^1").is_none());
+        assert!(explicit_upper_bound("=1.2.3").is_none());
+    }
+
+    #[test]
+    fn declared_bounds_choose_the_strictest_active_workspace_requirement() {
+        let packages = HashMap::from([(
+            "serde-id".to_string(),
+            PkgInfo {
+                name: "serde".to_string(),
+                version: "1.0.228".to_string(),
+                source: Some(CRATES_IO_SOURCE.to_string()),
+                path: String::new(),
+            },
+        )]);
+        let active_edges = HashMap::from([
+            (
+                "root-a".to_string(),
+                vec![ActiveEdge {
+                    dependency_name: "serde".to_string(),
+                    package_id: "serde-id".to_string(),
+                }],
+            ),
+            (
+                "root-b".to_string(),
+                vec![ActiveEdge {
+                    dependency_name: "serde".to_string(),
+                    package_id: "serde-id".to_string(),
+                }],
+            ),
+        ]);
+        let candidates = [
+            ("root-a", "serde", ">=1, <3"),
+            ("root-b", "serde", ">=1, <2"),
+            ("inactive-root", "serde", "<1.5"),
+        ]
+        .into_iter()
+        .map(|(root, name, requirement)| DeclaredBoundEdge {
+            requirer: root.to_string(),
+            dependency_name: name.to_string(),
+            package_name: name.to_string(),
+            requirement: requirement.to_string(),
+            upper: explicit_upper_bound(requirement).expect("upper bound"),
+        })
+        .collect();
+
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+
+        assert_eq!(
+            bounds
+                .get(&("serde".to_string(), "1.0.228".to_string()))
+                .map(String::as_str),
+            Some(">=1, <2")
+        );
+    }
+
+    #[test]
+    fn declared_bounds_follow_renamed_edges_to_their_resolved_major() {
+        let packages = HashMap::from([
+            (
+                "foo-v1".to_string(),
+                PkgInfo {
+                    name: "foo".to_string(),
+                    version: "1.9.0".to_string(),
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    path: String::new(),
+                },
+            ),
+            (
+                "foo-v2".to_string(),
+                PkgInfo {
+                    name: "foo".to_string(),
+                    version: "2.4.0".to_string(),
+                    source: Some(CRATES_IO_SOURCE.to_string()),
+                    path: String::new(),
+                },
+            ),
+        ]);
+        let active_edges = HashMap::from([(
+            "root".to_string(),
+            vec![
+                ActiveEdge {
+                    dependency_name: "foo-v1".to_string(),
+                    package_id: "foo-v1".to_string(),
+                },
+                ActiveEdge {
+                    dependency_name: "foo-v2".to_string(),
+                    package_id: "foo-v2".to_string(),
+                },
+            ],
+        )]);
+        let candidates = [("foo-v1", ">=1, <2"), ("foo-v2", ">=2, <3")]
+            .into_iter()
+            .map(|(dependency_name, requirement)| DeclaredBoundEdge {
+                requirer: "root".to_string(),
+                dependency_name: dependency_name.to_string(),
+                package_name: "foo".to_string(),
+                requirement: requirement.to_string(),
+                upper: explicit_upper_bound(requirement).expect("upper bound"),
+            })
+            .collect();
+
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+
+        assert_eq!(
+            bounds
+                .get(&("foo".to_string(), "1.9.0".to_string()))
+                .map(String::as_str),
+            Some(">=1, <2")
+        );
+        assert_eq!(
+            bounds
+                .get(&("foo".to_string(), "2.4.0".to_string()))
+                .map(String::as_str),
+            Some(">=2, <3")
+        );
+    }
+
+    #[test]
+    fn declared_bounds_include_a_workspace_member_dev_dependency() {
+        // A member's dev-dependency bound is as deliberate as a normal one (and dev deps are
+        // resolved and upgradeable), so `criterion = ">=0.5, <0.6"` must hold like the normal
+        // `serde` bound — the same treatment `exact_pins` gives a dev `=` pin.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [
+                    {"name": "serde", "req": ">=1, <2"},
+                    {"name": "criterion", "req": ">=0.5, <0.6", "kind": "dev"}
+                 ]},
+                {"id": "serde", "name": "serde", "version": "1.0.228", "dependencies": []},
+                {"id": "criterion", "name": "criterion", "version": "0.5.1", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "serde"}, {"pkg": "criterion"}]},
+                {"id": "serde", "deps": []},
+                {"id": "criterion", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.declared_bound("serde", "1.0.228"), Some(">=1, <2"));
+        assert_eq!(
+            graph.declared_bound("criterion", "0.5.1"),
+            Some(">=0.5, <0.6")
+        );
     }
 
     #[test]
@@ -814,6 +1129,7 @@ mod tests {
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
+            declared_bounds: HashMap::new(),
         };
 
         assert!(graph.is_exact_pinned("serde", "1.0.197"));
@@ -832,6 +1148,7 @@ mod tests {
             graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
+            declared_bounds: HashMap::new(),
         };
 
         assert!(graph.is_graph_capped("serde_derive", "1.0.228"));
@@ -914,6 +1231,7 @@ mod tests {
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
+            declared_bounds: HashMap::new(),
         };
 
         assert_eq!(
@@ -1134,6 +1452,7 @@ mod tests {
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
+            declared_bounds: HashMap::new(),
         };
 
         let names = |members: Vec<MemberRef>| {

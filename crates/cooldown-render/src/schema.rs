@@ -88,7 +88,18 @@ pub fn json_schema() -> Value {
         "type": "object",
         "required": ["reason", "message"],
         "properties": {
-            "reason": { "enum": ["graph_held", "transitive_in_cooldown", "resolver_conflict", "not_eligible", "needs_major"] },
+            "reason": {
+                "enum": [
+                    "graph_held",
+                    "transitive_in_cooldown",
+                    "resolver_conflict",
+                    "not_eligible",
+                    "needs_major",
+                    "declared_bound_held",
+                    "max_major_held",
+                    "multi_version_held"
+                ]
+            },
             "message": { "type": "string" },
             "offending": { "type": "string" }
         },
@@ -157,6 +168,7 @@ pub fn json_schema() -> Value {
                 },
                 "adoptableTarget": { "type": "string" },
                 "blockedBy": { "type": "string" },
+                "heldBy": { "type": "string" },
                 "latest": { "$ref": "#/$defs/latestInfo" },
                 "error": { "$ref": "#/$defs/diagnostic" }
             },
@@ -476,6 +488,53 @@ mod tests {
         assert_envelope_keys_match(&schema);
     }
 
+    #[test]
+    fn held_by_serializes_with_the_additive_camel_case_field() {
+        let value = serde_json::to_value(outdated_item()).expect("item serializes");
+        assert_eq!(value["heldBy"], "bound <2");
+    }
+
+    #[test]
+    fn ceiling_skips_rank_beside_needs_major() {
+        for reason in [
+            SkipReason::NeedsMajor,
+            SkipReason::DeclaredBoundHeld,
+            SkipReason::MaxMajorHeld,
+        ] {
+            let mut item = upgrade_item();
+            item.skipped = Some(SkippedInfo {
+                reason,
+                message: reason.message().to_string(),
+                offending: None,
+            });
+            assert_eq!(item.sort_rank(), 2);
+        }
+    }
+
+    #[test]
+    fn skipped_reason_schema_accepts_every_serialized_variant() {
+        let schema = json_schema();
+        let allowed = schema["$defs"]["skippedInfo"]["properties"]["reason"]["enum"]
+            .as_array()
+            .expect("skip reason enum");
+        for reason in [
+            SkipReason::GraphHeld,
+            SkipReason::TransitiveInCooldown,
+            SkipReason::ResolverConflict,
+            SkipReason::NotEligible,
+            SkipReason::NeedsMajor,
+            SkipReason::DeclaredBoundHeld,
+            SkipReason::MaxMajorHeld,
+            SkipReason::MultiVersionHeld,
+        ] {
+            let serialized = serde_json::to_value(reason).expect("reason serializes");
+            assert!(
+                allowed.contains(&serialized),
+                "schema is missing {serialized}"
+            );
+        }
+    }
+
     fn assert_definition_keys_match(schema: &Value) {
         assert_def_keys(schema, "diagnostic", diagnostic());
         assert_def_keys(schema, "window", window());
@@ -706,6 +765,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("1.2.3".to_string()),
             blocked_by: Some("typer".to_string()),
+            held_by: Some(cooldown_core::HeldReason::DeclaredBound("<2".to_string()).into()),
             latest: Some(latest_info()),
             error: Some(diagnostic()),
         }

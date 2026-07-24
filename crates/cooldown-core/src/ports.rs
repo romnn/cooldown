@@ -192,6 +192,14 @@ pub trait ReleaseFetcher: Send + Sync {
         candidates: CandidateScope,
     ) -> Result<Vec<Release>>;
 
+    /// Applies dependency-specific declared-bound classification to cached candidate releases.
+    ///
+    /// The application calls this on its private clone after the shared registry lookup. Adapters
+    /// that support explicit manifest upper bounds must classify them here instead of in
+    /// [`releases`](Self::releases), because two projects can share a package/version cache key
+    /// while declaring different requirements.
+    fn classify_declared_bound(&self, _dep: &Dependency, _releases: &mut [Release]) {}
+
     /// Returns the currently-locked version of `dep` as a [`Release`].
     ///
     /// The returned release carries its `quality` (equal to `dep.current_quality`) and the publish
@@ -225,7 +233,8 @@ pub trait ReleaseFetcher: Send + Sync {
     /// per project, so two projects that share a `(package, version)` never serve each other's
     /// answer; a project-independent fetcher (a global registry index) is shared across the whole
     /// run. Defaults to `false` — correct for every registry-index adapter. Override to `true` when
-    /// `releases`/`locked_release` read [`FetchContext::project`] or per-project [`Dependency`] state
+    /// `releases`/`locked_release` read [`FetchContext::project`] or project-specific state beyond
+    /// the declared bound handled by [`classify_declared_bound`](Self::classify_declared_bound)
     /// (e.g. Go's per-module `go list -m -versions`, uv's per-project locked artifact times).
     fn releases_are_project_scoped(&self) -> bool {
         false

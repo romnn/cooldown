@@ -227,6 +227,12 @@ pub fn major(v: &str) -> String {
     }
 }
 
+/// Returns the numeric major ordinal of `v`.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    parse(v)?.major.parse().ok()
+}
+
 /// Returns the major/minor prefix `vN.M` of `v`, or `""` if `v` is invalid.
 ///
 /// Mirrors `semver.MajorMinor`.
@@ -654,6 +660,13 @@ mod tests {
         assert_eq!(compare("v2.0.0+incompatible", "v1.9.9"), Greater);
         assert!(is_stable("v3.0.0+incompatible"));
         assert!(is_incompatible("v3.0.0+incompatible"));
+    }
+
+    #[test]
+    fn numeric_major_covers_path_and_incompatible_versions() {
+        assert_eq!(major_number("v2.1.0"), Some(2));
+        assert_eq!(major_number("v11.0.0+incompatible"), Some(11));
+        assert_eq!(major_number("not-a-version"), None);
     }
 
     #[test]

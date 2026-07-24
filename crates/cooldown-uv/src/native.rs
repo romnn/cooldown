@@ -131,7 +131,7 @@ pub(crate) fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLay
                     "{manifest}: invalid [tool.uv].exclude-newer-package pattern {package:?}: {error}"
                 ))
             })?;
-            let selector = Selector::Package(glob);
+            let selector = Selector::Package { glob, tool: None };
             if let Some(false) = value.as_bool() {
                 rules.push(NativeRule {
                     selector,

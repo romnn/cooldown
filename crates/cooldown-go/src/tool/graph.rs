@@ -41,7 +41,9 @@ pub(super) async fn locked_release(proxy: &GoProxy, dep: &Dependency) -> Result<
         version: dep.current.clone(),
         order: ReleaseOrder(Vec::new()),
         major: major_key_for_path(&dep.package.name),
+        major_number: crate::semver::major_number(dep.current.as_str()),
         kind_from_current: None,
+        beyond_declared_bound: false,
         published_at: time,
         yanked: false,
         quality: dep.current_quality,
@@ -83,6 +85,7 @@ fn dependency_of(
         // Go's module graph yields only a floor (MVS minimum); it does not impose an `==`-style
         // upper bound on a transitive module, so there is no ceiling to record.
         graph_ceiling: None,
+        declared_bound: None,
         members: Vec::new(),
         pinned: false,
     })

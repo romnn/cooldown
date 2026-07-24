@@ -319,6 +319,36 @@ impl UvLock {
         ceilings
     }
 
+    /// The most restrictive explicit upper-bound specifier declared by root/workspace packages for
+    /// each dependency.
+    #[must_use]
+    pub fn declared_bounds(&self) -> HashMap<String, String> {
+        let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        for package in &self.packages {
+            if !package.source.as_ref().is_some_and(Source::is_root) {
+                continue;
+            }
+            let Some(metadata) = &package.metadata else {
+                continue;
+            };
+            for requirement in &metadata.requires_dist {
+                if let Some(specifier) = &requirement.specifier {
+                    by_name
+                        .entry(requirement.name.clone())
+                        .or_default()
+                        .push(specifier.clone());
+                }
+            }
+        }
+        by_name
+            .into_iter()
+            .filter_map(|(name, specifiers)| {
+                crate::version::most_restrictive_declared_bound(specifiers)
+                    .map(|specifier| (name, specifier))
+            })
+            .collect()
+    }
+
     /// Finds the package resolved at exactly `name` and `version`, if present.
     ///
     /// `uv.lock` holds a single entry per name, so a version mismatch yields `None`.

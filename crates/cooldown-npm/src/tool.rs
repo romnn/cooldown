@@ -12,7 +12,8 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
-    build_registry_releases, skipped_on_apply_error, verify_current_unknown,
+    RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
+    verify_current_unknown,
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
@@ -161,11 +162,14 @@ pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release
     build_registry_releases(
         current,
         raw,
-        |value| version::parse(value).is_some(),
-        version::compare,
-        version::major_key,
-        version::classify_kind,
-        classify_quality,
+        RegistryVersionClassifier {
+            is_valid: |value| version::parse(value).is_some(),
+            compare: version::compare,
+            major_key: version::major_key,
+            major_number: version::major_number,
+            classify_kind: version::classify_kind,
+            classify_quality,
+        },
     )
 }
 
@@ -262,7 +266,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             if !seen.insert((name.clone(), version.clone())) {
                 continue; // a name can resolve to the same version via several paths
             }
-            let members = member_paths
+            let members: Vec<MemberRef> = member_paths
                 .into_iter()
                 .map(|path| MemberRef {
                     name: member_names
@@ -273,6 +277,11 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 })
                 .collect();
             let pinned = member_index.is_exact_pinned(&name, &version);
+            let declared_bound = if is_direct {
+                manifest::declared_bound(&project.root, &members, &name)?
+            } else {
+                None
+            };
             deps.push(Dependency {
                 package: PackageId::new(L::ID, name, Some(NPM.to_string())),
                 current: Version::new(version.clone()),
@@ -281,6 +290,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,
+                declared_bound,
                 members,
                 pinned,
             });
@@ -315,6 +325,15 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
         Ok(build_releases(dep.current.as_str(), raw))
     }
 
+    fn classify_declared_bound(&self, dep: &Dependency, releases: &mut [Release]) {
+        if let Some(requirement) = dep.declared_bound.as_deref() {
+            for release in releases {
+                release.beyond_declared_bound =
+                    !version::version_in_range(requirement, release.version.as_str());
+            }
+        }
+    }
+
     async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
         let time = self
             .registry
@@ -324,7 +343,9 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,

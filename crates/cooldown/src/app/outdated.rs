@@ -444,7 +444,6 @@ impl<'a> OutdatedRunner<'a> {
                 age_days: published.map(|p| age_days(p, self.ws.now())),
             }
         });
-
         OutdatedItem {
             name: dep.package.name.clone(),
             tool: pctx.tool.as_str().to_string(),
@@ -459,6 +458,7 @@ impl<'a> OutdatedRunner<'a> {
             status: verdict.status.into(),
             adoptable_target: verdict.adoptable_target.map(|v| v.to_string()),
             blocked_by: None,
+            held_by: verdict.held_reason.map(Into::into),
             latest,
             error: None,
         }
@@ -507,6 +507,7 @@ fn error_item(
         status: OutdatedStatus::Error,
         adoptable_target: None,
         blocked_by: None,
+        held_by: None,
         latest: None,
         error: Some(diag),
     }
@@ -647,6 +648,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some(target.to_string()),
             blocked_by: None,
+            held_by: None,
             latest: None,
             error: None,
         }
@@ -683,6 +685,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: item.members.clone(),
             pinned: false,
         }
@@ -700,7 +703,9 @@ mod tests {
             version: Version::new(version),
             order: ReleaseOrder(vec![order]),
             major: MajorKey(major.to_string()),
+            major_number: major.parse().ok(),
             kind_from_current: Some(UpdateKind::Major),
+            beyond_declared_bound: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,

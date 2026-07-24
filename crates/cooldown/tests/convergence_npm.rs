@@ -207,3 +207,109 @@ fn outdated_and_upgrade_resolve_eslint_with_mature_transitives() {
     assert_eq!(second.summary_skipped(), 0);
     assert_eq!(lock_after, fixture.read_bytes("package-lock.json"));
 }
+
+const VERSION_BOUND_FREEZE: &str = "2025-01-01T00:00:00Z";
+
+const VERSION_BOUND_PACKAGE_JSON: &str = indoc! {r#"
+    {
+      "name": "cooldown-npm-version-bound",
+      "version": "0.1.0",
+      "private": true,
+      "devDependencies": {
+        "typescript": ">=4 <5"
+      }
+    }
+"#};
+
+const MAX_MAJOR_PACKAGE_JSON: &str = indoc! {r#"
+    {
+      "name": "cooldown-npm-max-major",
+      "version": "0.1.0",
+      "private": true,
+      "devDependencies": {
+        "typescript": "^4.9.5"
+      }
+    }
+"#};
+
+const MAX_MAJOR_POLICY: &str = indoc! {"
+    [tool.npm.package.typescript]
+    max-major = 4
+"};
+
+fn typescript_fixture(package_json: &str) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("package.json", package_json);
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                &format!("--before={VERSION_BOUND_FREEZE}"),
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+#[test]
+fn explicit_upper_bound_holds_until_rewrite() {
+    skip_if_missing!("npm");
+    let fixture = typescript_fixture(VERSION_BOUND_PACKAGE_JSON);
+    let manifest_before = fixture.read_bytes("package.json");
+    let lock_before = fixture.read_bytes("package-lock.json");
+    assert!(
+        package_lock_version(&fixture, "typescript")
+            .is_some_and(|version| version.starts_with("4.")),
+        "the explicit bound must seed TypeScript 4.x"
+    );
+
+    let held = fixture.cooldown_json(&["upgrade", "--major", "--freeze", VERSION_BOUND_FREEZE]);
+    assert_eq!(
+        held.skipped_reasons_for("typescript"),
+        ["declared_bound_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(manifest_before, fixture.read_bytes("package.json"));
+    assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
+
+    let rewritten = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--rewrite",
+        "--freeze",
+        VERSION_BOUND_FREEZE,
+    ]);
+    assert!(rewritten.applied_names().contains("typescript"));
+    assert!(
+        package_lock_version(&fixture, "typescript")
+            .is_some_and(|version| version.starts_with("5.")),
+        "--rewrite must cross the explicit bound"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fixture.read_bytes("package.json")).contains(">=4 <5"),
+        "the crossed bound must be rewritten"
+    );
+}
+
+#[test]
+fn tool_scoped_max_major_holds_an_otherwise_adoptable_major() {
+    skip_if_missing!("npm");
+    let fixture = typescript_fixture(MAX_MAJOR_PACKAGE_JSON);
+    fixture.write("cooldown.toml", MAX_MAJOR_POLICY);
+    let manifest_before = fixture.read_bytes("package.json");
+    let lock_before = fixture.read_bytes("package-lock.json");
+
+    let held = fixture.cooldown_json(&["upgrade", "--major", "--freeze", VERSION_BOUND_FREEZE]);
+    assert_eq!(
+        held.skipped_reasons_for("typescript"),
+        ["max_major_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(manifest_before, fixture.read_bytes("package.json"));
+    assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
+}

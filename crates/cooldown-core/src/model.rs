@@ -291,9 +291,19 @@ pub struct Release {
     pub order: ReleaseOrder,
     /// The opaque same-major token, compared for equality with the current pin's.
     pub major: MajorKey,
+    /// The ecosystem's numeric major ordinal, or `None` when it cannot be classified.
+    ///
+    /// A configured `max-major` conservatively excludes releases without an ordinal. PEP 440
+    /// epochs do not affect this number; adapters use the first release segment.
+    pub major_number: Option<u64>,
     /// The update kind relative to the current pin, or `None` when not comparable (e.g. a
     /// commit pin).
     pub kind_from_current: Option<UpdateKind>,
+    /// Whether this release falls outside [`Dependency::declared_bound`].
+    ///
+    /// Adapters set this with their native range matcher. It is always `false` when the dependency
+    /// has no explicit declared upper bound.
+    pub beyond_declared_bound: bool,
     /// The newest upload time over the selected artifacts, or `None` if any selected
     /// artifact's time is unknown.
     pub published_at: Option<jiff::Timestamp>,
@@ -342,6 +352,11 @@ pub struct Dependency {
     /// `evaluate` relies on this: a ceiling above the fetched releases would be silently uncapped, and
     /// `check_pin` treats a ceiling at the locked version as graph-held in both directions.
     pub graph_ceiling: Option<Version>,
+    /// The verbatim declared requirement carrying an explicit `<` or `<=` upper bound.
+    ///
+    /// The core treats this as display-only opaque text. The declaring adapter parses it and marks
+    /// each [`Release::beyond_declared_bound`]. Implicit caret and tilde ceilings are not recorded.
+    pub declared_bound: Option<String>,
     /// The workspace member package(s) that declare this dependency at this resolved version — e.g.
     /// cargo member crates, pnpm/npm workspace packages, the uv project itself. Reports attribute the
     /// dependency to these packages (by name, or by path under `--paths`). Empty when the adapter
@@ -381,8 +396,8 @@ pub enum Status {
     InCooldown,
     /// Exempted by an `allow` rule (or, in `check`, a pseudo/commit pin).
     Exempt,
-    /// Pinned, so it will not move on its own: a commit pin (pseudo-version, no tagged version to
-    /// compare against) or an exact `==`/`=` manifest pin.
+    /// Held by a pin, resolved-graph ceiling, explicit manifest upper bound, or configured
+    /// `max-major`, so it will not move automatically.
     Held,
     /// The currently-locked version is itself younger than its window (the `check` violation).
     CurrentInCooldown,
@@ -445,6 +460,24 @@ pub struct Verdict {
     pub latest: Option<Version>,
     /// The per-candidate verdicts in ascending release order; the newest candidate is last.
     pub candidates: Vec<Candidate>,
+    /// Why the headline is [`Status::Held`], or `None` for every other status.
+    pub held_reason: Option<HeldReason>,
+}
+
+/// The policy or declaration that prevents a held dependency from moving automatically.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// An exact `==` or `=` manifest pin.
+    ExactPin,
+    /// A commit pin or pseudo-version.
+    CommitPin,
+    /// A requirer's exact pin caps the resolved graph.
+    GraphCeiling,
+    /// The manifest's verbatim explicit upper-bound requirement.
+    DeclaredBound(String),
+    /// The inclusive configured numeric major ceiling.
+    MaxMajor(u64),
 }
 
 impl Verdict {
@@ -549,21 +582,18 @@ pub struct Change {
 
 /// How `apply` should treat a manifest's declared version constraint when adopting a new version.
 ///
-/// The two modes differ only when the new version already satisfies the existing constraint (an
-/// in-range minor/patch, or a major under an open `>=` bound): [`Auto`](RewriteMode::Auto) leaves
-/// the constraint untouched and moves only the lock, while [`Always`](RewriteMode::Always) rewrites
-/// the constraint to track the adopted version. When the target falls *outside* the constraint
-/// (e.g. a cross-major bump past a caret range), both modes must rewrite — it is the only way to
-/// adopt it — so the lock-only path is reserved for genuinely in-range moves.
+/// Where an adapter supports lock-only updates, [`Auto`](RewriteMode::Auto) leaves an in-range
+/// constraint untouched and may widen an implicit caret/tilde ceiling for an opted-in major update.
+/// An explicit `<`/`<=` comparator holds in this mode. [`Always`](RewriteMode::Always) rewrites every
+/// adopted target and is the deliberate escape hatch for crossing an explicit upper bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RewriteMode {
-    /// Move the lock within the existing constraint; rewrite the manifest constraint only when the
-    /// target version lies outside it. The default — it keeps declared ranges as loose as the
-    /// author left them.
+    /// Preserve an in-range constraint where possible and widen only implicit ceilings when
+    /// required. Author-written `<`/`<=` upper bounds remain absolute in this default mode.
     #[default]
     Auto,
-    /// Always rewrite the manifest constraint to the adopted version, even for an in-range move.
+    /// Always rewrite the manifest constraint, including when crossing an explicit upper bound.
     Always,
 }
 
@@ -609,6 +639,10 @@ pub enum SkipReason {
     /// need `--major`), but unlike a real skip it never fails a `--strict` run — you chose not to
     /// take it, the run did not fail to.
     NeedsMajor,
+    /// An explicit manifest upper bound holds the dependency below the newer major.
+    DeclaredBoundHeld,
+    /// A configured package `max-major` holds the dependency below the candidate.
+    MaxMajorHeld,
     /// The dependency is declared at multiple versions across the workspace, so it is range-floated
     /// (each importer kept on its own line) rather than pinned to one target. A candidate whose target
     /// is out of this importer's line — a cross-line bump, e.g. one member on `@types/node@^22` while
@@ -643,6 +677,12 @@ impl SkipReason {
                 "no editable requirement to change (transitive-only or path/git dependency)"
             }
             SkipReason::NeedsMajor => "needs --major to adopt",
+            SkipReason::DeclaredBoundHeld => {
+                "declared upper bound holds this below the newer major; pass --rewrite to cross and rewrite it"
+            }
+            SkipReason::MaxMajorHeld => {
+                "config max-major ceiling holds this; raise it in cooldown.toml to adopt"
+            }
             SkipReason::MultiVersionHeld => {
                 "declared at multiple versions across the workspace; kept on its own line"
             }
@@ -819,6 +859,8 @@ mod tests {
             SkipReason::ResolverConflict,
             SkipReason::NotEligible,
             SkipReason::NeedsMajor,
+            SkipReason::DeclaredBoundHeld,
+            SkipReason::MaxMajorHeld,
             SkipReason::MultiVersionHeld,
         ];
         for (i, a) in all.iter().enumerate() {

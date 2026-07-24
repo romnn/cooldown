@@ -11,7 +11,9 @@ use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
-use cooldown_adapter_util::{build_registry_releases, verify_current_report};
+use cooldown_adapter_util::{
+    RegistryVersionClassifier, build_registry_releases, verify_current_report,
+};
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
@@ -89,11 +91,14 @@ pub fn build_releases(
     build_registry_releases(
         current,
         raw,
-        |value| version::parse(value).is_some(),
-        version::compare,
-        version::major_key,
-        version::classify_kind,
-        classify_quality,
+        RegistryVersionClassifier {
+            is_valid: |value| version::parse(value).is_some(),
+            compare: version::compare,
+            major_key: version::major_key,
+            major_number: version::major_number,
+            classify_kind: version::classify_kind,
+            classify_quality,
+        },
     )
 }
 
@@ -183,6 +188,7 @@ impl ToolRead for UvTool {
         let direct: std::collections::HashSet<String> = lock.direct_names().into_iter().collect();
         let floors = lock.graph_floors();
         let ceilings = lock.graph_ceilings();
+        let declared_bounds = lock.declared_bounds();
         let exact_pins = crate::native::exact_pinned_names(&project.manifest);
         // A uv project is a single package, so it is the source for every dependency it declares.
         let project_member = project_member(project, &lock)?;
@@ -225,6 +231,11 @@ impl ToolRead for UvTool {
                 artifacts: pkg.artifact_ids(),
                 graph_floor: floors.get(&pkg.name).map(|v| Version::new(v.clone())),
                 graph_ceiling,
+                declared_bound: if is_direct {
+                    declared_bounds.get(&pkg.name).cloned()
+                } else {
+                    None
+                },
                 members: if is_direct {
                     project_member.clone()
                 } else {
@@ -258,6 +269,7 @@ impl ToolRead for UvTool {
                     name,
                     floor,
                     pinned,
+                    bound,
                 } = req;
                 Dependency {
                     package: PackageId::new(UV_ID, name, Some(PYPI.to_string())),
@@ -269,6 +281,7 @@ impl ToolRead for UvTool {
                     artifacts: Vec::new(),
                     graph_floor: None,
                     graph_ceiling: None,
+                    declared_bound: bound,
                     members: members.clone(),
                     pinned,
                 }
@@ -309,6 +322,15 @@ impl ReleaseFetcher for UvTool {
         Ok(build_releases(dep.current.as_str(), raw, dep, fetch))
     }
 
+    fn classify_declared_bound(&self, dep: &Dependency, releases: &mut [Release]) {
+        if let Some(requirement) = dep.declared_bound.as_deref() {
+            for release in releases {
+                release.beyond_declared_bound =
+                    !version::version_in_range(requirement, release.version.as_str());
+            }
+        }
+    }
+
     fn releases_are_project_scoped(&self) -> bool {
         // uv is artifact-granular: `releases`/`locked_release` derive publish instants from the
         // project's own locked artifacts (`dep.artifacts`, and this project's `uv.lock`), so the
@@ -347,7 +369,9 @@ impl ReleaseFetcher for UvTool {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -1134,6 +1158,7 @@ mod tests {
             artifacts: vec![ArtifactId("wheel:py3-none-any".into())],
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: Vec::new(),
             pinned: false,
         };

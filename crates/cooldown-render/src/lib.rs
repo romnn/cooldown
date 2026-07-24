@@ -97,6 +97,7 @@ mod tests {
                 status: OutdatedStatus::Adoptable,
                 adoptable_target: Some("v0.18.0".into()),
                 blocked_by: None,
+                held_by: None,
                 latest: Some(LatestInfo {
                     version: "v0.18.0".into(),
                     published_at: Some("2026-05-01T00:00:00Z".into()),

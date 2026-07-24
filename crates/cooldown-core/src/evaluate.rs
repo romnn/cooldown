@@ -6,19 +6,21 @@
 //! is never mature" is enforced here, once.
 
 use crate::model::{
-    Candidate, Dependency, MajorKey, PinVerdict, Release, ReleaseOrder, ReleaseQuality, Status,
-    ToolId, UpdateKind, Verdict, Version,
+    Candidate, Dependency, HeldReason, MajorKey, PinVerdict, Release, ReleaseOrder, ReleaseQuality,
+    Status, ToolId, UpdateKind, Verdict, Version,
 };
-use crate::policy::{PolicyLayer, ResolveKind, ResolveQuery, resolve};
+use crate::policy::{
+    MaxMajorPick, PolicyLayer, ResolveKind, ResolveQuery, resolve, resolve_max_major,
+};
 use camino::Utf8Path;
 use jiff::Timestamp;
 
 /// The context the core needs to build resolution queries and apply the candidate filter.
 ///
-/// Threaded into both [`evaluate`] and [`check_pin`], it carries the per-invocation knobs that
-/// are not properties of the [`Dependency`] itself: which tool is being evaluated, which
-/// project the policy cascade resolves against, and whether cross-major jumps are admissible
-/// candidates. It is `Copy`, so it is cheap to pass by value or reference.
+/// Threaded into both [`evaluate`] and [`check_pin`], it carries the per-invocation knobs that are
+/// not properties of the [`Dependency`] itself: the tool, project, major scope, and whether an
+/// upgrade may rewrite explicit declared bounds. It is `Copy`, so it is cheap to pass by value or
+/// reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveContext<'a> {
     /// The tool being evaluated, used to build the [`ResolveQuery`](crate::ResolveQuery)
@@ -28,6 +30,53 @@ pub struct ResolveContext<'a> {
     pub project: &'a Utf8Path,
     /// `--major`: allow cross-major jumps as candidates (default: within the current major).
     pub allow_major: bool,
+    /// Whether explicit manifest upper bounds constrain candidates.
+    ///
+    /// This is `false` only for `upgrade --rewrite`, whose contract explicitly permits rewriting
+    /// and crossing such a bound.
+    pub honor_declared_bounds: bool,
+}
+
+/// Which package ceiling hid an otherwise adoptable release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingReason {
+    /// An explicit upper comparator in the declared manifest requirement.
+    DeclaredBound,
+    /// A package-scoped configured `max-major`.
+    MaxMajor,
+}
+
+/// A matured release that normal evaluation excludes because of a package ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingHold {
+    /// The ceiling responsible for the hold.
+    pub reason: CeilingReason,
+    /// The newest matured release that would be adopted without package ceilings.
+    pub target: Version,
+    /// The target's update kind relative to the current release.
+    pub update_kind: UpdateKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CeilingFilters {
+    declared_bound: bool,
+    max_major: bool,
+}
+
+impl CeilingFilters {
+    fn standard(ctx: &ResolveContext<'_>) -> Self {
+        Self {
+            declared_bound: ctx.honor_declared_bounds,
+            max_major: true,
+        }
+    }
+
+    const fn unbounded() -> Self {
+        Self {
+            declared_bound: false,
+            max_major: false,
+        }
+    }
 }
 
 fn query<'a>(
@@ -88,6 +137,84 @@ fn graph_ceiling_order<'a>(dep: &Dependency, releases: &'a [Release]) -> Option<
         .iter()
         .find(|r| r.version == *ceiling)
         .map(|r| &r.order)
+}
+
+fn within_max_major(release: &Release, max_major: Option<&MaxMajorPick>) -> bool {
+    max_major.is_none_or(|pick| {
+        release
+            .major_number
+            .is_some_and(|major| major <= pick.limit)
+    })
+}
+
+fn active_max_major(
+    current: &Release,
+    dep: &Dependency,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    enabled: bool,
+) -> Option<MaxMajorPick> {
+    enabled
+        .then(|| resolve_max_major(layers, &query(dep, ctx, ResolveKind::CurrentPin)))
+        .flatten()
+        .filter(|pick| current.major_number.is_none_or(|major| major <= pick.limit))
+}
+
+fn empty_candidate_held_reason(
+    dep: &Dependency,
+    eligible: &[&Release],
+    current_order: &ReleaseOrder,
+    ceiling_order: Option<&ReleaseOrder>,
+    max_major: Option<&MaxMajorPick>,
+    filters: CeilingFilters,
+) -> Option<HeldReason> {
+    let newer = eligible
+        .iter()
+        .copied()
+        .filter(|release| release.order > *current_order);
+    if dep.pinned && newer.clone().next().is_some() {
+        return Some(HeldReason::ExactPin);
+    }
+    let graph_blocks =
+        ceiling_order.is_some_and(|ceiling| newer.clone().any(|r| r.order > *ceiling));
+    let declaration_blocks = filters.declared_bound
+        && dep.declared_bound.is_some()
+        && newer.clone().any(|release| release.beyond_declared_bound);
+    let max_major_blocks = max_major.is_some_and(|pick| {
+        newer
+            .clone()
+            .any(|release| !within_max_major(release, Some(pick)))
+    });
+
+    if graph_blocks {
+        Some(HeldReason::GraphCeiling)
+    } else if declaration_blocks {
+        dep.declared_bound
+            .as_ref()
+            .map(|bound| HeldReason::DeclaredBound(bound.clone()))
+    } else if max_major_blocks {
+        max_major.map(|pick| HeldReason::MaxMajor(pick.limit))
+    } else {
+        None
+    }
+}
+
+fn commit_pin_verdict(dep: &Dependency, releases: &[Release], now: Timestamp) -> Option<Verdict> {
+    if dep.current_quality != ReleaseQuality::Pseudo {
+        return None;
+    }
+    let latest = releases
+        .iter()
+        .filter(|r| r.quality.is_stable_like() && !r.yanked && visible_at(r, now))
+        .max_by(|a, b| a.order.cmp(&b.order))
+        .map(|r| r.version.clone());
+    Some(Verdict {
+        status: Status::Held,
+        adoptable_target: None,
+        latest,
+        candidates: Vec::new(),
+        held_reason: Some(HeldReason::CommitPin),
+    })
 }
 
 /// Classify one newer release as a [`Candidate`]: resolve its per-kind cooldown window and judge its
@@ -151,12 +278,12 @@ fn classify_candidate(
 /// `None`). The headline `status` is [`Status::Adoptable`] whenever any candidate has matured;
 /// otherwise it is the newest candidate's status, or [`Status::UpToDate`] when no newer candidate
 /// exists — except when the only newer releases lie above the dependency's
-/// [`graph_ceiling`](Dependency::graph_ceiling) (a requirer's `==` pin), which yields
-/// [`Status::Held`] with `latest` still surfacing the newest version. Two further cases override the
-/// rollup: exact manifest pins are [`Status::Held`] when there is a candidate to review, and a commit
-/// pin (pseudo-version) has no tagged version to compare and yields [`Status::Held`]. If the current
-/// pin is absent from `releases` the result is conservatively [`Status::UpToDate`] (`check`, via
-/// [`check_pin`], is the real gate and does not rely on this).
+/// [`graph_ceiling`](Dependency::graph_ceiling), an explicit declared upper bound, or a configured
+/// `max-major`, which yields [`Status::Held`] with `latest` still surfacing the newest version. Two
+/// further cases override the rollup: exact manifest pins are [`Status::Held`] when there is a
+/// candidate to review, and a commit pin (pseudo-version) has no tagged version to compare and
+/// yields [`Status::Held`]. If the current pin is absent from `releases` the result is conservatively
+/// [`Status::UpToDate`] (`check`, via [`check_pin`], is the real gate and does not rely on this).
 ///
 /// # Examples
 ///
@@ -178,6 +305,7 @@ fn classify_candidate(
 ///     artifacts: Vec::new(),
 ///     graph_floor: None,
 ///     graph_ceiling: None,
+///     declared_bound: None,
 ///     members: Vec::new(),
 ///     pinned: false,
 /// };
@@ -188,7 +316,9 @@ fn classify_candidate(
 ///         version: Version::new("1.0.0"),
 ///         order: ReleaseOrder(vec![0]),
 ///         major: MajorKey("1".into()),
+///         major_number: Some(1),
 ///         kind_from_current: None,
+///         beyond_declared_bound: false,
 ///         published_at: Some(mature),
 ///         yanked: false,
 ///         quality: ReleaseQuality::Stable,
@@ -197,7 +327,9 @@ fn classify_candidate(
 ///         version: Version::new("1.0.1"),
 ///         order: ReleaseOrder(vec![1]),
 ///         major: MajorKey("1".into()),
+///         major_number: Some(1),
 ///         kind_from_current: Some(UpdateKind::Patch),
+///         beyond_declared_bound: false,
 ///         published_at: Some(now), // published right now → still cooling
 ///         yanked: false,
 ///         quality: ReleaseQuality::Stable,
@@ -214,6 +346,7 @@ fn classify_candidate(
 ///     tool: ToolId("cargo"),
 ///     project: Utf8Path::new("/repo"),
 ///     allow_major: false,
+///     honor_declared_bounds: true,
 /// };
 /// let verdict = evaluate(&dep, &releases, &[layer], &ctx, now);
 ///
@@ -230,6 +363,24 @@ pub fn evaluate(
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> Verdict {
+    evaluate_with_filters(
+        dep,
+        releases,
+        layers,
+        ctx,
+        now,
+        CeilingFilters::standard(ctx),
+    )
+}
+
+fn evaluate_with_filters(
+    dep: &Dependency,
+    releases: &[Release],
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+    filters: CeilingFilters,
+) -> Verdict {
     debug_assert!(
         releases.is_sorted_by(|a, b| a.order <= b.order),
         "releases must be sorted ascending by ReleaseOrder"
@@ -237,21 +388,11 @@ pub fn evaluate(
 
     // A commit pin (pseudo-version) has no tagged version to compare against, so it short-circuits to
     // Held with just the newest stable release as `latest` for context. An exact pin (`==`/`=`) is
-    // also Held, but it *is* a tagged version, so it flows through normal candidate evaluation below
-    // and is only relabelled `Held` at the end — that way its `adoptable_target` still reports the
-    // newest matured version, i.e. exactly which version could be manually pinned to.
-    if dep.current_quality == ReleaseQuality::Pseudo {
-        let latest = releases
-            .iter()
-            .filter(|r| r.quality.is_stable_like() && !r.yanked && visible_at(r, now))
-            .max_by(|a, b| a.order.cmp(&b.order))
-            .map(|r| r.version.clone());
-        return Verdict {
-            status: Status::Held,
-            adoptable_target: None,
-            latest,
-            candidates: Vec::new(),
-        };
+    // also Held, but it *is* a tagged version, so it flows through normal candidate evaluation below.
+    // That way its `adoptable_target` still reports the newest matured version, i.e. exactly which
+    // version could be manually pinned to.
+    if let Some(verdict) = commit_pin_verdict(dep, releases, now) {
+        return verdict;
     }
 
     let Some(current) = releases.iter().find(|r| r.version == dep.current) else {
@@ -263,6 +404,7 @@ pub fn evaluate(
             adoptable_target: None,
             latest: Some(dep.current.clone()),
             candidates: Vec::new(),
+            held_reason: None,
         };
     };
     let current_order = current.order.clone();
@@ -273,6 +415,7 @@ pub fn evaluate(
     // ceiling below the current version is not a real upper bound — the graph resolved past it — so
     // it is ignored, leaving a legal upgrade free rather than wrongly holding the dependency.
     let ceiling_order = graph_ceiling_order(dep, releases).filter(|order| **order >= current_order);
+    let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
 
     // Eligible = the releases adoption could target (quality + major filter + not yanked, and not
     // dated after `now`), current included, so `latest` is well-defined even when up to date.
@@ -297,22 +440,32 @@ pub fn evaluate(
     let candidates: Vec<Candidate> = eligible
         .iter()
         .copied()
-        .filter(|r| r.order > current_order && ceiling_order.is_none_or(|c| r.order <= *c))
+        .filter(|r| {
+            r.order > current_order
+                && ceiling_order.is_none_or(|c| r.order <= *c)
+                && within_max_major(r, max_major.as_ref())
+                && !(filters.declared_bound
+                    && dep.declared_bound.is_some()
+                    && r.beyond_declared_bound)
+        })
         .filter_map(|r| classify_candidate(r, dep, layers, ctx, now))
         .collect();
 
     // `candidates` is in ascending order (from sorted releases); the headline is the newest. An
-    // empty candidate set means no newer *admissible* release — "up to date", unless the graph
-    // ceiling excluded a newer one: then the dependency is pinned at its current version by a
-    // requirer's `==` (graph-held), with `latest` still showing the newest version for context.
+    // empty candidate set means no newer *admissible* release — "up to date", unless a ceiling
+    // excluded one. An exact pin remains the primary reason it cannot move even when a second
+    // ceiling also applies; this keeps pin filtering and the human explanation consistent.
     let Some(headline) = candidates.last() else {
-        let blocked_by_ceiling = ceiling_order.is_some_and(|ceiling| {
-            eligible
-                .iter()
-                .any(|r| r.order > current_order && r.order > *ceiling)
-        });
+        let held_reason = empty_candidate_held_reason(
+            dep,
+            &eligible,
+            &current_order,
+            ceiling_order,
+            max_major.as_ref(),
+            filters,
+        );
         return Verdict {
-            status: if blocked_by_ceiling {
+            status: if held_reason.is_some() {
                 Status::Held
             } else {
                 Status::UpToDate
@@ -320,6 +473,7 @@ pub fn evaluate(
             adoptable_target: None,
             latest,
             candidates,
+            held_reason,
         };
     };
     let adoptable_target = candidates
@@ -350,7 +504,63 @@ pub fn evaluate(
         adoptable_target,
         latest,
         candidates,
+        held_reason: dep.pinned.then_some(HeldReason::ExactPin),
     }
+}
+
+/// Finds the newest matured target hidden by a declared bound or configured `max-major`.
+///
+/// The ordinary graph ceiling and the context's major scope remain active. Only the two
+/// package-owned ceilings are removed for the comparison, so a returned target is actionable by
+/// changing the declaration or policy named by [`CeilingHold::reason`].
+#[must_use]
+pub fn evaluate_ceiling_hold(
+    dep: &Dependency,
+    releases: &[Release],
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> Option<CeilingHold> {
+    if dep.pinned || dep.current_quality == ReleaseQuality::Pseudo {
+        return None;
+    }
+
+    let filters = CeilingFilters::standard(ctx);
+    let bounded = evaluate_with_filters(dep, releases, layers, ctx, now, filters);
+    let unbounded =
+        evaluate_with_filters(dep, releases, layers, ctx, now, CeilingFilters::unbounded());
+    let target = unbounded.adoptable_target?;
+    if bounded.adoptable_target.as_ref() == Some(&target) {
+        return None;
+    }
+
+    let target_release = releases.iter().find(|release| release.version == target)?;
+    let reason = if filters.declared_bound
+        && dep.declared_bound.is_some()
+        && target_release.beyond_declared_bound
+    {
+        CeilingReason::DeclaredBound
+    } else {
+        let current = releases
+            .iter()
+            .find(|release| release.version == dep.current)?;
+        let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
+        if within_max_major(target_release, max_major.as_ref()) {
+            return None;
+        }
+        CeilingReason::MaxMajor
+    };
+    let update_kind = unbounded
+        .candidates
+        .iter()
+        .find(|candidate| candidate.version == target)?
+        .kind;
+
+    Some(CeilingHold {
+        reason,
+        target,
+        update_kind,
+    })
 }
 
 /// Judges the currently-locked release against the cooldown policy — the `check` gate.
@@ -464,6 +674,7 @@ pub fn evaluate_fix(
         };
     }
     let cutoff = pin.window.cutoff(now);
+    let max_major = active_max_major(current, dep, layers, ctx, true);
     // Never roll below the graph floor: the resolved graph requires at least that version, so a lower
     // one would not actually be selected (and would be re-bumped on the next lock). When the floor is
     // not among the fetched releases, fall back to no lower bound.
@@ -479,6 +690,10 @@ pub fn evaluate_fix(
         .filter(|r| {
             quality_eligible(r, dep.current_quality)
                 && major_eligible(r, &current.major, ctx.allow_major)
+                && within_max_major(r, max_major.as_ref())
+                && !(ctx.honor_declared_bounds
+                    && dep.declared_bound.is_some()
+                    && r.beyond_declared_bound)
                 && !r.yanked
         })
         .filter(|r| matches!(r.published_at, Some(published) if published <= cutoff))
@@ -517,7 +732,9 @@ mod tests {
             version: Version::new(version),
             order: ReleaseOrder(Vec::new()),
             major: MajorKey(major.to_string()),
+            major_number: major.parse().ok(),
             kind_from_current: kind,
+            beyond_declared_bound: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -549,11 +766,43 @@ mod tests {
             version: Version::new(version),
             order: ReleaseOrder(vec![order]),
             major: MajorKey("1".into()),
+            major_number: Some(1),
             kind_from_current: Some(UpdateKind::Patch),
+            beyond_declared_bound: false,
             published_at: Some(published.parse().expect("timestamp")),
             yanked: false,
             quality: ReleaseQuality::Stable,
         }
+    }
+
+    fn classified(
+        version: &str,
+        order: u8,
+        major: Option<u64>,
+        kind: Option<UpdateKind>,
+    ) -> Release {
+        Release {
+            version: Version::new(version),
+            order: ReleaseOrder(vec![order]),
+            major: MajorKey(major.map_or_else(String::new, |major| major.to_string())),
+            major_number: major,
+            kind_from_current: kind,
+            beyond_declared_bound: false,
+            published_at: Some("2025-12-01T00:00:00Z".parse().expect("timestamp")),
+            yanked: false,
+            quality: ReleaseQuality::Stable,
+        }
+    }
+
+    fn max_major_layer(limit: u64) -> PolicyLayer {
+        let mut layer = PolicyLayer::new(crate::Origin::Repo("cooldown.toml".into()));
+        let mut rule = crate::Rule::new(crate::Selector::Package {
+            glob: crate::PatternGlob::new("widget").expect("glob"),
+            tool: Some(ToolId("cargo")),
+        });
+        rule.max_major = Some(limit);
+        layer.rules.push(rule);
+        layer
     }
 
     fn fix_dep(current: &str) -> Dependency {
@@ -565,6 +814,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: Vec::new(),
             pinned: false,
         }
@@ -585,6 +835,7 @@ mod tests {
             tool: ToolId("cargo"),
             project: Utf8Path::new("/repo"),
             allow_major: false,
+            honor_declared_bounds: true,
         }
     }
 
@@ -602,6 +853,7 @@ mod tests {
         dep.graph_ceiling = Some(Version::new("1.0.0"));
         let verdict = evaluate(&dep, &releases, &[seven_day_layer()], &ctx(), now);
         assert_eq!(verdict.status, Status::Held);
+        assert_eq!(verdict.held_reason, Some(HeldReason::GraphCeiling));
         assert_eq!(verdict.latest, Some(Version::new("1.0.1")));
         assert_eq!(verdict.adoptable_target, None);
         assert!(verdict.candidates.is_empty());
@@ -612,6 +864,217 @@ mod tests {
         let verdict = evaluate(&dep, &releases, &[seven_day_layer()], &ctx(), now);
         assert_eq!(verdict.status, Status::Adoptable);
         assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.1")));
+    }
+
+    #[test]
+    fn max_major_holds_cross_major_and_keeps_latest_context() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            classified("5.9.0", 0, Some(5), None),
+            classified("6.0.0", 1, Some(6), Some(UpdateKind::Major)),
+        ];
+        let mut context = ctx();
+        context.allow_major = true;
+        let verdict = evaluate(
+            &fix_dep("5.9.0"),
+            &releases,
+            &[seven_day_layer(), max_major_layer(5)],
+            &context,
+            now,
+        );
+        assert_eq!(verdict.status, Status::Held);
+        assert_eq!(verdict.held_reason, Some(HeldReason::MaxMajor(5)));
+        assert_eq!(verdict.latest, Some(Version::new("6.0.0")));
+        assert!(verdict.candidates.is_empty());
+    }
+
+    #[test]
+    fn ceilings_admit_matured_candidates_within_the_allowed_line() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let mut beyond = classified("7.0.2", 2, Some(7), Some(UpdateKind::Major));
+        beyond.beyond_declared_bound = true;
+        let releases = vec![
+            classified("5.9.3", 0, Some(5), None),
+            classified("5.9.4", 1, Some(5), Some(UpdateKind::Patch)),
+            beyond,
+        ];
+        let mut dependency = fix_dep("5.9.3");
+        dependency.declared_bound = Some("<6".to_string());
+        let mut context = ctx();
+        context.allow_major = true;
+        let verdict = evaluate(
+            &dependency,
+            &releases,
+            &[seven_day_layer(), max_major_layer(5)],
+            &context,
+            now,
+        );
+        assert_eq!(verdict.status, Status::Adoptable);
+        assert_eq!(verdict.adoptable_target, Some(Version::new("5.9.4")));
+        assert_eq!(verdict.latest, Some(Version::new("7.0.2")));
+        assert_eq!(verdict.held_reason, None);
+    }
+
+    #[test]
+    fn max_major_is_inert_when_the_current_release_already_exceeds_it() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            classified("6.0.0", 0, Some(6), None),
+            classified("6.1.0", 1, Some(6), Some(UpdateKind::Minor)),
+        ];
+        let verdict = evaluate(
+            &fix_dep("6.0.0"),
+            &releases,
+            &[seven_day_layer(), max_major_layer(5)],
+            &ctx(),
+            now,
+        );
+        assert_eq!(verdict.status, Status::Adoptable);
+        assert_eq!(verdict.adoptable_target, Some(Version::new("6.1.0")));
+    }
+
+    #[test]
+    fn max_major_conservatively_excludes_an_unknown_numeric_major() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            classified("5.9.0", 0, Some(5), None),
+            classified("next", 1, None, Some(UpdateKind::Major)),
+        ];
+        let mut context = ctx();
+        context.allow_major = true;
+        let verdict = evaluate(
+            &fix_dep("5.9.0"),
+            &releases,
+            &[seven_day_layer(), max_major_layer(5)],
+            &context,
+            now,
+        );
+        assert_eq!(verdict.held_reason, Some(HeldReason::MaxMajor(5)));
+    }
+
+    #[test]
+    fn declared_bound_holds_unless_the_context_allows_rewriting_it() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let mut newer = classified("6.0.0", 1, Some(6), Some(UpdateKind::Major));
+        newer.beyond_declared_bound = true;
+        let releases = vec![classified("5.9.0", 0, Some(5), None), newer];
+        let mut dependency = fix_dep("5.9.0");
+        dependency.declared_bound = Some(">=5, <6".to_string());
+        let mut context = ctx();
+        context.allow_major = true;
+
+        let held = evaluate(&dependency, &releases, &[seven_day_layer()], &context, now);
+        assert_eq!(
+            held.held_reason,
+            Some(HeldReason::DeclaredBound(">=5, <6".to_string()))
+        );
+
+        context.honor_declared_bounds = false;
+        let rewritten = evaluate(&dependency, &releases, &[seven_day_layer()], &context, now);
+        assert_eq!(rewritten.status, Status::Adoptable);
+        assert_eq!(rewritten.adoptable_target, Some(Version::new("6.0.0")));
+    }
+
+    #[test]
+    fn held_reason_precedence_is_graph_then_bound_then_max_major() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let mut newer = classified("6.0.0", 1, Some(6), Some(UpdateKind::Major));
+        newer.beyond_declared_bound = true;
+        let releases = vec![classified("5.9.0", 0, Some(5), None), newer];
+        let mut dependency = fix_dep("5.9.0");
+        dependency.graph_ceiling = Some(Version::new("5.9.0"));
+        dependency.declared_bound = Some("<6".to_string());
+        let mut context = ctx();
+        context.allow_major = true;
+        let layers = [seven_day_layer(), max_major_layer(5)];
+
+        let graph = evaluate(&dependency, &releases, &layers, &context, now);
+        assert_eq!(graph.held_reason, Some(HeldReason::GraphCeiling));
+
+        dependency.graph_ceiling = None;
+        let bound = evaluate(&dependency, &releases, &layers, &context, now);
+        assert_eq!(
+            bound.held_reason,
+            Some(HeldReason::DeclaredBound("<6".to_string()))
+        );
+
+        dependency.declared_bound = None;
+        let max_major = evaluate(&dependency, &releases, &layers, &context, now);
+        assert_eq!(max_major.held_reason, Some(HeldReason::MaxMajor(5)));
+    }
+
+    #[test]
+    fn exact_pin_remains_the_reason_when_a_package_ceiling_also_blocks_candidates() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let releases = vec![
+            classified("5.9.0", 0, Some(5), None),
+            classified("6.0.0", 1, Some(6), Some(UpdateKind::Major)),
+        ];
+        let mut dependency = fix_dep("5.9.0");
+        dependency.pinned = true;
+        let mut context = ctx();
+        context.allow_major = true;
+
+        let verdict = evaluate(
+            &dependency,
+            &releases,
+            &[seven_day_layer(), max_major_layer(5)],
+            &context,
+            now,
+        );
+
+        assert_eq!(verdict.status, Status::Held);
+        assert_eq!(verdict.held_reason, Some(HeldReason::ExactPin));
+    }
+
+    #[test]
+    fn ceiling_probe_reports_only_the_package_ceiling_hiding_the_matured_target() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let mut newer = classified("6.0.0", 1, Some(6), Some(UpdateKind::Major));
+        newer.beyond_declared_bound = true;
+        let releases = vec![classified("5.9.0", 0, Some(5), None), newer];
+        let mut dependency = fix_dep("5.9.0");
+        dependency.declared_bound = Some("<6".to_string());
+        let mut context = ctx();
+        context.allow_major = true;
+        let layers = [seven_day_layer(), max_major_layer(5)];
+
+        let declared = evaluate_ceiling_hold(&dependency, &releases, &layers, &context, now)
+            .expect("declared hold");
+        assert_eq!(declared.reason, CeilingReason::DeclaredBound);
+        assert_eq!(declared.target, Version::new("6.0.0"));
+        assert_eq!(declared.update_kind, UpdateKind::Major);
+
+        context.honor_declared_bounds = false;
+        let configured = evaluate_ceiling_hold(&dependency, &releases, &layers, &context, now)
+            .expect("configured hold");
+        assert_eq!(configured.reason, CeilingReason::MaxMajor);
+    }
+
+    #[test]
+    fn fix_never_targets_a_release_beyond_either_ceiling() {
+        let now: Timestamp = "2026-01-08T00:00:00Z".parse().expect("now");
+        let safe = classified("5.8.0", 0, Some(5), Some(UpdateKind::Minor));
+        let mut beyond_bound = classified("5.8.1", 1, Some(5), Some(UpdateKind::Patch));
+        beyond_bound.beyond_declared_bound = true;
+        let beyond_max = classified("6.0.0", 2, Some(6), Some(UpdateKind::Major));
+        let mut current = classified("5.9.0", 3, Some(5), None);
+        current.published_at = Some("2026-01-07T00:00:00Z".parse().expect("timestamp"));
+
+        let mut dependency = fix_dep("5.9.0");
+        dependency.declared_bound = Some("<5.8.1".to_string());
+        let mut context = ctx();
+        context.allow_major = true;
+        let verdict = evaluate_fix(
+            &dependency,
+            &[safe, beyond_bound, beyond_max, current],
+            &[seven_day_layer(), max_major_layer(5)],
+            &context,
+            now,
+        );
+
+        assert_eq!(verdict.current.status, Status::CurrentInCooldown);
+        assert_eq!(verdict.target, Some(Version::new("5.8.0")));
     }
 
     #[test]

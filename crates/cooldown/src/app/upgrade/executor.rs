@@ -3,9 +3,10 @@ use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
-    ApplyReport, BaselineViolation, Change, DepScope, Dependency, Diagnostic, DiagnosticKind,
-    LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal, Release, ResolveContext,
-    SkipReason, Skipped, Status, UpdateKind, Version, check_pin, evaluate, evaluate_fix,
+    ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
+    DiagnosticKind, LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal, Release,
+    ResolveContext, RewriteMode, SkipReason, Skipped, Status, UpdateKind, Version, check_pin,
+    evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -693,7 +694,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             "fetching metadata for {} upgrade candidates",
             deps.len()
         ));
-        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let rctx = ResolveContext {
+            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
+            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
+        };
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
             .ws
@@ -722,6 +726,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &dep_resolve_ctx(&rctx, &dep),
                 self.ws.now(),
             );
+            self.record_held_back_ceiling(&dep, &releases, &rctx);
             // Surface an adoptable cross-major update the user could take with `--major` (it would
             // otherwise vanish from a default run even though `outdated` lists it).
             self.record_held_back_major(&dep, &releases, &rctx, verdict.adoptable_target.as_ref());
@@ -759,6 +764,52 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
         sort_planned_changes(&mut planned);
         planned
+    }
+
+    /// Records the matured target hidden by a declared or configured ceiling.
+    ///
+    /// A default major-off run probes with majors enabled so it reports the ceiling that would
+    /// still block `--major`, rather than giving the false advice to re-run with `--major`.
+    fn record_held_back_ceiling(
+        &mut self,
+        dep: &Dependency,
+        releases: &[Release],
+        rctx: &ResolveContext<'_>,
+    ) {
+        let probe_ctx = ResolveContext {
+            allow_major: dep.direct,
+            ..dep_resolve_ctx(rctx, dep)
+        };
+        let Some(hold) = evaluate_ceiling_hold(
+            dep,
+            releases,
+            &self.ctx.pctx.policy.layers,
+            &probe_ctx,
+            self.ws.now(),
+        ) else {
+            return;
+        };
+        let reason = match hold.reason {
+            CeilingReason::DeclaredBound => SkipReason::DeclaredBoundHeld,
+            CeilingReason::MaxMajor => SkipReason::MaxMajorHeld,
+        };
+        let change = Change {
+            package: target_package_for(releases, dep, &hold.target),
+            from: dep.current.clone(),
+            to: hold.target,
+            kind: hold.update_kind,
+            downgrade: false,
+            direct: dep.direct,
+            members: dep.members.clone(),
+        };
+        self.record_change_skip(
+            &change,
+            Some(SkippedInfo {
+                reason,
+                message: reason.message().to_string(),
+                offending: None,
+            }),
+        );
     }
 
     /// On a default (major-off) run, record an adoptable cross-major update as a `needs --major`
@@ -1295,9 +1346,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn add_batch_skips(&self, outcome: &mut BatchOutcome, skipped: Vec<cooldown_core::Skipped>) {
         for skipped in skipped {
             let offending = skipped.offending.map(|package| package.name);
-            // A multi-version dependency held within its own line is conservative-correct, not a
-            // failed upgrade — like `NeedsMajor` it must not fail a `--strict` run.
-            if skipped.reason != SkipReason::MultiVersionHeld {
+            // Deliberate policy holds are conservative-correct, not failed upgrades.
+            if !matches!(
+                skipped.reason,
+                SkipReason::NeedsMajor
+                    | SkipReason::DeclaredBoundHeld
+                    | SkipReason::MaxMajorHeld
+                    | SkipReason::MultiVersionHeld
+            ) {
                 outcome.strict_incomplete = true;
             }
             let change = skipped.change;
@@ -2178,7 +2234,13 @@ mod tests {
             version: Version::new(version),
             order: ReleaseOrder(vec![order]),
             major: MajorKey(String::new()),
+            major_number: version
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|major| major.parse().ok()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -2194,6 +2256,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: Vec::new(),
             pinned: false,
         }

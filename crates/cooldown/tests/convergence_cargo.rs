@@ -998,3 +998,54 @@ fn upgrade_moves_a_dual_entry_crate_for_real_and_converges() {
         "lock must be byte-identical across the two converged runs"
     );
 }
+
+const VERSION_BOUND_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-version-bound"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    clap = { version = ">=3, <4", default-features = false }
+"#};
+
+#[test]
+fn explicit_upper_bound_holds_until_rewrite() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", VERSION_BOUND_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    let manifest_before = fixture.read_bytes("Cargo.toml");
+    let lock_before = fixture.read_bytes("Cargo.lock");
+    assert!(
+        cargo_lock_versions_of("clap", &lock_before)
+            .iter()
+            .all(|version| version.starts_with("3.")),
+        "the explicit bound must seed clap 3.x"
+    );
+
+    let held = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert_eq!(
+        held.skipped_reasons_for("clap"),
+        ["declared_bound_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(manifest_before, fixture.read_bytes("Cargo.toml"));
+    assert_eq!(lock_before, fixture.read_bytes("Cargo.lock"));
+
+    let rewritten = fixture.cooldown_json(&["upgrade", "--major", "--rewrite", "--freeze", FREEZE]);
+    assert!(rewritten.applied_names().contains("clap"));
+    assert!(
+        cargo_lock_versions_of("clap", &fixture.read_bytes("Cargo.lock"))
+            .iter()
+            .any(|version| version.starts_with("4.")),
+        "--rewrite must cross the explicit bound"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fixture.read_bytes("Cargo.toml")).contains(">=3, <4"),
+        "the crossed bound must be rewritten"
+    );
+}

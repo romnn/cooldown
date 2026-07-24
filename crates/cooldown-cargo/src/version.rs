@@ -68,6 +68,22 @@ pub fn major_key(v: &str) -> MajorKey {
     }
 }
 
+/// Returns the numeric `SemVer` major ordinal for `v`.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    parse(v).map(|version| version.major)
+}
+
+/// Returns whether `v` satisfies a Cargo `SemVer` requirement.
+#[must_use]
+pub fn version_in_range(requirement: &str, v: &str) -> bool {
+    let (Ok(requirement), Some(version)) = (semver::VersionReq::parse(requirement), parse(v))
+    else {
+        return false;
+    };
+    requirement.matches(&version)
+}
+
 /// Classifies the [`UpdateKind`] of moving from `current` to `cand` by semver axis.
 ///
 /// Update kind by semver: differing major → [`UpdateKind::Major`], differing minor →
@@ -148,5 +164,18 @@ mod tests {
         assert_eq!(classify_kind("1.2.3", "2.0.0"), Some(UpdateKind::Major));
         assert_eq!(classify_kind("1.2.3", "1.3.0"), Some(UpdateKind::Minor));
         assert_eq!(classify_kind("1.2.3", "1.2.4"), Some(UpdateKind::Patch));
+    }
+
+    #[test]
+    fn native_requirement_matching_handles_prerelease_bounds() {
+        assert!(version_in_range(">=1, <2", "1.9.0"));
+        assert!(!version_in_range(">=1, <2", "2.0.0-rc.1"));
+    }
+
+    #[test]
+    fn numeric_major_uses_the_semver_major() {
+        assert_eq!(major_number("0.9.0"), Some(0));
+        assert_eq!(major_number("12.0.0-rc.1"), Some(12));
+        assert_eq!(major_number("not-a-version"), None);
     }
 }

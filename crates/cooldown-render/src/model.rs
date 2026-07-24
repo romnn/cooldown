@@ -5,8 +5,10 @@
 //! removal/retype/semantic change does. Consumers ignore unknown fields. The `status` and
 //! `minAgeSource` enums are part of the contract.
 
-use cooldown_core::{Diagnostic, LockStatus, MemberRef, SkipReason, Status, UpdateKind};
-use serde::Serialize;
+use cooldown_core::{
+    Diagnostic, HeldReason, LockStatus, MemberRef, SkipReason, Status, UpdateKind,
+};
+use serde::{Serialize, Serializer};
 
 /// The JSON schema version. Bumped only on a removal/retype/semantic change.
 pub const SCHEMA_VERSION: u32 = 3;
@@ -207,12 +209,54 @@ pub struct OutdatedItem {
     /// named. Omitted for every other status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
+    /// Why a held dependency cannot move automatically.
+    ///
+    /// JSON serializes this as the human-readable `heldBy` string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<HeldBy>,
     /// The newest existing version and its age, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<LatestInfo>,
     /// The error that prevented evaluation, present iff `status` is [`OutdatedStatus::Error`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
+}
+
+pub(crate) fn held_reason_label(reason: &HeldReason) -> String {
+    match reason {
+        HeldReason::ExactPin => "pinned".to_string(),
+        HeldReason::CommitPin => "commit pin".to_string(),
+        HeldReason::GraphCeiling => "graph ceiling".to_string(),
+        HeldReason::DeclaredBound(requirement) => format!("bound {requirement}"),
+        HeldReason::MaxMajor(limit) => format!("max-major {limit}"),
+    }
+}
+
+/// A typed held reason that serializes to the stable human-readable `heldBy` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBy(HeldReason);
+
+impl HeldBy {
+    /// Returns the underlying domain reason for filtering or terminal rendering.
+    #[must_use]
+    pub fn reason(&self) -> &HeldReason {
+        &self.0
+    }
+}
+
+impl From<HeldReason> for HeldBy {
+    fn from(reason: HeldReason) -> Self {
+        Self(reason)
+    }
+}
+
+impl Serialize for HeldBy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&held_reason_label(&self.0))
+    }
 }
 
 /// The aggregate counts for an `outdated` report, keyed by [`OutdatedStatus`].
@@ -429,7 +473,10 @@ impl UpgradeItem {
     #[must_use]
     pub fn sort_rank(&self) -> u8 {
         if let Some(skip) = &self.skipped {
-            if skip.reason == SkipReason::NeedsMajor {
+            if matches!(
+                skip.reason,
+                SkipReason::NeedsMajor | SkipReason::DeclaredBoundHeld | SkipReason::MaxMajorHeld
+            ) {
                 2
             } else {
                 1

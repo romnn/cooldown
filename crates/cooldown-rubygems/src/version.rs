@@ -96,6 +96,15 @@ pub fn major_key(v: &str) -> MajorKey {
     }
 }
 
+/// Returns the first numeric version segment.
+#[must_use]
+pub fn major_number(v: &str) -> Option<u64> {
+    segments(v).into_iter().find_map(|segment| match segment {
+        Seg::Num(number) => Some(number),
+        Seg::Str(_) => None,
+    })
+}
+
 /// Classifies the [`UpdateKind`] of moving from `current` to `cand` by the first two numeric axes.
 ///
 /// # Examples

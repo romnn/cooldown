@@ -36,6 +36,7 @@
 
 mod support;
 
+use indoc::indoc;
 use support::{Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. At this instant the huggingface-hub/typer conflict exists in
@@ -477,5 +478,61 @@ fn outdated_does_not_falsely_block_a_member_declared_dependency() {
     assert!(
         !blocked.contains("certifi"),
         "member-declared certifi must NOT be falsely blocked\nblocked={blocked:?}"
+    );
+}
+
+const VERSION_BOUND_FREEZE: &str = "2024-06-01T00:00:00Z";
+
+const VERSION_BOUND_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-version-bound"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "tomli>=1,<2",
+    ]
+"#};
+
+#[test]
+fn explicit_upper_bound_holds_until_rewrite() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", VERSION_BOUND_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, VERSION_BOUND_FREEZE);
+    let manifest_before = fixture.read_bytes("pyproject.toml");
+    let lock_before = fixture.read_bytes("uv.lock");
+    assert!(
+        toml_lock_pins(&lock_before)
+            .get("tomli")
+            .is_some_and(|version| version.starts_with("1.")),
+        "the explicit bound must seed tomli 1.x"
+    );
+
+    let held = fixture.cooldown_json(&["upgrade", "--major", "--freeze", VERSION_BOUND_FREEZE]);
+    assert_eq!(
+        held.skipped_reasons_for("tomli"),
+        ["declared_bound_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(manifest_before, fixture.read_bytes("pyproject.toml"));
+    assert_eq!(lock_before, fixture.read_bytes("uv.lock"));
+
+    let rewritten = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--rewrite",
+        "--freeze",
+        VERSION_BOUND_FREEZE,
+    ]);
+    assert!(rewritten.applied_names().contains("tomli"));
+    assert!(
+        toml_lock_pins(&fixture.read_bytes("uv.lock"))
+            .get("tomli")
+            .is_some_and(|version| version.starts_with("2.")),
+        "--rewrite must cross the explicit bound"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fixture.read_bytes("pyproject.toml")).contains("tomli>=1,<2"),
+        "the crossed bound must be rewritten"
     );
 }

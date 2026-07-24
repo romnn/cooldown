@@ -68,38 +68,53 @@ pub fn reaching_members<'a, S: BuildHasher>(
     members
 }
 
+/// Ecosystem-specific version operations used to classify registry releases for the core.
+#[derive(Clone, Copy)]
+pub struct RegistryVersionClassifier {
+    /// Whether a registry version string belongs in the release set.
+    pub is_valid: fn(&str) -> bool,
+    /// The ecosystem's ascending version order.
+    pub compare: fn(&str, &str) -> Ordering,
+    /// The opaque compatibility line used by the ordinary major gate.
+    pub major_key: fn(&str) -> MajorKey,
+    /// The numeric major ordinal used by package `max-major`.
+    pub major_number: fn(&str) -> Option<u64>,
+    /// The update kind relative to the locked version.
+    pub classify_kind: fn(&str, &str) -> Option<UpdateKind>,
+    /// Stable, prerelease, pseudo-version, or ecosystem-specific release quality.
+    pub classify_quality: fn(&str) -> ReleaseQuality,
+}
+
 /// Build sorted, deduplicated releases for a versioned registry-backed adapter.
 ///
-/// `is_valid` filters invalid version strings, `compare` defines ascending version order, and the
-/// remaining callbacks project adapter-specific release metadata into the core model.
+/// `classifier` supplies the ecosystem-specific version semantics while this function performs the
+/// shared core-model projection and ordering-token assignment.
 #[must_use]
 pub fn build_registry_releases(
     current: &str,
     raw: Vec<RawRelease>,
-    is_valid: impl Fn(&str) -> bool,
-    compare: impl Fn(&str, &str) -> Ordering,
-    major_key: impl Fn(&str) -> MajorKey,
-    classify_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
-    classify_quality: impl Fn(&str) -> ReleaseQuality,
+    classifier: RegistryVersionClassifier,
 ) -> Vec<Release> {
     let mut releases: Vec<Release> = raw
         .into_iter()
-        .filter(|release| is_valid(release.version.as_str()))
+        .filter(|release| (classifier.is_valid)(release.version.as_str()))
         .map(|release| {
             let version = release.version;
             let version_text = version.as_str().to_string();
             Release {
                 version,
                 order: ReleaseOrder(Vec::new()),
-                major: major_key(&version_text),
-                kind_from_current: classify_kind(current, &version_text),
+                major: (classifier.major_key)(&version_text),
+                major_number: (classifier.major_number)(&version_text),
+                kind_from_current: (classifier.classify_kind)(current, &version_text),
+                beyond_declared_bound: false,
                 published_at: release.published_at,
                 yanked: release.yanked,
-                quality: classify_quality(&version_text),
+                quality: (classifier.classify_quality)(&version_text),
             }
         })
         .collect();
-    releases.sort_by(|a, b| compare(a.version.as_str(), b.version.as_str()));
+    releases.sort_by(|a, b| (classifier.compare)(a.version.as_str(), b.version.as_str()));
     releases.dedup_by(|a, b| a.version == b.version);
     for (index, release) in releases.iter_mut().enumerate() {
         let token = u32::try_from(index).unwrap_or(u32::MAX);

@@ -1,6 +1,6 @@
 //! The pure policy core: domain model, the two decision functions
 //! ([`evaluate`](evaluate::evaluate) and [`check_pin`](evaluate::check_pin)), the policy
-//! [`resolve`](policy::resolve)r, the ports, and config parsing. No concrete I/O, no clock, no
+//! [`resolve`](policy::resolve), the ports, and config parsing. No concrete I/O, no clock, no
 //! version parsing — everything that decides "is this version too fresh?" lives here, once, for
 //! every tool.
 
@@ -14,12 +14,15 @@ pub mod policy;
 pub mod ports;
 
 pub use error::{CoreError, Diagnostic, DiagnosticKind, Result, ToolTermination, failure_detail};
-pub use evaluate::{FixVerdict, ResolveContext, check_pin, evaluate, evaluate_fix};
+pub use evaluate::{
+    CeilingHold, CeilingReason, FixVerdict, ResolveContext, check_pin, evaluate,
+    evaluate_ceiling_hold, evaluate_fix,
+};
 pub use model::*;
 pub use policy::{
-    ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
-    ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, exempt_package_globs, resolve,
-    window_exclude_newer,
+    ByKind, MaxMajorPick, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,
+    ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, exempt_package_globs,
+    resolve, resolve_max_major, window_exclude_newer,
 };
 pub use ports::{
     ApplyObserver, Capabilities, Clock, NativePolicyLayer, NativeRule, PackageRegistry,

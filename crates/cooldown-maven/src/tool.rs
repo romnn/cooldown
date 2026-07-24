@@ -8,7 +8,8 @@ use crate::version;
 use async_trait::async_trait;
 use camino::Utf8Path;
 use cooldown_adapter_util::{
-    Driver, build_registry_releases, skipped_on_apply_error, verify_current_unknown,
+    Driver, RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
+    verify_current_unknown,
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
@@ -142,11 +143,14 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
     build_registry_releases(
         current,
         raw,
-        |value| !value.is_empty(),
-        version::compare,
-        version::major_key,
-        version::classify_kind,
-        classify_quality,
+        RegistryVersionClassifier {
+            is_valid: |value| !value.is_empty(),
+            compare: version::compare,
+            major_key: version::major_key,
+            major_number: version::major_number,
+            classify_kind: version::classify_kind,
+            classify_quality,
+        },
     )
 }
 
@@ -195,6 +199,7 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,
+                declared_bound: None,
                 members: Vec::new(),
                 pinned: false,
             });
@@ -232,7 +237,9 @@ impl<L: JavaLayout> ReleaseFetcher for JavaTool<L> {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,

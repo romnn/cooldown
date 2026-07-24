@@ -178,9 +178,9 @@ pub(in crate::cli) enum Command {
         #[arg(long)]
         build: bool,
         /// Always rewrite the manifest's version constraint to the adopted version, even for in-range
-        /// moves. By default the constraint is left untouched and only the lock moves, unless the
-        /// target falls outside the current constraint (e.g. a cross-major bump), which always
-        /// rewrites the one owning manifest entry.
+        /// moves. By default the constraint is left untouched when possible; an opted-in major may
+        /// widen an implicit caret/tilde ceiling. This is the only way to cross an explicit `<`/`<=`
+        /// upper bound: by default such a bound holds even with `--major`.
         #[arg(long)]
         rewrite: bool,
         #[command(flatten)]
@@ -294,6 +294,7 @@ pub(in crate::cli) struct GlobalArgs {
     /// Allow major version changes. Default: ON for `outdated` (so a new major is discoverable),
     /// OFF for `upgrade`/`check`/etc. (a major bump is usually breaking work you opt into). For
     /// `upgrade`/`fix` it applies to every eligible dependency; narrow it with `--package`.
+    /// Explicit manifest upper bounds and configured `max-major` ceilings still hold.
     #[arg(long, global = true)]
     pub(in crate::cli) major: bool,
     /// Stay within the current major (the inverse of `--major`; alias `--minor`). Useful for

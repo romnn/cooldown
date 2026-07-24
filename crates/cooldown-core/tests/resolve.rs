@@ -90,6 +90,137 @@ fn within_layer_specificity_breaks_tie() {
     );
 }
 
+#[test]
+fn tool_scoped_package_rules_resolve_independently() {
+    let layer = repo(
+        r#"
+        [tool.go.package."shared"]
+        max-major = 2
+
+        [tool.cargo.package."shared"]
+        max-major = 5
+        "#,
+    );
+    let project = Utf8Path::new(".");
+    let go = ResolveQuery {
+        tool: GO,
+        package: "shared",
+        registry: None,
+        project,
+        kind: ResolveKind::CurrentPin,
+    };
+    let cargo = ResolveQuery {
+        tool: ToolId("cargo"),
+        ..go
+    };
+
+    let go_pick = resolve_max_major(std::slice::from_ref(&layer), &go).expect("go ceiling");
+    let cargo_pick = resolve_max_major(&[layer], &cargo).expect("cargo ceiling");
+    assert_eq!(go_pick.limit, 2);
+    assert_eq!(cargo_pick.limit, 5);
+    assert_eq!(go_pick.selector.specificity(), 5);
+    assert_eq!(
+        go_pick.selector.token().as_deref(),
+        Some("package=go:shared")
+    );
+}
+
+#[test]
+fn max_major_is_authority_first_then_specificity() {
+    let layers = vec![
+        global(
+            r#"
+            [tool.go.package."widget"]
+            max-major = 3
+            "#,
+        ),
+        repo(
+            r#"
+            [package."*"]
+            max-major = 6
+
+            [tool.go.package."widget"]
+            max-major = 5
+            "#,
+        ),
+    ];
+    let query = q("widget", Utf8Path::new("."), ResolveKind::CurrentPin);
+    let pick = resolve_max_major(&layers, &query).expect("ceiling");
+    assert_eq!(pick.limit, 5, "repo authority wins, then tool specificity");
+    assert!(matches!(pick.origin, Origin::Repo(_)));
+
+    let resolution = resolve(&layers, &query, now());
+    let applied = resolution
+        .trace
+        .iter()
+        .find(|step| step.field == "max-major" && step.applied)
+        .expect("max-major trace winner");
+    assert!(applied.note.contains('5'));
+}
+
+#[test]
+fn max_major_trace_marks_exactly_one_duplicate_selector_as_applied() {
+    let mut layer = PolicyLayer::new(Origin::Repo(Utf8PathBuf::from("cooldown.toml")));
+    for limit in [2, 3] {
+        let mut rule = Rule::new(Selector::Package {
+            glob: PatternGlob::new("widget").expect("glob"),
+            tool: Some(GO),
+        });
+        rule.max_major = Some(limit);
+        layer.rules.push(rule);
+    }
+    let query = q("widget", Utf8Path::new("."), ResolveKind::CurrentPin);
+
+    let resolution = resolve(std::slice::from_ref(&layer), &query, now());
+    let applied: Vec<_> = resolution
+        .trace
+        .iter()
+        .filter(|step| step.field == "max-major" && step.applied)
+        .collect();
+
+    assert_eq!(
+        resolve_max_major(&[layer], &query).map(|pick| pick.limit),
+        Some(2)
+    );
+    assert_eq!(applied.len(), 1);
+    assert!(applied[0].note.contains('2'));
+}
+
+#[test]
+fn max_major_and_nested_packages_are_rejected_outside_package_rules() {
+    for config in [
+        "max-major = 5",
+        "[tool.go]\nmax-major = 5",
+        "[registry.crates.package.foo]\nmax-major = 5",
+        "[project.\".\".package.foo]\nmax-major = 5",
+    ] {
+        let error = config::parse_config(config, Origin::Global).expect_err("invalid config");
+        let message = error.to_string();
+        assert!(
+            message.contains("max-major")
+                || message.contains("nested `package` tables are only supported under [tool.*]"),
+            "unexpected error: {message}"
+        );
+    }
+}
+
+#[test]
+fn non_tool_selectors_reject_misplaced_exclude_lists_with_a_location_hint() {
+    for table in ["package.foo", "registry.example", "project.\".\""] {
+        for key in ["exclude-folders", "exclude-packages"] {
+            let config = format!("[{table}]\n{key} = [\"ignored\"]");
+            let error = config::ConfigDocument::parse(&config, &Origin::Global)
+                .expect_err("invalid config");
+            let message = error.to_string();
+            assert!(message.contains(key), "unexpected error: {message}");
+            assert!(
+                message.contains("exclusion lists live under [tool.*]"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+}
+
 /// `repo > native > global > default` for `min-age`.
 #[test]
 fn layer_authority_order() {

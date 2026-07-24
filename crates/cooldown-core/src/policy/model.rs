@@ -110,7 +110,10 @@ impl PartialEq for PatternGlob {
 
 impl Eq for PatternGlob {}
 
-/// What a rule applies to. Specificity: `Package` > `Registry` > `Project` > `Tool` > `Default`.
+/// What a rule applies to.
+///
+/// Specificity descends from a tool-qualified package through an unqualified package, registry,
+/// project, tool, and finally the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     /// Matches every package; the catch-all with the lowest specificity.
@@ -121,8 +124,13 @@ pub enum Selector {
     Registry(String),
     /// Matches packages whose project path matches the [`PatternGlob`].
     Project(PatternGlob),
-    /// Matches packages whose name matches the [`PatternGlob`]; the most specific selector.
-    Package(PatternGlob),
+    /// Matches packages whose name matches the [`PatternGlob`], optionally within one tool.
+    Package {
+        /// The package-name pattern.
+        glob: PatternGlob,
+        /// The tool qualification, or `None` when the rule applies across tools.
+        tool: Option<ToolId>,
+    },
 }
 
 impl Selector {
@@ -130,7 +138,8 @@ impl Selector {
     #[must_use]
     pub fn specificity(&self) -> u8 {
         match self {
-            Selector::Package(_) => 4,
+            Selector::Package { tool: Some(_), .. } => 5,
+            Selector::Package { tool: None, .. } => 4,
             Selector::Registry(_) => 3,
             Selector::Project(_) => 2,
             Selector::Tool(_) => 1,
@@ -146,8 +155,10 @@ impl Selector {
             Selector::Tool(tool) => *tool == query.tool,
             Selector::Registry(registry) => query.registry == Some(registry.as_str()),
             Selector::Project(glob) => glob.is_match(query.project.as_str()),
-            Selector::Package(glob) => {
-                !matches!(query.kind, ResolveKind::EffectiveDefault) && glob.is_match(query.package)
+            Selector::Package { glob, tool } => {
+                !matches!(query.kind, ResolveKind::EffectiveDefault)
+                    && tool.is_none_or(|tool| tool == query.tool)
+                    && glob.is_match(query.package)
             }
         }
     }
@@ -160,7 +171,11 @@ impl Selector {
             Selector::Tool(tool) => Some(format!("tool={tool}")),
             Selector::Registry(registry) => Some(format!("registry={registry}")),
             Selector::Project(glob) => Some(format!("project={}", glob.raw())),
-            Selector::Package(glob) => Some(format!("package={}", glob.raw())),
+            Selector::Package {
+                glob,
+                tool: Some(tool),
+            } => Some(format!("package={tool}:{}", glob.raw())),
+            Selector::Package { glob, tool: None } => Some(format!("package={}", glob.raw())),
         }
     }
 }
@@ -289,13 +304,16 @@ pub struct Rule {
     pub allow: bool,
     /// A hard minimum window contributed by this rule (max-clamped across layers).
     pub floor: Option<SignedDuration>,
+    /// The highest numeric major this package may adopt.
+    pub max_major: Option<u64>,
 }
 
 impl Rule {
-    /// Builds an empty rule for `selector`: no windows, not exempt, no floor.
+    /// Builds an empty rule for `selector`: no windows, exemption, floor, or major ceiling.
     ///
-    /// Set [`window`](Rule::window), [`allow`](Rule::allow), and [`floor`](Rule::floor) on the
-    /// returned value to declare the policy this selector contributes.
+    /// Set [`window`](Rule::window), [`allow`](Rule::allow), [`floor`](Rule::floor), and
+    /// [`max_major`](Rule::max_major) on the returned value to declare the policy this selector
+    /// contributes.
     ///
     /// # Examples
     ///
@@ -314,6 +332,7 @@ impl Rule {
             window: ByKind::default(),
             allow: false,
             floor: None,
+            max_major: None,
         }
     }
 }

@@ -21,6 +21,11 @@
 //! two projects pinned to different versions of one package get distinct entries. The artifact scope
 //! is held constant for the whole run, so it is not in the key.
 //!
+//! A declared upper bound is deliberately not part of the key. The cache stores the shared release
+//! set, then [`ReleaseFetcher::classify_declared_bound`] annotates each caller's private clone. Two
+//! projects can therefore share one registry response without one manifest's bound leaking into the
+//! other's verdict.
+//!
 //! Whether the *project* is part of the key is the fetcher's call, via
 //! [`ReleaseFetcher::releases_are_project_scoped`]: a global registry index (cargo, npm, …) returns
 //! the same releases for a package regardless of who asks, so its entries are shared across the whole
@@ -214,7 +219,7 @@ impl ReleaseResolver for ReleaseCache {
             scope,
             project: project_scope(fetcher, fetch),
         };
-        let releases = self
+        let mut releases = self
             .candidates
             .get_or_resolve(key, || fetcher.releases(dep, fetch, scope))
             .await?;
@@ -226,6 +231,7 @@ impl ReleaseResolver for ReleaseCache {
             };
             self.locked.seed(key, locked);
         }
+        fetcher.classify_declared_bound(dep, &mut releases);
         Ok(releases)
     }
 
@@ -400,6 +406,38 @@ mod tests {
         }
     }
 
+    struct BoundClassifyingFetcher {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ReleaseFetcher for BoundClassifyingFetcher {
+        async fn releases(
+            &self,
+            _dep: &Dependency,
+            _fetch: &FetchContext<'_>,
+            _candidates: CandidateScope,
+        ) -> Result<Vec<Release>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![test_release()])
+        }
+
+        fn classify_declared_bound(&self, dep: &Dependency, releases: &mut [Release]) {
+            let beyond = dep.declared_bound.as_deref() == Some("<1");
+            for release in releases {
+                release.beyond_declared_bound = beyond;
+            }
+        }
+
+        async fn locked_release(
+            &self,
+            _dep: &Dependency,
+            _fetch: &FetchContext<'_>,
+        ) -> Result<Release> {
+            Err(CoreError::transient("unused"))
+        }
+    }
+
     fn test_dep() -> Dependency {
         Dependency {
             package: PackageId::new(ToolId("test"), "pkg".to_string(), None),
@@ -409,6 +447,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: Vec::new(),
             pinned: false,
         }
@@ -428,7 +467,9 @@ mod tests {
             version: Version::new("1.0.0"),
             order: ReleaseOrder(vec![1]),
             major: MajorKey("1".to_string()),
+            major_number: Some(1),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -534,5 +575,46 @@ mod tests {
         resolve_in(&cache, &fetcher, &test_project("/b")).await;
         // A global registry fetcher resolves once and shares across every project in the run.
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn declared_bound_classification_does_not_leak_through_the_shared_cache() {
+        let cache = ReleaseCache::new();
+        let fetcher = BoundClassifyingFetcher {
+            calls: AtomicU64::new(0),
+        };
+        let project = test_project("/project");
+        let fetch = FetchContext {
+            project: &project,
+            artifacts: ArtifactScope::Environment,
+        };
+        let unbounded = cache
+            .candidate_releases(
+                &fetcher,
+                &test_dep(),
+                &fetch,
+                CandidateScope::CurrentMajorOnly,
+            )
+            .await
+            .expect("unbounded releases");
+        let mut bounded_dep = test_dep();
+        bounded_dep.declared_bound = Some("<1".to_string());
+        let bounded = cache
+            .candidate_releases(
+                &fetcher,
+                &bounded_dep,
+                &fetch,
+                CandidateScope::CurrentMajorOnly,
+            )
+            .await
+            .expect("bounded releases");
+
+        assert!(!unbounded[0].beyond_declared_bound);
+        assert!(bounded[0].beyond_declared_bound);
+        assert_eq!(
+            fetcher.calls.load(Ordering::Relaxed),
+            1,
+            "both dependency declarations reuse one registry response"
+        );
     }
 }

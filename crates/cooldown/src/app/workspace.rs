@@ -146,12 +146,13 @@ pub struct RunOpts {
     pub compiled_excludes: Option<CompiledExcludes>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
-    /// `--hide-pinned` (outdated): omit held rows (exact `==`/`=` pins and commit pins) from the
-    /// table, leaving only deps with an actionable update. The `latest` column on a held row still
-    /// shows what is available, so this is purely a display filter.
+    /// `--hide-pinned` (outdated): omit exact `==`/`=` and commit-pin holds from the table. Bound,
+    /// graph, and `max-major` holds remain because they require a different action. This is purely a
+    /// display filter; JSON and summary counts retain every dependency.
     pub hide_pinned: bool,
-    /// `--rewrite` (upgrade): how to treat the manifest's version constraint. Defaults to
-    /// [`RewriteMode::Auto`] (lock-only when the target is in range, rewrite only when forced);
+    /// `--rewrite` (upgrade): how to treat the manifest's version constraint. By default,
+    /// [`RewriteMode::Auto`] preserves an in-range constraint where the adapter supports lock-only
+    /// updates, widens implicit ceilings when required, and holds explicit upper bounds.
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
     /// `outdated --transitive`: include transitive (indirect) deps in the report.
@@ -646,6 +647,7 @@ impl Workspace {
             tool: pctx.tool,
             project: &pctx.rel_path,
             allow_major: opts.allow_major,
+            honor_declared_bounds: true,
         }
     }
 
@@ -946,6 +948,7 @@ mod tests {
             artifacts: Vec::new(),
             graph_floor: None,
             graph_ceiling: None,
+            declared_bound: None,
             members: vec![MemberRef {
                 name: member_name.to_string(),
                 path: member_path.to_string(),
@@ -1097,6 +1100,7 @@ mod tests {
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,
+                declared_bound: None,
                 members: vec![
                     MemberRef {
                         name: "left".to_string(),

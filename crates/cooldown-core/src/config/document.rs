@@ -1,6 +1,6 @@
 use super::layers::policy_layer_from_config;
 use super::scan::{ScanConfig, scan_config_from_config};
-use super::schema::ConfigToml;
+use super::schema::{ConfigToml, SelectorToml};
 use crate::error::CoreError;
 use crate::policy::{Origin, PolicyLayer};
 
@@ -10,6 +10,44 @@ pub struct ConfigDocument {
     raw: ConfigToml,
 }
 
+fn reject_tool_only_fields(selector: &SelectorToml, ctx: &str) -> Result<(), CoreError> {
+    if selector.package.is_some() {
+        return Err(CoreError::Config(format!(
+            "{ctx}: nested `package` tables are only supported under [tool.*]"
+        )));
+    }
+    let misplaced_exclude = if selector.exclude_folders.is_some() {
+        Some("exclude-folders")
+    } else if selector.exclude_packages.is_some() {
+        Some("exclude-packages")
+    } else {
+        None
+    };
+    if let Some(field) = misplaced_exclude {
+        return Err(CoreError::Config(format!(
+            "{ctx}: `{field}` is not valid here; exclusion lists live under [tool.*], [global], or a command table"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_structure(config: &ConfigToml, origin: &Origin) -> Result<(), CoreError> {
+    if let Some(registries) = &config.registry {
+        for (name, selector) in registries {
+            reject_tool_only_fields(selector, &format!("{} [registry.{name:?}]", origin.token()))?;
+        }
+    }
+    if let Some(projects) = &config.project {
+        for (pattern, selector) in projects {
+            reject_tool_only_fields(
+                selector,
+                &format!("{} [project.{pattern:?}]", origin.token()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl ConfigDocument {
     /// Parse a config document once, annotating any syntax or shape error with the source origin.
     ///
@@ -17,8 +55,17 @@ impl ConfigDocument {
     ///
     /// Returns [`CoreError::Config`] if `content` is not valid config TOML.
     pub fn parse(content: &str, origin: &Origin) -> Result<Self, CoreError> {
-        let raw = toml::from_str(content)
-            .map_err(|error| CoreError::Config(format!("{}: {error}", origin.token())))?;
+        let raw = toml::from_str(content).map_err(|error| {
+            let error = error.to_string();
+            let exclude_hint =
+                if error.contains("exclude-folders") || error.contains("exclude-packages") {
+                    "; exclusion lists live under [tool.*], [global], or a command table"
+                } else {
+                    ""
+                };
+            CoreError::Config(format!("{}: {error}{exclude_hint}", origin.token()))
+        })?;
+        validate_structure(&raw, origin)?;
         Ok(ConfigDocument { raw })
     }
 

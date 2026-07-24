@@ -382,6 +382,7 @@ impl DenoTool {
                     artifacts: Vec::new(),
                     graph_floor: None,
                     graph_ceiling: None,
+                    declared_bound: None,
                     members: Vec::new(),
                     pinned: false,
                 });
@@ -451,7 +452,9 @@ impl ReleaseFetcher for DenoTool {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
             major: version::major_key(dep.current.as_str()),
+            major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
+            beyond_declared_bound: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,

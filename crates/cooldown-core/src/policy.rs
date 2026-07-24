@@ -6,6 +6,7 @@
 //!
 //! - `min-age` / per-kind windows — **authority-first**: the highest layer that sets the field
 //!   wins; within a layer the most specific selector breaks the tie. Layer dominates selector.
+//! - `max-major` — **authority-first**, using the same layer and selector ordering as `min-age`.
 //! - `floor` — **max-clamp**: the effective window clamps up to `max(floor)` over all layers.
 //! - `allow` — **accumulated union** that zeroes an ordinary window, but bypasses a floor only
 //!   per-floor: a floor is escaped only by an allow co-declared in that floor's own layer, or by an
@@ -20,4 +21,4 @@ pub use model::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, window_exclude_newer,
 };
-pub use resolve::{exempt_package_globs, resolve};
+pub use resolve::{MaxMajorPick, exempt_package_globs, resolve, resolve_max_major};

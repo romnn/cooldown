@@ -83,11 +83,11 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 ///
 /// Each field is combined by its own rule: `min-age` (and the per-kind windows) is
 /// **authority-first** — the highest layer that sets it wins, tie-broken within the layer by
-/// selector specificity, with a per-kind fall-through to the bare `default`; `floor` is
-/// **max-clamped** across layers; and `allow` is a floor-aware **union** that zeroes an ordinary
-/// window but bypasses a floor only when it is co-declared in that floor's layer or is an audited
-/// env/CLI override. The returned [`Resolution::trace`] records every rule considered and which one
-/// applied.
+/// selector specificity, with a per-kind fall-through to the bare `default`; `max-major` uses the
+/// same authority-first ordering; `floor` is **max-clamped** across layers; and `allow` is a
+/// floor-aware **union** that zeroes an ordinary window but bypasses a floor only when it is
+/// co-declared in that floor's layer or is an audited env/CLI override. The returned
+/// [`Resolution::trace`] records every rule considered and which one applied.
 ///
 /// `layers` are expected low → high authority. If no layer sets the resolved field (e.g. the
 /// caller omitted the built-in `Default` layer), a 7-day `min-age` safety net is used.
@@ -125,6 +125,7 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp) -> Resolution {
     let mut trace: Vec<TraceStep> = Vec::new();
     let pick = pick_window(layers, query, now, &mut trace);
+    trace_max_major(layers, query, &mut trace);
     let floors = collect_floor_candidates(layers, query, &mut trace);
     let allow = resolve_allows(layers, query, &floors, &mut trace);
 
@@ -170,13 +171,16 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
 /// deterministic, idempotent write. A `package` rule that sets a `min-age`/`freeze` (not `latest`) is
 /// not exempt and is never listed.
 #[must_use]
-pub fn exempt_package_globs(layers: &[PolicyLayer]) -> Vec<String> {
+pub fn exempt_package_globs(layers: &[PolicyLayer], target: crate::model::ToolId) -> Vec<String> {
     let mut globs = std::collections::BTreeSet::new();
     for layer in layers {
         for rule in &layer.rules {
-            let Selector::Package(glob) = &rule.selector else {
+            let Selector::Package { glob, tool } = &rule.selector else {
                 continue;
             };
+            if tool.is_some_and(|tool| tool != target) {
+                continue;
+            }
             let latest = [
                 &rule.window.default,
                 &rule.window.major,
@@ -192,6 +196,91 @@ pub fn exempt_package_globs(layers: &[PolicyLayer]) -> Vec<String> {
         }
     }
     globs.into_iter().collect()
+}
+
+/// The authority-first `max-major` result for a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaxMajorPick {
+    /// The inclusive numeric major ceiling.
+    pub limit: u64,
+    /// The winning policy layer.
+    pub origin: Origin,
+    /// The winning selector within that layer.
+    pub selector: Selector,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedMaxMajorPick {
+    pick: MaxMajorPick,
+    layer_index: usize,
+    rule_index: usize,
+    specificity: u8,
+}
+
+fn pick_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>) -> Option<IndexedMaxMajorPick> {
+    let mut best: Option<IndexedMaxMajorPick> = None;
+    for (layer_index, layer) in layers.iter().enumerate() {
+        for (rule_index, rule) in layer.rules.iter().enumerate() {
+            let Some(limit) = rule.max_major else {
+                continue;
+            };
+            if !rule.selector.matches(query) {
+                continue;
+            }
+            let specificity = rule.selector.specificity();
+            let better = best.as_ref().is_none_or(|best| {
+                (layer_index, specificity) > (best.layer_index, best.specificity)
+            });
+            if better {
+                best = Some(IndexedMaxMajorPick {
+                    pick: MaxMajorPick {
+                        limit,
+                        origin: layer.origin.clone(),
+                        selector: rule.selector.clone(),
+                    },
+                    layer_index,
+                    rule_index,
+                    specificity,
+                });
+            }
+        }
+    }
+    best
+}
+
+/// Resolves the inclusive package `max-major` ceiling by layer authority, then specificity.
+#[must_use]
+pub fn resolve_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>) -> Option<MaxMajorPick> {
+    pick_max_major(layers, query).map(|pick| pick.pick)
+}
+
+fn trace_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>, trace: &mut Vec<TraceStep>) {
+    let winner = pick_max_major(layers, query);
+    for (layer_index, layer) in layers.iter().enumerate() {
+        for (rule_index, rule) in layer.rules.iter().enumerate() {
+            let Some(limit) = rule.max_major else {
+                continue;
+            };
+            if !rule.selector.matches(query) {
+                continue;
+            }
+            let applied = winner.as_ref().is_some_and(|winner| {
+                winner.layer_index == layer_index && winner.rule_index == rule_index
+            });
+            trace.push(TraceStep {
+                layer: layer.origin.clone(),
+                field: "max-major".to_string(),
+                selector: Some(rule.selector.clone()),
+                min_age_days: None,
+                applied,
+                note: if applied {
+                    format!("selected inclusive major ceiling {limit}")
+                } else {
+                    format!("considered inclusive major ceiling {limit}")
+                },
+            });
+        }
+    }
 }
 
 /// Picks the authority-first window field for `query` and traces every rule considered.
@@ -396,7 +485,10 @@ mod exempt_tests {
     use jiff::SignedDuration;
 
     fn package_rule(glob: &str, window: ByKind, allow: bool) -> Rule {
-        let mut rule = Rule::new(Selector::Package(PatternGlob::new(glob).expect("glob")));
+        let mut rule = Rule::new(Selector::Package {
+            glob: PatternGlob::new(glob).expect("glob"),
+            tool: None,
+        });
         rule.window = window;
         rule.allow = allow;
         rule
@@ -427,7 +519,7 @@ mod exempt_tests {
 
         // Sorted + deduplicated; only the package-scoped latest/allow selectors.
         assert_eq!(
-            exempt_package_globs(&[layer]),
+            exempt_package_globs(&[layer], crate::model::ToolId("pnpm")),
             vec!["@scope/latest-pkg".to_string(), "allowed-pkg".to_string(),]
         );
     }
@@ -440,6 +532,23 @@ mod exempt_tests {
             ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 14))),
             false,
         ));
-        assert!(exempt_package_globs(&[layer]).is_empty());
+        assert!(exempt_package_globs(&[layer], crate::model::ToolId("pnpm")).is_empty());
+    }
+
+    #[test]
+    fn tool_qualified_exemptions_do_not_leak_to_other_tools() {
+        let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        let mut rule = Rule::new(Selector::Package {
+            glob: PatternGlob::new("shared").expect("glob"),
+            tool: Some(crate::model::ToolId("npm")),
+        });
+        rule.allow = true;
+        layer.rules.push(rule);
+
+        assert_eq!(
+            exempt_package_globs(std::slice::from_ref(&layer), crate::model::ToolId("npm")),
+            vec!["shared".to_string()]
+        );
+        assert!(exempt_package_globs(&[layer], crate::model::ToolId("pnpm")).is_empty());
     }
 }

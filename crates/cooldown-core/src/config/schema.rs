@@ -24,16 +24,25 @@ pub(crate) struct SelectorToml {
     pub(crate) latest: Option<bool>,
     pub(crate) freeze: Option<String>,
     pub(crate) floor: Option<String>,
-    /// `.gitignore`-style directories never scanned. Meaningful only under `[tool.<name>]` (added to
-    /// that tool's scan-exclude list); ignored on registry/package/project selectors, which are
-    /// policy-only.
+    pub(crate) package: Option<BTreeMap<String, PackageRuleToml>>,
+    /// `.gitignore`-style directories never scanned under `[tool.<name>]`.
     #[serde(rename = "exclude-folders")]
     pub(crate) exclude_folders: Option<Vec<String>>,
-    /// Package-name globs whose workspace members are dropped from reports. Meaningful only under
-    /// `[tool.<name>]`, where the ecosystem's name format is known (`my-pkg` vs `@scope/my-pkg`);
-    /// ignored on registry/package/project selectors.
+    /// Package-name globs whose workspace members are dropped from reports under `[tool.<name>]`.
     #[serde(rename = "exclude-packages")]
     pub(crate) exclude_packages: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageRuleToml {
+    #[serde(rename = "min-age")]
+    pub(crate) min_age: Option<MinAgeToml>,
+    pub(crate) latest: Option<bool>,
+    pub(crate) freeze: Option<String>,
+    pub(crate) floor: Option<String>,
+    #[serde(rename = "max-major")]
+    pub(crate) max_major: Option<u64>,
 }
 
 /// CLI-flag defaults from one config section: `[global]` (shared) or a `[<command>]` section.
@@ -247,7 +256,7 @@ pub(crate) struct ConfigToml {
     pub(crate) strict_native: Option<bool>,
     pub(crate) tool: Option<BTreeMap<String, SelectorToml>>,
     pub(crate) registry: Option<BTreeMap<String, SelectorToml>>,
-    pub(crate) package: Option<BTreeMap<String, SelectorToml>>,
+    pub(crate) package: Option<BTreeMap<String, PackageRuleToml>>,
     pub(crate) project: Option<BTreeMap<String, SelectorToml>>,
     /// Shared CLI-flag defaults across all subcommands.
     pub(crate) global: Option<CommandConfig>,
