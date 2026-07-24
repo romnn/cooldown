@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.12
+
 - Add tool-qualified package selectors such as `[tool.uv.package.glob]` and package-only
   `max-major` ceilings.
 - Respect explicit manifest `<`/`<=` upper bounds during major upgrades; `--rewrite` is the
