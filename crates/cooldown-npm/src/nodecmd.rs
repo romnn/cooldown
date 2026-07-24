@@ -39,6 +39,23 @@ impl NodeCmd {
             })
     }
 
+    async fn checked_output(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+    ) -> Result<std::process::Output> {
+        let output = self.output(dir, args).await?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(CoreError::Tool {
+                tool: self.bin.clone(),
+                termination: ToolTermination::from_exit_status(output.status),
+                stderr: failure_detail(&output),
+            })
+        }
+    }
+
     /// Runs the driver, mapping a non-zero exit to a [`CoreError::Tool`].
     ///
     /// # Errors
@@ -46,16 +63,18 @@ impl NodeCmd {
     /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
     /// it exits non-zero (e.g. an unsatisfiable pin — a resolver conflict).
     pub async fn run(&self, dir: &Utf8Path, args: &[String]) -> Result<()> {
-        let out = self.output(dir, args).await?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(CoreError::Tool {
-                tool: self.bin.clone(),
-                termination: ToolTermination::from_exit_status(out.status),
-                stderr: failure_detail(&out),
-            })
-        }
+        self.checked_output(dir, args).await.map(|_| ())
+    }
+
+    /// Runs the driver and returns its standard output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
+    /// it exits non-zero.
+    pub(crate) async fn stdout(&self, dir: &Utf8Path, args: &[String]) -> Result<String> {
+        let output = self.checked_output(dir, args).await?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Runs the driver as a build/verify step, folding the exit status into a [`VerifyReport`] so a

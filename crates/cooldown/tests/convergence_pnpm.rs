@@ -346,13 +346,12 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
 
     // `fix` matures the too-fresh deps down to versions at or before the freeze cutoff and re-locks.
     let fixed = fixture.cooldown_json(&["fix", "--freeze", FREEZE]);
-    assert!(
-        fixed.ok(),
-        "fix should succeed: {}",
-        fixture.cooldown(&["fix", "--freeze", FREEZE]).stderr_str()
-    );
+    assert!(fixed.ok(), "fix should succeed: {fixed:#?}");
     assert_pnpm_lock_current(&fixed);
     assert_eq!(fixed.summary_errors(), 0, "fix should not error");
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(check.ok(), "fix must leave a policy-clean graph");
+    assert_eq!(check.summary_violations(), 0);
 
     let lock_after_fix = fixture.read_bytes("pnpm-lock.yaml");
 
@@ -368,6 +367,115 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
         fixture.read_bytes("pnpm-lock.yaml"),
         "second fix must leave the lock byte-identical"
     );
+}
+
+/// `outdated` and `fix` recover after `sync` activates pnpm's native release-age gate.
+#[test]
+fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
+    skip_if_missing!("pnpm");
+
+    // Seed without a persistent native policy so the lock can contain versions newer than FREEZE.
+    // `nanoid` remains intentionally exempt after sync; the repair must preserve that native
+    // exemption while adding exact allowances for the versions it is repairing. TypeScript is
+    // pinned to an older, still-in-range version so `outdated` has one independently adoptable
+    // candidate to verify against the rejected starting lock.
+    let fixture = Fixture::new();
+    fixture.write("package.json", PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    add_root_dependency(&fixture, "nanoid", "^3.3.0");
+    add_root_dependency(&fixture, "typescript", "^5.0.0");
+    seed_lock(&fixture, FREEZE_LATER);
+    let seed_minutes = minimum_release_age_minutes(FREEZE_LATER).to_string();
+    fixture
+        .run_tool(
+            "pnpm",
+            &[
+                "update",
+                "typescript@5.4.5",
+                "--lockfile-only",
+                "--no-save",
+                &format!("--config.minimumReleaseAge={seed_minutes}"),
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture.write("cooldown.toml", "[package.nanoid]\nlatest = true\n");
+    let minimum_age_minutes = minimum_release_age_minutes(FREEZE);
+    let min_age = format!("{minimum_age_minutes}m");
+
+    // Activating the native gate after resolution makes pnpm reject the existing lock. This is the
+    // migration state `fix` must cross rather than misclassifying every downgrade as a conflict.
+    fixture
+        .cooldown(&["sync", "--tool", "pnpm", "--min-age", &min_age])
+        .expect_success();
+    let native_before_fix = fixture.read_bytes("pnpm-workspace.yaml");
+    let native = String::from_utf8(native_before_fix.clone()).expect("native config is utf8");
+    assert!(
+        native.contains(&format!("minimumReleaseAge: {minimum_age_minutes}")),
+        "sync must persist the requested native release-age gate: {native}"
+    );
+    assert!(
+        native.contains("minimumReleaseAgeExclude:") && native.contains("nanoid"),
+        "sync must persist the package exemption the repair needs to preserve: {native}"
+    );
+
+    let lock_before_rejection = fixture.read_bytes("pnpm-lock.yaml");
+    let rejected = fixture.run_tool("pnpm", &["install", "--lockfile-only"], &[]);
+    let rejection = format!("{}\n{}", rejected.stdout_str(), rejected.stderr_str());
+    assert!(
+        !rejected.status.success(),
+        "the fixture must reproduce pnpm's rejected-lock migration state"
+    );
+    assert!(
+        rejection.contains("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]"),
+        "pnpm must reject the starting lock for the reason under test: {rejection}"
+    );
+    assert_eq!(
+        lock_before_rejection,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "the raw preflight probe must leave the rejected lock unchanged"
+    );
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+    assert!(outdated.ok(), "outdated should complete: {outdated:#?}");
+    assert!(
+        outdated
+            .outdated_with_status("adoptable")
+            .contains("typescript"),
+        "the rejected baseline must not make the valid TypeScript update look blocked: {outdated:#?}"
+    );
+    assert!(
+        !outdated
+            .outdated_with_status("blocked")
+            .contains("typescript"),
+        "the valid TypeScript update must not be blocked by the starting-lock preflight"
+    );
+
+    let fixed = fixture.cooldown_json(&["fix", "--freeze", FREEZE]);
+    assert!(
+        fixed.ok(),
+        "fix should repair the pre-policy lock: {fixed:#?}"
+    );
+    assert_pnpm_lock_current(&fixed);
+    assert!(
+        fixed.summary_applied() > 0,
+        "the too-new seed must require at least one downgrade"
+    );
+    assert_eq!(
+        fixed.summary_skipped(),
+        0,
+        "every planned repair should land"
+    );
+    assert_eq!(fixed.summary_errors(), 0, "fix should not error");
+    assert_eq!(
+        native_before_fix,
+        fixture.read_bytes("pnpm-workspace.yaml"),
+        "temporary repair overrides must not leak into native config"
+    );
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(check.ok(), "the repaired lock should satisfy the policy");
+    assert_eq!(check.summary_violations(), 0);
 }
 
 /// The per-package-window fixture's manifest: a single direct `eslint` on the v9 line with a caret

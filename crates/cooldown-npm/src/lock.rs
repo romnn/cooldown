@@ -96,19 +96,36 @@ pub trait NodeLock: Send + Sync + 'static {
     /// stricter per-package window admits an older version than the global one (the gap a bare
     /// `--latest` left, since pnpm's `minimumReleaseAge` is a single global value). Multi-version
     /// candidates must be held out by the caller before this point: pnpm's bare `update <name>` can
-    /// write out-of-range lock entries while `--no-save` leaves manifests unchanged. `minimumReleaseAge`
-    /// is still passed as the *transitive* floor: a fresh transitive the pins drag in is capped to the
-    /// project-default window, so the uniform-window case lands the same lock as before while the
-    /// per-package targets are honored exactly. Transitives the pins float past the global window are
-    /// reconciled down by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no
-    /// global cutoff at all). `--no-save`/`--lockfile-only` keep `package.json` and `node_modules`
-    /// untouched. A `None` `window_minutes` (a true `Latest` opt-out) omits the cap. `None` for managers
-    /// without a joint resolve or when there are no exact pins to apply.
+    /// write out-of-range lock entries while `--no-save` leaves manifests unchanged.
+    ///
+    /// A positive `window_minutes` is the transitive floor: a fresh transitive the pins drag in is
+    /// capped to the project-default window. Transitives the pins float past it are reconciled down
+    /// by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no global
+    /// cutoff at all). `None` omits the command-line age setting.
+    ///
+    /// `--no-save`/`--lockfile-only` keep `package.json` and `node_modules` untouched. Returns `None`
+    /// for managers without a joint resolve or when there are no exact pins to apply.
     #[must_use]
     fn whole_graph_args(
         _pins: &[(String, String)],
         _filters: &[String],
         _window_minutes: Option<i64>,
+    ) -> Option<Vec<String>> {
+        None
+    }
+
+    /// A lock-only install used while repairing a lock that pnpm's persisted release-age preflight
+    /// rejects. `resolution_only` forces every edge through temporary exact overrides; the settling
+    /// pass clears the temporary override metadata after the original native config is restored.
+    ///
+    /// `--trust-lockfile` skips only pnpm's starting-lock verification. The age floor and exact
+    /// exclusions still govern the resolution that replaces the rejected entries. Returns `None`
+    /// for managers without this preflight.
+    #[must_use]
+    fn policy_repair_args(
+        _window_minutes: Option<i64>,
+        _minimum_age_excludes: &[String],
+        _resolution_only: bool,
     ) -> Option<Vec<String>> {
         None
     }
@@ -475,10 +492,7 @@ impl NodeLock for Pnpm {
         // treats the unmatched request like an unscoped update and moves unrelated direct dependencies.
         // Filters restrict the command to the importers known to declare at least one planned pin. The
         // recursive fallback is reserved for graph-only changes with no declaring-member attribution.
-        // `minimumReleaseAge` stays as the *transitive* floor — a fresh transitive the pins drag in is
-        // capped to the project-default window, so the uniform-window case lands the same lock as
-        // before. Transitives floated past the window are reconciled down by the caller's
-        // transitive-cooldown gate, exactly as for cargo/go.
+        // A positive `minimumReleaseAge` stays as the transitive floor.
         if pins.is_empty() {
             return None;
         }
@@ -503,6 +517,25 @@ impl NodeLock for Pnpm {
         args.push("--no-save".to_string());
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
+        }
+        Some(args)
+    }
+
+    fn policy_repair_args(
+        window_minutes: Option<i64>,
+        minimum_age_excludes: &[String],
+        resolution_only: bool,
+    ) -> Option<Vec<String>> {
+        let mut args = vec!["install".to_string(), "--lockfile-only".to_string()];
+        if resolution_only {
+            args.push("--resolution-only".to_string());
+        }
+        args.push("--trust-lockfile".to_string());
+        if let Some(minutes) = window_minutes {
+            args.push(format!("--config.minimumReleaseAge={minutes}"));
+        }
+        for exclusion in minimum_age_excludes {
+            args.push(format!("--config.minimumReleaseAgeExclude={exclusion}"));
         }
         Some(args)
     }

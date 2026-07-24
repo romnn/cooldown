@@ -376,6 +376,7 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
                     members: Vec::new(),
                 }],
                 rewrite: cooldown_core::RewriteMode::default(),
+                ..Plan::default()
             },
         )
         .await

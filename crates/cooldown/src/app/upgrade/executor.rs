@@ -3,9 +3,9 @@ use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::lock::ProjectLock;
 use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
 use cooldown_core::{
-    ApplyReport, Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockStatus, MajorKey,
-    PackageId, Plan, ProjectMutationJournal, Release, ResolveContext, SkipReason, Skipped, Status,
-    UpdateKind, Version, check_pin, evaluate, evaluate_fix,
+    ApplyReport, BaselineViolation, Change, DepScope, Dependency, Diagnostic, DiagnosticKind,
+    LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal, Release, ResolveContext,
+    SkipReason, Skipped, Status, UpdateKind, Version, check_pin, evaluate, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1085,6 +1085,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let plan = Plan {
             changes: changes.clone(),
             rewrite: self.ctx.opts.rewrite,
+            baseline_violations: plan_baseline_violations(&state.baseline_violations),
         };
         let primary = changes
             .first()
@@ -1692,6 +1693,22 @@ fn sort_planned_changes(changes: &mut [Change]) {
                     .cmp(b.members.iter().map(|member| (&member.name, &member.path)))
             })
     });
+}
+
+fn plan_baseline_violations(violations: &HashSet<(String, String)>) -> Vec<BaselineViolation> {
+    let mut baseline = violations
+        .iter()
+        .map(|(package, version)| BaselineViolation {
+            package: package.clone(),
+            version: Version::new(version),
+        })
+        .collect::<Vec<_>>();
+    baseline.sort_by(|a, b| {
+        a.package
+            .cmp(&b.package)
+            .then_with(|| a.version.as_str().cmp(b.version.as_str()))
+    });
+    baseline
 }
 
 /// Whether `to` is an older release than `from` — i.e. the move is a cooldown rollback, not a forward

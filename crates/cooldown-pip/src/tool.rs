@@ -358,6 +358,7 @@ mod tests {
         let plan = Plan {
             changes: vec![change],
             rewrite: cooldown_core::RewriteMode::Auto,
+            ..Plan::default()
         };
 
         let report = tool

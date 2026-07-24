@@ -739,7 +739,7 @@ impl ToolWrite for UvTool {
         }
         let lock_plan = Plan {
             changes: lock_changes,
-            rewrite: plan.rewrite,
+            ..plan.clone()
         };
 
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `uv.lock` before the

@@ -64,15 +64,7 @@ pub(crate) async fn apply_resilient_with_observer(
         Err(_) => {}
     }
 
-    let accepted = maximal_satisfiable_subset(
-        writer,
-        project,
-        &plan.changes,
-        plan.rewrite,
-        journal,
-        observer,
-    )
-    .await?;
+    let accepted = maximal_satisfiable_subset(writer, project, plan, journal, observer).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
@@ -85,7 +77,7 @@ pub(crate) async fn apply_resilient_with_observer(
     } else {
         let committed = Plan {
             changes: accepted,
-            rewrite: plan.rewrite,
+            ..plan.clone()
         };
         writer
             .apply_with_observer(project, &committed, journal, observer)
@@ -114,20 +106,19 @@ pub(crate) async fn apply_resilient_with_observer(
 async fn maximal_satisfiable_subset(
     writer: &dyn ToolWrite,
     project: &Project,
-    changes: &[Change],
-    rewrite: cooldown_core::RewriteMode,
+    plan: &Plan,
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
 ) -> Result<Vec<Change>> {
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
-    push_halves(&mut work, changes.to_vec());
+    push_halves(&mut work, plan.changes.clone());
 
     while let Some(group) = work.pop() {
         journal.restore(&project.root)?;
         let trial = Plan {
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
-            rewrite,
+            ..plan.clone()
         };
         match writer
             .apply_with_observer(project, &trial, journal, observer)
@@ -211,6 +202,7 @@ mod tests {
         Plan {
             changes: names.iter().map(|name| change(name)).collect(),
             rewrite: RewriteMode::Auto,
+            ..Plan::default()
         }
     }
 
@@ -512,6 +504,7 @@ mod tests {
         let plan = Plan {
             changes: vec![app_a, app_b],
             rewrite: RewriteMode::Auto,
+            ..Plan::default()
         };
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 

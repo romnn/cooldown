@@ -567,6 +567,15 @@ pub enum RewriteMode {
     Always,
 }
 
+/// A resolved package version already rejected by the active policy before an apply trial begins.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BaselineViolation {
+    /// The package name in its tool's native spelling.
+    pub package: String,
+    /// The exact version present in the starting graph.
+    pub version: Version,
+}
+
 /// A set of planned changes handed to an adapter's `apply`.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
@@ -575,6 +584,11 @@ pub struct Plan {
     /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
     /// flag). Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
+    /// Policy violations already present before this trial.
+    ///
+    /// Adapters may authorize these exact starting versions while resolving a repair, but must not
+    /// treat the set as permission for newly selected versions to bypass the policy.
+    pub baseline_violations: Vec<BaselineViolation>,
 }
 
 /// Why a planned change was not applied. Skips are `Ok` data, not `Err`.

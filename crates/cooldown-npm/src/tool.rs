@@ -23,8 +23,36 @@ use cooldown_core::{
     WindowSpec,
 };
 use cooldown_registry::SharedHttp;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use serde::de::DeserializeOwned;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
+
+struct WholeGraphInputs {
+    exact_pins: Vec<(String, String)>,
+    importer_filters: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ConfigStringList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ConfigStringList {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            ConfigStringList::One(value) => vec![value],
+            ConfigStringList::Many(values) => values,
+        }
+    }
+}
+
+impl Default for ConfigStringList {
+    fn default() -> Self {
+        ConfigStringList::Many(Vec::new())
+    }
+}
 
 /// The resolved lock's `name -> version` map, the snapshot `apply` diffs before/after the whole-graph
 /// re-resolve so *every* net version change is reported (the planned moves, the collateral churn the
@@ -146,6 +174,9 @@ fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutatio
     let mut seen = BTreeSet::new();
     let mut rels = Vec::new();
     push_journal_rel(&mut rels, &mut seen, Utf8PathBuf::from(L::LOCKFILE));
+    if let Some(native) = L::NATIVE_MIN_AGE_FILE {
+        push_journal_rel(&mut rels, &mut seen, Utf8PathBuf::from(native));
+    }
     for change in &plan.changes {
         for rel in manifest::manifest_rels(&change.members) {
             push_journal_rel(&mut rels, &mut seen, rel);
@@ -640,7 +671,7 @@ impl<L: NodeLock> NpmTool<L> {
             // successes so this candidate can be restored independently.
             let candidate_plan = Plan {
                 changes: vec![change.clone()],
-                rewrite: plan.rewrite,
+                ..plan.clone()
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
             let mut rewrote_manifest = false;
@@ -734,14 +765,18 @@ impl<L: NodeLock> NpmTool<L> {
     /// overshooting onto the global-window-newest — the gap a bare `--latest` left, since pnpm's
     /// `minimumReleaseAge` is a single global knob with no per-package publish-date cutoff. This mirrors
     /// cargo's `update --precise <to>` and go's `get module@<to>`: the per-package target already
-    /// encodes the per-package window, so pinning it enforces that window exactly. `minimumReleaseAge`
-    /// is still passed as the *transitive* floor (a fresh transitive the pins drag in is capped to the
-    /// project-default window, so the uniform-window case lands the same lock as before); transitives
-    /// floated past it are reconciled down by the caller's transitive-cooldown gate, exactly as for
-    /// cargo/go. The report is the diff of the journal's pre-apply lock against the result, so every
-    /// planned candidate is reported reached or held (naming the conflicting peer where attributable)
-    /// and every collateral move of an unplanned package surfaces as its own row. A resolver failure
-    /// marks all candidates held and lets the caller restore the journal.
+    /// encodes the per-package window, so pinning it enforces that window exactly.
+    ///
+    /// `minimumReleaseAge` is passed as the *transitive* floor. A persisted native policy can reject
+    /// an older lock before applying the exact pins that would repair it. For that migration state,
+    /// pnpm is rerun with temporary exact overrides for the planned targets and `--trust-lockfile`;
+    /// this skips only the rejected starting-lock preflight while the age floor still governs the
+    /// replacement graph. The original native config is restored before pnpm settles the lock again.
+    ///
+    /// The report is the diff of the journal's pre-apply lock against the result, so every planned
+    /// candidate is reported reached or held (naming the conflicting peer where attributable) and
+    /// every collateral move of an unplanned package surfaces as its own row. A resolver failure
+    /// after the repair retry marks the conflicting candidates held.
     async fn apply_whole_graph(
         &self,
         project: &Project,
@@ -775,17 +810,29 @@ impl<L: NodeLock> NpmTool<L> {
         // per-package target, so its own (possibly stricter) window is enforced by the pin, not this cap.
         let window_minutes =
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
-        match self
+        let first_resolve = self
             .whole_graph_resolve(project, plan, &multi_version, window_minutes)
-            .await
-        {
+            .await;
+        match first_resolve {
             Ok(()) => {}
-            Err(err) if err.is_tool_spawn_failure() => return Err(err),
+            Err(error) if error.is_local_environment_failure() => return Err(error),
+            Err(error)
+                if minimum_age_lock_rejected(&error)
+                    && window_minutes.is_some_and(|minutes| minutes > 0)
+                    && L::NATIVE_MIN_AGE_FILE.is_some() =>
+            {
+                // A persisted minimumReleaseAge validates the starting lock before pnpm applies the
+                // exact pins. Restore any partial resolver work, then rebuild through temporary exact
+                // overrides while retaining the age floor.
+                journal.restore(&project.root)?;
+                self.repair_policy_rejected_graph(project, plan, &multi_version, window_minutes)
+                    .await?;
+            }
             // The joint resolve is unsatisfiable as a whole. Propagate the failure so the caller's
             // `apply_resilient` can isolate the offending candidate(s) (an unfetchable version, one
             // side of a conflict) and apply the rest, instead of holding every candidate. The caller
             // restores the journal, so no partial lock is kept.
-            Err(err) => return Err(err),
+            Err(error) => return Err(error),
         }
 
         let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
@@ -880,6 +927,29 @@ impl<L: NodeLock> NpmTool<L> {
         multi_version: &HashSet<String>,
         window_minutes: Option<i64>,
     ) -> Result<()> {
+        let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
+        if inputs.exact_pins.is_empty() {
+            return Ok(());
+        }
+        self.joint_resolve(
+            project,
+            &inputs.exact_pins,
+            &inputs.importer_filters,
+            window_minutes,
+        )
+        .await?;
+        // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
+        // still left short of its target is blocked by *another* package's requirement (a peer
+        // conflict), which widening its own declared range cannot resolve — the lock diff reports it
+        // held. No post-resolve re-widen loop is needed.
+        Ok(())
+    }
+
+    fn prepare_whole_graph_inputs(
+        project: &Project,
+        plan: &Plan,
+        multi_version: &HashSet<String>,
+    ) -> Result<WholeGraphInputs> {
         let mut pins: Vec<(String, String)> = Vec::with_capacity(plan.changes.len());
         let mut importer_filters = Some(BTreeSet::new());
         for change in &plan.changes {
@@ -917,20 +987,14 @@ impl<L: NodeLock> NpmTool<L> {
             }
             pins.push((name, change.to.as_str().to_string()));
         }
-        if pins.is_empty() {
-            return Ok(());
-        }
         let filters = match importer_filters {
             Some(filters) => filters.into_iter().collect::<Vec<_>>(),
             None => Vec::new(),
         };
-        self.joint_resolve(project, &pins, &filters, window_minutes)
-            .await?;
-        // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
-        // still left short of its target is blocked by *another* package's requirement (a peer
-        // conflict), which widening its own declared range cannot resolve — the lock diff reports it
-        // held. No post-resolve re-widen loop is needed.
-        Ok(())
+        Ok(WholeGraphInputs {
+            exact_pins: pins,
+            importer_filters: filters,
+        })
     }
 
     async fn joint_resolve(
@@ -945,6 +1009,141 @@ impl<L: NodeLock> NpmTool<L> {
         };
         self.cmd.run(&project.root, &args).await
     }
+
+    async fn repair_policy_rejected_graph(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        multi_version: &HashSet<String>,
+        window_minutes: Option<i64>,
+    ) -> Result<()> {
+        let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
+        if inputs.exact_pins.is_empty() {
+            return Ok(());
+        }
+        let native = L::NATIVE_MIN_AGE_FILE.ok_or_else(|| {
+            CoreError::System("pnpm native config path is unavailable".to_string())
+        })?;
+        let native_rel = Utf8PathBuf::from(native);
+        let native_snapshot = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(
+                &project.root,
+                &native_rel,
+            )?],
+        };
+        let configured_exclusions = self
+            .configured_value::<ConfigStringList>(project, "minimumReleaseAgeExclude")
+            .await?
+            .into_vec();
+        let exclusions = minimum_age_repair_exclusions(plan, configured_exclusions);
+        let mut overrides = self
+            .configured_value::<BTreeMap<String, String>>(project, "overrides")
+            .await?;
+        overrides.extend(inputs.exact_pins);
+
+        let temporary_result = async {
+            set_yaml_string_map(&project.root.join(&native_rel), "overrides", &overrides)?;
+            let args =
+                L::policy_repair_args(window_minutes, &exclusions, true).ok_or_else(|| {
+                    CoreError::System("pnpm policy repair command is unavailable".to_string())
+                })?;
+            self.cmd
+                .run(&project.root, &args)
+                .await
+                .map_err(propagate_repeated_minimum_age_rejection)
+        }
+        .await;
+        let restore_result = native_snapshot.restore(&project.root);
+        restore_result?;
+        temporary_result?;
+
+        let args = L::policy_repair_args(window_minutes, &exclusions, false).ok_or_else(|| {
+            CoreError::System("pnpm policy settlement command is unavailable".to_string())
+        })?;
+        self.cmd
+            .run(&project.root, &args)
+            .await
+            .map_err(propagate_repeated_minimum_age_rejection)
+    }
+
+    async fn configured_value<T>(&self, project: &Project, key: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Default,
+    {
+        let args = vec![
+            "config".to_string(),
+            "get".to_string(),
+            key.to_string(),
+            "--json".to_string(),
+        ];
+        let output = self.cmd.stdout(&project.root, &args).await?;
+        let value = output.trim();
+        if value.is_empty() || value == "null" || value == "undefined" {
+            return Ok(T::default());
+        }
+        serde_json::from_str(value)
+            .map_err(|error| CoreError::Serialization(format!("pnpm {key}: {error}")))
+    }
+}
+
+fn minimum_age_lock_rejected(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Tool { stderr, .. }
+            if stderr.contains("[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]")
+    )
+}
+
+/// Keeps a failed repair out of resilient apply's candidate-conflict isolation.
+///
+/// The retry already grants every known starting violation a narrow exemption. Seeing the same
+/// preflight error again means the repair mechanism itself failed, not that one planned version is
+/// unsatisfiable.
+fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
+    if minimum_age_lock_rejected(&error) {
+        CoreError::System(format!(
+            "pnpm minimum-release-age repair did not clear the starting-lock violation: {error}"
+        ))
+    } else {
+        error
+    }
+}
+
+/// pnpm stops at the first matching exclusion rule, so one package's exact versions must share a
+/// `version||version` union rather than appearing as separate entries. A targeted package excludes
+/// only its approved destination; allowing its rejected starting version would let the settlement
+/// resolve float back to it after the temporary override is removed.
+fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
+    let mut exclusions = configured_exclusions.into_iter().collect::<BTreeSet<_>>();
+    let targeted = plan
+        .changes
+        .iter()
+        .map(|change| change.package.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
+    for violation in plan
+        .baseline_violations
+        .iter()
+        .filter(|violation| !targeted.contains(violation.package.as_str()))
+    {
+        exact_versions
+            .entry(violation.package.clone())
+            .or_default()
+            .insert(violation.version.to_string());
+    }
+    for change in &plan.changes {
+        exact_versions
+            .entry(change.package.name.clone())
+            .or_default()
+            .insert(change.to.to_string());
+    }
+    exclusions.extend(exact_versions.into_iter().map(|(package, versions)| {
+        format!(
+            "{package}@{}",
+            versions.into_iter().collect::<Vec<_>>().join("||")
+        )
+    }));
+    exclusions.into_iter().collect()
 }
 
 /// The post-resolve lock inconsistency, but only when this resolve introduced it.
@@ -1224,6 +1423,79 @@ fn set_yaml_block_list(
     Ok(true)
 }
 
+/// Set a top-level YAML string map while preserving the rest of the document.
+///
+/// The repair path uses this only for a temporary `overrides` map and restores the original bytes
+/// before returning, so comments inside the original block reappear unchanged.
+fn set_yaml_string_map(
+    path: &Utf8Path,
+    key: &str,
+    items: &BTreeMap<String, String>,
+) -> Result<bool> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(CoreError::Filesystem(format!("{path}: {e}"))),
+    };
+    let mut desired = Vec::new();
+    if !items.is_empty() {
+        desired.push(format!("{key}:"));
+        for (item_key, value) in items {
+            let item_key = serde_json::to_string(item_key)
+                .map_err(|e| CoreError::Serialization(e.to_string()))?;
+            let value = serde_json::to_string(value)
+                .map_err(|e| CoreError::Serialization(e.to_string()))?;
+            desired.push(format!("  {item_key}: {value}"));
+        }
+    }
+
+    let prefix = format!("{key}:");
+    let mut out = Vec::new();
+    let mut existing = Vec::new();
+    let mut found = false;
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
+            found = true;
+            existing.push(line.to_string());
+            while lines
+                .peek()
+                .is_some_and(|next| next.starts_with(char::is_whitespace))
+            {
+                existing.push(lines.next().unwrap_or_default().to_string());
+            }
+            out.extend(desired.iter().cloned());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+
+    let changed = if found {
+        existing != desired
+    } else {
+        !desired.is_empty()
+    };
+    if !changed {
+        return Ok(changed);
+    }
+
+    let mut text = if found {
+        out.join("\n")
+    } else {
+        let mut text = content.clone();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&desired.join("\n"));
+        text
+    };
+    if content.ends_with('\n') || !found {
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,6 +1624,34 @@ mod tests {
                 "--no-save".to_string(),
             ])
         );
+        let exclusions = [
+            "eslint@9.4.0".to_string(),
+            "@typescript-eslint/*".to_string(),
+        ];
+        assert_eq!(
+            Pnpm::policy_repair_args(Some(20160), &exclusions, true),
+            Some(vec![
+                "install".to_string(),
+                "--lockfile-only".to_string(),
+                "--resolution-only".to_string(),
+                "--trust-lockfile".to_string(),
+                "--config.minimumReleaseAge=20160".to_string(),
+                "--config.minimumReleaseAgeExclude=eslint@9.4.0".to_string(),
+                "--config.minimumReleaseAgeExclude=@typescript-eslint/*".to_string(),
+            ])
+        );
+        assert_eq!(
+            Pnpm::policy_repair_args(None, &[], false),
+            Some(vec![
+                "install".to_string(),
+                "--lockfile-only".to_string(),
+                "--trust-lockfile".to_string(),
+            ])
+        );
+        assert_eq!(
+            Npm::policy_repair_args(Some(20160), &exclusions, true),
+            None
+        );
         assert_eq!(Pnpm::whole_graph_args(&[], &filters, None), None);
         // npm/yarn/bun have no joint resolve, so they keep the per-package path.
         assert!(!Npm::supports_whole_graph_resolve());
@@ -1364,6 +1664,83 @@ mod tests {
         assert_eq!(
             crate::lock::Bun::whole_graph_args(&[], &filters, None),
             None
+        );
+    }
+
+    #[test]
+    fn minimum_age_repair_exclusions_are_exact_and_deterministic() {
+        let plan = Plan {
+            changes: vec![change("eslint", "10.7.0", "10.6.0")],
+            baseline_violations: vec![
+                cooldown_core::BaselineViolation {
+                    package: "eslint".to_string(),
+                    version: Version::new("10.7.0"),
+                },
+                cooldown_core::BaselineViolation {
+                    package: "flatted".to_string(),
+                    version: Version::new("3.4.3"),
+                },
+                cooldown_core::BaselineViolation {
+                    package: "flatted".to_string(),
+                    version: Version::new("3.4.2"),
+                },
+            ],
+            ..Plan::default()
+        };
+
+        assert_eq!(
+            minimum_age_repair_exclusions(
+                &plan,
+                vec!["@typescript-eslint/*".to_string(), "nanoid".to_string()],
+            ),
+            vec![
+                "@typescript-eslint/*".to_string(),
+                "eslint@10.6.0".to_string(),
+                "flatted@3.4.2||3.4.3".to_string(),
+                "nanoid".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_string_list_accepts_pnpm_singletons_and_arrays() {
+        let one = serde_json::from_str::<ConfigStringList>("\"nanoid\"")
+            .expect("singleton config value parses");
+        let many = serde_json::from_str::<ConfigStringList>("[\"nanoid\", \"eslint\"]")
+            .expect("array config value parses");
+
+        assert_eq!(one.into_vec(), vec!["nanoid".to_string()]);
+        assert_eq!(
+            many.into_vec(),
+            vec!["nanoid".to_string(), "eslint".to_string()]
+        );
+    }
+
+    #[test]
+    fn repeated_minimum_age_rejection_is_not_a_resolver_conflict() {
+        let error = CoreError::Tool {
+            tool: "pnpm".to_string(),
+            termination: cooldown_core::ToolTermination::ExitCode(1),
+            stderr: "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] lock rejected".to_string(),
+        };
+
+        let propagated = propagate_repeated_minimum_age_rejection(error);
+
+        assert!(propagated.is_local_environment_failure());
+        assert!(
+            propagated
+                .to_string()
+                .contains("repair did not clear the starting-lock violation")
+        );
+
+        let conflict = CoreError::Tool {
+            tool: "pnpm".to_string(),
+            termination: cooldown_core::ToolTermination::ExitCode(1),
+            stderr: "unresolvable peer dependency".to_string(),
+        };
+        assert!(
+            !propagate_repeated_minimum_age_rejection(conflict).is_local_environment_failure(),
+            "ordinary resolver failures must remain eligible for candidate isolation"
         );
     }
 
@@ -1656,6 +2033,33 @@ packages:
         assert!(!set_yaml_block_list(&path, "minimumReleaseAgeExclude", &[], false).expect("noop"));
     }
 
+    #[test]
+    fn set_yaml_string_map_replaces_only_the_requested_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            "minimumReleaseAge: 20160\noverrides:\n  existing: \"1.0.0\"\npackages:\n  - \"a\"\n# keep me\n",
+        )
+        .expect("write");
+        let items = BTreeMap::from([
+            ("@scope/pkg".to_string(), "2.0.0".to_string()),
+            ("existing".to_string(), "1.1.0".to_string()),
+        ]);
+
+        assert!(set_yaml_string_map(&path, "overrides", &items).expect("replace"));
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            written
+                .contains("overrides:\n  \"@scope/pkg\": \"2.0.0\"\n  \"existing\": \"1.1.0\"\n")
+        );
+        assert!(written.contains("minimumReleaseAge: 20160"));
+        assert!(written.contains("packages:\n  - \"a\""));
+        assert!(written.contains("# keep me"));
+        assert!(!set_yaml_string_map(&path, "overrides", &items).expect("idempotent"));
+    }
+
     #[tokio::test]
     async fn write_native_writes_minimum_release_age_exclude_for_latest_packages() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1874,6 +2278,7 @@ packages:
                 &Plan {
                     changes: vec![change("nanoid", "3.1.0", "3.3.0")],
                     rewrite: RewriteMode::Auto,
+                    ..Plan::default()
                 },
             )
             .await
@@ -1919,6 +2324,7 @@ packages:
                 &Plan {
                     changes: vec![planned],
                     rewrite: RewriteMode::Always,
+                    ..Plan::default()
                 },
             )
             .await
@@ -2166,6 +2572,7 @@ packages:
         let plan = Plan {
             changes: vec![change("nanoid", "3.1.0", "3.3.0")],
             rewrite: RewriteMode::Always,
+            ..Plan::default()
         };
 
         let report = tool()
