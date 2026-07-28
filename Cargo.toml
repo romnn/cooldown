@@ -24,6 +24,9 @@ targets = [
 	"aarch64-apple-darwin"
 ]
 
+[workspace.metadata.cargo-fc.subcommands.udeps]
+maximal_features = true
+
 [profile.release]
 opt-level = 3
 lto = true
