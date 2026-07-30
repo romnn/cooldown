@@ -209,7 +209,7 @@ tasks:
   lint:ast-grep:
     desc: "lint with ast-grep rules"
     cmds:
-      - sg scan
+      - ast-grep scan
 
   lint:
     desc: "lint cargo workspace"

@@ -20,8 +20,8 @@ Everyday loop:
 | `task build` | `cargo build --all-targets` | debug build |
 | `task test` | `cargo nextest run --workspace --all-targets` | run tests (nextest) |
 | `task test:doc` | `cargo test --doc --workspace` | doctests (nextest does not run these) |
-| `task lint` | `cargo clippy --all-targets --no-deps` + `sg scan` | clippy + ast-grep rules |
-| `task fix` / `task lint:fix` | `cargo clippy --fix …` + `sg scan` | auto-apply clippy fixes |
+| `task lint` | `cargo clippy --all-targets --no-deps` + `ast-grep scan` | clippy + ast-grep rules |
+| `task fix` / `task lint:fix` | `cargo clippy --fix …` + `ast-grep scan` | auto-apply clippy fixes |
 | `task typos` | `typos` | spell-check |
 | `task audit` / `task unused` / `task outdated` | `cargo audit` / `udeps` / `outdated` | dependency hygiene |
 
@@ -41,7 +41,7 @@ is what surfaces that.
 | `task check:fc` | check every feature combination |
 | `task build:fc` | build every feature combination |
 | `task test:fc` | test every feature combination |
-| `task lint:fc` | clippy every feature combination, then `sg scan` |
+| `task lint:fc` | clippy every feature combination, then `ast-grep scan` |
 
 `task lint:fc` is the lint gate, and `task test:fc` the test gate — "done" means
 green there, not just on the non-`:fc` tasks. They run N builds so they are
