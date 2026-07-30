@@ -706,6 +706,7 @@ mod tests {
             major_number: major.parse().ok(),
             kind_from_current: Some(UpdateKind::Major),
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,

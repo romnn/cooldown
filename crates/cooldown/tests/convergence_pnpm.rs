@@ -18,9 +18,13 @@
 //! pnpm has no absolute publish-date cutoff — only a *rolling* `minimumReleaseAge` minute count. But
 //! the two coincide: excluding releases younger than `now - FREEZE` is exactly excluding releases
 //! published after `FREEZE`. So the fixture seeds (and cooldown resolves) with
-//! `minimumReleaseAge = now - FREEZE`, which replays the npm registry's immutable history as of the
-//! freeze instant. The minute count drifts by only seconds between the seed and the cooldown run
-//! (far below the day-scale window), so the matured set is stable. Assertions check INVARIANTS
+//! `minimumReleaseAge = now - FREEZE`, which replays the npm registry's publish history as of the
+//! freeze instant (append-mostly: only an unpublish of a fixture dep could change it). The minute
+//! count drifts by only seconds between the seed and the cooldown run (far below the day-scale
+//! window), so the matured set is stable. The registry's other live input — the mutable `latest`
+//! dist-tag, which a maintainer can move at any time — is decoupled by running every fixture
+//! [`tag_independent`](support::Fixture::tag_independent) (`--no-respect-dist-tags`); only the
+//! dedicated `convergence_pnpm_dist_tags` probe couples to it. Assertions check INVARIANTS
 //! (convergence, no-silent-change, cross-command agreement), never hard-coded versions.
 //!
 //! # The conflict
@@ -42,9 +46,10 @@ mod support;
 
 use support::{Fixture, changed_packages, pnpm_lock_pins};
 
-/// The absolute resolution cutoff. The npm registry's release history before this instant is
-/// immutable, so the matured-version set reproduces forever. At this instant the eslint v9 / typescript-eslint
-/// v8 line is matured and the seed v7/eslint-8 line is upgradable.
+/// The absolute resolution cutoff. The npm registry's publish history before this instant is
+/// append-mostly (only an unpublish of a fixture dep could change it), so the matured-version set
+/// is stable across runs. At this instant the eslint v9 / typescript-eslint v8 line is matured and
+/// the seed v7/eslint-8 line is upgradable.
 const FREEZE: &str = "2024-08-01T00:00:00Z";
 
 /// A later cutoff used only to seed a genuinely too-fresh starting lock for the `fix` test: deps
@@ -116,7 +121,7 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
 }
 
 fn conflict_fixture(seed_cutoff: &str) -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     seed_lock(&fixture, seed_cutoff);
@@ -379,7 +384,7 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
     // exemption while adding exact allowances for the versions it is repairing. TypeScript is
     // pinned to an older, still-in-range version so `outdated` has one independently adoptable
     // candidate to verify against the rejected starting lock.
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     add_root_dependency(&fixture, "nanoid", "^3.3.0");
@@ -535,7 +540,7 @@ fn min_age_days(cutoff: &str) -> i64 {
 /// not a CLI `--freeze`: a CLI flag is the highest-authority layer and would override the per-package
 /// rule, which is exactly the overshoot this test guards against.)
 fn perpkg_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", PERPKG_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     let config = format!(
@@ -658,7 +663,7 @@ const WORKSPACE_UNRELATED_MEMBER_PACKAGE_JSON: &str = r#"{
 "#;
 
 fn workspace_member_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", COMPLEX_MEMBER_WORKSPACE_YAML);
     fixture.write("'app [literal]/package.json", WORKSPACE_MEMBER_PACKAGE_JSON);
@@ -670,7 +675,7 @@ fn workspace_member_fixture() -> Fixture {
 }
 
 fn workspace_root_dependency_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_DEP_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(
@@ -832,7 +837,7 @@ const MULTI_VERSION_B_PACKAGE_JSON: &str = r#"{
 const MULTI_VERSION_SEED: &str = "2022-06-01T00:00:00Z";
 
 fn multi_version_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/a/package.json", MULTI_VERSION_A_PACKAGE_JSON);
@@ -898,7 +903,7 @@ fn upgrade_preserves_distinct_versions_across_members() {
 #[test]
 fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write(
         "package.json",
         "{\n  \"name\": \"cooldown-sync-fixture\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
@@ -926,4 +931,373 @@ fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
         yaml.contains("minimumReleaseAgeExclude:") && yaml.contains("@typescript/native-preview"),
         "the latest-exempt package is written to the native exemption list: {yaml}"
     );
+}
+
+/// The peer-hold fixture: `eslint` on an open v8 range while `@typescript-eslint/eslint-plugin`
+/// is exact-pinned to `6.21.0`, whose peer range `eslint: ^7.0.0 || ^8.0.0` excludes eslint 9.
+/// At `FREEZE` the eslint 9.x line has long matured, so a `--major` upgrade plans the cross-major
+/// move — exactly the trap: pnpm itself only *warns* on the peer mismatch
+/// (`strict-peer-dependencies=false`, the realistic default) and would land the break silently.
+/// The exact pin keeps the plugin in place (`held`), so its lock-recorded peer range stays the
+/// authoritative constraint the gate judges.
+const PEER_HELD_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-peer-held-fixture",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "eslint": "^8.40.0",
+        "@typescript-eslint/eslint-plugin": "6.21.0"
+      }
+    }
+"#};
+
+fn peer_held_fixture(seed_cutoff: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", PEER_HELD_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, seed_cutoff);
+    fixture
+}
+
+/// The lock's resolved eslint pin, for asserting the major line never moved.
+fn locked_eslint(fixture: &Fixture) -> String {
+    pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
+        .get("eslint")
+        .cloned()
+        .expect("eslint is pinned in the lock")
+}
+
+#[test]
+fn upgrade_holds_a_cross_major_move_a_dependents_peer_range_excludes() {
+    skip_if_missing!("pnpm");
+    let fixture = peer_held_fixture(FREEZE);
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "the seed must start on the eslint v8 line"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(
+        report.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
+            .stderr_str()
+    );
+
+    // The cross-major eslint move is held up front with the dependent named — never attempted, so
+    // the lock keeps eslint on v8 (without the gate pnpm lands eslint 9 with only a warning).
+    let reasons = report.skipped_reasons_for("eslint");
+    assert!(
+        reasons.contains("peer_held"),
+        "eslint must be peer-held, got {reasons:?}"
+    );
+    assert_eq!(
+        report.skipped_offending_for("eslint").as_deref(),
+        Some("@typescript-eslint/eslint-plugin"),
+        "the hold names the peer-declaring dependent"
+    );
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "eslint must stay on the v8 line, got {}",
+        locked_eslint(&fixture)
+    );
+
+    // Convergence: a second run reports the same hold and moves nothing further.
+    let lock_after_first = fixture.read_bytes("pnpm-lock.yaml");
+    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert_eq!(
+        second.summary_applied(),
+        0,
+        "second upgrade must be a no-op (fixed point)"
+    );
+    assert!(
+        second.skipped_reasons_for("eslint").contains("peer_held"),
+        "the hold is reported consistently across converged runs"
+    );
+    assert_eq!(
+        lock_after_first,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "lock must be byte-identical across the converged runs"
+    );
+}
+
+#[test]
+fn outdated_reports_the_peer_held_target_as_blocked_by_the_dependent() {
+    skip_if_missing!("pnpm");
+    let fixture = peer_held_fixture(FREEZE);
+
+    // `outdated`'s whole-graph verification must agree with `upgrade`: the matured cross-major
+    // eslint is not advertised `adoptable` — it is `blocked`, naming the peer-declaring dependent.
+    let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
+    assert!(outdated.ok(), "outdated should succeed");
+    let blocked = outdated.outdated_with_status("blocked");
+    assert!(
+        blocked.contains("eslint"),
+        "eslint must be blocked, got blocked={blocked:?}, adoptable={:?}",
+        outdated.outdated_with_status("adoptable")
+    );
+    assert_eq!(
+        outdated.item_field_str("eslint", "blockedBy").as_deref(),
+        Some("@typescript-eslint/eslint-plugin"),
+        "the blocked row names the dependent whose peer range excludes the target"
+    );
+}
+
+/// A *workspace-local* package's peer contract lives only in its own `package.json`: with
+/// `auto-install-peers=false` pnpm records the linked shim in the lock without any peer metadata
+/// (under `auto-install-peers=true` the peer materializes as a shim importer dependency and the
+/// specifier-split machinery already holds the move as `multi_version_held`), so the gate must
+/// read the member manifest. The linked shim peer-requires `eslint@^8.0.0`; the matured
+/// cross-major eslint 9 must be held with the shim blamed, and the lock must stay on the v8
+/// line.
+#[test]
+fn upgrade_holds_a_cross_major_move_a_workspace_dependents_peer_excludes() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::new().tag_independent();
+    // `autoInstallPeers: false` (a pnpm-workspace.yaml setting on pnpm ≥ 10; the `.npmrc` key is
+    // ignored there) is the regime that needs the manifest source: the shim's peer is NOT
+    // materialized as an importer dependency, so the lock carries no trace of the contract — the
+    // shim importer is literally `packages/shim: {}`.
+    fixture.write(
+        "pnpm-workspace.yaml",
+        indoc::indoc! {"
+            packages:
+              - packages/*
+            autoInstallPeers: false
+        "},
+    );
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-pnpm-workspace-peer-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {
+                "eslint": "^8.40.0",
+                "local-eslint-shim": "workspace:*"
+              }
+            }
+        "#},
+    );
+    fixture.write(
+        "packages/shim/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "local-eslint-shim",
+              "version": "0.1.0",
+              "peerDependencies": {
+                "eslint": "^8.0.0"
+              }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", "strict-peer-dependencies=false\n");
+    seed_lock(&fixture, FREEZE);
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "the seed must start on the eslint v8 line"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report.skipped_reasons_for("eslint").contains("peer_held"),
+        "the cross-major eslint move is held by the workspace shim's manifest peer range, got {:?}",
+        report.skipped_reasons_for("eslint")
+    );
+    assert_eq!(
+        report.skipped_offending_for("eslint").as_deref(),
+        Some("local-eslint-shim"),
+        "the hold blames the workspace-local dependent"
+    );
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "the lock must stay on the v8 line"
+    );
+}
+
+/// The *injected* encoding of the same contract: with `dependenciesMeta.*.injected` pnpm records
+/// the shim as a root-relative `file:` version instead of a `link:` — and its peer stays out of
+/// the importer records exactly as in the linked case. The member deliberately lives at
+/// `packages/shim(foo@bar)`, so pnpm emits `file:packages/shim(foo@bar)(eslint@x)` — a scalar in
+/// which the directory's own `(foo@bar)` group is indistinguishable from the appended peer
+/// context; the gate must recover the path against the importer set to find the manifest. The
+/// peer is marked *optional* to preserve the original bypass reproduction (an optional peer on a
+/// present package still binds). Same regime: `autoInstallPeers: false`, so nothing materializes
+/// the contract into the importers.
+#[test]
+fn upgrade_holds_a_cross_major_move_an_injected_workspace_dependents_peer_excludes() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "pnpm-workspace.yaml",
+        indoc::indoc! {"
+            packages:
+              - packages/*
+            autoInstallPeers: false
+        "},
+    );
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-pnpm-injected-peer-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {
+                "eslint": "^8.40.0",
+                "local-eslint-shim": "workspace:*"
+              },
+              "dependenciesMeta": {
+                "local-eslint-shim": { "injected": true }
+              }
+            }
+        "#},
+    );
+    fixture.write(
+        "packages/shim(foo@bar)/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "local-eslint-shim",
+              "version": "0.1.0",
+              "peerDependencies": {
+                "eslint": "^8.0.0"
+              },
+              "peerDependenciesMeta": {
+                "eslint": { "optional": true }
+              }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", "strict-peer-dependencies=false\n");
+    seed_lock(&fixture, FREEZE);
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "the seed must start on the eslint v8 line"
+    );
+    let lock = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("utf8 lock");
+    assert!(
+        lock.contains("file:packages/shim(foo@bar)"),
+        "the seed must record the shim via the injected `file:` encoding at the ambiguous path"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report.skipped_reasons_for("eslint").contains("peer_held"),
+        "the cross-major eslint move is held by the injected shim's manifest peer range, got {:?}",
+        report.skipped_reasons_for("eslint")
+    );
+    assert_eq!(
+        report.skipped_offending_for("eslint").as_deref(),
+        Some("local-eslint-shim"),
+        "the hold blames the injected workspace-local dependent"
+    );
+    assert!(
+        locked_eslint(&fixture).starts_with("8."),
+        "the lock must stay on the v8 line"
+    );
+}
+
+/// Seed cutoff for the ceiling-held lockstep pair: react 18.3.1 is the newest react/react-dom
+/// before this date, and react 19 (2024-12) is beyond it.
+const LOCKSTEP_SEED: &str = "2024-11-01T00:00:00Z";
+
+/// Freeze under which react-dom 19.x is long matured while `max-major` still holds react at 18.
+const LOCKSTEP_FREEZE: &str = "2026-06-30T00:00:00Z";
+
+/// One side of a lockstep peer pair held by a *ceiling* rather than the peer gate: react is capped
+/// by config `max-major = 18`, so only react-dom enters the joint resolve — and pnpm, which only
+/// warns on a peer mismatch, would commit `react-dom@19.x(react@18.3.1)` whose recorded peer range
+/// `^19.x` provably excludes the still-held react. The post-resolve verification must reject that
+/// candidate with structured blame and leave the graph untouched; no run may end with the exact
+/// break the gate exists to prevent.
+#[test]
+fn upgrade_rejects_a_joint_move_that_breaks_a_ceiling_held_targets_peer_contract() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-pnpm-lockstep-ceiling-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {
+                "react": "^18.3.1",
+                "react-dom": "^18.3.1"
+              }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", "strict-peer-dependencies=false\n");
+    fixture.write(
+        "cooldown.toml",
+        indoc::indoc! {"
+            [tool.pnpm.package.react]
+            max-major = 18
+        "},
+    );
+    seed_lock(&fixture, LOCKSTEP_SEED);
+    let pins = support::pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        pins.get("react").map(String::as_str),
+        Some("18.3.1"),
+        "the seed must start on the react 18 line"
+    );
+    assert_eq!(pins.get("react-dom").map(String::as_str), Some("18.3.1"));
+    let manifest_before = fixture.read_bytes("package.json");
+    let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", LOCKSTEP_FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report
+            .skipped_reasons_for("react")
+            .contains("max_major_held"),
+        "react is held by its configured ceiling, got {:?}",
+        report.skipped_reasons_for("react")
+    );
+    assert!(
+        report
+            .skipped_reasons_for("react-dom")
+            .contains("peer_held"),
+        "react-dom's joint landing must be rejected by the post-resolve verification, got {:?}",
+        report.skipped_reasons_for("react-dom")
+    );
+    assert_eq!(
+        report.skipped_offending_for("react-dom").as_deref(),
+        Some("react"),
+        "react-dom's hold blames the ceiling-held peer target"
+    );
+    assert_eq!(report.summary_applied(), 0, "nothing may land");
+    let pins = support::pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        pins.get("react-dom").map(String::as_str),
+        Some("18.3.1"),
+        "the broken pair (react-dom@19 beside react@18) must not persist"
+    );
+    assert_eq!(
+        manifest_before,
+        fixture.read_bytes("package.json"),
+        "the rejected candidate must not leak its widened manifest"
+    );
+    assert_eq!(
+        lock_before,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "the lock must be byte-identical after the fully-held run"
+    );
+
+    // Convergence: the held pair reports identically on a second run and moves nothing.
+    let second = fixture.cooldown_json(&["upgrade", "--major", "--freeze", LOCKSTEP_FREEZE]);
+    assert_eq!(second.summary_applied(), 0);
+    assert!(
+        second
+            .skipped_reasons_for("react-dom")
+            .contains("peer_held")
+    );
+    assert_eq!(lock_before, fixture.read_bytes("pnpm-lock.yaml"));
 }

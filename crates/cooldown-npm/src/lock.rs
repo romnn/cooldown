@@ -40,6 +40,54 @@ pub trait NodeLock: Send + Sync + 'static {
         MemberIndex::default()
     }
 
+    /// The peer requirements the lock records: each resolved package's `peerDependencies` entries
+    /// (optional peers included — see [`PeerRequirement`]), used to hold a cross-major target that
+    /// would break a dependent's peer contract. Default: empty (yarn classic and bun record no peer
+    /// metadata in their locks), which fails open — the peer-feasibility gate simply never fires
+    /// for those managers. The lock is NOT authoritative for *workspace-local* packages' peer
+    /// contracts (a symlinked package's peers live only in its own `package.json`, and an injected
+    /// package's importer attribution is skipped); the gate reads those from the member manifests
+    /// separately.
+    #[must_use]
+    fn peer_requirements(_content: &str) -> Vec<PeerRequirement> {
+        Vec::new()
+    }
+
+    /// Which workspace member importers consume each *local* package, keyed by the local package's
+    /// importer path (e.g. `packages/plugin` → `["."]`). Covers every encoding of a locally
+    /// consumed package — pnpm symlinks (`link:`) and injected copies (`file:` via
+    /// `dependenciesMeta.*.injected`) alike. A local package is present in its consumers'
+    /// contexts, so its manifest-declared peer ranges bind there even though the lock's importer
+    /// records carry no peer metadata for it. Default: empty (fails open for lock formats without
+    /// local-package records).
+    #[must_use]
+    fn local_package_consumers(_content: &str) -> HashMap<String, Vec<String>> {
+        HashMap::new()
+    }
+
+    /// Every workspace member directory the lock records, whatever it declares — pnpm's
+    /// `importers:` keys, npm's non-`node_modules` `packages` keys (the root as `.`). A member
+    /// that declares no dependencies appears nowhere in [`member_sources`](NodeLock::member_sources)
+    /// yet still owns a `package.json` whose `peerDependencies` bind, so peer evidence enumerates
+    /// members from here rather than from what they declare. Default: empty (yarn classic and bun
+    /// record no member data).
+    #[must_use]
+    fn member_paths(_content: &str) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// The physical install layout the lock records, when this manager materializes a hoisted
+    /// `node_modules` tree the lock describes path-by-path (npm's package-lock v2/v3). Hoisting is
+    /// why the layout matters for peers: packages declared by *disjoint* workspace members still
+    /// meet at the root `node_modules`, so declaration paths cannot bound what a dependent
+    /// resolves. Default: `None` — a layout isolated by declaration (pnpm importers) or a lock
+    /// format that records no layout (yarn classic, bun); peer visibility then falls back to the
+    /// declaring-member overlap rule.
+    #[must_use]
+    fn install_paths(_content: &str) -> Option<InstallPaths> {
+        None
+    }
+
     /// The driver args that refresh the lock after cooldown has rewritten the declaring
     /// `package.json` range itself.
     ///
@@ -155,12 +203,10 @@ pub trait NodeLock: Send + Sync + 'static {
     /// path (so the lock lands on exactly the cooldown-approved target instead of re-resolving the
     /// widened range to its newest member).
     ///
-    /// Unlike [`lockonly_update_args`](NodeLock::lockonly_update_args) this *does* save the
-    /// `^version` range to the **root** manifest as a side effect — npm's `install <name>@<version>`
-    /// has no manifest-free exact pin (its `--no-save` is a no-op for the lock). The caller must
-    /// therefore only use it when the root manifest already declares the dependency (the entry the
-    /// rewrite just widened); for a member-only dependency it would add a spurious root dependency.
-    /// `None` (the default) means the manager has no exact-pin install, so the caller re-resolves.
+    /// Unlike [`lockonly_update_args`](NodeLock::lockonly_update_args), this may save a range as a
+    /// side effect. It is only safe inside a preserving transaction that restores cooldown's
+    /// authorized manifest bytes. `None` (the default) means the manager has no exact-pin install,
+    /// so the caller re-resolves.
     #[must_use]
     fn pinned_relock_args(
         _name: &str,
@@ -170,10 +216,58 @@ pub trait NodeLock: Send + Sync + 'static {
         None
     }
 
+    /// How this manager lands the EXACT planned version while preserving the manifest bytes
+    /// authorized by cooldown (see [`PreservingPin`]). `None` for a manager with no such
+    /// capability, which leaves the caller re-resolving.
+    ///
+    /// `workspaces` scopes managers whose root-level pin cannot safely reach a member-owned
+    /// declaration; managers with intrinsically manifest-free pins may ignore it.
+    #[must_use]
+    fn preserving_pin(
+        _name: &str,
+        _version: &str,
+        _before: Option<&str>,
+        _workspaces: &[String],
+    ) -> Option<PreservingPin> {
+        None
+    }
+
     /// The driver args that install/verify the resolved graph (the opt-in `--build` step).
     ///
     /// `before` has the same meaning as in [`NodeLock::relock_args`].
     fn build_args(_before: Option<&str>) -> Vec<String>;
+}
+
+/// How a manager lands one exact planned version while preserving cooldown's manifest edits.
+///
+/// The manifest state may be unchanged or contain a range widening authorized by the rewrite mode.
+/// A package manager must not broaden or relocate those edits while landing the lock target.
+///
+/// A plain relock cannot serve as the exact operation:
+///
+/// - it never moves a lock that still satisfies its range, so nothing happens;
+/// - a "move within the declared range" update (`npm update <name>`) is not target-directed. It
+///   lands the range *maximum*, so a plan that deliberately stays below it — a patch move under a
+///   `>=5 <7` range with `--major` off, or under a `max-major` ceiling — overshoots and is
+///   rejected by the exact-target check, and it cannot move *downward* at all, so a `fix` rollback
+///   silently does nothing.
+///
+/// So the operation is modeled by what the manager can actually do, not by one argv.
+pub enum PreservingPin {
+    /// One command pins the exact version and writes no manifest (pnpm's `update --no-save`).
+    Direct(Vec<String>),
+    /// The manager's only exact pin also *saves* the range (npm's `install <name>@<version>`, which
+    /// writes into whichever field already declares the package), so it runs bracketed: pin, restore
+    /// cooldown's authorized manifest bytes, then run a plain relock. The final step makes the
+    /// restore consistent: the pin also rewrote the lock's own copy of the manifest metadata, and
+    /// synchronization recopies the restored ranges while keeping the pinned version, which
+    /// satisfies them.
+    PinRestoreResync {
+        /// The exact pin, which may edit manifests.
+        pin: Vec<String>,
+        /// The manifest-preserving lock synchronization that follows the restore.
+        resync: Vec<String>,
+    },
 }
 
 /// Maps a resolved dependency to the workspace member packages that declare it.
@@ -312,6 +406,26 @@ impl MemberIndex {
             })
     }
 
+    /// Whether `name`@`version` is attributed per exact resolved version (a pnpm importer
+    /// declaration), as opposed to npm's name-only attribution, which cannot single out one
+    /// resolved copy of a name. The peer-feasibility gate needs the distinction: name-only
+    /// attribution of a name resolved at several versions may be pointing at a nested transitive
+    /// copy, which must not gate.
+    #[must_use]
+    pub fn version_attributed(&self, name: &str, version: &str) -> bool {
+        self.by_version
+            .contains_key(&(name.to_string(), version.to_string()))
+    }
+
+    /// Whether ANY member declares `name`, at whatever version — the veto-eligibility test for a
+    /// violated peer package: a purely transitive peer (an auto-installed
+    /// `@typescript-eslint/parser`) is the resolver's to place and re-place, so it may never veto
+    /// a move, no matter how it is physically bound.
+    #[must_use]
+    pub fn declares(&self, name: &str) -> bool {
+        self.by_name.contains_key(name) || self.by_version.keys().any(|(entry, _)| entry == name)
+    }
+
     /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
     /// lock carries no per-member attribution for this dependency.
     #[must_use]
@@ -328,6 +442,280 @@ impl MemberIndex {
         members.dedup();
         members
     }
+}
+
+/// One resolved package's declared peer requirement on another package, read from the lock.
+///
+/// `dependent`/`dependent_version` identify the resolved package declaring the peer; `package` is
+/// the peer's target and `range` its verbatim declared range. Optional peers
+/// (`peerDependenciesMeta.<name>.optional`) are reported like any other: optionality only tolerates
+/// the peer's *absence* (npm skips auto-installing it), not a present copy outside the declared
+/// range — and the gate only ever queries the requirement for a package that is present, since the
+/// queried peer is the package being upgraded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRequirement {
+    /// The resolved package declaring the peer requirement (e.g. `fumadocs-mdx`).
+    pub dependent: String,
+    /// The dependent's resolved version, whose metadata declared the range.
+    pub dependent_version: String,
+    /// The package the peer requirement targets (e.g. `fumadocs-core`).
+    pub package: String,
+    /// The verbatim declared peer range (e.g. `^16.0.0`).
+    pub range: String,
+}
+
+/// Parses the `packages:` section of `pnpm-lock.yaml` (v9) into every resolved package's peer
+/// requirements. Package entries carry `peerDependencies:` (name → range); the same line-based walk
+/// as [`parse_pnpm`], since the section's shape is fixed and shallow. A `(peer@x)` disambiguation
+/// suffix on the entry key is stripped, so one package resolved under several peer contexts reports
+/// its requirement once per resolved copy — duplicates are harmless to the gate. Optional peers are
+/// reported too (see [`PeerRequirement`]); the walk still tracks the `peerDependenciesMeta:` field
+/// only so its children are never misread as `peerDependencies:` entries.
+fn parse_pnpm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
+    /// Which nested field of the current package entry the walk is inside.
+    #[derive(PartialEq)]
+    enum Field {
+        None,
+        Peers,
+        Meta,
+    }
+
+    let mut out = Vec::new();
+    let mut in_packages = false;
+    let mut entry: Option<(String, String)> = None;
+    let mut field = Field::None;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue; // blank lines punctuate the file but never end a section
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => {
+                in_packages = trimmed == "packages:";
+                entry = None;
+                field = Field::None;
+            }
+            2 if in_packages => {
+                let key = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
+                // Balanced trailing-group strip, not a truncate at the first `(`: an injected
+                // key's `file:` path may itself contain parenthesized directory segments.
+                let key = strip_pnpm_peer_suffixes(key);
+                entry = split_name_version(key);
+                field = Field::None;
+            }
+            4 if in_packages && entry.is_some() => {
+                field = match trimmed.trim_end_matches(':') {
+                    "peerDependencies" => Field::Peers,
+                    "peerDependenciesMeta" => Field::Meta,
+                    _ => Field::None,
+                };
+            }
+            6 if in_packages && field == Field::Peers => {
+                if let (Some((dependent, version)), Some((name, range))) =
+                    (entry.as_ref(), trimmed.split_once(':'))
+                {
+                    let range = unquote_yaml_scalar(range);
+                    if !range.is_empty() {
+                        out.push(PeerRequirement {
+                            dependent: dependent.clone(),
+                            dependent_version: version.clone(),
+                            package: unquote_yaml_scalar(name).to_string(),
+                            range: range.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parses `package-lock.json` (lockfileVersion 2/3) into every resolved package's peer
+/// requirements, from the flat `packages` map's `peerDependencies` records — optional peers
+/// included (see [`PeerRequirement`]). A workspace member entry (a key not under `node_modules/`)
+/// is identified by its `name` field — npm copies the member's manifest, peers included, into the
+/// lock — never by its path-shaped key. The v1 `dependencies` tree records no peer metadata, so an
+/// old lock yields nothing (fail open).
+fn parse_npm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(packages) = doc.get("packages").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, val) in packages {
+        // The root project is keyed by the empty string; its own peers are reported via the
+        // workspace-manifest source instead (the gate reads member manifests directly).
+        if key.is_empty() {
+            continue;
+        }
+        // An installed package's name is its path tail; a workspace member entry carries a
+        // path-shaped key, so its real name comes from the copied manifest's `name` field.
+        let name = if key.contains("node_modules/") {
+            key.rsplit("node_modules/").next().filter(|s| !s.is_empty())
+        } else {
+            val.get("name").and_then(|v| v.as_str())
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let Some(version) = val.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(peers) = val.get("peerDependencies").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (peer, range) in peers {
+            if let Some(range) = range.as_str() {
+                out.push(PeerRequirement {
+                    dependent: name.to_string(),
+                    dependent_version: version.to_string(),
+                    package: peer.clone(),
+                    range: range.to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The physical install layout of a hoisted lock: every resolved instance keyed by the directory
+/// it is installed at (`node_modules/react`, `apps/a/node_modules/react`, and a workspace
+/// member's own directory such as `apps/a`) — the tree npm resolves `require` and peers against.
+/// Peer visibility is a question about this layout, not about declaring members: hoisting lets
+/// disjoint members' packages meet at the root, and a nested conflict copy shadows the hoisted
+/// one, so neither declaration paths nor a graph-wide version can answer "which copy does this
+/// dependent actually see".
+pub struct InstallPaths {
+    /// Install directory → the version installed there.
+    versions: HashMap<String, String>,
+    /// Package name → every `(version, directory)` instance of it.
+    instances: HashMap<String, Vec<(String, String)>>,
+}
+
+impl InstallPaths {
+    /// The instance a workspace member's own directory resolves `name` to: its version and its
+    /// install directory (the context that instance's peers then resolve from). This is what makes
+    /// a member's *direct* copy identifiable even when other versions of the name exist nested
+    /// elsewhere — declaration attribution is name-only in npm's lock, but the physical lookup is
+    /// exact.
+    #[must_use]
+    pub fn member_resolution(&self, member: &str, name: &str) -> Option<(&str, &str)> {
+        // The root project's member path is `.`; its install-tree directory is the empty key.
+        let dir = if member == "." { "" } else { member };
+        self.resolve_from(dir, name)
+    }
+
+    /// The instance `name` resolves to from `dir` — the nearest enclosing `node_modules/<name>`,
+    /// walking from the directory itself up to the workspace root — as `(version, directory)`.
+    /// Intermediate ancestors that are not package directories probe keys no lock ever records
+    /// (`…/node_modules/node_modules/x`), which is harmless.
+    #[must_use]
+    pub fn resolve_from(&self, dir: &str, name: &str) -> Option<(&str, &str)> {
+        let mut ancestor = dir;
+        loop {
+            let candidate = if ancestor.is_empty() {
+                format!("node_modules/{name}")
+            } else {
+                format!("{ancestor}/node_modules/{name}")
+            };
+            if let Some((instance, version)) = self.versions.get_key_value(&candidate) {
+                return Some((version, instance));
+            }
+            if ancestor.is_empty() {
+                return None;
+            }
+            ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
+
+    /// The install directories holding `name` at exactly `version` — every physical copy a
+    /// context-less move of that version could rewrite.
+    #[must_use]
+    pub fn instance_dirs(&self, name: &str, version: &str) -> Vec<&str> {
+        self.instances
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(instance_version, _)| instance_version == version)
+            .map(|(_, dir)| dir.as_str())
+            .collect()
+    }
+}
+
+/// The workspace member directories `package-lock.json` (v2/v3) records: every `packages` key that
+/// is not an install path, with the root's empty key normalized to `.`. A crafted or stale key that
+/// could address a manifest outside the workspace is rejected at this parse boundary.
+fn parse_npm_member_paths(content: &str) -> HashSet<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
+        return HashSet::new();
+    };
+    let Some(packages) = doc.get("packages").and_then(serde_json::Value::as_object) else {
+        return HashSet::new();
+    };
+    packages
+        .keys()
+        .filter(|key| !key.contains("node_modules/"))
+        .map(|key| if key.is_empty() { "." } else { key.as_str() })
+        .filter(|path| is_workspace_relative(path))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Reads the physical layout from `package-lock.json` (v2/v3): every `packages` entry keyed by
+/// its install directory. A workspace member's own entry (`apps/a`) counts as an instance of its
+/// manifest `name`; a symlink entry (`"link": true`) is an instance of its *target's* name and
+/// version at the link's directory — the hoisted `node_modules/<member>` alias consumers actually
+/// resolve. A v1 lock has no `packages` map and yields `None` (the caller falls back to
+/// declaring-member overlap).
+fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
+    let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let packages = doc.get("packages")?.as_object()?;
+    let mut versions: HashMap<String, String> = HashMap::new();
+    let mut instances: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (key, entry) in packages {
+        // The root project itself is keyed by the empty string; it is not an installed instance.
+        if key.is_empty() {
+            continue;
+        }
+        // A link entry records only its target path; the instance's name and version live there.
+        let entry = if entry.get("link").and_then(serde_json::Value::as_bool) == Some(true) {
+            let Some(target) = entry
+                .get("resolved")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|target| packages.get(target))
+            else {
+                continue;
+            };
+            target
+        } else {
+            entry
+        };
+        // An installed package's name is its path tail; a workspace member entry carries a
+        // path-shaped key, so its real name comes from the copied manifest's `name` field.
+        let name = if let Some((_, tail)) = key.rsplit_once("node_modules/") {
+            (!tail.is_empty()).then_some(tail)
+        } else {
+            entry.get("name").and_then(serde_json::Value::as_str)
+        };
+        let version = entry.get("version").and_then(serde_json::Value::as_str);
+        let (Some(name), Some(version)) = (name, version) else {
+            continue;
+        };
+        versions.insert(key.clone(), version.to_string());
+        instances
+            .entry(name.to_string())
+            .or_default()
+            .push((version.to_string(), key.clone()));
+    }
+    Some(InstallPaths {
+        versions,
+        instances,
+    })
 }
 
 /// Splits a `name@version` (or scoped `@scope/name@version`) specifier into its parts. The version
@@ -393,6 +781,18 @@ impl NodeLock for Npm {
             .unwrap_or_default()
     }
 
+    fn peer_requirements(content: &str) -> Vec<PeerRequirement> {
+        parse_npm_peer_requirements(content)
+    }
+
+    fn member_paths(content: &str) -> HashSet<String> {
+        parse_npm_member_paths(content)
+    }
+
+    fn install_paths(content: &str) -> Option<InstallPaths> {
+        parse_npm_install_paths(content)
+    }
+
     fn relock_args(before: Option<&str>) -> Vec<String> {
         // `--package-lock-only` re-resolves the lock without touching node_modules, keeping apply
         // fast and side-effect-light.
@@ -410,7 +810,7 @@ impl NodeLock for Npm {
 
     fn pinned_relock_args(name: &str, version: &str, before: Option<&str>) -> Option<Vec<String>> {
         // `npm install <name>@<version>` pins the lock to exactly that version (and saves the range
-        // to the root `package.json` — the caller gates this on the root declaring the dependency).
+        // to the selected install scope, which the preserving transaction restores afterward).
         let mut args = vec![
             "install".into(),
             format!("{name}@{version}"),
@@ -422,6 +822,24 @@ impl NodeLock for Npm {
             args.push(format!("--before={before}"));
         }
         Some(args)
+    }
+
+    fn preserving_pin(
+        name: &str,
+        version: &str,
+        before: Option<&str>,
+        workspaces: &[String],
+    ) -> Option<PreservingPin> {
+        // npm has no exact pin that skips the save (`--no-save` makes the install a no-op whenever
+        // the tree already satisfies the manifest), so cooldown restores its authorized manifest
+        // bytes after the pin. A plain relock then recopies those ranges into package-lock metadata
+        // while retaining the exact, compatible resolution. See [`PreservingPin::PinRestoreResync`].
+        let mut pin = Self::pinned_relock_args(name, version, before)?;
+        for workspace in workspaces {
+            pin.push(format!("--workspace={workspace}"));
+        }
+        let resync = Self::relock_args(before);
+        Some(PreservingPin::PinRestoreResync { pin, resync })
     }
 
     fn build_args(before: Option<&str>) -> Vec<String> {
@@ -447,6 +865,18 @@ impl NodeLock for Pnpm {
         MemberIndex::version_exact(parse_pnpm_importer_members(content))
             .with_exact_versions(parse_pnpm_exact_pins(content))
             .with_declared_specifiers(parse_pnpm_importer_specifiers(content))
+    }
+
+    fn peer_requirements(content: &str) -> Vec<PeerRequirement> {
+        parse_pnpm_peer_requirements(content)
+    }
+
+    fn member_paths(content: &str) -> HashSet<String> {
+        pnpm_importer_paths(content)
+    }
+
+    fn local_package_consumers(content: &str) -> HashMap<String, Vec<String>> {
+        parse_pnpm_local_package_consumers(content)
     }
 
     fn relock_args(_before: Option<&str>) -> Vec<String> {
@@ -544,6 +974,18 @@ impl NodeLock for Pnpm {
         pnpm_lock_consistency_error(content)
     }
 
+    fn preserving_pin(
+        name: &str,
+        version: &str,
+        _before: Option<&str>,
+        _workspaces: &[String],
+    ) -> Option<PreservingPin> {
+        // pnpm's exact pin already skips the manifest (`--no-save`), so one command suffices.
+        Some(PreservingPin::Direct(Self::lockonly_update_args(
+            name, version,
+        )?))
+    }
+
     fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {
         // `pnpm update <name>@<version>` re-pins the lock to exactly that version; `--no-save` keeps
         // the `package.json` range as the author wrote it, and `--lockfile-only` skips node_modules.
@@ -605,10 +1047,18 @@ fn parse_npm(content: &str) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     if let Some(packages) = doc.get("packages").and_then(|v| v.as_object()) {
         for (key, val) in packages {
-            // The root project is keyed by the empty string; skip it.
-            let Some(name) = key.rsplit("node_modules/").next().filter(|s| !s.is_empty()) else {
+            // Only install-path keys name registry-resolved packages. The root project is keyed
+            // by the empty string, and a workspace member's own entry by its directory path
+            // (`apps/a`) — both are local packages, not resolved dependencies; treating a member
+            // path as a package name would send `apps/a` to the registry as a lookup. (A member's
+            // hoisted `node_modules/<name>` alias is a link entry without a `version`, so it is
+            // skipped by the version filter below.)
+            let Some((_, name)) = key.rsplit_once("node_modules/") else {
                 continue;
             };
+            if name.is_empty() {
+                continue;
+            }
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
                 out.push((name.to_string(), version.to_string()));
             }
@@ -638,8 +1088,10 @@ fn parse_pnpm(content: &str) -> Vec<(String, String)> {
                 continue; // outside the section, or a nested field of a package entry
             }
             let key = unquote_yaml_scalar(stripped.trim_end().trim_end_matches(':'));
-            // Drop the `(peer@x)` suffix pnpm appends to disambiguate peer resolutions.
-            let key = key.split('(').next().unwrap_or(key);
+            // Drop the `(peer@x)` suffixes pnpm appends to disambiguate peer resolutions — as a
+            // balanced trailing-group strip, since an injected key's `file:` path may itself
+            // contain parenthesized directory segments.
+            let key = strip_pnpm_peer_suffixes(key);
             if let Some((name, version)) = split_name_version(key) {
                 out.push((name, version));
             }
@@ -694,7 +1146,10 @@ fn walk_pnpm_importer_entries(
             2 if in_importers => {
                 flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
                 let path = decode_pnpm_importer_path(trimmed.trim_end_matches(':'));
-                member = (!path.is_empty()).then_some(path);
+                // A crafted or stale importer key could name a path outside the workspace, and
+                // every consumer of these paths joins them onto the project root — reject
+                // non-workspace-relative keys once, here at the parse boundary.
+                member = is_workspace_relative(&path).then_some(path);
                 in_group = false;
                 dep_name = None;
                 specifier = None;
@@ -737,6 +1192,315 @@ fn flush_pnpm_entry(
     if let (Some(member), Some(name)) = (member, dep_name) {
         visit(member, name, specifier, version);
     }
+}
+
+/// Maps each *local* package (by its importer path) to the importers that consume it, read from
+/// `pnpm-lock.yaml`'s `importers:` section — the entries [`parse_pnpm_importer_members`]
+/// deliberately skips. Both pnpm encodings of a locally consumed package are covered: a symlinked
+/// `link:` version, whose target is recorded relative to the consuming importer
+/// (`link:../../packages/plugin` from `apps/app`), and an injected `file:` version
+/// (`dependenciesMeta.*.injected`), whose target is recorded workspace-root-relative with trailing
+/// peer-context groups and is recovered against the lock's own importer set (see
+/// [`resolve_injected_target`]). Either form normalizes to a workspace-root-relative importer path
+/// before keying; a target that escapes the workspace root is dropped rather than aliased onto a
+/// workspace path (see [`normalize_local_target`]).
+fn parse_pnpm_local_package_consumers(content: &str) -> HashMap<String, Vec<String>> {
+    let importers = pnpm_importer_paths(content);
+    let directories = pnpm_injected_directories(content);
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    walk_pnpm_importer_entries(content, |member, name, _specifier, version| {
+        let target = match version {
+            Some(value) => {
+                if let Some(target) = value.strip_prefix("link:") {
+                    normalize_local_target(member, target)
+                } else if let Some(target) = value.strip_prefix("file:") {
+                    resolve_injected_target(name, target, &importers, &directories)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        if let Some(target) = target {
+            map.entry(target).or_default().push(member.to_string());
+        }
+    });
+    for consumers in map.values_mut() {
+        consumers.sort();
+        consumers.dedup();
+    }
+    map
+}
+
+/// Every importer path in the lock's `importers:` section — including members that declare no
+/// dependencies (`packages/shim: {}`), which [`walk_pnpm_importer_entries`] never visits. This is
+/// the canonical set of workspace member directories, used as the ground truth when recovering a
+/// local package path from an injected `file:` version whose peer-suffix boundary is ambiguous.
+fn pnpm_importer_paths(content: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut in_importers = false;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => in_importers = trimmed == "importers:",
+            2 if in_importers => {
+                let raw_key = if let Some(stripped) = trimmed.strip_suffix(':') {
+                    stripped
+                } else if let Some((key, _)) = trimmed.split_once(": ") {
+                    // An importer with no dependencies is a flow-style `path: {}` line.
+                    key
+                } else {
+                    continue;
+                };
+                let path = decode_pnpm_importer_path(raw_key);
+                if is_workspace_relative(&path) {
+                    out.insert(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Recovers the workspace member path from an injected `file:` version. The scalar alone is
+/// ambiguous: pnpm appends `(peer@x)`/`(key=hash)` groups to the root-relative path, but a
+/// directory name may itself end in a parenthesized group containing the same marks —
+/// `file:packages/shim(foo@bar)(eslint@8.57.1)` is real pnpm 11 output for a member named
+/// `shim(foo@bar)`, and no suffix heuristic can split it correctly. Two authority sources
+/// disambiguate, in order: the lock's own `resolution: {directory: …, type: directory}` entry for
+/// THIS dependency (keyed `<name>@file:<reference>` — an unrelated package's directory carries no
+/// authority over this scalar's reading), then the importer set (locks predating the resolution
+/// shape). In both, the scalar resolves only when exactly ONE reading matches — an ambiguous
+/// scalar (both `packages/shim` and `packages/shim(eslint@8.57.1)` known) fails open rather than
+/// resolving by preference, which could read the wrong manifest and fabricate a hold.
+fn resolve_injected_target(
+    name: &str,
+    raw: &str,
+    importers: &HashSet<String>,
+    directories: &InjectedDirectories,
+) -> Option<String> {
+    directories
+        .resolve(name, raw)
+        .or_else(|| unique_match(&injected_interpretations(raw), importers))
+}
+
+/// Every reading of the scalar as reference-plus-peeled-trailing-groups, verbatim, least-peeled
+/// first. The verbatim scalar is a reading too: a parenthesized final directory segment peels
+/// like a suffix group, so only the full set of readings — never one preferred split — is sound.
+fn peeled_readings(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut candidate = raw;
+    loop {
+        out.push(candidate);
+        if !candidate.ends_with(')') {
+            break;
+        }
+        let Some(open) = trailing_group_start(candidate) else {
+            break;
+        };
+        let Some(prefix) = candidate.get(..open) else {
+            break;
+        };
+        candidate = prefix;
+    }
+    out
+}
+
+/// [`peeled_readings`] as normalized workspace-relative paths (unnormalizable readings dropped) —
+/// the form the importer set is keyed by.
+fn injected_interpretations(raw: &str) -> Vec<String> {
+    peeled_readings(raw)
+        .into_iter()
+        .filter_map(|candidate| normalize_local_target(".", candidate))
+        .collect()
+}
+
+/// The single interpretation the authority set names — `None` when none or several match, so an
+/// ambiguous scalar never resolves by preference.
+fn unique_match(interpretations: &[String], authority: &HashSet<String>) -> Option<String> {
+    let mut matches = interpretations
+        .iter()
+        .filter(|interpretation| authority.contains(*interpretation));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// The lock's `packages:` entries that resolve as injected workspace copies, each associated with
+/// the dependency identity that owns it: the entry key `<name>@file:<reference>` carries the
+/// dependency name and the suffix-free spelling of its `file:` reference, and its
+/// `resolution: {directory: …, type: directory}` line is the authoritative injected path — but
+/// only for that dependency. Treating every directory as interchangeable authority would let an
+/// unrelated package's entry decide another scalar's reading (and pick the wrong manifest
+/// whenever that scalar's own entry went unparsed).
+struct InjectedDirectories(HashMap<String, Vec<(String, String)>>);
+
+impl InjectedDirectories {
+    /// The directory this dependency's own resolution entry records for the scalar `raw`, trying
+    /// every peeled reading as the reference (the entry key stores the reference without pnpm's
+    /// appended peer/patch groups, while a parenthesized directory name keeps its groups — so the
+    /// verbatim reading is tried too). Distinct directories for several readings would be
+    /// contradictory authority: fail open.
+    fn resolve(&self, name: &str, raw: &str) -> Option<String> {
+        let entries = self.0.get(name)?;
+        let mut found: Option<&str> = None;
+        for reading in peeled_readings(raw) {
+            for (reference, directory) in entries {
+                if reference != reading {
+                    continue;
+                }
+                if found.is_some_and(|previous| previous != directory) {
+                    return None;
+                }
+                found = Some(directory);
+            }
+        }
+        found.map(str::to_string)
+    }
+}
+
+/// Scans the `packages:` section for injected entries (`resolution: {…, type: directory}`) and
+/// associates each recorded directory with the `<name>@file:<reference>` identity of its own
+/// entry key (see [`InjectedDirectories`]). A key without the `@file:` marker, or a directory
+/// that is not workspace-relative, contributes nothing.
+fn pnpm_injected_directories(content: &str) -> InjectedDirectories {
+    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut in_packages = false;
+    let mut current: Option<(String, String)> = None;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        match indent {
+            0 => {
+                in_packages = trimmed == "packages:";
+                current = None;
+            }
+            2 if in_packages => {
+                current = trimmed
+                    .strip_suffix(':')
+                    .map(unquote_yaml_scalar)
+                    // The first `@file:` is the name/reference boundary: a scope's `@` sits at the
+                    // very start of the name, and a name can never contain `:`.
+                    .and_then(|key| key.split_once("@file:"))
+                    .filter(|(name, _)| !name.is_empty())
+                    .map(|(name, reference)| (name.to_string(), reference.to_string()));
+            }
+            _ if in_packages && indent >= 4 => {
+                if let Some((name, reference)) = &current
+                    && let Some(rest) = trimmed.strip_prefix("resolution:")
+                    && rest.contains("type: directory")
+                    && let Some(after) = rest.split("directory:").nth(1)
+                {
+                    let value =
+                        unquote_yaml_scalar(after.split([',', '}']).next().unwrap_or("").trim());
+                    if is_workspace_relative(value) {
+                        map.entry(name.clone())
+                            .or_default()
+                            .push((reference.clone(), value.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    InjectedDirectories(map)
+}
+
+/// Resolves a local-package target into a workspace-root-relative importer path (`apps/app` +
+/// `../../packages/plugin` → `packages/plugin`; the workspace root importer is `.`). Returns
+/// `None` for a target the workspace cannot contain — an absolute path, a drive/URL form, or `..`
+/// traversal past the workspace root (root importer + `link:../shared/plugin`): silently clamping
+/// such a target would alias an *outside* package onto an unrelated inside path whose manifest
+/// could then produce a false hold, violating the gate's hold-only-on-proof rule.
+fn normalize_local_target(importer: &str, target: &str) -> Option<String> {
+    // Lock IDs use portable `/` separators exclusively, so a workspace-relative path never starts
+    // at the filesystem root, contains `:` (a Windows drive or nested protocol form), or contains
+    // `\` — on Windows, `..\outside` or `\\server\share` would read as one opaque segment here
+    // yet escape the workspace when joined onto the root.
+    if target.starts_with('/') || target.contains(':') || target.contains('\\') {
+        return None;
+    }
+    let mut segments: Vec<&str> = if importer == "." {
+        Vec::new()
+    } else {
+        importer.split('/').collect()
+    };
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(if segments.is_empty() {
+        ".".to_string()
+    } else {
+        segments.join("/")
+    })
+}
+
+/// Whether `path` is already a canonical workspace-root-relative importer path (`.` or `a/b` — no
+/// absolute/drive/protocol form, no `.`/`..` segments, no trailing slash). Lock-sourced member
+/// paths get joined onto the project root and read from disk, so any other form must be rejected
+/// at the parse boundary before it can address a manifest outside the workspace.
+pub(crate) fn is_workspace_relative(path: &str) -> bool {
+    normalize_local_target(".", path).as_deref() == Some(path)
+}
+
+/// Strips the trailing parenthesized disambiguation groups pnpm appends to a **package key**
+/// (`name@version(eslint@8.57.1)(patch_hash=…)`), leaving the `name@version` part. Only trailing
+/// balanced groups carrying a `@` or `=` are removed — a registry version never contains
+/// parentheses, so for registry keys this is exact. For an injected `file:` key the embedded
+/// directory path may itself end in such a group, making the boundary ambiguous from the scalar
+/// alone; key consumers only need the *name* (the version tail stays best-effort and is never
+/// used as a filesystem path). Local *path* recovery must not use this heuristic — that is
+/// [`resolve_injected_target`], which disambiguates against the lock's importer set.
+fn strip_pnpm_peer_suffixes(value: &str) -> &str {
+    let mut out = value;
+    while out.ends_with(')') {
+        let Some(open) = trailing_group_start(out) else {
+            break;
+        };
+        let Some((path, group)) = out.get(..open).zip(out.get(open..)) else {
+            break;
+        };
+        if group.contains('@') || group.contains('=') {
+            out = path;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// The byte index of the `(` opening the balanced group that closes at the end of `value`, or
+/// `None` when the parentheses are unbalanced. Only meaningful when `value` ends with `)`.
+fn trailing_group_start(value: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, byte) in value.bytes().enumerate().rev() {
+        match byte {
+            b')' => depth += 1,
+            b'(' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Maps each resolved `(name, version)` dependency to the workspace member importers that declare it,
@@ -866,6 +1630,11 @@ fn parse_npm_member_sources(content: &str) -> Option<HashMap<String, Vec<String>
             continue;
         }
         let member = if key.is_empty() { "." } else { key.as_str() };
+        // Member keys are workspace paths that consumers join onto the project root; reject a
+        // crafted or stale key that could address a manifest outside the workspace.
+        if !is_workspace_relative(member) {
+            continue;
+        }
         for field in DIRECT_GROUPS {
             if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
                 for name in obj.keys() {
@@ -1541,5 +2310,518 @@ packages:
         let pins = parse_pnpm_exact_pins(lock);
 
         assert!(pins.contains(&("@scope/pkg".to_string(), "2.11.0".to_string())));
+    }
+
+    /// pnpm's `packages:` section records each resolved package's peer ranges. Scoped (quoted)
+    /// keys, quoted ranges, and `(peer@x)` disambiguation suffixes all parse; a peer marked
+    /// `optional: true` in `peerDependenciesMeta` is reported like any other — optionality only
+    /// tolerates the peer's absence, not a present copy outside the range.
+    #[test]
+    fn pnpm_peer_requirements_include_optional_peers() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.0
+
+            packages:
+
+              '@typescript-eslint/eslint-plugin@6.21.0':
+                resolution: {integrity: sha512-aaa}
+                engines: {node: ^16.0.0 || >=18.0.0}
+                peerDependencies:
+                  '@typescript-eslint/parser': ^6.0.0 || ^6.0.0-alpha
+                  eslint: ^7.0.0 || ^8.0.0
+                peerDependenciesMeta:
+                  typescript:
+                    optional: true
+
+              fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+                resolution: {integrity: sha512-bbb}
+                peerDependencies:
+                  fumadocs-core: ^16.0.0
+                  typescript: '>=5'
+                peerDependenciesMeta:
+                  typescript:
+                    optional: true
+        "};
+
+        let reqs = parse_pnpm_peer_requirements(lock);
+        assert!(reqs.contains(&PeerRequirement {
+            dependent: "@typescript-eslint/eslint-plugin".into(),
+            dependent_version: "6.21.0".into(),
+            package: "eslint".into(),
+            range: "^7.0.0 || ^8.0.0".into(),
+        }));
+        // The peer-suffixed key strips down to its base name@version.
+        assert!(reqs.contains(&PeerRequirement {
+            dependent: "fumadocs-mdx".into(),
+            dependent_version: "15.1.1".into(),
+            package: "fumadocs-core".into(),
+            range: "^16.0.0".into(),
+        }));
+        // Optional peers are reported too: a present copy outside the range still violates.
+        assert!(reqs.contains(&PeerRequirement {
+            dependent: "fumadocs-mdx".into(),
+            dependent_version: "15.1.1".into(),
+            package: "typescript".into(),
+            range: ">=5".into(),
+        }));
+    }
+
+    /// The `link:`/`file:` entries the importer-member parse skips are exactly the local-package
+    /// consumer edges: each local package (keyed by its normalized workspace-root-relative path)
+    /// maps to the importers that consume it, whether pnpm records the consumption as a symlink
+    /// (`link:`, consumer-relative) or an injected copy (`file:`, root-relative with a `(peer@x)`
+    /// context suffix, recovered against the importer set).
+    #[test]
+    fn pnpm_local_package_consumers_cover_linked_and_injected_entries() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(eslint@8.57.1)'
+
+              apps/site:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'link:../../packages/shim'
+
+              apps/docs:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: link:packages/shim
+
+              packages/shim: {}
+        "};
+
+        let consumers = parse_pnpm_local_package_consumers(lock);
+        assert_eq!(
+            consumers.get("packages/shim"),
+            Some(&vec![".".to_string(), "apps/site".to_string()]),
+            "the injected root consumer and the symlinked consumer resolve to the same target"
+        );
+        assert_eq!(
+            consumers.get("apps/docs/packages/shim"),
+            Some(&vec!["apps/docs".to_string()]),
+            "a link target without `..` stays relative to its consuming importer"
+        );
+    }
+
+    /// An injected path may itself contain parenthesized directory segments — even ones carrying
+    /// `@`/`=`, indistinguishable from pnpm's suffix grammar in the scalar alone
+    /// (`file:packages/shim(foo@bar)(eslint@8.57.1)` is real pnpm 11 output for a member named
+    /// `shim(foo@bar)`). The importer set disambiguates: the scalar resolves only when exactly
+    /// one of its peeled readings names a known importer (see [`resolve_injected_target`]).
+    #[test]
+    fn pnpm_local_package_consumers_keep_parenthesized_path_segments() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  ambiguous-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(foo@bar)(eslint@8.57.1)'
+                  nested-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(foo)/pkg(eslint@8.57.1)'
+                  patched-widget:
+                    specifier: workspace:*
+                    version: 'file:packages/widget(a@1)(patch_hash=abc)'
+                  plain-parens:
+                    specifier: workspace:*
+                    version: 'file:packages/plain(dir)'
+                  stranger:
+                    specifier: workspace:*
+                    version: 'file:vendor/outsider(eslint@8.57.1)'
+
+              'packages/shim(foo@bar)': {}
+
+              packages/shim(foo)/pkg: {}
+
+              packages/widget: {}
+
+              packages/plain(dir): {}
+        "};
+
+        let consumers = parse_pnpm_local_package_consumers(lock);
+        assert_eq!(
+            consumers.get("packages/shim(foo@bar)"),
+            Some(&vec![".".to_string()]),
+            "a directory group carrying `@` survives because the importer set names it"
+        );
+        assert_eq!(
+            consumers.get("packages/shim(foo)/pkg"),
+            Some(&vec![".".to_string()]),
+            "a trailing peer group is peeled without touching parenthesized path segments"
+        );
+        assert_eq!(
+            consumers.get("packages/widget"),
+            Some(&vec![".".to_string()]),
+            "stacked peer and patch groups are all peeled down to the importer"
+        );
+        assert_eq!(
+            consumers.get("packages/plain(dir)"),
+            Some(&vec![".".to_string()]),
+            "a parenthesized final directory matches its importer exactly"
+        );
+        assert!(
+            !consumers.keys().any(|key| key.starts_with("vendor/")),
+            "a target matching no importer is dropped, not guessed at"
+        );
+    }
+
+    /// An ambiguous scalar — every interpretation names a *known* path — never resolves by
+    /// preference: with both `packages/shim` and `packages/shim(eslint@8.57.1)` as importers, the
+    /// scalar could be either package, and guessing could read the wrong manifest. It fails open
+    /// unless the lock's authoritative `resolution: {directory: …}` entries single one out.
+    #[test]
+    fn pnpm_injected_targets_fail_open_on_ambiguity_unless_a_resolution_directory_decides() {
+        let ambiguous = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(eslint@8.57.1)'
+
+              packages/shim: {}
+
+              'packages/shim(eslint@8.57.1)': {}
+        "};
+        assert!(
+            parse_pnpm_local_package_consumers(ambiguous).is_empty(),
+            "two plausible importer interpretations must fail open, not resolve by preference"
+        );
+
+        let decided = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(eslint@8.57.1)'
+
+              packages/shim: {}
+
+              'packages/shim(eslint@8.57.1)': {}
+
+            packages:
+
+              local-eslint-shim@file:packages/shim:
+                resolution: {directory: packages/shim, type: directory}
+                peerDependencies:
+                  eslint: ^8.0.0
+        "};
+        assert_eq!(
+            parse_pnpm_local_package_consumers(decided).get("packages/shim"),
+            Some(&vec![".".to_string()]),
+            "the authoritative resolution directory singles out the injected path"
+        );
+
+        // The resolution entry is authoritative only for its OWN dependency: an unrelated
+        // package's directory must not decide this scalar's reading — with the shim's own entry
+        // unparsed, the ambiguity stands and the edge is dropped, not resolved by proxy.
+        let unrelated_authority = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(eslint@8.57.1)'
+                  other-tool:
+                    specifier: workspace:*
+                    version: 'file:packages/shim'
+
+              packages/shim: {}
+
+              'packages/shim(eslint@8.57.1)': {}
+
+            packages:
+
+              other-tool@file:packages/shim:
+                resolution: {directory: packages/shim, type: directory}
+        "};
+        let consumers = parse_pnpm_local_package_consumers(unrelated_authority);
+        assert_eq!(
+            consumers.get("packages/shim"),
+            Some(&vec![".".to_string()]),
+            "the unambiguous scalar still resolves through its own entry"
+        );
+        assert_eq!(
+            consumers.get("packages/shim").map(Vec::len),
+            Some(1),
+            "the ambiguous shim scalar must not ride on other-tool's directory"
+        );
+        assert!(
+            !consumers.contains_key("packages/shim(eslint@8.57.1)"),
+            "no reading of the ambiguous scalar may resolve"
+        );
+    }
+
+    /// A workspace member's own entry is a local package, not a registry-resolved dependency: its
+    /// path-shaped key must not parse as a package *name* (`apps/a` would go to the registry as a
+    /// lookup), and its hoisted alias is a versionless link entry that contributes nothing
+    /// either.
+    #[test]
+    fn npm_member_entries_are_not_resolved_packages() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root", "version": "0.1.0" },
+                "apps/a": { "name": "app-a", "version": "0.1.0" },
+                "node_modules/app-a": { "resolved": "apps/a", "link": true },
+                "node_modules/react": { "version": "18.3.1" }
+            }
+        }"#};
+        assert_eq!(
+            crate::lock::Npm::parse(lock).expect("a v3 lock parses"),
+            vec![("react".to_string(), "18.3.1".to_string())]
+        );
+    }
+
+    /// npm resolves peers against the physical tree, so the layout — not the declaring member —
+    /// answers what a dependent sees: a hoisted root copy is visible from every member, a nested
+    /// conflict copy shadows it, and a workspace member (or its hoisted symlink) is an instance
+    /// of its manifest name.
+    #[test]
+    fn npm_install_paths_resolve_by_nearest_ancestor() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "version": "0.1.0", "dependencies": { "plugin": "^1.0.0" } },
+                "packages/lib": { "name": "lib", "version": "2.0.0" },
+                "node_modules/lib": { "resolved": "packages/lib", "link": true },
+                "node_modules/plugin": { "version": "1.0.0" },
+                "node_modules/host": { "version": "2.0.0" },
+                "node_modules/shadowed": { "version": "1.0.0" },
+                "node_modules/shadowed/node_modules/host": { "version": "1.0.0" }
+            }
+        }"#};
+        let paths = crate::lock::Npm::install_paths(lock).expect("v3 lock records the layout");
+
+        assert_eq!(
+            paths.resolve_from("node_modules/plugin", "host"),
+            Some(("2.0.0", "node_modules/host")),
+            "a hoisted instance resolves the hoisted peer"
+        );
+        assert_eq!(
+            paths.resolve_from("node_modules/shadowed", "host"),
+            Some(("1.0.0", "node_modules/shadowed/node_modules/host")),
+            "a nested copy shadows the hoisted one"
+        );
+        assert_eq!(
+            paths.member_resolution("apps/a", "plugin"),
+            Some(("1.0.0", "node_modules/plugin")),
+            "a workspace member resolves hoisted packages from its own directory"
+        );
+        assert_eq!(
+            paths.resolve_from("node_modules/lib", "host"),
+            Some(("2.0.0", "node_modules/host")),
+            "a link entry resolves peers from its own hoisted directory"
+        );
+        assert_eq!(
+            paths.instance_dirs("lib", "2.0.0").len(),
+            2,
+            "a workspace member is an instance at its directory AND at its hoisted link"
+        );
+        assert_eq!(
+            paths.resolve_from("node_modules/plugin", "absent"),
+            None,
+            "an uninstalled peer binds nowhere"
+        );
+
+        assert!(
+            crate::lock::Npm::install_paths(r#"{"lockfileVersion": 1}"#).is_none(),
+            "a v1 lock records no layout — the caller falls back to member overlap"
+        );
+    }
+
+    /// A local-package target the workspace cannot contain is dropped, never clamped onto an
+    /// inside path: root + `link:../shared/plugin` really points *outside* the workspace, and
+    /// aliasing it to `shared/plugin` could read an unrelated manifest and fabricate a hold.
+    #[test]
+    fn pnpm_local_package_consumers_reject_targets_escaping_the_workspace() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  external-plugin:
+                    specifier: link:../shared/plugin
+                    version: 'link:../shared/plugin'
+                  absolute-plugin:
+                    specifier: file:/opt/plugin
+                    version: 'file:/opt/plugin'
+
+              apps/site:
+                dependencies:
+                  deep-escape:
+                    specifier: workspace:*
+                    version: 'link:../../../elsewhere/plugin'
+        "};
+
+        assert!(
+            parse_pnpm_local_package_consumers(lock).is_empty(),
+            "escaping and absolute targets must not produce consumer edges"
+        );
+    }
+
+    /// Importer keys and member keys are joined onto the project root by their consumers, so the
+    /// parse boundary admits only canonical workspace-relative paths — a crafted or stale
+    /// `/tmp/app` or `../outside` key must never survive into attribution or a filesystem read.
+    #[test]
+    fn lock_member_paths_reject_non_workspace_relative_keys() {
+        for valid in [".", "packages/shim", "apps/site(x)"] {
+            assert!(is_workspace_relative(valid), "{valid} must be accepted");
+        }
+        for invalid in [
+            "",
+            "/tmp/app",
+            "../outside",
+            "a/../../b",
+            "C:/app",
+            "a/./b",
+            "a/",
+            r"..\outside",
+            r"\outside",
+            r"\\server\share",
+            r"a\b",
+        ] {
+            assert!(
+                !is_workspace_relative(invalid),
+                "{invalid} must be rejected"
+            );
+        }
+
+        let pnpm = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              /tmp/app:
+                dependencies:
+                  eslint:
+                    specifier: ^8.0.0
+                    version: 8.57.1
+
+              ../outside:
+                dependencies:
+                  eslint:
+                    specifier: ^8.0.0
+                    version: 8.57.1
+        "};
+        assert!(
+            Pnpm::member_sources(pnpm).all_paths().is_empty(),
+            "escaping pnpm importer keys must not attribute members"
+        );
+
+        let npm = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root", "dependencies": { "eslint": "^8.0.0" } },
+                "../outside": { "name": "evil", "dependencies": { "eslint": "^8.0.0" } }
+            }
+        }"#};
+        assert_eq!(
+            Npm::member_sources(npm).all_paths(),
+            HashSet::from([".".to_string()]),
+            "an escaping npm member key must be dropped while the root is kept"
+        );
+    }
+
+    /// A workspace member entry in package-lock (a key not under `node_modules/`) is identified by
+    /// its copied manifest's `name` field, never by its path-shaped key — otherwise its peer
+    /// requirement could not be attributed to the real dependent.
+    #[test]
+    fn npm_peer_requirements_use_the_member_manifest_name() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root-app" },
+                "packages/shim": {
+                    "name": "local-eslint-shim",
+                    "version": "0.1.0",
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                }
+            }
+        }"#};
+
+        let reqs = parse_npm_peer_requirements(lock);
+        assert_eq!(
+            reqs,
+            vec![PeerRequirement {
+                dependent: "local-eslint-shim".into(),
+                dependent_version: "0.1.0".into(),
+                package: "eslint".into(),
+                range: "^8.0.0".into(),
+            }]
+        );
+    }
+
+    /// package-lock.json (v2/v3) records peers per `packages` entry; the root project's own peers
+    /// (the empty key) are not a dependent's, while `peerDependenciesMeta` optionals are kept.
+    #[test]
+    fn npm_peer_requirements_parse_and_skip_root() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "peerDependencies": { "react": "^19.0.0" }
+                },
+                "node_modules/fumadocs-mdx": {
+                    "version": "15.1.1",
+                    "peerDependencies": { "fumadocs-core": "^16.0.0", "typescript": ">=5" },
+                    "peerDependenciesMeta": { "typescript": { "optional": true } }
+                }
+            }
+        }"#};
+
+        let reqs = parse_npm_peer_requirements(lock);
+        assert_eq!(
+            reqs,
+            vec![
+                PeerRequirement {
+                    dependent: "fumadocs-mdx".into(),
+                    dependent_version: "15.1.1".into(),
+                    package: "fumadocs-core".into(),
+                    range: "^16.0.0".into(),
+                },
+                PeerRequirement {
+                    dependent: "fumadocs-mdx".into(),
+                    dependent_version: "15.1.1".into(),
+                    package: "typescript".into(),
+                    range: ">=5".into(),
+                },
+            ]
+        );
     }
 }

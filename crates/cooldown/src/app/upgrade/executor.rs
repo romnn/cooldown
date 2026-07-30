@@ -766,7 +766,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         planned
     }
 
-    /// Records the matured target hidden by a declared or configured ceiling.
+    /// Records the matured target hidden by a package-owned ceiling: a declared manifest upper
+    /// bound, a configured `max-major`, or the registry's `latest` dist-tag.
     ///
     /// A default major-off run probes with majors enabled so it reports the ceiling that would
     /// still block `--major`, rather than giving the false advice to re-run with `--major`.
@@ -792,6 +793,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let reason = match hold.reason {
             CeilingReason::DeclaredBound => SkipReason::DeclaredBoundHeld,
             CeilingReason::MaxMajor => SkipReason::MaxMajorHeld,
+            CeilingReason::DistTag => SkipReason::DistTagHeld,
         };
         let change = Change {
             package: target_package_for(releases, dep, &hold.target),
@@ -1352,20 +1354,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 SkipReason::NeedsMajor
                     | SkipReason::DeclaredBoundHeld
                     | SkipReason::MaxMajorHeld
+                    | SkipReason::DistTagHeld
                     | SkipReason::MultiVersionHeld
             ) {
                 outcome.strict_incomplete = true;
             }
             let change = skipped.change;
+            // An adapter-supplied detail (e.g. the dependent's verbatim peer range) beats the
+            // generic per-reason message — it carries facts only the adapter knows.
+            let message = skipped.detail.unwrap_or_else(|| {
+                conflict_skip_message(skipped.reason, offending.as_deref(), &change.package.name)
+            });
             outcome.items.push(self.change_skip_item(
                 &change,
                 Some(SkippedInfo {
                     reason: skipped.reason,
-                    message: conflict_skip_message(
-                        skipped.reason,
-                        offending.as_deref(),
-                        &change.package.name,
-                    ),
+                    message,
                     offending,
                 }),
             ));
@@ -1911,6 +1915,7 @@ fn resolver_conflict(change: &Change) -> Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
+        detail: None,
     }
 }
 
@@ -2081,6 +2086,11 @@ fn conflict_skip_message(reason: SkipReason, offending: Option<&str>, changed: &
         (SkipReason::ResolverConflict, Some(offending)) if offending != changed => {
             format!("held: conflicts with {offending}")
         }
+        // A peer hold always names its dependent; the adapter normally supplies the verbatim range
+        // as the skip detail, so this is only the fallback wording.
+        (SkipReason::PeerHeld, Some(offending)) => {
+            format!("held: {offending} declares an incompatible peer range")
+        }
         // Name the stuck transitive: without it the report says only that *some* dependency is too
         // fresh, leaving no lead on what to baseline or wait out.
         (SkipReason::TransitiveInCooldown, Some(offending)) => {
@@ -2241,6 +2251,7 @@ mod tests {
                 .and_then(|major| major.parse().ok()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,

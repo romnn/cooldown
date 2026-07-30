@@ -43,6 +43,10 @@ impl ResolvedInvocation {
         self.run.concurrency
     }
 
+    pub(super) fn respect_dist_tags(&self) -> bool {
+        !self.run.ignore_dist_tags
+    }
+
     pub(super) fn respect_gitignore(&self) -> bool {
         self.respect_gitignore
     }
@@ -112,6 +116,7 @@ pub(super) fn resolve_invocation(
             exclude_packages_by_tool: BTreeMap::default(),
             compiled_excludes: None,
             allow_major: merged.major.unwrap_or(default_major),
+            ignore_dist_tags: !merged.respect_dist_tags.unwrap_or(true),
             // A display filter, read straight from the CLI (not config-file backed).
             hide_pinned: overrides.hide_pinned.unwrap_or(false),
             // Read straight from the CLI (not config-file backed).
@@ -175,6 +180,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         package: Vec::new(),
         gitignore: Some(true),
         major: Some(default_major),
+        respect_dist_tags: Some(true),
         all: Some(false),
         all_artifacts: Some(false),
         allow_stale_lock: Some(false),
@@ -205,6 +211,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         package: global.package.clone(),
         gitignore: overrides.gitignore,
         major: overrides.major,
+        respect_dist_tags: overrides.respect_dist_tags,
         all: overrides.all,
         all_artifacts: overrides.all_artifacts,
         allow_stale_lock: overrides.allow_stale_lock,

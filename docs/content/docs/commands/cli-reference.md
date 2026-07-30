@@ -18,7 +18,7 @@ Global flags may appear before or after the subcommand: `cooldown --dry-run upgr
 | `--min-age-minor <DUR>` | Per-kind window for minor jumps. |
 | `--min-age-patch <DUR>` | Per-kind window for patch jumps. |
 | `--latest` | Opt out — window `0` (alias `--no-min-age`). The explicit, audited escape hatch. |
-| `--freeze <DATE>` | An absolute cutoff instead of a rolling window (reproducible). |
+| `--freeze <DATE>` | An absolute cutoff instead of a rolling window — publication-time eligibility is fixed; live registry state (unpublish/yank, npm dist-tags) still applies. |
 | `--allow <GLOB>` | Exempt matching packages from the cooldown (repeatable, audited). |
 
 `--min-age`, `--latest`, and `--freeze` are mutually exclusive. Every escape hatch shows up in [`explain`]({{< relref "other.md" >}}).
@@ -29,6 +29,8 @@ Global flags may appear before or after the subcommand: `cooldown --dry-run upgr
 |---|---|
 | `--major` | Allow cross-major changes. On by default for `outdated`, off for the mutating commands. |
 | `--no-major` | Stay within the current major (alias `--minor`). |
+| `--respect-dist-tags` | Cap npm-family candidates at the registry's `latest` dist-tag (the default). |
+| `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `-p, --package <GLOB>` | Scope the command to matching packages (repeatable). |
 | `--tool <TOOL>` | Restrict to tool(s) — `cargo`, `go`, `uv`, … (comma-separated / repeatable; default: all detected). |
 | `--cargo` | Only the Rust/Cargo tool — shorthand for `--tool cargo`. |

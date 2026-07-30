@@ -84,22 +84,18 @@ pub fn json_schema() -> Value {
         "items": { "$ref": "#/$defs/memberRef" }
     });
 
+    // The closed reason set comes from `SkipReason::ALL` — the enum's own enumeration — so a new
+    // variant lands in the published schema the moment it exists, instead of drifting behind a
+    // hand-maintained string list.
+    let skip_reasons: Vec<Value> = cooldown_core::SkipReason::ALL
+        .iter()
+        .map(|reason| Value::String(reason.wire_value().to_string()))
+        .collect();
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
         "properties": {
-            "reason": {
-                "enum": [
-                    "graph_held",
-                    "transitive_in_cooldown",
-                    "resolver_conflict",
-                    "not_eligible",
-                    "needs_major",
-                    "declared_bound_held",
-                    "max_major_held",
-                    "multi_version_held"
-                ]
-            },
+            "reason": { "enum": skip_reasons },
             "message": { "type": "string" },
             "offending": { "type": "string" }
         },
@@ -500,6 +496,7 @@ mod tests {
             SkipReason::NeedsMajor,
             SkipReason::DeclaredBoundHeld,
             SkipReason::MaxMajorHeld,
+            SkipReason::DistTagHeld,
         ] {
             let mut item = upgrade_item();
             item.skipped = Some(SkippedInfo {
@@ -511,28 +508,26 @@ mod tests {
         }
     }
 
+    /// Walks `SkipReason::ALL` — the enum's own enumeration, not a copy — so a variant absent
+    /// from the published schema's `reason` enum fails here, whatever variant it is.
     #[test]
     fn skipped_reason_schema_accepts_every_serialized_variant() {
         let schema = json_schema();
         let allowed = schema["$defs"]["skippedInfo"]["properties"]["reason"]["enum"]
             .as_array()
             .expect("skip reason enum");
-        for reason in [
-            SkipReason::GraphHeld,
-            SkipReason::TransitiveInCooldown,
-            SkipReason::ResolverConflict,
-            SkipReason::NotEligible,
-            SkipReason::NeedsMajor,
-            SkipReason::DeclaredBoundHeld,
-            SkipReason::MaxMajorHeld,
-            SkipReason::MultiVersionHeld,
-        ] {
+        for reason in SkipReason::ALL {
             let serialized = serde_json::to_value(reason).expect("reason serializes");
             assert!(
                 allowed.contains(&serialized),
                 "schema is missing {serialized}"
             );
         }
+        assert_eq!(
+            allowed.len(),
+            SkipReason::ALL.len(),
+            "the schema enum must not carry stale extra values either"
+        );
     }
 
     fn assert_definition_keys_match(schema: &Value) {

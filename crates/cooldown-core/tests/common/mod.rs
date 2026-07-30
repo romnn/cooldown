@@ -43,10 +43,17 @@ pub fn rel(
         major_number: major.parse().ok(),
         kind_from_current: kind,
         beyond_declared_bound: false,
+        beyond_latest_tag: false,
         published_at: pub_at.map(ts),
         yanked: false,
         quality,
     }
+}
+
+/// Mark a release as ordered above the registry's `latest` dist-tag.
+pub fn above_tag(mut r: Release) -> Release {
+    r.beyond_latest_tag = true;
+    r
 }
 
 pub fn yanked(mut r: Release) -> Release {
@@ -74,6 +81,8 @@ pub fn ctx() -> CtxHolder {
     CtxHolder {
         project: camino::Utf8PathBuf::from("."),
         allow_major: false,
+        honor_declared_bounds: true,
+        honor_latest_tag: true,
     }
 }
 
@@ -81,6 +90,8 @@ pub fn ctx() -> CtxHolder {
 pub struct CtxHolder {
     pub project: camino::Utf8PathBuf,
     pub allow_major: bool,
+    pub honor_declared_bounds: bool,
+    pub honor_latest_tag: bool,
 }
 
 impl CtxHolder {
@@ -88,12 +99,21 @@ impl CtxHolder {
         self.allow_major = true;
         self
     }
+    pub fn rewrite_bounds(mut self) -> Self {
+        self.honor_declared_bounds = false;
+        self
+    }
+    pub fn ignore_dist_tags(mut self) -> Self {
+        self.honor_latest_tag = false;
+        self
+    }
     pub fn get(&self) -> ResolveContext<'_> {
         ResolveContext {
             tool: GO,
             project: &self.project,
             allow_major: self.allow_major,
-            honor_declared_bounds: true,
+            honor_declared_bounds: self.honor_declared_bounds,
+            honor_latest_tag: self.honor_latest_tag,
         }
     }
 }

@@ -36,10 +36,16 @@ pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
         })
 }
 
+/// `revalidate_npm_listings` is set for version-adopting commands that honor the dist-tag ceiling:
+/// the npm-family `latest` dist-tag is mutable, so the ceiling must be judged against the
+/// registry's current state, not a listing-TTL-stale cached copy (a maintainer's downward retag
+/// within the hour must hold, not authorize, the adoption). A run that ignores the tag reads it
+/// never, and pays nothing for its freshness.
 pub(super) fn adapter_set(
     offline: bool,
     fresh: bool,
     concurrency: usize,
+    revalidate_npm_listings: bool,
 ) -> Result<AdapterSet, CoreError> {
     let http = SharedHttp::new(
         discovery::cache_dir().into_std_path_buf(),
@@ -59,10 +65,20 @@ pub(super) fn adapter_set(
     adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())));
     adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())));
     adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(NpmCliTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PnpmTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(YarnTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(BunTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(
+        NpmCliTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
+    ));
+    adapters.register_target_verified_mutator(Arc::new(
+        PnpmTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
+    ));
+    adapters.register_target_verified_mutator(Arc::new(
+        YarnTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
+    ));
+    adapters.register_target_verified_mutator(Arc::new(
+        BunTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
+    ));
+    // Deno applies no dist-tag ceiling (`has_dist_tags` is false on that adapter), so it has
+    // nothing to keep fresh — it stays on the cached listing path.
     adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())));
     adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())));
     adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())));

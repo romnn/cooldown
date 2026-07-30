@@ -12,11 +12,14 @@
 //!    --no-save`) re-pins EVERY importer's lock to `<target>` regardless of its declared range, so a
 //!    cross-major target chosen for one member (`vite@7.3.5` for the `^7` importer) was forced onto a
 //!    sibling that declares `^6`, leaving its lock at `7.3.5` against an untouched `^6` manifest — a
-//!    lock/manifest inconsistency the next plain `install` then snapped back, breaking the fixed point.
+//!    lock/manifest inconsistency the next plain `install` then snapped back, breaking the fixed
+//!    point.
 //!
-//! Both are exercised with the REAL pnpm resolver against the npm registry's immutable history, frozen
-//! at an absolute cutoff (see `convergence_pnpm.rs` for the determinism argument). Assertions check
-//! INVARIANTS (held classification, in-range, byte-stable re-run), never the absolute registry-newest.
+//! Both are exercised with the REAL pnpm resolver against the npm registry's publish history,
+//! frozen at an absolute cutoff and decoupled from the mutable `latest` dist-tag via
+//! `tag_independent` fixtures (see `convergence_pnpm.rs` for the determinism argument).
+//! Assertions check INVARIANTS (held classification, in-range, byte-stable re-run), never the
+//! absolute registry-newest.
 
 #![allow(
     clippy::unwrap_used,
@@ -108,7 +111,7 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
 }
 
 fn multiline_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/v6/package.json", MEMBER_V6_PACKAGE_JSON);
@@ -261,7 +264,7 @@ const MEMBER_CARET7_PACKAGE_JSON: &str = r#"{
 const TILDE_MAX: &str = "7.3.8";
 
 fn tilde_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/tilde/package.json", MEMBER_TILDE_PACKAGE_JSON);

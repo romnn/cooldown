@@ -520,3 +520,329 @@ fn incompatible_is_adoptable() {
         Some(Version::new("v3.0.0+incompatible"))
     );
 }
+
+/// The fumadocs-core shape: a matured stable major (17.0.0) exists **above** the registry's
+/// `latest` dist-tag (16.13.0) — a premature major the maintainer kept releasing below. It must not
+/// become the adoptable target; the still-cooling in-tag minors drive the verdict instead, while
+/// `latest` keeps surfacing the newest existing version as context.
+#[test]
+fn major_above_latest_tag_is_not_adoptable() {
+    let d = dep("fumadocs-core", "16.11.4", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "16.11.4",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        // The premature major: long matured, but above the current `latest` tag.
+        above_tag(rel(
+            "17.0.0",
+            &[4],
+            "17",
+            Some(UpdateKind::Major),
+            Some("2026-02-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        )),
+        rel(
+            "16.11.5",
+            &[2],
+            "16",
+            Some(UpdateKind::Patch),
+            Some("2026-06-14T00:00:00Z"), // 3d old — still cooling
+            ReleaseQuality::Stable,
+        ),
+        rel(
+            "16.13.0", // the `latest`-tagged version
+            &[3],
+            "16",
+            Some(UpdateKind::Minor),
+            Some("2026-06-16T00:00:00Z"), // 1d old — still cooling
+            ReleaseQuality::Stable,
+        ),
+    ];
+    let mut sorted = releases;
+    sorted.sort_by(|a, b| a.order.cmp(&b.order));
+    let layers = layers_from(vec![]);
+    let h = ctx().major();
+
+    let verdict = evaluate(&d, &sorted, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::InCooldown);
+    assert_eq!(verdict.adoptable_target, None, "17.0.0 sits above the tag");
+    // The newest existing version stays visible as context, exactly like the other ceilings.
+    assert_eq!(verdict.latest, Some(Version::new("17.0.0")));
+    assert!(
+        verdict
+            .candidates
+            .iter()
+            .all(|candidate| candidate.version != Version::new("17.0.0")),
+        "the major above the tag must not be a candidate"
+    );
+}
+
+/// With nothing newer inside the tag, the major above it yields `Held` naming the dist-tag ceiling,
+/// mirroring `DeclaredBound`/`MaxMajor` — visible and explained, not silently up to date.
+#[test]
+fn only_above_tag_newer_is_held_with_dist_tag_reason() {
+    let d = dep("fumadocs-core", "16.13.0", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "16.13.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        above_tag(rel(
+            "17.0.0",
+            &[2],
+            "17",
+            Some(UpdateKind::Major),
+            Some("2026-02-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        )),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx().major();
+
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Held);
+    assert_eq!(verdict.adoptable_target, None);
+    assert_eq!(verdict.latest, Some(Version::new("17.0.0")));
+    assert_eq!(
+        verdict.held_reason,
+        Some(HeldReason::DistTag("16.13.0".to_string())),
+        "the hold names the tag version the registry recommends"
+    );
+}
+
+/// A current pin already above the tag (a project deliberately riding a `next` line) deactivates
+/// the ceiling ENTIRELY — not merely raising it to the pin's own line — so the project keeps
+/// seeing newer releases instead of a downgrade-or-silence dead end: once the project has
+/// knowingly passed the tag, the tag carries no guidance about where to stop.
+#[test]
+fn current_beyond_the_tag_deactivates_the_ceiling() {
+    let d = dep("ex", "17.0.0", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "16.13.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        above_tag(rel(
+            "17.0.0",
+            &[2],
+            "17",
+            None,
+            Some("2026-02-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        )),
+        above_tag(rel(
+            "17.1.0",
+            &[3],
+            "17",
+            Some(UpdateKind::Minor),
+            Some("2026-05-01T00:00:00Z"), // matured
+            ReleaseQuality::Stable,
+        )),
+        above_tag(rel(
+            "18.0.0",
+            &[4],
+            "18",
+            Some(UpdateKind::Major),
+            Some("2026-04-01T00:00:00Z"), // matured
+            ReleaseQuality::Stable,
+        )),
+    ];
+    let layers = layers_from(vec![]);
+
+    // Within the line: the newer minor is adoptable, no downgrade pressure toward the tag.
+    let h = ctx();
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Adoptable);
+    assert_eq!(verdict.adoptable_target, Some(Version::new("17.1.0")));
+
+    // Beyond the line under `--major`: the deactivated ceiling does not resurface as a cap at the
+    // pin's own major — even 18.0.0, well above the tag's current position, stays adoptable.
+    let h = ctx().major();
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Adoptable);
+    assert_eq!(verdict.adoptable_target, Some(Version::new("18.0.0")));
+}
+
+/// `respect-dist-tags = false` (`--no-respect-dist-tags`) is the deliberate escape hatch: the
+/// major above the tag becomes an ordinary candidate again.
+#[test]
+fn ignore_dist_tags_escape_hatch_admits_the_major_above_the_tag() {
+    let d = dep("fumadocs-core", "16.13.0", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "16.13.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        above_tag(rel(
+            "17.0.0",
+            &[2],
+            "17",
+            Some(UpdateKind::Major),
+            Some("2026-02-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        )),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx().major().ignore_dist_tags();
+
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Adoptable);
+    assert_eq!(verdict.adoptable_target, Some(Version::new("17.0.0")));
+}
+
+/// `evaluate_ceiling_hold` names the matured target the dist-tag hides, so `upgrade` can report the
+/// hold (`DistTagHeld`) exactly like a declared bound or `max-major`.
+#[test]
+fn ceiling_hold_names_the_dist_tag_hidden_target() {
+    let d = dep("fumadocs-core", "16.13.0", ReleaseQuality::Stable);
+    let releases = vec![
+        rel(
+            "16.13.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        above_tag(rel(
+            "17.0.0",
+            &[2],
+            "17",
+            Some(UpdateKind::Major),
+            Some("2026-02-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        )),
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx().major();
+
+    let hold = evaluate_ceiling_hold(&d, &releases, &layers, &h.get(), now())
+        .expect("the matured major above the tag is a hidden target");
+    assert_eq!(hold.reason, CeilingReason::DistTag);
+    assert_eq!(hold.target, Version::new("17.0.0"));
+    assert_eq!(hold.update_kind, UpdateKind::Major);
+}
+
+/// When a declared manifest bound and the dist-tag both hide the same target — so no single
+/// ceiling's removal exposes anything on its own — the declared bound, the author's own directly
+/// editable constraint, names the hold as the first step of the staged guidance.
+#[test]
+fn declared_bound_outranks_the_dist_tag_as_held_reason() {
+    let d = Dependency {
+        declared_bound: Some("<17".to_string()),
+        ..dep("fumadocs-core", "16.13.0", ReleaseQuality::Stable)
+    };
+    let mut beyond = above_tag(rel(
+        "17.0.0",
+        &[2],
+        "17",
+        Some(UpdateKind::Major),
+        Some("2026-02-01T00:00:00Z"),
+        ReleaseQuality::Stable,
+    ));
+    beyond.beyond_declared_bound = true;
+    let releases = vec![
+        rel(
+            "16.13.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        beyond,
+    ];
+    let layers = layers_from(vec![]);
+    let h = ctx().major();
+
+    let verdict = evaluate(&d, &releases, &layers, &h.get(), now());
+    assert_eq!(verdict.status, Status::Held);
+    assert_eq!(
+        verdict.held_reason,
+        Some(HeldReason::DeclaredBound("<17".to_string()))
+    );
+    let hold = evaluate_ceiling_hold(&d, &releases, &layers, &h.get(), now())
+        .expect("the bound-hidden target is still named");
+    assert_eq!(hold.reason, CeilingReason::DeclaredBound);
+}
+
+/// Stacked ceilings are probed individually: with the declared bound hiding a matured minor the
+/// dist-tag still admits, and the tag hiding the major beyond both, the hold names the bound with
+/// the target ITS removal exposes — `--rewrite` then actually reaches it. Naming the bound
+/// against the jointly hidden major would promise a version the rewrite alone cannot expose (the
+/// tag still holds it); that fallback shape is reported only when no single ceiling is causal
+/// (see `declared_bound_outranks_the_dist_tag_as_held_reason`).
+#[test]
+fn stacked_ceiling_hold_reports_the_singly_exposed_target() {
+    let d = Dependency {
+        declared_bound: Some("<16.5".to_string()),
+        ..dep("fumadocs-core", "16.0.0", ReleaseQuality::Stable)
+    };
+    let mut hidden_minor = rel(
+        "16.13.0",
+        &[2],
+        "16",
+        Some(UpdateKind::Minor),
+        Some("2026-01-15T00:00:00Z"),
+        ReleaseQuality::Stable,
+    );
+    hidden_minor.beyond_declared_bound = true;
+    let mut hidden_major = above_tag(rel(
+        "17.0.0",
+        &[3],
+        "17",
+        Some(UpdateKind::Major),
+        Some("2026-02-01T00:00:00Z"),
+        ReleaseQuality::Stable,
+    ));
+    hidden_major.beyond_declared_bound = true;
+    let releases = vec![
+        rel(
+            "16.0.0",
+            &[1],
+            "16",
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            ReleaseQuality::Stable,
+        ),
+        hidden_minor,
+        hidden_major,
+    ];
+    let layers = layers_from(vec![]);
+
+    let h = ctx().major();
+    let hold = evaluate_ceiling_hold(&d, &releases, &layers, &h.get(), now())
+        .expect("the bound alone hides a matured, tag-admitted target");
+    assert_eq!(hold.reason, CeilingReason::DeclaredBound);
+    assert_eq!(
+        hold.target,
+        Version::new("16.13.0"),
+        "the target is what lifting the NAMED ceiling exposes, not the jointly hidden major"
+    );
+    assert_eq!(hold.update_kind, UpdateKind::Minor);
+
+    // Step two of the staged guidance: with the bound rewritten away, the next run names the tag
+    // and the major it hides.
+    let h = ctx().major().rewrite_bounds();
+    let hold = evaluate_ceiling_hold(&d, &releases, &layers, &h.get(), now())
+        .expect("the tag still hides the major");
+    assert_eq!(hold.reason, CeilingReason::DistTag);
+    assert_eq!(hold.target, Version::new("17.0.0"));
+}

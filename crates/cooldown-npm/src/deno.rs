@@ -197,6 +197,7 @@ fn resolver_conflict(change: &Change) -> Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
+        detail: None,
     }
 }
 
@@ -443,7 +444,9 @@ impl ReleaseFetcher for DenoTool {
         _candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
         let raw = self.raw_releases(dep).await?;
-        Ok(build_releases(dep.current.as_str(), raw))
+        // No dist-tag ceiling for Deno: JSR has no dist-tags, and `npm:` specifiers are kept
+        // symmetrical with them (`has_dist_tags` stays false on this adapter).
+        Ok(build_releases(dep.current.as_str(), raw, None))
     }
 
     async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
@@ -455,6 +458,7 @@ impl ReleaseFetcher for DenoTool {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,

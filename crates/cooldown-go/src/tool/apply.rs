@@ -132,6 +132,7 @@ fn resolver_conflict(change: &Change) -> Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
+        detail: None,
     }
 }
 

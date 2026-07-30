@@ -233,6 +233,7 @@ impl<L: PyLayout> ReleaseFetcher for PyTool<L> {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -322,6 +323,7 @@ fn not_eligible(change: &Change) -> Skipped {
         change: change.clone(),
         reason: SkipReason::NotEligible,
         offending: Some(change.package.clone()),
+        detail: None,
     }
 }
 

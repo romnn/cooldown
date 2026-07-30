@@ -6,9 +6,11 @@
 //! `cooldown` binary against it, and parses the `--json` envelope.
 //!
 //! The fixtures pin the resolution clock to a fixed instant via the cooldown `--freeze <DATE>`
-//! cutoff (an absolute exclude-newer), so the underlying resolver replays the registry's immutable
-//! history and reproduces the same resolve forever. Tests assert invariants (convergence,
-//! no-silent-change, cross-command agreement), never hard-coded versions.
+//! cutoff (an absolute exclude-newer), so the underlying resolver replays the registry's publish
+//! history as of that instant — append-mostly in practice; an unpublish/yank of a fixture dep is
+//! one live mutation that could shift it, and the npm family's mutable `latest` dist-tag is the
+//! other, which frozen suites decouple via [`Fixture::tag_independent`]. Tests assert invariants
+//! (convergence, no-silent-change, cross-command agreement), never hard-coded versions.
 //!
 //! Everything here is ecosystem-agnostic. [`Fixture`] only knows how to write files, run an
 //! arbitrary tool (so each ecosystem can seed its own lock — `uv lock`, `cargo generate-lockfile`,
@@ -36,6 +38,7 @@ const TOOL_ATTEMPTS: usize = 3;
 /// A throwaway project tree under a temp dir, plus the means to run `cooldown` against it.
 pub struct Fixture {
     dir: tempfile::TempDir,
+    tag_independent: bool,
 }
 
 impl Fixture {
@@ -45,7 +48,19 @@ impl Fixture {
             .prefix("cooldown-it-")
             .tempdir()
             .expect("create temp dir");
-        Self { dir }
+        Self {
+            dir,
+            tag_independent: false,
+        }
+    }
+
+    /// Decouple every `cooldown` run from the registry's mutable `latest` dist-tag by passing
+    /// `--no-respect-dist-tags`. The frozen npm-family suites opt in: their publish-history replay
+    /// is stable, but the tag is live state a maintainer can move at any time, and only the
+    /// dedicated dist-tag probe should couple to it.
+    pub fn tag_independent(mut self) -> Self {
+        self.tag_independent = true;
+        self
     }
 
     /// The project root.
@@ -108,6 +123,7 @@ impl Fixture {
         let output = Command::new(exe)
             .current_dir(self.dir.path())
             .args(args)
+            .args(self.tag_independent.then_some("--no-respect-dist-tags"))
             // Pin tool/dir explicitly so detection is deterministic regardless of ambient state.
             .arg("--dir")
             .arg(self.dir.path())
@@ -340,6 +356,45 @@ impl Envelope {
     pub fn outdated_with_status(&self, status: &str) -> BTreeSet<String> {
         self.filter_names(|item| {
             item.get("status").and_then(serde_json::Value::as_str) == Some(status)
+        })
+    }
+
+    /// The named top-level string field of the first item with this `name` (e.g. `"blockedBy"`,
+    /// `"adoptableTarget"`, `"current"`), when present.
+    pub fn item_field_str(&self, name: &str, field: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    }
+
+    /// The `latest.version` of the named `outdated` item, when present.
+    pub fn latest_version_for(&self, name: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("latest")?
+                .get("version")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    }
+
+    /// The skip's `offending` package for the named item, when present.
+    pub fn skipped_offending_for(&self, name: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("skipped")?
+                .get("offending")?
+                .as_str()
+                .map(str::to_owned)
         })
     }
 

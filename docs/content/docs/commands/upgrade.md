@@ -31,6 +31,14 @@ An explicit upper comparator written by the author, such as `<6` or `>=5,<6`, is
 holds under the default behavior, even with `--major`. Pass `--rewrite` to cross and rewrite that
 bound. The same flag still always rewrites an in-range constraint (so `^1.4` becomes `^1.5`).
 
+One field is never rewritten, by any flag: **`peerDependencies`** (npm family). That range is not a
+declaration of what the package installs but a contract it publishes to *its* consumers, and
+widening shifts ranges rather than only loosening them (`>=5.6.0 <5.6.2` would become `^5.6.2`),
+which would drop consumers the author still supports. A move that a workspace package's own peer
+range provably excludes is reported `peer_held` instead — including a same-line move, since a narrow
+bound like `>=5.6.0 <5.6.2` is broken by a mere patch bump. Edit that range yourself to authorize
+the move; `--rewrite` does not cross it.
+
 The lock-only default is honored where the tool can pin an exact in-range version without editing the manifest:
 
 | Tool | In-range pin | Behavior |
@@ -63,6 +71,37 @@ When `upgrade` holds a cross-major update back, it explains the required action:
   `<`/`<=` bound.
 - `max_major_held` means raise the package's `max-major` in `cooldown.toml`; no CLI flag overrides
   this ceiling.
+- `dist_tag_held` (npm family) means the target sits above the registry's current `latest`
+  dist-tag, so it is not what a default `npm install` would resolve to today. Version-adopting
+  commands (`upgrade`, `fix`) revalidate the package document against the registry so the mutable
+  tag is judged live; read-only `outdated` may see a copy up to an hour old (`--fresh` forces
+  live reads everywhere). Pass
+  `--no-respect-dist-tags` (or set `respect-dist-tags = false` under `[global]` or a command
+  section in `cooldown.toml`) to adopt it deliberately.
+- `peer_held` (npm family) means a still-present dependent's recorded peer range excludes the
+  target (`held: fumadocs-mdx@15.1.1 requires fumadocs-core@^16.0.0`) — pnpm's resolver only
+  warns on that break, and npm, which rejects it by default (`ERESOLVE`), commits it under
+  relaxed enforcement such as `legacy-peer-deps`. Upgrade the dependent itself. On pnpm both can
+  move in one run: the joint move is the whole-graph resolve's decision, and cooldown re-checks
+  the result — a landing that provably breaks a recorded peer contract *between packages your
+  workspace itself declares, in a context that demonstrably binds them* (npm's hoisted tree is
+  judged physically, pnpm importers by their own declarations) is rejected and rolled back.
+  Contracts involving transitive packages, contexts that never bind the moved copy, or unprovable
+  ranges stay the resolver's call, so still review its peer warnings on a joint move. npm applies moves one at a
+  time with no joint resolve, so there the target stays held while the dependent moves — and the
+  dependent's own landing is verified after the fact: if its *new* peer range provably excludes
+  the still-held target (which relaxed enforcement like `legacy-peer-deps` would commit with only
+  a warning), that move is rolled back too. A lockstep pair whose new versions admit only each
+  other therefore stays held on both sides, each row naming the other; move such a pair in one
+  command (`npm install react@19 react-dom@19`) and cooldown maintains it from there. A dependent
+  whose new range still admits the current version lands normally, and the
+  next run releases the hold. A *workspace-local* dependent
+  (a `workspace:*` package, symlinked or injected — or the root project itself, which peer-requires
+  the moving package) never moves in a run, and cooldown never rewrites its published contract, so
+  editing its own `peerDependencies` range is what lifts that hold. Such a hold applies to
+  same-major moves too, since a narrow author-written bound can exclude a patch bump. There is
+  deliberately no flag to force the break. A `peer_held` run does not fall back to the newest in-range release in the
+  same pass; a run without `--major` picks that up.
 
 Only a matured release beyond the hold is reported. A fresh release still in cooldown does not
 produce an action that cannot yet be taken. Suppress command tips with `--no-suggestions`.
@@ -74,7 +113,8 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | `--transitive <mode>` | `allow` or `hide` — how to treat transitive dependencies (see above). |
 | `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound. |
 | `--build` | Also compile / sync after re-locking. |
-| `--major` | Allow cross-major bumps; explicit manifest bounds and config `max-major` ceilings still hold. |
+| `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
+| `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 

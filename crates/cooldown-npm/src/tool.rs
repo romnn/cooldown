@@ -8,7 +8,7 @@ use crate::lock::NodeLock;
 use crate::manifest;
 use crate::nodecmd::NodeCmd;
 use crate::registry::{NPM, NpmRegistry};
-use crate::version;
+use crate::version::{self, RangeMatch};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
@@ -145,6 +145,15 @@ impl<L: NodeLock> NpmTool<L> {
     pub fn from_http(http: SharedHttp) -> Self {
         NpmTool::new(NpmRegistry::new(http))
     }
+
+    /// Enables package-document revalidation for version-adopting runs, so the mutable `latest`
+    /// dist-tag ceiling is judged against the registry's current state rather than a cached copy
+    /// up to a listing-TTL stale (see [`NpmRegistry::with_listing_revalidation`]).
+    #[must_use]
+    pub fn with_listing_revalidation(mut self, revalidate: bool) -> Self {
+        self.registry = self.registry.with_listing_revalidation(revalidate);
+        self
+    }
 }
 
 pub(crate) fn classify_quality(v: &str) -> ReleaseQuality {
@@ -158,8 +167,17 @@ pub(crate) fn classify_quality(v: &str) -> ReleaseQuality {
 /// Builds the sorted, deduplicated [`Release`] list the core consumes from the registry's raw
 /// releases. npm and JSR both serve one artifact per version with no per-artifact split, so (unlike
 /// PyPI) there is no artifact-scope handling here.
-pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
-    build_registry_releases(
+///
+/// `latest_tag` is the version the registry's `latest` dist-tag names, when known: every release
+/// ordered above it is marked [`beyond_latest_tag`](Release::beyond_latest_tag) so the core can cap
+/// adoption at the maintainer's own "this is current" pointer. JSR and Deno pass `None` (no
+/// dist-tags there), leaving every release unmarked.
+pub(crate) fn build_releases(
+    current: &str,
+    raw: Vec<RawRelease>,
+    latest_tag: Option<&str>,
+) -> Vec<Release> {
+    let mut releases = build_registry_releases(
         current,
         raw,
         RegistryVersionClassifier {
@@ -170,7 +188,30 @@ pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release
             classify_kind: version::classify_kind,
             classify_quality,
         },
-    )
+    );
+    if let Some(tag) = latest_tag {
+        mark_beyond_latest_tag(&mut releases, tag);
+    }
+    releases
+}
+
+/// Marks every release ordered above the `latest`-tagged version as
+/// [`beyond_latest_tag`](Release::beyond_latest_tag).
+///
+/// Fails open when the tag names a version absent from the sorted release list (a registry
+/// inconsistency): nothing is marked, so no ceiling applies — the conservative direction for a
+/// signal that only ever *restricts* adoption.
+fn mark_beyond_latest_tag(releases: &mut [Release], tag: &str) {
+    let Some(tag_order) = releases
+        .iter()
+        .find(|release| version::compare(release.version.as_str(), tag).is_eq())
+        .map(|release| release.order.clone())
+    else {
+        return;
+    };
+    for release in releases {
+        release.beyond_latest_tag = release.order > tag_order;
+    }
 }
 
 /// Captures the lockfile and every package manifest this plan could rewrite.
@@ -213,7 +254,9 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         Capabilities {
             has_pseudo: false,
             has_incompatible: false,
-            has_dist_tags: false,
+            // npm, pnpm, yarn, and bun all resolve from the npm registry, whose mutable `latest`
+            // dist-tag caps candidate adoption (Release::beyond_latest_tag).
+            has_dist_tags: true,
             can_sync: true,
             artifact_granular: false,
         }
@@ -321,8 +364,12 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
         _fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
-        let raw = self.registry.releases(&dep.package).await?;
-        Ok(build_releases(dep.current.as_str(), raw))
+        let packument = self.registry.packument(&dep.package).await?;
+        Ok(build_releases(
+            dep.current.as_str(),
+            packument.releases,
+            packument.latest_tag.as_deref(),
+        ))
     }
 
     fn classify_declared_bound(&self, dep: &Dependency, releases: &mut [Release]) {
@@ -346,6 +393,7 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -353,15 +401,14 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
     }
 }
 
-/// Choose the lock-only driver command for one change, when the package manager supports one.
+/// Chooses the lock-only driver command for one change, when the package manager supports one.
 ///
 /// In `Auto` mode, when the package manager offers a lock-only update (only pnpm does) and the target
 /// already satisfies the declared `package.json` range, move just the lock and leave the range as the
-/// author wrote it. Otherwise — `Always`, a manager without a lock-only path, an out-of-range
-/// target, or a range we cannot evaluate — the caller rewrites the declaring package manifests and
-/// refreshes the lock. The in-range check happens up front because lock-only commands re-pin whatever
-/// version they are given without validating it, so an out-of-range version would leave the lock
-/// inconsistent with `package.json`.
+/// author wrote it. Otherwise the caller applies only the manifest edits authorized by the rewrite
+/// mode, then lands the exact target where the manager supports it. The in-range check happens up
+/// front because lock-only commands re-pin whatever version they are given without validating it,
+/// so an out-of-range version would leave the lock inconsistent with `package.json`.
 fn lockonly_command<L: NodeLock>(
     project: &Project,
     change: &Change,
@@ -378,31 +425,157 @@ fn lockonly_command<L: NodeLock>(
     Ok(None)
 }
 
-/// The command that refreshes the lock after [`manifest::widen_constraints`] rewrote the declaring
-/// manifests for an out-of-range (or `--rewrite`) change.
+/// The transaction that lands one candidate after cooldown has applied its authorized manifest
+/// edits and captured those resulting bytes.
+enum CandidateLanding {
+    /// The command preserves manifests itself; the snapshot re-establishes the authorized state if
+    /// a cutoff fallback first restores the candidate baseline.
+    Direct {
+        command: Vec<String>,
+        authorized_manifests: ProjectMutationJournal,
+    },
+    /// The exact pin may save a different manifest range, so the authorized bytes are restored and
+    /// the lock is resynchronized before the result is judged.
+    PinRestoreResync {
+        pin: Vec<String>,
+        authorized_manifests: ProjectMutationJournal,
+        resync: Vec<String>,
+    },
+}
+
+impl CandidateLanding {
+    fn command(&self) -> &[String] {
+        match self {
+            CandidateLanding::Direct { command, .. } => command,
+            CandidateLanding::PinRestoreResync { pin, .. } => pin,
+        }
+    }
+
+    fn authorized_manifests(&self) -> &ProjectMutationJournal {
+        match self {
+            CandidateLanding::Direct {
+                authorized_manifests,
+                ..
+            }
+            | CandidateLanding::PinRestoreResync {
+                authorized_manifests,
+                ..
+            } => authorized_manifests,
+        }
+    }
+}
+
+/// Plans how to land `change`, widening the declaring manifests when that is what this manager and
+/// mode require. `None` means no manifest declares the dependency, so the caller reports it not
+/// eligible rather than risk adding a spurious root dependency.
 ///
-/// Prefer a per-version pin so the lock lands on exactly the cooldown-approved target: a bare
-/// `relock_args` install re-resolves the just-widened range to its *newest* member, which can
-/// overshoot onto a newer-but-still-too-fresh release that the post-apply cooldown check then rolls
-/// back — silently failing a valid upgrade. pnpm pins the exact version without touching any manifest
-/// (`update --no-save`). npm's exact pin (`install <name>@<version>`) also saves `^version` to the
-/// *root* manifest, so it is used only when the root declares the dependency (the entry we just
-/// widened); for a member-only dependency that would add a spurious root dependency, so we re-resolve
-/// instead (an overshoot is safely rolled back). yarn and bun have no exact pin and re-resolve too.
-fn rewrite_relock<L: NodeLock>(project: &Project, change: &Change) -> Result<Vec<String>> {
-    let name = &change.package.name;
-    let version = change.to.as_str();
+/// Eligibility is a question about the *declarations*, not about what the widen happened to write: a
+/// dependency declared only in a published-contract field has an empty write set by design (nothing
+/// may rewrite it), and reading that as "undeclared" would skip a move whose lock can still be
+/// landed exactly.
+fn candidate_landing<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    mode: RewriteMode,
+) -> Result<Option<CandidateLanding>> {
+    if let Some(args) = lockonly_command::<L>(project, change, mode)? {
+        return Ok(Some(CandidateLanding::Direct {
+            command: args,
+            authorized_manifests: manifest_snapshot(project, change)?,
+        }));
+    }
+    let declarations =
+        manifest::declarations(&project.root, &change.members, &change.package.name)?;
+    if declarations.absent() {
+        return Ok(None);
+    }
+    let preserving_pin = preserving_pin::<L>(project, change, declarations.install_workspaces());
+    // Without an exact preserving pin, shifting even an in-range declaration is the only way to
+    // steer a bare relock to the planned target.
+    let manifest_mode = if mode == RewriteMode::Auto && preserving_pin.is_none() {
+        RewriteMode::Always
+    } else {
+        mode
+    };
+    let rewrite = manifest::widen_constraints(
+        &project.root,
+        &change.members,
+        &change.package.name,
+        change.to.as_str(),
+        manifest_mode,
+    )?;
+    if mode == RewriteMode::Auto
+        && rewrite.modified.is_empty()
+        && declarations.has_install()
+        && matches!(
+            &preserving_pin,
+            Some(crate::lock::PreservingPin::PinRestoreResync { .. })
+        )
+    {
+        // npm's resync can select the old lock again when every install range remains compatible.
+        // Shift those ranges only when no declaration needed widening; if one did, its edit already
+        // steers the resync and every compatible sibling remains untouched.
+        manifest::widen_constraints(
+            &project.root,
+            &change.members,
+            &change.package.name,
+            change.to.as_str(),
+            RewriteMode::Always,
+        )?;
+    }
+    let authorized_manifests = manifest_snapshot(project, change)?;
+    let landing = match preserving_pin {
+        Some(crate::lock::PreservingPin::Direct(command)) => CandidateLanding::Direct {
+            command,
+            authorized_manifests,
+        },
+        Some(crate::lock::PreservingPin::PinRestoreResync { pin, resync }) => {
+            CandidateLanding::PinRestoreResync {
+                pin,
+                authorized_manifests,
+                resync,
+            }
+        }
+        None => {
+            let before = absolute_cutoff_from_project(
+                project.exclude_newer.as_deref(),
+                jiff::Timestamp::now(),
+            );
+            CandidateLanding::Direct {
+                command: L::relock_args(before.as_deref()),
+                authorized_manifests,
+            }
+        }
+    };
+    Ok(Some(landing))
+}
+
+/// The manager's exact pin for this change, including any restore/resync transaction needed to keep
+/// the authorized manifest bytes authoritative.
+fn preserving_pin<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    workspaces: &[String],
+) -> Option<crate::lock::PreservingPin> {
     let before =
         absolute_cutoff_from_project(project.exclude_newer.as_deref(), jiff::Timestamp::now());
-    if let Some(args) = L::lockonly_update_args(name, version) {
-        return Ok(args);
+    L::preserving_pin(
+        &change.package.name,
+        change.to.as_str(),
+        before.as_deref(),
+        workspaces,
+    )
+}
+
+/// Captures just the `package.json` files a change could touch, leaving the lockfile outside the
+/// snapshot so the landing transaction can restore the authorized manifests and resynchronize the
+/// new pin.
+fn manifest_snapshot(project: &Project, change: &Change) -> Result<ProjectMutationJournal> {
+    let mut files = Vec::new();
+    for rel in manifest::manifest_rels(&change.members) {
+        files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
     }
-    if let Some(args) = L::pinned_relock_args(name, version, before.as_deref())
-        && manifest::declared_range(&project.manifest, name)?.is_some()
-    {
-        return Ok(args);
-    }
-    Ok(L::relock_args(before.as_deref()))
+    Ok(ProjectMutationJournal { files })
 }
 
 /// Whether the change's target satisfies every range declared for it in the manifests that could own
@@ -612,6 +785,1094 @@ fn reached(
     })
 }
 
+/// The journaled pre-apply lockfile body, when it was captured and is valid UTF-8.
+fn journaled_lock<L: NodeLock>(journal: &ProjectMutationJournal) -> Option<&str> {
+    journal
+        .files
+        .iter()
+        .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
+        .and_then(|file| file.contents.as_deref())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+}
+
+/// Everything the peer-feasibility gate reads from one immutable pre-apply lock, gathered once
+/// per apply so no evidence source is parsed twice (the member index in particular is shared
+/// between importer attribution and the workspace-manifest peer source).
+struct PeerEvidence {
+    /// Peer contracts recorded in the lock's resolved-package entries.
+    requirements: Vec<crate::lock::PeerRequirement>,
+    /// Importer attribution: which member declares which `(name, version)`.
+    members: crate::lock::MemberIndex,
+    /// Names *declared* at multiple versions across importers.
+    multi_version: HashSet<String>,
+    /// Names *resolved* at multiple versions anywhere in the graph.
+    resolved_splits: HashSet<String>,
+    /// Peer contracts read from workspace member manifests (empty without a project root).
+    workspace: Vec<WorkspacePeer>,
+    /// The physical install layout, when the lock records one (npm). Peer visibility is then
+    /// judged by nearest-ancestor lookup instead of declaring-member overlap: hoisting lets
+    /// disjoint members' packages meet at the root `node_modules`.
+    install: Option<crate::lock::InstallPaths>,
+}
+
+impl PeerEvidence {
+    /// Gathers the gate's evidence from the journaled pre-apply lock. `root` locates the member
+    /// manifests for the workspace source; `None` (lock-only contexts) leaves that source empty.
+    /// The multi-version sets are computed only when some contract could hold, so the common
+    /// no-peers apply skips those lock walks entirely.
+    fn gather<L: NodeLock>(root: Option<&Utf8Path>, lock: Option<&str>) -> Self {
+        let requirements = lock.map(L::peer_requirements).unwrap_or_default();
+        let members = L::member_sources(lock.unwrap_or_default());
+        let workspace = match (root, lock) {
+            (Some(root), Some(lock)) => workspace_peer_requirements::<L>(root, lock, &members),
+            _ => Vec::new(),
+        };
+        let (multi_version, resolved_splits, install) =
+            if requirements.is_empty() && workspace.is_empty() {
+                (HashSet::new(), HashSet::new(), None)
+            } else {
+                (
+                    members.names_declared_at_multiple_versions(),
+                    resolved_multi_version_names::<L>(lock.unwrap_or_default()),
+                    lock.and_then(L::install_paths),
+                )
+            };
+        Self {
+            requirements,
+            members,
+            multi_version,
+            resolved_splits,
+            workspace,
+            install,
+        }
+    }
+}
+
+/// The peer-feasibility gate: split the plan into the changes the resolve may attempt and the
+/// cross-major changes a lock-recorded peer requirement structurally excludes, each held as a
+/// [`SkipReason::PeerHeld`] naming the dependent and its verbatim range.
+///
+/// pnpm only *warns* on a peer mismatch by default, and npm — which rejects with `ERESOLVE` by
+/// default — commits it under relaxed enforcement (`legacy-peer-deps`, common in project
+/// `.npmrc`s), so without this gate a cross-major move that breaks a still-present dependent's
+/// peer contract (`fumadocs-core` 16→17 under `fumadocs-mdx`'s `fumadocs-core@^16`) can resolve
+/// "successfully" and land the break silently. Holding it up front makes `upgrade` skip it with
+/// the range named, and `outdated`'s verification reclassify the row `blocked by <dependent>` —
+/// the two commands agree.
+///
+/// The gate only fires when the violation is demonstrable, and fails open everywhere else:
+///
+/// - only forward moves across an npm compatibility line are gated — the same
+///   [`major_key`](version::major_key) predicate that gates `--major`, so `0.1 → 0.2` counts
+///   (caret semantics make the 0.x minor the breaking axis). The line is judged from the versions,
+///   never the caller-supplied kind, which `outdated`'s verification passes neutrally; in-range
+///   moves are the resolver's business;
+/// - the range must demonstrably bind: it *matches* the current version and *provably excludes*
+///   the target, judged with the tri-state [`range_match`](version::range_match) (peer ranges
+///   routinely union majors — `^7.0.0 || ^8.0.0`). A range with any branch the matcher cannot
+///   represent (npm hyphen ranges, `workspace:*`) yields `Unknown`, never `Excludes`, so it cannot
+///   block;
+/// - only an importer-declared (direct) dependent gates. A *transitive* dependent can be floated by
+///   the resolver within its parents' ranges to a sibling version that admits the target (npm does
+///   exactly this when a peer conflict arises), so its lock-recorded peer range is not
+///   authoritative — and a float that would need a still-cooling version is already stopped by the
+///   transitive cooldown gate. A direct dependent has no such latitude: an in-range version that
+///   lifts the peer would itself have been planned as a move (and then the co-move rule applies);
+/// - npm's package-lock attributes importer declarations by *name* only, but its physical layout
+///   is instance-exact: a declaring member's own nearest-ancestor lookup identifies its direct
+///   copy ([`direct_dependent_members`]), so a name resolved at several versions still gates
+///   through the proven-direct instance — and only through it. Without a physical layout (an npm
+///   v1 lock) the split stays ambiguous and never gates (pnpm's attribution is version-exact and
+///   unaffected);
+/// - on a manager with a whole-graph resolve (pnpm), the dependent must not itself be moving in
+///   the dependent's own importing context — its target may lift the peer range, and the joint
+///   resolve settles the pair's peer contexts in one pass. Holds are recomputed to a fixed point,
+///   so a dependent that is itself peer-held (or destined for the resolve's own multi-version
+///   skip) stops exempting the packages it pins. Two co-moving packages that each block the
+///   other's old range are deliberately both exempt: that joint move is exactly what the joint
+///   resolve exists to judge. A manager on the sequential per-package path (npm) grants NO co-move
+///   exemption: its resolver never judges the pair jointly — the moves land one at a time, so an
+///   exempted package could land against the dependent's *old* range with only a warning. The
+///   package stays held while the dependent moves; the dependent's own landing is post-verified
+///   ([`settle_landed_candidate`]) and rolled back when its *new* range provably breaks against
+///   the still-held package, so a strict lockstep pair stays held on both sides (moved together
+///   manually, e.g. `npm install react@19 react-dom@19`) instead of committing a broken
+///   intermediate; a dependent whose new range still admits the current version lands, and the
+///   next run releases the hold;
+/// - peer visibility follows the layout the manager actually resolves against. pnpm importers are
+///   isolated by declaration, so a dependent whose declaring importers are disjoint from the
+///   change's members keeps its own in-range copy and the moved copy cannot break it. npm's
+///   default layout *hoists* — packages declared by disjoint members meet at the root
+///   `node_modules` — so there the lock's physical paths decide ([`InstallPaths`]): a dependent
+///   whose nearest-ancestor lookup reaches the moving copy is bound wherever it is declared,
+///   while one shadowed by its own nested copy is not;
+/// - a name declared at multiple versions across the workspace is left to the resolve's own
+///   [`MultiVersionHeld`](SkipReason::MultiVersionHeld) classification;
+/// - peer contracts come from TWO sources: the lock's resolved-package records
+///   ([`NodeLock::peer_requirements`]) and every workspace member's own `package.json`
+///   ([`workspace_peer_requirements`], gathered into [`PeerEvidence`]) — the lock is not
+///   authoritative for a local package's peers, which pnpm keeps only in the manifest whether
+///   the package is symlinked (`link:`) or injected (`file:`). A workspace-local dependent binds
+///   in its own directory and in every importer that consumes or declares it, and it never moves
+///   in a plan, so no co-move exemption applies — only editing its peer range lifts the hold.
+///   Cooldown never edits it: a `peerDependencies` entry is a contract the package publishes to
+///   its consumers, not a declaration of what it installs, so manifest widening leaves that field
+///   alone entirely (`WIDENABLE_FIELDS`) and the workspace-manifest hold covers every provable
+///   break rather than only cross-line ones ([`workspace_peer_hold`]). Together those make the
+///   contract immutable for the whole apply, which is what lets the pre-apply snapshot serve as
+///   the post-resolve verifier's evidence without going stale.
+fn partition_peer_held<L: NodeLock>(plan: &Plan, evidence: &PeerEvidence) -> (Plan, Vec<Skipped>) {
+    let PeerEvidence {
+        requirements,
+        members,
+        multi_version,
+        resolved_splits,
+        workspace,
+        install,
+    } = evidence;
+    if requirements.is_empty() && workspace.is_empty() {
+        return (plan.clone(), Vec::new());
+    }
+
+    // One verdict slot per change, filled to a fixed point: a change held in one round stops
+    // moving, which can only expose further holds (never lift one), so the rounds are monotone,
+    // order-independent in their result, and bounded by the plan length.
+    let mut verdicts: Vec<Option<&crate::lock::PeerRequirement>> = vec![None; plan.changes.len()];
+    loop {
+        // The changes whose own move may exempt their dependents this round. Only a manager with a
+        // whole-graph resolve gets the exemption at all — the sequential per-package path never
+        // judges a pair jointly, so there `moving` stays empty and every binding range holds. One
+        // destined for the resolve's own multi-version skip never counts as moving either: it
+        // stays in place, so it must not exempt its dependents.
+        let moving: Vec<&Change> = if L::supports_whole_graph_resolve() {
+            plan.changes
+                .iter()
+                .zip(&verdicts)
+                .filter(|(change, verdict)| {
+                    verdict.is_none() && !multi_version.contains(&change.package.name)
+                })
+                .map(|(change, _)| change)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut grew = false;
+        for (change, verdict) in plan.changes.iter().zip(verdicts.iter_mut()) {
+            if verdict.is_none()
+                && let Some(blocker) = peer_hold(
+                    change,
+                    requirements,
+                    members,
+                    multi_version,
+                    resolved_splits,
+                    &moving,
+                    install.as_ref(),
+                )
+                .or_else(|| workspace_peer_hold(change, workspace, multi_version, install.as_ref()))
+            {
+                *verdict = Some(blocker);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut retained = Vec::with_capacity(plan.changes.len());
+    let mut skipped = Vec::new();
+    for (change, verdict) in plan.changes.iter().zip(&verdicts) {
+        match verdict {
+            Some(blocker) => {
+                skipped.push(peer_held_skip::<L>(
+                    change,
+                    blocker,
+                    blocker.dependent.clone(),
+                ));
+            }
+            None => retained.push(change.clone()),
+        }
+    }
+    let plan = Plan {
+        changes: retained,
+        rewrite: plan.rewrite,
+        baseline_violations: plan.baseline_violations.clone(),
+    };
+    (plan, skipped)
+}
+
+/// The `peer_held` skip row for `change`, blocked by `blocker`'s recorded contract. `offending`
+/// names the party whose move (or range edit) would release the hold: the dependent when the
+/// change is the peer target, the peer package when the change is the dependent itself (the
+/// post-apply verification path). One constructor, so the two paths cannot drift in wording.
+fn peer_held_skip<L: NodeLock>(
+    change: &Change,
+    blocker: &crate::lock::PeerRequirement,
+    offending: String,
+) -> Skipped {
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::PeerHeld,
+        offending: Some(PackageId::new(L::ID, offending, Some(NPM.to_string()))),
+        detail: Some(format!(
+            "held: {}@{} requires {}@{}",
+            blocker.dependent, blocker.dependent_version, blocker.package, blocker.range
+        )),
+    }
+}
+
+/// Settles a sequential candidate whose requested version landed: the landing alone is not
+/// sufficient, because under relaxed peer enforcement (`legacy-peer-deps` in a project `.npmrc`)
+/// npm commits a graph that provably breaks a peer contract — reachable here when a held pair's
+/// dependent is applied alone and its *new* peer range admits only the held target's new major.
+/// A candidate whose lock introduces a violation absent from `baseline` is restored from its
+/// journal and reported `peer_held`, blaming the contract's *other* party (the one whose move or
+/// range edit releases the hold) — the break the pre-apply gate exists to prevent must not
+/// persist even between runs.
+///
+/// `baseline` carries the violations of the last *accepted* lock across the candidate loop
+/// (initialized lazily from the first settled candidate's journal snapshot): an accepted
+/// candidate's violation map becomes the next baseline, and a rolled-back candidate restores the
+/// disk to exactly the baseline state, so each candidate lock is parsed once.
+fn settle_landed_candidate<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    candidate_journal: &ProjectMutationJournal,
+    workspace: &[WorkspacePeer],
+    baseline: &mut Option<PeerViolations>,
+    report: &mut ApplyReport,
+) -> Result<()> {
+    let after = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+    let current = proven_peer_violations::<L>(&after, workspace);
+    let fresh = {
+        let base = baseline.get_or_insert_with(|| {
+            journaled_lock::<L>(candidate_journal)
+                .map(|lock| proven_peer_violations::<L>(lock, workspace))
+                .unwrap_or_default()
+        });
+        current
+            .iter()
+            .find(|(id, detail)| !baseline_covers(base, id, detail))
+            .map(|(id, _)| id.requirement())
+    };
+    match fresh {
+        None => {
+            *baseline = Some(current);
+            report.applied.push(change.clone());
+        }
+        Some(violation) => {
+            candidate_journal.restore(&project.root)?;
+            let offending = if violation.dependent == change.package.name {
+                violation.package.clone()
+            } else {
+                violation.dependent.clone()
+            };
+            report
+                .skipped
+                .push(peer_held_skip::<L>(change, &violation, offending));
+        }
+    }
+    Ok(())
+}
+
+/// Identifies one proven violation *instance*: the dependent at its exact landed version, the
+/// violated peer package, and the recorded range. The dependent's version is part of the identity
+/// deliberately — two same-named dependent copies (a split held at 1.x in one importer and
+/// floated to 3.x in another, both recording the same range) are distinct instances whose
+/// violations must not collapse onto one key, or the float's fresh break inherits the old break's
+/// grandfathering ([`baseline_covers`] handles the version-insensitive part of "already broken").
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PeerViolationId {
+    dependent: String,
+    dependent_version: String,
+    package: String,
+    range: String,
+}
+
+impl PeerViolationId {
+    /// The violation as the reporting-side [`PeerRequirement`] (the blame row's contract line).
+    fn requirement(&self) -> crate::lock::PeerRequirement {
+        crate::lock::PeerRequirement {
+            dependent: self.dependent.clone(),
+            dependent_version: self.dependent_version.clone(),
+            package: self.package.clone(),
+            range: self.range.clone(),
+        }
+    }
+}
+
+/// Proven peer violations of one lock, keyed by instance (a `BTreeMap`, so iteration — and thus
+/// blame order — is deterministic).
+type PeerViolations = BTreeMap<PeerViolationId, ViolationDetail>;
+
+/// The contexts behind one proven violation: each binding member paired with the peer version its
+/// own context demonstrably binds — resolved from the member's dependent instance on npm's
+/// physical tree, or from the importer's own declaration on pnpm. Coverage compares the members
+/// ([`baseline_covers`]); attribution judges each binding counterfactually
+/// ([`attribute_peer_violation`]).
+#[derive(Clone)]
+struct ViolationDetail {
+    bindings: Vec<(String, String)>,
+}
+
+/// Whether the baseline already contained `fresh` in every context it binds: a violation of the
+/// same contract *shape* — dependent, package, range, the dependent's exact version aside — with
+/// a binding in each of the fresh members. Version-insensitive on purpose (on both sides): a
+/// dependent re-recorded at a new patch, or a peer floated between two versions the range
+/// excludes either way, keeps an already-broken contract broken — nothing newly breaks, and
+/// re-attributing it would reject an innocent candidate. Member-sensitive on purpose: a
+/// same-shaped violation surfacing in a member whose context was not violating before (a split
+/// copy floated onto the broken range) is a NEW break, and grandfathering it would accept exactly
+/// the break the verification exists to catch.
+fn baseline_covers(
+    baseline: &PeerViolations,
+    fresh: &PeerViolationId,
+    detail: &ViolationDetail,
+) -> bool {
+    detail
+        .bindings
+        .iter()
+        .all(|(member, _)| member_covered(baseline, fresh, member))
+}
+
+/// The per-member half of [`baseline_covers`]: whether the baseline holds a same-shaped violation
+/// binding in `member`.
+fn member_covered(baseline: &PeerViolations, fresh: &PeerViolationId, member: &str) -> bool {
+    baseline.iter().any(|(id, base)| {
+        id.dependent == fresh.dependent
+            && id.package == fresh.package
+            && id.range == fresh.range
+            && base.bindings.iter().any(|(bound, _)| bound == member)
+    })
+}
+
+/// The immutable pre-apply peer facts the post-resolve verifier judges against, gathered once per
+/// apply: the violations already present (never re-attributed to a candidate), the pre-apply
+/// member/importer attribution and physical layout (the counterfactual "old peer version",
+/// looked up per binding context), and each contract's uniquely recorded range (the
+/// counterfactual "old range" — a dependent recorded at several distinct ranges yields no entry,
+/// so attribution stays proof-only).
+struct PeerBaseline {
+    violations: PeerViolations,
+    members: crate::lock::MemberIndex,
+    install: Option<crate::lock::InstallPaths>,
+    ranges: HashMap<(String, String), String>,
+}
+
+impl PeerBaseline {
+    fn gather<L: NodeLock>(before: Option<&str>, workspace: &[WorkspacePeer]) -> Self {
+        let content = before.unwrap_or_default();
+        let mut unique: HashMap<(String, String), Option<String>> = HashMap::new();
+        for pr in L::peer_requirements(content) {
+            unique
+                .entry((pr.dependent, pr.package))
+                .and_modify(|slot| {
+                    if slot.as_deref() != Some(pr.range.as_str()) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(pr.range));
+        }
+        PeerBaseline {
+            violations: proven_peer_violations::<L>(content, workspace),
+            members: L::member_sources(content),
+            install: L::install_paths(content),
+            ranges: unique
+                .into_iter()
+                .filter_map(|(key, range)| range.map(|range| (key, range)))
+                .collect(),
+        }
+    }
+
+    /// The version `member`'s context bound `name` at before the apply — the importer's own
+    /// pre-apply declaration (pnpm), or the member's physical resolution on the pre-apply tree
+    /// (npm). `None` when the context did not demonstrably bind it, which leaves the
+    /// corresponding counterfactual unprovable.
+    fn bound_before(&self, member: &str, name: &str) -> Option<&str> {
+        self.members.resolved_version(member, name).or_else(|| {
+            self.install
+                .as_ref()
+                .and_then(|install| install.member_resolution(member, name))
+                .map(|(version, _)| version)
+        })
+    }
+}
+
+/// Which candidate one fresh binding proves culpable. The after-lock only proves the *pair*
+/// incompatible in that context, never which move broke it, so culpability is judged
+/// counterfactually against the pre-apply baseline, per binding context:
+///
+/// - the dependent alone, when its landed range provably excludes the version this member's
+///   context bound BEFORE — its move breaks even with the peer left in place;
+/// - the peer alone, when the dependent's OLD recorded range provably excludes the version the
+///   context binds now — its move breaks against the dependent as it already was;
+/// - with only one side planned at all, that side (the other never moved);
+/// - otherwise [`Unattributable`](PeerCulprit::Unattributable): both proofs hold, neither does,
+///   or neither side is planned — rejecting would be a guess, so the caller propagates a
+///   non-local rejection and candidate isolation decides.
+enum PeerCulprit {
+    Dependent,
+    Peer,
+    Unattributable,
+}
+
+fn attribute_peer_violation(
+    baseline: &PeerBaseline,
+    id: &PeerViolationId,
+    member: &str,
+    peer_version: &str,
+    dependent_planned: bool,
+    peer_planned: bool,
+) -> PeerCulprit {
+    match (dependent_planned, peer_planned) {
+        (true, false) => return PeerCulprit::Dependent,
+        (false, true) => return PeerCulprit::Peer,
+        (false, false) => return PeerCulprit::Unattributable,
+        (true, true) => {}
+    }
+    let dependent_breaks_old_peer = baseline
+        .bound_before(member, &id.package)
+        .is_some_and(|old| version::range_match(&id.range, old) == RangeMatch::Excludes);
+    let old_range_breaks_new_peer = baseline
+        .ranges
+        .get(&(id.dependent.clone(), id.package.clone()))
+        .is_some_and(|old_range| {
+            version::range_match(old_range, peer_version) == RangeMatch::Excludes
+        });
+    match (dependent_breaks_old_peer, old_range_breaks_new_peer) {
+        (true, false) => PeerCulprit::Dependent,
+        (false, true) => PeerCulprit::Peer,
+        _ => PeerCulprit::Unattributable,
+    }
+}
+
+/// The immutable inputs one whole-graph apply hands its peer-verified resolve loop: the plan to
+/// land, the pre-apply journal each round restores to, the multi-version names the resolve must not
+/// pin, the transitive age floor, and the workspace-manifest peer contracts the lock is not
+/// authoritative for.
+#[derive(Clone, Copy)]
+struct JointResolve<'a> {
+    plan: &'a Plan,
+    journal: &'a ProjectMutationJournal,
+    multi_version: &'a HashSet<String>,
+    window_minutes: Option<i64>,
+    workspace: &'a [WorkspacePeer],
+}
+
+/// One candidate rejection a verification round decided: which active change to drop, the
+/// violated contract, and the blamed other party.
+struct PeerRejection {
+    index: usize,
+    violation: crate::lock::PeerRequirement,
+    offending: String,
+}
+
+/// Plans this round's rejections from the fresh violations: every candidate a violation *uniquely*
+/// proves culpable is rejected in one round — each proof is counterfactual against the immutable
+/// baseline, so it stands regardless of the other rejections. A violation touching an
+/// already-rejected candidate is a cascade: that party reverts with the journal restore, so it is
+/// re-judged after the re-resolve instead of guessed at now. A violation binding in several
+/// contexts must prove ONE candidate culpable across all of them; disagreement — like an
+/// unattributable binding — aborts the round (`Err`), handing the interaction to the caller's
+/// candidate isolation.
+fn plan_peer_rejections(
+    baseline: &PeerBaseline,
+    current: &PeerViolations,
+    active: &Plan,
+    multi_version: &HashSet<String>,
+) -> Result<Vec<PeerRejection>> {
+    let mut rejections: Vec<PeerRejection> = Vec::new();
+    for (id, detail) in current {
+        let fresh: Vec<(&str, &str)> = detail
+            .bindings
+            .iter()
+            .filter(|(member, _)| !member_covered(&baseline.violations, id, member))
+            .map(|(member, peer_version)| (member.as_str(), peer_version.as_str()))
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        // A candidate is this violation's mover only when it actually landed the violating
+        // instance: same name AND the exact landed version, moving in a fresh binding context —
+        // name-only matching could blame a same-named change in an unrelated member. A
+        // multi-version name is no candidate at all: the whole-graph resolve deliberately never
+        // pins it ([`prepare_whole_graph_inputs`]), so its landing is resolver latitude and
+        // rejecting the unpinned change would alter nothing.
+        let planned = |name: &str, landed: &str, contexts: &[&str]| -> Option<usize> {
+            if multi_version.contains(name) {
+                return None;
+            }
+            active.changes.iter().position(|change| {
+                change.package.name == name
+                    && change.to.as_str() == landed
+                    && (change.members.is_empty()
+                        || change
+                            .members
+                            .iter()
+                            .any(|member| contexts.contains(&member.path.as_str())))
+            })
+        };
+        let fresh_members: Vec<&str> = fresh.iter().map(|(member, _)| *member).collect();
+        let dependent_index = planned(&id.dependent, &id.dependent_version, &fresh_members);
+        let peer_indexes: Vec<Option<usize>> = fresh
+            .iter()
+            .map(|(member, peer_version)| {
+                planned(&id.package, peer_version, std::slice::from_ref(member))
+            })
+            .collect();
+        let already_rejected = |index: Option<usize>| {
+            index.is_some_and(|index| rejections.iter().any(|rejection| rejection.index == index))
+        };
+        if already_rejected(dependent_index)
+            || peer_indexes.iter().any(|index| already_rejected(*index))
+        {
+            continue;
+        }
+        let unattributable = || {
+            CoreError::StaleLock(format!(
+                "resolve broke a peer contract without a uniquely culpable candidate: \
+                 {}@{} requires {}@{}",
+                id.dependent, id.dependent_version, id.package, id.range
+            ))
+        };
+        let mut agreed: Option<(usize, String)> = None;
+        for ((member, peer_version), peer_index) in fresh.iter().zip(&peer_indexes) {
+            let culprit = attribute_peer_violation(
+                baseline,
+                id,
+                member,
+                peer_version,
+                dependent_index.is_some(),
+                peer_index.is_some(),
+            );
+            let verdict = match culprit {
+                PeerCulprit::Dependent => dependent_index.map(|index| (index, id.package.clone())),
+                PeerCulprit::Peer => peer_index.map(|index| (index, id.dependent.clone())),
+                PeerCulprit::Unattributable => None,
+            };
+            let Some(verdict) = verdict else {
+                return Err(unattributable());
+            };
+            if agreed
+                .as_ref()
+                .is_some_and(|(index, _)| *index != verdict.0)
+            {
+                return Err(unattributable());
+            }
+            agreed = Some(verdict);
+        }
+        // `fresh` is non-empty, so the loop above either erred out or settled on one candidate.
+        let Some((index, offending)) = agreed else {
+            continue;
+        };
+        rejections.push(PeerRejection {
+            index,
+            violation: id.requirement(),
+            offending,
+        });
+    }
+    Ok(rejections)
+}
+
+/// The peer contracts a lock *provably* violates — between two importer-declared packages the
+/// dependent demonstrably sees. A violation is counted only on proof:
+///
+/// - the dependent must be a proven-direct instance ([`direct_dependent_members`], the same rule
+///   the pre-apply gate applies) — a transitive optional-peer plugin deep in the graph must not
+///   veto a move its own resolver accepted;
+/// - the violated peer package must be importer-declared too — a *transitive* peer
+///   (`@typescript-eslint/parser`, materialized only as the plugin's auto-installed peer) is the
+///   resolver's to place and re-place, so its lag must not veto a direct move the resolver
+///   accepted;
+/// - each binding is contextual, judged as the layout dictates: on npm's physical tree the peer
+///   version is whatever the dependent's own instance resolves by nearest-ancestor lookup
+///   ([`InstallPaths::resolve_from`] — hoisting lets disjoint members' packages meet at the root
+///   `node_modules`, a nested copy shadows the hoisted one, and a nested *satisfying* copy is
+///   equally decisive in the dependent's favor); on pnpm it is the version the importer itself
+///   declares ([`MemberIndex::resolved_version`] — peers resolve against the importing context,
+///   and each importer's declaration is that context's copy, so two importers may bind two
+///   different versions and each is judged on its own);
+/// - a context that does not demonstrably bind the peer contributes nothing: absent on the npm
+///   lookup path (a possibly-optional peer), or not declared by the pnpm importer (reaching the
+///   dependent only transitively — the resolver's business);
+/// - and a binding counts only when the bound version is [`RangeMatch::Excludes`]-proven outside
+///   the recorded range.
+///
+/// `workspace` carries the contracts the lock is not authoritative for — every workspace-local
+/// package's own `peerDependencies`, including the npm root project's, read from the pre-apply
+/// manifests ([`workspace_peer_requirements`]). They are judged by the same proof rules, bound
+/// through each contract's [`origin`](WorkspacePeer::origin) directory (npm) or its importer
+/// contexts (pnpm), and a local package never moves in a plan — so a resolver move that breaks one
+/// is the moved package's fault, and an unplanned collateral move that breaks one is escalated to
+/// candidate isolation.
+///
+/// A lock with no recorded peer contracts (yarn, bun) and no workspace contracts returns empty
+/// without any further parsing.
+fn proven_peer_violations<L: NodeLock>(
+    content: &str,
+    workspace: &[WorkspacePeer],
+) -> PeerViolations {
+    let requirements = L::peer_requirements(content);
+    if requirements.is_empty() && workspace.is_empty() {
+        return PeerViolations::new();
+    }
+    let members = L::member_sources(content);
+    let install = L::install_paths(content);
+    let mut resolved: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, version) in L::parse(content).unwrap_or_default() {
+        resolved.entry(name).or_default().insert(version);
+    }
+    let resolved_splits: HashSet<String> = resolved
+        .iter()
+        .filter(|(_, versions)| versions.len() > 1)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut out = PeerViolations::new();
+    for pr in requirements {
+        let Some(dependent_members) = direct_dependent_members(
+            &members,
+            install.as_ref(),
+            &pr.dependent,
+            &pr.dependent_version,
+            &resolved_splits,
+        ) else {
+            continue;
+        };
+        if !members.declares(&pr.package) {
+            continue;
+        }
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for member in dependent_members {
+            let bound = match &install {
+                Some(install) => install
+                    .member_resolution(&member, &pr.dependent)
+                    .and_then(|(_, instance)| install.resolve_from(instance, &pr.package))
+                    .map(|(version, _)| version),
+                None => members.resolved_version(&member, &pr.package),
+            };
+            let Some(peer_version) = bound else {
+                continue;
+            };
+            if version::range_match(&pr.range, peer_version) == RangeMatch::Excludes {
+                bindings.push((member, peer_version.to_string()));
+            }
+        }
+        if bindings.is_empty() {
+            continue;
+        }
+        out.insert(
+            PeerViolationId {
+                dependent: pr.dependent,
+                dependent_version: pr.dependent_version,
+                package: pr.package,
+                range: pr.range,
+            },
+            ViolationDetail { bindings },
+        );
+    }
+    for workspace_peer in workspace {
+        let pr = &workspace_peer.requirement;
+        // A local package's declared peer must still be a package the workspace itself declares:
+        // a contract naming something only the resolver placed transitively is its to re-place.
+        if !members.declares(&pr.package) {
+            continue;
+        }
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        match &install {
+            // The contract binds where the manifest lives — its origin directory, resolved
+            // physically. One context, exactly identified: no same-named package elsewhere in the
+            // tree can stand in for it.
+            Some(install) => {
+                if let Some((peer_version, _)) =
+                    install.member_resolution(&workspace_peer.origin, &pr.package)
+                    && version::range_match(&pr.range, peer_version) == RangeMatch::Excludes
+                {
+                    bindings.push((workspace_peer.origin.clone(), peer_version.to_string()));
+                }
+            }
+            // A declaration-isolated layout (pnpm): the contract binds in each importer that has
+            // the local package present, against that importer's own declared copy.
+            None => {
+                for context in &workspace_peer.contexts {
+                    let Some(peer_version) = members.resolved_version(context, &pr.package) else {
+                        continue;
+                    };
+                    if version::range_match(&pr.range, peer_version) == RangeMatch::Excludes {
+                        bindings.push((context.clone(), peer_version.to_string()));
+                    }
+                }
+            }
+        }
+        if bindings.is_empty() {
+            continue;
+        }
+        out.insert(
+            PeerViolationId {
+                dependent: pr.dependent.clone(),
+                dependent_version: pr.dependent_version.clone(),
+                package: pr.package.clone(),
+                range: pr.range.clone(),
+            },
+            ViolationDetail { bindings },
+        );
+    }
+    out
+}
+
+/// The first (smallest-keyed, hence deterministic) peer contract the `after` lock provably
+/// violates that the `before` lock did not already cover ([`baseline_covers`]) — the
+/// [`settle_landed_candidate`] diff in one call, kept as a test-side convenience for exercising
+/// the shared proof and coverage rules against raw lock bodies.
+#[cfg(test)]
+fn first_new_peer_violation<L: NodeLock>(
+    before: Option<&str>,
+    after: &str,
+) -> Option<crate::lock::PeerRequirement> {
+    let baseline = before
+        .map(|lock| proven_peer_violations::<L>(lock, &[]))
+        .unwrap_or_default();
+    proven_peer_violations::<L>(after, &[])
+        .into_iter()
+        .find(|(id, detail)| !baseline_covers(&baseline, id, detail))
+        .map(|(id, _)| id.requirement())
+}
+
+/// Names the lock resolves at more than one distinct version — the whole resolved graph, nested
+/// copies included, unlike [`multi_version_names`], which counts importer *declarations* only.
+/// Tells the gate when npm's name-only importer attribution is ambiguous — consulted only when no
+/// physical layout can resolve the split instance-exactly (see [`direct_dependent_members`]). An
+/// unparsable lock yields the empty set; unreachable in practice, since the peer requirements
+/// that trigger the query parse from the same document.
+fn resolved_multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
+    let mut versions: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, version) in L::parse(content).unwrap_or_default() {
+        versions.entry(name).or_default().insert(version);
+    }
+    versions
+        .into_iter()
+        .filter_map(|(name, set)| (set.len() > 1).then_some(name))
+        .collect()
+}
+
+/// A peer requirement sourced from a workspace-local package's own `package.json` — the contracts
+/// the lock's importer records are NOT authoritative for: a symlinked (`link:`) package's peers
+/// live only in its manifest, an injected (`file:`) package's importer entry carries none either,
+/// and npm's package-lock deliberately leaves the root project's own peers to this source.
+///
+/// `origin` is the manifest's own workspace path — the identity that makes this contract's binding
+/// context exact rather than name-keyed. It is where the package physically lives, and therefore
+/// where its `require`/peer lookups start: node resolves a symlinked workspace package from its
+/// real path (`--preserve-symlinks` is off by default), so a consumer's hoisted alias directory is
+/// NOT a second binding context — the package always sees its own nested copies first.
+///
+/// `contexts` are the importer paths the contract binds in on a declaration-isolated layout
+/// (pnpm): the package's own directory plus every importer that consumes or declares it.
+struct WorkspacePeer {
+    requirement: crate::lock::PeerRequirement,
+    origin: String,
+    contexts: Vec<String>,
+}
+
+/// Reads every workspace member manifest and returns its declared peer requirements with the
+/// contexts they bind in (see [`WorkspacePeer`]). A member manifest that is missing, unreadable,
+/// or nameless is skipped — fail open, the shared rule for every evidence source of this gate. A
+/// manifest without a version reports `workspace`, so the blame line still reads naturally.
+fn workspace_peer_requirements<L: NodeLock>(
+    root: &Utf8Path,
+    lock: &str,
+    members: &crate::lock::MemberIndex,
+) -> Vec<WorkspacePeer> {
+    let locals = L::local_package_consumers(lock);
+    // Candidate member dirs: every member directory the lock records ([`NodeLock::member_paths`] —
+    // including one that declares nothing, whose `package.json` still owns binding peer contracts,
+    // and npm's root, whose peers the lock deliberately omits), every importer that declares
+    // something, PLUS every local-package target (symlinked `link:` or injected `file:`) — a
+    // pure-peer local package can appear in the lock only as the target of its consumers' entries.
+    let mut paths: Vec<String> = L::member_paths(lock)
+        .into_iter()
+        .chain(members.all_paths())
+        .chain(locals.keys().cloned())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut out = Vec::new();
+    for path in paths {
+        // Both path sources validate at their parse boundary, but this is the one place lock
+        // data reaches the filesystem — keep the workspace-containment check where it matters.
+        if !crate::lock::is_workspace_relative(&path) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(root.join(&path).join("package.json")) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(name) = doc.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let version = doc
+            .get("version")
+            .and_then(|value| value.as_str())
+            .unwrap_or("workspace");
+        let Some(peers) = doc
+            .get("peerDependencies")
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+        let mut contexts = vec![path.clone()];
+        contexts.extend(locals.get(&path).into_iter().flatten().cloned());
+        // npm attributes importer declarations by name, so a member consumed as a workspace
+        // dependency contributes its declarers as binding contexts too.
+        contexts.extend(members.members_for(name, version));
+        contexts.sort();
+        contexts.dedup();
+        for (peer, range) in peers {
+            if let Some(range) = range.as_str() {
+                out.push(WorkspacePeer {
+                    requirement: crate::lock::PeerRequirement {
+                        dependent: name.to_string(),
+                        dependent_version: version.to_string(),
+                        package: peer.clone(),
+                        range: range.to_string(),
+                    },
+                    origin: path.clone(),
+                    contexts: contexts.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The workspace-manifest peer requirement that structurally excludes `change`'s target, when one
+/// exists — the manifest-sourced sibling of [`peer_hold`], judged with the same tri-state range
+/// proof. A workspace-local dependent never moves in a plan (it is consumed locally — symlinked or
+/// injected — not resolved from the registry), so no co-move exemption applies: only a deliberate
+/// edit of its own peer range lifts the hold.
+///
+/// Unlike [`peer_hold`] this does NOT require the move to cross a compatibility line. A published
+/// peer contract is the one range cooldown will not rewrite for the author
+/// ([`WIDENABLE_FIELDS`](manifest) omits `peerDependencies`), so the gate must catch *every*
+/// provable break or a same-line move would land against a contract that still excludes it: a
+/// narrow author-written bound (`>=5.6.0 <5.6.2`) is violated by a mere patch bump, which no
+/// compatibility-line test sees. The range proof is unchanged and remains the real test — it must
+/// match the current version and provably exclude the target — so widening the trigger can only
+/// add holds for demonstrable violations.
+fn workspace_peer_hold<'a>(
+    change: &Change,
+    workspace: &'a [WorkspacePeer],
+    multi_version: &HashSet<String>,
+    install: Option<&crate::lock::InstallPaths>,
+) -> Option<&'a crate::lock::PeerRequirement> {
+    if change.downgrade || multi_version.contains(&change.package.name) {
+        return None;
+    }
+    let rewritten = install.map(|install| rewritten_dirs(install, change));
+    workspace
+        .iter()
+        .filter(|workspace_peer| {
+            let pr = &workspace_peer.requirement;
+            pr.package == change.package.name
+                && pr.dependent != change.package.name
+                && version::range_match(&pr.range, change.from.as_str()) == RangeMatch::Matches
+                && version::range_match(&pr.range, change.to.as_str()) == RangeMatch::Excludes
+                // Visibility follows the layout (see `dependent_holds_context`): npm's hoisted
+                // tree is judged physically from the manifest's OWN directory — the origin, not
+                // any same-named package elsewhere in the tree — and the copy it binds must be a
+                // copy this change actually rewrites, not merely a same-version instance
+                // elsewhere. pnpm's isolated importers go by context overlap.
+                && match (install, &rewritten) {
+                    (Some(install), Some(rewritten)) => install
+                        .member_resolution(&workspace_peer.origin, &change.package.name)
+                        .is_some_and(|(_, bound)| rewritten.contains(&bound)),
+                    _ => members_overlap(&change.members, &workspace_peer.contexts),
+                }
+        })
+        .map(|workspace_peer| &workspace_peer.requirement)
+        .min_by_key(|pr| (&pr.dependent, &pr.dependent_version))
+}
+
+/// The install directories `change` actually rewrites: each declaring member's own resolution of
+/// the package, when it currently sits at the change's `from` version — moving `host` for
+/// `apps/b` rewrites the copy `apps/b` resolves, never an unrelated same-version copy nested in
+/// another subtree, so a dependent bound to the latter must not hold the former. A change without
+/// member attribution moves the name in every context (the single-context default), so every
+/// instance at the current version counts.
+fn rewritten_dirs<'i>(install: &'i crate::lock::InstallPaths, change: &Change) -> Vec<&'i str> {
+    if change.members.is_empty() {
+        return install.instance_dirs(&change.package.name, change.from.as_str());
+    }
+    let mut dirs: Vec<&str> = change
+        .members
+        .iter()
+        .filter_map(|member| install.member_resolution(&member.path, &change.package.name))
+        .filter(|(version, _)| *version == change.from.as_str())
+        .map(|(_, dir)| dir)
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+/// Whether `from → to` crosses an npm compatibility line: [`major_key`](version::major_key)
+/// inequality — the same predicate that gates `--major`, so `0.1 → 0.2` crosses (npm caret
+/// semantics: the 0.x minor is the breaking axis) — refined for `0.0.x`, where the caret admits
+/// nothing beyond the exact version (`^0.0.3` ⇔ `=0.0.3`), so *every* `0.0.x` step is a breaking
+/// move even though [`major_key`](version::major_key) keeps the whole range on one `0.0` line and
+/// `--major` does not gate inside it. The refinement only widens where the gate still demands
+/// proof (a range matching the current version and provably excluding the target), so it can add
+/// holds only for true violations. An unparsable version never crosses (fail open).
+fn crosses_compatibility_line(from: &str, to: &str) -> bool {
+    let (Some(from_version), Some(to_version)) = (version::parse(from), version::parse(to)) else {
+        return false;
+    };
+    if from_version.major == 0 && from_version.minor == 0 && from_version != to_version {
+        return true;
+    }
+    version::major_key(from) != version::major_key(to)
+}
+
+/// The lock-recorded peer requirement that structurally excludes `change`'s target, when one exists
+/// (see [`partition_peer_held`] for the gating rules). Blame is deterministic: the first blocker by
+/// `(dependent, dependent_version)`.
+fn peer_hold<'a>(
+    change: &Change,
+    requirements: &'a [crate::lock::PeerRequirement],
+    members: &crate::lock::MemberIndex,
+    multi_version: &HashSet<String>,
+    resolved_splits: &HashSet<String>,
+    moving: &[&Change],
+    install: Option<&crate::lock::InstallPaths>,
+) -> Option<&'a crate::lock::PeerRequirement> {
+    if change.downgrade
+        || !crosses_compatibility_line(change.from.as_str(), change.to.as_str())
+        || multi_version.contains(&change.package.name)
+    {
+        return None;
+    }
+    requirements
+        .iter()
+        .filter(|pr| {
+            pr.package == change.package.name
+                && pr.dependent != change.package.name
+                && version::range_match(&pr.range, change.from.as_str()) == RangeMatch::Matches
+                && version::range_match(&pr.range, change.to.as_str()) == RangeMatch::Excludes
+                && dependent_holds_context(change, pr, members, resolved_splits, moving, install)
+        })
+        .min_by_key(|pr| (&pr.dependent, &pr.dependent_version))
+}
+
+/// Whether the peer-declaring dependent is a held-in-place *direct* dependent of the change's
+/// importing context — the only shape whose lock-recorded peer range is authoritative for this move
+/// (see [`partition_peer_held`] for the full rules and their rationale).
+fn dependent_holds_context(
+    change: &Change,
+    pr: &crate::lock::PeerRequirement,
+    members: &crate::lock::MemberIndex,
+    resolved_splits: &HashSet<String>,
+    moving: &[&Change],
+    install: Option<&crate::lock::InstallPaths>,
+) -> bool {
+    let Some(dependent_members) = direct_dependent_members(
+        members,
+        install,
+        &pr.dependent,
+        &pr.dependent_version,
+        resolved_splits,
+    ) else {
+        return false;
+    };
+    // The dependent itself moves in (one of) its own importing contexts: its target may lift the
+    // peer range — joint feasibility is the resolver's decision.
+    if moving.iter().any(|other| {
+        other.package.name == pr.dependent && members_overlap(&other.members, &dependent_members)
+    }) {
+        return false;
+    }
+    // Peers resolve against the importing context — which the layout defines. npm's hoisted tree
+    // is judged physically, per direct instance: some member's own dependent copy must resolve the
+    // package at a copy this change actually rewrites — directory identity, not merely the same
+    // version, since an unrelated same-version instance in another subtree survives the move
+    // untouched (disjoint members' packages meet at the root `node_modules`, while a nested
+    // copy — conflicting or satisfying — shadows it). pnpm's importers are isolated by
+    // declaration, so there disjoint importers keep their own in-range copy and member overlap
+    // decides.
+    match install {
+        Some(install) => {
+            let rewritten = rewritten_dirs(install, change);
+            dependent_members.iter().any(|member| {
+                install
+                    .member_resolution(member, &pr.dependent)
+                    .and_then(|(_, instance)| install.resolve_from(instance, &change.package.name))
+                    .is_some_and(|(_, bound)| rewritten.contains(&bound))
+            })
+        }
+        None => {
+            change.members.is_empty()
+                || change
+                    .members
+                    .iter()
+                    .any(|member| dependent_members.contains(&member.path))
+        }
+    }
+}
+
+/// The importers declaring `dependent` — but only when the lock's attribution *proves* this is
+/// the direct instance, `None` otherwise. Shared by the pre-apply gate
+/// ([`dependent_holds_context`]) and the post-apply verification ([`proven_peer_violations`]), so
+/// the two cannot drift on what "direct" means:
+///
+/// - no importer attribution → transitive: the resolver may float it, so its recorded peer range
+///   is never authoritative;
+/// - with a physical layout (npm), attribution is instance-exact even though the declarations are
+///   name-only: a declaring member is direct for THIS record exactly when its own
+///   nearest-ancestor lookup resolves the dependent at this record's version — a nested copy of
+///   the same name (even at another version) neither masquerades as direct nor blinds the real
+///   direct copy;
+/// - without one (pnpm is version-exact and unaffected; an npm v1 lock records no layout),
+///   name-only attribution of a name resolved at several versions cannot single out the direct
+///   instance from a nested transitive copy — fail open.
+fn direct_dependent_members(
+    members: &crate::lock::MemberIndex,
+    install: Option<&crate::lock::InstallPaths>,
+    dependent: &str,
+    dependent_version: &str,
+    resolved_splits: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let dependent_members = members.members_for(dependent, dependent_version);
+    if dependent_members.is_empty() {
+        return None;
+    }
+    let Some(install) = install else {
+        if !members.version_attributed(dependent, dependent_version)
+            && resolved_splits.contains(dependent)
+        {
+            return None;
+        }
+        return Some(dependent_members);
+    };
+    let direct: Vec<String> = dependent_members
+        .into_iter()
+        .filter(|member| {
+            install
+                .member_resolution(member, dependent)
+                .is_some_and(|(version, _)| version == dependent_version)
+        })
+        .collect();
+    (!direct.is_empty()).then_some(direct)
+}
+
+/// Whether a change's member attribution overlaps the dependent's declaring importers. A change
+/// with no attribution moves the name in every context (the single-context default).
+fn members_overlap(change_members: &[MemberRef], dependent_members: &[String]) -> bool {
+    change_members.is_empty()
+        || change_members
+            .iter()
+            .any(|member| dependent_members.contains(&member.path))
+}
+
 /// Name the package whose peer/version requirement structurally holds `held` below `target`, scanning
 /// the resolved `pnpm-lock.yaml`. pnpm appends a `(peer@x)` suffix to a package key whenever its
 /// presence depends on a peer being resolved a certain way, so a held candidate that has *no* matured
@@ -666,8 +1927,57 @@ fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<(String, String)> {
 }
 
 impl<L: NodeLock> NpmTool<L> {
-    /// For each change, moves the lock with a lock-only update or, after widening the declaring
-    /// `package.json`, a pinned/bare relock, then reports collateral lock movements.
+    async fn run_candidate_landing(
+        &self,
+        project: &Project,
+        candidate_journal: &ProjectMutationJournal,
+        landing: &CandidateLanding,
+    ) -> Result<()> {
+        let (result, retried_without_cutoff) =
+            match self.cmd.run(&project.root, landing.command()).await {
+                Ok(()) => (Ok(()), false),
+                Err(error) => {
+                    let fallback = matches!(&error, CoreError::Tool { .. })
+                        .then(|| without_before(landing.command()))
+                        .flatten();
+                    if let Some(fallback) = fallback {
+                        // An existing, baselined post-cutoff package can make npm's historical-tree
+                        // resolve impossible. Retry from a clean candidate snapshot without the
+                        // native cutoff and let the application policy gate accept, reconcile, or
+                        // roll back the resulting graph against that baseline.
+                        candidate_journal.restore(&project.root)?;
+                        landing.authorized_manifests().restore(&project.root)?;
+                        (self.cmd.run(&project.root, &fallback).await, true)
+                    } else {
+                        (Err(error), false)
+                    }
+                }
+            };
+        match (result, landing) {
+            (
+                Ok(()),
+                CandidateLanding::PinRestoreResync {
+                    authorized_manifests,
+                    resync,
+                    ..
+                },
+            ) => {
+                authorized_manifests.restore(&project.root)?;
+                // The resync must use the same resolver regime as the successful pin; restoring
+                // `--before` here would recreate the historical-tree failure that triggered fallback.
+                let resync = if retried_without_cutoff {
+                    without_before(resync).unwrap_or_else(|| resync.clone())
+                } else {
+                    resync.clone()
+                };
+                self.cmd.run(&project.root, &resync).await
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// For each change, moves the lock with a lock-only update or an exact pin around cooldown's
+    /// authorized manifest edits, then reports collateral lock movements.
     ///
     /// npm's `--before` constrains the complete resolved tree, so even a per-package command can move
     /// transitives. Diffing the journaled lock against the final lock keeps those movements visible.
@@ -676,16 +1986,13 @@ impl<L: NodeLock> NpmTool<L> {
         project: &Project,
         plan: &Plan,
         baseline_journal: &ProjectMutationJournal,
+        workspace: &[WorkspacePeer],
     ) -> Result<ApplyReport> {
-        let before = baseline_journal
-            .files
-            .iter()
-            .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
-            .and_then(|file| file.contents.as_deref())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        let before = journaled_lock::<L>(baseline_journal)
             .map(locked_versions::<L>)
             .unwrap_or_default();
         let mut report = ApplyReport::default();
+        let mut violation_baseline: Option<PeerViolations> = None;
         for change in &plan.changes {
             // A failed later candidate must not leak its widened manifest when an earlier sibling
             // succeeded and makes the outer batch committable. Capture the state after those earlier
@@ -695,56 +2002,28 @@ impl<L: NodeLock> NpmTool<L> {
                 ..plan.clone()
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
-            let mut rewrote_manifest = false;
-            let args = if let Some(args) = lockonly_command::<L>(project, change, plan.rewrite)? {
-                args
-            } else {
-                let rewrite = manifest::widen_constraints(
-                    &project.root,
-                    &change.members,
-                    &change.package.name,
-                    change.to.as_str(),
-                )?;
-                if rewrite.modified.is_empty() {
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::NotEligible,
-                        offending: Some(change.package.clone()),
-                    });
-                    continue;
-                }
-                rewrote_manifest = true;
-                rewrite_relock::<L>(project, change)?
+            let Some(landing) = candidate_landing::<L>(project, change, plan.rewrite)? else {
+                report.skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::NotEligible,
+                    offending: Some(change.package.clone()),
+                    detail: None,
+                });
+                continue;
             };
-            let result = match self.cmd.run(&project.root, &args).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let fallback = matches!(&error, CoreError::Tool { .. })
-                        .then(|| without_before(&args))
-                        .flatten();
-                    if let Some(fallback) = fallback {
-                        // An existing, baselined post-cutoff package can make npm's historical-tree
-                        // resolve impossible. Retry from a clean candidate snapshot without the
-                        // native cutoff and let the application policy gate accept, reconcile, or
-                        // roll back the resulting graph against that baseline.
-                        candidate_journal.restore(&project.root)?;
-                        if rewrote_manifest {
-                            manifest::widen_constraints(
-                                &project.root,
-                                &change.members,
-                                &change.package.name,
-                                change.to.as_str(),
-                            )?;
-                        }
-                        self.cmd.run(&project.root, &fallback).await
-                    } else {
-                        Err(error)
-                    }
-                }
-            };
+            let result = self
+                .run_candidate_landing(project, &candidate_journal, &landing)
+                .await;
             match result {
                 Ok(()) if exact_target_reached::<L>(project, change)? => {
-                    report.applied.push(change.clone());
+                    settle_landed_candidate::<L>(
+                        project,
+                        change,
+                        &candidate_journal,
+                        workspace,
+                        &mut violation_baseline,
+                        &mut report,
+                    )?;
                 }
                 Ok(()) => {
                     candidate_journal.restore(&project.root)?;
@@ -752,6 +2031,7 @@ impl<L: NodeLock> NpmTool<L> {
                         change: change.clone(),
                         reason: SkipReason::ResolverConflict,
                         offending: Some(change.package.clone()),
+                        detail: None,
                     });
                 }
                 Err(error) => {
@@ -774,9 +2054,10 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(report)
     }
 
-    /// Re-resolve the **whole** importer graph once (pnpm), pinning every planned candidate to its
-    /// EXACT per-package target, then report the full before/after lock diff — the proven cargo/go
-    /// pattern ported to pnpm.
+    /// Re-resolve the **whole** importer graph jointly (pnpm), pinning every planned candidate to
+    /// its EXACT per-package target, then report the full before/after lock diff — the proven
+    /// cargo/go pattern ported to pnpm. Peer verification can reject candidates and re-resolve,
+    /// so one apply may run several native resolves (see [`Self::resolve_and_verify_peers`]).
     ///
     /// One importer-filtered `pnpm update <pkg>@<target> … --lockfile-only --no-save` jointly
     /// re-resolves the affected graph, settling mutually-exclusive peer conflicts at a single fixed
@@ -797,12 +2078,18 @@ impl<L: NodeLock> NpmTool<L> {
     /// The report is the diff of the journal's pre-apply lock against the result, so every planned
     /// candidate is reported reached or held (naming the conflicting peer where attributable) and
     /// every collateral move of an unplanned package surfaces as its own row. A resolver failure
-    /// after the repair retry marks the conflicting candidates held.
+    /// after the repair retry marks the conflicting candidates held. The accepted result is
+    /// post-verified against the pre-apply peer contracts *between workspace-declared packages in
+    /// a context that demonstrably binds them* — the lock's own records plus every workspace
+    /// member manifest's ([`proven_peer_violations`]): pnpm only warns on a peer mismatch, so a
+    /// candidate whose landing provably breaks such a contract (its pair held outside the plan) is
+    /// rejected `peer_held` and the remainder re-resolved rather than committing the break.
     async fn apply_whole_graph(
         &self,
         project: &Project,
         plan: &Plan,
         journal: &ProjectMutationJournal,
+        workspace: &[WorkspacePeer],
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
@@ -812,12 +2099,7 @@ impl<L: NodeLock> NpmTool<L> {
         // The pre-apply lock, captured in the journal. Both the newest-version map (for the move diff)
         // and the multi-version set (for the exact-pin-vs-float decision) are derived from this one
         // copy — no extra disk read, and both see exactly the lock the resolve starts from.
-        let before_content = journal
-            .files
-            .iter()
-            .find(|file| file.path == Utf8Path::new(L::LOCKFILE))
-            .and_then(|file| file.contents.as_deref())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let before_content = journaled_lock::<L>(journal);
         let before = before_content.map(locked_versions::<L>).unwrap_or_default();
         let multi_version = before_content
             .map(multi_version_names::<L>)
@@ -831,43 +2113,38 @@ impl<L: NodeLock> NpmTool<L> {
         // per-package target, so its own (possibly stricter) window is enforced by the pin, not this cap.
         let window_minutes =
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
-        let first_resolve = self
-            .whole_graph_resolve(project, plan, &multi_version, window_minutes)
-            .await;
-        match first_resolve {
-            Ok(()) => {}
-            Err(error) if error.is_local_environment_failure() => return Err(error),
-            Err(error)
-                if minimum_age_lock_rejected(&error)
-                    && window_minutes.is_some_and(|minutes| minutes > 0)
-                    && L::NATIVE_MIN_AGE_FILE.is_some() =>
-            {
-                // A persisted minimumReleaseAge validates the starting lock before pnpm applies the
-                // exact pins. Restore any partial resolver work, then rebuild through temporary exact
-                // overrides while retaining the age floor.
-                journal.restore(&project.root)?;
-                self.repair_policy_rejected_graph(project, plan, &multi_version, window_minutes)
-                    .await?;
-            }
-            // The joint resolve is unsatisfiable as a whole. Propagate the failure so the caller's
-            // `apply_resilient` can isolate the offending candidate(s) (an unfetchable version, one
-            // side of a conflict) and apply the rest, instead of holding every candidate. The caller
-            // restores the journal, so no partial lock is kept.
-            Err(error) => return Err(error),
-        }
 
-        let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-        if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
-            return Err(CoreError::StaleLock(detail));
-        }
+        let mut peer_skips: Vec<Skipped> = Vec::new();
+        let after_content = self
+            .resolve_and_verify_peers(
+                project,
+                &JointResolve {
+                    plan,
+                    journal,
+                    multi_version: &multi_version,
+                    window_minutes,
+                    workspace,
+                },
+                &mut peer_skips,
+            )
+            .await?;
         let after = locked_versions::<L>(&after_content);
         // Per-importer resolved versions, so a candidate's landing is judged at *its* member rather
         // than the name's newest copy — the multi-version float leaves a lower line short of a
         // cross-line target the higher line already satisfies.
         let after_members = L::member_sources(&after_content);
 
+        // A peer-rejected candidate already carries its structured skip row; the diff loop below
+        // must not add a second (resolver-conflict) verdict for it.
+        let peer_rejected: HashSet<(&str, &str)> = peer_skips
+            .iter()
+            .map(|skip| (skip.change.package.name.as_str(), skip.change.to.as_str()))
+            .collect();
         for change in &plan.changes {
             let name = change.package.name.as_str();
+            if peer_rejected.contains(&(name, change.to.as_str())) {
+                continue;
+            }
             // Whether the lock's version for this name actually moved. A name can resolve to several
             // copies in a pnpm graph; `before`/`after` track its *newest* copy, so a candidate planned
             // off a stale duplicate copy whose newest copy is already at the target shows no net move.
@@ -893,6 +2170,7 @@ impl<L: NodeLock> NpmTool<L> {
                     change: change.clone(),
                     reason: SkipReason::MultiVersionHeld,
                     offending: None,
+                    detail: None,
                 });
             } else {
                 // The joint resolve could not place this candidate at its target without breaking the
@@ -905,9 +2183,12 @@ impl<L: NodeLock> NpmTool<L> {
                     change: change.clone(),
                     reason: SkipReason::ResolverConflict,
                     offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
+                    detail: None,
                 });
             }
         }
+
+        report.skipped.extend(peer_skips);
 
         // The hard requirement: no net version change to *any* package may be omitted. Every moved
         // package the applied rows above do not already report is surfaced as its own collateral
@@ -916,6 +2197,95 @@ impl<L: NodeLock> NpmTool<L> {
         let collateral = collateral_changes::<L>(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
+    }
+
+    /// Runs the joint resolve to a verified fixed point and returns the accepted lock content.
+    /// pnpm only *warns* on a peer mismatch, so the resolve can commit a graph that provably
+    /// breaks a recorded contract between two importer-declared packages when one side of a pair
+    /// is missing from the plan (a host held by a ceiling while its dependent moves —
+    /// `react-dom@19(react@18)` requiring `react@^19`).
+    ///
+    /// Each round runs the resolve, then diffs the proven violations against the pre-apply
+    /// baseline (gathered once — see [`PeerBaseline`]) and rejects every candidate a violation
+    /// uniquely proves culpable ([`plan_peer_rejections`]) with structured `peer_held` blame; the
+    /// journal is restored and the remainder re-resolved, so unrelated moves survive without the
+    /// caller's bisect and extra rounds correspond only to real cascades. An unattributable
+    /// violation propagates as a non-local rejection for candidate isolation. The rounds are
+    /// bounded by the plan length (each continuing round removes at least one candidate); when
+    /// every candidate is rejected, the restored pre-apply lock is the result.
+    async fn resolve_and_verify_peers(
+        &self,
+        project: &Project,
+        inputs: &JointResolve<'_>,
+        peer_skips: &mut Vec<Skipped>,
+    ) -> Result<String> {
+        let &JointResolve {
+            plan,
+            journal,
+            multi_version,
+            window_minutes,
+            workspace,
+        } = inputs;
+        let before_content = journaled_lock::<L>(journal);
+        let baseline = PeerBaseline::gather::<L>(before_content, workspace);
+        let mut active = plan.clone();
+        loop {
+            let resolve = self
+                .whole_graph_resolve(project, &active, multi_version, window_minutes)
+                .await;
+            match resolve {
+                Ok(()) => {}
+                Err(error) if error.is_local_environment_failure() => return Err(error),
+                Err(error)
+                    if minimum_age_lock_rejected(&error)
+                        && window_minutes.is_some_and(|minutes| minutes > 0)
+                        && L::NATIVE_MIN_AGE_FILE.is_some() =>
+                {
+                    // A persisted minimumReleaseAge validates the starting lock before pnpm
+                    // applies the exact pins. Restore any partial resolver work, then rebuild
+                    // through temporary exact overrides while retaining the age floor.
+                    journal.restore(&project.root)?;
+                    self.repair_policy_rejected_graph(
+                        project,
+                        &active,
+                        multi_version,
+                        window_minutes,
+                    )
+                    .await?;
+                }
+                // The joint resolve is unsatisfiable as a whole. Propagate the failure so the
+                // caller's `apply_resilient` can isolate the offending candidate(s) (an
+                // unfetchable version, one side of a conflict) and apply the rest, instead of
+                // holding every candidate. The caller restores the journal, so no partial lock
+                // is kept.
+                Err(error) => return Err(error),
+            }
+
+            let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+            if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
+                return Err(CoreError::StaleLock(detail));
+            }
+            let current = proven_peer_violations::<L>(&after_content, workspace);
+            let mut rejections = plan_peer_rejections(&baseline, &current, &active, multi_version)?;
+            if rejections.is_empty() {
+                return Ok(after_content);
+            }
+            // Highest index first, so each removal leaves the remaining indices valid.
+            rejections.sort_by_key(|rejection| std::cmp::Reverse(rejection.index));
+            for rejection in rejections {
+                let change = active.changes.remove(rejection.index);
+                peer_skips.push(peer_held_skip::<L>(
+                    &change,
+                    &rejection.violation,
+                    rejection.offending,
+                ));
+            }
+            journal.restore(&project.root)?;
+            if active.changes.is_empty() {
+                // Every candidate was rejected; the restored journal is the result.
+                return Ok(before_content.unwrap_or_default().to_string());
+            }
+        }
     }
 
     /// Build the per-candidate pins, widen the manifests the exact pins need, then run one joint
@@ -994,6 +2364,7 @@ impl<L: NodeLock> NpmTool<L> {
                     &change.members,
                     &change.package.name,
                     change.to.as_str(),
+                    plan.rewrite,
                 )?;
             }
             if change.members.is_empty() {
@@ -1214,15 +2585,30 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         plan: &Plan,
         journal: &ProjectMutationJournal,
     ) -> Result<ApplyReport> {
-        // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph in one
-        // pass and reports the full before/after lock diff, so a candidate can never silently move
+        // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
+        // work: a cross-major target a still-present dependent's peer range excludes is held up
+        // front — pnpm's resolver only *warns* on the mismatch, and npm (which rejects it by
+        // default) commits it under relaxed enforcement. The gated changes never reach the
+        // resolve (no manifest widen, no pin). Workspace member manifests are read from disk here
+        // — still pre-apply state — because the lock is not authoritative for a local package's
+        // peer contracts.
+        let lock = journaled_lock::<L>(journal);
+        let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock);
+        let (plan, peer_held) = partition_peer_held::<L>(plan, &evidence);
+        // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
+        // jointly (peer verification may reject candidates and re-resolve) and reports the full
+        // before/after lock diff, so a candidate can never silently move
         // another package and mutually-exclusive peers settle at a single fixed point. The others
         // (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock path.
-        if L::supports_whole_graph_resolve() {
-            self.apply_whole_graph(project, plan, journal).await
+        let mut report = if L::supports_whole_graph_resolve() {
+            self.apply_whole_graph(project, &plan, journal, &evidence.workspace)
+                .await?
         } else {
-            self.apply_per_package(project, plan, journal).await
-        }
+            self.apply_per_package(project, &plan, journal, &evidence.workspace)
+                .await?
+        };
+        report.skipped.extend(peer_held);
+        Ok(report)
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
@@ -1522,7 +2908,74 @@ mod tests {
     use super::*;
     use crate::lock::{Npm, Pnpm};
     use camino::Utf8PathBuf;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
+
+    fn raw(version: &str) -> RawRelease {
+        RawRelease {
+            version: cooldown_core::Version::new(version),
+            published_at: None,
+            yanked: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Only releases ordered strictly above the `latest`-tagged version are marked beyond the tag
+    /// (the fumadocs-core shape: `17.0.0` above `latest = 16.13.0`).
+    #[test]
+    fn build_releases_marks_only_releases_above_the_latest_tag() {
+        let releases = build_releases(
+            "16.11.4",
+            vec![raw("16.11.4"), raw("17.0.0"), raw("16.13.0")],
+            Some("16.13.0"),
+        );
+        let beyond: Vec<&str> = releases
+            .iter()
+            .filter(|release| release.beyond_latest_tag)
+            .map(|release| release.version.as_str())
+            .collect();
+        assert_eq!(beyond, vec!["17.0.0"]);
+    }
+
+    /// A tag naming a version absent from the release list (a registry inconsistency) fails open:
+    /// nothing is marked, so no ceiling applies. Same for no tag at all.
+    #[test]
+    fn unknown_or_absent_latest_tag_marks_nothing() {
+        for tag in [Some("99.0.0"), None] {
+            let releases = build_releases("1.0.0", vec![raw("1.0.0"), raw("2.0.0")], tag);
+            assert!(
+                releases.iter().all(|release| !release.beyond_latest_tag),
+                "tag {tag:?} must not mark any release"
+            );
+        }
+    }
+
+    /// A tag at the newest release marks nothing — every release is at or below it.
+    #[test]
+    fn tag_at_the_newest_release_marks_nothing() {
+        let releases = build_releases(
+            "1.0.0",
+            vec![raw("1.0.0"), raw("1.1.0"), raw("2.0.0")],
+            Some("2.0.0"),
+        );
+        assert!(releases.iter().all(|release| !release.beyond_latest_tag));
+    }
+
+    /// A prerelease ordered above the tag is marked too — harmless for the prerelease rule (quality
+    /// already excludes it) but it keeps the marker's meaning uniform: "ordered above the tag".
+    #[test]
+    fn prerelease_above_the_tag_is_marked() {
+        let releases = build_releases(
+            "1.0.0",
+            vec![raw("1.0.0"), raw("2.0.0"), raw("3.0.0-rc.1")],
+            Some("2.0.0"),
+        );
+        let beyond: Vec<&str> = releases
+            .iter()
+            .filter(|release| release.beyond_latest_tag)
+            .map(|release| release.version.as_str())
+            .collect();
+        assert_eq!(beyond, vec!["3.0.0-rc.1"]);
+    }
 
     #[test]
     fn window_minutes_from_cutoff_handles_spans_and_absolute_instants() {
@@ -2371,6 +3824,2023 @@ packages:
         }
     }
 
+    /// The fumadocs shape as a pnpm lock: the root importer declares `fumadocs-core` and
+    /// `fumadocs-mdx`; mdx peer-requires `fumadocs-core@^16.0.0`.
+    const PEER_LOCK: &str = indoc! {"
+        lockfileVersion: '9.0'
+
+        importers:
+
+          .:
+            dependencies:
+              fumadocs-core:
+                specifier: ^16.0.0
+                version: 16.11.4
+              fumadocs-mdx:
+                specifier: ^15.0.0
+                version: 15.1.1(fumadocs-core@16.11.4)
+
+        packages:
+
+          fumadocs-core@16.11.4:
+            resolution: {integrity: sha512-aaa}
+
+          fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+            resolution: {integrity: sha512-bbb}
+            peerDependencies:
+              fumadocs-core: ^16.0.0
+    "};
+
+    fn plan_of(changes: Vec<Change>) -> Plan {
+        Plan {
+            changes,
+            ..Plan::default()
+        }
+    }
+
+    /// Gathers lock-only peer evidence (no workspace root, so no manifest source) and partitions —
+    /// the shape most gate tests exercise.
+    fn peer_partition<L: NodeLock>(plan: &Plan, lock: Option<&str>) -> (Plan, Vec<Skipped>) {
+        partition_peer_held::<L>(plan, &PeerEvidence::gather::<L>(None, lock))
+    }
+
+    /// The trap itself: a cross-major target a still-present dependent's peer range excludes is
+    /// held up front, naming the dependent and its verbatim range — pnpm would only warn and land
+    /// the break silently.
+    #[test]
+    fn peer_gate_holds_a_cross_major_target_excluded_by_a_dependent_range() {
+        let plan = plan_of(vec![change("fumadocs-core", "16.11.4", "17.0.0")]);
+
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(PEER_LOCK));
+
+        assert!(
+            retained.changes.is_empty(),
+            "the gated change never resolves"
+        );
+        let held = skipped.first().expect("one peer hold");
+        assert_eq!(held.reason, SkipReason::PeerHeld);
+        assert_eq!(
+            held.offending.as_ref().map(|package| package.name.as_str()),
+            Some("fumadocs-mdx")
+        );
+        assert_eq!(
+            held.detail.as_deref(),
+            Some("held: fumadocs-mdx@15.1.1 requires fumadocs-core@^16.0.0")
+        );
+    }
+
+    /// A peer range that unions majors (`^7.0.0 || ^8.0.0`, the common peer idiom) gates a move
+    /// beyond the union and passes one within it.
+    #[test]
+    fn peer_gate_judges_union_ranges() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.0
+                  '@typescript-eslint/eslint-plugin':
+                    specifier: 6.21.0
+                    version: 6.21.0(eslint@8.57.0)
+
+            packages:
+
+              '@typescript-eslint/eslint-plugin@6.21.0':
+                resolution: {integrity: sha512-aaa}
+                peerDependencies:
+                  eslint: ^7.0.0 || ^8.0.0
+        "};
+
+        // 8 → 9 leaves the union: held, blaming the plugin.
+        let cross = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("@typescript-eslint/eslint-plugin")
+        );
+
+        // 7 → 8 stays within the union: the resolver's business.
+        let within = plan_of(vec![change("eslint", "7.32.0", "8.57.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
+        assert_eq!(retained.changes.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// A *transitive* dependent never gates: the resolver may float it within its parents' ranges
+    /// to a sibling version whose peer range admits the target (npm does exactly this), so its
+    /// lock-recorded peer range is not authoritative — the real-world `eslint-plugin-jsdoc` shape.
+    #[test]
+    fn peer_gate_never_gates_on_a_transitive_dependent() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^9.16.0
+                    version: 9.16.0
+                  eslint-config-treesitter:
+                    specifier: ^1.0.2
+                    version: 1.0.2(eslint@9.16.0)
+
+            packages:
+
+              eslint-plugin-jsdoc@50.6.0(eslint@9.16.0):
+                resolution: {integrity: sha512-aaa}
+                peerDependencies:
+                  eslint: ^7.0.0 || ^8.0.0 || ^9.0.0
+        "};
+
+        let plan = plan_of(vec![change("eslint", "9.16.0", "10.6.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        assert_eq!(
+            retained.changes.len(),
+            1,
+            "a transitive dependent's peer range must not hold the move"
+        );
+        assert!(skipped.is_empty());
+    }
+
+    /// Fail-open rules: an in-range move is the resolver's business, and a dependent moving in the
+    /// same plan may lift its own peer range, so joint moves stay with the resolver too.
+    #[test]
+    fn peer_gate_passes_in_range_moves_and_joint_moves() {
+        // A minor move inside the peer range never gates.
+        let minor = plan_of(vec![change("fumadocs-core", "16.11.4", "16.13.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&minor, Some(PEER_LOCK));
+        assert_eq!(retained.changes.len(), 1);
+        assert!(skipped.is_empty());
+
+        // The dependent co-moves in the same plan: the resolver decides joint feasibility. This is
+        // deliberately fail-open — the lock records only the dependent's *current* peer range, so
+        // whether its target admits the moved package is unknowable here; the resolve that follows
+        // is the authority (pnpm settles both peer contexts in its one whole-graph pass).
+        let joint = plan_of(vec![
+            change("fumadocs-core", "16.11.4", "17.0.0"),
+            change("fumadocs-mdx", "15.1.1", "16.0.0"),
+        ]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&joint, Some(PEER_LOCK));
+        assert_eq!(retained.changes.len(), 2);
+        assert!(skipped.is_empty());
+
+        // No lock captured (a fresh project): nothing to prove, nothing gated.
+        let plan = plan_of(vec![change("fumadocs-core", "16.11.4", "17.0.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, None);
+        assert_eq!(retained.changes.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// A dependent declared only by *other* importers keeps its own in-range copy of the package
+    /// (pnpm resolves peers per importing context), so a change scoped to disjoint members passes.
+    #[test]
+    fn peer_gate_passes_a_change_whose_members_are_disjoint_from_the_dependent() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/site:
+                dependencies:
+                  fumadocs-core:
+                    specifier: ^16.0.0
+                    version: 16.11.4
+
+              apps/docs:
+                dependencies:
+                  fumadocs-core:
+                    specifier: ^16.0.0
+                    version: 16.11.4
+                  fumadocs-mdx:
+                    specifier: ^15.0.0
+                    version: 15.1.1(fumadocs-core@16.11.4)
+
+            packages:
+
+              fumadocs-core@16.11.4:
+                resolution: {integrity: sha512-aaa}
+
+              fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+                resolution: {integrity: sha512-bbb}
+                peerDependencies:
+                  fumadocs-core: ^16.0.0
+        "};
+        let member = |path: &str| MemberRef {
+            name: path.to_string(),
+            path: path.to_string(),
+        };
+
+        // fumadocs-core is declared by both importers, so it is multi-version-safe here only via
+        // members: a change scoped to `apps/site` cannot break `apps/docs`'s mdx peer.
+        let mut site = change("fumadocs-core", "16.11.4", "17.0.0");
+        site.members = vec![member("apps/site")];
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Pnpm>(&plan_of(vec![site]), Some(lock));
+        assert_eq!(retained.changes.len(), 1, "disjoint importers pass");
+        assert!(skipped.is_empty());
+
+        // Scoped to the importer that also declares the dependent, the gate fires.
+        let mut docs = change("fumadocs-core", "16.11.4", "17.0.0");
+        docs.members = vec![member("apps/docs")];
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Pnpm>(&plan_of(vec![docs]), Some(lock));
+        assert!(retained.changes.is_empty());
+        assert_eq!(skipped.len(), 1);
+    }
+
+    /// Exclusion must be *proven*: a range with a branch the matcher cannot represent (an npm
+    /// hyphen range) yields `Unknown`, never a hold — while a fully understood union (x-wildcards
+    /// included) still gates.
+    #[test]
+    fn peer_gate_never_holds_on_a_range_with_an_unrepresentable_branch() {
+        let lock_with_range = |range: &str| {
+            formatdoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      fumadocs-core:
+                        specifier: ^16.0.0
+                        version: 16.11.4
+                      fumadocs-mdx:
+                        specifier: ^15.0.0
+                        version: 15.1.1(fumadocs-core@16.11.4)
+
+                packages:
+
+                  fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+                    resolution: {{integrity: sha512-bbb}}
+                    peerDependencies:
+                      fumadocs-core: '{range}'
+            "}
+        };
+        let plan = plan_of(vec![change("fumadocs-core", "16.11.4", "18.0.0")]);
+
+        // The hyphen branch is unrepresentable: current matches `^16.0.0`, but excluding 18.0.0
+        // cannot be proven, so the move passes to the resolver.
+        let union = lock_with_range("^16.0.0 || 17.0.0 - 17.4.0");
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(&union));
+        assert_eq!(retained.changes.len(), 1, "unproven exclusion never holds");
+        assert!(skipped.is_empty());
+
+        // The x-wildcard union is fully understood: 18.0.0 is provably outside it.
+        let wildcard = lock_with_range("^16.0.0 || 17.x");
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(&wildcard));
+        assert!(retained.changes.is_empty());
+        assert_eq!(skipped.len(), 1);
+    }
+
+    /// An *optional* peer gates like any other when the peer is present: optionality tolerates
+    /// absence (npm skips auto-installing it), not a present copy outside the declared range — and
+    /// the queried peer is by construction present, it is the package being upgraded.
+    #[test]
+    fn peer_gate_holds_an_optional_peer_that_is_present_but_incompatible() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  typescript:
+                    specifier: ^5.5.0
+                    version: 5.5.4
+                  ts-linter:
+                    specifier: ^3.0.0
+                    version: 3.2.0(typescript@5.5.4)
+
+            packages:
+
+              ts-linter@3.2.0(typescript@5.5.4):
+                resolution: {integrity: sha512-aaa}
+                peerDependencies:
+                  typescript: '>=5 <6'
+                peerDependenciesMeta:
+                  typescript:
+                    optional: true
+        "};
+
+        let plan = plan_of(vec![change("typescript", "5.5.4", "6.0.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("ts-linter")
+        );
+    }
+
+    /// `0.1 → 0.2` crosses an npm compatibility line (caret semantics make the 0.x minor the
+    /// breaking axis), so it is gated exactly like a numeric major jump — while a same-line `0.1`
+    /// patch move stays the resolver's business.
+    #[test]
+    fn peer_gate_gates_a_zero_line_jump() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  zod-mini:
+                    specifier: ~0.1.0
+                    version: 0.1.5
+                  zod-adapter:
+                    specifier: ^2.0.0
+                    version: 2.0.0(zod-mini@0.1.5)
+
+            packages:
+
+              zod-adapter@2.0.0(zod-mini@0.1.5):
+                resolution: {integrity: sha512-aaa}
+                peerDependencies:
+                  zod-mini: ~0.1.0
+        "};
+
+        let cross = plan_of(vec![change("zod-mini", "0.1.5", "0.2.0")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
+        assert!(retained.changes.is_empty(), "0.1 → 0.2 is a breaking jump");
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("zod-adapter")
+        );
+
+        let within = plan_of(vec![change("zod-mini", "0.1.5", "0.1.9")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
+        assert_eq!(retained.changes.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// In `0.0.x` the caret admits nothing beyond the exact version (`^0.0.3` ⇔ `=0.0.3`), so even
+    /// a patch step is a breaking move: a dependent's `^0.0.3` provably excludes `0.0.4` and the
+    /// gate must consult that proof rather than exit on "same line".
+    #[test]
+    fn peer_gate_gates_a_double_zero_patch_step() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  proto-kit:
+                    specifier: ^0.0.3
+                    version: 0.0.3
+                  proto-kit-adapter:
+                    specifier: ^1.0.0
+                    version: 1.0.0(proto-kit@0.0.3)
+
+            packages:
+
+              proto-kit-adapter@1.0.0(proto-kit@0.0.3):
+                resolution: {integrity: sha512-aaa}
+                peerDependencies:
+                  proto-kit: ^0.0.3
+        "};
+
+        let plan = plan_of(vec![change("proto-kit", "0.0.3", "0.0.4")]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        assert!(
+            retained.changes.is_empty(),
+            "a 0.0.x step that provably breaks a peer range must hold"
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("proto-kit-adapter")
+        );
+    }
+
+    /// npm's package-lock attributes importer declarations by *name* only, but the physical
+    /// layout is instance-exact: the member's own nearest-ancestor lookup identifies its direct
+    /// copy, so a name resolved at several versions is no longer ambiguity. Both directions
+    /// matter — the nested copy's stricter range must not be promoted to a blocker, and the
+    /// direct copy's stricter range must not be blinded by the nested split (the escape a blanket
+    /// split fail-open used to leave).
+    #[test]
+    fn peer_gate_resolves_npm_name_splits_physically() {
+        let nested_would_block = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "eslint": "^8.40.0", "eslint-plugin-legacy": "^2.0.0" }
+                },
+                "node_modules/eslint": { "version": "8.57.0" },
+                "node_modules/eslint-plugin-legacy": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0 || ^9.0.0" }
+                },
+                "node_modules/report-tool/node_modules/eslint-plugin-legacy": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                }
+            }
+        }"#};
+        let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
+
+        // The nested 1.0.0 copy would bind, but the root's lookup proves its direct copy is the
+        // admitting 2.0.0 — the nested record is the transitive one and holds nothing.
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Npm>(&plan, Some(nested_would_block));
+        assert_eq!(
+            retained.changes.len(),
+            1,
+            "the nested transitive copy must not be promoted to a blocker"
+        );
+        assert!(skipped.is_empty());
+
+        // The inverse split: the DIRECT copy blocks while a nested copy admits. The split must
+        // not blind the gate — the root's own instance is identified physically and holds.
+        let direct_blocks = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "eslint": "^8.40.0", "eslint-plugin-legacy": "^1.0.0" }
+                },
+                "node_modules/eslint": { "version": "8.57.0" },
+                "node_modules/eslint-plugin-legacy": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                },
+                "node_modules/report-tool/node_modules/eslint-plugin-legacy": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0 || ^9.0.0" }
+                }
+            }
+        }"#};
+        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&plan, Some(direct_blocks));
+        assert!(
+            retained.changes.is_empty(),
+            "the direct copy's contract holds despite the nested split"
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("eslint-plugin-legacy")
+        );
+
+        // One resolved version + a declaring importer: that instance IS the direct dependency.
+        let unambiguous = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "eslint": "^8.40.0", "eslint-plugin-legacy": "^1.0.0" }
+                },
+                "node_modules/eslint": { "version": "8.57.0" },
+                "node_modules/eslint-plugin-legacy": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                }
+            }
+        }"#};
+        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&plan, Some(unambiguous));
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("eslint-plugin-legacy")
+        );
+    }
+
+    /// A published peer contract is never rewritten out from under itself, so a narrow
+    /// author-written bound holds even a same-line move: `peerDependencies.chalk =
+    /// ">=5.6.0 <5.6.2"` excludes a 5.6.0 → 5.6.2 patch bump that no compatibility-line test
+    /// sees. The alternative — letting the widen shift the contract to `^5.6.2` so the move can
+    /// land — silently drops the consumers on 5.6.0/5.6.1 that the author still supports.
+    #[test]
+    fn workspace_manifest_peer_holds_a_same_line_move_its_narrow_bound_excludes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let manifest = indoc! {r#"{
+            "name": "root-lib",
+            "version": "1.2.0",
+            "devDependencies": { "chalk": "^5.6.0" },
+            "peerDependencies": { "chalk": ">=5.6.0 <5.6.2" }
+        }"#};
+        std::fs::write(root.join("package.json"), manifest).expect("root manifest");
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root-lib",
+                    "version": "1.2.0",
+                    "devDependencies": { "chalk": "^5.6.0" },
+                    "peerDependencies": { "chalk": ">=5.6.0 <5.6.2" }
+                },
+                "node_modules/chalk": { "version": "5.6.0" }
+            }
+        }"#};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+        let plan = plan_of(vec![change("chalk", "5.6.0", "5.6.2")]);
+        let (retained, skipped) = partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
+        assert!(
+            retained.changes.is_empty(),
+            "a provable break holds even without crossing a compatibility line"
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("root-lib"),
+            "the hold names the local package whose contract must be edited"
+        );
+
+        // The gate holds the move *before* any widen runs, and a widen could not touch the
+        // contract anyway: the published field is outside the write set, so the pre-apply
+        // snapshot the post-resolve verifier judges against can never go stale.
+        manifest::widen_constraints(&root, &[], "chalk", "5.6.2", RewriteMode::Always)
+            .expect("widen");
+        let after = std::fs::read_to_string(root.join("package.json")).expect("read manifest");
+        assert!(
+            after.contains(r#""chalk": ">=5.6.0 <5.6.2""#),
+            "the published peer contract must survive a widen verbatim: {after}"
+        );
+        assert!(
+            after.contains(r#""chalk": "^5.6.2""#),
+            "the install declaration is still widened: {after}"
+        );
+    }
+
+    /// A `fix` downgrade is exempt from the pre-gate (rolling back is its whole purpose), so a
+    /// downgrade that lands below a local package's published peer floor is caught by the
+    /// post-resolve verifier instead — and blamed on the moving package, since the local dependent
+    /// never moves. Cooldown neither commits the break nor lowers the author's published floor: it
+    /// reports and rolls back, leaving the remedy (relax the range, or baseline the violation) to
+    /// the author.
+    #[test]
+    fn workspace_manifest_peer_floor_rejects_a_downgrade_below_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"{
+                "name": "root-lib",
+                "version": "1.2.0",
+                "devDependencies": { "chalk": "^5.6.2" },
+                "peerDependencies": { "chalk": ">=5.6.2" }
+            }"#},
+        )
+        .expect("root manifest");
+        let lock = |version: &str| {
+            formatdoc! {r#"{{
+                "lockfileVersion": 3,
+                "packages": {{
+                    "": {{
+                        "name": "root-lib",
+                        "version": "1.2.0",
+                        "devDependencies": {{ "chalk": "^5.6.2" }},
+                        "peerDependencies": {{ "chalk": ">=5.6.2" }}
+                    }},
+                    "node_modules/chalk": {{ "version": "{version}" }}
+                }}
+            }}"#}
+        };
+        let before = lock("5.6.2");
+        let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(&before));
+
+        // The pre-gate lets the downgrade through — `fix` must be able to roll back.
+        let mut downgrade = change("chalk", "5.6.2", "5.6.0");
+        downgrade.downgrade = true;
+        let (retained, _) =
+            partition_peer_held::<crate::lock::Npm>(&plan_of(vec![downgrade.clone()]), &evidence);
+        assert_eq!(retained.changes.len(), 1, "a downgrade is not pre-held");
+
+        // The landed graph is then post-verified and rejected, blaming the moved package.
+        let after = lock("5.6.0");
+        let baseline = PeerBaseline::gather::<crate::lock::Npm>(Some(&before), &evidence.workspace);
+        let current = proven_peer_violations::<crate::lock::Npm>(&after, &evidence.workspace);
+        assert_eq!(
+            current
+                .keys()
+                .map(|id| (id.dependent.as_str(), id.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("root-lib", ">=5.6.2")],
+            "the downgrade provably breaks the published floor"
+        );
+        let rejections = plan_peer_rejections(
+            &baseline,
+            &current,
+            &plan_of(vec![downgrade]),
+            &HashSet::new(),
+        )
+        .expect("uniquely attributable");
+        assert_eq!(
+            rejections
+                .first()
+                .map(|rejection| rejection.offending.as_str()),
+            Some("root-lib"),
+            "the rejection names the contract holder, not a guess"
+        );
+    }
+
+    /// Workspace-manifest contracts survive the pre-gate into post-resolve verification: a
+    /// *collateral* move — one the resolve dragged in, never a planned candidate — that breaks a
+    /// local package's recorded contract is a proven violation with no culpable candidate, so the
+    /// round escalates to candidate isolation instead of committing the break.
+    #[test]
+    fn workspace_manifest_peer_violations_are_post_verified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("packages/shim")).expect("mkdir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root-app", "dependencies": { "eslint": "^8.40.0" } }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("packages/shim/package.json"),
+            r#"{ "name": "local-eslint-shim", "version": "0.1.0", "peerDependencies": { "eslint": "^8.0.0" } }"#,
+        )
+        .expect("member manifest");
+        let before = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.0
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: link:packages/shim
+
+              packages/shim: {}
+        "};
+        let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(before));
+        assert!(
+            proven_peer_violations::<crate::lock::Pnpm>(before, &evidence.workspace).is_empty(),
+            "the pre-apply graph satisfies the shim's contract"
+        );
+
+        // The resolve floated eslint across the major on its own — no planned candidate did it.
+        let after = before.replace("version: 8.57.0", "version: 9.8.0");
+        let baseline = PeerBaseline::gather::<crate::lock::Pnpm>(Some(before), &evidence.workspace);
+        let current = proven_peer_violations::<crate::lock::Pnpm>(&after, &evidence.workspace);
+        assert_eq!(
+            current
+                .keys()
+                .map(|id| id.dependent.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-eslint-shim"],
+            "the workspace contract is checked after the resolve, not only before it"
+        );
+        assert!(
+            plan_peer_rejections(
+                &baseline,
+                &current,
+                &plan_of(vec![change("unrelated", "1.0.0", "1.1.0")]),
+                &HashSet::new(),
+            )
+            .is_err(),
+            "a collateral break with no culpable candidate escalates to candidate isolation"
+        );
+    }
+
+    /// npm's package-lock deliberately records no peers for the root project, delegating them to
+    /// the workspace-manifest source — and the root is not an installed instance either, so a
+    /// name-keyed instance lookup finds nothing and the contract goes ungated. A root library
+    /// declaring `peerDependencies.eslint = "^8"` must hold an eslint 8→9 move: without the hold,
+    /// apply's manifest widening rewrites that very `peerDependencies` entry, silently changing
+    /// the package's own published contract.
+    #[test]
+    fn workspace_manifest_peer_holds_the_root_projects_own_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"{
+                "name": "root-lib",
+                "version": "1.2.0",
+                "devDependencies": { "eslint": "^8.40.0" },
+                "peerDependencies": { "eslint": "^8.0.0" }
+            }"#},
+        )
+        .expect("root manifest");
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root-lib",
+                    "version": "1.2.0",
+                    "devDependencies": { "eslint": "^8.40.0" },
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                },
+                "node_modules/eslint": { "version": "8.57.0" }
+            }
+        }"#};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+        let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
+        let (retained, skipped) = partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
+        assert!(
+            retained.changes.is_empty(),
+            "the root project's own peer contract must gate the move"
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("root-lib"),
+            "the hold names the local package whose contract must be edited deliberately"
+        );
+
+        // The same contract, post-verified: a resolver move that lands eslint 9 anyway is a
+        // proven violation of the root's recorded contract, so the apply can roll it back.
+        let after = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "root-lib",
+                    "version": "1.2.0",
+                    "devDependencies": { "eslint": "^8.40.0" },
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                },
+                "node_modules/eslint": { "version": "9.8.0" }
+            }
+        }"#};
+        assert!(
+            proven_peer_violations::<crate::lock::Npm>(lock, &evidence.workspace).is_empty(),
+            "the pre-apply graph satisfies the contract"
+        );
+        let violations = proven_peer_violations::<crate::lock::Npm>(after, &evidence.workspace);
+        assert_eq!(
+            violations
+                .keys()
+                .map(|id| (id.dependent.as_str(), id.package.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("root-lib", "eslint")],
+            "the landed graph provably breaks the root's contract"
+        );
+    }
+
+    /// A workspace contract binds through its manifest's OWN directory, never through a same-named
+    /// package elsewhere in the tree: a registry dependency that happens to share the local
+    /// package's name must not stand in for it and fabricate a hold.
+    #[test]
+    fn workspace_manifest_peer_ignores_a_same_name_registry_decoy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("packages/shim")).expect("mkdir");
+        std::fs::create_dir_all(root.join("apps/site")).expect("mkdir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root-app", "workspaces": ["apps/*", "packages/*"] }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("apps/site/package.json"),
+            r#"{ "name": "site", "dependencies": { "eslint": "^8.40.0", "toolkit": "^1.0.0" } }"#,
+        )
+        .expect("app manifest");
+        // The local package declares the peer, but its own directory holds a nested eslint copy
+        // the change never rewrites. A registry `toolkit` of the same name sits hoisted at the
+        // root and *does* resolve the rewritten copy — a name-keyed lookup would let it stand in
+        // for the local package and fabricate a hold.
+        std::fs::write(
+            root.join("packages/shim/package.json"),
+            r#"{ "name": "toolkit", "version": "0.1.0", "peerDependencies": { "eslint": "^8.0.0" } }"#,
+        )
+        .expect("member manifest");
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root-app" },
+                "apps/site": {
+                    "name": "site",
+                    "dependencies": { "eslint": "^8.40.0", "toolkit": "^1.0.0" }
+                },
+                "packages/shim": { "name": "toolkit", "version": "0.1.0" },
+                "packages/shim/node_modules/eslint": { "version": "8.57.0" },
+                "node_modules/toolkit": { "version": "1.0.0" },
+                "node_modules/eslint": { "version": "8.57.0" }
+            }
+        }"#};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+        assert!(
+            evidence
+                .workspace
+                .iter()
+                .any(|peer| peer.origin == "packages/shim"),
+            "the local package's contract is collected with its origin"
+        );
+        let mut eslint = change("eslint", "8.57.0", "9.8.0");
+        eslint.members = vec![MemberRef {
+            name: "site".to_string(),
+            path: "apps/site".to_string(),
+        }];
+        let (retained, skipped) =
+            partition_peer_held::<crate::lock::Npm>(&plan_of(vec![eslint]), &evidence);
+        assert_eq!(
+            retained.changes.len(),
+            1,
+            "the same-named registry copy must not bind the local contract: {skipped:?}"
+        );
+        assert!(
+            proven_peer_violations::<crate::lock::Npm>(lock, &evidence.workspace).is_empty(),
+            "the local package's own nested copy satisfies its contract"
+        );
+    }
+
+    /// A *workspace-local* package's peer contract lives only in its own `package.json` — pnpm
+    /// records a linked package in the lock without its peer metadata — so the gate must read the
+    /// member manifests: a cross-major move that provably breaks a linked dependent's peer range
+    /// is held, blamed on the local package. The binding contexts are the package's own directory
+    /// plus its link consumers, so a change scoped to an unrelated importer still passes.
+    #[test]
+    fn workspace_manifest_peer_holds_a_cross_major_move() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("packages/shim")).expect("mkdir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root-app", "dependencies": { "eslint": "^8.40.0" } }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("packages/shim/package.json"),
+            r#"{ "name": "local-eslint-shim", "version": "0.1.0", "peerDependencies": { "eslint": "^8.0.0" } }"#,
+        )
+        .expect("member manifest");
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.0
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: link:packages/shim
+
+              packages/shim: {}
+        "};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+        assert_eq!(
+            evidence.workspace.len(),
+            1,
+            "the shim's manifest peer is collected"
+        );
+        assert_eq!(
+            evidence
+                .workspace
+                .first()
+                .map(|peer| peer.contexts.clone())
+                .unwrap_or_default(),
+            vec![".".to_string(), "packages/shim".to_string()],
+            "the peer binds in the shim's own dir and its link consumer"
+        );
+
+        // The provably breaking cross-major move is held, blamed on the local package.
+        let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
+        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped.first().and_then(|held| held.detail.as_deref()),
+            Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
+        );
+
+        // Scoped to an importer outside the peer's binding contexts, the same move passes.
+        let mut scoped = change("eslint", "8.57.0", "9.8.0");
+        scoped.members = vec![MemberRef {
+            name: "other".into(),
+            path: "apps/other".into(),
+        }];
+        let (retained, skipped) =
+            partition_peer_held::<crate::lock::Pnpm>(&plan_of(vec![scoped]), &evidence);
+        assert_eq!(retained.changes.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// An *injected* workspace dependency (`dependenciesMeta.*.injected`) is recorded as a
+    /// root-relative `file:` version with a `(peer@x)` context suffix, not a `link:` — a second
+    /// encoding of the same domain fact (a locally consumed package whose peers live in its
+    /// manifest). The gate must reach the same hold through it: the injected shim's manifest peer
+    /// range holds the cross-major move, blamed on the shim.
+    #[test]
+    fn workspace_manifest_peer_holds_an_injected_cross_major_move() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("packages/shim")).expect("mkdir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root-app", "dependencies": { "eslint": "^8.40.0" } }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("packages/shim/package.json"),
+            r#"{ "name": "local-eslint-shim", "version": "0.1.0", "peerDependencies": { "eslint": "^8.0.0" } }"#,
+        )
+        .expect("member manifest");
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.1
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(eslint@8.57.1)'
+                dependenciesMeta:
+                  local-eslint-shim:
+                    injected: true
+
+              packages/shim: {}
+
+            packages:
+
+              local-eslint-shim@file:packages/shim:
+                resolution: {directory: packages/shim, type: directory}
+                peerDependencies:
+                  eslint: ^8.0.0
+        "};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+        assert_eq!(
+            evidence
+                .workspace
+                .first()
+                .map(|peer| peer.contexts.clone())
+                .unwrap_or_default(),
+            vec![".".to_string(), "packages/shim".to_string()],
+            "the peer binds in the shim's own dir and its injecting consumer"
+        );
+
+        let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
+        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped.first().and_then(|held| held.detail.as_deref()),
+            Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
+        );
+    }
+
+    /// The injected path itself may end in a parenthesized directory group carrying `@` —
+    /// `file:packages/shim(foo@bar)(eslint@8.57.1)` is real pnpm 11 output for a member named
+    /// `shim(foo@bar)` — so the gate must recover the path against the importer set and find the
+    /// manifest there; any scalar-only suffix split would read the wrong directory (or none) and
+    /// lose the hold.
+    #[test]
+    fn workspace_manifest_peer_holds_across_a_parenthesized_injected_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("packages/shim(foo@bar)")).expect("mkdir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root-app", "dependencies": { "eslint": "^8.40.0" } }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("packages/shim(foo@bar)/package.json"),
+            r#"{ "name": "local-eslint-shim", "version": "0.1.0", "peerDependencies": { "eslint": "^8.0.0" } }"#,
+        )
+        .expect("member manifest");
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  eslint:
+                    specifier: ^8.40.0
+                    version: 8.57.1
+                  local-eslint-shim:
+                    specifier: workspace:*
+                    version: 'file:packages/shim(foo@bar)(eslint@8.57.1)'
+
+              'packages/shim(foo@bar)': {}
+        "};
+
+        let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+        let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
+        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        assert!(retained.changes.is_empty());
+        assert_eq!(
+            skipped.first().and_then(|held| held.detail.as_deref()),
+            Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
+        );
+    }
+
+    /// npm's sequential per-package path never judges a pair jointly, so a co-moving dependent
+    /// grants NO exemption there: the excluded target stays held against the dependent's current
+    /// range while the dependent's own move proceeds (the next run reads its new range). pnpm's
+    /// whole-graph resolve keeps the joint exemption — see
+    /// `peer_gate_passes_in_range_moves_and_joint_moves`.
+    #[test]
+    fn peer_gate_grants_no_co_move_exemption_on_the_per_package_path() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "eslint": "^8.40.0", "eslint-plugin-legacy": "^1.0.0" }
+                },
+                "node_modules/eslint": { "version": "8.57.0" },
+                "node_modules/eslint-plugin-legacy": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "eslint": "^8.0.0" }
+                }
+            }
+        }"#};
+
+        let joint = plan_of(vec![
+            change("eslint", "8.57.0", "9.8.0"),
+            change("eslint-plugin-legacy", "1.0.0", "2.0.0"),
+        ]);
+        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&joint, Some(lock));
+        let retained_names: Vec<&str> = retained
+            .changes
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+        assert_eq!(
+            retained_names,
+            vec!["eslint-plugin-legacy"],
+            "the dependent's own move proceeds; the excluded target does not ride along"
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("eslint-plugin-legacy")
+        );
+    }
+
+    /// The sequential path's post-condition: a landed candidate whose lock now provably violates a
+    /// peer contract the pre-candidate lock did not (the dependent moved alone and its *new* range
+    /// excludes the still-held peer — what `legacy-peer-deps` commits with only a warning) is a
+    /// break the candidate caused. A contract the graph already broke, or an unchanged lock, is
+    /// never re-attributed to the candidate.
+    #[test]
+    fn post_apply_diff_detects_only_new_proven_peer_violations() {
+        let before = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "react": "^18.3.1", "react-dom": "^18.3.1" }
+                },
+                "node_modules/react": { "version": "18.3.1" },
+                "node_modules/react-dom": {
+                    "version": "18.3.1",
+                    "peerDependencies": { "react": "^18.3.1" }
+                }
+            }
+        }"#};
+        let after = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "dependencies": { "react": "^18.3.1", "react-dom": "^19.1.0" }
+                },
+                "node_modules/react": { "version": "18.3.1" },
+                "node_modules/react-dom": {
+                    "version": "19.1.0",
+                    "peerDependencies": { "react": "^19.1.0" }
+                }
+            }
+        }"#};
+
+        let violation = first_new_peer_violation::<crate::lock::Npm>(Some(before), after)
+            .expect("the dependent's new range provably excludes the held peer");
+        assert_eq!(
+            (
+                violation.dependent.as_str(),
+                violation.dependent_version.as_str(),
+                violation.package.as_str(),
+                violation.range.as_str(),
+            ),
+            ("react-dom", "19.1.0", "react", "^19.1.0")
+        );
+
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(Some(before), before).is_none(),
+            "an unchanged lock introduces nothing"
+        );
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(Some(after), after).is_none(),
+            "a pre-existing violation is not re-attributed to the candidate"
+        );
+    }
+
+    /// The post-condition holds only on proof, the gate's shared rule: a dependent whose own
+    /// context binds a *satisfying* nested copy, an absent peer (possibly optional), or a range
+    /// the translator cannot prove all yield nothing.
+    #[test]
+    fn post_apply_diff_fails_open_without_proof() {
+        let satisfied_nested = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "react-dom": "^19.1.0" } },
+                "node_modules/react": { "version": "18.3.1" },
+                "node_modules/react-dom": {
+                    "version": "19.1.0",
+                    "peerDependencies": { "react": "^19.1.0" }
+                },
+                "node_modules/react-dom/node_modules/react": { "version": "19.1.0" }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, satisfied_nested).is_none(),
+            "the dependent's own lookup binds its satisfying nested copy, not the root's 18.x"
+        );
+
+        let absent_peer = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "react-dom": "^19.1.0" } },
+                "node_modules/react-dom": {
+                    "version": "19.1.0",
+                    "peerDependencies": { "react": "^19.1.0" }
+                }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, absent_peer).is_none(),
+            "an absent peer may be legitimately optional"
+        );
+
+        let unprovable_range = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "react-dom": "^19.1.0" } },
+                "node_modules/react": { "version": "18.3.1" },
+                "node_modules/react-dom": {
+                    "version": "19.1.0",
+                    "peerDependencies": { "react": "next" }
+                }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, unprovable_range).is_none(),
+            "an unprovable range is ignorance, not proof of exclusion"
+        );
+
+        // eslint moved to 10 while a *transitive* plugin's (optional) peer range still names ^9 —
+        // the shape every eslint plugin creates. The dependent is not importer-declared, so its
+        // recorded range is not authoritative (the pre-apply gate's own directness rule) and the
+        // resolver's acceptance stands.
+        let transitive_dependent = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "eslint": "^10.0.0" } },
+                "node_modules/eslint": { "version": "10.6.0" },
+                "node_modules/eslint-plugin-jsdoc": {
+                    "version": "50.6.1",
+                    "peerDependencies": { "eslint": "^9.0.0" }
+                }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, transitive_dependent).is_none(),
+            "a transitive dependent's stale peer range must not veto the accepted move"
+        );
+
+        // A direct plugin whose violated peer is *transitive* — `@typescript-eslint/parser`,
+        // present only as the plugin's auto-installed peer, lagging behind the plugin's new major.
+        // The resolver owns a transitive peer's placement (it accepted this graph and can
+        // re-place the copy per context), so its lag must not veto the direct move — only a
+        // contract between two importer-declared packages gates.
+        let transitive_peer = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^8.0.0" } },
+                "node_modules/plugin": {
+                    "version": "8.0.0",
+                    "peerDependencies": { "parser": "^8.0.0" }
+                },
+                "node_modules/parser": { "version": "7.18.0" }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, transitive_peer).is_none(),
+            "a lagging transitive peer must not veto the direct move the resolver accepted"
+        );
+
+        // The root's own lookup resolves plugin@1 — the physically proven direct copy — so the
+        // nested plugin@2's peer range is a transitive contract that must not masquerade as a
+        // direct one (the pre-gate's directness rule, shared via `direct_dependent_members`).
+        let split_resolved_dependent = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "eslint": "^10.0.0", "plugin": "^1.0.0" } },
+                "node_modules/eslint": { "version": "10.6.0" },
+                "node_modules/plugin": { "version": "1.0.0" },
+                "node_modules/other/node_modules/plugin": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "eslint": "^9.0.0" }
+                }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, split_resolved_dependent).is_none(),
+            "a nested copy is not the direct instance any member's lookup resolves"
+        );
+    }
+
+    /// Contextual binding replaces the global-singleton requirement: a peer resolved at several
+    /// versions is judged per context — npm by the dependent instance's own lookup, pnpm by each
+    /// importer's declared copy — so a genuine break against the bound copy is proven even while
+    /// another version exists elsewhere in the graph.
+    #[test]
+    fn post_apply_diff_binds_peers_per_context() {
+        // npm: the dependent's context binds the root host@1.0.0; an unrelated nested host@0.9.0
+        // also exists. The graph-wide split must not suppress the proven break against the copy
+        // the dependent actually sees.
+        let npm_bound_break = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^3.0.0", "host": "^1.0.0" } },
+                "node_modules/plugin": {
+                    "version": "3.0.0",
+                    "peerDependencies": { "host": "^2.0.0" }
+                },
+                "node_modules/host": { "version": "1.0.0" },
+                "node_modules/report-tool/node_modules/host": { "version": "0.9.0" }
+            }
+        }"#};
+        let violation = first_new_peer_violation::<crate::lock::Npm>(None, npm_bound_break)
+            .expect("the bound root copy provably violates; the nested split must not blind it");
+        assert_eq!(
+            (violation.package.as_str(), violation.range.as_str()),
+            ("host", "^2.0.0")
+        );
+
+        // pnpm: importers bind their own declared copies — apps/a's plugin sees apps/a's
+        // host@1.0.0 (a proven break) even though apps/b resolves host@2.0.0.
+        let pnpm_importer_break = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^3.0.0
+                    version: 3.0.0
+                  host:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+
+              apps/b:
+                dependencies:
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@3.0.0:
+                resolution: {integrity: sha512-p3}
+                peerDependencies:
+                  host: ^2.0.0
+
+              host@1.0.0:
+                resolution: {integrity: sha512-h1}
+
+              host@2.0.0:
+                resolution: {integrity: sha512-h2}
+        "};
+        let violation = first_new_peer_violation::<crate::lock::Pnpm>(None, pnpm_importer_break)
+            .expect(
+                "apps/a's own declared copy provably violates despite the cross-importer split",
+            );
+        assert_eq!(violation.dependent.as_str(), "plugin");
+    }
+
+    /// Peers resolve against the dependent's importing context — and the context is defined by
+    /// the layout the manager materializes. pnpm isolates importers by declaration, so a package
+    /// moved in a *disjoint* importer cannot break a dependent that never sees it. npm's default
+    /// layout *hoists*: the same disjoint declarations meet at the root `node_modules`, so there
+    /// the contract genuinely binds — and only a physically shadowed dependent (its own nested
+    /// copy) stays out of reach.
+    #[test]
+    fn post_apply_diff_requires_importer_context_overlap() {
+        let split_pnpm_importers = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+
+              apps/b:
+                dependencies:
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@1.0.0:
+                peerDependencies:
+                  host: ^1.0.0
+
+              host@2.0.0:
+                resolution: {integrity: sha512-test}
+        "};
+        assert!(
+            first_new_peer_violation::<crate::lock::Pnpm>(None, split_pnpm_importers).is_none(),
+            "disjoint pnpm importers keep their own contexts — no contract binds"
+        );
+
+        // The same declarations under npm: both packages hoist to the root `node_modules`, so
+        // `plugin`'s nearest-ancestor lookup reaches the violating `host` copy no matter which
+        // member declared it — declaration disjointness must not suppress the proven break.
+        let hoisted_npm_members = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "dependencies": { "plugin": "^1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "host": "^2.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0" }
+                },
+                "node_modules/host": { "version": "2.0.0" }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, hoisted_npm_members).is_some(),
+            "hoisted npm packages bind across disjoint members — the break is real"
+        );
+
+        // Physical isolation is what fails open on npm: host exists only inside apps/b's own
+        // subtree, so plugin's ancestor lookup never reaches it and no contract binds.
+        let isolated_npm_members = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "dependencies": { "plugin": "^1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "host": "^2.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0" }
+                },
+                "apps/b/node_modules/host": { "version": "2.0.0" }
+            }
+        }"#};
+        assert!(
+            first_new_peer_violation::<crate::lock::Npm>(None, isolated_npm_members).is_none(),
+            "a peer copy the dependent cannot physically reach binds nothing"
+        );
+
+        let overlapping_pnpm = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@1.0.0:
+                peerDependencies:
+                  host: ^1.0.0
+
+              host@2.0.0:
+                resolution: {integrity: sha512-test}
+        "};
+        assert!(
+            first_new_peer_violation::<crate::lock::Pnpm>(None, overlapping_pnpm).is_some(),
+            "the same shape inside one importer is a genuine proven violation"
+        );
+    }
+
+    /// Counterfactual attribution: the after-lock proves the *pair* incompatible, not who broke
+    /// it. A dependent whose range did not change (`^1 || ^2`) is innocent when the peer jumped
+    /// past it (1→3): the peer's candidate is rejected and the dependent's own move survives —
+    /// dependent-first guessing would discard the maximal safe subset.
+    #[test]
+    fn peer_rejections_attribute_the_causally_culpable_candidate() {
+        let before = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^1.0.0", "host": "^1.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0 || ^2.0.0" }
+                },
+                "node_modules/host": { "version": "1.0.0" }
+            }
+        }"#};
+        let after = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^2.0.0", "host": "^3.0.0" } },
+                "node_modules/plugin": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "host": "^1.0.0 || ^2.0.0" }
+                },
+                "node_modules/host": { "version": "3.0.0" }
+            }
+        }"#};
+        let baseline = PeerBaseline::gather::<crate::lock::Npm>(Some(before), &[]);
+        let current = proven_peer_violations::<crate::lock::Npm>(after, &[]);
+        let active = plan_of(vec![
+            change("plugin", "1.0.0", "2.0.0"),
+            change("host", "1.0.0", "3.0.0"),
+        ]);
+
+        let rejections = plan_peer_rejections(&baseline, &current, &active, &HashSet::new())
+            .expect("uniquely attributable");
+        assert_eq!(rejections.len(), 1, "exactly the culpable candidate");
+        assert_eq!(
+            rejections.first().map(|rejection| rejection.index),
+            Some(1),
+            "host (the peer whose jump the unchanged old range provably excludes) is rejected"
+        );
+        assert_eq!(
+            rejections
+                .first()
+                .map(|rejection| rejection.offending.as_str()),
+            Some("plugin"),
+            "the rejection blames the contract's other party"
+        );
+
+        // The mirror shape: the dependent's NEW range excludes even the old peer — the dependent
+        // is independently culpable and the peer's own move survives.
+        let dependent_broke = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^2.0.0", "host": "^1.0.0" } },
+                "node_modules/plugin": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "host": "^9.0.0" }
+                },
+                "node_modules/host": { "version": "1.0.0" }
+            }
+        }"#};
+        let current = proven_peer_violations::<crate::lock::Npm>(dependent_broke, &[]);
+        let rejections = plan_peer_rejections(&baseline, &current, &active, &HashSet::new())
+            .expect("uniquely attributable");
+        assert_eq!(
+            rejections.first().map(|rejection| rejection.index),
+            Some(0),
+            "plugin (whose new range excludes even the old host) is rejected"
+        );
+
+        // Neither side uniquely provable (the new range admits the old peer AND the old range
+        // admits the new peer — an interaction only the pair exhibits): rejection would be a
+        // guess, so the round aborts for candidate isolation.
+        let interaction = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "dependencies": { "plugin": "^2.0.0", "host": "^2.0.0" } },
+                "node_modules/plugin": {
+                    "version": "2.0.0",
+                    "peerDependencies": { "host": "^1.0.0" }
+                },
+                "node_modules/host": { "version": "2.0.0" }
+            }
+        }"#};
+        let current = proven_peer_violations::<crate::lock::Npm>(interaction, &[]);
+        let active = plan_of(vec![
+            change("plugin", "1.0.0", "2.0.0"),
+            change("host", "1.0.0", "2.0.0"),
+        ]);
+        assert!(
+            plan_peer_rejections(&baseline, &current, &active, &HashSet::new()).is_err(),
+            "an interaction violation must go to candidate isolation, not a guess"
+        );
+    }
+
+    /// npm's pre-apply gate judges visibility physically: hoisting lets a dependent declared by a
+    /// *different* member bind the moving copy at the root `node_modules` (declaration
+    /// disjointness holds nothing back), while a dependent whose own nested copy shadows the
+    /// moving one is out of reach and must not hold it.
+    #[test]
+    fn peer_gate_judges_npm_visibility_physically() {
+        let member_ref = |name: &str, path: &str| MemberRef {
+            name: name.to_string(),
+            path: path.to_string(),
+        };
+        let hoisted = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "dependencies": { "plugin": "^1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "host": "^2.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0 || ^2.0.0" }
+                },
+                "node_modules/host": { "version": "2.0.0" }
+            }
+        }"#};
+        let mut host = change("host", "2.0.0", "3.0.0");
+        host.members = vec![member_ref("b", "apps/b")];
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Npm>(&plan_of(vec![host.clone()]), Some(hoisted));
+        assert!(
+            retained.changes.is_empty(),
+            "the hoisted contract binds across disjoint members"
+        );
+        assert_eq!(
+            skipped.first().map(|skip| skip.reason),
+            Some(SkipReason::PeerHeld)
+        );
+
+        // The dependent's own nested copy shadows the moving root instance: `plugin` never
+        // resolves the copy this change rewrites, so nothing binds and the move is free.
+        let shadowed = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "dependencies": { "plugin": "^1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "host": "^2.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0 || ^2.0.0" }
+                },
+                "node_modules/plugin/node_modules/host": { "version": "1.0.0" },
+                "node_modules/host": { "version": "2.0.0" }
+            }
+        }"#};
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Npm>(&plan_of(vec![host]), Some(shadowed));
+        assert_eq!(
+            retained.changes.len(),
+            1,
+            "a physically shadowed dependent holds nothing: {skipped:?}"
+        );
+
+        // Directory identity, not version equality: the dependent binds its own nested host@1
+        // while the change rewrites apps/b's separate host@1 — same version, different physical
+        // copy, so the plugin's copy survives the move untouched and must not hold it.
+        let same_version_elsewhere = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root" },
+                "apps/a": { "name": "a", "dependencies": { "plugin": "^1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "host": "^1.0.0" } },
+                "node_modules/plugin": {
+                    "version": "1.0.0",
+                    "peerDependencies": { "host": "^1.0.0" }
+                },
+                "node_modules/plugin/node_modules/host": { "version": "1.0.0" },
+                "apps/b/node_modules/host": { "version": "1.0.0" }
+            }
+        }"#};
+        let mut scoped = change("host", "1.0.0", "2.0.0");
+        scoped.members = vec![member_ref("b", "apps/b")];
+        let (retained, skipped) = peer_partition::<crate::lock::Npm>(
+            &plan_of(vec![scoped]),
+            Some(same_version_elsewhere),
+        );
+        assert_eq!(
+            retained.changes.len(),
+            1,
+            "an unrelated same-version copy must not conflate into a hold: {skipped:?}"
+        );
+    }
+
+    /// The workspace-manifest source obeys the same layout rule as the lock source: under npm's
+    /// hoisted tree, the local package's own directory resolves the moving copy no matter which
+    /// member the change is scoped to, so context disjointness holds nothing back — while pnpm's
+    /// isolated layout keeps the disjoint change out of the contract's reach.
+    #[test]
+    fn workspace_manifest_peer_judges_npm_visibility_physically() {
+        let lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root-app" },
+                "apps/site": { "name": "site", "dependencies": { "eslint": "^8.40.0" } },
+                "packages/shim": { "name": "local-eslint-shim", "version": "0.1.0" },
+                "node_modules/local-eslint-shim": { "resolved": "packages/shim", "link": true },
+                "node_modules/eslint": { "version": "8.57.0" }
+            }
+        }"#};
+        let install = crate::lock::Npm::install_paths(lock);
+        let shim_peer = || WorkspacePeer {
+            requirement: crate::lock::PeerRequirement {
+                dependent: "local-eslint-shim".to_string(),
+                dependent_version: "0.1.0".to_string(),
+                package: "eslint".to_string(),
+                range: "^8.0.0".to_string(),
+            },
+            origin: "packages/shim".to_string(),
+            contexts: vec!["packages/shim".to_string()],
+        };
+        let mut eslint = change("eslint", "8.57.0", "9.0.0");
+        eslint.members = vec![MemberRef {
+            name: "site".to_string(),
+            path: "apps/site".to_string(),
+        }];
+
+        assert!(
+            workspace_peer_hold(&eslint, &[shim_peer()], &HashSet::new(), install.as_ref())
+                .is_some(),
+            "the shim's directory resolves the hoisted eslint the disjoint change rewrites"
+        );
+        assert!(
+            workspace_peer_hold(&eslint, &[shim_peer()], &HashSet::new(), None).is_none(),
+            "without a physical layout the disjoint contexts keep the contract out of reach"
+        );
+
+        // Directory identity again: the shim binds its OWN nested eslint copy while the change
+        // rewrites apps/site's separate copy at the same version — the shim's copy survives the
+        // move, so nothing may hold.
+        let nested_lock = indoc! {r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "root-app" },
+                "apps/site": { "name": "site", "dependencies": { "eslint": "^8.40.0" } },
+                "packages/shim": { "name": "local-eslint-shim", "version": "0.1.0" },
+                "node_modules/local-eslint-shim": { "resolved": "packages/shim", "link": true },
+                "packages/shim/node_modules/eslint": { "version": "8.57.0" },
+                "apps/site/node_modules/eslint": { "version": "8.57.0" }
+            }
+        }"#};
+        let nested = crate::lock::Npm::install_paths(nested_lock);
+        assert!(
+            workspace_peer_hold(&eslint, &[shim_peer()], &HashSet::new(), nested.as_ref())
+                .is_none(),
+            "an unrelated same-version copy must not conflate into a workspace-manifest hold"
+        );
+    }
+
+    /// One contract shape, several instances: violation identity is per dependent instance, and
+    /// baseline coverage is per binding member. A split copy floated onto the broken range in a
+    /// member the baseline never covered is a NEW break; a dependent merely re-recorded at a new
+    /// patch (same member, same range, contract already broken) introduces nothing.
+    #[test]
+    fn post_apply_diff_distinguishes_instances_of_one_contract_shape() {
+        let before = split_shape_before();
+        // apps/b's plugin floats 2 → 3; the new range is the SAME string apps/a's broken copy
+        // already recorded (`^1.0.0`), so a shape-keyed diff would collapse the two instances
+        // and grandfather the fresh break.
+        let after = split_shape_after();
+        let violation = first_new_peer_violation::<crate::lock::Pnpm>(Some(&before), &after)
+            .expect("the apps/b float is a new break even under an old shape");
+        assert_eq!(
+            (
+                violation.dependent.as_str(),
+                violation.dependent_version.as_str()
+            ),
+            ("plugin", "3.0.0"),
+            "the fresh instance, not apps/a's grandfathered one, is attributed"
+        );
+
+        // The counterpart: apps/a's already-broken copy re-recorded at a patch bump stays
+        // grandfathered — same member, same range, nothing newly broken.
+        let rerecorded = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.1
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+              apps/b:
+                dependencies:
+                  plugin:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@1.0.1:
+                resolution: {integrity: sha512-p11}
+                peerDependencies:
+                  host: ^1.0.0
+
+              plugin@2.0.0:
+                resolution: {integrity: sha512-p2}
+                peerDependencies:
+                  host: ^1.0.0 || ^2.0.0
+
+              host@2.0.0:
+                resolution: {integrity: sha512-h2}
+        "};
+        assert!(
+            first_new_peer_violation::<crate::lock::Pnpm>(Some(&before), rerecorded).is_none(),
+            "a re-recorded instance of an already-broken contract is not re-attributed"
+        );
+    }
+
+    /// Culprit matching is instance-aware. The rejected candidate must have LANDED the violating
+    /// instance — same name, exact landed version, overlapping member — so a same-named change in
+    /// another member is never blamed for it; and a multi-version name, which the whole-graph
+    /// resolve deliberately never pins ([`prepare_whole_graph_inputs`]), is no candidate at all —
+    /// implicating it aborts to candidate isolation instead of uselessly rejecting an unpinned
+    /// change.
+    #[test]
+    fn peer_rejections_match_the_landed_instance_not_the_name() {
+        let member_ref = |name: &str, path: &str| MemberRef {
+            name: name.to_string(),
+            path: path.to_string(),
+        };
+        let before = split_shape_before();
+        let after = split_shape_after();
+        let baseline = PeerBaseline::gather::<crate::lock::Pnpm>(Some(&before), &[]);
+        let current = proven_peer_violations::<crate::lock::Pnpm>(&after, &[]);
+
+        // Two same-named candidates: only the apps/b change landed the violating 3.0.0 instance.
+        let mut decoy = change("plugin", "1.0.0", "1.5.0");
+        decoy.members = vec![member_ref("a", "apps/a")];
+        let mut mover = change("plugin", "2.0.0", "3.0.0");
+        mover.members = vec![member_ref("b", "apps/b")];
+        let active = plan_of(vec![decoy, mover]);
+        let rejections = plan_peer_rejections(&baseline, &current, &active, &HashSet::new())
+            .expect("uniquely attributable");
+        assert_eq!(
+            rejections.first().map(|rejection| rejection.index),
+            Some(1),
+            "the landed instance's own change is rejected, never the same-named decoy"
+        );
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections
+                .first()
+                .map(|rejection| rejection.offending.as_str()),
+            Some("host")
+        );
+
+        // The same violation with `plugin` multi-version — the resolve never pinned it, its
+        // float is resolver latitude, and the peer did not move either: nobody is uniquely
+        // culpable, so the round aborts to candidate isolation.
+        let multi: HashSet<String> = std::iter::once("plugin".to_string()).collect();
+        assert!(
+            plan_peer_rejections(&baseline, &current, &active, &multi).is_err(),
+            "an unpinned multi-version name must not be rejected as a candidate"
+        );
+    }
+
+    /// The pnpm lock behind the split-instance tests: apps/a's `plugin@1` already violates
+    /// against the shared `host@2` (grandfathered), while apps/b's `plugin@2` range still admits
+    /// it.
+    fn split_shape_before() -> String {
+        indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+              apps/b:
+                dependencies:
+                  plugin:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@1.0.0:
+                resolution: {integrity: sha512-p1}
+                peerDependencies:
+                  host: ^1.0.0
+
+              plugin@2.0.0:
+                resolution: {integrity: sha512-p2}
+                peerDependencies:
+                  host: ^1.0.0 || ^2.0.0
+
+              host@2.0.0:
+                resolution: {integrity: sha512-h2}
+        "}
+        .to_string()
+    }
+
+    /// [`split_shape_before`] after apps/b's plugin floated to 3.0.0, whose range re-records the
+    /// same `^1.0.0` string apps/a's copy already carries.
+    fn split_shape_after() -> String {
+        indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/a:
+                dependencies:
+                  plugin:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+              apps/b:
+                dependencies:
+                  plugin:
+                    specifier: ^3.0.0
+                    version: 3.0.0
+                  host:
+                    specifier: ^2.0.0
+                    version: 2.0.0
+
+            packages:
+
+              plugin@1.0.0:
+                resolution: {integrity: sha512-p1}
+                peerDependencies:
+                  host: ^1.0.0
+
+              plugin@3.0.0:
+                resolution: {integrity: sha512-p3}
+                peerDependencies:
+                  host: ^1.0.0
+
+              host@2.0.0:
+                resolution: {integrity: sha512-h2}
+        "}
+        .to_string()
+    }
+
+    /// The moving-dependent exemption is recomputed to a fixed point: a dependent whose own move is
+    /// peer-held stays in place, so it stops exempting the package it pins — the plan cannot leak a
+    /// break through a co-move that never happens.
+    #[test]
+    fn peer_gate_recomputes_when_the_exempting_dependent_is_itself_held() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  fumadocs-core:
+                    specifier: ^16.0.0
+                    version: 16.11.4
+                  fumadocs-mdx:
+                    specifier: ^15.0.0
+                    version: 15.1.1(fumadocs-core@16.11.4)
+                  docs-kit:
+                    specifier: ^1.0.0
+                    version: 1.0.0(fumadocs-mdx@15.1.1)
+
+            packages:
+
+              fumadocs-core@16.11.4:
+                resolution: {integrity: sha512-aaa}
+
+              fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+                resolution: {integrity: sha512-bbb}
+                peerDependencies:
+                  fumadocs-core: ^16.0.0
+
+              docs-kit@1.0.0(fumadocs-mdx@15.1.1):
+                resolution: {integrity: sha512-ccc}
+                peerDependencies:
+                  fumadocs-mdx: ^15.0.0
+        "};
+
+        // mdx's own move is held by docs-kit's peer range, so mdx stays at 15.1.1 — and the second
+        // round therefore holds core, which round one had exempted for mdx's planned co-move.
+        let plan = plan_of(vec![
+            change("fumadocs-core", "16.11.4", "17.0.0"),
+            change("fumadocs-mdx", "15.1.1", "16.0.0"),
+        ]);
+        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        assert!(retained.changes.is_empty());
+        let blame_for = |name: &str| {
+            skipped
+                .iter()
+                .find(|held| held.change.package.name == name)
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str())
+        };
+        assert_eq!(blame_for("fumadocs-mdx"), Some("docs-kit"));
+        assert_eq!(blame_for("fumadocs-core"), Some("fumadocs-mdx"));
+    }
+
+    /// A same-name move in a *disjoint* importer never exempts: the held copy's importer keeps its
+    /// version, so the peer range still binds there. (The moving copy here is also a
+    /// multi-version-declared name, which the resolve later skips as `MultiVersionHeld` — one more
+    /// reason it must not count as moving.)
+    #[test]
+    fn peer_gate_ignores_a_same_name_move_in_a_disjoint_importer() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/site:
+                dependencies:
+                  fumadocs-mdx:
+                    specifier: ^16.0.0
+                    version: 16.0.0
+
+              apps/docs:
+                dependencies:
+                  fumadocs-core:
+                    specifier: ^16.0.0
+                    version: 16.11.4
+                  fumadocs-mdx:
+                    specifier: ~15.1.0
+                    version: 15.1.1(fumadocs-core@16.11.4)
+
+            packages:
+
+              fumadocs-core@16.11.4:
+                resolution: {integrity: sha512-aaa}
+
+              fumadocs-mdx@15.1.1(fumadocs-core@16.11.4):
+                resolution: {integrity: sha512-bbb}
+                peerDependencies:
+                  fumadocs-core: ^16.0.0
+
+              fumadocs-mdx@16.0.0:
+                resolution: {integrity: sha512-ccc}
+        "};
+        let member = |path: &str| MemberRef {
+            name: path.to_string(),
+            path: path.to_string(),
+        };
+
+        let mut site_mdx = change("fumadocs-mdx", "16.0.0", "16.2.0");
+        site_mdx.members = vec![member("apps/site")];
+        let mut docs_core = change("fumadocs-core", "16.11.4", "17.0.0");
+        docs_core.members = vec![member("apps/docs")];
+
+        let (retained, skipped) =
+            peer_partition::<crate::lock::Pnpm>(&plan_of(vec![docs_core, site_mdx]), Some(lock));
+        // The mdx move in apps/site cannot lift apps/docs's mdx@15.1.1 peer pin on core.
+        assert_eq!(retained.changes.len(), 1, "only the mdx move survives");
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("fumadocs-mdx")
+        );
+        assert_eq!(
+            skipped
+                .first()
+                .map(|held| held.change.package.name.as_str()),
+            Some("fumadocs-core")
+        );
+    }
+
     fn project_declaring(spec: &str) -> (tempfile::TempDir, Project) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
@@ -2474,22 +5944,27 @@ packages:
         );
     }
 
+    /// npm's save-capable exact pin is bracketed around the manifest bytes cooldown authorized,
+    /// including when cooldown widened the range before taking the snapshot.
     #[test]
-    fn rewrite_relock_pins_exact_target_where_supported() {
-        // Root declares `nanoid`, so the post-widen relock lands the lock on exactly the
-        // cooldown-approved version instead of re-resolving the widened range to a newer member.
+    fn npm_restores_the_authorized_widened_range_after_its_exact_pin() {
         let (_dir, mut project) = project_declaring("^3.0.0");
         project.exclude_newer = Some("2024-08-01T00:00:00Z".to_string());
         let change = change("nanoid", "3.1.0", "5.1.11");
 
-        // pnpm pins the exact target without touching the manifest.
+        let landing = candidate_landing::<Npm>(&project, &change, RewriteMode::Auto)
+            .expect("landing")
+            .expect("declared candidate");
+        let CandidateLanding::PinRestoreResync {
+            pin,
+            authorized_manifests,
+            resync,
+        } = landing
+        else {
+            panic!("npm's save-capable pin must be bracketed")
+        };
         assert_eq!(
-            rewrite_relock::<crate::lock::Pnpm>(&project, &change).expect("cmd"),
-            ["update", "nanoid@5.1.11", "--lockfile-only", "--no-save"]
-        );
-        // npm pins the exact target via `install <name>@<version>` (the root declares it).
-        assert_eq!(
-            rewrite_relock::<Npm>(&project, &change).expect("cmd"),
+            pin,
             [
                 "install",
                 "nanoid@5.1.11",
@@ -2499,18 +5974,119 @@ packages:
                 "--before=2024-08-01T00:00:00Z"
             ]
         );
+        assert_eq!(
+            resync,
+            [
+                "install",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund",
+                "--before=2024-08-01T00:00:00Z"
+            ]
+        );
+        assert!(
+            std::fs::read_to_string(&project.manifest)
+                .expect("read widened manifest")
+                .contains(r#""nanoid": "^5.1.11""#),
+            "cooldown applies the authorized range before npm runs"
+        );
+
+        std::fs::write(
+            &project.manifest,
+            r#"{ "dependencies": { "nanoid": "^5.1.11-overwritten" } }"#,
+        )
+        .expect("simulate npm save");
+        authorized_manifests
+            .restore(&project.root)
+            .expect("restore authorized bytes");
+        assert_eq!(
+            std::fs::read_to_string(&project.manifest).expect("read restored manifest"),
+            r#"{ "dependencies": { "nanoid": "^5.1.11" } }"#,
+            "the snapshot restores cooldown's range, not the pre-widen or npm-authored bytes"
+        );
     }
 
     #[test]
-    fn npm_re_resolves_when_root_does_not_declare_the_dependency() {
-        // A member-only dependency: npm's exact pin would save it to the root manifest, adding a
-        // spurious root dependency, so it re-resolves the widened range instead (safe — an overshoot
-        // is rolled back). The root here declares something else.
+    fn npm_authorizes_a_target_steering_member_edit_when_every_range_is_compatible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::create_dir_all(root.join("apps/app")).expect("member directory");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "peerDependencies": { "chalk": ">=5.6.0 <5.7.0" } }"#,
+        )
+        .expect("root manifest");
+        std::fs::write(
+            root.join("apps/app/package.json"),
+            r#"{ "devDependencies": { "chalk": "^5.6.0" } }"#,
+        )
+        .expect("member manifest");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut change = change("chalk", "5.6.0", "5.6.2");
+        change.members = vec![
+            MemberRef {
+                name: "root".into(),
+                path: ".".into(),
+            },
+            MemberRef {
+                name: "app".into(),
+                path: "apps/app".into(),
+            },
+        ];
+
+        let landing = candidate_landing::<Npm>(&project, &change, RewriteMode::Auto)
+            .expect("landing")
+            .expect("declared candidate");
+
+        let CandidateLanding::PinRestoreResync { pin, resync, .. } = landing else {
+            panic!("npm's member-owned exact pin must be bracketed")
+        };
+        assert_eq!(
+            pin,
+            [
+                "install",
+                "chalk@5.6.2",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund",
+                "--workspace=apps/app"
+            ]
+        );
+        assert_eq!(
+            resync,
+            ["install", "--package-lock-only", "--no-audit", "--no-fund"]
+        );
+        assert!(
+            std::fs::read_to_string(root.join("apps/app/package.json"))
+                .expect("read member")
+                .contains(r#""chalk": "^5.6.2""#),
+            "the member edit keeps npm's restored lock on the exact target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).expect("read root"),
+            r#"{ "peerDependencies": { "chalk": ">=5.6.0 <5.7.0" } }"#,
+            "the root's published contract remains byte-identical"
+        );
+    }
+
+    /// A declaration nothing may rewrite (a published `peerDependencies` contract) leaves an empty
+    /// widen write set, and a plain relock cannot move a lock that still satisfies its range — so
+    /// the landing is an EXACT manifest-preserving pin. It must be target-directed, not a
+    /// "newest the range admits" update: under a broad `>=5 <7` range, a deliberate patch move
+    /// (`--major` off) would overshoot the plan and be rejected, and a `fix` rollback could not move
+    /// downward at all.
+    #[test]
+    fn npm_pins_a_peer_only_declaration_exactly_and_restores_the_manifest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         std::fs::write(
             root.join("package.json"),
-            r#"{ "dependencies": { "lodash": "^4.0.0" } }"#,
+            r#"{ "peerDependencies": { "chalk": ">=5.6.0 <5.7.0" } }"#,
         )
         .expect("write manifest");
         let project = Project {
@@ -2519,11 +6095,54 @@ packages:
             manifest: root.join("package.json"),
             exclude_newer: None,
         };
-        let change = change("nanoid", "3.1.0", "5.1.11");
-
+        let change = change("chalk", "5.6.0", "5.6.2");
+        let declarations =
+            manifest::declarations(&project.root, &change.members, &change.package.name)
+                .expect("declarations");
         assert_eq!(
-            rewrite_relock::<Npm>(&project, &change).expect("cmd"),
-            ["install", "--package-lock-only", "--no-audit", "--no-fund"]
+            (
+                declarations.absent(),
+                declarations.has_install(),
+                declarations.peer
+            ),
+            (false, false, true),
+            "a peer-only declaration is declared, but writable nowhere"
+        );
+
+        // The landing is the bracketed exact pin: the pin names the exact planned version, and the
+        // plain resync recopies metadata from the restored manifest.
+        let pin = preserving_pin::<Npm>(&project, &change, &[]).expect("npm can pin exactly");
+        match pin {
+            crate::lock::PreservingPin::PinRestoreResync { pin, resync } => {
+                assert_eq!(
+                    pin,
+                    [
+                        "install",
+                        "chalk@5.6.2",
+                        "--package-lock-only",
+                        "--no-audit",
+                        "--no-fund"
+                    ],
+                    "the pin is target-directed, not a range-maximum update"
+                );
+                assert_eq!(
+                    resync,
+                    ["install", "--package-lock-only", "--no-audit", "--no-fund"],
+                    "the resync recopies restored manifest metadata without retargeting the lock"
+                );
+            }
+            crate::lock::PreservingPin::Direct(args) => {
+                panic!("npm's exact pin saves the range, so it must be bracketed: {args:?}")
+            }
+        }
+
+        // pnpm needs no bracketing: its exact pin already skips the manifest.
+        assert!(
+            matches!(
+                preserving_pin::<crate::lock::Pnpm>(&project, &change, &[]),
+                Some(crate::lock::PreservingPin::Direct(_))
+            ),
+            "pnpm pins exactly without touching a manifest"
         );
     }
 
@@ -2569,7 +6188,7 @@ packages:
     }
 
     #[test]
-    fn npm_has_no_lock_only_path_so_always_rewrites() {
+    fn npm_has_no_direct_lock_only_command() {
         let (_dir, project) = project_declaring("^3.0.0");
         let in_range = change("nanoid", "3.1.0", "3.3.0");
         assert!(

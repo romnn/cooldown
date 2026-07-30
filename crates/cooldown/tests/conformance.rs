@@ -39,6 +39,7 @@ fn rel(v: &str, ord: u32, pub_at: Option<&str>, kind: Option<UpdateKind>) -> Rel
             .and_then(|major| major.parse().ok()),
         kind_from_current: kind,
         beyond_declared_bound: false,
+        beyond_latest_tag: false,
         published_at: pub_at.map(ts),
         yanked: false,
         quality: ReleaseQuality::Stable,
@@ -1662,6 +1663,86 @@ async fn upgrade_reports_a_matured_target_held_by_max_major() {
     );
 }
 
+/// The releases of `a_v1_and_matured_v2` with the v2 major marked beyond the registry's `latest`
+/// dist-tag — the fumadocs-core shape (a matured, stable major the registry's current `latest`
+/// tag points below).
+fn a_v1_and_matured_v2_above_the_tag() -> Vec<Release> {
+    a_v1_and_matured_v2()
+        .into_iter()
+        .map(|mut release| {
+            release.beyond_latest_tag = release.version == Version::new("v2.0.0");
+            release
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn upgrade_reports_a_matured_target_held_by_the_dist_tag() {
+    let (_g, root) = tmp_root();
+    let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            strict: true,
+            ..opts()
+        })
+        .await;
+
+    // A dist-tag hold is conservative-correct — the maintainer's own tag says v2 is not current —
+    // so it is reported, does not fail `--strict`, and nothing is applied.
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    assert_eq!(out.items[0].to, "v2.0.0");
+    assert_eq!(
+        out.items[0].skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::DistTagHeld)
+    );
+}
+
+#[tokio::test]
+async fn upgrade_ignoring_dist_tags_crosses_the_tag() {
+    let (_g, root) = tmp_root();
+    let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ignore_dist_tags: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.items[0].to, "v2.0.0");
+    assert!(out.items[0].skipped.is_none());
+}
+
+#[tokio::test]
+async fn outdated_holds_a_major_above_the_tag_with_the_dist_tag_named() {
+    let (_g, root) = tmp_root();
+    let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
+    let out = workspace(fake, Baseline::default())
+        .outdated(&RunOpts {
+            allow_major: true,
+            ..opts()
+        })
+        .await;
+
+    let row = out.items.first().expect("the held row");
+    assert_eq!(row.status, OutdatedStatus::Held);
+    // The hold names the version the registry's `latest` tag recommends (the current pin here), and
+    // the newest existing version stays visible as context.
+    assert_eq!(
+        row.held_by.as_ref().map(|held| held.reason().clone()),
+        Some(HeldReason::DistTag("v1.0.0".to_string()))
+    );
+    assert_eq!(
+        row.latest.as_ref().map(|latest| latest.version.as_str()),
+        Some("v2.0.0")
+    );
+    assert!(row.adoptable_target.is_none());
+}
+
 #[tokio::test]
 async fn upgrade_major_crosses_a_direct_but_not_a_transitive() {
     // `--major` rewrites a *direct* dep's manifest constraint across a major boundary, but a
@@ -3102,6 +3183,7 @@ impl ToolWrite for HeldConflictFake {
                         "huggingface-hub".to_string(),
                         Some("proxy.example".into()),
                     )),
+                    detail: None,
                 });
             } else {
                 report.applied.push(change.clone());

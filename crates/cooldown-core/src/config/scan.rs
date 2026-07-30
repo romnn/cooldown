@@ -271,6 +271,30 @@ gitignore = false
     }
 
     #[test]
+    fn respect_dist_tags_resolves_command_over_global_over_absent() {
+        let cfg = scan(indoc::indoc! {"
+            [global]
+            respect-dist-tags = false
+
+            [upgrade]
+            respect-dist-tags = true
+        "});
+        assert_eq!(
+            cfg.resolved("upgrade").respect_dist_tags,
+            Some(true),
+            "command overrides global"
+        );
+        assert_eq!(
+            cfg.resolved("outdated").respect_dist_tags,
+            Some(false),
+            "inherited from global"
+        );
+        // Absent everywhere: the built-in default (on) applies downstream.
+        let bare = scan("[global]\n");
+        assert_eq!(bare.resolved("outdated").respect_dist_tags, None);
+    }
+
+    #[test]
     fn merge_concatenates_excludes_and_lets_later_scalars_win() {
         let base = scan("[global]\nexclude-folders = [\"a\"]\ngitignore = true\n");
         let over = scan("[global]\nexclude-folders = [\"b\"]\ngitignore = false\n");

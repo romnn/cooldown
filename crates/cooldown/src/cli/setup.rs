@@ -35,10 +35,19 @@ pub(crate) async fn prepare_run(
     let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
     options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
     invocation.progress().phase("discovering projects");
+    // Version-adopting commands revalidate npm package documents so the mutable `latest`
+    // dist-tag ceiling reflects the registry's current state (read-only commands accept the
+    // bounded listing-TTL staleness; `--fresh` upgrades every command to live reads). `sync`
+    // adopts no versions — it only writes native policy files, never fetching a package
+    // document — so it stays on the cached path. With the ceiling switched off
+    // (`--no-respect-dist-tags`, `respect-dist-tags = false`) the tag is never read, so paying a
+    // conditional request per npm-family package would buy nothing.
+    let adopting = matches!(command_key, "upgrade" | "fix");
     let adapters = detect::adapter_set(
         invocation.offline(),
         invocation.fresh(),
         invocation.concurrency(),
+        adopting && invocation.respect_dist_tags(),
     )?;
     let projects = detect::detect_projects(
         &adapters,

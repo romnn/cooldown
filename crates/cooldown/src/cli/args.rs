@@ -306,6 +306,20 @@ pub(in crate::cli) struct GlobalArgs {
         conflicts_with = "major"
     )]
     pub(in crate::cli) no_major: bool,
+    /// Cap npm-family candidates at the registry's `latest` dist-tag (the default). The tag is the
+    /// maintainer's own "this is current" pointer, so a stable release above it — a premature or
+    /// abandoned major the maintainer kept releasing below — is held, not proposed.
+    #[arg(long = "respect-dist-tags", global = true)]
+    pub(in crate::cli) respect_dist_tags: bool,
+    /// Adopt npm-family releases above the `latest` dist-tag too (the inverse of
+    /// `--respect-dist-tags`). The deliberate escape hatch for taking a release the registry's
+    /// current `latest` tag points below.
+    #[arg(
+        long = "no-respect-dist-tags",
+        global = true,
+        conflicts_with = "respect_dist_tags"
+    )]
+    pub(in crate::cli) no_respect_dist_tags: bool,
     /// Scope the command to matching packages (repeatable).
     #[arg(long, short = 'p', global = true, value_name = "GLOB")]
     pub(in crate::cli) package: Vec<String>,
@@ -456,6 +470,7 @@ impl GlobalArgs {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CliOverrides {
     pub(crate) major: Option<bool>,
+    pub(crate) respect_dist_tags: Option<bool>,
     pub(crate) gitignore: Option<bool>,
     pub(crate) all: Option<bool>,
     pub(crate) all_artifacts: Option<bool>,
@@ -500,6 +515,15 @@ impl CliOverrides {
             major: if set_on_cli(matches, "major") {
                 Some(true)
             } else if set_on_cli(matches, "no_major") {
+                Some(false)
+            } else {
+                None
+            },
+            // `--respect-dist-tags` forces the npm `latest` cap on; `--no-respect-dist-tags`
+            // forces it off.
+            respect_dist_tags: if set_on_cli(matches, "respect_dist_tags") {
+                Some(true)
+            } else if set_on_cli(matches, "no_respect_dist_tags") {
                 Some(false)
             } else {
                 None
@@ -611,6 +635,7 @@ mod tests {
     fn exhaustively_destructure_overrides(overrides: CliOverrides) {
         let CliOverrides {
             major,
+            respect_dist_tags,
             gitignore,
             all,
             all_artifacts,
@@ -635,6 +660,7 @@ mod tests {
         } = overrides;
         let _ = (
             major,
+            respect_dist_tags,
             gitignore,
             all,
             all_artifacts,
@@ -686,6 +712,19 @@ mod tests {
             overrides(&["cooldown", "outdated", "--no-gitignore"]).gitignore,
             Some(false)
         );
+    }
+
+    #[test]
+    fn respect_dist_tags_pair_maps_to_explicit_true_and_false() {
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--respect-dist-tags"]).respect_dist_tags,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--no-respect-dist-tags"]).respect_dist_tags,
+            Some(false)
+        );
+        assert_eq!(overrides(&["cooldown", "outdated"]).respect_dist_tags, None);
     }
 
     #[test]

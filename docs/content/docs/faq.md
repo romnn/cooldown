@@ -35,7 +35,13 @@ Yes, to read publish times from each registry — unless you run `--offline` aga
 
 ## Can I pin an absolute cutoff instead of a rolling window?
 
-Yes — `freeze = "2026-06-01"` (or `--freeze`) evaluates against a fixed instant, so a run is reproducible no matter when it happens. It's the reproducible counterpart to a rolling `min-age`.
+Yes — `freeze = "2026-06-01"` (or `--freeze`) evaluates against a fixed instant: nothing published
+after that date is ever adoptable, no matter when the run happens. Note what is frozen: the
+*publication-time* eligibility. The registry's *current* state still applies — an unpublished or
+yanked version disappears, and on the npm family the mutable `latest` dist-tag still caps
+adoption (judged live by version-adopting commands, from a copy at most an hour old by read-only
+ones), so a maintainer retagging can change which frozen-eligible release the tag ceiling admits
+(`--no-respect-dist-tags` makes a frozen run tag-independent).
 
 ## How do I stay on TypeScript 5.x but keep taking 5.x updates?
 
@@ -49,6 +55,16 @@ max-major = 5
 This permits matured 5.x releases and holds 6.x even under `upgrade --major`. Alternatively, write
 an explicit `<6` upper bound in `package.json`; that bound holds by default and can be crossed only
 when you deliberately pass `--rewrite`.
+
+## Why isn't the highest version on npm adoptable?
+
+Because the registry's own `latest` dist-tag points below it. The tag is the maintainer's "this is
+current" pointer — what a bare `npm install <pkg>` resolves to — so a stable release above it is
+usually a premature or abandoned major the maintainer kept releasing below (a `17.0.0` published
+months before the `16.x` line continued). `cooldown` holds such releases (`dist-tag latest 16.13.0`
+in the table) instead of proposing a version the ecosystem itself would not install.
+`--no-respect-dist-tags` (or `respect-dist-tags = false` under `[global]` or a command section in
+`cooldown.toml`) is the deliberate escape hatch.
 
 ## Why did `upgrade` also *downgrade* some packages?
 

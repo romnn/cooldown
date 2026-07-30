@@ -40,7 +40,13 @@ latest = true            # sugar for min-age = "0d" — adopt anything, no coold
 freeze = "2026-06-01"    # an absolute cutoff instead of a rolling window
 ```
 
-`freeze` pins the "as-of" instant: nothing published after that date is adoptable, no matter when you run `cooldown`. It makes a run **reproducible** — useful for pinning an audited state, or for a CI job that should evaluate against a fixed point in time rather than a moving one.
+`freeze` pins the "as-of" instant: nothing published after that date is adoptable, no matter when
+you run `cooldown` — useful for pinning an audited state, or for a CI job that should evaluate
+against a fixed point in time rather than a moving one. It freezes *publication-time* eligibility;
+the registry's current state still applies (an unpublished or yanked version disappears, and the
+npm family's mutable `latest` dist-tag still caps adoption — judged live by version-adopting
+commands, from a copy at most an hour old by read-only ones (`--fresh` forces live reads). Pass
+`--no-respect-dist-tags` for a tag-independent frozen run).
 
 ## `allow`
 

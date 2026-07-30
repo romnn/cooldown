@@ -38,6 +38,45 @@ while the implicit ceiling in `^5` does not. A package-level config `max-major =
 the dependency at 5.x. Held rows name the reason in the table (`bound >=5 <6`, `max-major 5`,
 `pinned`, and so on); JSON reports the same information in the additive `heldBy` field.
 
+Two npm-family safeguards refine what counts as adoptable:
+
+- **The `latest` dist-tag caps adoption.** The tag is the maintainer's own "this is current"
+  pointer — what a bare `npm install <pkg>` resolves to under npm's default configuration — so a
+  stable release above it (a premature or abandoned major the maintainer kept releasing below,
+  like a `17.0.0` published months before the `16.x` line continued) is held rather than
+  proposed: the row reads `dist-tag latest 16.13.0` while **Latest** still shows the newer
+  version for context. A project already pinned above the tag is unaffected (a pin beyond the tag
+  deactivates the ceiling entirely — a project deliberately riding a `next` line keeps seeing
+  newer releases), and `--no-respect-dist-tags` is the deliberate escape hatch. The tag — like
+  every npm listing cooldown reads — comes from the public registry (`registry.npmjs.org`); a
+  project resolving from a private registry or mirror whose tags diverge should opt out. In
+  `cooldown.toml` the same opt-out goes under `[global]` or a command section:
+
+  ```toml
+  [global]
+  respect-dist-tags = false
+  ```
+
+- **Peer contracts block infeasible majors.** A matured cross-major target that a still-present
+  dependent's recorded peer range excludes (`fumadocs-mdx` peer-requires `fumadocs-core@^16` while
+  the target is `17.0.0`) is reported `blocked by fumadocs-mdx` instead of `adoptable` — pnpm's
+  resolver only warns on that break, and npm, which rejects it by default, commits it under
+  relaxed enforcement such as `legacy-peer-deps`. The way forward is to upgrade the
+  dependent — or, when the dependent is a *workspace-local* package (a `workspace:*` package,
+  symlinked or injected), to edit its own `peerDependencies` range, since a local package never
+  moves in a run. On pnpm both can move in the same run: its whole-graph resolve decides the pair's
+  joint feasibility, and the result is re-checked — a landing that provably breaks a recorded
+  peer contract *between packages your workspace itself declares, in a context that demonstrably
+  binds them* (npm's hoisted tree is judged physically, pnpm importers by their own declarations)
+  is rejected. Contracts involving transitive packages, contexts that never bind the moved copy,
+  or unprovable ranges stay the resolver's call, so still review its peer warnings on a joint
+  move. npm has no joint
+  resolve, so there the target
+  stays blocked while the dependent moves; a dependent move that would itself break the contract
+  is rolled back after the fact (see [`upgrade`]({{< relref "upgrade.md" >}})), and otherwise the
+  next run reads the dependent's new peer range and releases the block if it now admits the
+  target.
+
 ## Flags
 
 | Flag | Effect |

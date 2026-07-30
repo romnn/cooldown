@@ -146,6 +146,12 @@ pub struct RunOpts {
     pub compiled_excludes: Option<CompiledExcludes>,
     /// `--major`: allow cross-major candidates.
     pub allow_major: bool,
+    /// `--no-respect-dist-tags` (config `respect-dist-tags = false`): admit npm-family releases
+    /// ordered above the registry's mutable `latest` dist-tag as candidates. Off by default: the
+    /// tag is the maintainer's own "this is current" pointer (`npm install` resolves to it), so a
+    /// stable release above it — a premature or abandoned major the maintainer kept releasing
+    /// below — is held rather than proposed.
+    pub ignore_dist_tags: bool,
     /// `--hide-pinned` (outdated): omit exact `==`/`=` and commit-pin holds from the table. Bound,
     /// graph, and `max-major` holds remain because they require a different action. This is purely a
     /// display filter; JSON and summary counts retain every dependency.
@@ -648,6 +654,7 @@ impl Workspace {
             project: &pctx.rel_path,
             allow_major: opts.allow_major,
             honor_declared_bounds: true,
+            honor_latest_tag: !opts.ignore_dist_tags,
         }
     }
 

@@ -60,6 +60,7 @@ pub(super) fn build_releases(current: &str, raw: Vec<(String, RawRelease)>) -> V
                 major_number: semver::major_number(version),
                 kind_from_current: classify_kind(current, version),
                 beyond_declared_bound: false,
+                beyond_latest_tag: false,
                 published_at: release.published_at,
                 yanked: release.yanked,
                 quality: classify_quality(version),

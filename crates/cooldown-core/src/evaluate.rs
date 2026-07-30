@@ -35,6 +35,18 @@ pub struct ResolveContext<'a> {
     /// This is `false` only for `upgrade --rewrite`, whose contract explicitly permits rewriting
     /// and crossing such a bound.
     pub honor_declared_bounds: bool,
+    /// Whether the registry's `latest` dist-tag caps candidates
+    /// ([`Release::beyond_latest_tag`]).
+    ///
+    /// The cap applies only while the current pin sits at or below the tag. A pin already beyond
+    /// it (a project deliberately riding a `next` line) deactivates the ceiling *entirely* — not
+    /// merely raising it to the pin — so such a project never sees downgrade pressure or a silent
+    /// "up to date", and even releases above its own line stay adoptable: once the project has
+    /// knowingly passed the tag, the tag carries no guidance about where it should stop. This is
+    /// `false` only when the user opts out (`respect-dist-tags = false` /
+    /// `--no-respect-dist-tags`), electing to adopt releases above the registry's current `latest`
+    /// tag.
+    pub honor_latest_tag: bool,
 }
 
 /// Which package ceiling hid an otherwise adoptable release.
@@ -44,6 +56,9 @@ pub enum CeilingReason {
     DeclaredBound,
     /// A package-scoped configured `max-major`.
     MaxMajor,
+    /// The registry's `latest` dist-tag currently sits below the release — it is not what a plain
+    /// install would resolve to today.
+    DistTag,
 }
 
 /// A matured release that normal evaluation excludes because of a package ceiling.
@@ -61,6 +76,7 @@ pub struct CeilingHold {
 struct CeilingFilters {
     declared_bound: bool,
     max_major: bool,
+    latest_tag: bool,
 }
 
 impl CeilingFilters {
@@ -68,6 +84,7 @@ impl CeilingFilters {
         Self {
             declared_bound: ctx.honor_declared_bounds,
             max_major: true,
+            latest_tag: ctx.honor_latest_tag,
         }
     }
 
@@ -75,6 +92,7 @@ impl CeilingFilters {
         Self {
             declared_bound: false,
             max_major: false,
+            latest_tag: false,
         }
     }
 }
@@ -166,6 +184,7 @@ fn empty_candidate_held_reason(
     current_order: &ReleaseOrder,
     ceiling_order: Option<&ReleaseOrder>,
     max_major: Option<&MaxMajorPick>,
+    latest_tagged: Option<&Release>,
     filters: CeilingFilters,
 ) -> Option<HeldReason> {
     let newer = eligible
@@ -185,7 +204,11 @@ fn empty_candidate_held_reason(
             .clone()
             .any(|release| !within_max_major(release, Some(pick)))
     });
+    let dist_tag_blocks =
+        latest_tagged.is_some() && newer.clone().any(|release| release.beyond_latest_tag);
 
+    // The dist-tag comes last: it is the least user-actionable ceiling (the registry owns the tag),
+    // so a coincident manifest bound or configured max-major names the hold the user can act on.
     if graph_blocks {
         Some(HeldReason::GraphCeiling)
     } else if declaration_blocks {
@@ -194,9 +217,25 @@ fn empty_candidate_held_reason(
             .map(|bound| HeldReason::DeclaredBound(bound.clone()))
     } else if max_major_blocks {
         max_major.map(|pick| HeldReason::MaxMajor(pick.limit))
+    } else if dist_tag_blocks {
+        latest_tagged.map(|tagged| HeldReason::DistTag(tagged.version.to_string()))
     } else {
         None
     }
+}
+
+/// The release the registry's `latest` dist-tag names, recovered from the per-release markers:
+/// every release ordered above the tag carries [`Release::beyond_latest_tag`], so the tagged
+/// release is the greatest unflagged one. `None` when no release is flagged — no dist-tag data, or
+/// the tag already sits at the newest release — in which case there is nothing to cap.
+fn latest_tagged_release(releases: &[Release]) -> Option<&Release> {
+    if !releases.iter().any(|release| release.beyond_latest_tag) {
+        return None;
+    }
+    releases
+        .iter()
+        .filter(|release| !release.beyond_latest_tag)
+        .max_by(|a, b| a.order.cmp(&b.order))
 }
 
 fn commit_pin_verdict(dep: &Dependency, releases: &[Release], now: Timestamp) -> Option<Verdict> {
@@ -278,8 +317,9 @@ fn classify_candidate(
 /// `None`). The headline `status` is [`Status::Adoptable`] whenever any candidate has matured;
 /// otherwise it is the newest candidate's status, or [`Status::UpToDate`] when no newer candidate
 /// exists — except when the only newer releases lie above the dependency's
-/// [`graph_ceiling`](Dependency::graph_ceiling), an explicit declared upper bound, or a configured
-/// `max-major`, which yields [`Status::Held`] with `latest` still surfacing the newest version. Two
+/// [`graph_ceiling`](Dependency::graph_ceiling), an explicit declared upper bound, a configured
+/// `max-major`, or the registry's `latest` dist-tag ([`Release::beyond_latest_tag`]), which yields
+/// [`Status::Held`] with `latest` still surfacing the newest version. Two
 /// further cases override the rollup: exact manifest pins are [`Status::Held`] when there is a
 /// candidate to review, and a commit pin (pseudo-version) has no tagged version to compare and
 /// yields [`Status::Held`]. If the current pin is absent from `releases` the result is conservatively
@@ -319,6 +359,7 @@ fn classify_candidate(
 ///         major_number: Some(1),
 ///         kind_from_current: None,
 ///         beyond_declared_bound: false,
+///         beyond_latest_tag: false,
 ///         published_at: Some(mature),
 ///         yanked: false,
 ///         quality: ReleaseQuality::Stable,
@@ -330,6 +371,7 @@ fn classify_candidate(
 ///         major_number: Some(1),
 ///         kind_from_current: Some(UpdateKind::Patch),
 ///         beyond_declared_bound: false,
+///         beyond_latest_tag: false,
 ///         published_at: Some(now), // published right now → still cooling
 ///         yanked: false,
 ///         quality: ReleaseQuality::Stable,
@@ -347,6 +389,7 @@ fn classify_candidate(
 ///     project: Utf8Path::new("/repo"),
 ///     allow_major: false,
 ///     honor_declared_bounds: true,
+///     honor_latest_tag: true,
 /// };
 /// let verdict = evaluate(&dep, &releases, &[layer], &ctx, now);
 ///
@@ -416,6 +459,15 @@ fn evaluate_with_filters(
     // it is ignored, leaving a legal upgrade free rather than wrongly holding the dependency.
     let ceiling_order = graph_ceiling_order(dep, releases).filter(|order| **order >= current_order);
     let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
+    // The dist-tag cap applies only while the current pin sits at or below the tag: a pin already
+    // beyond it (a project deliberately riding a `next` line) deactivates the ceiling entirely, so
+    // that project keeps seeing newer releases instead of a downgrade-or-silence dead end — once
+    // the project has knowingly passed the tag, the tag carries no guidance about where to stop.
+    let latest_tagged = if filters.latest_tag && !current.beyond_latest_tag {
+        latest_tagged_release(releases)
+    } else {
+        None
+    };
 
     // Eligible = the releases adoption could target (quality + major filter + not yanked, and not
     // dated after `now`), current included, so `latest` is well-defined even when up to date.
@@ -447,6 +499,7 @@ fn evaluate_with_filters(
                 && !(filters.declared_bound
                     && dep.declared_bound.is_some()
                     && r.beyond_declared_bound)
+                && !(latest_tagged.is_some() && r.beyond_latest_tag)
         })
         .filter_map(|r| classify_candidate(r, dep, layers, ctx, now))
         .collect();
@@ -462,6 +515,7 @@ fn evaluate_with_filters(
             &current_order,
             ceiling_order,
             max_major.as_ref(),
+            latest_tagged,
             filters,
         );
         return Verdict {
@@ -508,11 +562,19 @@ fn evaluate_with_filters(
     }
 }
 
-/// Finds the newest matured target hidden by a declared bound or configured `max-major`.
+/// Finds the newest matured target hidden by a declared bound, a configured `max-major`, or the
+/// registry's `latest` dist-tag.
 ///
-/// The ordinary graph ceiling and the context's major scope remain active. Only the two
-/// package-owned ceilings are removed for the comparison, so a returned target is actionable by
-/// changing the declaration or policy named by [`CeilingHold::reason`].
+/// The ordinary graph ceiling and the context's major scope remain active; only the package-owned
+/// ceilings are probed. Each ceiling is probed *individually*: the reported hold names a ceiling
+/// whose removal alone exposes the reported target, so the action its reason implies (rewriting
+/// the bound, raising `max-major`, opting out via `respect-dist-tags = false`) is sufficient to
+/// reach that target — with two ceilings stacked, naming the outer one against the jointly hidden
+/// target would promise a version the named action cannot expose. Only when no single ceiling is
+/// causal does the hold fall back to the first violated ceiling in the same actionability order
+/// (dist-tag last — the registry owns the tag) against the jointly exposed target: staged
+/// guidance, where lifting the named ceiling is necessary and the next run names the remaining
+/// one.
 #[must_use]
 pub fn evaluate_ceiling_hold(
     dep: &Dependency,
@@ -533,7 +595,66 @@ pub fn evaluate_ceiling_hold(
     if bounded.adoptable_target.as_ref() == Some(&target) {
         return None;
     }
+    let current = releases
+        .iter()
+        .find(|release| release.version == dep.current)?;
 
+    let singly_causal = |reason: CeilingReason, lifted: CeilingFilters| -> Option<CeilingHold> {
+        let probe = evaluate_with_filters(dep, releases, layers, ctx, now, lifted);
+        let target = probe.adoptable_target?;
+        if bounded.adoptable_target.as_ref() == Some(&target) {
+            return None;
+        }
+        let update_kind = probe
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version == target)?
+            .kind;
+        Some(CeilingHold {
+            reason,
+            target,
+            update_kind,
+        })
+    };
+    if filters.declared_bound
+        && dep.declared_bound.is_some()
+        && let Some(hold) = singly_causal(
+            CeilingReason::DeclaredBound,
+            CeilingFilters {
+                declared_bound: false,
+                ..filters
+            },
+        )
+    {
+        return Some(hold);
+    }
+    if active_max_major(current, dep, layers, ctx, filters.max_major).is_some()
+        && let Some(hold) = singly_causal(
+            CeilingReason::MaxMajor,
+            CeilingFilters {
+                max_major: false,
+                ..filters
+            },
+        )
+    {
+        return Some(hold);
+    }
+    if filters.latest_tag
+        && !current.beyond_latest_tag
+        && releases.iter().any(|release| release.beyond_latest_tag)
+        && let Some(hold) = singly_causal(
+            CeilingReason::DistTag,
+            CeilingFilters {
+                latest_tag: false,
+                ..filters
+            },
+        )
+    {
+        return Some(hold);
+    }
+
+    // No single ceiling exposes anything by itself — only the stack's joint removal reaches
+    // `target`. Name the first ceiling the target provably violates (staged guidance, see above).
     let target_release = releases.iter().find(|release| release.version == target)?;
     let reason = if filters.declared_bound
         && dep.declared_bound.is_some()
@@ -541,14 +662,17 @@ pub fn evaluate_ceiling_hold(
     {
         CeilingReason::DeclaredBound
     } else {
-        let current = releases
-            .iter()
-            .find(|release| release.version == dep.current)?;
         let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
-        if within_max_major(target_release, max_major.as_ref()) {
+        if !within_max_major(target_release, max_major.as_ref()) {
+            CeilingReason::MaxMajor
+        } else if filters.latest_tag
+            && !current.beyond_latest_tag
+            && target_release.beyond_latest_tag
+        {
+            CeilingReason::DistTag
+        } else {
             return None;
         }
-        CeilingReason::MaxMajor
     };
     let update_kind = unbounded
         .candidates
@@ -735,6 +859,7 @@ mod tests {
             major_number: major.parse().ok(),
             kind_from_current: kind,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -769,6 +894,7 @@ mod tests {
             major_number: Some(1),
             kind_from_current: Some(UpdateKind::Patch),
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: Some(published.parse().expect("timestamp")),
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -788,6 +914,7 @@ mod tests {
             major_number: major,
             kind_from_current: kind,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: Some("2025-12-01T00:00:00Z".parse().expect("timestamp")),
             yanked: false,
             quality: ReleaseQuality::Stable,
@@ -836,6 +963,7 @@ mod tests {
             project: Utf8Path::new("/repo"),
             allow_major: false,
             honor_declared_bounds: true,
+            honor_latest_tag: true,
         }
     }
 

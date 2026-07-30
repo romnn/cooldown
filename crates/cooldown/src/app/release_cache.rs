@@ -470,6 +470,7 @@ mod tests {
             major_number: Some(1),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: None,
             yanked: false,
             quality: ReleaseQuality::Stable,

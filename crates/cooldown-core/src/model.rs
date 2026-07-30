@@ -304,6 +304,18 @@ pub struct Release {
     /// Adapters set this with their native range matcher. It is always `false` when the dependency
     /// has no explicit declared upper bound.
     pub beyond_declared_bound: bool,
+    /// Whether this release is ordered above the version the registry's mutable `latest` dist-tag
+    /// names (npm-family only; see [`Capabilities::has_dist_tags`](crate::Capabilities)).
+    ///
+    /// The tag is the maintainer's own "this is current" pointer — `npm install <pkg>` resolves to
+    /// it — so a stable release ordered above it (a premature or abandoned major the maintainer
+    /// kept releasing below, e.g. a `17.0.0` published months before the `16.x` line continued) is
+    /// not a normal adoption target. `evaluate` holds such releases out of the candidate set unless
+    /// the current pin is itself beyond the tag (a project deliberately riding a `next` line) or
+    /// [`honor_latest_tag`](crate::ResolveContext::honor_latest_tag) is off. Always `false` for
+    /// registries without dist-tags, and for the tagged version itself and everything ordered at or
+    /// below it.
+    pub beyond_latest_tag: bool,
     /// The newest upload time over the selected artifacts, or `None` if any selected
     /// artifact's time is unknown.
     pub published_at: Option<jiff::Timestamp>,
@@ -478,6 +490,9 @@ pub enum HeldReason {
     DeclaredBound(String),
     /// The inclusive configured numeric major ceiling.
     MaxMajor(u64),
+    /// The registry's `latest` dist-tag caps adoption at this version; the releases above it (the
+    /// current tag points below them, whatever other tag they carry) are held.
+    DistTag(String),
 }
 
 impl Verdict {
@@ -621,35 +636,73 @@ pub struct Plan {
     pub baseline_violations: Vec<BaselineViolation>,
 }
 
-/// Why a planned change was not applied. Skips are `Ok` data, not `Err`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkipReason {
+/// Declares [`SkipReason`] together with its [`ALL`](SkipReason::ALL) enumeration and per-variant
+/// wire tokens in a single invocation: each variant's serde `rename`, its `ALL` entry, and its
+/// [`wire_value`](SkipReason::wire_value) all expand from the same `$wire` literal, so the
+/// serialized token, the schema token, and the enumeration structurally cannot disagree.
+macro_rules! skip_reasons {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// Why a planned change was not applied. Skips are `Ok` data, not `Err`.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        pub enum SkipReason {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl SkipReason {
+            /// Every variant, in declaration order. An enumeration consumer (the report JSON
+            /// schema's `reason` enum, the tests that walk every reason) can never miss one:
+            /// a variant exists exactly when it appears here.
+            pub const ALL: &'static [SkipReason] = &[ $( SkipReason::$variant, )+ ];
+
+            /// The wire token this reason serializes as (`"needs_major"`, `"peer_held"`, …).
+            /// Identical to serde's output by construction, exposed so the JSON schema can
+            /// enumerate the closed set without serializing.
+            #[must_use]
+            pub fn wire_value(self) -> &'static str {
+                match self {
+                    $( SkipReason::$variant => $wire, )+
+                }
+            }
+        }
+    };
+}
+
+skip_reasons! {
     /// The graph requires this version newer (MVS floor / `=` pin) — cannot downgrade.
-    GraphHeld,
+    GraphHeld = "graph_held",
     /// Applying it would drag a too-fresh, non-acknowledged transitive into the lock.
-    TransitiveInCooldown,
+    TransitiveInCooldown = "transitive_in_cooldown",
     /// The resolver/MVS rejected the change.
-    ResolverConflict,
+    ResolverConflict = "resolver_conflict",
     /// The dependency has no editable version requirement to retarget — it is transitive-only or a
     /// path/git source — so `upgrade` cannot move it by rewriting a constraint.
-    NotEligible,
+    NotEligible = "not_eligible",
     /// An adoptable update crosses a major boundary and `--major` was not set; re-run with `--major`
     /// (per `--package`) to take it. It counts as a skip (the report breaks out how many such rows
     /// need `--major`), but unlike a real skip it never fails a `--strict` run — you chose not to
     /// take it, the run did not fail to.
-    NeedsMajor,
+    NeedsMajor = "needs_major",
     /// An explicit manifest upper bound holds the dependency below the newer major.
-    DeclaredBoundHeld,
+    DeclaredBoundHeld = "declared_bound_held",
     /// A configured package `max-major` holds the dependency below the candidate.
-    MaxMajorHeld,
+    MaxMajorHeld = "max_major_held",
+    /// The registry's `latest` dist-tag currently points below the newer release, so adopting it
+    /// would move past what a plain install resolves to today. Like
+    /// [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct — the maintainer's own
+    /// tag says the newer release is not current — so it never fails a `--strict` run.
+    DistTagHeld = "dist_tag_held",
+    /// A resolved dependent's declared peer range excludes the target (e.g. `fumadocs-mdx`
+    /// peer-requires `fumadocs-core@^16` while the target is `17.0.0`), so landing it would break
+    /// the peer contract even where the native resolver only warns. The offending dependent is
+    /// named on the [`Skipped`] row.
+    PeerHeld = "peer_held",
     /// The dependency is declared at multiple versions across the workspace, so it is range-floated
     /// (each importer kept on its own line) rather than pinned to one target. A candidate whose target
     /// is out of this importer's line — a cross-line bump, e.g. one member on `@types/node@^22` while
     /// the target is `25`, or a peer-only dependency the resolver will not move — is deliberately held
     /// in range. Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
     /// upgrade, so it never fails a `--strict` run.
-    MultiVersionHeld,
+    MultiVersionHeld = "multi_version_held",
 }
 
 impl SkipReason {
@@ -683,6 +736,12 @@ impl SkipReason {
             SkipReason::MaxMajorHeld => {
                 "config max-major ceiling holds this; raise it in cooldown.toml to adopt"
             }
+            SkipReason::DistTagHeld => {
+                "the registry's current latest dist-tag points below this newer release; set respect-dist-tags = false to adopt it"
+            }
+            SkipReason::PeerHeld => {
+                "a resolved dependent's peer dependency range excludes this target"
+            }
             SkipReason::MultiVersionHeld => {
                 "declared at multiple versions across the workspace; kept on its own line"
             }
@@ -699,6 +758,10 @@ pub struct Skipped {
     pub reason: SkipReason,
     /// The package responsible for the skip (e.g. the too-fresh transitive), when known.
     pub offending: Option<PackageId>,
+    /// An adapter-supplied elaboration of the skip carrying facts only the adapter knows (e.g. the
+    /// dependent's verbatim peer range that excludes the target). Reports prefer it over the
+    /// generic [`SkipReason::message`] when present.
+    pub detail: Option<String>,
 }
 
 /// The outcome of an `apply`: what changed and what was skipped. Skips are non-fatal data.
@@ -853,24 +916,29 @@ mod tests {
         );
         // ResolverConflict's exact wording is already pinned by the `message()` doctest; here we
         // only assert every reason has a *distinct* message so two skips never read identically.
-        let all = [
-            SkipReason::GraphHeld,
-            SkipReason::TransitiveInCooldown,
-            SkipReason::ResolverConflict,
-            SkipReason::NotEligible,
-            SkipReason::NeedsMajor,
-            SkipReason::DeclaredBoundHeld,
-            SkipReason::MaxMajorHeld,
-            SkipReason::MultiVersionHeld,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
+        for (i, a) in SkipReason::ALL.iter().enumerate() {
+            for b in &SkipReason::ALL[i + 1..] {
                 assert_ne!(
                     a.message(),
                     b.message(),
                     "skip-reason messages must be distinct"
                 );
             }
+        }
+    }
+
+    /// Serde's token and `wire_value` expand from the same macro literal, so they cannot disagree
+    /// by construction; the property left to check is that `ALL` enumerates distinct wire tokens
+    /// (two variants sharing one `$wire` would alias on the wire without a compile error).
+    #[test]
+    fn skip_reason_wire_tokens_are_distinct() {
+        use super::SkipReason;
+        let mut seen = std::collections::BTreeSet::new();
+        for reason in SkipReason::ALL {
+            assert!(
+                seen.insert(reason.wire_value()),
+                "ALL must list every wire token once"
+            );
         }
     }
 }

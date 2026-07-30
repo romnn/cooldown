@@ -76,6 +76,9 @@ pub struct CommandConfig {
     pub gitignore: Option<bool>,
     /// Cross-major candidate scope (`--major` / `--no-major`).
     pub major: Option<bool>,
+    /// Whether the npm-family `latest` dist-tag caps candidates
+    /// (`--respect-dist-tags` / `--no-respect-dist-tags`; default on).
+    pub respect_dist_tags: Option<bool>,
     /// List up-to-date deps in `outdated` (`--all`).
     pub all: Option<bool>,
     /// Gate every recorded artifact in `check` (`--all-artifacts`).
@@ -121,6 +124,7 @@ impl CommandConfig {
             mut package,
             gitignore,
             major,
+            respect_dist_tags,
             all,
             all_artifacts,
             allow_stale_lock,
@@ -143,6 +147,7 @@ impl CommandConfig {
         self.package.append(&mut package);
         self.gitignore = gitignore.or(self.gitignore);
         self.major = major.or(self.major);
+        self.respect_dist_tags = respect_dist_tags.or(self.respect_dist_tags);
         self.all = all.or(self.all);
         self.all_artifacts = all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = allow_stale_lock.or(self.allow_stale_lock);
@@ -176,6 +181,7 @@ impl CommandConfig {
             package,
             gitignore,
             major,
+            respect_dist_tags,
             all,
             all_artifacts,
             allow_stale_lock,
@@ -200,6 +206,7 @@ impl CommandConfig {
         }
         self.gitignore = (*gitignore).or(self.gitignore);
         self.major = (*major).or(self.major);
+        self.respect_dist_tags = (*respect_dist_tags).or(self.respect_dist_tags);
         self.all = (*all).or(self.all);
         self.all_artifacts = (*all_artifacts).or(self.all_artifacts);
         self.allow_stale_lock = (*allow_stale_lock).or(self.allow_stale_lock);

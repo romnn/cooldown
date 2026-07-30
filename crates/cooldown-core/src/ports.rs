@@ -279,12 +279,16 @@ pub trait ToolWrite: Send + Sync {
 
     /// Applies `plan` to `project` and reports what was applied or skipped.
     ///
-    /// Mechanics only (manifest rewrites, MVS, resolver runs); there is **no intra-plan rollback** —
-    /// the application layer captures a [`ProjectMutationJournal`] before calling `apply`, restores
-    /// it if the trial is rejected, and verifies the resulting graph before committing/reporting a
-    /// planned change as applied. An adapter should still return only changes it believes reached
-    /// their exact [`Change::to`](crate::model::Change::to) target, plus any collateral lock diff it
-    /// can derive from the before/after lock state. Skips are reported as `Ok` data in the
+    /// Mechanics only (manifest rewrites, MVS, resolver runs). **Whole-plan** rollback belongs to
+    /// the application layer: it captures a [`ProjectMutationJournal`] before calling `apply`,
+    /// restores it if the trial is rejected, and verifies the resulting graph before
+    /// committing/reporting a planned change as applied. An adapter MAY additionally restore that
+    /// same journal internally to reject individual candidates whose landing it can prove wrong
+    /// (the npm-family peer verification does), provided every rejected candidate is reported as
+    /// a skip and the tree it returns is consistent — never a partially-applied state the caller
+    /// cannot see. An adapter should still return only changes it believes reached their exact
+    /// [`Change::to`](crate::model::Change::to) target, plus any collateral lock diff it can
+    /// derive from the before/after lock state. Skips are reported as `Ok` data in the
     /// [`ApplyReport`], not errors.
     ///
     /// # Errors

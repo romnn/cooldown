@@ -372,6 +372,7 @@ impl ReleaseFetcher for UvTool {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -747,6 +748,7 @@ impl ToolWrite for UvTool {
                     change: change.clone(),
                     reason: SkipReason::NotEligible,
                     offending: None,
+                    detail: None,
                 });
             }
         }
@@ -827,6 +829,7 @@ impl ToolWrite for UvTool {
                     change: change.clone(),
                     reason: SkipReason::ResolverConflict,
                     offending: Some(PackageId::new(UV_ID, offender, Some(PYPI.to_string()))),
+                    detail: None,
                 });
             }
         }

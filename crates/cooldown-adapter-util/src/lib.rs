@@ -108,6 +108,7 @@ pub fn build_registry_releases(
                 major_number: (classifier.major_number)(&version_text),
                 kind_from_current: (classifier.classify_kind)(current, &version_text),
                 beyond_declared_bound: false,
+                beyond_latest_tag: false,
                 published_at: release.published_at,
                 yanked: release.yanked,
                 quality: (classifier.classify_quality)(&version_text),
@@ -143,6 +144,7 @@ pub fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipp
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
+        detail: None,
     })
 }
 

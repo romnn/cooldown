@@ -229,6 +229,7 @@ pub(crate) fn held_reason_label(reason: &HeldReason) -> String {
         HeldReason::GraphCeiling => "graph ceiling".to_string(),
         HeldReason::DeclaredBound(requirement) => format!("bound {requirement}"),
         HeldReason::MaxMajor(limit) => format!("max-major {limit}"),
+        HeldReason::DistTag(version) => format!("dist-tag latest {version}"),
     }
 }
 
@@ -475,7 +476,10 @@ impl UpgradeItem {
         if let Some(skip) = &self.skipped {
             if matches!(
                 skip.reason,
-                SkipReason::NeedsMajor | SkipReason::DeclaredBoundHeld | SkipReason::MaxMajorHeld
+                SkipReason::NeedsMajor
+                    | SkipReason::DeclaredBoundHeld
+                    | SkipReason::MaxMajorHeld
+                    | SkipReason::DistTagHeld
             ) {
                 2
             } else {

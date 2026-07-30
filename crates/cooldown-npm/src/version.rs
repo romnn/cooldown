@@ -25,15 +25,21 @@ pub fn parse(v: &str) -> Option<Version> {
     Version::parse(v).ok()
 }
 
-/// Whether `target` satisfies the declared `package.json` range `spec` — used to decide whether a
-/// lock-only move (pnpm `update --no-save`) stays inside the author's constraint or needs a manifest
-/// rewrite instead.
+/// Whether `target` satisfies the declared `package.json` range `spec` under **npm's** range
+/// semantics — used to decide whether a lock-only move (pnpm `update --no-save`) stays inside the
+/// author's constraint or needs a manifest rewrite instead.
+///
+/// npm and the Rust `semver` parser disagree on bare tokens: npm reads a bare full version as an
+/// *equality* (`1.2.3` ⇔ `=1.2.3`) and a bare partial as an *X-range* (`1.2` ⇔ `1.2.x`), while the
+/// Rust parser would assume an implicit caret for both. [`normalized_requirement`] translates each
+/// clause accordingly before parsing; operator-led partials need no translation (the parser's
+/// `>I.J`-style desugarings already match node-semver's X-range rules).
 ///
 /// Conservative by design: whitespace-separated comparator clauses are normalized into the
 /// parser's comma-separated `AND` form, while ranges it still cannot represent (npm hyphen ranges,
-/// `||` unions, `x`/`X` wildcards, `workspace:`/`catalog:` protocols) return `false`. The caller
-/// then falls back to rewriting the manifest — always correct, just less minimal than a lock-only
-/// move would have been.
+/// `||` unions, `workspace:`/`catalog:` protocols) return `false`. The caller then falls back to
+/// rewriting the manifest — always correct, just less minimal than a lock-only move would have
+/// been.
 ///
 /// # Examples
 ///
@@ -42,6 +48,9 @@ pub fn parse(v: &str) -> Option<Version> {
 ///
 /// assert!(version_in_range("^3.0.0", "3.4.1"));
 /// assert!(!version_in_range("^3.0.0", "4.0.0"));
+/// // npm token semantics: a bare version is an equality, a bare partial an X-range.
+/// assert!(!version_in_range("3.0.0", "3.4.1"));
+/// assert!(version_in_range("3.4", "3.4.1"));
 /// assert!(!version_in_range("workspace:*", "3.4.1")); // unrepresentable → rewrite
 /// ```
 #[must_use]
@@ -54,6 +63,74 @@ pub fn version_in_range(spec: &str, target: &str) -> bool {
         return false;
     };
     requirement.matches(&version)
+}
+
+/// How a declared npm range relates to one target version, for decisions that must distinguish
+/// "provably excluded" from "not understood".
+///
+/// A boolean matcher collapses both non-matches into `false`, which is safe only for positive
+/// queries; a caller that *negates* it (the peer-feasibility gate proving a target excluded) would
+/// turn every range form the parser cannot represent into a false incompatibility. The tri-state
+/// keeps proof and ignorance apart: [`Excludes`](RangeMatch::Excludes) is only reported when every
+/// `||` branch was understood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeMatch {
+    /// An understood `||` branch admits the target.
+    Matches,
+    /// Every `||` branch is understood and none admits the target — exclusion is proven.
+    Excludes,
+    /// No understood branch admits the target, but some branch (or the target itself) is not
+    /// representable — nothing is proven either way.
+    Unknown,
+}
+
+/// Judges `target` against `spec` with npm `semver.satisfies` union semantics: each `||` branch is
+/// an AND comparator set judged like [`version_in_range`], and the verdict is the tri-state
+/// [`RangeMatch`].
+///
+/// This is the matcher for *declared peer ranges*, which routinely union majors
+/// (`eslint: ^7.0.0 || ^8.0.0`); [`version_in_range`] deliberately stays union-free because its
+/// callers must fall back to a manifest rewrite for anything they cannot represent.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_npm::version::{RangeMatch, range_match};
+///
+/// assert_eq!(range_match("^7.0.0 || ^8.0.0", "8.57.0"), RangeMatch::Matches);
+/// assert_eq!(range_match("^7.0.0 || ^8.0.0", "9.8.0"), RangeMatch::Excludes);
+/// // An npm hyphen-range branch cannot be represented, so exclusion is never proven.
+/// assert_eq!(
+///     range_match("^16.0.0 || 17.0.0 - 17.4.0", "18.0.0"),
+///     RangeMatch::Unknown
+/// );
+/// ```
+#[must_use]
+pub fn range_match(spec: &str, target: &str) -> RangeMatch {
+    let Some(target) = parse(target) else {
+        return RangeMatch::Unknown;
+    };
+    let mut every_branch_understood = true;
+    for branch in spec.split("||") {
+        match branch_admits(branch, &target) {
+            Some(true) => return RangeMatch::Matches,
+            Some(false) => {}
+            None => every_branch_understood = false,
+        }
+    }
+    if every_branch_understood {
+        RangeMatch::Excludes
+    } else {
+        RangeMatch::Unknown
+    }
+}
+
+/// Whether one `||`-free branch admits `target`, or [`None`] when the branch is not representable
+/// (hyphen ranges, protocols, an empty branch — npm's "match anything" spelling).
+fn branch_admits(branch: &str, target: &Version) -> Option<bool> {
+    let normalized = normalized_requirement(branch)?;
+    let requirement = semver::VersionReq::parse(&normalized).ok()?;
+    Some(requirement.matches(target))
 }
 
 fn normalized_requirement(spec: &str) -> Option<String> {
@@ -69,10 +146,36 @@ fn normalized_requirement(spec: &str) -> Option<String> {
         {
             clauses.push(format!("{token}{version}"));
         } else {
-            clauses.push(token.to_string());
+            clauses.push(npm_clause(token));
         }
     }
     Some(clauses.join(", "))
+}
+
+/// Translates one range clause into the Rust parser's syntax with **npm's** token semantics: a
+/// BARE version is an equality in npm (`1.2.3` ⇔ `=1.2.3`; a bare partial `1.2` ⇔ the X-range
+/// `1.2.x`, which `=1.2` desugars to identically), never the implicit caret the Rust parser would
+/// assume. Operator-led clauses and explicit X-ranges pass through unchanged — their parser
+/// desugarings already match node-semver's. A clause neither form can represent simply fails the
+/// downstream parse, keeping the callers' conservative fallbacks.
+fn npm_clause(clause: &str) -> String {
+    if clause.starts_with(['<', '>', '=', '~', '^']) || is_x_range(clause) {
+        clause.to_string()
+    } else {
+        format!("={clause}")
+    }
+}
+
+/// Whether `clause` is an npm X-range (`*`, `1.x`, `1.2.X`): a wildcard *version component* before
+/// any prerelease/build suffix — so `1.0.0-x.7` (a prerelease tag that merely contains `x`) is not
+/// one.
+fn is_x_range(clause: &str) -> bool {
+    clause
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(clause)
+        .split('.')
+        .any(|part| matches!(part, "x" | "X" | "*"))
 }
 
 #[derive(Clone)]
@@ -148,7 +251,12 @@ pub fn is_prerelease(v: &str) -> bool {
 ///
 /// npm's caret semantics: `^1.2` is compatible within `1.x`, but `^0.1` is NOT compatible with
 /// `0.2` — so for `0.x` the minor acts as the breaking axis. `--major` gates a jump across this
-/// key. An unparsable version yields an empty [`MajorKey`].
+/// key. `0.0.x` deliberately maps to the single `0.0` line even though the caret pins each `0.0.z`
+/// exactly (`^0.0.3` ⇔ `=0.0.3`): gating every `0.0.x` step behind `--major` would make such a
+/// package unmovable in practice, and the same convention holds across the other adapters
+/// (cargo's `0.0` line is keyed identically). The peer-feasibility gate refines `0.0.x` steps
+/// itself where a provable peer violation is at stake. An unparsable version yields an empty
+/// [`MajorKey`].
 ///
 /// # Examples
 ///
@@ -275,6 +383,51 @@ mod tests {
             most_restrictive_declared_bound([">=5 <7".to_string(), ">=5 <6".to_string(),]),
             Some(">=5 <6".to_string())
         );
+    }
+
+    #[test]
+    fn npm_bare_versions_are_equalities_and_partials_are_x_ranges() {
+        // npm reads a bare full version as an equality — never Rust's implicit caret.
+        assert!(version_in_range("1.2.3", "1.2.3"));
+        assert!(!version_in_range("1.2.3", "1.2.4"));
+        assert_eq!(
+            range_match("0.0.3-alpha", "0.0.3-alpha"),
+            RangeMatch::Matches
+        );
+        // A bare prerelease is exact too: the stable 0.0.3 is OUTSIDE it.
+        assert_eq!(range_match("0.0.3-alpha", "0.0.3"), RangeMatch::Excludes);
+        // A bare partial is an X-range (`1.2` ⇔ `1.2.x`), not `^1.2`.
+        assert!(version_in_range("1.2", "1.2.5"));
+        assert!(!version_in_range("1.2", "1.9.0"));
+        assert_eq!(range_match("1.2", "1.9.0"), RangeMatch::Excludes);
+        assert!(version_in_range("1", "1.9.0"));
+        assert!(!version_in_range("1", "2.0.0"));
+        // Explicit X-ranges and operator-led partials keep their (already npm-matching) meaning.
+        assert!(version_in_range("1.2.x", "1.2.5"));
+        assert!(!version_in_range("1.2.x", "1.3.0"));
+        assert!(version_in_range("*", "3.0.0"));
+        assert!(version_in_range(">1.2", "1.3.0"));
+        // A dist-tag used as a range is not representable and never matches (nor proves exclusion).
+        assert!(!version_in_range("latest", "1.0.0"));
+        assert_eq!(range_match("latest", "1.0.0"), RangeMatch::Unknown);
+    }
+
+    #[test]
+    fn range_match_distinguishes_proof_from_ignorance() {
+        use RangeMatch::{Excludes, Matches, Unknown};
+        assert_eq!(range_match("^7.0.0 || ^8.0.0", "8.57.0"), Matches);
+        assert_eq!(range_match("^7.0.0 || ^8.0.0", "9.8.0"), Excludes);
+        // x-wildcard branches are representable, so the union is judged in full.
+        assert_eq!(range_match("^16.0.0 || 17.x", "17.2.0"), Matches);
+        assert_eq!(range_match("^16.0.0 || 17.x", "18.0.0"), Excludes);
+        // A hyphen-range branch is not representable: exclusion is never proven through it.
+        assert_eq!(range_match("^16.0.0 || 17.0.0 - 17.4.0", "18.0.0"), Unknown);
+        assert_eq!(range_match("16.11.4 - 17.0.0", "18.0.0"), Unknown);
+        // npm's empty range means "anything"; it is unrepresentable here and proves nothing.
+        assert_eq!(range_match("", "1.0.0"), Unknown);
+        assert_eq!(range_match("workspace:*", "1.0.0"), Unknown);
+        // An unparsable target proves nothing either.
+        assert_eq!(range_match("^1.0.0", "not-a-version"), Unknown);
     }
 
     #[test]

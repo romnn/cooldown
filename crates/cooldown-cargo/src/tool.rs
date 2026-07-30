@@ -108,6 +108,7 @@ fn derive_locked_release(dep: &Dependency, releases: &[Release]) -> Option<Relea
         major_number: version::major_number(dep.current.as_str()),
         kind_from_current: None,
         beyond_declared_bound: false,
+        beyond_latest_tag: false,
         published_at: candidate.published_at,
         yanked: false,
         quality: dep.current_quality,
@@ -241,6 +242,7 @@ impl ReleaseFetcher for CargoTool {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: None,
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: time,
             yanked: false,
             quality: dep.current_quality,
@@ -703,6 +705,7 @@ impl CargoTool {
                         offender,
                         Some(CRATES_IO.to_string()),
                     )),
+                    detail: None,
                 });
             }
         }
@@ -876,6 +879,7 @@ mod tests {
             major_number: version::major_number(dep.current.as_str()),
             kind_from_current: Some(UpdateKind::Patch),
             beyond_declared_bound: false,
+            beyond_latest_tag: false,
             published_at: Some(published_at),
             yanked: true,
             quality: ReleaseQuality::Prerelease,
