@@ -30,9 +30,9 @@ pub struct ManifestRewrite {
 /// `[workspace.dependencies]`. When attribution gave no members (or none declared it directly), the
 /// root manifest is the best-effort fallback.
 ///
-/// Returns the modified manifest paths. An empty result means no editable requirement was found —
-/// the crate is pulled in only transitively, or via a path/git source with no version — so the
-/// caller should report the change as not-applied rather than re-locking.
+/// Returns the manifest paths whose contents changed. An empty result means either no editable
+/// requirement was found or every editable requirement already has the normalized target
+/// constraint, so the caller should not re-lock.
 ///
 /// # Errors
 ///
@@ -45,6 +45,7 @@ pub fn widen_constraint(
 ) -> Result<ManifestRewrite, CoreError> {
     let mut rewrite = ManifestRewrite::default();
     let mut needs_workspace = false;
+    let mut matched_member = false;
     let mut seen: BTreeSet<Utf8PathBuf> = BTreeSet::new();
 
     for member in members {
@@ -61,20 +62,26 @@ pub fn widen_constraint(
             write_document(&abs, &doc)?;
             rewrite.modified.push(rel);
         }
+        matched_member |= edits.matched;
         needs_workspace |= edits.inherited;
     }
 
     // An inherited entry lives in the root `[workspace.dependencies]`; the members-empty / nothing-
     // found case falls back to the root manifest (workspace table first, then its own dep sections).
-    if needs_workspace || rewrite.modified.is_empty() {
+    if needs_workspace || !matched_member {
         let rel = Utf8PathBuf::from("Cargo.toml");
         let abs = root.join(&rel);
         if let Some(mut doc) = parse_document(&abs)? {
             let changed = if needs_workspace {
-                rewrite_workspace(&mut doc, crate_name, target)
+                matches!(rewrite_workspace(&mut doc, crate_name, target), Edit::Done)
             } else {
-                rewrite_workspace(&mut doc, crate_name, target)
-                    || rewrite_member(&mut doc, crate_name, target).edited
+                match rewrite_workspace(&mut doc, crate_name, target) {
+                    Edit::Done => true,
+                    Edit::Unchanged => false,
+                    Edit::Inherited | Edit::NoVersion | Edit::NotFound => {
+                        rewrite_member(&mut doc, crate_name, target).edited
+                    }
+                }
             };
             if changed && !rewrite.modified.iter().any(|path| path == &rel) {
                 write_document(&abs, &doc)?;
@@ -103,6 +110,8 @@ enum Edit {
     Inherited,
     /// The crate is declared but carries no version requirement (a path/git source).
     NoVersion,
+    /// The requirement already has the normalized target constraint.
+    Unchanged,
     /// The requirement was rewritten in place.
     Done,
 }
@@ -110,6 +119,8 @@ enum Edit {
 /// What rewriting one member manifest changed, aggregated across all of its dependency sections.
 #[derive(Default)]
 struct MemberEdits {
+    /// At least one editable requirement was found.
+    matched: bool,
     /// At least one requirement was rewritten in place.
     edited: bool,
     /// At least one entry inherits from the workspace (`crate = { workspace = true }`).
@@ -125,7 +136,11 @@ fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Memb
     for section in dependency_section_paths(doc) {
         let keys: Vec<&str> = section.iter().map(String::as_str).collect();
         match rewrite_entry(doc, &keys, crate_name, target) {
-            Edit::Done => edits.edited = true,
+            Edit::Done => {
+                edits.matched = true;
+                edits.edited = true;
+            }
+            Edit::Unchanged => edits.matched = true,
             Edit::Inherited => edits.inherited = true,
             Edit::NoVersion | Edit::NotFound => {}
         }
@@ -134,11 +149,8 @@ fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Memb
 }
 
 /// Rewrite a crate's requirement in the root `[workspace.dependencies]` table, if present.
-fn rewrite_workspace(doc: &mut DocumentMut, crate_name: &str, target: &str) -> bool {
-    matches!(
-        rewrite_entry(doc, &["workspace", "dependencies"], crate_name, target),
-        Edit::Done
-    )
+fn rewrite_workspace(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Edit {
+    rewrite_entry(doc, &["workspace", "dependencies"], crate_name, target)
 }
 
 /// The dotted key paths of every dependency table in a manifest, including per-target sections.
@@ -174,7 +186,11 @@ fn rewrite_entry(doc: &mut DocumentMut, section: &[&str], crate_name: &str, targ
 /// (`dep = { version = "1", … }` / `[deps.dep]`), preserving every other field.
 fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
     if let Some(req) = item.as_str().map(str::to_owned) {
-        *item = toml_edit::value(bump_req(&req, target));
+        let bumped = bump_req(&req, target);
+        if bumped == req {
+            return Edit::Unchanged;
+        }
+        *item = toml_edit::value(bumped);
         return Edit::Done;
     }
     let Some(table) = item.as_table_like_mut() else {
@@ -186,7 +202,11 @@ fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
     if let Some(version) = table.get_mut("version")
         && let Some(req) = version.as_str().map(str::to_owned)
     {
-        *version = toml_edit::value(bump_req(&req, target));
+        let bumped = bump_req(&req, target);
+        if bumped == req {
+            return Edit::Unchanged;
+        }
+        *version = toml_edit::value(bumped);
         return Edit::Done;
     }
     Edit::NoVersion
@@ -306,6 +326,44 @@ mod tests {
     }
 
     #[test]
+    fn already_widened_member_is_unchanged_without_root_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        let root_manifest = indoc::indoc! {r#"
+            [workspace]
+            members = ["crates/app"]
+
+            [workspace.dependencies]
+            serde = "1"
+        "#};
+        std::fs::write(root.join("Cargo.toml"), root_manifest).expect("write root");
+        let member_manifest = indoc::indoc! {r#"
+            [package]
+            name = "app"
+
+            [dependencies]
+            serde = "2.3.0"
+        "#};
+        std::fs::write(root.join("crates/app/Cargo.toml"), member_manifest).expect("write member");
+
+        let rewrite = widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "serde",
+            "2.3.0+build.1",
+        )
+        .expect("widen");
+
+        assert!(rewrite.modified.is_empty());
+        let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
+        assert_eq!(root_after, root_manifest);
+        let member_after =
+            std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read member");
+        assert_eq!(member_after, member_manifest);
+    }
+
+    #[test]
     fn rewrites_every_section_declaring_the_crate() {
         // A crate declared in `[dependencies]` and again in `[build-dependencies]` (rawloader's
         // `toml = "1"` beside `toml = "0.5"`) needs both entries widened: stopping at the first
@@ -359,6 +417,9 @@ mod tests {
             after.contains("features = [\"derive\"]"),
             "features kept: {after}"
         );
+        let repeated =
+            widen_constraint(root, &[member("root", ".")], "serde", "2.3.0").expect("widen again");
+        assert!(repeated.modified.is_empty());
     }
 
     #[test]
