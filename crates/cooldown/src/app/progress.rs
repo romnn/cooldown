@@ -65,10 +65,65 @@ struct Tracker {
     active_packages: BTreeMap<String, usize>,
     completed_packages: u64,
     package_total: u64,
-    candidate_targets: HashSet<ChangeTargetKey>,
-    checked_candidates: HashSet<ChangeTargetKey>,
-    candidate_total: u64,
+    candidates: CandidateTracker,
     cleared: bool,
+}
+
+#[derive(Default)]
+struct CandidateTracker {
+    targets: HashSet<ChangeTargetKey>,
+    decided: HashSet<ChangeTargetKey>,
+    policy_passes: u64,
+    resolver_operations: u64,
+}
+
+impl CandidateTracker {
+    fn start(changes: &[Change]) -> Self {
+        Self {
+            targets: changes.iter().map(change_target_key).collect(),
+            ..Self::default()
+        }
+    }
+
+    fn decide(&mut self, changes: &[Change]) {
+        for change in changes {
+            let key = change_target_key(change);
+            if self.targets.contains(&key) {
+                self.decided.insert(key);
+            }
+        }
+    }
+
+    fn begin_policy_pass(&mut self) {
+        self.policy_passes = self.policy_passes.saturating_add(1);
+    }
+
+    fn begin_resolver_operation(&mut self) {
+        self.resolver_operations = self.resolver_operations.saturating_add(1);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.decided.len() == self.targets.len()
+    }
+
+    fn status(&self, detail: &str) -> String {
+        let decisions = match (self.decided.len(), self.targets.len()) {
+            (0, 0) => "no candidates".to_string(),
+            (0, total) => format!("{total} decisions pending"),
+            (decided, total) => format!("{decided}/{total} decided"),
+        };
+        let mut parts = vec![decisions];
+        if self.policy_passes > 0 {
+            parts.push(format!("policy pass {}", self.policy_passes));
+        }
+        if self.resolver_operations > 0 {
+            parts.push(format!("resolver op {}", self.resolver_operations));
+        }
+        if !detail.is_empty() {
+            parts.push(detail.to_string());
+        }
+        parts.join(" · ")
+    }
 }
 
 /// Marks one project as complete even when its command path returns early.
@@ -89,11 +144,11 @@ impl Progress {
     pub fn interactive(colors: bool) -> Self {
         console::set_colors_enabled_stderr(colors);
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
-        let tools = multi.add(ProgressBar::new_spinner());
-        let tool = multi.add(ProgressBar::new_spinner());
-        let phase = multi.add(ProgressBar::new_spinner());
-        let packages = multi.add(ProgressBar::new_spinner());
-        let candidates = multi.add(ProgressBar::new_spinner());
+        let tools = multi.add(ProgressBar::no_length());
+        let tool = multi.add(ProgressBar::no_length());
+        let phase = multi.add(ProgressBar::no_length());
+        let packages = multi.add(ProgressBar::no_length());
+        let candidates = multi.add(ProgressBar::no_length());
 
         tools.set_prefix("tools");
         tool.set_prefix("tool");
@@ -107,14 +162,12 @@ impl Progress {
         candidates.set_message("waiting");
         multi.set_move_cursor(true);
         multi.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
-        tools.set_style(spinner_style("tools", "cyan", colors));
-        tool.set_style(spinner_style("tool", "magenta", colors));
-        phase.set_style(spinner_style("phase", "yellow", colors));
-        packages.set_style(spinner_style("packages", "blue", colors));
-        candidates.set_style(spinner_style("candidates", "green", colors));
-        for spinner in [&tools, &tool, &phase, &packages, &candidates] {
-            spinner.enable_steady_tick(Duration::from_millis(80));
-        }
+        tools.set_style(status_style("tools", "cyan", colors));
+        tool.set_style(status_style("tool", "magenta", colors));
+        phase.set_style(status_style("phase", "yellow", colors));
+        packages.set_style(status_style("packages", "blue", colors));
+        candidates.set_style(candidate_style("green", colors));
+        candidates.enable_steady_tick(Duration::from_secs(1));
 
         Self {
             inner: Some(Arc::new(ProgressInner {
@@ -179,23 +232,20 @@ impl Progress {
             tracker.active_packages.clear();
             tracker.completed_packages = 0;
             tracker.package_total = 0;
-            tracker.candidate_targets.clear();
-            tracker.checked_candidates.clear();
-            tracker.candidate_total = 0;
+            tracker.candidates = CandidateTracker::default();
             match &inner.output {
                 Output::Interactive(ui) => {
                     ui.tool.set_prefix(tool_name.to_string());
                     ui.tool.set_message(project.to_string());
                     ui.phase.set_message("starting");
                     ui.packages
-                        .set_style(spinner_style("packages", "blue", ui.colors));
+                        .set_style(status_style("packages", "blue", ui.colors));
                     ui.packages.set_position(0);
                     ui.packages.set_message("waiting");
-                    ui.candidates
-                        .set_style(spinner_style("candidates", "green", ui.colors));
+                    ui.candidates.set_style(candidate_style("green", ui.colors));
                     ui.candidates.set_position(0);
                     ui.candidates.set_message("waiting");
-                    ui.tool.tick();
+                    ui.candidates.reset_elapsed();
                 }
                 Output::Plain => write_line(&format!(
                     "{tool_name:>12}  {:<20}  starting",
@@ -216,10 +266,7 @@ impl Progress {
         let tracker = lock_tracker(inner);
         let message = message.as_ref();
         match &inner.output {
-            Output::Interactive(ui) => {
-                ui.phase.set_message(message.to_string());
-                ui.phase.tick();
-            }
+            Output::Interactive(ui) => ui.phase.set_message(message.to_string()),
             Output::Plain => write_line(&plain_status(&tracker, "phase", message)),
         }
     }
@@ -307,91 +354,79 @@ impl Progress {
             return;
         };
         let mut tracker = lock_tracker(inner);
-        tracker.candidate_targets = changes.iter().map(change_target_key).collect();
-        tracker.checked_candidates.clear();
-        tracker.candidate_total = usize_to_u64(tracker.candidate_targets.len());
+        tracker.candidates = CandidateTracker::start(changes);
+        let detail = if changes.is_empty() {
+            "complete"
+        } else {
+            message.as_ref()
+        };
+        let status = tracker.candidates.status(detail);
         match &inner.output {
             Output::Interactive(ui) => {
-                ui.candidates
-                    .set_style(bar_style("candidates", "green", ui.colors));
-                ui.candidates.set_length(tracker.candidate_total);
-                ui.candidates.set_position(0);
-                ui.candidates.set_message(if changes.is_empty() {
-                    "complete".to_string()
-                } else {
-                    message.as_ref().to_string()
-                });
+                ui.candidates.set_style(candidate_style("green", ui.colors));
+                ui.candidates.reset_elapsed();
+                ui.candidates.set_message(status);
             }
-            Output::Plain => write_line(&plain_status(
-                &tracker,
-                "candidates",
-                &format!("{} ({})", message.as_ref(), tracker.candidate_total),
-            )),
+            Output::Plain => write_line(&plain_status(&tracker, "candidates", &status)),
         }
     }
 
-    pub(crate) fn candidate(&self, change: &Change) {
+    fn resolver_operation(&self, change: &Change) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let tracker = lock_tracker(inner);
-        let message = format!("{} → {}", change.package.name, change.to);
+        let mut tracker = lock_tracker(inner);
+        tracker.candidates.begin_resolver_operation();
+        let detail = format!("{} {} → {}", change.package.name, change.from, change.to);
+        let message = tracker.candidates.status(&detail);
         match &inner.output {
             Output::Interactive(ui) => ui.candidates.set_message(message),
             Output::Plain => write_line(&plain_status(&tracker, "candidate", &message)),
         }
     }
 
-    pub(crate) fn candidate_group(&self, changes: &[Change]) {
+    pub(crate) fn policy_pass(&self, changes: &[Change]) {
         let Some(first) = changes.first() else {
             return;
         };
         let Some(inner) = &self.inner else {
             return;
         };
-        let tracker = lock_tracker(inner);
-        let message = if changes.len() == 1 {
-            format!("{} → {}", first.package.name, first.to)
+        let mut tracker = lock_tracker(inner);
+        tracker.candidates.begin_policy_pass();
+        let detail = if changes.len() == 1 {
+            format!("{} {} → {}", first.package.name, first.from, first.to)
         } else {
             format!(
-                "{} → {} (+{} in trial)",
+                "{} {} → {} (+{} targets)",
                 first.package.name,
+                first.from,
                 first.to,
                 changes.len() - 1
             )
         };
+        let message = tracker.candidates.status(&detail);
         match &inner.output {
             Output::Interactive(ui) => ui.candidates.set_message(message),
-            Output::Plain => write_line(&plain_status(&tracker, "trial", &message)),
+            Output::Plain => write_line(&plain_status(&tracker, "pass", &message)),
         }
     }
 
-    pub(crate) fn candidates_checked(&self, changes: &[Change]) {
+    pub(crate) fn candidates_decided(&self, changes: &[Change]) {
         let Some(inner) = &self.inner else {
             return;
         };
         let mut tracker = lock_tracker(inner);
-        for change in changes {
-            let key = change_target_key(change);
-            if tracker.candidate_targets.contains(&key) {
-                tracker.checked_candidates.insert(key);
-            }
-        }
-        let checked = usize_to_u64(tracker.checked_candidates.len()).min(tracker.candidate_total);
+        tracker.candidates.decide(changes);
+        let detail = if tracker.candidates.is_complete() {
+            "complete"
+        } else {
+            ""
+        };
+        let status = tracker.candidates.status(detail);
         match &inner.output {
-            Output::Interactive(ui) => {
-                ui.candidates.set_position(checked);
-                if checked == tracker.candidate_total {
-                    ui.candidates.set_message("complete");
-                } else {
-                    ui.candidates.set_message(format!("{checked} checked"));
-                }
-            }
-            Output::Plain => write_line(&plain_status(
-                &tracker,
-                "checked",
-                &format!("{checked}/{} candidates", tracker.candidate_total),
-            )),
+            Output::Interactive(ui) => ui.candidates.set_message(status),
+            Output::Plain => write_line(&plain_status(&tracker, "decided", &status)),
         }
     }
 
@@ -438,7 +473,7 @@ impl Progress {
 
 impl cooldown_core::ApplyObserver for Progress {
     fn candidate_started(&self, change: &Change) {
-        self.candidate(change);
+        self.resolver_operation(change);
     }
 }
 
@@ -465,33 +500,53 @@ fn clear_interactive(inner: &ProgressInner, tracker: &mut Tracker) {
 }
 
 fn bar_style(prefix: &str, color: &str, colors: bool) -> ProgressStyle {
-    let template = if colors {
+    let template = bar_template(color, colors);
+    style_or_default(&template, prefix).progress_chars("━━╸─")
+}
+
+fn bar_template(color: &str, colors: bool) -> String {
+    if colors {
         format!(
-            "{{spinner:.{color}}} {{prefix:>12.bold.{color}}} [{{bar:32.{color}/black}}] \
+            "{{prefix:>12.bold.{color}}} [{{bar:32.{color}/black}}] \
              {{pos:>3}}/{{len:<3}} {{msg:.bold}}"
         )
     } else {
-        "{spinner} {prefix:>12} [{bar:32}] {pos:>3}/{len:<3} {msg}".to_string()
-    };
-    style_or_default(&template, ProgressStyle::default_bar(), prefix).progress_chars("━━╸─")
+        "{prefix:>12} [{bar:32}] {pos:>3}/{len:<3} {msg}".to_string()
+    }
 }
 
-fn spinner_style(prefix: &str, color: &str, colors: bool) -> ProgressStyle {
-    let template = if colors {
-        format!("{{spinner:.{color}}} {{prefix:>12.bold.{color}}} {{msg}}")
+fn status_style(prefix: &str, color: &str, colors: bool) -> ProgressStyle {
+    let template = status_template(color, colors);
+    style_or_default(&template, prefix)
+}
+
+fn status_template(color: &str, colors: bool) -> String {
+    if colors {
+        format!("{{prefix:>12.bold.{color}}} {{msg}}")
     } else {
-        "{spinner} {prefix:>12} {msg}".to_string()
-    };
-    style_or_default(&template, ProgressStyle::default_spinner(), prefix)
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+        "{prefix:>12} {msg}".to_string()
+    }
 }
 
-fn style_or_default(template: &str, fallback: ProgressStyle, prefix: &str) -> ProgressStyle {
+fn candidate_style(color: &str, colors: bool) -> ProgressStyle {
+    let template = candidate_template(color, colors);
+    style_or_default(&template, "candidates")
+}
+
+fn candidate_template(color: &str, colors: bool) -> String {
+    if colors {
+        format!("{{prefix:>12.bold.{color}}} [{{elapsed_precise:.dim}}] {{msg}}")
+    } else {
+        "{prefix:>12} [{elapsed_precise}] {msg}".to_string()
+    }
+}
+
+fn style_or_default(template: &str, prefix: &str) -> ProgressStyle {
     match ProgressStyle::with_template(template) {
         Ok(style) => style,
         Err(error) => {
             tracing::debug!(%error, prefix, "invalid built-in progress style");
-            fallback
+            ProgressStyle::default_bar()
         }
     }
 }
@@ -595,9 +650,9 @@ mod tests {
         let second = member_change("second");
         progress.candidates(&[first.clone(), second.clone()], "checking");
 
-        progress.candidates_checked(&[first, second]);
+        progress.candidates_decided(&[first, second]);
 
-        assert_eq!(checked_candidates(&progress), 2);
+        assert_eq!(decided_candidates(&progress), 2);
     }
 
     #[test]
@@ -607,9 +662,57 @@ mod tests {
         let unrelated = member_change("unrelated");
         progress.candidates(std::slice::from_ref(&expected), "checking");
 
-        progress.candidates_checked(&[unrelated]);
+        progress.candidates_decided(&[unrelated]);
 
-        assert_eq!(checked_candidates(&progress), 0);
+        assert_eq!(decided_candidates(&progress), 0);
+    }
+
+    #[test]
+    fn resolver_operations_advance_while_candidate_decisions_remain_pending() {
+        let progress = Progress::plain();
+        let first = member_change("first");
+        let second = member_change("second");
+        progress.candidates(&[first.clone(), second.clone()], "checking");
+        progress.policy_pass(&[first.clone(), second]);
+
+        cooldown_core::ApplyObserver::candidate_started(&progress, &first);
+        cooldown_core::ApplyObserver::candidate_started(&progress, &first);
+
+        assert_eq!(decided_candidates(&progress), 0);
+        assert_eq!(
+            candidate_summary(&progress, "shared 1.0.0 → 2.0.0"),
+            "2 decisions pending · policy pass 1 · resolver op 2 · shared 1.0.0 → 2.0.0"
+        );
+
+        progress.candidates_decided(std::slice::from_ref(&first));
+        assert_eq!(
+            candidate_summary(&progress, ""),
+            "1/2 decided · policy pass 1 · resolver op 2"
+        );
+    }
+
+    #[test]
+    fn interactive_progress_rows_have_no_spinners() {
+        for colors in [false, true] {
+            for template in [
+                super::bar_template("green", colors),
+                super::status_template("green", colors),
+                super::candidate_template("green", colors),
+            ] {
+                assert!(!template.contains("{spinner"));
+                assert!(indicatif::ProgressStyle::with_template(&template).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_work_is_indeterminate_and_time_aware() {
+        let template = super::candidate_template("green", false);
+
+        assert!(template.contains("{elapsed_precise}"));
+        assert!(!template.contains("{bar"));
+        assert!(!template.contains("{pos"));
+        assert!(!template.contains("{len"));
     }
 
     fn completed_tools(progress: &Progress) -> u64 {
@@ -632,9 +735,14 @@ mod tests {
         super::lock_tracker(inner).package_total
     }
 
-    fn checked_candidates(progress: &Progress) -> usize {
+    fn decided_candidates(progress: &Progress) -> usize {
         let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).checked_candidates.len()
+        super::lock_tracker(inner).candidates.decided.len()
+    }
+
+    fn candidate_summary(progress: &Progress, detail: &str) -> String {
+        let inner = progress.inner.as_ref().expect("plain progress is enabled");
+        super::lock_tracker(inner).candidates.status(detail)
     }
 
     fn member_change(member: &str) -> Change {

@@ -287,9 +287,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .opts
                 .progress
                 .candidates(&build_changes, "checking build backend updates");
-            let checked = build_changes.clone();
+            let decided = build_changes.clone();
             let outcome = self.apply_batch(build_changes, state).await;
-            self.ctx.opts.progress.candidates_checked(&checked);
+            self.ctx.opts.progress.candidates_decided(&decided);
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
         }
@@ -324,7 +324,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
         match initial {
             UpgradeTrialResult::Settled(outcomes) => {
-                self.ctx.opts.progress.candidates_checked(&lock_changes);
+                self.ctx.opts.progress.candidates_decided(&lock_changes);
                 self.merge_batch_outcomes(outcomes);
                 self.collapse_collateral(&baseline_before_lock.baseline_violations);
                 return;
@@ -348,7 +348,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 // A singleton batch has nothing to isolate: the lone candidate is the culprit.
                 if lock_changes.len() == 1 {
-                    self.ctx.opts.progress.candidates_checked(&lock_changes);
+                    self.ctx.opts.progress.candidates_decided(&lock_changes);
                     self.record_unreconciled_skips(&lock_changes, &violations);
                     self.collapse_collateral(&baseline_before_lock.baseline_violations);
                     return;
@@ -425,7 +425,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
                         return UpgradeSelectionResult::Aborted(outcome);
                     }
-                    self.ctx.opts.progress.candidates_checked(&group);
                     accepted.extend(group);
                 }
                 UpgradeTrialResult::PolicyBlocked(violations) => {
@@ -436,7 +435,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     if group.len() > 1 {
                         push_upgrade_halves(&mut work, group);
                     } else {
-                        self.ctx.opts.progress.candidates_checked(&group);
+                        self.ctx.opts.progress.candidates_decided(&group);
                         rejected
                             .extend(group.into_iter().map(|change| (change, violations.clone())));
                     }
@@ -480,6 +479,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             UpgradeTrialResult::Settled(outcomes) => {
+                self.ctx.opts.progress.candidates_decided(&accepted);
                 self.merge_batch_outcomes(outcomes);
                 self.record_rejected_upgrade_changes(rejected);
             }
@@ -489,6 +489,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     self.merge_batch_outcome(outcome);
                     return;
                 }
+                self.ctx.opts.progress.candidates_decided(&accepted);
                 self.record_unreconciled_skips(&accepted, &violations);
                 self.record_rejected_upgrade_changes(rejected);
             }
@@ -1006,9 +1007,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .opts
                 .progress
                 .candidates(&changes, "checking cooldown fixes");
-            let checked = changes.clone();
+            let decided = changes.clone();
             let outcome = self.apply_batch(changes, state).await;
-            self.ctx.opts.progress.candidates_checked(&checked);
+            self.ctx.opts.progress.candidates_decided(&decided);
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
@@ -1148,7 +1149,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .opts
             .progress
             .phase(format!("applying {} planned changes", changes.len()));
-        self.ctx.opts.progress.candidate_group(&changes);
+        self.ctx.opts.progress.policy_pass(&changes);
         let journal = match self
             .ctx
             .writer
