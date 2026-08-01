@@ -224,7 +224,7 @@ impl Workspace {
             .await
         {
             Ok(report) => {
-                let (status, path) = classify(&report);
+                let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
                 SyncItem {
                     tool: tool.as_str().to_string(),
@@ -280,7 +280,7 @@ impl Workspace {
             .await
         {
             Ok(report) => {
-                let (status, path) = classify(&report);
+                let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
                 SyncItem {
                     tool: tool.as_str().to_string(),
@@ -312,14 +312,21 @@ fn repo_relative_root() -> String {
     ".".to_string()
 }
 
-/// Map a [`SyncReport`] to a [`SyncStatus`] and the native config path it touched.
-fn classify(report: &SyncReport) -> (SyncStatus, Option<String>) {
-    match report {
+/// A [`SyncReport`] mapped to its report row parts.
+struct SyncClassification {
+    status: SyncStatus,
+    /// The native config path the sync touched, when one exists.
+    path: Option<String>,
+}
+
+fn classify(report: &SyncReport) -> SyncClassification {
+    let (status, path) = match report {
         SyncReport::Written { path } => (SyncStatus::Written, Some(path.to_string())),
         SyncReport::Unchanged { path } => (SyncStatus::Unchanged, Some(path.to_string())),
         SyncReport::Deferred { .. } => (SyncStatus::Written, None),
         SyncReport::Unsupported => (SyncStatus::Unsupported, None),
-    }
+    };
+    SyncClassification { status, path }
 }
 
 /// A short window label for display (`14d`, a freeze date, or `latest`).

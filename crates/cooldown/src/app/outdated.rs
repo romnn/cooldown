@@ -3,8 +3,8 @@
 
 use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
 use super::{
-    Exit, LockReportAction, RunOpts, Workspace, age_days, diag_from_error, lock_report_outcome,
-    render_window,
+    Exit, FetchedRelease, LockReportAction, RunOpts, Workspace, age_days, diag_from_error,
+    lock_report_outcome, render_window,
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
@@ -160,8 +160,10 @@ impl<'a> OutdatedRunner<'a> {
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
 
-        let (mut project_items, verification_candidates) =
-            self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
+        let ClassifiedProject {
+            items: mut project_items,
+            verification_candidates,
+        } = self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
 
         // Reconcile the per-package "adoptable" verdicts with what the whole-graph upgrade resolve would
         // actually land. A matured candidate the resolve cannot place (a conflicting requirement wins) is
@@ -183,11 +185,15 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
         rctx: &cooldown_core::ResolveContext<'_>,
-        fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)>,
-    ) -> (Vec<OutdatedItem>, Vec<VerificationCandidate>) {
+        fetched: Vec<FetchedRelease<Vec<Release>>>,
+    ) -> ClassifiedProject {
         let mut items = Vec::new();
         let mut candidates = Vec::new();
-        for (dep, result) in fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
             match result {
                 Ok(releases) => {
                     if is_yanked_locked(&releases, &dep) {
@@ -212,7 +218,10 @@ impl<'a> OutdatedRunner<'a> {
                 }
             }
         }
-        (items, candidates)
+        ClassifiedProject {
+            items,
+            verification_candidates: candidates,
+        }
     }
 
     /// Re-classify any `adoptable` item the whole-graph upgrade resolve would not actually land as
@@ -331,7 +340,7 @@ impl<'a> OutdatedRunner<'a> {
         project_label: &str,
         deps: Vec<Dependency>,
         fctx: &cooldown_core::FetchContext<'_>,
-    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+    ) -> Vec<FetchedRelease<Vec<Release>>> {
         tracing::info!(
             project = project_label,
             tool = pctx.tool.as_str(),
@@ -354,7 +363,11 @@ impl<'a> OutdatedRunner<'a> {
                 self.opts.fanout(),
             )
             .await;
-        for (dep, result) in &fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in &fetched
+        {
             match result {
                 Ok(releases) => tracing::trace!(
                     package = dep.package.name.as_str(),
@@ -511,6 +524,13 @@ fn error_item(
         latest: None,
         error: Some(diag),
     }
+}
+
+/// One project's classified rows plus the adoptable candidates the whole-graph verification pass
+/// re-checks against the real upgrade trial.
+struct ClassifiedProject {
+    items: Vec<OutdatedItem>,
+    verification_candidates: Vec<VerificationCandidate>,
 }
 
 /// An `adoptable` item paired (by position in the project's item list) with the forward [`Change`]
@@ -673,6 +693,7 @@ mod tests {
                 offending: Some(blocker.to_string()),
             }),
             error: None,
+            edge: None,
         }
     }
 

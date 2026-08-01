@@ -37,7 +37,7 @@
 
 mod support;
 
-use support::{Fixture, changed_packages, deno_lock_pins};
+use support::{ChangeVersions, Fixture, changed_packages, deno_lock_pins};
 
 /// The absolute resolution cutoff. The npm registry's release history before this instant is
 /// immutable, so the matured-version set reproduces forever. `debug` 4.3.6 is the newest matured here.
@@ -346,7 +346,7 @@ fn upgrade_moves_a_member_declared_dependency() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("debug")
         .expect("debug should be in the report");
     assert_ne!(from, to, "debug must move to a newer matured version");

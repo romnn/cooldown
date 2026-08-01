@@ -199,7 +199,10 @@ mod tests {
 
     #[test]
     fn exact_pinned_names_collects_across_dependency_tables() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
             [project]
             dependencies = ["protobuf==6.33.5", "httpx>=0.27"]
 
@@ -214,17 +217,31 @@ mod tests {
         assert!(!pins.contains("httpx") && !pins.contains("ruff"));
     }
 
-    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path =
-            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
-        std::fs::write(&path, contents).expect("write manifest");
-        (dir, path)
+    /// A `pyproject.toml` written into its own temporary directory.
+    struct TempManifest {
+        /// Owns the temporary directory; dropping it deletes the manifest from disk.
+        directory: tempfile::TempDir,
+        /// The path of the `pyproject.toml` inside the temporary directory.
+        manifest: Utf8PathBuf,
+    }
+
+    fn write_manifest(contents: &str) -> TempManifest {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest =
+            Utf8PathBuf::from_path_buf(directory.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&manifest, contents).expect("write manifest");
+        TempManifest {
+            directory,
+            manifest,
+        }
     }
 
     #[test]
     fn parse_native_errors_on_invalid_package_rule() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
             [tool.uv]
             exclude-newer = "2026-06-01"
 
@@ -238,7 +255,10 @@ mod tests {
 
     #[test]
     fn parse_native_reads_valid_rules() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
             [tool.uv]
             exclude-newer = "2026-06-01"
 

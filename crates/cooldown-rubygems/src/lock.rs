@@ -5,10 +5,19 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// Returns the resolved `(name, version)` of every gem in a `specs:` block. Nested lines (a gem's
+/// A gem and the exact version a `Gemfile.lock` `specs:` line resolves it to.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedPin {
+    /// The gem name.
+    pub name: String,
+    /// The resolved version, with any platform suffix dropped.
+    pub version: String,
+}
+
+/// Returns the [`ResolvedPin`] of every gem in a `specs:` block. Nested lines (a gem's
 /// own dependencies, indented past four spaces) are skipped, as are non-spec lines.
 #[must_use]
-pub fn parse_resolved(content: &str) -> Vec<(String, String)> {
+pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     let mut in_specs = false;
     for line in content.lines() {
@@ -37,14 +46,17 @@ pub fn parse_resolved(content: &str) -> Vec<(String, String)> {
 
 /// Parses a single `name (version)` spec line, dropping any platform suffix on the version
 /// (`1.2.3-x86_64-linux` → `1.2.3`).
-fn parse_spec(line: &str) -> Option<(String, String)> {
+fn parse_spec(line: &str) -> Option<ResolvedPin> {
     let line = line.trim_end();
     let open = line.find(" (")?;
     let name = &line[..open];
     let version = line.get(open + 2..)?.strip_suffix(')')?;
     // A native-extension gem records `version-platform`; cooldown reasons about the version alone.
     let version = version.split('-').next().unwrap_or(version);
-    Some((name.to_string(), version.to_string()))
+    Some(ResolvedPin {
+        name: name.to_string(),
+        version: version.to_string(),
+    })
 }
 
 /// The graph ceiling for each gem some *requirer* pins exactly in the `specs:` block: a nested
@@ -75,16 +87,25 @@ pub fn graph_ceilings(content: &str) -> HashMap<String, String> {
         if !rest.starts_with(' ') {
             continue; // the spec line itself (the requirer), not one of its dependency edges
         }
-        if let Some((name, version)) = exact_dep_pin(rest.trim()) {
-            ceilings.insert(name.to_string(), version.to_string());
+        if let Some(pin) = exact_dep_pin(rest.trim()) {
+            ceilings.insert(pin.name.to_string(), pin.version.to_string());
         }
     }
     ceilings
 }
 
-/// The `(name, version)` of a gem dependency edge that pins exactly — `foo (= 1.2.3)` — or `None` for
+/// An exactly pinned (`= X`) gem dependency edge, borrowing from its lock line.
+#[derive(Debug, PartialEq)]
+struct ExactDepPin<'a> {
+    /// The dependency's gem name.
+    name: &'a str,
+    /// The version the requirer pins the gem to.
+    version: &'a str,
+}
+
+/// The [`ExactDepPin`] of a gem dependency edge that pins exactly — `foo (= 1.2.3)` — or `None` for
 /// an unconstrained edge (`foo`), a range (`foo (~> 1.4)`, `foo (>= 1, < 2)`), or a malformed line.
-fn exact_dep_pin(line: &str) -> Option<(&str, &str)> {
+fn exact_dep_pin(line: &str) -> Option<ExactDepPin<'_>> {
     let open = line.find(" (")?;
     let name = &line[..open];
     let requirement = line.get(open + 2..)?.strip_suffix(')')?;
@@ -92,7 +113,7 @@ fn exact_dep_pin(line: &str) -> Option<(&str, &str)> {
         return None; // a compound requirement (`>= 1, < 2`) is not an exact pin
     }
     let version = requirement.trim().strip_prefix('=')?.trim();
-    (!version.is_empty()).then_some((name, version))
+    (!version.is_empty()).then_some(ExactDepPin { name, version })
 }
 
 /// Returns the set of gem names declared directly in the `Gemfile`, read from the lock's
@@ -128,16 +149,23 @@ mod tests {
 
     const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.13.0)\n      racc (~> 1.4)\n    racc (1.6.0)\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  nokogiri\n  rake (~> 13.0)\n\nBUNDLED WITH\n   2.3.0\n";
 
+    fn pin(name: &str, version: &str) -> ResolvedPin {
+        ResolvedPin {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
     #[test]
     fn resolved_skips_nested_deps() {
         let mut got = parse_resolved(LOCK);
-        got.sort();
+        got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
             vec![
-                ("nokogiri".to_string(), "1.13.0".to_string()),
-                ("racc".to_string(), "1.6.0".to_string()),
-                ("rake".to_string(), "13.0.6".to_string()),
+                pin("nokogiri", "1.13.0"),
+                pin("racc", "1.6.0"),
+                pin("rake", "13.0.6"),
             ]
         );
     }
@@ -167,7 +195,13 @@ mod tests {
 
     #[test]
     fn exact_dep_pin_recognises_only_a_lone_equals() {
-        assert_eq!(exact_dep_pin("foo (= 1.2.3)"), Some(("foo", "1.2.3")));
+        assert_eq!(
+            exact_dep_pin("foo (= 1.2.3)"),
+            Some(ExactDepPin {
+                name: "foo",
+                version: "1.2.3"
+            })
+        );
         assert_eq!(exact_dep_pin("foo (~> 1.4)"), None);
         assert_eq!(exact_dep_pin("foo (>= 1.0)"), None);
         assert_eq!(exact_dep_pin("foo (>= 1, < 2)"), None);

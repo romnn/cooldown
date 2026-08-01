@@ -99,11 +99,11 @@ where
         .cloned()
     }
 
-    fn stats(&self) -> (u64, u64) {
-        (
-            self.lookups.load(Ordering::Relaxed),
-            self.resolved.load(Ordering::Relaxed),
-        )
+    fn stats(&self) -> Stats {
+        Stats {
+            lookups: self.lookups.load(Ordering::Relaxed),
+            resolved: self.resolved.load(Ordering::Relaxed),
+        }
     }
 
     /// Seed a value discovered through an equivalent operation without counting a cache lookup.
@@ -252,18 +252,18 @@ impl ReleaseResolver for ReleaseCache {
     }
 
     fn stats(&self) -> Stats {
-        let (candidate_lookups, candidate_resolved) = self.candidates.stats();
-        let (locked_lookups, locked_resolved) = self.locked.stats();
+        let candidates = self.candidates.stats();
+        let locked = self.locked.stats();
         Stats {
-            lookups: candidate_lookups + locked_lookups,
-            resolved: candidate_resolved + locked_resolved,
+            lookups: candidates.lookups + locked.lookups,
+            resolved: candidates.resolved + locked.resolved,
         }
     }
 }
 
 /// A snapshot of [`ReleaseCache`] effectiveness: how many resolve requests were made and how many
 /// actually ran a fetch. [`saved`](Stats::saved) is the redundant work the cache removed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stats {
     pub(crate) lookups: u64,
     pub(crate) resolved: u64,
@@ -305,8 +305,13 @@ mod tests {
             // Three racers, one fetch; all share the value.
             (7, 7, 7, 1)
         );
-        let (lookups, resolved) = cache.stats();
-        assert_eq!((lookups, resolved), (3, 1));
+        assert_eq!(
+            cache.stats(),
+            Stats {
+                lookups: 3,
+                resolved: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -332,7 +337,13 @@ mod tests {
             (a.expect("a"), b.expect("b"), a_again.expect("a again")),
             (1, 2, 1)
         );
-        assert_eq!(cache.stats(), (3, 2));
+        assert_eq!(
+            cache.stats(),
+            Stats {
+                lookups: 3,
+                resolved: 2
+            }
+        );
     }
 
     /// A stand-in resolver, proving the port is mockable without any registry, fetcher, or fixtures.

@@ -373,9 +373,9 @@ pub(crate) fn replace_declared_range(
     let object_start = find_top_level_object_for_key(content, &field_key)?;
     let object_end = find_matching_brace(content, object_start)?;
     let section = content.get(object_start + 1..object_end)?;
-    let (value_start, value_end) = find_string_value_for_key(section, &name_key, &old_value)?;
-    let value_start = object_start + 1 + value_start;
-    let value_end = object_start + 1 + value_end;
+    let span = find_string_value_for_key(section, &name_key, &old_value)?;
+    let value_start = object_start + 1 + span.start;
+    let value_end = object_start + 1 + span.end;
     let mut out = content.to_string();
     out.replace_range(value_start..value_end, &new_value);
     Some(out)
@@ -415,7 +415,15 @@ fn find_top_level_object_for_key(content: &str, key: &str) -> Option<usize> {
     None
 }
 
-fn find_string_value_for_key(section: &str, key: &str, value: &str) -> Option<(usize, usize)> {
+/// The byte span of a quoted JSON string value within the searched section, quotes included.
+struct StringValueSpan {
+    /// Byte offset of the value's opening quote.
+    start: usize,
+    /// Byte offset one past the value's closing quote.
+    end: usize,
+}
+
+fn find_string_value_for_key(section: &str, key: &str, value: &str) -> Option<StringValueSpan> {
     let bytes = section.as_bytes();
     let mut depth = 0usize;
     let mut index = 0usize;
@@ -430,7 +438,10 @@ fn find_string_value_for_key(section: &str, key: &str, value: &str) -> Option<(u
                         let value_start = skip_ws(bytes, colon + 1);
                         let value_end = scan_string_end(bytes, value_start)?;
                         if section.get(value_start..value_end) == Some(value) {
-                            return Some((value_start, value_end));
+                            return Some(StringValueSpan {
+                                start: value_start,
+                                end: value_end,
+                            });
                         }
                     }
                 }
@@ -511,16 +522,28 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
-    fn manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
+    /// A `package.json` written into a temporary directory.
+    struct ManifestFixture {
+        /// Owns the temporary directory; dropping it deletes the manifest, so it must stay bound
+        /// for as long as the path is read.
+        guard: tempfile::TempDir,
+        /// The path of the `package.json` inside the temporary directory.
+        path: Utf8PathBuf,
+    }
+
+    fn manifest(contents: &str) -> ManifestFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(dir.path().join("package.json")).expect("utf8 path");
         std::fs::write(&path, contents).expect("write");
-        (dir, path)
+        ManifestFixture { guard: dir, path }
     }
 
     #[test]
     fn declared_range_finds_across_fields_and_reports_absence() {
-        let (_dir, path) = manifest(
+        let ManifestFixture {
+            guard: _guard,
+            path,
+        } = manifest(
             r#"{ "dependencies": { "nanoid": "^3.0.0" }, "devDependencies": { "vitest": "~1.2.0" } }"#,
         );
         assert_eq!(

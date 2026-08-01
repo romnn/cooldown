@@ -47,8 +47,8 @@ pub(crate) fn rewrite_imports(
 
 pub(crate) fn old_import_path(change: &Change) -> Option<String> {
     let new_path = &change.package.name;
-    let (prefix, _path_major, ok) = semver::split_path_version(new_path);
-    if !ok {
+    let split = semver::split_path_version(new_path);
+    if !split.well_formed {
         return None;
     }
     // A `+incompatible` module (e.g. `github.com/docker/cli`) stays on one import path across its v2+
@@ -64,9 +64,9 @@ pub(crate) fn old_import_path(change: &Change) -> Option<String> {
     let from_major = semver::major(change.from.as_str());
     let n: u32 = from_major.trim_start_matches('v').parse().ok()?;
     let old = if n <= 1 {
-        prefix
+        split.prefix
     } else {
-        semver::major_path(&prefix, n)
+        semver::major_path(&split.prefix, n)
     };
     (&old != new_path).then_some(old)
 }

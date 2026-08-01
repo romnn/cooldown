@@ -171,7 +171,7 @@ fn parse_requires(go_mod: &str) -> HashMap<String, String> {
         if in_block {
             if line == ")" {
                 in_block = false;
-            } else if let Some((path, version)) = parse_require_pair(line) {
+            } else if let Some(RequirePair { path, version }) = parse_require_pair(line) {
                 requires.insert(path, version);
             }
             continue;
@@ -179,7 +179,7 @@ fn parse_requires(go_mod: &str) -> HashMap<String, String> {
         if line == "require (" {
             in_block = true;
         } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some((path, version)) = parse_require_pair(rest.trim())
+            && let Some(RequirePair { path, version }) = parse_require_pair(rest.trim())
         {
             requires.insert(path, version);
         }
@@ -195,13 +195,24 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-/// Parse a `module/path v1.2.3` pair into `(path, version)`. Returns `None` for a malformed line
+/// One `require` directive's module path and pinned version, parsed by [`parse_require_pair`].
+struct RequirePair {
+    /// The required module path (the directive's first whitespace-separated field).
+    path: String,
+    /// The pinned version, validated as a `v`-prefixed Go semver string.
+    version: String,
+}
+
+/// Parse a `module/path v1.2.3` pair into a [`RequirePair`]. Returns `None` for a malformed line
 /// (no second field, or a second field that is not a valid Go version).
-fn parse_require_pair(line: &str) -> Option<(String, String)> {
+fn parse_require_pair(line: &str) -> Option<RequirePair> {
     let mut fields = line.split_whitespace();
     let path = fields.next()?;
     let version = fields.next()?;
-    semver::is_valid(version).then(|| (path.to_string(), version.to_string()))
+    semver::is_valid(version).then(|| RequirePair {
+        path: path.to_string(),
+        version: version.to_string(),
+    })
 }
 
 #[cfg(test)]

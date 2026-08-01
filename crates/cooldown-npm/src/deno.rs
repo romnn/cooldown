@@ -5,7 +5,7 @@
 //! dependency's recorded registry. Both registries speak `SemVer`, so the version model is shared.
 
 use crate::jsr::{JSR, JsrRegistry};
-use crate::lock::split_name_version;
+use crate::lock::{NameVersion, split_name_version};
 use crate::nodecmd::NodeCmd;
 use crate::registry::{NPM, NpmRegistry};
 use crate::tool::{build_releases, classify_quality};
@@ -75,18 +75,33 @@ impl DenoTool {
     }
 }
 
+/// The registry-backed parts of a `deno.lock` specifier.
+#[derive(Debug, PartialEq)]
+struct SpecifierParts {
+    /// The registry the specifier's scheme names: [`NPM`] or [`JSR`].
+    registry: &'static str,
+    /// The package name, with a scope's leading `@` preserved.
+    name: String,
+    /// The requested version.
+    version: String,
+}
+
 /// Splits a `deno.lock` specifier (`npm:lodash@4.17.15`, `jsr:@std/path@1.0.0`) into its registry,
 /// package name, and requested version. An unknown scheme (e.g. an `https:` import) yields `None`,
 /// so only registry-backed dependencies are surfaced.
-fn split_specifier(spec: &str) -> Option<(&'static str, String, String)> {
+fn split_specifier(spec: &str) -> Option<SpecifierParts> {
     let (scheme, rest) = spec.split_once(':')?;
     let registry = match scheme {
         "npm" => NPM,
         "jsr" => JSR,
         _ => return None,
     };
-    let (name, version) = split_name_version(rest)?;
-    Some((registry, name, version))
+    let NameVersion { name, version } = split_name_version(rest)?;
+    Some(SpecifierParts {
+        registry,
+        name,
+        version,
+    })
 }
 
 /// The resolved lock's `name -> (registry, newest version)` map, the snapshot `apply` diffs
@@ -106,7 +121,7 @@ fn locked_versions(content: &str) -> HashMap<String, (&'static str, String)> {
             continue;
         };
         for key in section.keys() {
-            let Some((name, version)) = split_name_version(key) else {
+            let Some(NameVersion { name, version }) = split_name_version(key) else {
                 continue;
             };
             match out.entry(name) {
@@ -256,7 +271,7 @@ fn pin_import(root: &Utf8Path, scheme: &str, name: &str, target: &str) -> Result
         let entry = imports.iter().find_map(|(alias, value)| {
             let spec = value.as_str()?;
             split_specifier(spec)
-                .is_some_and(|(reg, n, _)| reg == scheme && n == name)
+                .is_some_and(|parts| parts.registry == scheme && parts.name == name)
                 .then(|| (alias.clone(), spec.to_string()))
         });
         let Some((alias, old_spec)) = entry else {
@@ -330,7 +345,7 @@ fn workspace_direct_specifiers(lock: &serde_json::Value) -> HashSet<(&'static st
             .flatten()
         {
             if let Some(spec) = spec.as_str()
-                && let Some((registry, name, _)) = split_specifier(spec)
+                && let Some(SpecifierParts { registry, name, .. }) = split_specifier(spec)
             {
                 direct.insert((registry, name));
             }
@@ -365,7 +380,7 @@ impl DenoTool {
                 continue;
             };
             for key in section.keys() {
-                let Some((name, version)) = split_name_version(key) else {
+                let Some(NameVersion { name, version }) = split_name_version(key) else {
                     continue;
                 };
                 let is_direct = direct.contains(&(registry, name.clone()));
@@ -596,11 +611,19 @@ mod tests {
     fn splits_npm_and_jsr_specifiers() {
         assert_eq!(
             split_specifier("npm:lodash@4.17.15"),
-            Some((NPM, "lodash".into(), "4.17.15".into()))
+            Some(SpecifierParts {
+                registry: NPM,
+                name: "lodash".into(),
+                version: "4.17.15".into()
+            })
         );
         assert_eq!(
             split_specifier("jsr:@std/path@1.0.0"),
-            Some((JSR, "@std/path".into(), "1.0.0".into()))
+            Some(SpecifierParts {
+                registry: JSR,
+                name: "@std/path".into(),
+                version: "1.0.0".into()
+            })
         );
         assert_eq!(split_specifier("https://example.com/mod.ts"), None);
     }

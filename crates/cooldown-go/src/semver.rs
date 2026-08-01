@@ -37,8 +37,16 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// A numeric version component split off the front of its input by [`parse_int`].
+struct ParsedInteger<'a> {
+    /// The component's run of ASCII digits, with no leading zero unless the component is `0`.
+    digits: &'a str,
+    /// The unconsumed remainder of the input, immediately after the digits.
+    rest: &'a str,
+}
+
 /// Parse one numeric component (no leading zeros, ≥1 digit). Returns the digits and the rest.
-fn parse_int(s: &str) -> Option<(&str, &str)> {
+fn parse_int(s: &str) -> Option<ParsedInteger<'_>> {
     let bytes = s.as_bytes();
     match bytes {
         // A leading `0` followed by another digit is an illegal leading zero.
@@ -46,7 +54,8 @@ fn parse_int(s: &str) -> Option<(&str, &str)> {
         [first, ..] if first.is_ascii_digit() => {
             let end = s.bytes().take_while(u8::is_ascii_digit).count();
             // `end` counts ASCII digits from the start, so it is a valid char boundary.
-            Some(s.split_at(end))
+            let (digits, rest) = s.split_at(end);
+            Some(ParsedInteger { digits, rest })
         }
         _ => None,
     }
@@ -80,17 +89,26 @@ fn parse(v: &str) -> Option<Parsed> {
     // `v1-pre` / `v1.2-pre` are NOT — after a missing minor/patch the only legal continuation is
     // `.` for the next numeric component.
     let rest = v.strip_prefix('v')?;
-    let (major, rest) = parse_int(rest)?;
+    let ParsedInteger {
+        digits: major,
+        rest,
+    } = parse_int(rest)?;
     if rest.is_empty() {
         return Some(parsed(major, "0", "0", "", ""));
     }
     let rest = rest.strip_prefix('.')?; // must be `.MINOR`
-    let (minor, rest) = parse_int(rest)?;
+    let ParsedInteger {
+        digits: minor,
+        rest,
+    } = parse_int(rest)?;
     if rest.is_empty() {
         return Some(parsed(major, minor, "0", "", ""));
     }
     let rest = rest.strip_prefix('.')?; // must be `.PATCH`
-    let (patch, rest) = parse_int(rest)?;
+    let ParsedInteger {
+        digits: patch,
+        rest,
+    } = parse_int(rest)?;
 
     let (prerelease, rest) = if let Some(r) = rest.strip_prefix('-') {
         // The prerelease runs up to the build separator `+` (if any); `rest` keeps the `+…` build,
@@ -503,34 +521,62 @@ fn parse_pseudo_timestamp(ts: &[u8]) -> Option<Timestamp> {
         .map(|z| z.timestamp())
 }
 
-/// Splits a module `path` into `(prefix, path_major, ok)`, mirroring `module.SplitPathVersion`.
+/// A module path split into its base prefix and trailing major-version element,
+/// as returned by [`split_path_version`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct PathVersionSplit {
+    /// The module path with the trailing major-version element removed; the unchanged
+    /// input path when the split is not [`well_formed`](Self::well_formed).
+    pub prefix: String,
+    /// The trailing major-version element (`/vN`, or `.vN` for `gopkg.in` paths);
+    /// empty for a base path at major v0/v1.
+    pub path_major: String,
+    /// Whether the path's version element is well-formed. `false` when the path carries
+    /// a malformed element (e.g. a dotted `/v2.0.0`, a leading-zero major, or an
+    /// explicit `/v1`).
+    pub well_formed: bool,
+}
+
+/// Splits a module `path` into a [`PathVersionSplit`], mirroring `module.SplitPathVersion`.
 ///
 /// `path_major` is the trailing major-version element (`/vN`, or `.vN` for `gopkg.in`
-/// paths), and is empty for a base path at major v0/v1. `ok` is `false` when the path
-/// carries a malformed version element (e.g. a dotted `/v2.0.0`, a leading-zero major,
-/// or an explicit `/v1`), in which case `prefix` is the unchanged `path`.
+/// paths), and is empty for a base path at major v0/v1. `well_formed` is `false` when
+/// the path carries a malformed version element (e.g. a dotted `/v2.0.0`, a leading-zero
+/// major, or an explicit `/v1`), in which case `prefix` is the unchanged `path`.
 ///
 /// # Examples
 ///
 /// ```
-/// use cooldown_go::semver;
+/// use cooldown_go::semver::{self, PathVersionSplit};
 ///
 /// assert_eq!(
 ///     semver::split_path_version("example.com/foo"),
-///     ("example.com/foo".to_string(), String::new(), true)
+///     PathVersionSplit {
+///         prefix: "example.com/foo".to_string(),
+///         path_major: String::new(),
+///         well_formed: true,
+///     }
 /// );
 /// assert_eq!(
 ///     semver::split_path_version("example.com/foo/v2"),
-///     ("example.com/foo".to_string(), "/v2".to_string(), true)
+///     PathVersionSplit {
+///         prefix: "example.com/foo".to_string(),
+///         path_major: "/v2".to_string(),
+///         well_formed: true,
+///     }
 /// );
 /// assert_eq!(
 ///     semver::split_path_version("gopkg.in/yaml.v2"),
-///     ("gopkg.in/yaml".to_string(), ".v2".to_string(), true)
+///     PathVersionSplit {
+///         prefix: "gopkg.in/yaml".to_string(),
+///         path_major: ".v2".to_string(),
+///         well_formed: true,
+///     }
 /// );
-/// assert!(!semver::split_path_version("example.com/foo/v1").2);
+/// assert!(!semver::split_path_version("example.com/foo/v1").well_formed);
 /// ```
 #[must_use]
-pub fn split_path_version(path: &str) -> (String, String, bool) {
+pub fn split_path_version(path: &str) -> PathVersionSplit {
     if let Some(rest) = path.strip_prefix("gopkg.in/") {
         return split_gopkg_in(path, rest);
     }
@@ -552,20 +598,36 @@ pub fn split_path_version(path: &str) -> (String, String, bool) {
         && i.checked_sub(1).and_then(|p| bytes.get(p)) == Some(&b'v')
         && i.checked_sub(2).and_then(|p| bytes.get(p)) == Some(&b'/');
     if !is_versioned {
-        return (path.to_string(), String::new(), true);
+        return PathVersionSplit {
+            prefix: path.to_string(),
+            path_major: String::new(),
+            well_formed: true,
+        };
     }
     let (Some(prefix), Some(path_major)) = (path.get(..i - 2), path.get(i - 2..)) else {
-        return (path.to_string(), String::new(), true);
+        return PathVersionSplit {
+            prefix: path.to_string(),
+            path_major: String::new(),
+            well_formed: true,
+        };
     };
     // Reject a dotted run (e.g. `/v2.0.0`), a bare `/v`, a leading-zero major, and `/v1`.
     let leading_zero = bytes.get(i) == Some(&b'0');
     if dot || path_major.len() <= 2 || leading_zero || path_major == "/v1" {
-        return (path.to_string(), String::new(), false);
+        return PathVersionSplit {
+            prefix: path.to_string(),
+            path_major: String::new(),
+            well_formed: false,
+        };
     }
-    (prefix.to_string(), path_major.to_string(), true)
+    PathVersionSplit {
+        prefix: prefix.to_string(),
+        path_major: path_major.to_string(),
+        well_formed: true,
+    }
 }
 
-fn split_gopkg_in(path: &str, _rest: &str) -> (String, String, bool) {
+fn split_gopkg_in(path: &str, _rest: &str) -> PathVersionSplit {
     // gopkg.in/pkg.vN or gopkg.in/user/pkg.vN (with an optional `-unstable`). Go strips `-unstable`
     // from the returned pathMajor, so the boundary is found on the stripped base and pathMajor is
     // a bare `.vN`. gopkg.in accepts `.v0`/`.v1`, but rejects a leading-zero major like `.v02`.
@@ -578,10 +640,18 @@ fn split_gopkg_in(path: &str, _rest: &str) -> (String, String, bool) {
         let leading_zero = num_part.len() > 1 && num_part.starts_with('0');
         if !num_part.is_empty() && num_part.bytes().all(|b| b.is_ascii_digit()) && !leading_zero {
             // `path_major` is the bare `.vN` (with any `-unstable` suffix already stripped).
-            return (prefix.to_string(), path_major.to_string(), true);
+            return PathVersionSplit {
+                prefix: prefix.to_string(),
+                path_major: path_major.to_string(),
+                well_formed: true,
+            };
         }
     }
-    (path.to_string(), String::new(), false)
+    PathVersionSplit {
+        prefix: path.to_string(),
+        path_major: String::new(),
+        well_formed: false,
+    }
 }
 
 /// Builds the module path for major version `n` (≥ 2) from a base path's `prefix`.
@@ -699,27 +769,43 @@ mod tests {
         // `-unstable` is stripped from the returned pathMajor.
         assert_eq!(
             split_path_version("gopkg.in/check.v1-unstable"),
-            ("gopkg.in/check".into(), ".v1".into(), true)
+            PathVersionSplit {
+                prefix: "gopkg.in/check".into(),
+                path_major: ".v1".into(),
+                well_formed: true,
+            }
         );
         // A leading-zero major is rejected.
-        assert!(!split_path_version("gopkg.in/foo.v02").2);
+        assert!(!split_path_version("gopkg.in/foo.v02").well_formed);
     }
 
     #[test]
     fn split_path_version_cases() {
         assert_eq!(
             split_path_version("example.com/foo"),
-            ("example.com/foo".into(), String::new(), true)
+            PathVersionSplit {
+                prefix: "example.com/foo".into(),
+                path_major: String::new(),
+                well_formed: true,
+            }
         );
         assert_eq!(
             split_path_version("example.com/foo/v2"),
-            ("example.com/foo".into(), "/v2".into(), true)
+            PathVersionSplit {
+                prefix: "example.com/foo".into(),
+                path_major: "/v2".into(),
+                well_formed: true,
+            }
         );
-        assert!(!split_path_version("example.com/foo/v1").2);
-        assert!(!split_path_version("example.com/foo/v2.0.0").2);
+        assert!(!split_path_version("example.com/foo/v1").well_formed);
+        assert!(!split_path_version("example.com/foo/v2.0.0").well_formed);
         assert_eq!(
             split_path_version("gopkg.in/yaml.v2"),
-            ("gopkg.in/yaml".into(), ".v2".into(), true)
+            PathVersionSplit {
+                prefix: "gopkg.in/yaml".into(),
+                path_major: ".v2".into(),
+                well_formed: true,
+            }
         );
         assert_eq!(major_path("example.com/foo", 3), "example.com/foo/v3");
     }

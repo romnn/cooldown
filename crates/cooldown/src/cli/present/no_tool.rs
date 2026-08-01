@@ -91,6 +91,8 @@ fn no_tool_mutation(
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_held: 0,
             },
             Vec::<render::UpgradeItem>::new(),
         ),

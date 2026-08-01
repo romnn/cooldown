@@ -4,7 +4,7 @@
 //! same adapter specialised over their lock format — they share the npm registry and version model
 //! and differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
-use crate::lock::NodeLock;
+use crate::lock::{NameVersion, NodeLock};
 use crate::manifest;
 use crate::nodecmd::NodeCmd;
 use crate::registry::{NPM, NpmRegistry};
@@ -62,7 +62,7 @@ impl Default for ConfigStringList {
 /// declaration is never masked by a stale transitive copy of the same name.
 fn locked_versions<L: NodeLock>(content: &str) -> HashMap<String, String> {
     let mut versions: HashMap<String, String> = HashMap::new();
-    for (name, version) in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
         match versions.entry(name) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 if version::compare(&version, slot.get()).is_gt() {
@@ -297,7 +297,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
 
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
-        for (name, version) in resolved {
+        for NameVersion { name, version } in resolved {
             let member_paths = member_index.members_for(&name, &version);
             let is_direct = match &manifest_direct {
                 Some(names) => names.contains(&name),
@@ -848,6 +848,16 @@ impl PeerEvidence {
     }
 }
 
+/// The peer-feasibility gate's split of a plan (see [`partition_peer_held`]).
+struct PeerPartition {
+    /// The plan with only the changes the resolve may attempt; every other plan setting passes
+    /// through untouched.
+    retained: Plan,
+    /// One [`SkipReason::PeerHeld`] row per held change, naming the blocking dependent and its
+    /// verbatim range.
+    skipped: Vec<Skipped>,
+}
+
 /// The peer-feasibility gate: split the plan into the changes the resolve may attempt and the
 /// cross-major changes a lock-recorded peer requirement structurally excludes, each held as a
 /// [`SkipReason::PeerHeld`] naming the dependent and its verbatim range.
@@ -921,7 +931,7 @@ impl PeerEvidence {
 ///   break rather than only cross-line ones ([`workspace_peer_hold`]). Together those make the
 ///   contract immutable for the whole apply, which is what lets the pre-apply snapshot serve as
 ///   the post-resolve verifier's evidence without going stale.
-fn partition_peer_held<L: NodeLock>(plan: &Plan, evidence: &PeerEvidence) -> (Plan, Vec<Skipped>) {
+fn partition_peer_held<L: NodeLock>(plan: &Plan, evidence: &PeerEvidence) -> PeerPartition {
     let PeerEvidence {
         requirements,
         members,
@@ -931,7 +941,10 @@ fn partition_peer_held<L: NodeLock>(plan: &Plan, evidence: &PeerEvidence) -> (Pl
         install,
     } = evidence;
     if requirements.is_empty() && workspace.is_empty() {
-        return (plan.clone(), Vec::new());
+        return PeerPartition {
+            retained: plan.clone(),
+            skipped: Vec::new(),
+        };
     }
 
     // One verdict slot per change, filled to a fixed point: a change held in one round stops
@@ -993,12 +1006,13 @@ fn partition_peer_held<L: NodeLock>(plan: &Plan, evidence: &PeerEvidence) -> (Pl
             None => retained.push(change.clone()),
         }
     }
-    let plan = Plan {
+    // Rebuild with only the retained changes; every other plan setting passes through untouched
+    // (including fields this adapter has no use for, like the cargo edge policy).
+    let retained = Plan {
         changes: retained,
-        rewrite: plan.rewrite,
-        baseline_violations: plan.baseline_violations.clone(),
+        ..plan.clone()
     };
-    (plan, skipped)
+    PeerPartition { retained, skipped }
 }
 
 /// The `peer_held` skip row for `change`, blocked by `blocker`'s recorded contract. `offending`
@@ -1193,7 +1207,7 @@ impl PeerBaseline {
             self.install
                 .as_ref()
                 .and_then(|install| install.member_resolution(member, name))
-                .map(|(version, _)| version)
+                .map(|instance| instance.version)
         })
     }
 }
@@ -1419,7 +1433,7 @@ fn proven_peer_violations<L: NodeLock>(
     let members = L::member_sources(content);
     let install = L::install_paths(content);
     let mut resolved: HashMap<String, HashSet<String>> = HashMap::new();
-    for (name, version) in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
         resolved.entry(name).or_default().insert(version);
     }
     let resolved_splits: HashSet<String> = resolved
@@ -1446,8 +1460,10 @@ fn proven_peer_violations<L: NodeLock>(
             let bound = match &install {
                 Some(install) => install
                     .member_resolution(&member, &pr.dependent)
-                    .and_then(|(_, instance)| install.resolve_from(instance, &pr.package))
-                    .map(|(version, _)| version),
+                    .and_then(|dependent_instance| {
+                        install.resolve_from(dependent_instance.directory, &pr.package)
+                    })
+                    .map(|instance| instance.version),
                 None => members.resolved_version(&member, &pr.package),
             };
             let Some(peer_version) = bound else {
@@ -1483,11 +1499,11 @@ fn proven_peer_violations<L: NodeLock>(
             // physically. One context, exactly identified: no same-named package elsewhere in the
             // tree can stand in for it.
             Some(install) => {
-                if let Some((peer_version, _)) =
+                if let Some(instance) =
                     install.member_resolution(&workspace_peer.origin, &pr.package)
-                    && version::range_match(&pr.range, peer_version) == RangeMatch::Excludes
+                    && version::range_match(&pr.range, instance.version) == RangeMatch::Excludes
                 {
-                    bindings.push((workspace_peer.origin.clone(), peer_version.to_string()));
+                    bindings.push((workspace_peer.origin.clone(), instance.version.to_string()));
                 }
             }
             // A declaration-isolated layout (pnpm): the contract binds in each importer that has
@@ -1545,7 +1561,7 @@ fn first_new_peer_violation<L: NodeLock>(
 /// that trigger the query parse from the same document.
 fn resolved_multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
     let mut versions: HashMap<String, HashSet<String>> = HashMap::new();
-    for (name, version) in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
         versions.entry(name).or_default().insert(version);
     }
     versions
@@ -1686,7 +1702,7 @@ fn workspace_peer_hold<'a>(
                 && match (install, &rewritten) {
                     (Some(install), Some(rewritten)) => install
                         .member_resolution(&workspace_peer.origin, &change.package.name)
-                        .is_some_and(|(_, bound)| rewritten.contains(&bound)),
+                        .is_some_and(|instance| rewritten.contains(&instance.directory)),
                     _ => members_overlap(&change.members, &workspace_peer.contexts),
                 }
         })
@@ -1708,8 +1724,8 @@ fn rewritten_dirs<'i>(install: &'i crate::lock::InstallPaths, change: &Change) -
         .members
         .iter()
         .filter_map(|member| install.member_resolution(&member.path, &change.package.name))
-        .filter(|(version, _)| *version == change.from.as_str())
-        .map(|(_, dir)| dir)
+        .filter(|instance| instance.version == change.from.as_str())
+        .map(|instance| instance.directory)
         .collect();
     dirs.sort_unstable();
     dirs.dedup();
@@ -1805,8 +1821,10 @@ fn dependent_holds_context(
             dependent_members.iter().any(|member| {
                 install
                     .member_resolution(member, &pr.dependent)
-                    .and_then(|(_, instance)| install.resolve_from(instance, &change.package.name))
-                    .is_some_and(|(_, bound)| rewritten.contains(&bound))
+                    .and_then(|dependent_instance| {
+                        install.resolve_from(dependent_instance.directory, &change.package.name)
+                    })
+                    .is_some_and(|instance| rewritten.contains(&instance.directory))
             })
         }
         None => {
@@ -1858,7 +1876,7 @@ fn direct_dependent_members(
         .filter(|member| {
             install
                 .member_resolution(member, dependent)
-                .is_some_and(|(version, _)| version == dependent_version)
+                .is_some_and(|instance| instance.version == dependent_version)
         })
         .collect();
     (!direct.is_empty()).then_some(direct)
@@ -1883,9 +1901,9 @@ fn members_overlap(change_members: &[MemberRef], dependent_members: &[String]) -
 /// same best-effort contract as uv's `unique_edge_requirer`.
 fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     let mut blockers: BTreeSet<String> = BTreeSet::new();
-    for (name, _) in pnpm_peer_suffixed_keys(lock) {
-        if name != held {
-            blockers.insert(name);
+    for key in pnpm_peer_suffixed_keys(lock) {
+        if key.name != held {
+            blockers.insert(key.name);
         }
     }
     match blockers.len() {
@@ -1894,10 +1912,24 @@ fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     }
 }
 
-/// The `(name, peer-suffix)` of every `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer
-/// disambiguation suffix — the resolved entries whose identity depends on a peer resolution. Used to
-/// attribute a held peer conflict to the sibling that forced the peer choice.
-fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<(String, String)> {
+/// One `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer disambiguation suffix — a
+/// resolved entry whose identity depends on a peer resolution.
+struct PeerSuffixedKey {
+    /// The package name of the suffixed key (`chalk` for `chalk@4.0.0(supports-color@7.2.0)`).
+    name: String,
+    /// The trailing parenthesized peer group(s), exactly as written in the key
+    /// (`(supports-color@7.2.0)`).
+    #[expect(
+        dead_code,
+        reason = "the suffix completes the extracted key's identity; blame attribution reads only the name"
+    )]
+    peer_suffix: String,
+}
+
+/// Every `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer disambiguation suffix —
+/// the resolved entries whose identity depends on a peer resolution (see [`PeerSuffixedKey`]). Used
+/// to attribute a held peer conflict to the sibling that forced the peer choice.
+fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<PeerSuffixedKey> {
     let mut out = Vec::new();
     let mut in_packages = false;
     for line in lock.lines() {
@@ -1916,8 +1948,11 @@ fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<(String, String)> {
             let Some(open) = key.find('(') else { continue };
             let suffix = key[open..].to_string();
             let base = key[..open].to_string();
-            if let Some((name, _version)) = crate::lock::split_name_version(&base) {
-                out.push((name, suffix));
+            if let Some(NameVersion { name, .. }) = crate::lock::split_name_version(&base) {
+                out.push(PeerSuffixedKey {
+                    name,
+                    peer_suffix: suffix,
+                });
             }
         } else {
             in_packages = line.starts_with("packages:");
@@ -2594,7 +2629,10 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         // peer contracts.
         let lock = journaled_lock::<L>(journal);
         let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock);
-        let (plan, peer_held) = partition_peer_held::<L>(plan, &evidence);
+        let PeerPartition {
+            retained: plan,
+            skipped: peer_held,
+        } = partition_peer_held::<L>(plan, &evidence);
         // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
         // jointly (peer verification may reject candidates and re-resolve) and reports the full
         // before/after lock diff, so a candidate can never silently move
@@ -3860,7 +3898,7 @@ packages:
 
     /// Gathers lock-only peer evidence (no workspace root, so no manifest source) and partitions —
     /// the shape most gate tests exercise.
-    fn peer_partition<L: NodeLock>(plan: &Plan, lock: Option<&str>) -> (Plan, Vec<Skipped>) {
+    fn peer_partition<L: NodeLock>(plan: &Plan, lock: Option<&str>) -> PeerPartition {
         partition_peer_held::<L>(plan, &PeerEvidence::gather::<L>(None, lock))
     }
 
@@ -3871,7 +3909,8 @@ packages:
     fn peer_gate_holds_a_cross_major_target_excluded_by_a_dependent_range() {
         let plan = plan_of(vec![change("fumadocs-core", "16.11.4", "17.0.0")]);
 
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(PEER_LOCK));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(PEER_LOCK));
 
         assert!(
             retained.changes.is_empty(),
@@ -3917,7 +3956,8 @@ packages:
 
         // 8 → 9 leaves the union: held, blaming the plugin.
         let cross = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped
@@ -3929,7 +3969,8 @@ packages:
 
         // 7 → 8 stays within the union: the resolver's business.
         let within = plan_of(vec![change("eslint", "7.32.0", "8.57.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
         assert_eq!(retained.changes.len(), 1);
         assert!(skipped.is_empty());
     }
@@ -3962,7 +4003,8 @@ packages:
         "};
 
         let plan = plan_of(vec![change("eslint", "9.16.0", "10.6.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
         assert_eq!(
             retained.changes.len(),
             1,
@@ -3977,7 +4019,8 @@ packages:
     fn peer_gate_passes_in_range_moves_and_joint_moves() {
         // A minor move inside the peer range never gates.
         let minor = plan_of(vec![change("fumadocs-core", "16.11.4", "16.13.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&minor, Some(PEER_LOCK));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&minor, Some(PEER_LOCK));
         assert_eq!(retained.changes.len(), 1);
         assert!(skipped.is_empty());
 
@@ -3989,13 +4032,14 @@ packages:
             change("fumadocs-core", "16.11.4", "17.0.0"),
             change("fumadocs-mdx", "15.1.1", "16.0.0"),
         ]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&joint, Some(PEER_LOCK));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&joint, Some(PEER_LOCK));
         assert_eq!(retained.changes.len(), 2);
         assert!(skipped.is_empty());
 
         // No lock captured (a fresh project): nothing to prove, nothing gated.
         let plan = plan_of(vec![change("fumadocs-core", "16.11.4", "17.0.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, None);
+        let PeerPartition { retained, skipped } = peer_partition::<crate::lock::Pnpm>(&plan, None);
         assert_eq!(retained.changes.len(), 1);
         assert!(skipped.is_empty());
     }
@@ -4043,7 +4087,7 @@ packages:
         // members: a change scoped to `apps/site` cannot break `apps/docs`'s mdx peer.
         let mut site = change("fumadocs-core", "16.11.4", "17.0.0");
         site.members = vec![member("apps/site")];
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Pnpm>(&plan_of(vec![site]), Some(lock));
         assert_eq!(retained.changes.len(), 1, "disjoint importers pass");
         assert!(skipped.is_empty());
@@ -4051,7 +4095,7 @@ packages:
         // Scoped to the importer that also declares the dependent, the gate fires.
         let mut docs = change("fumadocs-core", "16.11.4", "17.0.0");
         docs.members = vec![member("apps/docs")];
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Pnpm>(&plan_of(vec![docs]), Some(lock));
         assert!(retained.changes.is_empty());
         assert_eq!(skipped.len(), 1);
@@ -4090,13 +4134,15 @@ packages:
         // The hyphen branch is unrepresentable: current matches `^16.0.0`, but excluding 18.0.0
         // cannot be proven, so the move passes to the resolver.
         let union = lock_with_range("^16.0.0 || 17.0.0 - 17.4.0");
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(&union));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(&union));
         assert_eq!(retained.changes.len(), 1, "unproven exclusion never holds");
         assert!(skipped.is_empty());
 
         // The x-wildcard union is fully understood: 18.0.0 is provably outside it.
         let wildcard = lock_with_range("^16.0.0 || 17.x");
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(&wildcard));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(&wildcard));
         assert!(retained.changes.is_empty());
         assert_eq!(skipped.len(), 1);
     }
@@ -4132,7 +4178,8 @@ packages:
         "};
 
         let plan = plan_of(vec![change("typescript", "5.5.4", "6.0.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped
@@ -4171,7 +4218,8 @@ packages:
         "};
 
         let cross = plan_of(vec![change("zod-mini", "0.1.5", "0.2.0")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
         assert!(retained.changes.is_empty(), "0.1 → 0.2 is a breaking jump");
         assert_eq!(
             skipped
@@ -4182,7 +4230,8 @@ packages:
         );
 
         let within = plan_of(vec![change("zod-mini", "0.1.5", "0.1.9")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&within, Some(lock));
         assert_eq!(retained.changes.len(), 1);
         assert!(skipped.is_empty());
     }
@@ -4215,7 +4264,8 @@ packages:
         "};
 
         let plan = plan_of(vec![change("proto-kit", "0.0.3", "0.0.4")]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
         assert!(
             retained.changes.is_empty(),
             "a 0.0.x step that provably breaks a peer range must hold"
@@ -4259,7 +4309,7 @@ packages:
 
         // The nested 1.0.0 copy would bind, but the root's lookup proves its direct copy is the
         // admitting 2.0.0 — the nested record is the transitive one and holds nothing.
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Npm>(&plan, Some(nested_would_block));
         assert_eq!(
             retained.changes.len(),
@@ -4288,7 +4338,8 @@ packages:
                 }
             }
         }"#};
-        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&plan, Some(direct_blocks));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Npm>(&plan, Some(direct_blocks));
         assert!(
             retained.changes.is_empty(),
             "the direct copy's contract holds despite the nested split"
@@ -4316,7 +4367,8 @@ packages:
                 }
             }
         }"#};
-        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&plan, Some(unambiguous));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Npm>(&plan, Some(unambiguous));
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped
@@ -4358,7 +4410,8 @@ packages:
 
         let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
         let plan = plan_of(vec![change("chalk", "5.6.0", "5.6.2")]);
-        let (retained, skipped) = partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
+        let PeerPartition { retained, skipped } =
+            partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
         assert!(
             retained.changes.is_empty(),
             "a provable break holds even without crossing a compatibility line"
@@ -4428,7 +4481,7 @@ packages:
         // The pre-gate lets the downgrade through — `fix` must be able to roll back.
         let mut downgrade = change("chalk", "5.6.2", "5.6.0");
         downgrade.downgrade = true;
-        let (retained, _) =
+        let PeerPartition { retained, .. } =
             partition_peer_held::<crate::lock::Npm>(&plan_of(vec![downgrade.clone()]), &evidence);
         assert_eq!(retained.changes.len(), 1, "a downgrade is not pre-held");
 
@@ -4560,7 +4613,8 @@ packages:
 
         let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
         let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
-        let (retained, skipped) = partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
+        let PeerPartition { retained, skipped } =
+            partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
         assert!(
             retained.changes.is_empty(),
             "the root project's own peer contract must gate the move"
@@ -4659,7 +4713,7 @@ packages:
             name: "site".to_string(),
             path: "apps/site".to_string(),
         }];
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             partition_peer_held::<crate::lock::Npm>(&plan_of(vec![eslint]), &evidence);
         assert_eq!(
             retained.changes.len(),
@@ -4727,7 +4781,8 @@ packages:
 
         // The provably breaking cross-major move is held, blamed on the local package.
         let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
-        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        let PeerPartition { retained, skipped } =
+            partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped.first().and_then(|held| held.detail.as_deref()),
@@ -4740,7 +4795,7 @@ packages:
             name: "other".into(),
             path: "apps/other".into(),
         }];
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             partition_peer_held::<crate::lock::Pnpm>(&plan_of(vec![scoped]), &evidence);
         assert_eq!(retained.changes.len(), 1);
         assert!(skipped.is_empty());
@@ -4805,7 +4860,8 @@ packages:
         );
 
         let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
-        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        let PeerPartition { retained, skipped } =
+            partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped.first().and_then(|held| held.detail.as_deref()),
@@ -4852,7 +4908,8 @@ packages:
 
         let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
         let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
-        let (retained, skipped) = partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
+        let PeerPartition { retained, skipped } =
+            partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
         assert!(retained.changes.is_empty());
         assert_eq!(
             skipped.first().and_then(|held| held.detail.as_deref()),
@@ -4886,7 +4943,8 @@ packages:
             change("eslint", "8.57.0", "9.8.0"),
             change("eslint-plugin-legacy", "1.0.0", "2.0.0"),
         ]);
-        let (retained, skipped) = peer_partition::<crate::lock::Npm>(&joint, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Npm>(&joint, Some(lock));
         let retained_names: Vec<&str> = retained
             .changes
             .iter()
@@ -5381,7 +5439,7 @@ packages:
         }"#};
         let mut host = change("host", "2.0.0", "3.0.0");
         host.members = vec![member_ref("b", "apps/b")];
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Npm>(&plan_of(vec![host.clone()]), Some(hoisted));
         assert!(
             retained.changes.is_empty(),
@@ -5408,7 +5466,7 @@ packages:
                 "node_modules/host": { "version": "2.0.0" }
             }
         }"#};
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Npm>(&plan_of(vec![host]), Some(shadowed));
         assert_eq!(
             retained.changes.len(),
@@ -5435,7 +5493,7 @@ packages:
         }"#};
         let mut scoped = change("host", "1.0.0", "2.0.0");
         scoped.members = vec![member_ref("b", "apps/b")];
-        let (retained, skipped) = peer_partition::<crate::lock::Npm>(
+        let PeerPartition { retained, skipped } = peer_partition::<crate::lock::Npm>(
             &plan_of(vec![scoped]),
             Some(same_version_elsewhere),
         );
@@ -5760,7 +5818,8 @@ packages:
             change("fumadocs-core", "16.11.4", "17.0.0"),
             change("fumadocs-mdx", "15.1.1", "16.0.0"),
         ]);
-        let (retained, skipped) = peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
         assert!(retained.changes.is_empty());
         let blame_for = |name: &str| {
             skipped
@@ -5822,7 +5881,7 @@ packages:
         let mut docs_core = change("fumadocs-core", "16.11.4", "17.0.0");
         docs_core.members = vec![member("apps/docs")];
 
-        let (retained, skipped) =
+        let PeerPartition { retained, skipped } =
             peer_partition::<crate::lock::Pnpm>(&plan_of(vec![docs_core, site_mdx]), Some(lock));
         // The mdx move in apps/site cannot lift apps/docs's mdx@15.1.1 peer pin on core.
         assert_eq!(retained.changes.len(), 1, "only the mdx move survives");
@@ -5841,7 +5900,16 @@ packages:
         );
     }
 
-    fn project_declaring(spec: &str) -> (tempfile::TempDir, Project) {
+    /// A [`Project`] rooted in a temporary directory whose `package.json` declares `nanoid`.
+    struct DeclaredProject {
+        /// Owns the temporary root directory; dropping it deletes the project on disk, so it must
+        /// stay bound for as long as the project is used.
+        guard: tempfile::TempDir,
+        /// The project whose root and manifest live inside the temporary directory.
+        project: Project,
+    }
+
+    fn project_declaring(spec: &str) -> DeclaredProject {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         std::fs::write(
@@ -5855,12 +5923,18 @@ packages:
             manifest: root.join("package.json"),
             exclude_newer: None,
         };
-        (dir, project)
+        DeclaredProject {
+            guard: dir,
+            project,
+        }
     }
 
     #[test]
     fn pnpm_uses_lock_only_only_for_in_range_auto() {
-        let (_dir, project) = project_declaring("^3.0.0");
+        let DeclaredProject {
+            guard: _guard,
+            project,
+        } = project_declaring("^3.0.0");
 
         // In-range minor under Auto → lock-only `pnpm update --no-save` (the declared range stands).
         let in_range = change("nanoid", "3.1.0", "3.3.0");
@@ -5948,7 +6022,10 @@ packages:
     /// including when cooldown widened the range before taking the snapshot.
     #[test]
     fn npm_restores_the_authorized_widened_range_after_its_exact_pin() {
-        let (_dir, mut project) = project_declaring("^3.0.0");
+        let DeclaredProject {
+            guard: _guard,
+            mut project,
+        } = project_declaring("^3.0.0");
         project.exclude_newer = Some("2024-08-01T00:00:00Z".to_string());
         let change = change("nanoid", "3.1.0", "5.1.11");
 
@@ -6189,7 +6266,10 @@ packages:
 
     #[test]
     fn npm_has_no_direct_lock_only_command() {
-        let (_dir, project) = project_declaring("^3.0.0");
+        let DeclaredProject {
+            guard: _guard,
+            project,
+        } = project_declaring("^3.0.0");
         let in_range = change("nanoid", "3.1.0", "3.3.0");
         assert!(
             lockonly_command::<Npm>(&project, &in_range, RewriteMode::Auto)

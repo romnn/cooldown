@@ -35,14 +35,24 @@ pub trait PyLayout: Send + Sync + 'static {
     /// The driver binary, shelled out to for apply/build.
     const BIN: &'static str;
 
-    /// Parses the lock + manifest into resolved `(name, version, is_direct)` triples.
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)>;
+    /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
 
     /// The driver args that re-pin `name` to `version`.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
 
     /// The driver args for the opt-in `--build` step.
     fn build_args() -> Vec<String>;
+}
+
+/// One resolved distribution from a [`PyLayout`]'s lock + manifest.
+pub struct ResolvedDep {
+    /// The distribution name as recorded in the lock.
+    pub name: String,
+    /// The resolved (locked) version.
+    pub version: String,
+    /// Whether the manifest declares the distribution directly (vs. a transitive dependency).
+    pub direct: bool,
 }
 
 /// pip: a pinned `requirements.txt` is both the manifest and the version source, and every pinned
@@ -57,10 +67,14 @@ impl PyLayout for Pip {
     const MANIFEST: &'static str = "requirements.txt";
     const BIN: &'static str = "pip";
 
-    fn parse(lock: &str, _manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
         lock::parse_requirements(lock)
             .into_iter()
-            .map(|(name, ver)| (name, ver, true))
+            .map(|pin| ResolvedDep {
+                name: pin.name,
+                version: pin.version,
+                direct: true,
+            })
             .collect()
     }
 
@@ -79,13 +93,17 @@ impl PyLayout for Poetry {
     const MANIFEST: &'static str = "pyproject.toml";
     const BIN: &'static str = "poetry";
 
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
         let direct = lock::parse_poetry_direct(manifest);
         lock::parse_poetry_lock(lock)
             .into_iter()
-            .map(|(name, ver)| {
-                let is_direct = lock::is_direct(&direct, &name);
-                (name, ver, is_direct)
+            .map(|pin| {
+                let is_direct = lock::is_direct(&direct, &pin.name);
+                ResolvedDep {
+                    name: pin.name,
+                    version: pin.version,
+                    direct: is_direct,
+                }
             })
             .collect()
     }
@@ -180,15 +198,15 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         let lock = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let mut deps = Vec::new();
-        for (name, ver, is_direct) in L::parse(&lock, &manifest) {
-            if scope == DepScope::Direct && !is_direct {
+        for resolved in L::parse(&lock, &manifest) {
+            if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(L::ID, name, Some(PYPI.to_string())),
-                current: Version::new(ver.clone()),
-                current_quality: classify_quality(&ver),
-                direct: is_direct,
+                package: PackageId::new(L::ID, resolved.name, Some(PYPI.to_string())),
+                current: Version::new(resolved.version.clone()),
+                current_quality: classify_quality(&resolved.version),
+                direct: resolved.direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,

@@ -3,7 +3,7 @@
 //! per-manager differences (lockfile name, driver binary, parse, and lock refresh args) so a single
 //! generic adapter can serve all of them.
 //!
-//! Every parser returns the flat list of resolved `(name, version)` pairs the lock pins. Where the
+//! Every parser returns the flat list of resolved [`NameVersion`] pairs the lock pins. Where the
 //! lock records importer/member declarations (npm v2/v3, pnpm), the adapter uses that same data for
 //! both direct/transitive classification and source attribution; older formats fall back to the root
 //! manifest's declared dependency names.
@@ -25,12 +25,12 @@ pub trait NodeLock: Send + Sync + 'static {
     /// `sync` is then `unsupported`.
     const NATIVE_MIN_AGE_FILE: Option<&'static str> = None;
 
-    /// Parses the lockfile body into the flat list of resolved `(name, version)` pairs.
+    /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
     /// # Errors
     ///
     /// Returns a [`CoreError`] if the lockfile cannot be parsed.
-    fn parse(content: &str) -> Result<Vec<(String, String)>>;
+    fn parse(content: &str) -> Result<Vec<NameVersion>>;
 
     /// The workspace member package(s) that declare each dependency, for attributing a dependency to
     /// its source package(s) in reports. Default: empty (yarn classic and bun record no per-member
@@ -482,7 +482,7 @@ fn parse_pnpm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
 
     let mut out = Vec::new();
     let mut in_packages = false;
-    let mut entry: Option<(String, String)> = None;
+    let mut entry: Option<NameVersion> = None;
     let mut field = Field::None;
 
     for line in content.lines() {
@@ -513,14 +513,14 @@ fn parse_pnpm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
                 };
             }
             6 if in_packages && field == Field::Peers => {
-                if let (Some((dependent, version)), Some((name, range))) =
+                if let (Some(dependent), Some((name, range))) =
                     (entry.as_ref(), trimmed.split_once(':'))
                 {
                     let range = unquote_yaml_scalar(range);
                     if !range.is_empty() {
                         out.push(PeerRequirement {
-                            dependent: dependent.clone(),
-                            dependent_version: version.clone(),
+                            dependent: dependent.name.clone(),
+                            dependent_version: dependent.version.clone(),
                             package: unquote_yaml_scalar(name).to_string(),
                             range: range.to_string(),
                         });
@@ -597,6 +597,16 @@ pub struct InstallPaths {
     instances: HashMap<String, Vec<(String, String)>>,
 }
 
+/// One physical copy of a package, as a lookup on the install tree resolves it.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedInstance<'a> {
+    /// The version installed at this instance's directory.
+    pub version: &'a str,
+    /// The instance's install directory (`node_modules/react`,
+    /// `apps/a/node_modules/react`) — the context its own peers then resolve from.
+    pub directory: &'a str,
+}
+
 impl InstallPaths {
     /// The instance a workspace member's own directory resolves `name` to: its version and its
     /// install directory (the context that instance's peers then resolve from). This is what makes
@@ -604,18 +614,18 @@ impl InstallPaths {
     /// elsewhere — declaration attribution is name-only in npm's lock, but the physical lookup is
     /// exact.
     #[must_use]
-    pub fn member_resolution(&self, member: &str, name: &str) -> Option<(&str, &str)> {
+    pub fn member_resolution(&self, member: &str, name: &str) -> Option<ResolvedInstance<'_>> {
         // The root project's member path is `.`; its install-tree directory is the empty key.
         let dir = if member == "." { "" } else { member };
         self.resolve_from(dir, name)
     }
 
     /// The instance `name` resolves to from `dir` — the nearest enclosing `node_modules/<name>`,
-    /// walking from the directory itself up to the workspace root — as `(version, directory)`.
+    /// walking from the directory itself up to the workspace root — as a [`ResolvedInstance`].
     /// Intermediate ancestors that are not package directories probe keys no lock ever records
     /// (`…/node_modules/node_modules/x`), which is harmless.
     #[must_use]
-    pub fn resolve_from(&self, dir: &str, name: &str) -> Option<(&str, &str)> {
+    pub fn resolve_from(&self, dir: &str, name: &str) -> Option<ResolvedInstance<'_>> {
         let mut ancestor = dir;
         loop {
             let candidate = if ancestor.is_empty() {
@@ -623,8 +633,8 @@ impl InstallPaths {
             } else {
                 format!("{ancestor}/node_modules/{name}")
             };
-            if let Some((instance, version)) = self.versions.get_key_value(&candidate) {
-                return Some((version, instance));
+            if let Some((directory, version)) = self.versions.get_key_value(&candidate) {
+                return Some(ResolvedInstance { version, directory });
             }
             if ancestor.is_empty() {
                 return None;
@@ -718,12 +728,36 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
     })
 }
 
+/// The two halves of a `name@version` specifier.
+///
+/// The derived ordering (name first, then version) gives resolved-package lists a stable sort key.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NameVersion {
+    /// The package name, with a scope's leading `@` preserved (`@scope/name`).
+    pub name: String,
+    /// The version — everything after the specifier's last `@`.
+    pub version: String,
+}
+
+impl NameVersion {
+    /// Builds the pair from its already-split halves.
+    pub(crate) fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+}
+
 /// Splits a `name@version` (or scoped `@scope/name@version`) specifier into its parts. The version
 /// is taken after the last `@`, so the leading `@` of a scope is preserved in the name.
-pub(crate) fn split_name_version(spec: &str) -> Option<(String, String)> {
+pub(crate) fn split_name_version(spec: &str) -> Option<NameVersion> {
     let at = spec.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = spec.split_at(at);
-    Some((name.to_string(), version[1..].to_string()))
+    Some(NameVersion {
+        name: name.to_string(),
+        version: version[1..].to_string(),
+    })
 }
 
 fn unquote_yaml_scalar(value: &str) -> &str {
@@ -769,7 +803,7 @@ impl NodeLock for Npm {
     const LOCKFILE: &'static str = "package-lock.json";
     const BIN: &'static str = "npm";
 
-    fn parse(content: &str) -> Result<Vec<(String, String)>> {
+    fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_npm(content)
     }
 
@@ -857,7 +891,7 @@ impl NodeLock for Pnpm {
     const BIN: &'static str = "pnpm";
     const NATIVE_MIN_AGE_FILE: Option<&'static str> = Some("pnpm-workspace.yaml");
 
-    fn parse(content: &str) -> Result<Vec<(String, String)>> {
+    fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(parse_pnpm(content))
     }
 
@@ -1007,7 +1041,7 @@ impl NodeLock for Yarn {
     const LOCKFILE: &'static str = "yarn.lock";
     const BIN: &'static str = "yarn";
 
-    fn parse(content: &str) -> Result<Vec<(String, String)>> {
+    fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(parse_yarn(content))
     }
 
@@ -1025,7 +1059,7 @@ impl NodeLock for Bun {
     const LOCKFILE: &'static str = "bun.lock";
     const BIN: &'static str = "bun";
 
-    fn parse(content: &str) -> Result<Vec<(String, String)>> {
+    fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_bun(content)
     }
 
@@ -1041,7 +1075,7 @@ impl NodeLock for Bun {
 /// Parses `package-lock.json` (lockfileVersion 2/3): the flat `packages` map keys every install
 /// path (`node_modules/<name>`, possibly nested) to a record carrying its resolved `version`. The
 /// v1 `dependencies` tree is handled as a fallback for older locks.
-fn parse_npm(content: &str) -> Result<Vec<(String, String)>> {
+fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
     let doc: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| CoreError::Parse(format!("package-lock.json: {e}")))?;
     let mut out = Vec::new();
@@ -1060,13 +1094,13 @@ fn parse_npm(content: &str) -> Result<Vec<(String, String)>> {
                 continue;
             }
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
-                out.push((name.to_string(), version.to_string()));
+                out.push(NameVersion::new(name, version));
             }
         }
     } else if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_object()) {
         for (name, val) in deps {
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
-                out.push((name.clone(), version.to_string()));
+                out.push(NameVersion::new(name.clone(), version));
             }
         }
     }
@@ -1076,7 +1110,7 @@ fn parse_npm(content: &str) -> Result<Vec<(String, String)>> {
 /// Parses `pnpm-lock.yaml` (v9): the top-level `packages:` section keys every resolved package by
 /// its `name@version(...peers)` identity. We read those keys directly — line by line — rather than
 /// pulling in a YAML dependency, since the keys are the only field we need.
-fn parse_pnpm(content: &str) -> Vec<(String, String)> {
+fn parse_pnpm(content: &str) -> Vec<NameVersion> {
     let mut out = Vec::new();
     let mut in_packages = false;
     for line in content.lines() {
@@ -1092,8 +1126,8 @@ fn parse_pnpm(content: &str) -> Vec<(String, String)> {
             // balanced trailing-group strip, since an injected key's `file:` path may itself
             // contain parenthesized directory segments.
             let key = strip_pnpm_peer_suffixes(key);
-            if let Some((name, version)) = split_name_version(key) {
-                out.push((name, version));
+            if let Some(entry) = split_name_version(key) {
+                out.push(entry);
             }
         } else {
             // A non-indented line begins a new top-level section; we only want `packages:`.
@@ -1728,14 +1762,14 @@ fn parse_npm_exact_pins(content: &str) -> HashSet<String> {
 
 /// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
 /// specifiers ending in `:`, followed by an indented `version "x.y.z"` line that resolves them.
-fn parse_yarn(content: &str) -> Vec<(String, String)> {
+fn parse_yarn(content: &str) -> Vec<NameVersion> {
     let mut out = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("  version ") {
             let version = rest.trim().trim_matches('"');
             for name in pending.drain(..) {
-                out.push((name, version.to_string()));
+                out.push(NameVersion::new(name, version));
             }
         } else if !line.starts_with([' ', '#']) && line.trim_end().ends_with(':') {
             let key = line.trim_end().trim_end_matches(':');
@@ -1762,7 +1796,7 @@ fn parse_yarn(content: &str) -> Vec<(String, String)> {
 /// Parses `bun.lock`: a JSONC document whose `packages` map values are arrays of the form
 /// `["name@version", registry, {...}, integrity]`. Bun writes trailing commas (valid JSONC but not
 /// JSON), so the body is normalised before handing it to the JSON parser.
-fn parse_bun(content: &str) -> Result<Vec<(String, String)>> {
+fn parse_bun(content: &str) -> Result<Vec<NameVersion>> {
     let normalised = strip_trailing_commas(content);
     let doc: serde_json::Value = serde_json::from_str(&normalised)
         .map_err(|e| CoreError::Parse(format!("bun.lock: {e}")))?;
@@ -1770,9 +1804,9 @@ fn parse_bun(content: &str) -> Result<Vec<(String, String)>> {
     if let Some(packages) = doc.get("packages").and_then(|v| v.as_object()) {
         for val in packages.values() {
             if let Some(spec) = val.get(0).and_then(|v| v.as_str())
-                && let Some((name, version)) = split_name_version(spec)
+                && let Some(entry) = split_name_version(spec)
             {
-                out.push((name, version));
+                out.push(entry);
             }
         }
     }
@@ -1842,20 +1876,26 @@ mod tests {
     use super::*;
     use indoc::indoc;
 
-    fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
-        v.sort();
-        v
+    fn sorted(mut entries: Vec<NameVersion>) -> Vec<NameVersion> {
+        entries.sort();
+        entries
     }
 
     #[test]
     fn splits_scoped_and_plain_specifiers() {
         assert_eq!(
             split_name_version("lodash@4.17.15"),
-            Some(("lodash".into(), "4.17.15".into()))
+            Some(NameVersion {
+                name: "lodash".into(),
+                version: "4.17.15".into()
+            })
         );
         assert_eq!(
             split_name_version("@babel/core@7.1.0"),
-            Some(("@babel/core".into(), "7.1.0".into()))
+            Some(NameVersion {
+                name: "@babel/core".into(),
+                version: "7.1.0".into()
+            })
         );
         assert_eq!(split_name_version("no-version"), None);
     }
@@ -1875,9 +1915,9 @@ mod tests {
         assert_eq!(
             sorted(parse_npm(lock).unwrap()),
             sorted(vec![
-                ("lodash".into(), "4.17.15".into()),
-                ("@babel/core".into(), "7.1.0".into()),
-                ("b".into(), "2.0.0".into()),
+                NameVersion::new("lodash", "4.17.15"),
+                NameVersion::new("@babel/core", "7.1.0"),
+                NameVersion::new("b", "2.0.0"),
             ])
         );
     }
@@ -1888,9 +1928,9 @@ mod tests {
         assert_eq!(
             sorted(parse_pnpm(lock)),
             sorted(vec![
-                ("lodash".into(), "4.17.15".into()),
-                ("@babel/core".into(), "7.1.0".into()),
-                ("chalk".into(), "4.0.0".into()),
+                NameVersion::new("lodash", "4.17.15"),
+                NameVersion::new("@babel/core", "7.1.0"),
+                NameVersion::new("chalk", "4.0.0"),
             ])
         );
     }
@@ -1950,8 +1990,8 @@ mod tests {
         assert_eq!(
             sorted(parse_yarn(lock)),
             sorted(vec![
-                ("lodash".into(), "4.17.15".into()),
-                ("@babel/core".into(), "7.1.0".into()),
+                NameVersion::new("lodash", "4.17.15"),
+                NameVersion::new("@babel/core", "7.1.0"),
             ])
         );
     }
@@ -1969,8 +2009,8 @@ mod tests {
         assert_eq!(
             sorted(parse_bun(lock).unwrap()),
             sorted(vec![
-                ("lodash".into(), "4.17.15".into()),
-                ("@babel/core".into(), "7.1.0".into()),
+                NameVersion::new("lodash", "4.17.15"),
+                NameVersion::new("@babel/core", "7.1.0"),
             ])
         );
     }
@@ -2600,7 +2640,7 @@ packages:
         }"#};
         assert_eq!(
             crate::lock::Npm::parse(lock).expect("a v3 lock parses"),
-            vec![("react".to_string(), "18.3.1".to_string())]
+            vec![NameVersion::new("react", "18.3.1")]
         );
     }
 
@@ -2627,22 +2667,34 @@ packages:
 
         assert_eq!(
             paths.resolve_from("node_modules/plugin", "host"),
-            Some(("2.0.0", "node_modules/host")),
+            Some(ResolvedInstance {
+                version: "2.0.0",
+                directory: "node_modules/host"
+            }),
             "a hoisted instance resolves the hoisted peer"
         );
         assert_eq!(
             paths.resolve_from("node_modules/shadowed", "host"),
-            Some(("1.0.0", "node_modules/shadowed/node_modules/host")),
+            Some(ResolvedInstance {
+                version: "1.0.0",
+                directory: "node_modules/shadowed/node_modules/host"
+            }),
             "a nested copy shadows the hoisted one"
         );
         assert_eq!(
             paths.member_resolution("apps/a", "plugin"),
-            Some(("1.0.0", "node_modules/plugin")),
+            Some(ResolvedInstance {
+                version: "1.0.0",
+                directory: "node_modules/plugin"
+            }),
             "a workspace member resolves hoisted packages from its own directory"
         );
         assert_eq!(
             paths.resolve_from("node_modules/lib", "host"),
-            Some(("2.0.0", "node_modules/host")),
+            Some(ResolvedInstance {
+                version: "2.0.0",
+                directory: "node_modules/host"
+            }),
             "a link entry resolves peers from its own hoisted directory"
         );
         assert_eq!(

@@ -48,16 +48,31 @@ mod tests {
     use cooldown_core::{CoreError, RawWindow};
     use indoc::indoc;
 
-    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("Cargo.toml")).expect("utf8 path");
-        std::fs::write(&path, contents).expect("write manifest");
-        (dir, path)
+    /// A `Cargo.toml` written into its own temporary directory.
+    struct TempManifest {
+        /// Owns the temporary directory; dropping it deletes the manifest from disk.
+        directory: tempfile::TempDir,
+        /// The path of the `Cargo.toml` inside the temporary directory.
+        manifest: Utf8PathBuf,
+    }
+
+    fn write_manifest(contents: &str) -> TempManifest {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest =
+            Utf8PathBuf::from_path_buf(directory.path().join("Cargo.toml")).expect("utf8 path");
+        std::fs::write(&manifest, contents).expect("write manifest");
+        TempManifest {
+            directory,
+            manifest,
+        }
     }
 
     #[test]
     fn parse_native_errors_on_invalid_min_age() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
 
             [package]
             name = "demo"
@@ -73,7 +88,10 @@ mod tests {
 
     #[test]
     fn parse_native_reads_valid_package_metadata() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
 
             [package]
             name = "demo"

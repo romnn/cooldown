@@ -59,8 +59,16 @@ pub fn is_prerelease(v: &str) -> bool {
     segments(v).iter().any(|s| matches!(s, Seg::Str(_)))
 }
 
+/// The first two numeric axes of a gem version.
+struct MajorMinor {
+    /// The first numeric segment (the major axis); `0` when absent.
+    major: u64,
+    /// The next numeric segment after the major (the minor axis); `0` when absent.
+    minor: u64,
+}
+
 /// The first numeric segment (the major), and the next numeric segment after it (the minor).
-fn major_minor(v: &str) -> (u64, u64) {
+fn major_minor(v: &str) -> MajorMinor {
     let nums: Vec<u64> = segments(v)
         .into_iter()
         .filter_map(|s| match s {
@@ -68,10 +76,10 @@ fn major_minor(v: &str) -> (u64, u64) {
             Seg::Str(_) => None,
         })
         .collect();
-    (
-        nums.first().copied().unwrap_or(0),
-        nums.get(1).copied().unwrap_or(0),
-    )
+    MajorMinor {
+        major: nums.first().copied().unwrap_or(0),
+        minor: nums.get(1).copied().unwrap_or(0),
+    }
 }
 
 /// Returns the compatibility "major" key for `v`, gating `--major`. As with SemVer/cargo, a `0.x`
@@ -88,7 +96,7 @@ fn major_minor(v: &str) -> (u64, u64) {
 /// ```
 #[must_use]
 pub fn major_key(v: &str) -> MajorKey {
-    let (major, minor) = major_minor(v);
+    let MajorMinor { major, minor } = major_minor(v);
     if major > 0 {
         MajorKey(major.to_string())
     } else {
@@ -118,11 +126,11 @@ pub fn major_number(v: &str) -> Option<u64> {
 /// ```
 #[must_use]
 pub fn classify_kind(current: &str, cand: &str) -> Option<UpdateKind> {
-    let (cm, cn) = major_minor(current);
-    let (nm, nn) = major_minor(cand);
-    if cm != nm {
+    let current = major_minor(current);
+    let cand = major_minor(cand);
+    if current.major != cand.major {
         Some(UpdateKind::Major)
-    } else if cn != nn {
+    } else if current.minor != cand.minor {
         Some(UpdateKind::Minor)
     } else {
         Some(UpdateKind::Patch)

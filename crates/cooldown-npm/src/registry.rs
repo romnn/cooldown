@@ -71,16 +71,27 @@ pub struct NpmPackument {
     pub latest_tag: Option<String>,
 }
 
+/// One installable release of a package doc.
+struct InstallableRelease<'a> {
+    /// The version string — a key of the document's `versions` map.
+    version: &'a str,
+    /// The publish instant from the document's `time` map, when present and parseable.
+    published_at: Option<Timestamp>,
+}
+
 /// The INSTALLABLE releases of a package doc: each `versions` key paired with its publish instant from
 /// `time`. A version present only in `time` — an unpublished version npm never pruned from the `time`
 /// map — is excluded, so cooldown never proposes a version the package manager cannot fetch.
-fn installable_releases(doc: &Doc) -> impl Iterator<Item = (&String, Option<Timestamp>)> {
+fn installable_releases(doc: &Doc) -> impl Iterator<Item = InstallableRelease<'_>> {
     doc.versions.keys().map(|vers| {
         let when = doc
             .time
             .get(vers)
             .and_then(|when| when.parse::<Timestamp>().ok());
-        (vers, when)
+        InstallableRelease {
+            version: vers,
+            published_at: when,
+        }
     })
 }
 
@@ -176,10 +187,10 @@ impl NpmRegistry {
             return Err(CoreError::NotFound(package.name.clone()));
         };
         let releases = installable_releases(&doc)
-            .map(|(vers, when)| {
-                let published_at = self.guard(&package.name, vers, when);
+            .map(|release| {
+                let published_at = self.guard(&package.name, release.version, release.published_at);
                 RawRelease {
-                    version: Version::new(vers.clone()),
+                    version: Version::new(release.version.to_string()),
                     published_at,
                     yanked: false,
                     artifacts: Vec::new(),
@@ -245,7 +256,7 @@ mod tests {
         .expect("parse doc");
 
         let mut versions: Vec<&str> = super::installable_releases(&doc)
-            .map(|(vers, _)| vers.as_str())
+            .map(|release| release.version)
             .collect();
         versions.sort_unstable();
         // Only the two versions still in `versions`; the unpublished 1.4.1/1.4.2 (time-only) are gone.
@@ -253,7 +264,7 @@ mod tests {
 
         // The kept versions carry their publish instant from `time`.
         let with_time = super::installable_releases(&doc)
-            .filter(|(_, when)| when.is_some())
+            .filter(|release| release.published_at.is_some())
             .count();
         assert_eq!(with_time, 2);
     }

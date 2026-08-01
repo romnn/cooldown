@@ -207,7 +207,14 @@ mod tests {
         }
     }
 
-    fn temp_project() -> (tempfile::TempDir, Project) {
+    /// A [`Project`] rooted in its own temporary directory.
+    struct TempProject {
+        /// Owns the temporary directory; dropping it deletes the project tree.
+        directory: tempfile::TempDir,
+        project: Project,
+    }
+
+    fn temp_project() -> TempProject {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
         let manifest = root.join("manifest");
@@ -217,7 +224,10 @@ mod tests {
             manifest,
             exclude_newer: None,
         };
-        (dir, project)
+        TempProject {
+            directory: dir,
+            project,
+        }
     }
 
     /// A local fault the mock injects before consulting the resolve oracle, so a test can assert it
@@ -308,7 +318,7 @@ mod tests {
             if (self.resolves)(&names) {
                 Ok(ApplyReport {
                     applied: plan.changes.clone(),
-                    skipped: Vec::new(),
+                    ..ApplyReport::default()
                 })
             } else {
                 Err(match self.reject_error {
@@ -372,7 +382,10 @@ mod tests {
     async fn happy_path_is_a_single_apply_with_no_bisection() {
         // Everything resolves: exactly one `apply`, every change applied, nothing held.
         let writer = MockWriter::new(|_| true);
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b", "c"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -397,7 +410,10 @@ mod tests {
 
         let writer = MockWriter::new(|_| true);
         let observer = Counter(AtomicUsize::new(0));
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b", "c"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -413,7 +429,10 @@ mod tests {
         // `colors` is unfetchable (the resolve fails whenever it is present); every other candidate
         // must still be applied — the exact "one bad version blocks everything" bug this guards.
         let writer = MockWriter::new(|names| !names.iter().any(|n| n == "colors"));
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b", "colors", "c", "d"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -440,7 +459,10 @@ mod tests {
         // The recovery oracle must bisect it just like an unsatisfiable resolve, so one pnpm importer
         // mismatch does not turn the whole workspace into held candidates.
         let writer = MockWriter::stale_lock(|names| !names.iter().any(|name| name == "vite"));
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "vite", "b"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -466,7 +488,10 @@ mod tests {
     async fn multiple_unfetchable_candidates_are_all_isolated() {
         let writer =
             MockWriter::new(|names| !names.iter().any(|n| n == "colors" || n == "left-pad"));
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "colors", "b", "left-pad", "c"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -497,7 +522,10 @@ mod tests {
                 .iter()
                 .any(|name| name == "nix" && names.iter().filter(|n| *n == "nix").count() > 1)
         });
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let mut app_a = change_from("nix", "0.28.0", "0.31.3");
         app_a.members = vec![member("app-a", "crates/app-a")];
         let mut app_b = change_from("nix", "0.30.0", "0.31.3");
@@ -535,7 +563,10 @@ mod tests {
             let contains_left = names.iter().any(|name| name == "a" || name == "b");
             !(contains_bad || contains_r && contains_left)
         });
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b", "r", "bad"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -560,7 +591,10 @@ mod tests {
         let writer = MockWriter::new(|names| {
             !(names.iter().any(|n| n == "x") && names.iter().any(|n| n == "y"))
         });
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "x", "b", "y", "c"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -585,7 +619,10 @@ mod tests {
     #[tokio::test]
     async fn everything_unsatisfiable_holds_all_and_applies_none() {
         let writer = MockWriter::new(|_| false);
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b", "c"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 
@@ -605,7 +642,10 @@ mod tests {
         writer: MockWriter,
         expected: impl Fn(&CoreError) -> bool,
     ) {
-        let (_dir, project) = temp_project();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
         let plan = plan(&["a", "b"]);
         let journal = writer.mutation_journal(&project, &plan).await.unwrap();
 

@@ -18,11 +18,20 @@ fn tag_value<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
     Some(rest.get(..end)?.trim())
 }
 
-/// Parses the `<dependency>` entries of a `pom.xml` into `(group:artifact, version)`. Dependencies
+/// A dependency coordinate and the exact version a build file resolves it to.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedPin {
+    /// The `group:artifact` coordinate as recorded in the file.
+    pub name: String,
+    /// The exact version the file pins the coordinate to.
+    pub version: String,
+}
+
+/// Parses the `<dependency>` entries of a `pom.xml` into resolved [`ResolvedPin`]s. Dependencies
 /// whose version is absent or a `${property}`/BOM-managed placeholder are skipped, since cooldown
 /// cannot resolve those to a concrete version without running Maven.
 #[must_use]
-pub fn parse_pom(content: &str) -> Vec<(String, String)> {
+pub fn parse_pom(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     let mut rest = content;
     while let Some(start) = rest.find("<dependency>") {
@@ -37,18 +46,21 @@ pub fn parse_pom(content: &str) -> Vec<(String, String)> {
             tag_value(block, "version"),
         ) && !version.contains("${")
         {
-            out.push((format!("{group}:{artifact}"), version.to_string()));
+            out.push(ResolvedPin {
+                name: format!("{group}:{artifact}"),
+                version: version.to_string(),
+            });
         }
         rest = &after[end..];
     }
     out
 }
 
-/// Parses a `gradle.lockfile` into resolved `(group:artifact, version)`. Each non-comment line is
+/// Parses a `gradle.lockfile` into resolved [`ResolvedPin`]s. Each non-comment line is
 /// `group:artifact:version=configurations`; the trailing `empty=` line and `#` comments are
 /// skipped.
 #[must_use]
-pub fn parse_gradle_lock(content: &str) -> Vec<(String, String)> {
+pub fn parse_gradle_lock(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -61,7 +73,10 @@ pub fn parse_gradle_lock(content: &str) -> Vec<(String, String)> {
             && ga.contains(':')
             && !version.is_empty()
         {
-            out.push((ga.to_string(), version.to_string()));
+            out.push(ResolvedPin {
+                name: ga.to_string(),
+                version: version.to_string(),
+            });
         }
     }
     out
@@ -108,6 +123,13 @@ fn quoted_literals(src: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    fn pin(name: &str, version: &str) -> ResolvedPin {
+        ResolvedPin {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
     #[test]
     fn pom_dependencies_skip_property_versions() {
         let pom = "<project><dependencies>\
@@ -116,7 +138,7 @@ mod tests {
             </dependencies></project>";
         assert_eq!(
             parse_pom(pom),
-            vec![("com.google.code.gson:gson".to_string(), "2.8.0".to_string())]
+            vec![pin("com.google.code.gson:gson", "2.8.0")]
         );
     }
 
@@ -124,12 +146,12 @@ mod tests {
     fn gradle_lock_and_direct() {
         let lock = "# This is a Gradle generated file...\ncom.google.code.gson:gson:2.8.0=compileClasspath\norg.slf4j:slf4j-api:1.7.30=compileClasspath\nempty=\n";
         let mut got = parse_gradle_lock(lock);
-        got.sort();
+        got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
             vec![
-                ("com.google.code.gson:gson".to_string(), "2.8.0".to_string()),
-                ("org.slf4j:slf4j-api".to_string(), "1.7.30".to_string()),
+                pin("com.google.code.gson:gson", "2.8.0"),
+                pin("org.slf4j:slf4j-api", "1.7.30"),
             ]
         );
 

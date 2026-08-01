@@ -44,7 +44,7 @@
 
 mod support;
 
-use support::{Fixture, changed_packages, pnpm_lock_pins};
+use support::{ChangeVersions, Fixture, changed_packages, pnpm_lock_pins};
 
 /// The absolute resolution cutoff. The npm registry's publish history before this instant is
 /// append-mostly (only an unpublish of a fixture dep could change it), so the matured-version set
@@ -569,7 +569,7 @@ fn upgrade_honors_a_stricter_per_package_window() {
     );
     assert_pnpm_lock_current(&upgrade);
 
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
@@ -710,7 +710,7 @@ fn upgrade_moves_a_root_declared_dependency_in_a_workspace() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
@@ -750,7 +750,7 @@ fn upgrade_moves_a_member_declared_dependency() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");

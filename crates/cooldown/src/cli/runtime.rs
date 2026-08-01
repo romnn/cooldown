@@ -110,11 +110,11 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     }
 
     let generated_at = generated_at(ws.now());
-    let mut progress_projects = ws.progress_projects(&opts);
+    let mut progress_project_tools = ws.progress_project_tools(&opts);
     if matches!(cli.command, Command::Explain { .. }) {
-        progress_projects.truncate(1);
+        progress_project_tools.truncate(1);
     }
-    opts.progress.start_run(&progress_projects);
+    opts.progress.start_run(&progress_project_tools);
     let result = commands::dispatch(
         cli.command,
         commands::CommandContext {

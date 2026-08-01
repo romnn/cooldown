@@ -3,8 +3,8 @@
 //! resolved graph (direct + transitive) by default.
 
 use super::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, LockReportAction, RunOpts,
-    TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
+    RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
     render_window,
 };
 use cooldown_core::{
@@ -217,7 +217,11 @@ impl<'a> CheckRunner<'a> {
                 self.opts.fanout(),
             )
             .await;
-        for (dep, result) in fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
             self.gate_pin(pctx, &read.project_label, &dep, result, &read.resolve);
         }
     }

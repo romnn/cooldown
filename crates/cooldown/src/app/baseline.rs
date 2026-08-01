@@ -5,6 +5,7 @@
 //! young version reintroduced in another project later is not silently grandfathered. A clean
 //! ratchet: baseline once, then the set only shrinks.
 
+use super::FetchedRelease;
 use cooldown_core::CoreError;
 use cooldown_toml_util::read_toml_file;
 use jiff::Timestamp;
@@ -193,7 +194,11 @@ impl crate::app::Workspace {
                 .fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout())
                 .await;
 
-            for (dep, result) in fetched {
+            for FetchedRelease {
+                dependency: dep,
+                result,
+            } in fetched
+            {
                 let Ok(locked) = result else { continue };
                 let pv = check_pin(&dep, &locked, &pctx.policy.layers, &rctx, self.now());
                 if pv.status == Status::CurrentInCooldown {

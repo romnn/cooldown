@@ -101,25 +101,29 @@ impl ToolRead for BundlerTool {
         let direct = lock::parse_direct(&content);
         let ceilings = lock::graph_ceilings(&content);
         let mut deps = Vec::new();
-        for (name, ver) in lock::parse_resolved(&content) {
-            let is_direct = direct.contains(&name);
+        for resolved in lock::parse_resolved(&content) {
+            let is_direct = direct.contains(&resolved.name);
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(BUNDLER_ID, name.clone(), Some(RUBYGEMS.to_string())),
-                current: Version::new(ver.clone()),
-                current_quality: classify_quality(&ver),
+                package: PackageId::new(
+                    BUNDLER_ID,
+                    resolved.name.clone(),
+                    Some(RUBYGEMS.to_string()),
+                ),
+                current: Version::new(resolved.version.clone()),
+                current_quality: classify_quality(&resolved.version),
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 // A requirer pinning this gem `(= X)` caps it at its resolved version. The active
                 // check (pin equals the resolved version) records the canonical resolved form so it
                 // matches a fetched release, mirroring the uv adapter.
-                graph_ceiling: ceilings.get(&name).and_then(|pin| {
-                    version::compare(pin, &ver)
+                graph_ceiling: ceilings.get(&resolved.name).and_then(|pin| {
+                    version::compare(pin, &resolved.version)
                         .is_eq()
-                        .then(|| Version::new(ver.clone()))
+                        .then(|| Version::new(resolved.version.clone()))
                 }),
                 declared_bound: None,
                 members: Vec::new(),

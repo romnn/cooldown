@@ -35,7 +35,7 @@
 mod support;
 
 use indoc::indoc;
-use support::{Fixture, changed_packages, toml_lock_pins};
+use support::{ChangeVersions, Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
 /// the matured-version set — and the precise targets cooldown computes — reproduce forever.
@@ -209,12 +209,12 @@ fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
 
     assert_eq!(
         upgrade.changes_for("jsonschema"),
-        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        vec![ChangeVersions::new("0.46.5", "0.46.6")],
         "jsonschema must have one baseline-to-final report row"
     );
     assert_eq!(
         upgrade.changes_for("referencing"),
-        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        vec![ChangeVersions::new("0.46.5", "0.46.6")],
         "referencing must not retain a false skip or its transient 0.46.10 position"
     );
     assert_eq!(

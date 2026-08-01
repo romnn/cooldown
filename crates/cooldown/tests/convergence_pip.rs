@@ -11,7 +11,7 @@
 
 mod support;
 
-use support::Fixture;
+use support::{ChangeVersions, Fixture};
 
 /// PyPI history before this instant is immutable. `requests` has a within-major target after 2.28.0
 /// but before this cutoff, so the tests assert invariants without hard-coding the selected version.
@@ -75,7 +75,7 @@ fn upgrade_rewrites_plain_requirements_file_and_converges() {
         upgrade.warning_kinds()
     );
 
-    let (_from, to) = upgrade
+    let ChangeVersions { to, .. } = upgrade
         .change_for("requests")
         .expect("requests should be reported applied");
     let rewritten = String::from_utf8(fixture.read_bytes("requirements.txt")).unwrap();

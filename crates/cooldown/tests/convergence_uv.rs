@@ -37,7 +37,7 @@
 mod support;
 
 use indoc::indoc;
-use support::{Fixture, changed_packages, toml_lock_pins};
+use support::{ChangeVersions, Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. At this instant the huggingface-hub/typer conflict exists in
 /// PyPI's immutable history, so the resolve is reproducible forever.
@@ -146,7 +146,7 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
 
     // The collateral move specifically: huggingface-hub is downgraded to make room for newest
     // typer, and that downgrade is in the report.
-    let (from, to) = report
+    let ChangeVersions { from, to } = report
         .change_for("huggingface-hub")
         .expect("huggingface-hub move reported");
     // Compare component-wise as numbers, not lexicographically: a string compare happens to order
@@ -434,7 +434,7 @@ fn upgrade_moves_a_member_declared_dependency() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("certifi")
         .expect("certifi should be in the report");
     assert_ne!(from, to, "certifi must move to a newer matured version");

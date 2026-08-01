@@ -185,8 +185,12 @@ pub fn pixi_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
             continue;
         }
         if let Some(item) = trimmed.strip_prefix("- ") {
-            if in_constraints && let Some((name, version)) = exact_match_spec(item) {
-                push_ceiling(&mut ceilings, normalize_name(name), version.to_string());
+            if in_constraints && let Some(pin) = exact_match_spec(item) {
+                push_ceiling(
+                    &mut ceilings,
+                    normalize_name(pin.name),
+                    pin.version.to_string(),
+                );
             }
             continue;
         }
@@ -254,14 +258,23 @@ pub fn conda_lock_ceilings(content: &str) -> HashMap<String, Vec<String>> {
     ceilings
 }
 
-/// The `(name, version)` of an exact conda match-spec — `libprotobuf 6.31.1` or
+/// A conda match-spec that pins a package to one exact version, borrowing from the spec.
+#[derive(Debug, PartialEq)]
+struct ExactMatchSpec<'a> {
+    /// The package name (the spec's first token, not normalized).
+    name: &'a str,
+    /// The exactly pinned version (any trailing build string dropped).
+    version: &'a str,
+}
+
+/// The name and pinned version of an exact conda match-spec — `libprotobuf 6.31.1` or
 /// `ld_impl_linux-64 2.44 h1423503_1` (the trailing build is ignored). `None` for an unconstrained
 /// name or a relational/fuzzy spec (`python >=3.9`, `numpy 1.21.*`).
-fn exact_match_spec(spec: &str) -> Option<(&str, &str)> {
+fn exact_match_spec(spec: &str) -> Option<ExactMatchSpec<'_>> {
     let mut tokens = spec.split_whitespace();
     let name = tokens.next()?;
     let version = exact_version(tokens.next()?)?;
-    Some((name, version))
+    Some(ExactMatchSpec { name, version })
 }
 
 /// The version from an exact conda version spec — a bare version (`6.31.1`) or `==X`. `None` for a
@@ -541,11 +554,17 @@ mod tests {
     fn exact_match_spec_and_version_recognise_only_exact_pins() {
         assert_eq!(
             exact_match_spec("libprotobuf 6.31.1"),
-            Some(("libprotobuf", "6.31.1"))
+            Some(ExactMatchSpec {
+                name: "libprotobuf",
+                version: "6.31.1"
+            })
         );
         assert_eq!(
             exact_match_spec("ld_impl 2.44 h1423503_1"),
-            Some(("ld_impl", "2.44"))
+            Some(ExactMatchSpec {
+                name: "ld_impl",
+                version: "2.44"
+            })
         );
         assert_eq!(exact_match_spec("python >=3.9"), None);
         assert_eq!(exact_match_spec("numpy 1.21.*"), None);
@@ -559,7 +578,10 @@ mod tests {
         assert_eq!(exact_version("1!2.0.3"), Some("1!2.0.3"));
         assert_eq!(
             exact_match_spec("openssl 1!1.1.1"),
-            Some(("openssl", "1!1.1.1"))
+            Some(ExactMatchSpec {
+                name: "openssl",
+                version: "1!1.1.1"
+            })
         );
         // A PEP 508 marker token must not be mistaken for a version (a pypi-style list entry).
         assert_eq!(
