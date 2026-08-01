@@ -113,18 +113,6 @@ fn selector_rule(
     Ok(rule)
 }
 
-/// Rejects a cargo-only `edge-policy` key in a selector context that cannot honor it. The scan
-/// projection owns the `[tool.cargo]` placement (and rejects other tools); registry/project
-/// selectors are policy-only, so the key would be silently dead there — an error is kinder.
-fn reject_edge_policy(selector_toml: &SelectorToml, ctx: &str) -> Result<(), CoreError> {
-    if selector_toml.edge_policy.is_some() {
-        return Err(CoreError::Config(format!(
-            "`edge-policy` in {ctx} is cargo-specific; move it to [tool.cargo]"
-        )));
-    }
-    Ok(())
-}
-
 fn package_rule(
     selector: Selector,
     package_toml: &PackageRuleToml,
@@ -231,7 +219,6 @@ pub(crate) fn policy_layer_from_config(
     }
     if let Some(registries) = config.registry {
         for (name, selector) in registries {
-            reject_edge_policy(&selector, &format!("[registry.{name:?}]"))?;
             layer.rules.push(selector_rule(
                 Selector::Registry(name.clone()),
                 &selector,
@@ -253,7 +240,6 @@ pub(crate) fn policy_layer_from_config(
     }
     if let Some(projects) = config.project {
         for (pattern, selector) in projects {
-            reject_edge_policy(&selector, &format!("[project.{pattern:?}]"))?;
             layer.rules.push(selector_rule(
                 Selector::Project(PatternGlob::new(&pattern)?),
                 &selector,

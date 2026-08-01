@@ -216,6 +216,8 @@ fn canonicalize_heals_a_seeded_bad_binding_and_converges() {
         edge_rows.iter().any(|row| {
             row.dependency == "uuid"
                 && row.dependent == "diesel"
+                && row.dependent_source.as_deref()
+                    == Some("registry+https://github.com/rust-lang/crates.io-index")
                 && row.action == "canonicalized"
                 && row.from == "0.8.2"
                 && row.to == target
@@ -399,6 +401,7 @@ fn canonicalize_heals_without_any_planned_change() {
         "the healed binding is counted apart from the version changes"
     );
     assert_eq!(upgrade.summary_edges_held(), 0);
+    assert_eq!(upgrade.summary_edges_unaddressable(), 0);
     assert!(
         upgrade.meta_applied(),
         "a corrected edge binding wrote the lock, so meta.applied must say so"
@@ -415,6 +418,7 @@ fn canonicalize_heals_without_any_planned_change() {
             row.dependency == "uuid"
                 && row.dependent == "diesel"
                 && row.action == "canonicalized"
+                && row.applied
                 && row.from == "0.8.2"
                 && row.to == target
         }),

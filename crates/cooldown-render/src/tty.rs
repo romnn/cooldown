@@ -574,8 +574,13 @@ struct MutationStatus {
 
 fn mutation_status(it: &UpgradeItem) -> MutationStatus {
     if let Some(edge) = &it.edge {
+        let source = edge
+            .dependent_source
+            .as_deref()
+            .map(|source| format!(" ({source})"))
+            .unwrap_or_default();
         let subject = format!(
-            "{} {}'s {} edge binding",
+            "{} {}{source}'s {} edge binding",
             edge.dependent, edge.dependent_version, it.name
         );
         return match edge.action {
@@ -586,9 +591,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
             },
             cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
                 status: "canonicalized",
-                reason: format!(
-                    "{subject} bound to the highest locked version satisfying its requirement"
-                ),
+                reason: format!("{subject} bound to the canonical satisfying locked version"),
                 color: Color::Green,
             },
             cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
@@ -601,6 +604,14 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
                 reason: match &edge.detail {
                     Some(detail) => format!("{subject} left in place: {detail}"),
                     None => format!("{subject} left in place; correction withheld"),
+                },
+                color: Color::Yellow,
+            },
+            cooldown_core::EdgeBindingAction::Unaddressable => MutationStatus {
+                status: "unaddressable",
+                reason: match &edge.detail {
+                    Some(detail) => format!("{subject} could not be corrected: {detail}"),
+                    None => format!("{subject} could not be corrected safely"),
                 },
                 color: Color::Yellow,
             },
@@ -639,6 +650,24 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
             color: Color::Cyan,
         }
     }
+}
+
+fn edge_summary_note(summary: &UpgradeSummary) -> String {
+    let mut note = String::new();
+    if summary.edges_corrected > 0 {
+        let _ = write!(note, " · {} edges corrected", summary.edges_corrected);
+    }
+    if summary.edges_held > 0 {
+        let _ = write!(note, " · {} edges held", summary.edges_held);
+    }
+    if summary.edges_unaddressable > 0 {
+        let _ = write!(
+            note,
+            " · {} edges unaddressable",
+            summary.edges_unaddressable
+        );
+    }
+    note
 }
 
 fn mutation_project_column_needed(
@@ -751,15 +780,7 @@ fn render_mutation(
     } else {
         format!(" ({needs_major} need --major)")
     };
-    // Edge-binding counts only appear when the run produced any, so the common summary line is
-    // unchanged for runs without edge activity.
-    let mut edge_note = String::new();
-    if summary.edges_corrected > 0 {
-        let _ = write!(edge_note, " · {} edges corrected", summary.edges_corrected);
-    }
-    if summary.edges_held > 0 {
-        let _ = write!(edge_note, " · {} edges held", summary.edges_held);
-    }
+    let edge_note = edge_summary_note(summary);
     let _ = writeln!(
         out,
         "\n{} applied · {} skipped{} · {} errors{} · {}",
@@ -1439,6 +1460,7 @@ mod tests {
                 errors: 0,
                 edges_corrected: 0,
                 edges_held: 0,
+                edges_unaddressable: 0,
             },
             items,
             &[],
@@ -1541,6 +1563,7 @@ mod tests {
                 errors: 0,
                 edges_corrected: 0,
                 edges_held: 0,
+                edges_unaddressable: 0,
             },
             &items,
             &[],
@@ -1620,6 +1643,7 @@ mod tests {
                 errors: 0,
                 edges_corrected: 0,
                 edges_held: 0,
+                edges_unaddressable: 0,
             },
             &items,
             &[],
@@ -1661,6 +1685,7 @@ mod tests {
                 errors: 0,
                 edges_corrected: 0,
                 edges_held: 0,
+                edges_unaddressable: 0,
             },
             &[],
             &[],

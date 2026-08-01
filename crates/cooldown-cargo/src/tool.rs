@@ -12,9 +12,11 @@
 //! non-candidate crates, and the candidates a mutually-exclusive `=`-pin or single-major shared
 //! transitive leaves held), and a converged graph re-applies to a byte-stable fixed point.
 
-use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
+use crate::CARGO_ID;
+use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
+use crate::lockfile::{CargoLock, SlotKey};
 use crate::manifest;
 use crate::native::parse_native;
 use crate::version;
@@ -24,17 +26,14 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, EdgeBindingAction,
-    EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport, NativePolicyLayer, PackageId,
-    PackageRegistry, Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId,
-    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, EdgePolicy, EdgeRebind,
+    FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
+    ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
+    ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
-
-/// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
-pub const CARGO_ID: ToolId = ToolId("cargo");
 
 /// The Rust/Cargo implementation of the [`Tool`] port.
 ///
@@ -200,8 +199,8 @@ impl ToolRead for CargoTool {
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         match self.cargo.verify_locked(&project.root).await {
-            Ok(ok) => Ok(verify_current_report(
-                ok,
+            Ok(graph) => Ok(verify_current_report(
+                graph.is_some(),
                 "Cargo.lock is current",
                 "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
             )),
@@ -259,110 +258,6 @@ impl ReleaseFetcher for CargoTool {
     }
 }
 
-/// A `(name, major)` slot key. Cargo coexists multiple majors of one crate (`serde 0.9` and
-/// `serde 1.0` can both be in the lock), so a name alone is ambiguous; the slot a `--precise` pin
-/// moves and the slot the before/after diff compares is the `(name, major)` pair. A net version
-/// change within one slot is a *move*; a slot that appears or disappears is graph-shape churn the
-/// diff ignores (a consequence of a reported move, not a silent version change).
-type SlotKey = (String, String);
-
-/// Every registry version present in each Cargo compatibility slot.
-type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
-
-fn locked_slots(lock: &CargoLock) -> LockedSlots {
-    matching_locked_slots(lock, LockPackage::is_registry)
-}
-
-fn crates_io_locked_slots(lock: &CargoLock) -> LockedSlots {
-    matching_locked_slots(lock, LockPackage::is_crates_io)
-}
-
-fn matching_locked_slots(lock: &CargoLock, include: impl Fn(&LockPackage) -> bool) -> LockedSlots {
-    let mut slots: LockedSlots = BTreeMap::new();
-    for package in &lock.package {
-        let (Some(version), true) = (package.version.as_deref(), include(package)) else {
-            continue;
-        };
-        slots
-            .entry((package.name.clone(), version::major_key(version).0))
-            .or_default()
-            .insert(version.to_string());
-    }
-    slots
-}
-
-/// The resolved registry-crate versions of a `Cargo.lock`, keyed per `(name, major)` slot — the
-/// snapshot `apply` diffs before/after the whole-graph re-resolve to report *every* net version
-/// change (the planned moves, the collateral moves the resolve forced for consistency, and the
-/// candidates a conflict left held). Path/git/workspace packages carry no comparable registry
-/// version and are skipped. When two nodes share a `(name, major)` slot (rare; only via distinct
-/// `source` registries), the highest version wins so the slot is single-valued.
-fn locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
-    highest_locked_versions(locked_slots(lock))
-}
-
-fn crates_io_locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
-    highest_locked_versions(crates_io_locked_slots(lock))
-}
-
-fn highest_locked_versions(slots: LockedSlots) -> BTreeMap<SlotKey, String> {
-    slots
-        .into_iter()
-        .filter_map(|(key, versions)| {
-            versions
-                .into_iter()
-                .max_by(|left, right| version::compare(left, right))
-                .map(|version| (key, version))
-        })
-        .collect()
-}
-
-/// The `Cargo.lock`'s `[[package]]` array, parsed for the before/after version diff and the
-/// edge-binding policies. Only the fields those need are read; `cargo` owns the canonical format.
-#[derive(serde::Deserialize)]
-pub(crate) struct CargoLock {
-    #[serde(default)]
-    pub(crate) package: Vec<LockPackage>,
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct LockPackage {
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) version: Option<String>,
-    /// The source URL. Absent for path/workspace members; present for registry and git crates. Only
-    /// registry crates have a comparable, fetchable version, so the diff keeps only those.
-    #[serde(default)]
-    pub(crate) source: Option<String>,
-    /// The package's resolved dependency entries — `"name"`, `"name x.y.z"` when the lock holds
-    /// several versions of the name, or `"name x.y.z (source)"` when several sources coexist. The
-    /// version-qualified form is an edge *binding* the edge-policy module inspects and may rewrite.
-    #[serde(default)]
-    pub(crate) dependencies: Vec<String>,
-}
-
-impl LockPackage {
-    /// Whether this locked package came from a registry (crates.io or an alternate registry), the
-    /// only source kind whose version the cooldown diff can move and compare. Git and path/workspace
-    /// sources are excluded.
-    fn is_registry(&self) -> bool {
-        self.source
-            .as_deref()
-            .is_some_and(|source| source.starts_with("registry+"))
-    }
-
-    fn is_crates_io(&self) -> bool {
-        self.source.as_deref() == Some(CRATES_IO_SOURCE)
-    }
-}
-
-impl CargoLock {
-    pub(crate) fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content)
-            .map_err(|err| cooldown_core::CoreError::LockUnreadable(format!("Cargo.lock: {err}")))
-    }
-}
-
 /// Selects the currently resolved node that represents a planned change without changing the
 /// change's immutable baseline `from` version.
 ///
@@ -374,7 +269,7 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     if change.package.registry.as_deref() != Some(CRATES_IO) {
         return None;
     }
-    let slots = crates_io_locked_slots(lock);
+    let slots = lock.crates_io_locked_slots();
     let source_key = (
         change.package.name.clone(),
         version::major_key(change.from.as_str()).0,
@@ -525,7 +420,7 @@ impl CargoTool {
             // false positive this loop exists to avoid.
             let needs_graph = plan.changes.iter().any(needs_member_graph);
             for _ in 0..plan.changes.len() {
-                let after = crates_io_locked_versions(&read_lock(project)?);
+                let after = read_lock(project)?.crates_io_locked_versions();
                 let graph = if needs_graph {
                     Some(self.cargo.metadata(&project.root).await?)
                 } else {
@@ -590,7 +485,7 @@ impl CargoTool {
 
         let mut seen = BTreeSet::new();
         for _ in 0..worklist.len().saturating_add(1) {
-            let before = locked_slots(&read_lock(project)?);
+            let before = read_lock(project)?.locked_slots();
             if !seen.insert(before.clone()) {
                 break;
             }
@@ -607,7 +502,7 @@ impl CargoTool {
                 self.update_precise(project, &change.package.name, &current, change.to.as_str())
                     .await?;
             }
-            let after = locked_slots(&read_lock(project)?);
+            let after = read_lock(project)?.locked_slots();
             if !attempted || after == before {
                 break;
             }
@@ -665,7 +560,7 @@ impl CargoTool {
             .and_then(|content| CargoLock::parse(content).ok());
         let before = before_lock
             .as_ref()
-            .map(locked_versions)
+            .map(CargoLock::locked_versions)
             .unwrap_or_default();
 
         // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
@@ -682,12 +577,9 @@ impl CargoTool {
             Err(err) => return Err(err),
         }
 
-        // The resolved graph proves direct member changes reached the target and names the crate
-        // whose `=`-pin holds a short candidate back. Fetched before the edge-policy pass so the
-        // pass can read declared requirements from it; the pass only rewrites which coexisting
-        // version an edge is bound to — the package set and the manifest-derived data the reach
-        // checks consume are unaffected. A corrective edge policy makes the fetch mandatory: a
-        // swallowed failure would silently degrade the requested correction to observe-only.
+        // The resolved graph supplies declared requirements to edge enforcement and proves which
+        // direct member edges reached their targets. A corrective policy makes the initial fetch
+        // mandatory; successful lock verification returns a fresh graph after any correction.
         let needs_graph = plan.changes.iter().any(needs_member_graph);
         let corrective_edges = matches!(
             plan.edge_policy,
@@ -701,18 +593,20 @@ impl CargoTool {
 
         // Enforce the plan's edge policy over the re-resolved lock and collect every edge binding
         // that moved between coexisting versions — corrected or not, never silent.
-        let edge_rebinds = self
-            .enforce_edge_policy(
-                project,
-                plan.edge_policy,
-                before_lock.as_ref(),
-                graph.as_ref(),
-            )
-            .await?;
+        let enforced = edges::enforce::enforce(
+            &self.cargo,
+            project,
+            plan.edge_policy,
+            before_lock.as_ref(),
+            graph,
+        )
+        .await?;
+        let graph = enforced.graph;
+        let edge_rebinds = enforced.rebinds;
 
         let after_lock = read_lock(project)?;
-        let after = locked_versions(&after_lock);
-        let crates_io_after = crates_io_locked_versions(&after_lock);
+        let after = after_lock.locked_versions();
+        let crates_io_after = after_lock.crates_io_locked_versions();
         // Each planned candidate either reached cooldown's target (its newest-within-window) —
         // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
         // transitive won — reported held, naming the blocker.
@@ -748,317 +642,6 @@ impl CargoTool {
         report.applied.extend(collateral);
         report.edge_rebinds = edge_rebinds;
         Ok(report)
-    }
-
-    /// Enforces the plan's [`EdgePolicy`] over the freshly re-resolved lock and reports every edge
-    /// binding that moved between coexisting versions of one crate.
-    ///
-    /// The policy's corrective rewrites pass the shared guards ([`edges::guard_rewrites`]), are
-    /// applied as targeted lock surgery, and are then verified with the same `cargo metadata
-    /// --locked` probe the lock-currency check uses — a failed batch retries each rewrite in
-    /// isolation, and what still fails is withheld as [`Held`](EdgeBindingAction::Held) with the
-    /// reason. Residual rebinds — policy [`None`](EdgePolicy::None), or moves no policy proposed a
-    /// correction for — are reported as plain [`Rebound`](EdgeBindingAction::Rebound) rows: every
-    /// binding move between `[[package]]` blocks present in both locks surfaces as some row (a
-    /// block whose own identity changed was legitimately re-resolved and is excluded by design).
-    async fn enforce_edge_policy(
-        &self,
-        project: &Project,
-        policy: EdgePolicy,
-        before: Option<&CargoLock>,
-        graph: Option<&ResolvedGraph>,
-    ) -> Result<Vec<EdgeRebind>> {
-        let lock_path = project.root.join("Cargo.lock");
-        let resolver_text = std::fs::read_to_string(&lock_path)?;
-        let resolver_lock = CargoLock::parse(&resolver_text)?;
-        let resolver_view = edges::LockEdgeView::from_lock(&resolver_lock);
-        let before_view = before.map(edges::LockEdgeView::from_lock);
-
-        let proposed = match (policy, graph) {
-            // Without resolved metadata there are no declared requirements to validate a rewrite
-            // against, so nothing is corrected (rebinds are still reported below).
-            (EdgePolicy::None, _) | (_, None) => Vec::new(),
-            (EdgePolicy::Preserve, Some(graph)) => before_view
-                .as_ref()
-                .map(|before_view| {
-                    edges::preserve::restorations(
-                        before_view,
-                        &resolver_view,
-                        &edges::RequirementIndex::new(graph),
-                    )
-                })
-                .unwrap_or_default(),
-            (EdgePolicy::Canonicalize, Some(graph)) => edges::canonicalize::rebindings(
-                &resolver_view,
-                &edges::RequirementIndex::new(graph),
-            ),
-        };
-        let mut guarded = edges::guard_rewrites(&resolver_view, proposed);
-        let committed = self
-            .apply_edge_rewrites(project, &lock_path, &resolver_text, &mut guarded)
-            .await?;
-
-        let action = match policy {
-            EdgePolicy::Preserve => EdgeBindingAction::Restored,
-            EdgePolicy::Canonicalize => EdgeBindingAction::Canonicalized,
-            // `None` proposes no rewrites, so `corrected` is empty and the value is never used.
-            EdgePolicy::None => EdgeBindingAction::Rebound,
-        };
-        let mut rebinds: Vec<EdgeRebind> = committed
-            .corrected
-            .iter()
-            .map(|rewrite| edge_rebind(rewrite, action, None))
-            .collect();
-        // Withheld corrections are still rows — a policy that could not act must say so, not stay
-        // silent (the binding they describe is unchanged, so the residual diff cannot see them).
-        rebinds.extend(guarded.rejected.iter().map(|rejected| {
-            edge_rebind(
-                &rejected.rewrite,
-                EdgeBindingAction::Held,
-                Some(rejected.reason.clone()),
-            )
-        }));
-        // Ambiguity is a typed outcome too: a duplicate-identity dependent's edges cannot be
-        // corrected (block surgery cannot single out one twin), so the correcting policy reports
-        // them held at their current binding instead of silently skipping them. The registry stays
-        // unattributed — the twins may straddle sources.
-        if matches!(policy, EdgePolicy::Canonicalize) {
-            for edge in resolver_view.duplicate_identity_edges() {
-                rebinds.push(EdgeRebind {
-                    dependent: edge.dependent.name,
-                    dependent_version: Version::new(edge.dependent.version),
-                    dependency: PackageId::new(CARGO_ID, edge.dependency, None),
-                    from: Version::new(edge.bound.clone()),
-                    to: Version::new(edge.bound),
-                    action: EdgeBindingAction::Held,
-                    detail: Some(
-                        "the dependent's name and version identify more than one locked \
-                         package; the binding cannot be canonicalized"
-                            .to_string(),
-                    ),
-                });
-            }
-        }
-
-        // Residual detection: any binding that still differs from the pre-apply lock and that no
-        // corrective or withheld row above covers is reported as a plain rebind.
-        if let Some(before_view) = &before_view {
-            let final_view = if committed.corrected.is_empty() {
-                resolver_view
-            } else {
-                edges::LockEdgeView::from_lock(&CargoLock::parse(&committed.lock_text)?)
-            };
-            let residual = residual_rebound_rows(before_view, &final_view, &rebinds);
-            rebinds.extend(residual);
-        }
-        Ok(rebinds)
-    }
-
-    /// Applies the guard-accepted rewrites as targeted lock surgery and verifies the result with
-    /// `cargo metadata --locked`. On success the accepted set moves out as the corrected set; a
-    /// failed batch verification falls back to per-rewrite isolation
-    /// ([`isolate_edge_rewrites`](Self::isolate_edge_rewrites)) so one invalid correction does not
-    /// withhold the rest. Whatever cannot be kept is withheld with the reason, so the caller
-    /// reports it instead of losing it.
-    async fn apply_edge_rewrites(
-        &self,
-        project: &Project,
-        lock_path: &Utf8Path,
-        resolver_text: &str,
-        guarded: &mut edges::GuardedRewrites,
-    ) -> Result<CommittedRewrites> {
-        if guarded.accepted.is_empty() {
-            return Ok(CommittedRewrites::unchanged(resolver_text));
-        }
-        let Some(rewritten) = edges::rewrite_lock_text(resolver_text, &guarded.accepted) else {
-            // The lock text no longer matches the parsed view (an all-or-nothing refusal);
-            // nothing was written.
-            reject_all(
-                guarded,
-                "the lock text did not match the parsed entry; correction skipped",
-            );
-            return Ok(CommittedRewrites::unchanged(resolver_text));
-        };
-        std::fs::write(lock_path, &rewritten)?;
-        match self.cargo.verify_locked(&project.root).await {
-            Ok(true) => Ok(CommittedRewrites {
-                corrected: std::mem::take(&mut guarded.accepted),
-                lock_text: rewritten,
-            }),
-            // The batch did not verify (a feature or source interaction the requirement model
-            // cannot see): keep the resolver's own lock, then retry each rewrite on its own so
-            // only the actually-invalid ones are withheld.
-            Ok(false) => {
-                std::fs::write(lock_path, resolver_text)?;
-                self.isolate_edge_rewrites(project, lock_path, resolver_text, guarded)
-                    .await
-            }
-            Err(err) => {
-                std::fs::write(lock_path, resolver_text)?;
-                Err(err)
-            }
-        }
-    }
-
-    /// Retries each accepted rewrite of a failed batch individually — apply, verify with `cargo
-    /// metadata --locked`, keep or roll back — accumulating the survivors. A single-rewrite batch
-    /// has nothing to isolate and is withheld directly. Interdependent rewrites the orphan guard
-    /// only validated as a set (a reciprocal swap) cannot survive individually and end up
-    /// withheld, same as the batch outcome.
-    async fn isolate_edge_rewrites(
-        &self,
-        project: &Project,
-        lock_path: &Utf8Path,
-        resolver_text: &str,
-        guarded: &mut edges::GuardedRewrites,
-    ) -> Result<CommittedRewrites> {
-        if guarded.accepted.len() <= 1 {
-            reject_all(
-                guarded,
-                "the corrected lock failed cargo's --locked verification; \
-                 kept the resolver's lock",
-            );
-            return Ok(CommittedRewrites::unchanged(resolver_text));
-        }
-        let mut corrected = Vec::new();
-        let mut current_text = resolver_text.to_string();
-        for rewrite in std::mem::take(&mut guarded.accepted) {
-            let Some(candidate_text) =
-                edges::rewrite_lock_text(&current_text, std::slice::from_ref(&rewrite))
-            else {
-                guarded.rejected.push(edges::RejectedRewrite {
-                    rewrite,
-                    reason: "the lock text did not match the parsed entry; correction skipped"
-                        .to_string(),
-                });
-                continue;
-            };
-            std::fs::write(lock_path, &candidate_text)?;
-            match self.cargo.verify_locked(&project.root).await {
-                Ok(true) => {
-                    corrected.push(rewrite);
-                    current_text = candidate_text;
-                }
-                Ok(false) => {
-                    std::fs::write(lock_path, &current_text)?;
-                    guarded.rejected.push(edges::RejectedRewrite {
-                        rewrite,
-                        reason: "the corrected lock failed cargo's --locked verification; \
-                                 kept the resolver's binding"
-                            .to_string(),
-                    });
-                }
-                Err(err) => {
-                    std::fs::write(lock_path, &current_text)?;
-                    return Err(err);
-                }
-            }
-        }
-        Ok(CommittedRewrites {
-            corrected,
-            lock_text: current_text,
-        })
-    }
-}
-
-/// What an edge-rewrite pass left behind: the rewrites that survived verification and the lock
-/// text now on disk (the resolver's own text when nothing survived).
-struct CommittedRewrites {
-    corrected: Vec<edges::EdgeRewrite>,
-    lock_text: String,
-}
-
-impl CommittedRewrites {
-    /// The no-correction outcome: the lock on disk is `resolver_text`, untouched.
-    fn unchanged(resolver_text: &str) -> Self {
-        CommittedRewrites {
-            corrected: Vec::new(),
-            lock_text: resolver_text.to_string(),
-        }
-    }
-}
-
-/// The residual observation rows: every binding that differs between the pre-apply and final lock
-/// views and that no corrective or withheld row in `covered_rows` already describes, reported as a
-/// plain [`Rebound`](EdgeBindingAction::Rebound).
-fn residual_rebound_rows(
-    before_view: &edges::LockEdgeView,
-    final_view: &edges::LockEdgeView,
-    covered_rows: &[EdgeRebind],
-) -> Vec<EdgeRebind> {
-    let covered: BTreeSet<(String, String, String)> = covered_rows
-        .iter()
-        .map(|rebind| {
-            (
-                rebind.dependent.clone(),
-                rebind.dependent_version.to_string(),
-                rebind.dependency.name.clone(),
-            )
-        })
-        .collect();
-    let mut rows = Vec::new();
-    for change in edges::binding_changes(before_view, final_view) {
-        if covered.contains(&(
-            change.dependent.name.clone(),
-            change.dependent.version.clone(),
-            change.dependency.clone(),
-        )) {
-            continue;
-        }
-        // Attribute the crates.io registry only when both endpoint versions are crates.io
-        // packages; an alternate-source or cross-source rebind keeps the registry
-        // unattributed rather than mislabeled.
-        let crates_io_endpoints = final_view
-            .has_crates_io_version(&change.dependency, &change.before)
-            && final_view.has_crates_io_version(&change.dependency, &change.after);
-        let registry =
-            (change.detail.is_none() && crates_io_endpoints).then(|| CRATES_IO.to_string());
-        rows.push(EdgeRebind {
-            dependent: change.dependent.name.clone(),
-            dependent_version: Version::new(change.dependent.version.clone()),
-            dependency: PackageId::new(CARGO_ID, change.dependency.clone(), registry),
-            from: Version::new(change.before),
-            to: Version::new(change.after),
-            action: EdgeBindingAction::Rebound,
-            detail: change.detail,
-        });
-    }
-    rows
-}
-
-/// Moves every still-accepted rewrite into the rejected set with one shared `reason` — the
-/// all-or-nothing failure paths (a failed verification, a surgery mismatch) withhold the whole
-/// batch.
-fn reject_all(guarded: &mut edges::GuardedRewrites, reason: &str) {
-    for rewrite in guarded.accepted.drain(..) {
-        guarded.rejected.push(edges::RejectedRewrite {
-            rewrite,
-            reason: reason.to_string(),
-        });
-    }
-}
-
-/// Maps one corrective (or withheld) rewrite to its report row. For a correction, `from` is the
-/// resolver-produced binding the policy superseded and `to` the binding the committed lock ends
-/// with; for a withheld one ([`Held`](EdgeBindingAction::Held)) the lock keeps `from` and `to` is
-/// the target that was not applied, with `detail` carrying why.
-fn edge_rebind(
-    rewrite: &edges::EdgeRewrite,
-    action: EdgeBindingAction,
-    detail: Option<String>,
-) -> EdgeRebind {
-    EdgeRebind {
-        dependent: rewrite.dependent.name.clone(),
-        dependent_version: Version::new(rewrite.dependent.version.clone()),
-        dependency: PackageId::new(
-            CARGO_ID,
-            rewrite.dependency.clone(),
-            Some(CRATES_IO.to_string()),
-        ),
-        from: Version::new(rewrite.from.clone()),
-        to: Version::new(rewrite.to.clone()),
-        action,
-        detail,
     }
 }
 
@@ -1181,8 +764,9 @@ impl ToolWrite for CargoTool {
         let graph = self.cargo.metadata(&project.root).await?;
         // No journal snapshot exists outside an apply: enforcement runs against the current lock
         // alone (no churn to restore or diff), and rolls its own surgery back on a failed verify.
-        self.enforce_edge_policy(project, policy, None, Some(&graph))
+        edges::enforce::enforce(&self.cargo, project, policy, None, Some(graph))
             .await
+            .map(|result| result.rebinds)
     }
 }
 
@@ -1192,7 +776,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
         use std::fmt::Write as _;
@@ -1288,7 +872,7 @@ mod tests {
             source = "git+https://example.com/x#abc"
         "#})
         .expect("lock parses");
-        let slots = locked_versions(&lock);
+        let slots = lock.locked_versions();
         // The path/workspace member `demo` and the git source are excluded; the two serde majors are
         // distinct slots, and semantic ordering chooses 1.0.197 over lexically-greater 1.0.99.
         assert_eq!(
@@ -1307,7 +891,7 @@ mod tests {
 
     #[test]
     fn reached_requires_the_exact_target_in_its_major_slot() {
-        let after = locked_versions(&lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]));
+        let after = lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]).locked_versions();
         // A concrete Cargo `--precise` target must land exactly; an overshoot remains off-policy.
         assert!(reached(
             &after,
@@ -1339,7 +923,7 @@ mod tests {
         .expect("mixed-registry lock parses");
         assert!(
             !reached(
-                &crates_io_locked_versions(&private_target),
+                &private_target.crates_io_locked_versions(),
                 &change("serde", "1.0.100", "1.0.200", false),
             ),
             "an alternate-registry target does not satisfy a crates.io plan"
@@ -1396,7 +980,7 @@ mod tests {
 
     #[test]
     fn target_gated_workspace_duplicate_requires_member_aware_rewrite() {
-        let after = locked_versions(&lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]));
+        let after = lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]).locked_versions();
         let graph = crate::cargocmd::Cargo::build_graph_from_json(
             r#"{
                 "packages": [
@@ -1472,13 +1056,62 @@ mod tests {
         assert!(manifest.contains(r#"features = ["signal"]"#), "{manifest}");
     }
 
+    /// A corrective edge rewrite can be the operation that makes a direct member reach its planned
+    /// target. Success classification must therefore consume the graph returned by verification,
+    /// not the metadata snapshot taken before enforcement.
+    #[test]
+    fn member_reach_classification_changes_with_the_verified_edge_graph() {
+        let graph = |app_target: &str| {
+            let json = formatdoc!(
+                r#"{{
+                    "packages": [
+                        {{"id": "app", "name": "app", "version": "0.1.0",
+                         "manifest_path": "/repo/Cargo.toml",
+                         "dependencies": [{{"name": "dep", "req": ">=1.0, <2"}}]}},
+                        {{"id": "keeper", "name": "keeper", "version": "1.0.0",
+                         "dependencies": [{{"name": "dep", "req": "=1.0.0"}}]}},
+                        {{"id": "consumer", "name": "consumer", "version": "1.0.0",
+                         "dependencies": [{{"name": "dep", "req": "=1.1.0"}}]}},
+                        {{"id": "dep-old", "name": "dep", "version": "1.0.0",
+                         "source": "registry+https://github.com/rust-lang/crates.io-index",
+                         "dependencies": []}},
+                        {{"id": "dep-target", "name": "dep", "version": "1.1.0",
+                         "source": "registry+https://github.com/rust-lang/crates.io-index",
+                         "dependencies": []}}
+                    ],
+                    "workspace_members": ["app"],
+                    "workspace_root": "/repo",
+                    "resolve": {{"nodes": [
+                        {{"id": "app", "deps": [{{"pkg": "{app_target}"}}, {{"pkg": "keeper"}}, {{"pkg": "consumer"}}]}},
+                        {{"id": "keeper", "deps": [{{"pkg": "dep-old"}}]}},
+                        {{"id": "consumer", "deps": [{{"pkg": "dep-target"}}]}},
+                        {{"id": "dep-old", "deps": []}},
+                        {{"id": "dep-target", "deps": []}}
+                    ]}}
+                }}"#,
+            );
+            crate::cargocmd::Cargo::build_graph_from_json(&json)
+        };
+        let stale = graph("dep-old");
+        let verified = graph("dep-target");
+        let after = lock_with(&[("dep", "1.0.0"), ("dep", "1.1.0")]).locked_versions();
+        let mut change = change("dep", "1.0.0", "1.1.0", false);
+        change.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+
+        assert!(!reached_after(&after, Some(&stale), &change));
+        assert!(reached_after(&after, Some(&verified), &change));
+    }
+
     #[test]
     fn collateral_change_surfaces_a_forced_non_candidate_downgrade() {
         // Raising `a` forces the shared transitive `shared` from 1.1.0 down to 1.0.0 as a consistency
         // move. No applied row reports `shared`, so the diff must surface it as its own collateral
         // row — the silent drift the earlier per-precise-pin design allowed.
-        let before = locked_versions(&lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]));
-        let after = locked_versions(&lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]));
+        let before = lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]).locked_versions();
+        let after = lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]).locked_versions();
         let applied = [change("a", "1.0.0", "2.0.0", false)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1496,16 +1129,8 @@ mod tests {
     fn collateral_change_excludes_applied_and_unchanged_packages() {
         // `a`'s move is already told by its applied row (no duplicate), `b` is unchanged (no row),
         // `c` is an unplanned forward move (a real collateral change). Only `c` is surfaced.
-        let before = locked_versions(&lock_with(&[
-            ("a", "2.0.0"),
-            ("b", "2.0.0"),
-            ("c", "1.0.0"),
-        ]));
-        let after = locked_versions(&lock_with(&[
-            ("a", "1.0.0"),
-            ("b", "2.0.0"),
-            ("c", "1.5.0"),
-        ]));
+        let before = lock_with(&[("a", "2.0.0"), ("b", "2.0.0"), ("c", "1.0.0")]).locked_versions();
+        let after = lock_with(&[("a", "1.0.0"), ("b", "2.0.0"), ("c", "1.5.0")]).locked_versions();
         let applied = [change("a", "2.0.0", "1.0.0", true)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1518,8 +1143,8 @@ mod tests {
         // A held planned candidate has no applied row, yet a sibling pin still floated it off its
         // baseline. That net move must surface as a collateral row beside the held skip instead of
         // being silently dropped behind the planned name.
-        let before = locked_versions(&lock_with(&[("referencing", "0.46.5")]));
-        let after = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let before = lock_with(&[("referencing", "0.46.5")]).locked_versions();
+        let after = lock_with(&[("referencing", "0.46.10")]).locked_versions();
         let collateral = collateral_changes(&before, &after, &[]);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "referencing");
@@ -1528,7 +1153,7 @@ mod tests {
 
         // Once the candidate reaches its target, its applied row already tells the move: no
         // duplicate collateral row.
-        let landed = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let landed = lock_with(&[("referencing", "0.46.10")]).locked_versions();
         let applied = [change("referencing", "0.46.5", "0.46.10", false)];
         assert!(collateral_changes(&before, &landed, &applied).is_empty());
     }

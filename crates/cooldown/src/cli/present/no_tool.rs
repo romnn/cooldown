@@ -93,6 +93,7 @@ fn no_tool_mutation(
                 errors: 0,
                 edges_corrected: 0,
                 edges_held: 0,
+                edges_unaddressable: 0,
             },
             Vec::<render::UpgradeItem>::new(),
         ),

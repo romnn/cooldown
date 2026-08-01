@@ -245,8 +245,12 @@ pub struct EdgeRow {
     pub dependency: String,
     /// The dependent package whose edge it is.
     pub dependent: String,
-    /// The policy outcome: `restored`, `canonicalized`, `rebound`, or `held`.
+    /// The dependent package's source-bearing lock identity, when present.
+    pub dependent_source: Option<String>,
+    /// The policy outcome: `restored`, `canonicalized`, `rebound`, `held`, or `unaddressable`.
     pub action: String,
+    /// Whether this binding outcome is present in the committed lock.
+    pub applied: bool,
     /// The binding version before the move (for `held`, the binding that stays in place).
     pub from: String,
     /// The binding version after the move (for `held`, the withheld correction target).
@@ -313,6 +317,10 @@ impl Envelope {
 
     pub fn summary_edges_held(&self) -> u64 {
         self.summary_u64("edgesHeld")
+    }
+
+    pub fn summary_edges_unaddressable(&self) -> u64 {
+        self.summary_u64("edgesUnaddressable")
     }
 
     /// `meta.applied` (flattened at the top level): whether any mutation was written — a version
@@ -487,7 +495,12 @@ impl Envelope {
                 Some(EdgeRow {
                     dependency: item.get("name")?.as_str()?.to_owned(),
                     dependent: edge.get("dependent")?.as_str()?.to_owned(),
+                    dependent_source: edge
+                        .get("dependentSource")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     action: edge.get("action")?.as_str()?.to_owned(),
+                    applied: item.get("applied")?.as_bool()?,
                     from: item.get("from")?.as_str()?.to_owned(),
                     to: item.get("to")?.as_str()?.to_owned(),
                 })

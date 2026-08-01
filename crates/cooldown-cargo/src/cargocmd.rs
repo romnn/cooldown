@@ -6,8 +6,9 @@ use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
-/// The `source` string a `Cargo.lock` entry and `cargo metadata` carry for crates.io packages.
-pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub(crate) use crate::lockfile::CRATES_IO_SOURCE;
+pub use crate::lockfile::LockPackageId;
+pub(crate) use crate::lockfile::PackageKey;
 
 /// The crates.io index in Cargo package-ID-spec form (`<url>#<name>@<version>`) — the same
 /// source as [`CRATES_IO_SOURCE`] without the `registry+` kind prefix.
@@ -54,38 +55,15 @@ pub struct ResolvedGraph {
     /// requirements a lock edge of that package must satisfy. Dev-dependencies of
     /// non-workspace packages are excluded (they are never resolved into the lock, so they
     /// constrain no edge); workspace members' dev deps are resolved and included. Keyed by
-    /// [`PackageKey`] because name and version are all a `Cargo.lock` entry carries; a
-    /// same-name-same-version collision across sources merges its requirements, which only ever
-    /// *over*-constrains an edge check (the safe direction).
-    pub declared_requirements: HashMap<PackageKey, Vec<DeclaredRequirement>>,
+    /// [`LockPackageId`] so source-distinct packages never share requirements.
+    pub declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>>,
     /// Each resolved package's declared `rust-version` (MSRV); absent when the package declares
     /// none (or it is unparsable, which cargo's MSRV-aware resolver likewise treats as
     /// compatible).
-    pub rust_versions: HashMap<PackageKey, RustVersion>,
+    pub rust_versions: HashMap<LockPackageId, RustVersion>,
     /// The lowest `rust-version` any workspace member declares — the workspace MSRV cargo's
     /// MSRV-aware resolver honors when picking versions — or `None` when no member declares one.
     pub workspace_rust_version: Option<RustVersion>,
-}
-
-/// A resolved package's `(name, version)` identity, as both `cargo metadata` and `Cargo.lock`
-/// spell it. Not guaranteed unique — the same name and version can resolve from two sources at
-/// once; maps keyed by it merge such collisions, so each consumer must be safe under that merge.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PackageKey {
-    /// The crate's package name.
-    pub name: String,
-    /// The resolved version.
-    pub version: String,
-}
-
-impl PackageKey {
-    /// Builds the identity from anything string-like, cloning borrowed inputs.
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        PackageKey {
-            name: name.into(),
-            version: version.into(),
-        }
-    }
 }
 
 /// A declared `rust-version` (MSRV) as a release triple. The derived ordering compares
@@ -132,7 +110,7 @@ fn parse_rust_version(value: &str) -> Option<RustVersion> {
 /// declared `rust-version` keyed by package identity, and the workspace minimum across members.
 #[derive(Default)]
 struct MsrvIndex {
-    rust_versions: HashMap<PackageKey, RustVersion>,
+    rust_versions: HashMap<LockPackageId, RustVersion>,
     workspace_rust_version: Option<RustVersion>,
 }
 
@@ -141,8 +119,10 @@ impl MsrvIndex {
         let Some(msrv) = package.rust_version.as_deref().and_then(parse_rust_version) else {
             return;
         };
-        self.rust_versions
-            .insert(PackageKey::new(&*package.name, &*package.version), msrv);
+        self.rust_versions.insert(
+            LockPackageId::new(&package.name, &package.version, package.source.as_deref()),
+            msrv,
+        );
         // The workspace MSRV is the lowest member declaration — the strictest bound the MSRV-aware
         // resolver honors for any member's dependency choice.
         if is_member {
@@ -779,9 +759,7 @@ impl Cargo {
         let stdout = self
             .run(dir, &["metadata", "--format-version", "1"])
             .await?;
-        let raw: RawMeta = serde_json::from_str(&stdout)
-            .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
-        Ok(Self::build_graph(raw))
+        Self::parse_graph(&stdout)
     }
 
     /// Builds a [`ResolvedGraph`] from raw `cargo metadata` JSON, for tests that exercise the graph
@@ -810,7 +788,7 @@ impl Cargo {
         // may rewrite, not structural third-party graph floors.
         let mut floor_edges: Vec<FloorEdge> = Vec::new();
         let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
-        let mut declared_requirements: HashMap<PackageKey, Vec<DeclaredRequirement>> =
+        let mut declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>> =
             HashMap::new();
         let mut msrv = MsrvIndex::default();
         for p in raw.packages {
@@ -862,7 +840,7 @@ impl Cargo {
                 // never resolved into the lock and so constrains no edge.
                 if !is_dev || roots.contains(&p.id) {
                     declared_requirements
-                        .entry(PackageKey::new(&*p.name, &*p.version))
+                        .entry(LockPackageId::new(&p.name, &p.version, p.source.as_deref()))
                         .or_default()
                         .push(DeclaredRequirement {
                             dependency: dep.name.clone(),
@@ -913,15 +891,21 @@ impl Cargo {
         }
     }
 
-    /// Returns whether `Cargo.lock` is current relative to `Cargo.toml`.
+    fn parse_graph(stdout: &str) -> Result<ResolvedGraph, CoreError> {
+        let raw: RawMeta = serde_json::from_str(stdout)
+            .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
+        Ok(Self::build_graph(raw))
+    }
+
+    /// Verifies `Cargo.lock` and returns the authoritative resolved graph when it is current.
     ///
-    /// Runs `cargo metadata --locked --offline`; a stale lock exits 101 and yields `Ok(false)`.
+    /// Runs `cargo metadata --locked --offline`; a stale lock exits 101 and yields `Ok(None)`.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if it
     /// fails for a reason other than a stale lock (e.g. a missing offline index).
-    pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
+    pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<Option<ResolvedGraph>, CoreError> {
         let out = self
             .output(
                 dir,
@@ -929,13 +913,14 @@ impl Cargo {
             )
             .await?;
         if out.status.success() {
-            return Ok(true);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Self::parse_graph(&stdout).map(Some);
         }
         // `--locked` on a stale lock exits 101 with a clear message. A different failure (e.g.
         // missing offline index) is reported as a tool error.
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("--locked") || stderr.contains("lock file") {
-            Ok(false)
+            Ok(None)
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
@@ -997,6 +982,7 @@ impl Cargo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn member_path_relativizes_workspace_members() {
@@ -1032,7 +1018,7 @@ mod tests {
     #[test]
     fn build_graph_collects_msrv_data_for_the_edge_policy() {
         // The workspace MSRV is the lowest member declaration; per-package `rust-version`s are
-        // keyed by (name, version) for the canonicalize candidate filter.
+        // keyed by full lock identity for the canonicalize candidate filter.
         let json = r#"{
             "packages": [
                 {"id": "root-a", "name": "app-a", "version": "0.1.0", "rust_version": "1.75",
@@ -1053,15 +1039,45 @@ mod tests {
             Some(RustVersion::new(1, 70, 1))
         );
         assert_eq!(
-            graph.rust_versions.get(&PackageKey::new("uuid", "1.24.0")),
+            graph
+                .rust_versions
+                .get(&LockPackageId::new("uuid", "1.24.0", None::<String>)),
             Some(&RustVersion::new(1, 63, 0))
         );
         assert!(
             !graph
                 .rust_versions
-                .contains_key(&PackageKey::new("uuid", "0.8.2")),
+                .contains_key(&LockPackageId::new("uuid", "0.8.2", None::<String>)),
             "a package without a declared rust-version contributes nothing"
         );
+    }
+
+    #[test]
+    fn build_graph_keeps_source_distinct_requirements_separate() {
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "registry-twin", "name": "twin", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "rust_version": "1.70",
+                     "dependencies": [{"name": "dep", "req": "^1"}]},
+                    {"id": "git-twin", "name": "twin", "version": "1.0.0",
+                     "source": "git+https://example.com/twin#abcdef",
+                     "rust_version": "1.80",
+                     "dependencies": [{"name": "dep", "req": "^2"}]}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": []}
+            }
+        "#});
+        let registry = LockPackageId::new("twin", "1.0.0", Some(CRATES_IO_SOURCE));
+        let git = LockPackageId::new("twin", "1.0.0", Some("git+https://example.com/twin#abcdef"));
+
+        assert_eq!(graph.declared_requirements[&registry][0].requirement, "^1");
+        assert_eq!(graph.declared_requirements[&git][0].requirement, "^2");
+        assert_eq!(graph.rust_versions[&registry], RustVersion::new(1, 70, 0));
+        assert_eq!(graph.rust_versions[&git], RustVersion::new(1, 80, 0));
     }
 
     #[test]

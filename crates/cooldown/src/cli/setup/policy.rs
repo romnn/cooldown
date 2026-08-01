@@ -56,12 +56,12 @@ pub(super) fn repo_layers(
     shared: &SharedLayers,
     repo_root: &Utf8Path,
 ) -> Result<Vec<PolicyLayer>, CoreError> {
-    let cascade = configs.repo_cascade_layers(repo_root, repo_root)?;
+    let project_config = configs.project_config(repo_root, repo_root)?;
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &shared.global {
         layers.push(layer.clone());
     }
-    layers.extend(cascade);
+    layers.extend(project_config.policy_layers);
     for layer in [&shared.explicit, &shared.env, &shared.cli]
         .into_iter()
         .flatten()
@@ -95,9 +95,14 @@ async fn assemble_ctx(
             None => None,
         }
     };
-    let cascade = assembly
+    let project_config = assembly
         .configs
-        .repo_cascade_layers(assembly.repo_root, &project.root)?;
+        .project_config(assembly.repo_root, &project.root)?;
+    let edge_policy = assembly
+        .invocation
+        .edge_policy_override()
+        .or(project_config.cargo_edge_policy)
+        .unwrap_or_default();
 
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &assembly.shared.global {
@@ -106,7 +111,7 @@ async fn assemble_ctx(
     if let Some(layer) = native {
         layers.push(layer);
     }
-    layers.extend(cascade);
+    layers.extend(project_config.policy_layers);
     for layer in [
         &assembly.shared.explicit,
         &assembly.shared.env,
@@ -174,6 +179,7 @@ async fn assemble_ctx(
             layers,
             strict_native,
         },
+        edge_policy,
     })
 }
 

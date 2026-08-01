@@ -325,6 +325,7 @@ fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLa
             layers,
             strict_native: false,
         },
+        edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake));
@@ -423,6 +424,7 @@ fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
             layers: vec![builtin_default_layer()],
             strict_native: false,
         },
+        edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake));
@@ -1442,13 +1444,20 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
     assert!(b.downgrade);
 }
 
-#[tokio::test]
-async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts() {
-    // An adapter's apply can report lock-edge *binding* moves beside the version changes (the cargo
-    // edge policy). Each rebind must surface as its own report row — carrying the dependent and the
-    // policy outcome — while the applied/skipped/error counts stay those of the version changes:
-    // edge activity is counted apart, in `edges_corrected`/`edges_held`.
-    let TmpRoot { guard: _g, root } = tmp_root();
+fn diesel_rebind(dependent_source: Option<String>, action: EdgeBindingAction) -> EdgeRebind {
+    EdgeRebind {
+        dependent: "diesel".to_string(),
+        dependent_version: Version::new("2.3.11"),
+        dependent_source,
+        dependency: PackageId::new(GO, "uuid", Some("proxy.example".into())),
+        from: Version::new("v0.8.2"),
+        to: Version::new("v1.24.0"),
+        action,
+        detail: None,
+    }
+}
+
+fn edge_reporting_fake(root: Utf8PathBuf, edge_rebinds_on_apply: Vec<EdgeRebind>) -> FakeEco {
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1467,16 +1476,7 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
         "a".to_string(),
         rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
     );
-    let rebind = |action| EdgeRebind {
-        dependent: "diesel".to_string(),
-        dependent_version: Version::new("2.3.11"),
-        dependency: PackageId::new(GO, "uuid", Some("proxy.example".into())),
-        from: Version::new("v0.8.2"),
-        to: Version::new("v1.24.0"),
-        action,
-        detail: None,
-    };
-    let fake = FakeEco {
+    FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
         transitive: vec![],
         fresh_transitive: None,
@@ -1484,18 +1484,7 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
-        edge_rebinds_on_apply: vec![
-            rebind(EdgeBindingAction::Restored),
-            EdgeRebind {
-                dependent: "arboard".to_string(),
-                dependent_version: Version::new("3.6.1"),
-                dependency: PackageId::new(GO, "windows-sys", Some("proxy.example".into())),
-                from: Version::new("v0.60.2"),
-                to: Version::new("v0.52.0"),
-                action: EdgeBindingAction::Rebound,
-                detail: None,
-            },
-        ],
+        edge_rebinds_on_apply,
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1503,37 +1492,95 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
         build_fails_after_apply: false,
         state: Mutex::new(State::default()),
         root,
-    };
-    let ws = workspace(fake, Baseline::default());
-    let out = ws.upgrade(&opts()).await;
+    }
+}
+
+fn assert_source_distinct_restorations(items: &[cooldown::app::UpgradeItem]) {
+    let restored: Vec<_> = items.iter().filter(|item| item.name == "uuid").collect();
+    assert_eq!(
+        restored.len(),
+        2,
+        "source-distinct twins must not deduplicate"
+    );
+    let dependent_sources: std::collections::BTreeSet<_> = restored
+        .iter()
+        .map(|item| {
+            item.edge
+                .as_ref()
+                .and_then(|edge| edge.dependent_source.as_deref())
+        })
+        .collect();
+    assert_eq!(
+        dependent_sources,
+        std::collections::BTreeSet::from([
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+            Some("git+https://example.com/diesel#abcdef"),
+        ])
+    );
+    for restored in restored {
+        assert!(
+            restored.edge.is_some(),
+            "restored row must carry an edge block"
+        );
+        let Some(edge) = restored.edge.as_ref() else {
+            continue;
+        };
+        assert_eq!(edge.dependent, "diesel");
+        assert_eq!(edge.dependent_version, "2.3.11");
+        assert_eq!(edge.action, EdgeBindingAction::Restored);
+        assert_eq!(restored.from, "v0.8.2");
+        assert_eq!(restored.to, "v1.24.0");
+        assert!(restored.applied, "a committed edge correction was applied");
+        assert!(restored.skipped.is_none() && restored.error.is_none());
+    }
+}
+
+fn incomplete_edge_fake(root: Utf8PathBuf, action: EdgeBindingAction) -> FakeEco {
+    let mut rebind = diesel_rebind(None, action);
+    rebind.detail =
+        Some("rebinding away from uuid v0.8.2 would orphan its last lock reference".to_string());
+    edge_reporting_fake(root, vec![rebind])
+}
+
+#[tokio::test]
+async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts() {
+    // An adapter's apply can report lock-edge *binding* moves beside the version changes (the cargo
+    // edge policy). Each rebind must surface as its own report row — carrying the dependent and the
+    // policy outcome — while the version counts remain separate.
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let fake = edge_reporting_fake(
+        root,
+        vec![
+            diesel_rebind(
+                Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                EdgeBindingAction::Restored,
+            ),
+            diesel_rebind(
+                Some("git+https://example.com/diesel#abcdef".to_string()),
+                EdgeBindingAction::Restored,
+            ),
+            EdgeRebind {
+                dependent: "arboard".to_string(),
+                dependent_version: Version::new("3.6.1"),
+                dependent_source: None,
+                dependency: PackageId::new(GO, "windows-sys", Some("proxy.example".into())),
+                from: Version::new("v0.60.2"),
+                to: Version::new("v0.52.0"),
+                action: EdgeBindingAction::Rebound,
+                detail: None,
+            },
+        ],
+    );
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
 
     assert_eq!(out.exit, Exit::Ok);
-    // The version-change counts are untouched by the edge rows; edge activity is counted apart.
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.summary.skipped, 0);
     assert_eq!(out.summary.errors, 0);
-    assert_eq!(
-        out.summary.edges_corrected, 1,
-        "the restored edge counts as a correction"
-    );
-    assert_eq!(
-        out.summary.edges_held, 0,
-        "a plain rebound observation is not a held correction"
-    );
-
-    let restored = out
-        .items
-        .iter()
-        .find(|item| item.name == "uuid")
-        .expect("the restored edge must surface as its own row");
-    let edge = restored.edge.as_ref().expect("edge block");
-    assert_eq!(edge.dependent, "diesel");
-    assert_eq!(edge.dependent_version, "2.3.11");
-    assert_eq!(edge.action, EdgeBindingAction::Restored);
-    assert_eq!(restored.from, "v0.8.2");
-    assert_eq!(restored.to, "v1.24.0");
-    assert!(!restored.applied, "an edge row is not an applied change");
-    assert!(restored.skipped.is_none() && restored.error.is_none());
+    assert_eq!(out.summary.edges_corrected, 2);
+    assert_eq!(out.summary.edges_held, 0);
+    assert_eq!(out.summary.edges_unaddressable, 0);
+    assert_source_distinct_restorations(&out.items);
 
     let rebound = out
         .items
@@ -1544,6 +1591,10 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
         rebound.edge.as_ref().expect("edge block").action,
         EdgeBindingAction::Rebound
     );
+    assert!(
+        rebound.applied,
+        "the resolver-produced binding was committed"
+    );
 
     // Edge rows sort after the applied rows: footnotes to the version changes above them.
     let a_position = out.items.iter().position(|item| item.name == "a");
@@ -1552,65 +1603,14 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
 }
 
 #[tokio::test]
-async fn upgrade_fails_strict_when_an_edge_correction_is_held() {
-    // A held edge is a requested correction the adapter could not complete (orphan guard, failed
-    // verification, ambiguous identity). Under `--strict` that is an incomplete mutation and must
-    // fail the run; without `--strict` it stays a reported row with the reason.
-    let releases_and_locked = || {
-        let mut releases = HashMap::new();
-        releases.insert(
-            "a".to_string(),
-            vec![
-                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
-                rel(
-                    "v1.1.0",
-                    1,
-                    Some("2026-06-01T00:00:00Z"),
-                    Some(UpdateKind::Minor),
-                ),
-            ],
-        );
-        let mut locked = HashMap::new();
-        locked.insert(
-            "a".to_string(),
-            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
-        );
-        (releases, locked)
-    };
-    let held_fake = |root| {
-        let (releases, locked) = releases_and_locked();
-        FakeEco {
-            direct: vec![dep("a", "v1.0.0", true)],
-            transitive: vec![],
-            fresh_transitive: None,
-            releases,
-            locked,
-            inject_fresh_on_apply: false,
-            collateral_on_apply: Vec::new(),
-            edge_rebinds_on_apply: vec![EdgeRebind {
-                dependent: "diesel".to_string(),
-                dependent_version: Version::new("2.3.11"),
-                dependency: PackageId::new(GO, "uuid", Some("proxy.example".into())),
-                from: Version::new("v0.8.2"),
-                to: Version::new("v1.24.0"),
-                action: EdgeBindingAction::Held,
-                detail: Some(
-                    "rebinding away from uuid v0.8.2 would orphan its last lock reference"
-                        .to_string(),
-                ),
-            }],
-            stale_lock: false,
-            fail_graph_after_apply: false,
-            fail_locked_release_after_apply_for: None,
-            stale_lock_after_apply: false,
-            build_fails_after_apply: false,
-            state: Mutex::new(State::default()),
-            root,
-        }
-    };
-
+async fn upgrade_fails_strict_when_an_edge_policy_is_incomplete() {
+    // A withheld target or an unaddressable corrective-policy move makes the mutation incomplete
+    // under `--strict`; without `--strict` either remains a truthful row with its reason.
     let TmpRoot { guard: _g, root } = tmp_root();
-    let ws = workspace(held_fake(root), Baseline::default());
+    let ws = workspace(
+        incomplete_edge_fake(root, EdgeBindingAction::Held),
+        Baseline::default(),
+    );
     let out = ws.upgrade(&opts()).await;
     assert_eq!(
         out.exit,
@@ -1619,12 +1619,22 @@ async fn upgrade_fails_strict_when_an_edge_correction_is_held() {
     );
     assert_eq!(out.summary.edges_held, 1);
     assert_eq!(out.summary.edges_corrected, 0);
+    assert_eq!(out.summary.edges_unaddressable, 0);
+    let held = out
+        .items
+        .iter()
+        .find(|item| item.edge.is_some())
+        .expect("held row");
+    assert!(!held.applied, "a withheld target was not committed");
 
     let TmpRoot {
         guard: _g2,
         root: strict_root,
     } = tmp_root();
-    let strict_ws = workspace(held_fake(strict_root), Baseline::default());
+    let strict_ws = workspace(
+        incomplete_edge_fake(strict_root, EdgeBindingAction::Held),
+        Baseline::default(),
+    );
     let strict_out = strict_ws
         .upgrade(&RunOpts {
             strict: true,
@@ -1635,6 +1645,33 @@ async fn upgrade_fails_strict_when_an_edge_correction_is_held() {
         strict_out.exit,
         Exit::Policy,
         "a withheld correction is an incomplete mutation under --strict"
+    );
+
+    let TmpRoot {
+        guard: _g3,
+        root: unaddressable_root,
+    } = tmp_root();
+    let unaddressable_ws = workspace(
+        incomplete_edge_fake(unaddressable_root, EdgeBindingAction::Unaddressable),
+        Baseline::default(),
+    );
+    let unaddressable_out = unaddressable_ws
+        .upgrade(&RunOpts {
+            strict: true,
+            ..opts()
+        })
+        .await;
+    assert_eq!(unaddressable_out.exit, Exit::Policy);
+    assert_eq!(unaddressable_out.summary.edges_held, 0);
+    assert_eq!(unaddressable_out.summary.edges_unaddressable, 1);
+    let unaddressable = unaddressable_out
+        .items
+        .iter()
+        .find(|item| item.edge.is_some())
+        .expect("unaddressable row");
+    assert!(
+        unaddressable.applied,
+        "the resolver's observed edge move was committed even though policy could not address it"
     );
 }
 
@@ -2941,6 +2978,7 @@ async fn explain_applies_registry_scoped_rule() {
             layers: vec![builtin_default_layer(), repo],
             strict_native: false,
         },
+        edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake));
@@ -3104,6 +3142,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
                 layers: vec![builtin_default_layer()],
                 strict_native: false,
             },
+            edge_policy: EdgePolicy::default(),
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -3264,6 +3303,7 @@ async fn sync_project_scope_writes_native_per_project() {
                 layers: vec![builtin_default_layer()],
                 strict_native: false,
             },
+            edge_policy: EdgePolicy::default(),
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -3443,6 +3483,7 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
             layers: vec![builtin_default_layer()],
             strict_native: false,
         },
+        edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake));

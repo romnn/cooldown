@@ -6,9 +6,9 @@ use crate::app::{
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal, Release,
-    ResolveContext, RewriteMode, SkipReason, Skipped, Status, UpdateKind, Version, check_pin,
-    evaluate, evaluate_ceiling_hold, evaluate_fix,
+    DiagnosticKind, EdgeBindingAction, LockStatus, MajorKey, PackageId, Plan,
+    ProjectMutationJournal, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
+    UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -268,7 +268,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         match self
             .ctx
             .writer
-            .normalize_lock_edges(&self.ctx.pctx.project, self.ctx.opts.edge_policy)
+            .normalize_lock_edges(&self.ctx.pctx.project, self.ctx.pctx.edge_policy)
             .await
         {
             Ok(rebinds) => {
@@ -1212,7 +1212,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let plan = Plan {
             changes: changes.clone(),
             rewrite: self.ctx.opts.rewrite,
-            edge_policy: self.ctx.opts.edge_policy,
+            edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
         };
         let primary = changes
@@ -1763,8 +1763,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// The report row for one lock-edge rebind: the package column names the dependency whose
     /// binding moved, From/To carry the binding versions, and the `edge` block names the dependent
-    /// and the policy outcome. Not an applied/skipped version change — the row leaves every
-    /// summary count untouched.
+    /// and the policy outcome. Version summary counts exclude edge rows explicitly.
     fn edge_rebind_item(&self, rebind: &cooldown_core::EdgeRebind) -> UpgradeItem {
         UpgradeItem {
             name: rebind.dependency.name.clone(),
@@ -1782,12 +1781,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .reader
                 .classify_update_kind(rebind.from.as_str(), rebind.to.as_str())
                 .unwrap_or(UpdateKind::Minor),
-            applied: false,
+            applied: rebind.action != EdgeBindingAction::Held,
             skipped: None,
             error: None,
             edge: Some(crate::app::UpgradeEdgeInfo {
                 dependent: rebind.dependent.clone(),
                 dependent_version: rebind.dependent_version.to_string(),
+                dependent_source: rebind.dependent_source.clone(),
                 action: rebind.action,
                 detail: rebind.detail.clone(),
             }),

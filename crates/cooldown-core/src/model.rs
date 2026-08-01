@@ -631,57 +631,52 @@ pub enum EdgePolicy {
     #[default]
     Preserve,
     /// Bind every ambiguous edge to the **highest** locked version satisfying the dependent's
-    /// declared requirement, preferring candidates the workspace MSRV can build (the adapter's
-    /// owned normalization; matches a from-scratch resolve in the common case). Unlike
-    /// [`Preserve`](EdgePolicy::Preserve) this also heals bad bindings that predate the run.
+    /// declared requirement, preferring candidates whose declared `rust-version` is
+    /// workspace-compatible (the adapter's owned normalization; matches a from-scratch resolve in
+    /// the common case). Unlike [`Preserve`](EdgePolicy::Preserve) this also heals bad bindings
+    /// that predate the run.
     Canonicalize,
     /// Leave every binding exactly as the resolver produced it. Unplanned rebinds are still
     /// *reported* (never silent), just not corrected.
     None,
 }
 
-/// What the adapter's edge policy did (or observed) about one rebound lock edge. See
-/// [`EdgeRebind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeBindingAction {
-    /// The re-resolve rebound the edge; [`EdgePolicy::Preserve`] restored the pre-apply binding.
-    Restored,
-    /// [`EdgePolicy::Canonicalize`] rebound the edge to the highest locked version satisfying the
-    /// dependent's declared requirement.
-    Canonicalized,
-    /// The re-resolve rebound the edge and the binding was left as produced — the policy is
-    /// [`EdgePolicy::None`], or no policy proposed a correction for it. Reported so the change is
-    /// never silent.
-    Rebound,
-    /// A corrective rewrite was **withheld** and the binding left as found: the correction would
-    /// orphan a locked version's last reference, the corrected lock failed the tool's own
-    /// verification and was rolled back, or the dependent's identity is not unique in the lock.
-    /// [`EdgeRebind::to`] then carries the withheld target and [`EdgeRebind::detail`] says why.
-    Held,
+macro_rules! edge_binding_actions {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// What the adapter's edge policy did or observed about one lock edge.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        pub enum EdgeBindingAction {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl EdgeBindingAction {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [EdgeBindingAction] =
+                &[ $( EdgeBindingAction::$variant, )+ ];
+
+            /// Returns the serialized wire token for this action.
+            #[must_use]
+            pub fn wire_value(self) -> &'static str {
+                match self {
+                    $( EdgeBindingAction::$variant => $wire, )+
+                }
+            }
+        }
+    };
 }
 
-impl EdgeBindingAction {
-    /// Every variant, in declaration order — the closed set the report JSON schema's `action`
-    /// enum builds from, so a new variant cannot be missed there.
-    pub const ALL: &'static [EdgeBindingAction] = &[
-        EdgeBindingAction::Restored,
-        EdgeBindingAction::Canonicalized,
-        EdgeBindingAction::Rebound,
-        EdgeBindingAction::Held,
-    ];
-
-    /// The wire token this action serializes as (`"restored"`, `"held"`, …). A unit test asserts
-    /// each token equals serde's `snake_case` output, so the two cannot drift.
-    #[must_use]
-    pub fn wire_value(self) -> &'static str {
-        match self {
-            EdgeBindingAction::Restored => "restored",
-            EdgeBindingAction::Canonicalized => "canonicalized",
-            EdgeBindingAction::Rebound => "rebound",
-            EdgeBindingAction::Held => "held",
-        }
-    }
+edge_binding_actions! {
+    /// The re-resolve rebound the edge; [`EdgePolicy::Preserve`] restored the earlier binding.
+    Restored = "restored",
+    /// [`EdgePolicy::Canonicalize`] wrote the canonical binding.
+    Canonicalized = "canonicalized",
+    /// The resolver-produced binding was allowed and committed.
+    Rebound = "rebound",
+    /// A concrete corrective target was withheld; [`EdgeRebind::to`] carries that target.
+    Held = "held",
+    /// A binding moved, but the lock does not identify the requirement precisely enough to correct
+    /// it safely; [`EdgeRebind::detail`] explains the limitation.
+    Unaddressable = "unaddressable",
 }
 
 /// A resolved lock edge the edge policy corrected, withheld a correction for, or observed rebound,
@@ -689,15 +684,18 @@ impl EdgeBindingAction {
 ///
 /// For [`Restored`](EdgeBindingAction::Restored)/[`Canonicalized`](EdgeBindingAction::Canonicalized)
 /// `to` is the binding the committed lock ends with and `from` the resolver-produced binding it
-/// superseded; for [`Rebound`](EdgeBindingAction::Rebound) `from` is the pre-apply binding and `to`
-/// the committed one; for [`Held`](EdgeBindingAction::Held) the committed binding **stays at**
-/// `from` and `to` is the correction that was withheld.
+/// superseded; for [`Rebound`](EdgeBindingAction::Rebound) and
+/// [`Unaddressable`](EdgeBindingAction::Unaddressable), `from` is the pre-apply binding and `to` the
+/// committed one; for [`Held`](EdgeBindingAction::Held) the committed binding **stays at** `from`
+/// and `to` is the correction that was withheld.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeRebind {
     /// The dependent package whose edge moved (e.g. `diesel`).
     pub dependent: String,
     /// The dependent's resolved version (a dependent can coexist at several versions).
     pub dependent_version: Version,
+    /// The dependent's package source, absent for path and workspace packages.
+    pub dependent_source: Option<String>,
     /// The dependency the edge points at (e.g. `uuid`).
     pub dependency: PackageId,
     /// The superseded binding version (or, for [`Held`](EdgeBindingAction::Held), the binding that
@@ -708,7 +706,7 @@ pub struct EdgeRebind {
     pub to: Version,
     /// What the policy did (or observed) about the rebind.
     pub action: EdgeBindingAction,
-    /// Why a correction was withheld ([`Held`](EdgeBindingAction::Held)); `None` otherwise.
+    /// Why a correction was withheld or could not be addressed; `None` otherwise.
     pub detail: Option<String>,
 }
 
@@ -1049,9 +1047,8 @@ mod tests {
         }
     }
 
-    /// `EdgeBindingAction::wire_value` is hand-written beside the serde derive (no macro couples
-    /// them like `skip_reasons!` does), so assert each token equals serde's actual output and that
-    /// `ALL` enumerates every variant distinctly.
+    /// The enum, serde token, and `wire_value` expand from one macro literal, so the remaining
+    /// property to check is that every variant has a distinct wire token.
     #[test]
     fn edge_binding_action_wire_tokens_match_serde() {
         use super::EdgeBindingAction;

@@ -155,6 +155,7 @@ impl Workspace {
                             project: copy.project.clone(),
                             rel_path: pctx.rel_path.clone(),
                             policy: pctx.policy.clone(),
+                            edge_policy: pctx.edge_policy,
                         };
                         _dry_copy = copy;
                         &dry_pctx
@@ -221,6 +222,7 @@ impl Workspace {
             project: copy.project.clone(),
             rel_path: pctx.rel_path.clone(),
             policy: pctx.policy.clone(),
+            edge_policy: pctx.edge_policy,
         };
         let mut preview_opts = opts.clone();
         preview_opts.build = false;
@@ -270,7 +272,11 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.from.cmp(&b.from))
     });
-    let applied = acc.items.iter().filter(|item| item.applied).count();
+    let applied = acc
+        .items
+        .iter()
+        .filter(|item| item.edge.is_none() && item.applied)
+        .count();
     // Every non-applied, non-errored change is a skip — including the `needs --major` rows (a
     // held-back cross-major *is* a skip). The renderer breaks out how many of them need `--major`.
     let skipped = acc
@@ -287,11 +293,11 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
         ],
     );
     let edges_held = count_edge_actions(&acc.items, &[EdgeBindingAction::Held]);
-    // A held edge is a requested correction that could not be completed — strict-relevant like
-    // any other incomplete mutation. Plain `rebound` rows are not: under a corrective policy
-    // the residual rebinds are deliberate non-targets (a planned cross-major move whose old
-    // version another consumer keeps), and under policy `none` observation is the contract.
-    acc.strict_incomplete |= edges_held > 0;
+    let edges_unaddressable = count_edge_actions(&acc.items, &[EdgeBindingAction::Unaddressable]);
+    // Held and unaddressable edges make a corrective policy incomplete. Plain `rebound` rows do
+    // not: under a corrective policy they are allowed planned follows, and under policy `none`
+    // observation is the contract.
+    acc.strict_incomplete |= edges_held > 0 || edges_unaddressable > 0;
 
     let exit = if err_count > 0 || acc.build_ok == Some(false) {
         Exit::Environment
@@ -308,6 +314,7 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
         errors: err_count,
         edges_corrected,
         edges_held,
+        edges_unaddressable,
     };
     UpgradeOutcome {
         meta,
@@ -346,6 +353,7 @@ fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
             item.to.clone(),
             edge.dependent.clone(),
             edge.dependent_version.clone(),
+            edge.dependent_source.clone(),
             edge.action.wire_value(),
             edge.detail.clone(),
         ))

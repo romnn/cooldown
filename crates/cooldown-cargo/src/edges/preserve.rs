@@ -28,9 +28,23 @@ pub(crate) fn restorations(
             if earlier == binding.bound {
                 return None;
             }
+            // Preserve never crosses package sources. The metadata requirement does not encode the
+            // source constraint, so both the resolver-produced and restored endpoints must be
+            // positively identified as crates.io packages by the lock itself.
+            if after
+                .dependency_source(binding.dependency, binding.bound)
+                .as_deref()
+                != Some(crate::cargocmd::CRATES_IO_SOURCE)
+            {
+                return None;
+            }
             // The pre-apply binding must still be a locked crates.io version — a vanished version
             // means the slot legitimately moved (a planned or collateral version change), not churn.
-            if !after.has_crates_io_version(binding.dependency, earlier) {
+            if after
+                .dependency_source(binding.dependency, earlier)
+                .as_deref()
+                != Some(crate::cargocmd::CRATES_IO_SOURCE)
+            {
                 return None;
             }
             // And it must still satisfy every requirement the dependent declares (post-widen
@@ -53,15 +67,19 @@ pub(crate) fn restorations(
 mod tests {
     use super::super::tests::{CHURNED_LOCK, key, view};
     use super::*;
-    use crate::cargocmd::{DeclaredRequirement, PackageKey, ResolvedGraph};
+    use crate::cargocmd::{CRATES_IO_SOURCE, DeclaredRequirement, LockPackageId, ResolvedGraph};
     use std::collections::{HashMap, HashSet};
 
     fn graph_with(requirements: &[(&str, &str, &str, &str)]) -> ResolvedGraph {
-        let mut declared_requirements: HashMap<PackageKey, Vec<DeclaredRequirement>> =
+        let mut declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>> =
             HashMap::new();
         for (name, version, dependency, requirement) in requirements {
             declared_requirements
-                .entry(PackageKey::new(*name, *version))
+                .entry(LockPackageId::new(
+                    *name,
+                    *version,
+                    (*name != "app").then_some(CRATES_IO_SOURCE),
+                ))
                 .or_default()
                 .push(DeclaredRequirement {
                     dependency: (*dependency).to_string(),
@@ -170,5 +188,41 @@ mod tests {
         let graph = graph_with(&[]);
 
         assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+    }
+
+    #[test]
+    fn a_source_change_is_not_restored_as_a_crates_io_rebind() {
+        let before_text = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "0.9.0"
+            source = "git+https://example.com/foo#abcdef"
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+        "#};
+        let after_text = before_text.replace("\"foo 1.0.0\",", "\"foo 0.9.0\",");
+        let graph = graph_with(&[("app", "0.1.0", "foo", ">=0.9, <2")]);
+
+        assert!(
+            restorations(
+                &view(before_text),
+                &view(&after_text),
+                &RequirementIndex::new(&graph),
+            )
+            .is_empty(),
+            "a source-changing move is outside the crates.io edge policy"
+        );
     }
 }

@@ -13,6 +13,7 @@ pub(super) struct ResolvedInvocation {
     env_policy: WindowFields,
     cli_policy: WindowFields,
     strict_native: StrictNativeMode,
+    edge_policy_override: Option<cooldown_core::EdgePolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,10 @@ impl ResolvedInvocation {
         self.strict_native
     }
 
+    pub(super) fn edge_policy_override(&self) -> Option<cooldown_core::EdgePolicy> {
+        self.edge_policy_override
+    }
+
     pub(super) fn progress(&self) -> &Progress {
         &self.run.progress
     }
@@ -94,7 +99,6 @@ pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
     cfg: &CommandConfig,
-    cargo_edge_policy: Option<cooldown_core::EdgePolicy>,
     default_major: bool,
 ) -> Result<ResolvedInvocation, CoreError> {
     let explicit = explicit_command_config(global, overrides);
@@ -126,12 +130,6 @@ pub(super) fn resolve_invocation(
             } else {
                 cooldown_core::RewriteMode::Auto
             },
-            // Cargo-scoped: an explicit `--cargo-edge-policy` wins over the `[tool.cargo]`
-            // `edge-policy` config value, then the built-in default (preserve).
-            edge_policy: overrides
-                .edge_policy
-                .or(cargo_edge_policy)
-                .unwrap_or_default(),
             transitive: merged.transitive.unwrap_or(false),
             // A display control, read straight from the CLI (not config-file backed); absent, the
             // report counts down to the latest version.
@@ -176,6 +174,7 @@ pub(super) fn resolve_invocation(
         env_policy: env_window_fields(),
         cli_policy: cli_window_fields(global),
         strict_native: strict_native_mode(overrides),
+        edge_policy_override: overrides.edge_policy,
     })
 }
 

@@ -1,7 +1,6 @@
 //! The observation diff: which edge bindings moved between two locks, computed over the raw
 //! per-block qualified-entry multisets so that moves among entries too ambiguous to *rewrite*
-//! (renamed multi-version deps, source-suffixed entries, twin blocks sharing one identity) are
-//! still reported.
+//! (renamed multi-version deps and source-suffixed entries) are still reported.
 
 use super::lock_view::remainder_version;
 use super::{BindingChange, LockEdgeView};
@@ -55,10 +54,12 @@ pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Ve
             let detail = (from == to)
                 .then(|| format!("the entry's source changed: \"{from_entry}\" → \"{to_entry}\""));
             changes.push(BindingChange {
-                dependent: super::PackageKey::new(&*block.name, &*block.version),
+                dependent: block.clone(),
                 dependency: dependency.clone(),
                 before: from,
                 after: to,
+                before_source: before.dependency_source(dependency, &from_entry),
+                after_source: after.dependency_source(dependency, &to_entry),
                 detail,
             });
         }
@@ -88,6 +89,8 @@ mod tests {
                 dependency: "uuid".to_string(),
                 before: "0.8.2".to_string(),
                 after: "1.24.0".to_string(),
+                before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
                 detail: None,
             }]
         );
@@ -118,10 +121,12 @@ mod tests {
         assert_eq!(
             changes,
             vec![BindingChange {
-                dependent: key("app", "0.1.0"),
+                dependent: super::super::tests::path_key("app", "0.1.0"),
                 dependency: "uuid".to_string(),
                 before: "1.24.0".to_string(),
                 after: "0.8.2".to_string(),
+                before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
                 detail: None,
             }],
             "an ambiguous pair's move must still be observed"
@@ -185,17 +190,78 @@ mod tests {
                     dependency: "dep".to_string(),
                     before: "1.0.0".to_string(),
                     after: "2.0.0".to_string(),
+                    before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                    after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
                     detail: None,
                 },
                 BindingChange {
-                    dependent: key("twin", "1.0.0"),
+                    dependent: crate::cargocmd::LockPackageId::new(
+                        "twin",
+                        "1.0.0",
+                        Some("git+https://example.com/twin#abcdef"),
+                    ),
                     dependency: "dep".to_string(),
                     before: "2.0.0".to_string(),
                     after: "1.0.0".to_string(),
+                    before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                    after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
                     detail: None,
                 },
             ],
             "each twin block's rebind must be observed independently"
+        );
+    }
+
+    /// Source-distinct twins can make the same move. The rows remain distinct because their full
+    /// dependent identities survive observation instead of collapsing to `(name, version)`.
+    #[test]
+    fn binding_changes_keep_same_direction_twin_moves_distinct() {
+        let twins_before = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "dep"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "dep"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "twin"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            dependencies = [
+             "dep 1.0.0",
+            ]
+
+            [[package]]
+            name = "twin"
+            version = "1.0.0"
+            source = "git+https://example.com/twin#abcdef"
+            dependencies = [
+             "dep 1.0.0",
+            ]
+        "#};
+        let twins_after = twins_before.replace("\"dep 1.0.0\",", "\"dep 2.0.0\",");
+
+        let changes = binding_changes(&view(twins_before), &view(&twins_after));
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|change| {
+            change.before == "1.0.0" && change.after == "2.0.0" && change.dependent.name == "twin"
+        }));
+        let sources: std::collections::BTreeSet<_> = changes
+            .iter()
+            .map(|change| change.dependent.source.as_deref())
+            .collect();
+        assert_eq!(
+            sources,
+            std::collections::BTreeSet::from([
+                Some(crate::cargocmd::CRATES_IO_SOURCE),
+                Some("git+https://example.com/twin#abcdef"),
+            ])
         );
     }
 
@@ -233,6 +299,14 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].before, "1.0.0");
         assert_eq!(changes[0].after, "1.0.0");
+        assert_eq!(
+            changes[0].before_source.as_deref(),
+            Some(crate::cargocmd::CRATES_IO_SOURCE)
+        );
+        assert_eq!(
+            changes[0].after_source.as_deref(),
+            Some("git+https://example.com/foo#abcdef")
+        );
         let detail = changes[0].detail.as_deref().unwrap_or_default();
         assert!(
             detail.contains("git+https://example.com/foo"),

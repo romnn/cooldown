@@ -9,15 +9,16 @@
   `uuid = ">=0.7, <2.0"` beside a `0.8` and a `1.x` line) — a build-affecting change that is
   invisible per-version and passes `cargo metadata --locked`. `preserve` (the default) restores
   such churn to the pre-upgrade binding; `canonicalize` binds each unambiguous crates.io edge to
-  the highest satisfying locked version — preferring MSRV-compatible candidates and falling back
-  to the highest satisfying one when none is, mirroring cargo's
+  the highest satisfying locked version — preferring candidates whose declared `rust-version` is
+  workspace-compatible and falling back to the highest satisfying one when none is, mirroring cargo's
   `incompatible-rust-versions = "fallback"` rule — healing pre-existing bad bindings too, also on
-  a run with no version change to apply; `none` only observes. Every corrected, withheld, or
-  surviving rebind is reported as its own `restored`/`canonicalized`/`held`/`rebound` row naming
-  the dependent. The `upgrade`/`fix` summary counts edge activity apart from version changes
-  (`edgesCorrected`/`edgesHeld`), a corrected edge sets the report's `applied` meta, and a `held`
-  row (an orphan-guarded, ambiguous-identity, or verification-rejected correction) fails
-  `--strict`.
+  a run with no version change to apply; `none` only observes. Every corrected, withheld,
+  unaddressable, or surviving rebind is reported as its own
+  `restored`/`canonicalized`/`held`/`unaddressable`/`rebound` row, preserving the dependent's full
+  source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
+  version changes (`edgesCorrected`/`edgesHeld`/`edgesUnaddressable`); row-level `applied` says
+  whether the binding outcome is committed, and a `held` or `unaddressable` row fails `--strict`.
+  Config follows the per-project repository cascade, and the closed JSON contract is schema v4.
 
 ## v0.0.12
 

@@ -32,13 +32,7 @@ pub(crate) async fn prepare_run(
     // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
-    let invocation = options::resolve_invocation(
-        global,
-        overrides,
-        &cfg,
-        scan.cargo_edge_policy,
-        default_major,
-    )?;
+    let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
     options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
     invocation.progress().phase("discovering projects");
     // Version-adopting commands revalidate npm package documents so the mutable `latest`

@@ -26,6 +26,8 @@ pub struct ProjectCtx {
     pub rel_path: Utf8PathBuf,
     /// The fully-assembled, project-scoped policy layers.
     pub policy: PolicyStack,
+    /// The Cargo edge policy resolved for this project's config cascade.
+    pub edge_policy: cooldown_core::EdgePolicy,
 }
 
 /// The exit-code taxonomy. `check` is the CI gate, so non-zero is its contract.
@@ -161,12 +163,6 @@ pub struct RunOpts {
     /// updates, widens implicit ceilings when required, and holds explicit upper bounds.
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
-    /// `--cargo-edge-policy` (upgrade/fix, config `[tool.cargo] edge-policy`): how the adapter
-    /// treats resolved lock
-    /// edge bindings after the re-resolve. Defaults to
-    /// [`EdgePolicy::Preserve`](cooldown_core::EdgePolicy::Preserve); currently enforced by the
-    /// cargo adapter (see [`cooldown_core::EdgePolicy`]).
-    pub edge_policy: cooldown_core::EdgePolicy,
     /// `outdated --transitive`: include transitive (indirect) deps in the report.
     pub transitive: bool,
     /// `--countdown <latest|soonest>` (outdated): which still-cooling upgrade the Cooldown column
@@ -959,6 +955,7 @@ mod tests {
                 layers: vec![builtin_default_layer()],
                 strict_native: false,
             },
+            edge_policy: cooldown_core::EdgePolicy::default(),
         }
     }
 

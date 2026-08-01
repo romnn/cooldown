@@ -213,13 +213,14 @@ pub fn json_schema() -> Value {
         },
         "upgradeSummary": {
             "type": "object",
-            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesHeld"],
+            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesHeld", "edgesUnaddressable"],
             "properties": {
                 "applied": { "type": "integer", "minimum": 0 },
                 "skipped": { "type": "integer", "minimum": 0 },
                 "errors": { "type": "integer", "minimum": 0 },
                 "edgesCorrected": { "type": "integer", "minimum": 0 },
-                "edgesHeld": { "type": "integer", "minimum": 0 }
+                "edgesHeld": { "type": "integer", "minimum": 0 },
+                "edgesUnaddressable": { "type": "integer", "minimum": 0 }
             },
             "additionalProperties": false
         },
@@ -253,6 +254,7 @@ pub fn json_schema() -> Value {
             "properties": {
                 "dependent": { "type": "string" },
                 "dependentVersion": { "type": "string" },
+                "dependentSource": { "type": "string" },
                 "action": { "enum": edge_actions },
                 "detail": { "type": "string" }
             },
@@ -850,6 +852,7 @@ mod tests {
             errors: 0,
             edges_corrected: 1,
             edges_held: 1,
+            edges_unaddressable: 1,
         }
     }
 
@@ -876,6 +879,7 @@ mod tests {
         UpgradeEdgeInfo {
             dependent: "diesel".to_string(),
             dependent_version: "2.3.11".to_string(),
+            dependent_source: Some("registry+https://example.invalid/index".to_string()),
             action: cooldown_core::EdgeBindingAction::Held,
             detail: Some("would orphan its last lock reference".to_string()),
         }

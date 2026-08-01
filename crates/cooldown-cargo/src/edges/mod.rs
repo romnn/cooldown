@@ -17,6 +17,7 @@
 //! bindings per `[[package]]` block so a rebind that no policy corrected is still reported.
 
 pub(crate) mod canonicalize;
+pub(crate) mod enforce;
 mod lock_view;
 mod observe;
 pub(crate) mod preserve;
@@ -26,21 +27,17 @@ pub(crate) use lock_view::LockEdgeView;
 pub(crate) use observe::binding_changes;
 pub(crate) use rewrite::{guard_rewrites, rewrite_lock_text};
 
-use crate::cargocmd::ResolvedGraph;
+use crate::cargocmd::{CRATES_IO_SOURCE, ResolvedGraph};
 use crate::version;
 
-/// The `(name, version)` package identity shared with the metadata layer — the form a lock
-/// dependency entry names and the block surgery targets. Not guaranteed unique: the same name and
-/// version can be resolved from two sources at once (a git fork beside the crates.io release);
-/// [`LockEdgeView`] tracks those as duplicate identities and keeps their edges observation-only.
-pub(crate) use crate::cargocmd::PackageKey;
+pub(crate) use crate::cargocmd::{LockPackageId, PackageKey};
 
 /// One corrective binding rewrite a policy proposes: rebind `dependent`'s edge to `dependency`
 /// from its current bound version to `to`. `from` is the binding as the (post-apply) lock has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EdgeRewrite {
     /// The dependent package whose edge is rewritten.
-    pub(crate) dependent: PackageKey,
+    pub(crate) dependent: LockPackageId,
     /// The depended-on crate name.
     pub(crate) dependency: String,
     /// The bound version being replaced (as present in the lock the rewrite applies to).
@@ -54,13 +51,17 @@ pub(crate) struct EdgeRewrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BindingChange {
     /// The dependent package whose edge moved.
-    pub(crate) dependent: PackageKey,
+    pub(crate) dependent: LockPackageId,
     /// The depended-on crate name.
     pub(crate) dependency: String,
     /// The bound version in the earlier lock.
     pub(crate) before: String,
     /// The bound version in the later lock.
     pub(crate) after: String,
+    /// The earlier binding target's source, when it can be identified unambiguously.
+    pub(crate) before_source: Option<String>,
+    /// The later binding target's source, when it can be identified unambiguously.
+    pub(crate) after_source: Option<String>,
     /// Extra context when the versions alone understate the move — a same-version entry swap
     /// between two sources. Carried into the report row's detail.
     pub(crate) detail: Option<String>,
@@ -80,7 +81,12 @@ impl<'a> RequirementIndex<'a> {
     /// Whether every requirement `dependent` declares for `dependency` admits `candidate`.
     /// A dependent or dependency the metadata does not know yields `false` — no known requirement
     /// means no license to rewrite.
-    pub(crate) fn admits(&self, dependent: &PackageKey, dependency: &str, candidate: &str) -> bool {
+    pub(crate) fn admits(
+        &self,
+        dependent: &LockPackageId,
+        dependency: &str,
+        candidate: &str,
+    ) -> bool {
         let Some(requirements) = self.graph.declared_requirements.get(dependent) else {
             return false;
         };
@@ -108,11 +114,11 @@ impl<'a> RequirementIndex<'a> {
         let Some(workspace) = self.graph.workspace_rust_version else {
             return true;
         };
-        match self
-            .graph
-            .rust_versions
-            .get(&PackageKey::new(dependency, candidate))
-        {
+        match self.graph.rust_versions.get(&LockPackageId::new(
+            dependency,
+            candidate,
+            Some(CRATES_IO_SOURCE),
+        )) {
             Some(required) => *required <= workspace,
             None => true,
         }
@@ -138,9 +144,10 @@ pub(crate) struct GuardedRewrites {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::PackageKey;
     use super::lock_view::LockEdgeView;
-    use crate::tool::CargoLock;
+    use super::{LockPackageId, PackageKey};
+    use crate::cargocmd::CRATES_IO_SOURCE;
+    use crate::lockfile::CargoLock;
     use indoc::indoc;
 
     pub(crate) const CHURNED_LOCK: &str = indoc! {r#"
@@ -188,7 +195,15 @@ pub(crate) mod tests {
         LockEdgeView::from_lock(&CargoLock::parse(lock_text).expect("lock parses"))
     }
 
-    pub(crate) fn key(name: &str, version: &str) -> PackageKey {
+    pub(crate) fn key(name: &str, version: &str) -> LockPackageId {
+        LockPackageId::new(name, version, Some(CRATES_IO_SOURCE))
+    }
+
+    pub(crate) fn path_key(name: &str, version: &str) -> LockPackageId {
+        LockPackageId::new(name, version, None::<String>)
+    }
+
+    pub(crate) fn package_key(name: &str, version: &str) -> PackageKey {
         PackageKey::new(name, version)
     }
 }

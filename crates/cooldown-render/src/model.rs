@@ -1,9 +1,8 @@
 //! The serializable view model — the stable `--json` contract. One common envelope, with
 //! command-specific `summary`, `items[]`, and a flattened command-specific top-level `meta`.
 //!
-//! Stability policy: SemVer-style — additive fields don't bump [`SCHEMA_VERSION`]; a
-//! removal/retype/semantic change does. Consumers ignore unknown fields. The `status` and
-//! `minAgeSource` enums are part of the contract.
+//! [`SCHEMA_VERSION`] identifies the exact closed JSON Schema contract. Any output field or enum
+//! change bumps it because schema objects reject unknown properties.
 
 use cooldown_core::{
     Diagnostic, EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status,
@@ -11,8 +10,8 @@ use cooldown_core::{
 };
 use serde::{Serialize, Serializer};
 
-/// The JSON schema version. Bumped only on a removal/retype/semantic change.
-pub const SCHEMA_VERSION: u32 = 3;
+/// The JSON schema version.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -440,15 +439,18 @@ pub struct UpgradeEdgeInfo {
     pub dependent: String,
     /// The dependent's resolved version.
     pub dependent_version: String,
-    /// What the edge policy did (or observed): `restored`, `canonicalized`, `rebound`, or `held`
-    /// (a correction was withheld; the row's `to` is the target that was not applied).
+    /// The dependent's package source, absent for path and workspace packages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependent_source: Option<String>,
+    /// What the edge policy did or observed.
     pub action: EdgeBindingAction,
-    /// Why a correction was withheld (`held` only).
+    /// Why a correction was withheld or could not be addressed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-/// One row in an `upgrade` or `fix` report: a planned version change and its outcome.
+/// One row in an `upgrade` or `fix` report: either a package version change or a lock-edge binding
+/// outcome, distinguished by [`edge`](UpgradeItem::edge).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeItem {
@@ -478,9 +480,10 @@ pub struct UpgradeItem {
     pub to: String,
     /// The update kind of the change relative to the current pin.
     pub kind: UpdateKind,
-    /// Whether the change was actually written to the manifest/lock.
+    /// Whether this row's version or edge-binding change is present in the committed result.
     pub applied: bool,
-    /// Why the change was not applied, present iff [`applied`](UpgradeItem::applied) is `false` and no error.
+    /// Why a package version change was not applied. Edge outcomes carry their explanation in
+    /// [`UpgradeEdgeInfo::detail`] instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<SkippedInfo>,
     /// The error that prevented the change, if one occurred.
@@ -526,7 +529,7 @@ impl UpgradeItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeSummary {
-    /// The number of changes that were applied.
+    /// The number of package version changes that were applied. Edge rows are counted separately.
     pub applied: usize,
     /// The number of planned changes that were skipped.
     pub skipped: usize,
@@ -539,6 +542,9 @@ pub struct UpgradeSummary {
     /// The number of lock-edge corrections that were withheld (`held` rows). Under `--strict` a
     /// non-zero count fails the run — a requested correction could not be completed.
     pub edges_held: usize,
+    /// The number of committed edge moves a corrective policy could not address safely. Under
+    /// `--strict` a non-zero count fails the run.
+    pub edges_unaddressable: usize,
 }
 
 /// The post-mutation build result reported in [`UpgradeMeta`].

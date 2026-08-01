@@ -6,10 +6,16 @@
 pub mod cargocmd;
 mod edges;
 pub mod index;
+mod lockfile;
 mod manifest;
 mod native;
 pub mod tool;
 pub mod version;
 
+use cooldown_core::ToolId;
+
+/// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
+pub const CARGO_ID: ToolId = ToolId("cargo");
+
 pub use index::CratesIoIndex;
-pub use tool::{CARGO_ID, CargoTool};
+pub use tool::CargoTool;

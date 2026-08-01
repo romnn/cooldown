@@ -2,14 +2,15 @@
 //! and the targeted textual surgery that applies the survivors while leaving every other byte of
 //! the lock identical.
 
-use super::{EdgeRewrite, GuardedRewrites, LockEdgeView, PackageKey, RejectedRewrite};
+use super::{
+    EdgeRewrite, GuardedRewrites, LockEdgeView, LockPackageId, PackageKey, RejectedRewrite,
+};
 use std::collections::HashMap;
 
 /// Filters policy-proposed rewrites through the shared safety guards, in deterministic order. A
-/// rewrite is withheld when its dependent's identity names more than one locked block (surgery
-/// could hit the wrong one), or when the rewrite set's **net** effect would leave a still-locked
-/// version with no reference (an orphan `cargo metadata --locked` rejects). Withheld rewrites are
-/// returned, not dropped — the caller reports them.
+/// rewrite is withheld when the rewrite set's **net** effect would leave a still-locked version
+/// with no reference (an orphan `cargo metadata --locked` rejects). Withheld rewrites are returned,
+/// not dropped — the caller reports them.
 pub(crate) fn guard_rewrites(
     view: &LockEdgeView,
     mut rewrites: Vec<EdgeRewrite>,
@@ -19,21 +20,8 @@ pub(crate) fn guard_rewrites(
             .cmp(&b.dependent)
             .then_with(|| a.dependency.cmp(&b.dependency))
     });
-    let mut candidates = Vec::new();
     let mut rejected = Vec::new();
-    for rewrite in rewrites {
-        // The policies only propose from `bindings`, which already excludes duplicate identities;
-        // this re-check keeps the guard safe against any future caller that does not.
-        if view.duplicate_identities.contains(&rewrite.dependent) {
-            rejected.push(RejectedRewrite {
-                rewrite,
-                reason: "the dependent's name and version identify more than one locked package"
-                    .to_string(),
-            });
-            continue;
-        }
-        candidates.push(rewrite);
-    }
+    let mut candidates = rewrites;
 
     // Orphan validation over the NET effect of the whole candidate set: a version's final
     // reference count is its current count minus the edges rebound away plus the edges rebound
@@ -90,7 +78,7 @@ pub(crate) fn guard_rewrites(
 /// Returns `None` when any rewrite's entry line cannot be found in its dependent's block — the
 /// text then no longer matches the parsed view, and half-applied surgery must not be written.
 pub(crate) fn rewrite_lock_text(lock_text: &str, rewrites: &[EdgeRewrite]) -> Option<String> {
-    let mut wanted: HashMap<(PackageKey, String), (String, bool)> = rewrites
+    let mut wanted: HashMap<(LockPackageId, String), (String, bool)> = rewrites
         .iter()
         .map(|rewrite| {
             (
@@ -103,45 +91,81 @@ pub(crate) fn rewrite_lock_text(lock_text: &str, rewrites: &[EdgeRewrite]) -> Op
         })
         .collect();
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut current: Option<PackageKey> = None;
+    let mut text = String::with_capacity(lock_text.len());
     let mut block_name: Option<String> = None;
-    for line in lock_text.lines() {
+    let mut block_version: Option<String> = None;
+    let mut block_source: Option<String> = None;
+    for segment in lock_text.split_inclusive('\n') {
+        let (line, terminator) = if let Some(line) = segment.strip_suffix("\r\n") {
+            (line, "\r\n")
+        } else if let Some(line) = segment.strip_suffix('\n') {
+            (line, "\n")
+        } else {
+            (segment, "")
+        };
         let trimmed = line.trim();
         if trimmed == "[[package]]" {
-            current = None;
             block_name = None;
+            block_version = None;
+            block_source = None;
         } else if let Some(rest) = trimmed.strip_prefix("name = ") {
             block_name = Some(rest.trim_matches('"').to_string());
         } else if let Some(rest) = trimmed.strip_prefix("version = ") {
-            if let Some(name) = block_name.take() {
-                current = Some(PackageKey::new(name, rest.trim_matches('"')));
-            }
-        } else if let Some(dependent) = &current
+            block_version = Some(rest.trim_matches('"').to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("source = ") {
+            block_source = Some(rest.trim_matches('"').to_string());
+        } else if let (Some(name), Some(version)) = (&block_name, &block_version)
+            && let dependent = LockPackageId::new(name, version, block_source.as_deref())
             && let Some((replacement, seen)) =
                 wanted.get_mut(&(dependent.clone(), trimmed.to_string()))
         {
-            let indent = &line[..line.len() - trimmed.len()];
-            lines.push(format!("{indent}{replacement}"));
+            let leading_len = line.len() - line.trim_start().len();
+            let trailing_start = line.trim_end().len();
+            text.push_str(&line[..leading_len]);
+            text.push_str(replacement);
+            text.push_str(&line[trailing_start..]);
+            text.push_str(terminator);
             *seen = true;
             continue;
         }
-        lines.push(line.to_string());
+        text.push_str(line);
+        text.push_str(terminator);
     }
     if wanted.values().any(|(_, seen)| !seen) {
         return None;
     }
-    // `Cargo.lock` ends with a trailing newline; `lines()` drops it, so restore it.
-    let mut text = lines.join("\n");
-    if lock_text.ends_with('\n') {
-        text.push('\n');
-    }
     Some(text)
+}
+
+/// Groups rewrites whose dependency-version endpoints overlap.
+///
+/// A component is the smallest retry unit that preserves reciprocal swaps and other refcount-
+/// balanced corrections which may be invalid when verified one edge at a time.
+pub(crate) fn rewrite_components(mut rewrites: Vec<EdgeRewrite>) -> Vec<Vec<EdgeRewrite>> {
+    let mut components = Vec::new();
+    while !rewrites.is_empty() {
+        let mut component = vec![rewrites.remove(0)];
+        while let Some(position) = rewrites
+            .iter()
+            .position(|candidate| component.iter().any(|member| connected(member, candidate)))
+        {
+            component.push(rewrites.remove(position));
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn connected(left: &EdgeRewrite, right: &EdgeRewrite) -> bool {
+    left.dependency == right.dependency
+        && [left.from.as_str(), left.to.as_str()]
+            .iter()
+            .any(|endpoint| *endpoint == right.from || *endpoint == right.to)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{CHURNED_LOCK, key, view};
+    use super::super::tests::{CHURNED_LOCK, key, path_key, view};
     use super::*;
     use indoc::indoc;
 
@@ -154,7 +178,7 @@ mod tests {
         let orphaning = guard_rewrites(
             &view,
             vec![EdgeRewrite {
-                dependent: key("app", "0.1.0"),
+                dependent: path_key("app", "0.1.0"),
                 dependency: "uuid".to_string(),
                 from: "1.24.0".to_string(),
                 to: "0.8.2".to_string(),
@@ -286,11 +310,10 @@ mod tests {
         assert!(guarded.rejected.is_empty());
     }
 
-    /// Two `[[package]]` blocks sharing one `(name, version)` identity (a git fork beside the
-    /// crates.io release): surgery could hit the wrong block, so the dependent's edges are
-    /// observation-only and any proposed rewrite is withheld with a reason.
+    /// Source-bearing dependent identities let surgery target one of two same-name, same-version
+    /// blocks without touching its twin.
     #[test]
-    fn a_duplicate_dependent_identity_is_untouchable_but_observed() {
+    fn rewrite_targets_one_source_distinct_twin() {
         let lock = indoc! {r#"
             version = 4
 
@@ -317,16 +340,10 @@ mod tests {
             version = "1.0.0"
             source = "git+https://example.com/twin#abcdef"
             dependencies = [
-             "dep 2.0.0",
+             "dep 1.0.0",
             ]
         "#};
         let twins = view(lock);
-        assert_eq!(
-            twins.binding(&key("twin", "1.0.0"), "dep"),
-            None,
-            "a duplicate identity has no rewritable binding"
-        );
-
         let guarded = guard_rewrites(
             &twins,
             vec![EdgeRewrite {
@@ -336,12 +353,25 @@ mod tests {
                 to: "2.0.0".to_string(),
             }],
         );
-        assert!(guarded.accepted.is_empty());
-        assert_eq!(guarded.rejected.len(), 1);
+        assert_eq!(guarded.accepted.len(), 1);
+        let rewritten = rewrite_lock_text(lock, &guarded.accepted).expect("rewrite twin");
         assert!(
-            guarded.rejected[0].reason.contains("more than one"),
-            "the withheld reason names the identity collision: {}",
-            guarded.rejected[0].reason
+            rewritten.contains(indoc! {r#"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+                dependencies = [
+                 "dep 2.0.0",
+                ]
+            "#}),
+            "the crates.io twin is rewritten: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(indoc! {r#"
+                source = "git+https://example.com/twin#abcdef"
+                dependencies = [
+                 "dep 1.0.0",
+                ]
+            "#}),
+            "the git twin remains unchanged: {rewritten}"
         );
     }
 
@@ -393,5 +423,61 @@ mod tests {
             .is_none(),
             "surgery must be all-or-nothing"
         );
+    }
+
+    #[test]
+    fn rewrite_lock_text_preserves_crlf_and_trailing_whitespace() {
+        let crlf = CHURNED_LOCK.replace('\n', "\r\n");
+        let rewritten = rewrite_lock_text(
+            &crlf,
+            &[EdgeRewrite {
+                dependent: key("diesel", "2.3.11"),
+                dependency: "uuid".to_string(),
+                from: "0.8.2".to_string(),
+                to: "1.24.0".to_string(),
+            }],
+        )
+        .expect("rewrite CRLF lock");
+        assert_eq!(
+            rewritten.matches("\r\n").count(),
+            crlf.matches("\r\n").count()
+        );
+        assert!(!rewritten.replace("\r\n", "").contains('\n'));
+
+        let trailing = CHURNED_LOCK.replacen(
+            "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 0.8.2\",",
+            "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 0.8.2\",   ",
+            1,
+        );
+        let rewritten = rewrite_lock_text(
+            &trailing,
+            &[EdgeRewrite {
+                dependent: key("diesel", "2.3.11"),
+                dependency: "uuid".to_string(),
+                from: "0.8.2".to_string(),
+                to: "1.24.0".to_string(),
+            }],
+        )
+        .expect("rewrite trailing whitespace");
+        assert!(rewritten.contains(" \"uuid 1.24.0\",   \n"));
+    }
+
+    #[test]
+    fn rewrite_components_keep_reciprocal_endpoints_together() {
+        let rewrite = |dependent: &str, dependency: &str, from: &str, to: &str| EdgeRewrite {
+            dependent: key(dependent, "1.0.0"),
+            dependency: dependency.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        let components = rewrite_components(vec![
+            rewrite("a", "shared", "1.0.0", "2.0.0"),
+            rewrite("b", "shared", "2.0.0", "1.0.0"),
+            rewrite("c", "other", "1.0.0", "2.0.0"),
+        ]);
+
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].len(), 2, "the reciprocal swap stays atomic");
+        assert_eq!(components[1].len(), 1, "the unrelated rewrite isolates");
     }
 }

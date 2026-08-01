@@ -70,8 +70,8 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
   versions to its pre-upgrade binding: an upgrade touches only what it reports.
 - **`canonicalize`** — cooldown's owned normalization: bind every unambiguous crates.io edge to
   the **highest** locked version satisfying the dependent's declared requirement, preferring
-  candidates the workspace MSRV (`rust-version`) can build and falling back to the highest
-  satisfying candidate when none is compatible — the same preference cargo's
+  candidates whose declared `rust-version` is workspace-compatible and falling back to the
+  highest satisfying candidate when none is compatible — the same preference cargo's
   `incompatible-rust-versions = "fallback"` rule (the resolver-v3 default) applies. Unlike
   `preserve` this also heals bad bindings that predate the run, including on a run that applies no
   version change at all. It is a policy over the existing package set, not a re-run of cargo's
@@ -79,15 +79,20 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
   higher, MSRV-incompatible version where `canonicalize` keeps the compatible one.
 - **`none`** — leave bindings exactly as the resolver produced them.
 
-Every corrected, withheld, or surviving rebind is reported as its own row (`restored`,
-`canonicalized`, `held`, or `rebound`) naming the dependent whose edge moved. Corrections are
-applied as targeted lock edits and re-verified with `cargo metadata --locked`; a correction that
-would orphan a locked version, address an ambiguous lock identity, or fail verification is
-withheld and reported as `held` with the reason. The summary counts edge activity apart from the
-version changes (`edgesCorrected` / `edgesHeld` in `--json`), a corrected edge sets the report's
-`applied` meta, and a `held` row fails a `--strict` run — a requested correction that could not be
-completed is an incomplete mutation. The policy is cargo-specific, so its config placement is too:
-set `edge-policy` under `[tool.cargo]` in `cooldown.toml`.
+Every corrected, withheld, unaddressable, or surviving rebind is reported as its own row
+(`restored`, `canonicalized`, `held`, `unaddressable`, or `rebound`) naming the dependent whose
+edge moved. Corrections are applied as targeted lock edits and re-verified with
+`cargo metadata --locked`. A concrete correction rejected by the orphan guard or verification is
+`held`, with `to` naming the withheld target. If a renamed multi-version or source-qualified lock
+entry moves but cannot be mapped safely to one declared requirement, it is `unaddressable` rather
+than being mislabeled as an ordinary rebound. The JSON summary counts edge activity apart from
+version changes (`edgesCorrected`, `edgesHeld`, and `edgesUnaddressable`); each edge row's
+`applied` says whether its binding outcome is present in the committed lock, while top-level
+`applied` says whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a
+`--strict` run because the corrective policy is incomplete. The policy is cargo-specific, so its
+config placement is too: set `edge-policy` under `[tool.cargo]` in the nearest applicable
+`cooldown.toml`; nearer project config wins, then an explicit `--config`, and the CLI flag has
+highest precedence.
 
 ## Major versions
 
