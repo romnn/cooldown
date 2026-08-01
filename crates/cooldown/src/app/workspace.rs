@@ -161,6 +161,12 @@ pub struct RunOpts {
     /// updates, widens implicit ceilings when required, and holds explicit upper bounds.
     /// `--rewrite` selects [`RewriteMode::Always`].
     pub rewrite: cooldown_core::RewriteMode,
+    /// `--cargo-edge-policy` (upgrade/fix, config `[tool.cargo] edge-policy`): how the adapter
+    /// treats resolved lock
+    /// edge bindings after the re-resolve. Defaults to
+    /// [`EdgePolicy::Preserve`](cooldown_core::EdgePolicy::Preserve); currently enforced by the
+    /// cargo adapter (see [`cooldown_core::EdgePolicy`]).
+    pub edge_policy: cooldown_core::EdgePolicy,
     /// `outdated --transitive`: include transitive (indirect) deps in the report.
     pub transitive: bool,
     /// `--countdown <latest|soonest>` (outdated): which still-cooling upgrade the Cooldown column
@@ -514,9 +520,11 @@ impl Workspace {
             .filter(move |project| Self::project_in_source_scope(project, opts))
     }
 
-    pub(crate) fn progress_projects(&self, opts: &RunOpts) -> Vec<(ToolId, String)> {
+    /// The tool of each project the run's scope covers, one entry per project — what the
+    /// progress display needs to size its per-tool counters.
+    pub(crate) fn progress_project_tools(&self, opts: &RunOpts) -> Vec<ToolId> {
         self.scoped_projects(opts)
-            .map(|project| (project.tool, project.rel_path.to_string()))
+            .map(|project| project.tool)
             .collect()
     }
 
@@ -675,7 +683,7 @@ impl Workspace {
         fetch: &FetchContext<'_>,
         progress: &Progress,
         fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Release>)> {
+    ) -> Vec<FetchedRelease<Release>> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
@@ -691,7 +699,10 @@ impl Workspace {
                         .locked_release(fetcher, &dep, fetch)
                         .await;
                     progress.package_finished(&dep.package.name);
-                    (dep, result)
+                    FetchedRelease {
+                        dependency: dep,
+                        result,
+                    }
                 }
             })
             .buffer_unordered(fanout)
@@ -716,7 +727,7 @@ impl Workspace {
         candidate_scope: CandidateScope,
         progress: &Progress,
         fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+    ) -> Vec<FetchedRelease<Vec<Release>>> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
@@ -732,7 +743,10 @@ impl Workspace {
                         .candidate_releases(fetcher, &dep, fetch, candidate_scope)
                         .await;
                     progress.package_finished(&dep.package.name);
-                    (dep, result)
+                    FetchedRelease {
+                        dependency: dep,
+                        result,
+                    }
                 }
             })
             .buffer_unordered(fanout)
@@ -756,19 +770,28 @@ impl Workspace {
     }
 }
 
+/// One dependency's release-fetch outcome, keeping the input beside its result so per-dep
+/// reporting never loses attribution.
+pub(crate) struct FetchedRelease<T> {
+    /// The dependency the fetch was for.
+    pub(crate) dependency: Dependency,
+    /// The fetch outcome: a locked release, the candidate list, or the per-dep error.
+    pub(crate) result: cooldown_core::Result<T>,
+}
+
 /// The fallback result when a tool somehow has no registered [`ReleaseFetcher`] (every registered
 /// adapter has one, so this is unreachable in practice) — one typed error per dep, never a panic.
-fn no_fetcher_results<T>(
-    tool: ToolId,
-    deps: Vec<Dependency>,
-) -> Vec<(Dependency, cooldown_core::Result<T>)> {
+fn no_fetcher_results<T>(tool: ToolId, deps: Vec<Dependency>) -> Vec<FetchedRelease<T>> {
     deps.into_iter()
         .map(|dep| {
             let err = cooldown_core::CoreError::System(format!(
                 "no release fetcher registered for tool {}",
                 tool.as_str()
             ));
-            (dep, Err(err))
+            FetchedRelease {
+                dependency: dep,
+                result: Err(err),
+            }
         })
         .collect()
 }

@@ -256,14 +256,21 @@ fn check_cooldown_cell(window: &Window, age_days: Option<f64>) -> String {
     age_over_window_cell(window, &age)
 }
 
-fn check_status_cell(status: CheckStatus) -> (&'static str, Color) {
-    match status {
+/// A status column cell: the one-word label and the color the row renders it in.
+struct StatusCell {
+    label: &'static str,
+    color: Color,
+}
+
+fn check_status_cell(status: CheckStatus) -> StatusCell {
+    let (label, color) = match status {
         CheckStatus::Violation => ("violation", Color::Red),
         CheckStatus::Acknowledged => ("acknowledged", Color::Cyan),
         CheckStatus::Allowed => ("allowed", Color::Yellow),
         CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
         CheckStatus::Error => ("error", Color::Red),
-    }
+    };
+    StatusCell { label, color }
 }
 
 fn check_notes_cell(item: &CheckItem) -> String {
@@ -469,7 +476,7 @@ pub fn render_check(
                     used_by.then(|| members_cell(&item.members, list_packages, paths, item.direct)),
                     item.current.clone(),
                     check_cooldown_cell(&item.window, item.age_days),
-                    check_status_cell(item.status).0,
+                    check_status_cell(item.status).label,
                     check_notes_cell(item),
                 )
             },
@@ -485,7 +492,7 @@ pub fn render_check(
         header.extend(["Version", "Cooldown", "Status", "Notes"]);
         t.set_header(header);
         for it in items {
-            let (label, color) = check_status_cell(it.status);
+            let StatusCell { label, color } = check_status_cell(it.status);
             let cooldown = check_cooldown_cell(&it.window, it.age_days);
             let notes = check_notes_cell(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
@@ -551,29 +558,86 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
-/// The (status word, reason detail, color) for one mutation row — both cells share the color. The
-/// applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is `downgraded`,
-/// not `upgraded`. A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean
-/// apply has an empty reason (Status says it).
-fn mutation_status(it: &UpgradeItem) -> (&'static str, String, Color) {
+/// The Status/Reason cells of one mutation row — both cells share the color. The applied word is
+/// per-item, not per-command: a too-fresh pin an `upgrade` rolls back is `downgraded`, not
+/// `upgraded`. A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean
+/// apply has an empty reason (Status says it). An edge row reports a lock-edge *binding* move (the
+/// From/To cells are binding versions), so its status word names the edge-policy outcome and its
+/// reason names the dependent whose edge moved.
+struct MutationStatus {
+    /// The one-word status cell.
+    status: &'static str,
+    /// The reason/detail cell; empty for a clean apply.
+    reason: String,
+    color: Color,
+}
+
+fn mutation_status(it: &UpgradeItem) -> MutationStatus {
+    if let Some(edge) = &it.edge {
+        let subject = format!(
+            "{} {}'s {} edge binding",
+            edge.dependent, edge.dependent_version, it.name
+        );
+        return match edge.action {
+            cooldown_core::EdgeBindingAction::Restored => MutationStatus {
+                status: "restored",
+                reason: format!("the re-resolve rebound {subject}; restored"),
+                color: Color::Green,
+            },
+            cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
+                status: "canonicalized",
+                reason: format!(
+                    "{subject} bound to the highest locked version satisfying its requirement"
+                ),
+                color: Color::Green,
+            },
+            cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
+                status: "rebound",
+                reason: format!("the re-resolve moved {subject}; left as bound"),
+                color: Color::Yellow,
+            },
+            cooldown_core::EdgeBindingAction::Held => MutationStatus {
+                status: "held",
+                reason: match &edge.detail {
+                    Some(detail) => format!("{subject} left in place: {detail}"),
+                    None => format!("{subject} left in place; correction withheld"),
+                },
+                color: Color::Yellow,
+            },
+        };
+    }
     if it.applied {
-        let word = if it.downgrade {
-            "downgraded"
-        } else {
-            "upgraded"
-        };
-        (word, String::new(), Color::Green)
+        MutationStatus {
+            status: if it.downgrade {
+                "downgraded"
+            } else {
+                "upgraded"
+            },
+            reason: String::new(),
+            color: Color::Green,
+        }
     } else if let Some(sk) = &it.skipped {
-        let detail = if sk.reason == SkipReason::NeedsMajor {
-            "needs --major".to_string()
-        } else {
-            sk.message.clone()
-        };
-        ("skipped", detail, Color::Yellow)
+        MutationStatus {
+            status: "skipped",
+            reason: if sk.reason == SkipReason::NeedsMajor {
+                "needs --major".to_string()
+            } else {
+                sk.message.clone()
+            },
+            color: Color::Yellow,
+        }
     } else if let Some(e) = &it.error {
-        ("failed", e.message.clone(), Color::Red)
+        MutationStatus {
+            status: "failed",
+            reason: e.message.clone(),
+            color: Color::Red,
+        }
     } else {
-        ("planned", String::new(), Color::Cyan)
+        MutationStatus {
+            status: "planned",
+            reason: String::new(),
+            color: Color::Cyan,
+        }
     }
 }
 
@@ -587,7 +651,7 @@ fn mutation_project_column_needed(
         opts.show_projects,
         |item| item.project.as_str(),
         |item| {
-            let (status, detail, _) = mutation_status(item);
+            let status = mutation_status(item);
             (
                 item.name.clone(),
                 used_by.then(|| {
@@ -595,8 +659,8 @@ fn mutation_project_column_needed(
                 }),
                 item.from.clone(),
                 item.to.clone(),
-                status,
-                detail,
+                status.status,
+                status.reason,
             )
         },
     )
@@ -639,7 +703,11 @@ fn render_mutation(
         header.extend(["From", "To", "Status", "Reason"]);
         t.set_header(header);
         for it in items {
-            let (status, detail, color) = mutation_status(it);
+            let MutationStatus {
+                status,
+                reason,
+                color,
+            } = mutation_status(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -655,7 +723,7 @@ fn render_mutation(
             row.push(Cell::new(&it.from));
             row.push(Cell::new(&it.to));
             row.push(cell_colored(status, color, use_color));
-            row.push(cell_colored(detail, color, use_color));
+            row.push(cell_colored(reason, color, use_color));
             t.add_row(row);
         }
         out.push_str(&dim_borders(&t.to_string(), use_color));
@@ -683,10 +751,19 @@ fn render_mutation(
     } else {
         format!(" ({needs_major} need --major)")
     };
+    // Edge-binding counts only appear when the run produced any, so the common summary line is
+    // unchanged for runs without edge activity.
+    let mut edge_note = String::new();
+    if summary.edges_corrected > 0 {
+        let _ = write!(edge_note, " · {} edges corrected", summary.edges_corrected);
+    }
+    if summary.edges_held > 0 {
+        let _ = write!(edge_note, " · {} edges held", summary.edges_held);
+    }
     let _ = writeln!(
         out,
-        "\n{} applied · {} skipped{} · {} errors · {}",
-        summary.applied, summary.skipped, major_note, summary.errors, lock
+        "\n{} applied · {} skipped{} · {} errors{} · {}",
+        summary.applied, summary.skipped, major_note, summary.errors, edge_note, lock
     );
     if meta.build.requested {
         let _ = writeln!(
@@ -1342,6 +1419,7 @@ mod tests {
                 offending: None,
             }),
             error: None,
+            edge: None,
         }
     }
 
@@ -1359,6 +1437,8 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_held: 0,
             },
             items,
             &[],
@@ -1382,6 +1462,7 @@ mod tests {
             applied: true,
             skipped: None,
             error: None,
+            edge: None,
         }
     }
 
@@ -1458,6 +1539,8 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_held: 0,
             },
             &items,
             &[],
@@ -1535,6 +1618,8 @@ mod tests {
                 applied: 0,
                 skipped: 1,
                 errors: 0,
+                edges_corrected: 0,
+                edges_held: 0,
             },
             &items,
             &[],
@@ -1574,6 +1659,8 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_held: 0,
             },
             &[],
             &[],

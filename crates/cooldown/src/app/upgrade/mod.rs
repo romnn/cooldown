@@ -17,7 +17,8 @@ use super::{
     BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    Change, Diagnostic, DiagnosticKind, LockStatus, PackageId, ToolRead, ToolWrite,
+    Change, Diagnostic, DiagnosticKind, EdgeBindingAction, LockStatus, PackageId, ToolRead,
+    ToolWrite,
 };
 use std::collections::HashSet;
 
@@ -182,50 +183,7 @@ impl Workspace {
             .await;
         }
 
-        // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
-        // items explicitly so the output is stable, status-first (errored/skipped lead, applied
-        // last). A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its
-        // items carry the real applied/skipped outcome and sort identically to the real run.
-        acc.items.sort_by(|a, b| {
-            a.project
-                .cmp(&b.project)
-                .then_with(|| a.sort_rank().cmp(&b.sort_rank()))
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.from.cmp(&b.from))
-        });
-        let applied = acc.items.iter().filter(|item| item.applied).count();
-        // Every non-applied, non-errored change is a skip — including the `needs --major` rows (a
-        // held-back cross-major *is* a skip). The renderer breaks out how many of them need `--major`.
-        let skipped = acc
-            .items
-            .iter()
-            .filter(|item| item.skipped.is_some())
-            .count();
-        let err_count =
-            acc.items.iter().filter(|item| item.error.is_some()).count() + acc.errors.len();
-
-        let exit = if err_count > 0 || acc.build_ok == Some(false) {
-            Exit::Environment
-        } else if opts.strict && acc.strict_incomplete {
-            Exit::Policy
-        } else {
-            Exit::Ok
-        };
-
-        let meta = upgrade_meta(opts, &acc, applied);
-        let summary = UpgradeSummary {
-            applied,
-            skipped,
-            errors: err_count,
-        };
-        UpgradeOutcome {
-            meta,
-            summary,
-            items: acc.items,
-            warnings: acc.warnings,
-            errors: acc.errors,
-            exit,
-        }
+        finalize_outcome(opts, acc)
     }
 
     /// Runs preselected upgrade targets through the complete policy trial in a project copy.
@@ -294,9 +252,111 @@ fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
     .with_path(pctx.project.manifest.as_str())
 }
 
-fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, applied: usize) -> UpgradeMeta {
+/// Distills the accumulated per-project state into the final report: dedupes and sorts the rows,
+/// derives the counts, folds edge outcomes into strict/meta, and decides the exit.
+fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
+    // Successive batches can each re-correct churn the next re-resolve re-introduced, so
+    // identical edge rows collapse to one — the report describes the run's net effect, like
+    // the version legs collapsed by `collapse_applied_legs`.
+    dedupe_edge_items(&mut acc.items);
+    // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
+    // items explicitly so the output is stable, status-first (errored/skipped lead, applied
+    // last). A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its
+    // items carry the real applied/skipped outcome and sort identically to the real run.
+    acc.items.sort_by(|a, b| {
+        a.project
+            .cmp(&b.project)
+            .then_with(|| a.sort_rank().cmp(&b.sort_rank()))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.from.cmp(&b.from))
+    });
+    let applied = acc.items.iter().filter(|item| item.applied).count();
+    // Every non-applied, non-errored change is a skip — including the `needs --major` rows (a
+    // held-back cross-major *is* a skip). The renderer breaks out how many of them need `--major`.
+    let skipped = acc
+        .items
+        .iter()
+        .filter(|item| item.skipped.is_some())
+        .count();
+    let err_count = acc.items.iter().filter(|item| item.error.is_some()).count() + acc.errors.len();
+    let edges_corrected = count_edge_actions(
+        &acc.items,
+        &[
+            EdgeBindingAction::Restored,
+            EdgeBindingAction::Canonicalized,
+        ],
+    );
+    let edges_held = count_edge_actions(&acc.items, &[EdgeBindingAction::Held]);
+    // A held edge is a requested correction that could not be completed — strict-relevant like
+    // any other incomplete mutation. Plain `rebound` rows are not: under a corrective policy
+    // the residual rebinds are deliberate non-targets (a planned cross-major move whose old
+    // version another consumer keeps), and under policy `none` observation is the contract.
+    acc.strict_incomplete |= edges_held > 0;
+
+    let exit = if err_count > 0 || acc.build_ok == Some(false) {
+        Exit::Environment
+    } else if opts.strict && acc.strict_incomplete {
+        Exit::Policy
+    } else {
+        Exit::Ok
+    };
+
+    let meta = upgrade_meta(opts, &acc, applied + edges_corrected);
+    let summary = UpgradeSummary {
+        applied,
+        skipped,
+        errors: err_count,
+        edges_corrected,
+        edges_held,
+    };
+    UpgradeOutcome {
+        meta,
+        summary,
+        items: acc.items,
+        warnings: acc.warnings,
+        errors: acc.errors,
+        exit,
+    }
+}
+
+/// The number of edge rows whose action is one of `actions`.
+fn count_edge_actions(items: &[UpgradeItem], actions: &[EdgeBindingAction]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            item.edge
+                .as_ref()
+                .is_some_and(|edge| actions.contains(&edge.action))
+        })
+        .count()
+}
+
+/// Drops edge rows that duplicate an earlier one exactly (same project, packages, versions, and
+/// outcome). Version rows are never touched.
+fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
+    let mut seen = HashSet::new();
+    items.retain(|item| {
+        let Some(edge) = &item.edge else {
+            return true;
+        };
+        seen.insert((
+            item.project.clone(),
+            item.name.clone(),
+            item.from.clone(),
+            item.to.clone(),
+            edge.dependent.clone(),
+            edge.dependent_version.clone(),
+            edge.action.wire_value(),
+            edge.detail.clone(),
+        ))
+    });
+}
+
+/// `mutations` counts everything that wrote to the project: applied version changes plus
+/// corrected edge bindings.
+fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> UpgradeMeta {
     UpgradeMeta {
-        applied: applied > 0,
+        applied: mutations > 0,
         lock_status: if opts.dry_run { None } else { acc.lock_status },
         build: BuildInfo {
             requested: acc.build_requested,

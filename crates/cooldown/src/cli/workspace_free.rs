@@ -82,6 +82,7 @@ const STARTER_CONFIG: &str = indoc! {r#"
     # [tool.cargo]
     # exclude-folders = ["vendor"]       # extra folder excludes for one tool
     # exclude-packages = ["xtask"]       # ecosystem-specific package excludes (npm: "@scope/*")
+    # edge-policy = "preserve"           # lock edge bindings: preserve (default) | canonicalize | none
     #
     # [outdated]
     # major = true                # outdated shows cross-major by default; set false for minor-only

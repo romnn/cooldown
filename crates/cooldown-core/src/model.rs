@@ -612,6 +612,106 @@ pub enum RewriteMode {
     Always,
 }
 
+/// How an adapter treats resolved lock **edge bindings** after a whole-graph re-resolve.
+///
+/// A lock records not only which package versions exist but which coexisting version each
+/// dependent's edge is *bound* to (cargo's `dependencies = ["uuid 0.8.2"]` entries). When a
+/// dependent's declared range admits several locked versions (e.g. diesel's
+/// `uuid = ">=0.7, <2.0"` with both `0.8.2` and `1.x` in the lock), an incremental re-resolve can
+/// silently rebind such an edge between them — a build-affecting change (`rustc` receives the other
+/// copy as `--extern`) that is invisible at the per-version level and passes the tool's own lock
+/// verification. This policy decides what the adapter does about it. Currently enforced by the
+/// cargo adapter; adapters without ambiguous edge bindings ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgePolicy {
+    /// Restore any edge the re-resolve rebound between two still-coexisting versions back to its
+    /// pre-apply binding (when that binding still satisfies the declared requirement) — an upgrade
+    /// touches only what it reports. The default.
+    #[default]
+    Preserve,
+    /// Bind every ambiguous edge to the **highest** locked version satisfying the dependent's
+    /// declared requirement, preferring candidates the workspace MSRV can build (the adapter's
+    /// owned normalization; matches a from-scratch resolve in the common case). Unlike
+    /// [`Preserve`](EdgePolicy::Preserve) this also heals bad bindings that predate the run.
+    Canonicalize,
+    /// Leave every binding exactly as the resolver produced it. Unplanned rebinds are still
+    /// *reported* (never silent), just not corrected.
+    None,
+}
+
+/// What the adapter's edge policy did (or observed) about one rebound lock edge. See
+/// [`EdgeRebind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeBindingAction {
+    /// The re-resolve rebound the edge; [`EdgePolicy::Preserve`] restored the pre-apply binding.
+    Restored,
+    /// [`EdgePolicy::Canonicalize`] rebound the edge to the highest locked version satisfying the
+    /// dependent's declared requirement.
+    Canonicalized,
+    /// The re-resolve rebound the edge and the binding was left as produced — the policy is
+    /// [`EdgePolicy::None`], or no policy proposed a correction for it. Reported so the change is
+    /// never silent.
+    Rebound,
+    /// A corrective rewrite was **withheld** and the binding left as found: the correction would
+    /// orphan a locked version's last reference, the corrected lock failed the tool's own
+    /// verification and was rolled back, or the dependent's identity is not unique in the lock.
+    /// [`EdgeRebind::to`] then carries the withheld target and [`EdgeRebind::detail`] says why.
+    Held,
+}
+
+impl EdgeBindingAction {
+    /// Every variant, in declaration order — the closed set the report JSON schema's `action`
+    /// enum builds from, so a new variant cannot be missed there.
+    pub const ALL: &'static [EdgeBindingAction] = &[
+        EdgeBindingAction::Restored,
+        EdgeBindingAction::Canonicalized,
+        EdgeBindingAction::Rebound,
+        EdgeBindingAction::Held,
+    ];
+
+    /// The wire token this action serializes as (`"restored"`, `"held"`, …). A unit test asserts
+    /// each token equals serde's `snake_case` output, so the two cannot drift.
+    #[must_use]
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            EdgeBindingAction::Restored => "restored",
+            EdgeBindingAction::Canonicalized => "canonicalized",
+            EdgeBindingAction::Rebound => "rebound",
+            EdgeBindingAction::Held => "held",
+        }
+    }
+}
+
+/// A resolved lock edge the edge policy corrected, withheld a correction for, or observed rebound,
+/// reported by an adapter's `apply` so no build-affecting lock change is ever silent.
+///
+/// For [`Restored`](EdgeBindingAction::Restored)/[`Canonicalized`](EdgeBindingAction::Canonicalized)
+/// `to` is the binding the committed lock ends with and `from` the resolver-produced binding it
+/// superseded; for [`Rebound`](EdgeBindingAction::Rebound) `from` is the pre-apply binding and `to`
+/// the committed one; for [`Held`](EdgeBindingAction::Held) the committed binding **stays at**
+/// `from` and `to` is the correction that was withheld.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRebind {
+    /// The dependent package whose edge moved (e.g. `diesel`).
+    pub dependent: String,
+    /// The dependent's resolved version (a dependent can coexist at several versions).
+    pub dependent_version: Version,
+    /// The dependency the edge points at (e.g. `uuid`).
+    pub dependency: PackageId,
+    /// The superseded binding version (or, for [`Held`](EdgeBindingAction::Held), the binding that
+    /// remains in place).
+    pub from: Version,
+    /// The binding version the committed lock ends with (or, for
+    /// [`Held`](EdgeBindingAction::Held), the withheld correction target).
+    pub to: Version,
+    /// What the policy did (or observed) about the rebind.
+    pub action: EdgeBindingAction,
+    /// Why a correction was withheld ([`Held`](EdgeBindingAction::Held)); `None` otherwise.
+    pub detail: Option<String>,
+}
+
 /// A resolved package version already rejected by the active policy before an apply trial begins.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BaselineViolation {
@@ -629,6 +729,10 @@ pub struct Plan {
     /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
     /// flag). Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
+    /// How the adapter treats resolved lock edge bindings after the re-resolve (the
+    /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key). Defaults to
+    /// [`EdgePolicy::Preserve`].
+    pub edge_policy: EdgePolicy,
     /// Policy violations already present before this trial.
     ///
     /// Adapters may authorize these exact starting versions while resolving a repair, but must not
@@ -771,6 +875,9 @@ pub struct ApplyReport {
     pub applied: Vec<Change>,
     /// The changes that were skipped, with reasons.
     pub skipped: Vec<Skipped>,
+    /// Lock edges whose binding moved between coexisting versions, with what the
+    /// [`EdgePolicy`] did about each. Empty for adapters without ambiguous edge bindings.
+    pub edge_rebinds: Vec<EdgeRebind>,
 }
 
 /// Whether to gate only environment-relevant artifacts or every recorded artifact (`--all-artifacts`).
@@ -937,6 +1044,27 @@ mod tests {
         for reason in SkipReason::ALL {
             assert!(
                 seen.insert(reason.wire_value()),
+                "ALL must list every wire token once"
+            );
+        }
+    }
+
+    /// `EdgeBindingAction::wire_value` is hand-written beside the serde derive (no macro couples
+    /// them like `skip_reasons!` does), so assert each token equals serde's actual output and that
+    /// `ALL` enumerates every variant distinctly.
+    #[test]
+    fn edge_binding_action_wire_tokens_match_serde() {
+        use super::EdgeBindingAction;
+        let mut seen = std::collections::BTreeSet::new();
+        for action in EdgeBindingAction::ALL {
+            let serialized = toml::Value::try_from(action).ok();
+            assert_eq!(
+                serialized,
+                Some(toml::Value::String(action.wire_value().to_string())),
+                "wire_value must equal serde's token"
+            );
+            assert!(
+                seen.insert(action.wire_value()),
                 "ALL must list every wire token once"
             );
         }

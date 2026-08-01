@@ -19,6 +19,11 @@ pub struct ScanConfig {
     pub tool_exclude_folders: BTreeMap<String, Vec<String>>,
     /// `[tool.<name>].exclude-packages` lists, keyed by tool name.
     pub tool_exclude_packages: BTreeMap<String, Vec<String>>,
+    /// `[tool.cargo].edge-policy`: how the cargo adapter treats resolved lock edge bindings after
+    /// a re-resolve. Deliberately tool-scoped — only cargo reads it, so it lives under
+    /// `[tool.cargo]` rather than masquerading as a global setting; parsing rejects it under any
+    /// other selector.
+    pub cargo_edge_policy: Option<crate::EdgePolicy>,
 }
 
 impl ScanConfig {
@@ -43,6 +48,7 @@ impl ScanConfig {
                 .or_default()
                 .extend(value);
         }
+        self.cargo_edge_policy = other.cargo_edge_policy.or(self.cargo_edge_policy);
         self
     }
 
@@ -126,7 +132,7 @@ pub(crate) fn scan_config_from_config(
         let packages = selector
             .exclude_packages
             .filter(|entries| !entries.is_empty());
-        if folders.is_none() && packages.is_none() {
+        if folders.is_none() && packages.is_none() && selector.edge_policy.is_none() {
             continue;
         }
         let tool = tool_id(&name).ok_or_else(|| {
@@ -135,6 +141,16 @@ pub(crate) fn scan_config_from_config(
                 recognized_tool_names()
             ))
         })?;
+        if let Some(edge_policy) = selector.edge_policy {
+            // Lock edge bindings are a cargo concept; accepting the key under another tool would
+            // silently do nothing, so it is rejected rather than ignored.
+            if tool.as_str() != "cargo" {
+                return Err(CoreError::Config(format!(
+                    "`edge-policy` in [tool.{name}] is cargo-specific; move it to [tool.cargo]"
+                )));
+            }
+            scan.cargo_edge_policy = Some(edge_policy);
+        }
         let key = tool.as_str().to_string();
         if let Some(folders) = folders {
             scan.tool_exclude_folders
@@ -223,6 +239,37 @@ mod tests {
         assert!(!cfg.tool_exclude_packages.contains_key("cargo"));
         // Folders and packages are independent surfaces.
         assert!(cfg.resolved("outdated").exclude_folders.is_empty());
+    }
+
+    #[test]
+    fn edge_policy_is_read_from_tool_cargo_and_rejected_elsewhere() {
+        let cfg = scan(indoc! {r#"
+            [tool.cargo]
+            edge-policy = "canonicalize"
+        "#});
+        assert_eq!(
+            cfg.cargo_edge_policy,
+            Some(crate::EdgePolicy::Canonicalize),
+            "the [tool.cargo] placement is the one source of the cargo edge policy"
+        );
+
+        // A higher-precedence layer's value wins on merge.
+        let higher = scan(indoc! {r#"
+            [tool.cargo]
+            edge-policy = "none"
+        "#});
+        assert_eq!(
+            cfg.merge(higher).cargo_edge_policy,
+            Some(crate::EdgePolicy::None)
+        );
+
+        // Under any other tool the key would silently do nothing, so it is rejected.
+        let err = parse_scan_config("[tool.npm]\nedge-policy = \"preserve\"\n", &Origin::Default)
+            .expect_err("edge-policy under a non-cargo tool must be rejected");
+        assert!(
+            err.to_string().contains("[tool.cargo]"),
+            "the error points at the correct placement: {err}"
+        );
     }
 
     #[test]

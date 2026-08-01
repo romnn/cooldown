@@ -56,6 +56,39 @@ By default `upgrade` moves the **whole graph**: it advances each dependency to i
 - **`--transitive hide`** — direct-only: leave transitive dependencies untouched.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
 
+## Lock edge bindings (cargo)
+
+A `Cargo.lock` records not only which versions exist but which coexisting version each dependent's
+edge is **bound** to (`dependencies = ["uuid 0.8.2"]`). When a crate declares a range wide enough to
+admit two locked versions at once — diesel's `uuid = ">=0.7, <2.0"` beside both a `0.8` and a `1.x`
+line — cargo's incremental re-resolves can silently rebind that edge between them. The rebinding is
+build-affecting (the dependent compiles against the other copy) yet invisible at the version level,
+and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` decides what
+`upgrade`/`fix` do about it:
+
+- **`preserve`** (default) — restore any edge the re-resolve rebound between two still-coexisting
+  versions to its pre-upgrade binding: an upgrade touches only what it reports.
+- **`canonicalize`** — cooldown's owned normalization: bind every unambiguous crates.io edge to
+  the **highest** locked version satisfying the dependent's declared requirement, preferring
+  candidates the workspace MSRV (`rust-version`) can build and falling back to the highest
+  satisfying candidate when none is compatible — the same preference cargo's
+  `incompatible-rust-versions = "fallback"` rule (the resolver-v3 default) applies. Unlike
+  `preserve` this also heals bad bindings that predate the run, including on a run that applies no
+  version change at all. It is a policy over the existing package set, not a re-run of cargo's
+  resolver: a workspace on resolver v1/v2 (default `allow`) may see a fresh cargo resolve bind a
+  higher, MSRV-incompatible version where `canonicalize` keeps the compatible one.
+- **`none`** — leave bindings exactly as the resolver produced them.
+
+Every corrected, withheld, or surviving rebind is reported as its own row (`restored`,
+`canonicalized`, `held`, or `rebound`) naming the dependent whose edge moved. Corrections are
+applied as targeted lock edits and re-verified with `cargo metadata --locked`; a correction that
+would orphan a locked version, address an ambiguous lock identity, or fail verification is
+withheld and reported as `held` with the reason. The summary counts edge activity apart from the
+version changes (`edgesCorrected` / `edgesHeld` in `--json`), a corrected edge sets the report's
+`applied` meta, and a `held` row fails a `--strict` run — a requested correction that could not be
+completed is an incomplete mutation. The policy is cargo-specific, so its config placement is too:
+set `edge-policy` under `[tool.cargo]` in `cooldown.toml`.
+
 ## Major versions
 
 A cross-major bump is usually breaking work you opt into, so `--major` is **off** by default for `upgrade`. With `--major` it applies to every eligible dependency; narrow it to a subset with `--package`:
@@ -112,6 +145,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 |---|---|
 | `--transitive <mode>` | `allow` or `hide` — how to treat transitive dependencies (see above). |
 | `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound. |
+| `--cargo-edge-policy <policy>` | cargo: `preserve` (default), `canonicalize`, or `none` — how lock edge bindings are treated after the re-resolve (see above). Config: `[tool.cargo] edge-policy`. |
 | `--build` | Also compile / sync after re-locking. |
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |

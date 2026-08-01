@@ -1,7 +1,9 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::lock::ProjectLock;
-use crate::app::{SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error};
+use crate::app::{
+    FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
+};
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
     DiagnosticKind, LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal, Release,
@@ -81,10 +83,18 @@ struct BatchOutcome {
     committed: Option<CommittedBatch>,
 }
 
+/// One policy-violating resolved pin — the package and the exact too-fresh version the graph
+/// holds. The key the trial state machine tracks baseline and residual violations by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ViolationKey {
+    package: String,
+    version: String,
+}
+
 /// What a kept batch changes about the trial state.
 struct CommittedBatch {
     /// The graph's non-baselined violations after this batch (the next trial baseline).
-    violations_after: HashSet<(String, String)>,
+    violations_after: HashSet<ViolationKey>,
     /// Whether the batch floated up violations the reconcile pass should mature down.
     reconcile_needed: bool,
 }
@@ -104,12 +114,15 @@ enum TransitiveGateVerdict {
 /// cooldown violations that reject the group, or an error that aborts recovery entirely.
 enum UpgradeTrialResult {
     Settled(Vec<BatchOutcome>),
-    PolicyBlocked(Vec<(String, String)>),
+    PolicyBlocked(Vec<ViolationKey>),
     Aborted(BatchOutcome),
 }
 
 /// A candidate isolation rejected, with the residual violations its trial forced into the graph.
-type RejectedUpgrade = (Change, Vec<(String, String)>);
+struct RejectedUpgrade {
+    change: Change,
+    residual: Vec<ViolationKey>,
+}
 
 /// The outcome of isolating a policy-blocked batch into safe and unsafe candidates.
 enum UpgradeSelectionResult {
@@ -123,6 +136,9 @@ enum UpgradeSelectionResult {
 struct VerifiedBatchReport {
     applied: HashSet<ChangeTargetKey>,
     collateral: Vec<Change>,
+    /// Lock edges the adapter's edge policy corrected or observed rebound (cargo only); committed
+    /// as report rows alongside the applied/collateral changes.
+    edge_rebinds: Vec<cooldown_core::EdgeRebind>,
     planned_applied: bool,
 }
 
@@ -152,7 +168,7 @@ impl BatchOutcome {
 #[derive(Clone)]
 struct TrialState {
     /// In-cooldown, non-baselined pins present before the next trial.
-    baseline_violations: HashSet<(String, String)>,
+    baseline_violations: HashSet<ViolationKey>,
     /// Whether the last committed batch introduced transitive cooldown violations to reconcile.
     reconcile_needed: bool,
 }
@@ -166,6 +182,12 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     mode: PlanMode,
     acc: &'a mut UpgradeAccum,
     lock_refreshed_by_apply: bool,
+    /// Whether a committed (kept, not rolled back) apply has already enforced the edge policy over
+    /// the current lock — every `apply_plan` enforces before returning, and a rollback restores a
+    /// state that itself was either initial or produced by a committed apply. When set, the
+    /// standalone [`normalize_edges`](Self::normalize_edges) pass would be a redundant re-run over
+    /// an already-enforced lock and is skipped.
+    lock_edges_enforced: bool,
     /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
@@ -186,6 +208,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             ctx,
             acc,
             lock_refreshed_by_apply: false,
+            lock_edges_enforced: false,
             manifest_only: HashSet::new(),
         }
     }
@@ -225,7 +248,37 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         }
 
+        // A healing edge policy must not be gated on an unrelated version change existing: apply
+        // enforces it during a batch, but a run that applied nothing (or rolled every batch back,
+        // taking the in-batch enforcement with it) still owes the lock its edge pass. A committed
+        // apply already enforced the policy over the lock it left behind, so the standalone pass
+        // runs only when no commit did — one enforcement owner per run, no redundant metadata
+        // spawn. Runs before `finalize` so the final lock probe verifies the result.
+        if !self.lock_edges_enforced {
+            self.normalize_edges().await;
+        }
+
         self.finalize().await;
+    }
+
+    /// Standalone edge-binding enforcement for this project (see
+    /// [`normalize_lock_edges`](cooldown_core::ToolWrite::normalize_lock_edges)); corrected or
+    /// observed rebinds surface as report rows like the in-apply ones.
+    async fn normalize_edges(&mut self) {
+        match self
+            .ctx
+            .writer
+            .normalize_lock_edges(&self.ctx.pctx.project, self.ctx.opts.edge_policy)
+            .await
+        {
+            Ok(rebinds) => {
+                for rebind in &rebinds {
+                    let item = self.edge_rebind_item(rebind);
+                    self.acc.items.push(item);
+                }
+            }
+            Err(error) => self.record_project_error(&error, None),
+        }
     }
 
     /// Runs the upgrade policy state machine for targets selected by another read path.
@@ -436,8 +489,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         push_upgrade_halves(&mut work, group);
                     } else {
                         self.ctx.opts.progress.candidates_decided(&group);
-                        rejected
-                            .extend(group.into_iter().map(|change| (change, violations.clone())));
+                        rejected.extend(group.into_iter().map(|change| RejectedUpgrade {
+                            change,
+                            residual: violations.clone(),
+                        }));
                     }
                 }
                 UpgradeTrialResult::Aborted(mut outcome) => {
@@ -512,7 +567,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn try_upgrade_group(
         &mut self,
         changes: Vec<Change>,
-        policy_baseline: &HashSet<(String, String)>,
+        policy_baseline: &HashSet<ViolationKey>,
         state: &mut TrialState,
         rollback: &mut ProjectMutationJournal,
     ) -> UpgradeTrialResult {
@@ -556,7 +611,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
-    fn collapse_collateral(&mut self, prior_violations: &HashSet<(String, String)>) {
+    fn collapse_collateral(&mut self, prior_violations: &HashSet<ViolationKey>) {
         let project = self.project_label.clone();
         let tool = self.ctx.tool_name();
         let classifier = self.ctx.reader;
@@ -574,6 +629,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// merging (which may happen later, after buffering) can never re-apply or clobber it.
     fn merge_batch_outcome(&mut self, outcome: BatchOutcome) {
         self.lock_refreshed_by_apply |= outcome.lock_refreshed;
+        // Only kept batches reach the merge with `committed` intact (rolled-back trials strip it),
+        // so this records exactly "the current lock was produced by a committed apply" — which
+        // enforced the edge policy on its way out.
+        self.lock_edges_enforced |= outcome.committed.is_some();
         outcome.merge_into(self.acc);
     }
 
@@ -597,10 +656,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// Reports each change of a policy-blocked trial as held by the transitive it would force
     /// into the graph.
-    fn record_unreconciled_skips(&mut self, changes: &[Change], residual: &[(String, String)]) {
+    fn record_unreconciled_skips(&mut self, changes: &[Change], residual: &[ViolationKey]) {
         self.acc.strict_incomplete = true;
         // Name one stuck transitive as the offender (sorted for a stable report).
-        let offender = residual.iter().map(|(name, _)| name.clone()).min();
+        let offender = residual
+            .iter()
+            .map(|violation| violation.package.clone())
+            .min();
         for change in changes {
             self.record_change_skip(
                 change,
@@ -617,9 +679,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    fn record_rejected_upgrade_changes(&mut self, rejected: Vec<(Change, Vec<(String, String)>)>) {
-        for (change, violations) in rejected {
-            self.record_unreconciled_skips(std::slice::from_ref(&change), &violations);
+    fn record_rejected_upgrade_changes(&mut self, rejected: Vec<RejectedUpgrade>) {
+        for rejected_upgrade in rejected {
+            self.record_unreconciled_skips(
+                std::slice::from_ref(&rejected_upgrade.change),
+                &rejected_upgrade.residual,
+            );
         }
     }
 
@@ -712,8 +777,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await;
         let mut planned = Vec::new();
-        for (dep, releases) in fetched {
-            let releases = match releases {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
+            let releases = match result {
                 Ok(releases) => releases,
                 Err(error) => {
                     self.record_project_error(&error, Some(&dep.package.name));
@@ -902,8 +971,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut planned = Vec::new();
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
-        for (dep, releases) in fetched {
-            let releases = match releases {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
+            let releases = match result {
                 Ok(releases) => releases,
                 Err(error) => {
                     errors.push(self.project_diag(&error, Some(&dep.package.name)));
@@ -1139,6 +1212,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let plan = Plan {
             changes: changes.clone(),
             rewrite: self.ctx.opts.rewrite,
+            edge_policy: self.ctx.opts.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
         };
         let primary = changes
@@ -1225,6 +1299,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             &mut outcome,
             &changes,
             &report.collateral,
+            &report.edge_rebinds,
             &report.applied,
             committed,
         );
@@ -1250,6 +1325,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         VerifiedBatchReport {
             applied,
             collateral,
+            edge_rebinds: report.edge_rebinds,
             planned_applied,
         }
     }
@@ -1259,7 +1335,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         outcome: &mut BatchOutcome,
         changes: &[Change],
         applied: &HashSet<ChangeTargetKey>,
-        baseline_violations: &HashSet<(String, String)>,
+        baseline_violations: &HashSet<ViolationKey>,
     ) -> Option<CommittedBatch> {
         self.ctx
             .opts
@@ -1278,7 +1354,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return None;
             }
         };
-        let after_keys: HashSet<(String, String)> = after.keys().cloned().collect();
+        let after_keys: HashSet<ViolationKey> = after.keys().cloned().collect();
         match self.gate_batch_transitives(
             outcome,
             &after,
@@ -1300,6 +1376,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         outcome: &mut BatchOutcome,
         changes: &[Change],
         collateral: &[Change],
+        edge_rebinds: &[cooldown_core::EdgeRebind],
         applied: &HashSet<ChangeTargetKey>,
         committed: CommittedBatch,
     ) {
@@ -1312,6 +1389,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
         for change in collateral {
             outcome.items.push(self.change_applied_item(change));
+        }
+        for rebind in edge_rebinds {
+            outcome.items.push(self.edge_rebind_item(rebind));
         }
     }
 
@@ -1386,14 +1466,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn gate_batch_transitives(
         &self,
         outcome: &mut BatchOutcome,
-        after: &HashMap<(String, String), bool>,
-        after_keys: &HashSet<(String, String)>,
+        after: &HashMap<ViolationKey, bool>,
+        after_keys: &HashSet<ViolationKey>,
         changes: &[Change],
         applied: &HashSet<ChangeTargetKey>,
-        baseline_violations: &HashSet<(String, String)>,
+        baseline_violations: &HashSet<ViolationKey>,
     ) -> TransitiveGateVerdict {
         let keep = |reconcile_needed| TransitiveGateVerdict::Keep { reconcile_needed };
-        let new_violations: Vec<&(String, String)> =
+        let new_violations: Vec<&ViolationKey> =
             after_keys.difference(baseline_violations).collect();
         if new_violations.is_empty() {
             return keep(false);
@@ -1401,7 +1481,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         match self.transitive_mode() {
             TransitiveGate::Hide => keep(false),
             TransitiveGate::Allow => {
-                for (package, version) in &new_violations {
+                for violation in &new_violations {
+                    let package = violation.package.as_str();
+                    let version = violation.version.as_str();
                     self.add_fix_warning_to_outcome(
                         outcome,
                         &format!(
@@ -1424,7 +1506,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 if matches!(self.mode, PlanMode::Upgrade) {
                     return keep(true);
                 }
-                let Some((forced_pkg, _)) = new_violations
+                let Some(forced) = new_violations
                     .iter()
                     .find(|key| !after.get(**key).copied().unwrap_or(false))
                 else {
@@ -1441,10 +1523,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                                 reason: SkipReason::TransitiveInCooldown,
                                 message: conflict_skip_message(
                                     SkipReason::TransitiveInCooldown,
-                                    Some(forced_pkg),
+                                    Some(&forced.package),
                                     &change.package.name,
                                 ),
-                                offending: Some(forced_pkg.clone()),
+                                offending: Some(forced.package.clone()),
                             }),
                         ));
                     }
@@ -1560,7 +1642,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// can try to roll it back without violating known lower bounds. `upgrade` uses this same set for
     /// the final residual check, but it no longer relies on the boolean prediction before attempting
     /// reconciliation.
-    async fn graph_violations(&self) -> cooldown_core::Result<HashMap<(String, String), bool>> {
+    async fn graph_violations(&self) -> cooldown_core::Result<HashMap<ViolationKey, bool>> {
         // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
         // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
         // must not narrow it. Only pin ages are read here — never `members` — so nothing leaks.
@@ -1583,7 +1665,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
 
         let mut violations = HashMap::new();
-        for (dep, result) in fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
             let locked = result?;
             let pin = check_pin(
                 &dep,
@@ -1607,7 +1693,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         .as_ref()
                         .is_some_and(|floor| *floor != dep.current);
                     violations.insert(
-                        (dep.package.name.clone(), dep.current.to_string()),
+                        ViolationKey {
+                            package: dep.package.name.clone(),
+                            version: dep.current.to_string(),
+                        },
                         reconcilable,
                     );
                 }
@@ -1670,6 +1759,39 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             false,
             skipped,
         )
+    }
+
+    /// The report row for one lock-edge rebind: the package column names the dependency whose
+    /// binding moved, From/To carry the binding versions, and the `edge` block names the dependent
+    /// and the policy outcome. Not an applied/skipped version change — the row leaves every
+    /// summary count untouched.
+    fn edge_rebind_item(&self, rebind: &cooldown_core::EdgeRebind) -> UpgradeItem {
+        UpgradeItem {
+            name: rebind.dependency.name.clone(),
+            tool: self.ctx.tool_name().to_string(),
+            project: self.project_label.clone(),
+            direct: false,
+            downgrade: false,
+            members: Vec::new(),
+            registry: rebind.dependency.registry.clone(),
+            from: rebind.from.to_string(),
+            to: rebind.to.to_string(),
+            // Informational: the kind of the binding jump, when classifiable.
+            kind: self
+                .ctx
+                .reader
+                .classify_update_kind(rebind.from.as_str(), rebind.to.as_str())
+                .unwrap_or(UpdateKind::Minor),
+            applied: false,
+            skipped: None,
+            error: None,
+            edge: Some(crate::app::UpgradeEdgeInfo {
+                dependent: rebind.dependent.clone(),
+                dependent_version: rebind.dependent_version.to_string(),
+                action: rebind.action,
+                detail: rebind.detail.clone(),
+            }),
+        }
     }
 
     fn record_change_skip(&mut self, change: &Change, skipped: Option<SkippedInfo>) {
@@ -1756,12 +1878,12 @@ fn sort_planned_changes(changes: &mut [Change]) {
     });
 }
 
-fn plan_baseline_violations(violations: &HashSet<(String, String)>) -> Vec<BaselineViolation> {
+fn plan_baseline_violations(violations: &HashSet<ViolationKey>) -> Vec<BaselineViolation> {
     let mut baseline = violations
         .iter()
-        .map(|(package, version)| BaselineViolation {
-            package: package.clone(),
-            version: Version::new(version),
+        .map(|violation| BaselineViolation {
+            package: violation.package.clone(),
+            version: Version::new(&violation.version),
         })
         .collect::<Vec<_>>();
     baseline.sort_by(|a, b| {
@@ -1862,6 +1984,7 @@ fn verify_applied_targets(
     let mut verified = ApplyReport {
         applied: Vec::new(),
         skipped: report.skipped,
+        edge_rebinds: report.edge_rebinds,
     };
 
     for change in report.applied {
@@ -1942,16 +2065,22 @@ fn collateral_rows(applied: &[Change], planned: &[Change]) -> Vec<Change> {
 }
 
 fn newly_introduced_violations(
-    before: &HashSet<(String, String)>,
-    after: &HashSet<(String, String)>,
-) -> Vec<(String, String)> {
+    before: &HashSet<ViolationKey>,
+    after: &HashSet<ViolationKey>,
+) -> Vec<ViolationKey> {
     let before_counts = violation_counts_by_name(before);
     let after_counts = violation_counts_by_name(after);
-    let mut residual: Vec<(String, String)> = after
+    let mut residual: Vec<ViolationKey> = after
         .difference(before)
-        .filter(|(name, _)| {
-            after_counts.get(name.as_str()).copied().unwrap_or(0)
-                > before_counts.get(name.as_str()).copied().unwrap_or(0)
+        .filter(|violation| {
+            after_counts
+                .get(violation.package.as_str())
+                .copied()
+                .unwrap_or(0)
+                > before_counts
+                    .get(violation.package.as_str())
+                    .copied()
+                    .unwrap_or(0)
         })
         .cloned()
         .collect();
@@ -1959,10 +2088,10 @@ fn newly_introduced_violations(
     residual
 }
 
-fn violation_counts_by_name(violations: &HashSet<(String, String)>) -> HashMap<&str, usize> {
+fn violation_counts_by_name(violations: &HashSet<ViolationKey>) -> HashMap<&str, usize> {
     let mut counts = HashMap::new();
-    for (name, _) in violations {
-        *counts.entry(name.as_str()).or_default() += 1;
+    for violation in violations {
+        *counts.entry(violation.package.as_str()).or_default() += 1;
     }
     counts
 }
@@ -1990,7 +2119,7 @@ fn collapse_applied_legs(
     items: &mut Vec<UpgradeItem>,
     project: &str,
     tool: &str,
-    prior_violations: &HashSet<(String, String)>,
+    prior_violations: &HashSet<ViolationKey>,
     classify_update_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
 ) {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
@@ -2043,7 +2172,10 @@ fn collapse_applied_legs(
                 continue;
             }
             let downgrade = head.downgrade
-                || prior_violations.contains(&(head.name.clone(), head.from.clone()));
+                || prior_violations.contains(&ViolationKey {
+                    package: head.name.clone(),
+                    version: head.from.clone(),
+                });
             let kind = classify_update_kind(&head.from, &net_to).unwrap_or(head.kind);
             retarget.push((first, net_to, downgrade, kind));
             remove.extend(chain.iter().skip(1).copied());
@@ -2122,15 +2254,17 @@ fn plan_item(
         applied,
         skipped,
         error: None,
+        edge: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanMode, candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status,
-        conflict_skip_message, is_downgrade, newly_introduced_violations, planned_changes_landed,
-        preserve_rollback_entries, sort_planned_changes, target_package, verify_applied_targets,
+        PlanMode, ViolationKey, candidate_scope, collapse_applied_legs, collateral_rows,
+        combine_lock_status, conflict_skip_message, is_downgrade, newly_introduced_violations,
+        planned_changes_landed, preserve_rollback_entries, sort_planned_changes, target_package,
+        verify_applied_targets,
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
@@ -2340,7 +2474,7 @@ mod tests {
         let planned = vec![change("serde", "1.0.0", "1.0.1")];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
 
         let verified = verify_applied_targets(report, &planned, &[dep("serde", "1.0.0")]);
@@ -2358,7 +2492,7 @@ mod tests {
         let planned = vec![landed.clone(), missed.clone()];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
 
         let verified = verify_applied_targets(report, &planned, &[dep("serde", "1.0.1")]);
@@ -2375,7 +2509,7 @@ mod tests {
         let planned = vec![planned_change.clone()];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
         let mut old_dep = dep("nix", "0.28.0");
         old_dep.members = vec![member("micromux-mcp", "crates/micromux-mcp")];
@@ -2401,7 +2535,7 @@ mod tests {
         let planned = vec![planned_change.clone()];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
         let mut old_line = dep("toml", "0.5.11");
         old_line.members = vec![member("rawloader", "rawloader")];
@@ -2419,7 +2553,7 @@ mod tests {
         // not the member's own entry) — the member's move has landed.
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
         old_line.direct = false;
         let verified = verify_applied_targets(report, &planned, &[old_line, new_line]);
@@ -2439,7 +2573,7 @@ mod tests {
         let planned = vec![held_a.clone(), held_b.clone()];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
         let mut a_dep = dep("nix", "0.28.0");
         a_dep.members = vec![member("app-a", "crates/app-a")];
@@ -2466,7 +2600,7 @@ mod tests {
         let planned = vec![held_a.clone(), held_b];
         let report = ApplyReport {
             applied: planned.clone(),
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
 
         let verified = verify_applied_targets(report, &planned, &[dep("shared", "1.0.0")]);
@@ -2482,7 +2616,7 @@ mod tests {
         let collateral = change("itoa", "1.0.0", "1.0.1");
         let report = ApplyReport {
             applied: vec![planned_change.clone(), collateral.clone()],
-            skipped: Vec::new(),
+            ..ApplyReport::default()
         };
 
         let verified = verify_applied_targets(
@@ -2519,17 +2653,21 @@ mod tests {
             applied: true,
             skipped: None,
             error: None,
+            edge: None,
         }
     }
 
-    fn no_prior() -> HashSet<(String, String)> {
+    fn no_prior() -> HashSet<ViolationKey> {
         HashSet::new()
     }
 
-    fn violations(items: &[(&str, &str)]) -> HashSet<(String, String)> {
+    fn violations(items: &[(&str, &str)]) -> HashSet<ViolationKey> {
         items
             .iter()
-            .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+            .map(|(name, version)| ViolationKey {
+                package: (*name).to_string(),
+                version: (*version).to_string(),
+            })
             .collect()
     }
 
@@ -2555,7 +2693,10 @@ mod tests {
 
         assert_eq!(
             newly_introduced_violations(&before, &after),
-            vec![("t".to_string(), "1.0.0".to_string())]
+            vec![ViolationKey {
+                package: "t".to_string(),
+                version: "1.0.0".to_string(),
+            }]
         );
     }
 
@@ -2566,7 +2707,10 @@ mod tests {
 
         assert_eq!(
             newly_introduced_violations(&before, &after),
-            vec![("other".to_string(), "2.0.0".to_string())]
+            vec![ViolationKey {
+                package: "other".to_string(),
+                version: "2.0.0".to_string(),
+            }]
         );
     }
 
@@ -2661,8 +2805,10 @@ mod tests {
             applied_item("quote", "1.0.5", "1.0.7", false),
             applied_item("quote", "1.0.7", "1.0.4", true),
         ];
-        let prior: HashSet<(String, String)> =
-            HashSet::from([("quote".to_string(), "1.0.5".to_string())]);
+        let prior: HashSet<ViolationKey> = HashSet::from([ViolationKey {
+            package: "quote".to_string(),
+            version: "1.0.5".to_string(),
+        }]);
         collapse_applied_legs(&mut items, ".", "cargo", &prior, no_kind);
         assert_eq!(items.len(), 1);
         assert_eq!(

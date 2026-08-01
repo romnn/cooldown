@@ -115,4 +115,23 @@ mod tests {
         assert_eq!(scan.global.major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
     }
+
+    /// The cargo-only `edge-policy` key is rejected under registry/project selectors (which are
+    /// policy-only and could never honor it), like the misplaced exclude lists before it.
+    #[test]
+    fn edge_policy_is_rejected_under_registry_and_project_selectors() {
+        for src in [
+            "[registry.\"npmjs.com\"]\nedge-policy = \"preserve\"\n",
+            "[project.\"apps/*\"]\nedge-policy = \"preserve\"\n",
+        ] {
+            let doc = ConfigDocument::parse(src, &Origin::Global).expect("parse config document");
+            let err = doc
+                .policy_layer(Origin::Global)
+                .expect_err("a misplaced edge-policy must be rejected");
+            assert!(
+                err.to_string().contains("[tool.cargo]"),
+                "the error points at the correct placement: {err}"
+            );
+        }
+    }
 }

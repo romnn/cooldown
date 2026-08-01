@@ -6,7 +6,8 @@
 //! `minAgeSource` enums are part of the contract.
 
 use cooldown_core::{
-    Diagnostic, HeldReason, LockStatus, MemberRef, SkipReason, Status, UpdateKind,
+    Diagnostic, EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status,
+    UpdateKind,
 };
 use serde::{Serialize, Serializer};
 
@@ -428,6 +429,25 @@ pub struct SkippedInfo {
     pub offending: Option<String>,
 }
 
+/// The lock-edge block on an [`UpgradeItem`]: which dependent's edge was rebound between two
+/// coexisting versions of the row's package, and what the edge policy did about it. Present iff
+/// the row reports an edge *binding* move rather than a package version change (cargo only; see
+/// [`cooldown_core::EdgePolicy`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeEdgeInfo {
+    /// The dependent package whose edge moved (e.g. `diesel`).
+    pub dependent: String,
+    /// The dependent's resolved version.
+    pub dependent_version: String,
+    /// What the edge policy did (or observed): `restored`, `canonicalized`, `rebound`, or `held`
+    /// (a correction was withheld; the row's `to` is the target that was not applied).
+    pub action: EdgeBindingAction,
+    /// Why a correction was withheld (`held` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// One row in an `upgrade` or `fix` report: a planned version change and its outcome.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -466,14 +486,21 @@ pub struct UpgradeItem {
     /// The error that prevented the change, if one occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
+    /// The lock-edge block, present iff this row reports an edge *binding* move between coexisting
+    /// versions rather than a package version change. [`from`](UpgradeItem::from)/
+    /// [`to`](UpgradeItem::to) then carry the binding versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<UpgradeEdgeInfo>,
 }
 
 impl UpgradeItem {
-    /// Ordering key for the report: errored/skipped changes first, planned rows next, and applied
-    /// rows last.
+    /// Ordering key for the report: errored/skipped changes first, planned rows next, applied
+    /// rows after those, and edge-binding rows last (footnotes to the version changes above them).
     #[must_use]
     pub fn sort_rank(&self) -> u8 {
-        if let Some(skip) = &self.skipped {
+        if self.edge.is_some() {
+            5
+        } else if let Some(skip) = &self.skipped {
             if matches!(
                 skip.reason,
                 SkipReason::NeedsMajor
@@ -505,6 +532,13 @@ pub struct UpgradeSummary {
     pub skipped: usize,
     /// The number of changes that errored.
     pub errors: usize,
+    /// The number of lock-edge bindings a corrective edge policy wrote back (`restored` or
+    /// `canonicalized` rows). Counted apart from [`applied`](UpgradeSummary::applied): an edge
+    /// correction changes the lock without moving any package version.
+    pub edges_corrected: usize,
+    /// The number of lock-edge corrections that were withheld (`held` rows). Under `--strict` a
+    /// non-zero count fails the run — a requested correction could not be completed.
+    pub edges_held: usize,
 }
 
 /// The post-mutation build result reported in [`UpgradeMeta`].
@@ -521,7 +555,8 @@ pub struct BuildInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeMeta {
-    /// Whether any change was applied (`false` for a dry run).
+    /// Whether any mutation was applied — a package version change or a corrected lock-edge
+    /// binding (a dry run reports what the real run would apply).
     pub applied: bool,
     /// Re-lock status; `null` for `--dry-run` (which never mutates).
     pub lock_status: Option<LockStatus>,

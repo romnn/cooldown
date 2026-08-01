@@ -4,6 +4,7 @@
 //! chosen window. `[package.metadata.cooldown]` is read as a native config layer.
 
 pub mod cargocmd;
+mod edges;
 pub mod index;
 mod manifest;
 mod native;

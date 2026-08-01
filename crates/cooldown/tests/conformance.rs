@@ -91,6 +91,10 @@ struct FakeEco {
     /// executor must surface them, mirroring how the uv adapter reports a forced non-candidate move
     /// from the full lock diff (never silent).
     collateral_on_apply: Vec<Change>,
+    /// Edge-binding rebinds the fake reports from its apply — simulating the cargo adapter's
+    /// edge-policy pass so the app layer's plumbing (report rows, counts) is conformance-tested
+    /// without a real `Cargo.lock`.
+    edge_rebinds_on_apply: Vec<EdgeRebind>,
     stale_lock: bool,
     fail_graph_after_apply: bool,
     fail_locked_release_after_apply_for: Option<String>,
@@ -292,6 +296,7 @@ impl ToolWrite for FakeEco {
         Ok(ApplyReport {
             applied,
             skipped: Vec::new(),
+            edge_rebinds: self.edge_rebinds_on_apply.clone(),
         })
     }
     async fn build(&self, _p: &Project) -> Result<VerifyReport> {
@@ -438,10 +443,18 @@ fn opts() -> RunOpts {
     }
 }
 
-fn tmp_root() -> (tempfile::TempDir, Utf8PathBuf) {
+/// A fresh temp-dir project root for one fake ecosystem.
+struct TmpRoot {
+    /// Owns the temporary directory; dropping it deletes the tree.
+    guard: tempfile::TempDir,
+    /// The directory's UTF-8 path, handed to the fake as its project root.
+    root: Utf8PathBuf,
+}
+
+fn tmp_root() -> TmpRoot {
     let dir = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-    (dir, root)
+    TmpRoot { guard: dir, root }
 }
 
 fn fake(
@@ -459,6 +472,7 @@ fn fake(
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -497,7 +511,7 @@ fn release_named(releases: &[Release], version: &str) -> Release {
 
 #[tokio::test]
 async fn outdated_splits_adoptable_and_in_cooldown() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     // `a`: the newest (v1.2.0) is still cooling, but v1.1.0 has matured → adoptable (you can update).
     releases.insert(
@@ -539,6 +553,7 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -572,7 +587,7 @@ async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
     // The ruff scenario: locked at 0.15.15 with three newer patches under the default 7-day window
     // (now = 2026-06-17, cutoff 2026-06-10). 0.15.16 has matured (adoptable); 0.15.17 and 0.15.18 are
     // still cooling. 0.15.18 is the freshest (newest), but 0.15.17 unlocks three days sooner.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "ruff".to_string(),
@@ -657,7 +672,7 @@ async fn outdated_default_view_never_labels_even_with_an_unclassifiable_newest()
     // yet never becomes a candidate; the shown candidate is the next one down, 0.15.17. The label is
     // suppressed by comparing the shown version against the newest *candidate* (not `verdict.latest`),
     // so the cell stays bare — byte-identical to the pre-feature output.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "ruff".to_string(),
@@ -706,7 +721,7 @@ async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_
     // which the report surfaces. `fix` (downgrade-only) never advances anything. Here a direct dep
     // `a` has a matured newer version, and bumping it drags the indirect `t` forward to its newest
     // matured release — exactly the MVS promotion the new scope relies on.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -793,7 +808,7 @@ async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_
 
 #[tokio::test]
 async fn outdated_transitive_scopes_in_indirect_deps() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     // Both a direct and a transitive dep have a matured newer version → both are adoptable.
     for name in ["a", "t"] {
@@ -819,6 +834,7 @@ async fn outdated_transitive_scopes_in_indirect_deps() {
             locked: HashMap::new(),
             inject_fresh_on_apply: false,
             collateral_on_apply: Vec::new(),
+            edge_rebinds_on_apply: Vec::new(),
             stale_lock: false,
             fail_graph_after_apply: false,
             fail_locked_release_after_apply_for: None,
@@ -845,7 +861,7 @@ async fn outdated_transitive_scopes_in_indirect_deps() {
 
 #[tokio::test]
 async fn per_tool_exclude_prunes_workspace_member_dependencies() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut kept = dep("kept", "v1.0.0", true);
     kept.members = vec![MemberRef {
         name: "kept-app".into(),
@@ -879,6 +895,7 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -907,7 +924,7 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
 
 #[tokio::test]
 async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut kept = dep("kept", "v1.0.0", true);
     kept.members = vec![MemberRef {
         name: "@app/kept".into(),
@@ -941,6 +958,7 @@ async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -975,7 +993,7 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
     // Coverage for the global/command `opts.exclude_packages` branch (set from `[global]`/
     // `[<command>]` or `--exclude-packages`), distinct from the per-tool map: `dependencies_in_scope`
     // seeds its package matcher from `opts.exclude_packages` before extending with the per-tool list.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut kept = dep("kept", "v1.0.0", true);
     kept.members = vec![MemberRef {
         name: "@app/kept".into(),
@@ -1009,6 +1027,7 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1035,7 +1054,7 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
 
 #[tokio::test]
 async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut locked = HashMap::new();
     locked.insert(
         "a".to_string(),
@@ -1054,6 +1073,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
         locked: locked.clone(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1096,7 +1116,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
 
 #[tokio::test]
 async fn check_transitive_allow_and_hide_modes() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut locked = HashMap::new();
     locked.insert(
         "a".to_string(),
@@ -1115,6 +1135,7 @@ async fn check_transitive_allow_and_hide_modes() {
         locked: locked.clone(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1154,7 +1175,7 @@ async fn check_transitive_allow_and_hide_modes() {
 
 #[tokio::test]
 async fn check_fails_closed_on_stale_lock() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
         transitive: vec![],
@@ -1163,6 +1184,7 @@ async fn check_fails_closed_on_stale_lock() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: true,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1180,7 +1202,7 @@ async fn check_fails_closed_on_stale_lock() {
 
 #[tokio::test]
 async fn upgrade_applies_clean_change() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1207,6 +1229,7 @@ async fn upgrade_applies_clean_change() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1225,7 +1248,7 @@ async fn upgrade_applies_clean_change() {
 
 #[tokio::test]
 async fn upgrade_warns_when_final_lock_currency_is_unknown() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1252,6 +1275,7 @@ async fn upgrade_warns_when_final_lock_currency_is_unknown() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1276,7 +1300,7 @@ async fn upgrade_warns_when_final_lock_currency_is_unknown() {
 
 #[tokio::test]
 async fn upgrade_honors_allow_stale_lock_after_apply() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1303,6 +1327,7 @@ async fn upgrade_honors_allow_stale_lock_after_apply() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1335,7 +1360,7 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
     // committed lock, so it MUST appear in the report. The silent-non-candidate-downgrade bug was
     // exactly this move being applied to the lock yet omitted from the report, which let it ping-pong
     // back on the next run. Here the forced `b` downgrade is asserted to surface as its own applied row.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1385,6 +1410,7 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: vec![forced_b_downgrade],
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1414,6 +1440,202 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
     assert_eq!(b.from, "v2.1.0");
     assert_eq!(b.to, "v2.0.0");
     assert!(b.downgrade);
+}
+
+#[tokio::test]
+async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts() {
+    // An adapter's apply can report lock-edge *binding* moves beside the version changes (the cargo
+    // edge policy). Each rebind must surface as its own report row — carrying the dependent and the
+    // policy outcome — while the applied/skipped/error counts stay those of the version changes:
+    // edge activity is counted apart, in `edges_corrected`/`edges_held`.
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let rebind = |action| EdgeRebind {
+        dependent: "diesel".to_string(),
+        dependent_version: Version::new("2.3.11"),
+        dependency: PackageId::new(GO, "uuid", Some("proxy.example".into())),
+        from: Version::new("v0.8.2"),
+        to: Version::new("v1.24.0"),
+        action,
+        detail: None,
+    };
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: vec![
+            rebind(EdgeBindingAction::Restored),
+            EdgeRebind {
+                dependent: "arboard".to_string(),
+                dependent_version: Version::new("3.6.1"),
+                dependency: PackageId::new(GO, "windows-sys", Some("proxy.example".into())),
+                from: Version::new("v0.60.2"),
+                to: Version::new("v0.52.0"),
+                action: EdgeBindingAction::Rebound,
+                detail: None,
+            },
+        ],
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let ws = workspace(fake, Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    // The version-change counts are untouched by the edge rows; edge activity is counted apart.
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.skipped, 0);
+    assert_eq!(out.summary.errors, 0);
+    assert_eq!(
+        out.summary.edges_corrected, 1,
+        "the restored edge counts as a correction"
+    );
+    assert_eq!(
+        out.summary.edges_held, 0,
+        "a plain rebound observation is not a held correction"
+    );
+
+    let restored = out
+        .items
+        .iter()
+        .find(|item| item.name == "uuid")
+        .expect("the restored edge must surface as its own row");
+    let edge = restored.edge.as_ref().expect("edge block");
+    assert_eq!(edge.dependent, "diesel");
+    assert_eq!(edge.dependent_version, "2.3.11");
+    assert_eq!(edge.action, EdgeBindingAction::Restored);
+    assert_eq!(restored.from, "v0.8.2");
+    assert_eq!(restored.to, "v1.24.0");
+    assert!(!restored.applied, "an edge row is not an applied change");
+    assert!(restored.skipped.is_none() && restored.error.is_none());
+
+    let rebound = out
+        .items
+        .iter()
+        .find(|item| item.name == "windows-sys")
+        .expect("the uncorrected rebind must surface too — never silent");
+    assert_eq!(
+        rebound.edge.as_ref().expect("edge block").action,
+        EdgeBindingAction::Rebound
+    );
+
+    // Edge rows sort after the applied rows: footnotes to the version changes above them.
+    let a_position = out.items.iter().position(|item| item.name == "a");
+    let uuid_position = out.items.iter().position(|item| item.name == "uuid");
+    assert!(a_position < uuid_position);
+}
+
+#[tokio::test]
+async fn upgrade_fails_strict_when_an_edge_correction_is_held() {
+    // A held edge is a requested correction the adapter could not complete (orphan guard, failed
+    // verification, ambiguous identity). Under `--strict` that is an incomplete mutation and must
+    // fail the run; without `--strict` it stays a reported row with the reason.
+    let releases_and_locked = || {
+        let mut releases = HashMap::new();
+        releases.insert(
+            "a".to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+        let mut locked = HashMap::new();
+        locked.insert(
+            "a".to_string(),
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        );
+        (releases, locked)
+    };
+    let held_fake = |root| {
+        let (releases, locked) = releases_and_locked();
+        FakeEco {
+            direct: vec![dep("a", "v1.0.0", true)],
+            transitive: vec![],
+            fresh_transitive: None,
+            releases,
+            locked,
+            inject_fresh_on_apply: false,
+            collateral_on_apply: Vec::new(),
+            edge_rebinds_on_apply: vec![EdgeRebind {
+                dependent: "diesel".to_string(),
+                dependent_version: Version::new("2.3.11"),
+                dependency: PackageId::new(GO, "uuid", Some("proxy.example".into())),
+                from: Version::new("v0.8.2"),
+                to: Version::new("v1.24.0"),
+                action: EdgeBindingAction::Held,
+                detail: Some(
+                    "rebinding away from uuid v0.8.2 would orphan its last lock reference"
+                        .to_string(),
+                ),
+            }],
+            stale_lock: false,
+            fail_graph_after_apply: false,
+            fail_locked_release_after_apply_for: None,
+            stale_lock_after_apply: false,
+            build_fails_after_apply: false,
+            state: Mutex::new(State::default()),
+            root,
+        }
+    };
+
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let ws = workspace(held_fake(root), Baseline::default());
+    let out = ws.upgrade(&opts()).await;
+    assert_eq!(
+        out.exit,
+        Exit::Ok,
+        "without --strict a held edge only reports"
+    );
+    assert_eq!(out.summary.edges_held, 1);
+    assert_eq!(out.summary.edges_corrected, 0);
+
+    let TmpRoot {
+        guard: _g2,
+        root: strict_root,
+    } = tmp_root();
+    let strict_ws = workspace(held_fake(strict_root), Baseline::default());
+    let strict_out = strict_ws
+        .upgrade(&RunOpts {
+            strict: true,
+            ..opts()
+        })
+        .await;
+    assert_eq!(
+        strict_out.exit,
+        Exit::Policy,
+        "a withheld correction is an incomplete mutation under --strict"
+    );
 }
 
 /// Releases for package "a": the current v1.0.0 plus a long-matured cross-major v2.0.0. `kind =
@@ -1454,6 +1676,7 @@ fn major_update_fake(root: camino::Utf8PathBuf, direct: bool, a_releases: Vec<Re
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -1466,7 +1689,7 @@ fn major_update_fake(root: camino::Utf8PathBuf, direct: bool, a_releases: Vec<Re
 
 #[tokio::test]
 async fn upgrade_surfaces_adoptable_major_update_held_back_by_default() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let ws = workspace(
         major_update_fake(root, true, a_v1_and_matured_v2()),
         Baseline::default(),
@@ -1494,7 +1717,7 @@ async fn upgrade_surfaces_adoptable_major_update_held_back_by_default() {
 
 #[tokio::test]
 async fn upgrade_major_adopts_the_update_instead_of_hinting() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let ws = workspace(
         major_update_fake(root, true, a_v1_and_matured_v2()),
         Baseline::default(),
@@ -1520,7 +1743,7 @@ async fn upgrade_major_adopts_the_update_instead_of_hinting() {
 
 #[tokio::test]
 async fn upgrade_reports_a_matured_target_held_by_a_declared_bound() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = a_v1_and_matured_v2();
     releases[1].beyond_declared_bound = true;
     let mut fake = major_update_fake(root, true, releases);
@@ -1551,7 +1774,7 @@ async fn upgrade_reports_a_matured_target_held_by_a_declared_bound() {
 
 #[tokio::test]
 async fn upgrade_applies_an_in_bound_update_and_reports_the_bound_held_major() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = vec![
         rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
         rel(
@@ -1593,7 +1816,7 @@ async fn upgrade_applies_an_in_bound_update_and_reports_the_bound_held_major() {
 
 #[tokio::test]
 async fn upgrade_does_not_report_a_bound_without_a_matured_target_beyond_it() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = a_v1_and_matured_v2();
     releases[1].published_at = Some(ts("2026-06-16T00:00:00Z"));
     releases[1].beyond_declared_bound = true;
@@ -1612,7 +1835,7 @@ async fn upgrade_does_not_report_a_bound_without_a_matured_target_beyond_it() {
 
 #[tokio::test]
 async fn upgrade_rewrite_crosses_a_declared_bound() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = a_v1_and_matured_v2();
     releases[1].beyond_declared_bound = true;
     let mut fake = major_update_fake(root, true, releases);
@@ -1632,7 +1855,7 @@ async fn upgrade_rewrite_crosses_a_declared_bound() {
 
 #[tokio::test]
 async fn upgrade_reports_a_matured_target_held_by_max_major() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = major_update_fake(root, true, a_v1_and_matured_v2());
     let mut ceiling = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
     let mut rule = Rule::new(Selector::Package {
@@ -1678,7 +1901,7 @@ fn a_v1_and_matured_v2_above_the_tag() -> Vec<Release> {
 
 #[tokio::test]
 async fn upgrade_reports_a_matured_target_held_by_the_dist_tag() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
     let out = workspace(fake, Baseline::default())
         .upgrade(&RunOpts {
@@ -1702,7 +1925,7 @@ async fn upgrade_reports_a_matured_target_held_by_the_dist_tag() {
 
 #[tokio::test]
 async fn upgrade_ignoring_dist_tags_crosses_the_tag() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
     let out = workspace(fake, Baseline::default())
         .upgrade(&RunOpts {
@@ -1719,7 +1942,7 @@ async fn upgrade_ignoring_dist_tags_crosses_the_tag() {
 
 #[tokio::test]
 async fn outdated_holds_a_major_above_the_tag_with_the_dist_tag_named() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
     let out = workspace(fake, Baseline::default())
         .outdated(&RunOpts {
@@ -1749,7 +1972,7 @@ async fn upgrade_major_crosses_a_direct_but_not_a_transitive() {
     // transitive dep has no editable constraint and the resolver would reject an independent
     // cross-major bump — so it is capped to its current major. Tool-agnostic: proven on the fake
     // adapter, so it holds for every tool that reports `direct` correctly.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), a_v1_and_matured_v2());
     releases.insert("t".to_string(), a_v1_and_matured_v2());
@@ -1801,7 +2024,7 @@ async fn upgrade_does_not_hint_a_transitive_major_update() {
     // Only a directly-declared dep can be adopted by `--major` (it rewrites a manifest constraint),
     // so a transitive cross-major must never be hinted — `cooldown upgrade --major -p <transitive>`
     // would do nothing. The dep is in scope (graph) but `dep.direct` is false.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let ws = workspace(
         major_update_fake(root, false, a_v1_and_matured_v2()),
         Baseline::default(),
@@ -1822,7 +2045,7 @@ async fn upgrade_applies_the_in_range_update_and_still_hints_the_major() {
     // A dep with both a matured in-range minor (v1.1.0) and a matured cross-major (v2.0.0): the
     // default run adopts the minor and still surfaces the major as a separate hint. The hint's `to`
     // is the major (not the just-applied minor) — the `!=` guard keeps them distinct.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let releases = vec![
         rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
         rel(
@@ -1862,7 +2085,7 @@ async fn upgrade_applies_the_in_range_update_and_still_hints_the_major() {
 
 #[tokio::test]
 async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -1900,7 +2123,7 @@ async fn fix_downgrades_two_simultaneously_too_fresh_deps_in_one_batch() {
     // too-fresh dep; neither must be reported as a conflict because the other also moved backward —
     // the regression the earlier collateral-downgrade guard introduced, where a fix that matured two
     // deps together was rolled back as a false conflict.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -1936,7 +2159,7 @@ async fn fix_downgrades_two_simultaneously_too_fresh_deps_in_one_batch() {
 
 #[tokio::test]
 async fn fix_warns_and_leaves_exact_pin_unless_opted_in() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -1961,7 +2184,7 @@ async fn fix_warns_and_leaves_exact_pin_unless_opted_in() {
 
 #[tokio::test]
 async fn fix_strict_fails_when_a_violation_is_left_unresolved() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -1987,7 +2210,7 @@ async fn fix_strict_fails_when_a_violation_is_left_unresolved() {
 
 #[tokio::test]
 async fn fix_downgrades_exact_pin_when_opted_in() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -2011,7 +2234,7 @@ async fn fix_downgrades_exact_pin_when_opted_in() {
 
 #[tokio::test]
 async fn fix_warns_and_leaves_graph_held_violation() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("a".to_string(), package_releases.clone());
@@ -2036,7 +2259,7 @@ async fn fix_warns_and_leaves_graph_held_violation() {
 
 #[tokio::test]
 async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let package_releases = too_fresh_fix_releases();
     let mut releases = HashMap::new();
     releases.insert("t".to_string(), package_releases.clone());
@@ -2094,7 +2317,7 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
 
 #[tokio::test]
 async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2127,6 +2350,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
         locked,
         inject_fresh_on_apply: true, // applying the change drags in `t`
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2151,7 +2375,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
 
 #[tokio::test]
 async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("fake.lock"), b"baseline lock").expect("seed fake lock");
     let mut releases = HashMap::new();
     releases.insert(
@@ -2191,6 +2415,7 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
         locked,
         inject_fresh_on_apply: true,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2230,7 +2455,7 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
 
 #[tokio::test]
 async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2267,6 +2492,7 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
         locked,
         inject_fresh_on_apply: true, // applying the `a` upgrade drags in `t`
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2292,7 +2518,7 @@ async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
     // The optimistic upgrade gate does not roll back solely because the first graph probe lacks a
     // per-node floor prediction. It keeps the forward move, lets the adapter try the reconcile
     // downgrade, and rolls back only if the final graph still has a newly introduced violation.
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2329,6 +2555,7 @@ async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
         locked,
         inject_fresh_on_apply: true,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2349,7 +2576,7 @@ async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
 
 #[tokio::test]
 async fn upgrade_checks_full_graph_even_when_package_filtered() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2381,6 +2608,7 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
         locked,
         inject_fresh_on_apply: true,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2409,7 +2637,7 @@ async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_
     // `v0.6.0` that the reconcile pass cannot mature down. Because `t` was ALREADY violating, floating
     // it is not a newly-introduced offender — the optimistic gate must keep the valid `a` upgrade
     // rather than roll it back (one dirty version line stayed one dirty version line).
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2458,6 +2686,7 @@ async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_
             direct: false,
             members: Vec::new(),
         }],
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2494,7 +2723,7 @@ async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_
 
 #[tokio::test]
 async fn upgrade_fails_closed_when_post_apply_validation_errors() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2521,6 +2750,7 @@ async fn upgrade_fails_closed_when_post_apply_validation_errors() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: true,
         fail_locked_release_after_apply_for: None,
@@ -2540,7 +2770,7 @@ async fn upgrade_fails_closed_when_post_apply_validation_errors() {
 
 #[tokio::test]
 async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2567,6 +2797,7 @@ async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: Some("a".into()),
@@ -2586,7 +2817,7 @@ async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
 
 #[tokio::test]
 async fn upgrade_reports_final_lock_and_build_failures() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2613,6 +2844,7 @@ async fn upgrade_reports_final_lock_and_build_failures() {
         locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2643,7 +2875,7 @@ async fn upgrade_reports_final_lock_and_build_failures() {
 
 #[tokio::test]
 async fn explain_traces_the_default_window() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
         transitive: vec![],
@@ -2652,6 +2884,7 @@ async fn explain_traces_the_default_window() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2672,7 +2905,7 @@ async fn explain_traces_the_default_window() {
 /// rule is applied (it would be silently skipped if explain resolved with no registry).
 #[tokio::test]
 async fn explain_applies_registry_scoped_rule() {
-    let (_g, root) = tmp_root();
+    let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)], // dep `a` is published from registry "proxy.example"
         transitive: vec![],
@@ -2681,6 +2914,7 @@ async fn explain_applies_registry_scoped_rule() {
         locked: HashMap::new(),
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
         stale_lock: false,
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
@@ -2852,7 +3086,7 @@ impl ToolWrite for RepoScopedFake {
 
 #[tokio::test]
 async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
-    let (_dir, root) = tmp_root();
+    let TmpRoot { guard: _dir, root } = tmp_root();
     let repo_writes = Arc::new(Mutex::new(0usize));
     let fake = RepoScopedFake {
         root: root.clone(),
@@ -3012,7 +3246,7 @@ impl ToolWrite for ProjectScopedFake {
 
 #[tokio::test]
 async fn sync_project_scope_writes_native_per_project() {
-    let (_dir, root) = tmp_root();
+    let TmpRoot { guard: _dir, root } = tmp_root();
     let native_writes = Arc::new(Mutex::new(Vec::new()));
     let fake = ProjectScopedFake {
         root: root.clone(),
@@ -3222,16 +3456,26 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
     )
 }
 
+/// One held/blocked candidate as a run reports it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HeldCandidate {
+    /// The candidate package that came back skipped.
+    package: String,
+    /// The blocker the resolve named, when it named one.
+    offending: Option<String>,
+}
+
 /// The held/blocked set a run reports: every typer-or-other candidate that came back skipped, with
 /// the blocker the resolve named. Shared by the real and dry-run assertions so the two are compared
 /// by the exact same extraction.
-fn held_set(items: &[cooldown::app::UpgradeItem]) -> Vec<(String, Option<String>)> {
-    let mut held: Vec<(String, Option<String>)> = items
+fn held_set(items: &[cooldown::app::UpgradeItem]) -> Vec<HeldCandidate> {
+    let mut held: Vec<HeldCandidate> = items
         .iter()
         .filter_map(|item| {
-            item.skipped
-                .as_ref()
-                .map(|skipped| (item.name.clone(), skipped.offending.clone()))
+            item.skipped.as_ref().map(|skipped| HeldCandidate {
+                package: item.name.clone(),
+                offending: skipped.offending.clone(),
+            })
         })
         .collect();
     held.sort();
@@ -3244,7 +3488,10 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
     // it because huggingface-hub requires typer<0.26.0. A `--dry-run` must preview the TRUE outcome —
     // typer HELD (not `planned`/applied) — by running the same resolve against a throwaway copy, so it
     // agrees with the real run exactly.
-    let (_real_dir, real_root) = tmp_root();
+    let TmpRoot {
+        guard: _real_dir,
+        root: real_root,
+    } = tmp_root();
     let real_sentinel = real_root.join("applied.sentinel");
 
     let dry = held_conflict_workspace(real_root.clone())
@@ -3281,7 +3528,10 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
     assert_eq!(dry.meta.lock_status, None);
 
     // The real run produces the identical held/blocked set — the two agree by construction.
-    let (_real_dir2, real_root2) = tmp_root();
+    let TmpRoot {
+        guard: _real_dir2,
+        root: real_root2,
+    } = tmp_root();
     let real = held_conflict_workspace(real_root2.clone())
         .upgrade(&opts())
         .await;
@@ -3292,7 +3542,10 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
     );
     assert_eq!(
         held_set(&real.items),
-        vec![("typer".to_string(), Some("huggingface-hub".to_string()))],
+        vec![HeldCandidate {
+            package: "typer".to_string(),
+            offending: Some("huggingface-hub".to_string()),
+        }],
     );
     // The real run did mutate its own (separate) root — proving the sentinel mechanism actually fires
     // when the apply is against the real tree, so the dry-run's absent sentinel is meaningful.
@@ -3306,7 +3559,7 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
 async fn dry_run_leaves_the_real_lock_and_manifest_byte_identical() {
     // Beyond "no sentinel": the real on-disk manifest and lock must be byte-for-byte unchanged after a
     // dry-run, since the whole resolve ran against a throwaway copy.
-    let (_dir, root) = tmp_root();
+    let TmpRoot { guard: _dir, root } = tmp_root();
     let manifest = root.join("pyproject.toml");
     let lock = root.join("uv.lock");
     std::fs::write(

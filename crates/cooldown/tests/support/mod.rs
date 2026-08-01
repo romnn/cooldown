@@ -218,6 +218,41 @@ impl CapturedOutput {
     }
 }
 
+/// The `from -> to` versions of one reported change row, extracted by
+/// [`Envelope::change_for`]/[`Envelope::changes_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeVersions {
+    /// The version the row moves from.
+    pub from: String,
+    /// The version the row moves to.
+    pub to: String,
+}
+
+impl ChangeVersions {
+    pub fn new(from: &str, to: &str) -> Self {
+        ChangeVersions {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+}
+
+/// One lock-edge row of an `upgrade`/`fix` report (an item carrying an `edge` block), extracted by
+/// [`Envelope::edge_rows`].
+#[derive(Debug)]
+pub struct EdgeRow {
+    /// The dependency whose binding moved (the row's package column).
+    pub dependency: String,
+    /// The dependent package whose edge it is.
+    pub dependent: String,
+    /// The policy outcome: `restored`, `canonicalized`, `rebound`, or `held`.
+    pub action: String,
+    /// The binding version before the move (for `held`, the binding that stays in place).
+    pub from: String,
+    /// The binding version after the move (for `held`, the withheld correction target).
+    pub to: String,
+}
+
 /// A parsed `cooldown --json` envelope with typed accessors for the fields the invariants check.
 #[derive(Debug)]
 pub struct Envelope {
@@ -270,6 +305,23 @@ impl Envelope {
 
     pub fn summary_violations(&self) -> u64 {
         self.summary_u64("violations")
+    }
+
+    pub fn summary_edges_corrected(&self) -> u64 {
+        self.summary_u64("edgesCorrected")
+    }
+
+    pub fn summary_edges_held(&self) -> u64 {
+        self.summary_u64("edgesHeld")
+    }
+
+    /// `meta.applied` (flattened at the top level): whether any mutation was written — a version
+    /// change or a corrected lock-edge binding.
+    pub fn meta_applied(&self) -> bool {
+        self.value
+            .get("applied")
+            .and_then(serde_json::Value::as_bool)
+            .expect("envelope.applied")
     }
 
     /// The number of *direct* dependencies `check` flagged as a cooldown violation (`direct == true`
@@ -399,26 +451,46 @@ impl Envelope {
     }
 
     /// The `from -> to` change reported for a named item, if present.
-    pub fn change_for(&self, name: &str) -> Option<(String, String)> {
+    pub fn change_for(&self, name: &str) -> Option<ChangeVersions> {
         self.items().iter().find_map(|item| {
             if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
                 return None;
             }
-            let from = item.get("from")?.as_str()?.to_owned();
-            let to = item.get("to")?.as_str()?.to_owned();
-            Some((from, to))
+            Some(ChangeVersions {
+                from: item.get("from")?.as_str()?.to_owned(),
+                to: item.get("to")?.as_str()?.to_owned(),
+            })
         })
     }
 
     /// Every `from -> to` row reported for a package, preserving report order.
-    pub fn changes_for(&self, name: &str) -> Vec<(String, String)> {
+    pub fn changes_for(&self, name: &str) -> Vec<ChangeVersions> {
         self.items()
             .iter()
             .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
             .filter_map(|item| {
-                let from = item.get("from")?.as_str()?.to_owned();
-                let to = item.get("to")?.as_str()?.to_owned();
-                Some((from, to))
+                Some(ChangeVersions {
+                    from: item.get("from")?.as_str()?.to_owned(),
+                    to: item.get("to")?.as_str()?.to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    /// The lock-edge rows of an `upgrade`/`fix` report, in report order. Empty when no edge
+    /// binding moved (or the tool has no edge policy).
+    pub fn edge_rows(&self) -> Vec<EdgeRow> {
+        self.items()
+            .iter()
+            .filter_map(|item| {
+                let edge = item.get("edge")?;
+                Some(EdgeRow {
+                    dependency: item.get("name")?.as_str()?.to_owned(),
+                    dependent: edge.get("dependent")?.as_str()?.to_owned(),
+                    action: edge.get("action")?.as_str()?.to_owned(),
+                    from: item.get("from")?.as_str()?.to_owned(),
+                    to: item.get("to")?.as_str()?.to_owned(),
+                })
             })
             .collect()
     }
@@ -563,15 +635,15 @@ pub fn go_mod_pins(go_mod: &[u8]) -> BTreeMap<String, String> {
         if in_block {
             if line == ")" {
                 in_block = false;
-            } else if let Some((path, version)) = go_require_pair(line) {
-                pins.insert(path, version);
+            } else if let Some(require) = go_require_pair(line) {
+                pins.insert(require.path, require.version);
             }
         } else if line == "require (" {
             in_block = true;
         } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some((path, version)) = go_require_pair(rest.trim())
+            && let Some(require) = go_require_pair(rest.trim())
         {
-            pins.insert(path, version);
+            pins.insert(require.path, require.version);
         }
     }
     pins
@@ -672,14 +744,23 @@ pub fn deno_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
     pins
 }
 
-/// Split a `module/path v1.2.3` line into `(path, version)`, requiring a `v`-prefixed second field.
-fn go_require_pair(line: &str) -> Option<(String, String)> {
+/// One `go.mod` require line split into its parts.
+struct GoRequire {
+    /// The required module path.
+    path: String,
+    /// The `v`-prefixed pinned version.
+    version: String,
+}
+
+/// Split a `module/path v1.2.3` line, requiring a `v`-prefixed second field.
+fn go_require_pair(line: &str) -> Option<GoRequire> {
     let mut fields = line.split_whitespace();
     let path = fields.next()?;
     let version = fields.next()?;
-    version
-        .starts_with('v')
-        .then(|| (path.to_string(), version.to_string()))
+    version.starts_with('v').then(|| GoRequire {
+        path: path.to_string(),
+        version: version.to_string(),
+    })
 }
 
 /// Extract the quoted value of a `key = "value"` line, if the line is exactly that field.

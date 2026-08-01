@@ -364,6 +364,28 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Enforces the lock **edge-binding** policy without any planned version change, so a policy
+    /// that can heal pre-existing state ([`EdgePolicy::Canonicalize`](crate::EdgePolicy)) is not
+    /// gated on an unrelated upgrade existing. `apply` already enforces the policy as part of its
+    /// re-resolve; the mutating commands call this when no committed apply ran for the project.
+    /// Returns the corrected (or held) rebinds; adapters without ambiguous edge bindings keep the
+    /// default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned, the
+    /// lock cannot be read, or the metadata the policy's requirement checks need cannot be fetched
+    /// — a failed prerequisite must surface as the project error it is, never as a successful
+    /// no-op. A correction that fails the adapter's own lock verification is rolled back and
+    /// reported as held, not an error.
+    async fn normalize_lock_edges(
+        &self,
+        _project: &Project,
+        _policy: crate::EdgePolicy,
+    ) -> Result<Vec<crate::EdgeRebind>> {
+        Ok(Vec::new())
+    }
+
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
     /// The default implementation returns [`SyncReport::Unsupported`]; adapters that can sync

@@ -91,6 +91,11 @@ pub fn json_schema() -> Value {
         .iter()
         .map(|reason| Value::String(reason.wire_value().to_string()))
         .collect();
+    // Same construction for the edge-binding action set.
+    let edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -208,11 +213,13 @@ pub fn json_schema() -> Value {
         },
         "upgradeSummary": {
             "type": "object",
-            "required": ["applied", "skipped", "errors"],
+            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesHeld"],
             "properties": {
                 "applied": { "type": "integer", "minimum": 0 },
                 "skipped": { "type": "integer", "minimum": 0 },
-                "errors": { "type": "integer", "minimum": 0 }
+                "errors": { "type": "integer", "minimum": 0 },
+                "edgesCorrected": { "type": "integer", "minimum": 0 },
+                "edgesHeld": { "type": "integer", "minimum": 0 }
             },
             "additionalProperties": false
         },
@@ -232,7 +239,22 @@ pub fn json_schema() -> Value {
                 "kind": { "enum": ["patch", "minor", "major"] },
                 "applied": { "type": "boolean" },
                 "skipped": { "$ref": "#/$defs/skippedInfo" },
-                "error": { "$ref": "#/$defs/diagnostic" }
+                "error": { "$ref": "#/$defs/diagnostic" },
+                "edge": { "$ref": "#/$defs/upgradeEdgeInfo" }
+            },
+            "additionalProperties": false
+        },
+        // Present iff the row reports a lock-edge *binding* move between coexisting versions
+        // (cargo `--cargo-edge-policy`); `from`/`to` then carry the binding versions (for `held`,
+        // `to` is the withheld correction target and `detail` says why it was withheld).
+        "upgradeEdgeInfo": {
+            "type": "object",
+            "required": ["dependent", "dependentVersion", "action"],
+            "properties": {
+                "dependent": { "type": "string" },
+                "dependentVersion": { "type": "string" },
+                "action": { "enum": edge_actions },
+                "detail": { "type": "string" }
             },
             "additionalProperties": false
         },
@@ -468,7 +490,8 @@ mod tests {
         BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
         CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
         ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
-        OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+        OutdatedSummary, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
+        Window,
     };
     use cooldown_core::{
         Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
@@ -499,6 +522,9 @@ mod tests {
             SkipReason::DistTagHeld,
         ] {
             let mut item = upgrade_item();
+            // The schema sample carries an `edge` block, which would rank the row as an
+            // edge-binding footnote; this test is about plain skip rows.
+            item.edge = None;
             item.skipped = Some(SkippedInfo {
                 reason,
                 message: reason.message().to_string(),
@@ -543,6 +569,7 @@ mod tests {
         assert_def_keys(schema, "checkItem", check_item());
         assert_def_keys(schema, "upgradeSummary", upgrade_summary());
         assert_def_keys(schema, "upgradeItem", upgrade_item());
+        assert_def_keys(schema, "upgradeEdgeInfo", upgrade_edge_info());
         assert_def_keys(schema, "explainSummary", ExplainSummary {});
         assert_def_keys(schema, "explainStep", explain_step());
         assert_def_keys(schema, "configSummary", config_summary());
@@ -821,6 +848,8 @@ mod tests {
             applied: 1,
             skipped: 1,
             errors: 0,
+            edges_corrected: 1,
+            edges_held: 1,
         }
     }
 
@@ -839,6 +868,16 @@ mod tests {
             applied: false,
             skipped: Some(skipped_info()),
             error: Some(diagnostic()),
+            edge: Some(upgrade_edge_info()),
+        }
+    }
+
+    fn upgrade_edge_info() -> UpgradeEdgeInfo {
+        UpgradeEdgeInfo {
+            dependent: "diesel".to_string(),
+            dependent_version: "2.3.11".to_string(),
+            action: cooldown_core::EdgeBindingAction::Held,
+            detail: Some("would orphan its last lock reference".to_string()),
         }
     }
 

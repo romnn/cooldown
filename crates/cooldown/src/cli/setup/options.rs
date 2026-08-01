@@ -94,6 +94,7 @@ pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
     cfg: &CommandConfig,
+    cargo_edge_policy: Option<cooldown_core::EdgePolicy>,
     default_major: bool,
 ) -> Result<ResolvedInvocation, CoreError> {
     let explicit = explicit_command_config(global, overrides);
@@ -125,6 +126,12 @@ pub(super) fn resolve_invocation(
             } else {
                 cooldown_core::RewriteMode::Auto
             },
+            // Cargo-scoped: an explicit `--cargo-edge-policy` wins over the `[tool.cargo]`
+            // `edge-policy` config value, then the built-in default (preserve).
+            edge_policy: overrides
+                .edge_policy
+                .or(cargo_edge_policy)
+                .unwrap_or_default(),
             transitive: merged.transitive.unwrap_or(false),
             // A display control, read straight from the CLI (not config-file backed); absent, the
             // report counts down to the latest version.

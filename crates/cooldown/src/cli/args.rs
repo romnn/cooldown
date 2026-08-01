@@ -106,6 +106,37 @@ pub(crate) enum TransitiveMode {
     Hide,
 }
 
+/// `upgrade`/`fix --cargo-edge-policy <preserve|canonicalize|none>`: how the cargo adapter treats
+/// resolved lock **edge bindings** after the whole-graph re-resolve. An incremental re-resolve can
+/// silently rebind an edge between two coexisting versions a wide declared range admits — a
+/// build-affecting change the per-version report cannot see. `preserve` (the default) restores
+/// such churn to the pre-upgrade binding; `canonicalize` binds every ambiguous edge to the highest
+/// locked version satisfying its requirement (also healing pre-existing bad bindings); `none` only
+/// reports. Cargo-specific, so both the flag and the config key are cargo-scoped: in config it
+/// lives under `[tool.cargo]` as `edge-policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum EdgePolicyArg {
+    /// Restore any edge the re-resolve rebound between still-coexisting versions (the default).
+    #[default]
+    Preserve,
+    /// Bind every ambiguous edge to the highest locked version satisfying its requirement.
+    Canonicalize,
+    /// Leave bindings as the resolver produced them; rebinds are still reported.
+    None,
+}
+
+impl EdgePolicyArg {
+    /// Map the CLI flag onto the core [`EdgePolicy`](cooldown_core::EdgePolicy).
+    pub(in crate::cli) fn policy(self) -> cooldown_core::EdgePolicy {
+        match self {
+            EdgePolicyArg::Preserve => cooldown_core::EdgePolicy::Preserve,
+            EdgePolicyArg::Canonicalize => cooldown_core::EdgePolicy::Canonicalize,
+            EdgePolicyArg::None => cooldown_core::EdgePolicy::None,
+        }
+    }
+}
+
 /// `outdated --countdown <latest|soonest>`: which still-cooling upgrade the "Cooldown" column
 /// counts down to when several newer versions exist. Display-only — neither value changes what is
 /// adoptable, only which candidate's `age/window` the column shows.
@@ -183,6 +214,12 @@ pub(in crate::cli) enum Command {
         /// upper bound: by default such a bound holds even with `--major`.
         #[arg(long)]
         rewrite: bool,
+        /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
+        /// `preserve` restores bindings the resolver churned between coexisting versions
+        /// (default), `canonicalize` binds each ambiguous edge to the highest version satisfying
+        /// its requirement, `none` only reports rebinds. Config: `[tool.cargo] edge-policy`.
+        #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
+        edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]
         mutation: MutationArgs,
     },
@@ -197,6 +234,12 @@ pub(in crate::cli) enum Command {
         /// left in place with a warning, since a pin is a deliberate choice.
         #[arg(long = "downgrade-pinned")]
         downgrade_pinned: bool,
+        /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
+        /// `preserve` restores bindings the resolver churned between coexisting versions
+        /// (default), `canonicalize` binds each ambiguous edge to the highest version satisfying
+        /// its requirement, `none` only reports rebinds. Config: `[tool.cargo] edge-policy`.
+        #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
+        edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]
         mutation: MutationArgs,
     },
@@ -493,6 +536,10 @@ pub struct CliOverrides {
     pub(crate) countdown: Option<Countdown>,
     /// `upgrade --rewrite` — CLI-only manifest-rewrite control (not config-backed).
     pub(crate) rewrite: Option<bool>,
+    /// `upgrade`/`fix --cargo-edge-policy <preserve|canonicalize|none>` — the cargo lock
+    /// edge-binding policy, if set on the CLI (`[tool.cargo] edge-policy` supplies the default
+    /// otherwise).
+    pub(crate) edge_policy: Option<cooldown_core::EdgePolicy>,
     /// `check`/`config --fail-on-stricter-native` — CLI-only (not config-backed).
     pub(crate) fail_on_stricter_native: Option<bool>,
     /// `check`/`config --no-fail-on-stricter-native` — CLI-only override of a config `strict-native`.
@@ -545,6 +592,16 @@ impl CliOverrides {
                 .subcommand_matches("outdated")
                 .and_then(|sub| sub.get_one::<Countdown>("countdown").copied()),
             rewrite: set_on_subcommand(matches, "upgrade", "rewrite").then_some(true),
+            // `--cargo-edge-policy <policy>` carries an enum value on the mutating commands; only
+            // the active subcommand holds a value, so take it from whichever ran.
+            edge_policy: ["upgrade", "fix"]
+                .iter()
+                .find_map(|command| {
+                    matches
+                        .subcommand_matches(command)
+                        .and_then(|sub| sub.get_one::<EdgePolicyArg>("edge_policy").copied())
+                })
+                .map(EdgePolicyArg::policy),
             // `--strict` is shared by the mutating commands (flattened into both `upgrade` and `fix`).
             strict: (set_on_subcommand(matches, "upgrade", "strict")
                 || set_on_subcommand(matches, "fix", "strict"))
@@ -650,6 +707,7 @@ mod tests {
             hide_pinned,
             countdown,
             rewrite,
+            edge_policy,
             fail_on_stricter_native,
             no_fail_on_stricter_native,
             lock,
@@ -675,6 +733,7 @@ mod tests {
             hide_pinned,
             countdown,
             rewrite,
+            edge_policy,
             fail_on_stricter_native,
             no_fail_on_stricter_native,
             lock,

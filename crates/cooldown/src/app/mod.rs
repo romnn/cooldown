@@ -27,12 +27,14 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use cooldown_render::{
     BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
     EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
-    OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+    OutdatedSummary, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
+    Window,
 };
 pub use progress::Progress;
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace};
 
 pub(crate) use workspace::{
-    LockReportAction, age_days, diag_from_error, lock_report_outcome, render_window, round2,
+    FetchedRelease, LockReportAction, age_days, diag_from_error, lock_report_outcome,
+    render_window, round2,
 };
