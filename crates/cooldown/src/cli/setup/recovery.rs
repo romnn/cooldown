@@ -26,7 +26,10 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let scan_root = scan_root_for(&workdir, &repo_root);
     let mut targets = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
-        let roots = cargo_recovery_roots(&scan_root, !global.no_gitignore)?;
+        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root);
+        roots.extend(cargo_recovery_roots(&scan_root, !global.no_gitignore)?);
+        roots.sort();
+        roots.dedup();
         for root in roots.into_iter().filter(|root| {
             workdir == scan_root || workdir.starts_with(root) || root.starts_with(&workdir)
         }) {
@@ -44,6 +47,19 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
         json: global.json,
         progress: super::options::progress_mode(global),
     })
+}
+
+fn direct_cargo_recovery_roots(workdir: &Utf8Path, repo_root: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let mut roots = Vec::new();
+    for ancestor in workdir.ancestors() {
+        if ancestor.join(RECOVERY_MARKER).is_file() {
+            roots.push(ancestor.to_owned());
+        }
+        if ancestor == repo_root {
+            break;
+        }
+    }
+    roots
 }
 
 fn selected_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError> {
@@ -156,5 +172,42 @@ mod tests {
 
         assert_eq!(prepared.targets.len(), 1);
         assert_eq!(prepared.targets[0].root, root);
+    }
+
+    #[test]
+    fn explicit_ignored_project_is_still_a_recovery_target() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("ignored/project");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(root.join(".gitignore"), "ignored/\n")?;
+        std::fs::write(project.join(RECOVERY_MARKER), "{}")?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", project.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        assert_eq!(prepared.targets.len(), 1);
+        assert_eq!(prepared.targets[0].root, project);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_hidden_project_is_still_a_recovery_target() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join(".hidden/project");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(project.join(RECOVERY_MARKER), "{}")?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", project.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        assert_eq!(prepared.targets.len(), 1);
+        assert_eq!(prepared.targets[0].root, project);
+        Ok(())
     }
 }

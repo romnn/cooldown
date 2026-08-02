@@ -361,10 +361,42 @@ impl ToolWrite for FakeEco {
             applied,
             skipped: Vec::new(),
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
-            warnings: Vec::new(),
+            warnings: p
+                .root
+                .join("warn-on-apply")
+                .exists()
+                .then(|| {
+                    Diagnostic::new(
+                        DiagnosticKind::Filesystem,
+                        "committed correction durability is uncertain",
+                    )
+                })
+                .into_iter()
+                .collect(),
         })
     }
-    async fn build(&self, _p: &Project) -> Result<VerifyReport> {
+
+    async fn apply_with_observer(
+        &self,
+        p: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        _observer: &dyn ApplyObserver,
+    ) -> Result<ApplyAttempt> {
+        let report = self.apply(p, plan, journal).await;
+        if p.root.join("pending-recovery-on-apply").exists() {
+            return Ok(ApplyAttempt::PendingRecovery {
+                error: CoreError::PendingRecovery(
+                    "fake adapter retained authoritative recovery evidence".to_string(),
+                ),
+            });
+        }
+        let postimage = journal.capture_state(&p.root)?;
+        Ok(ApplyAttempt::Finished { report, postimage })
+    }
+
+    async fn build(&self, p: &Project) -> Result<VerifyReport> {
+        std::fs::write(p.root.join("build-invoked"), b"")?;
         Ok(VerifyReport {
             ok: !(self.build_fails_after_apply && self.state.lock().unwrap().apply_attempted),
             detail: if self.build_fails_after_apply && self.state.lock().unwrap().apply_attempted {
@@ -377,11 +409,16 @@ impl ToolWrite for FakeEco {
 
     async fn normalize_lock_edges(
         &self,
-        _project: &Project,
+        project: &Project,
         _policy: EdgePolicy,
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<cooldown_core::EdgeNormalizationReport> {
+        if project.root.join("fail-edge-normalization").exists() {
+            return Err(CoreError::PendingRecovery(
+                "fake edge normalization retained recovery evidence".to_string(),
+            ));
+        }
         if before.is_none() {
             return Ok(cooldown_core::EdgeNormalizationReport::default());
         }
@@ -683,6 +720,88 @@ async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Resul
         "build-tool\n"
     );
     assert_eq!(std::fs::read(root.join("fake.lock"))?, b"external edit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_adapter_recovery_prevents_outer_rollback_and_build() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("fake.lock"), b"original lock")?;
+    std::fs::write(root.join("pending-recovery-on-apply"), b"")?;
+    let mut adapter = fake(
+        root.clone(),
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        HashMap::from([(
+            "a".to_string(),
+            vec![
+                rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    2,
+                    Some("2025-02-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        )]),
+        HashMap::from([(
+            "a".to_string(),
+            rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+        )]),
+    );
+    adapter
+        .state
+        .get_mut()
+        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?
+        .write_lock_on_apply = true;
+    let mut options = opts();
+    options.build = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&options)
+        .await;
+
+    assert_eq!(std::fs::read(root.join("fake.lock"))?, b"mutated lock");
+    assert!(!root.join("build-invoked").exists());
+    assert_eq!(outcome.summary.applied, 0);
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .chain(outcome.items.iter().filter_map(|item| item.error.as_ref()))
+            .any(|error| error.kind == DiagnosticKind::PendingRecovery)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn edge_normalization_failure_stops_before_final_build() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("edge.snapshot"), b"run-start edge state")?;
+    std::fs::write(root.join("fail-edge-normalization"), b"")?;
+    let mut options = opts();
+    options.build = true;
+
+    let outcome = workspace(
+        fake(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ),
+        Baseline::default(),
+    )
+    .upgrade(&options)
+    .await;
+
+    assert!(!root.join("build-invoked").exists());
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.kind == DiagnosticKind::PendingRecovery)
+    );
     Ok(())
 }
 
@@ -1404,8 +1523,9 @@ async fn check_fails_closed_on_stale_lock() {
 }
 
 #[tokio::test]
-async fn upgrade_applies_clean_change() {
+async fn upgrade_applies_clean_change() -> color_eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("warn-on-apply"), b"")?;
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -1447,6 +1567,12 @@ async fn upgrade_applies_clean_change() {
     assert_eq!(out.summary.applied, 1);
     assert!(out.items[0].applied);
     assert_eq!(out.items[0].to, "v1.1.0");
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message == "committed correction durability is uncertain")
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1715,7 +1841,7 @@ fn assert_source_distinct_restorations(items: &[cooldown::app::UpgradeItem]) {
         dependent_sources,
         std::collections::BTreeSet::from([
             Some("registry+https://github.com/rust-lang/crates.io-index"),
-            Some("git+https://example.com/diesel#abcdef"),
+            Some("git+https://example.com/diesel#REDACTED"),
         ])
     );
     for restored in restored {
@@ -1817,15 +1943,21 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
 }
 
 #[tokio::test]
-async fn edge_report_redacts_source_credentials_at_the_app_boundary() -> color_eyre::Result<()> {
+async fn edge_report_redacts_source_secrets_at_the_app_boundary() -> color_eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut rebind = diesel_rebind(
-        Some("git+https://token@example.com/diesel#abcdef".to_string()),
+        Some(
+            "git+https://token@example.com/diesel?branch=next&access_token=hidden#abcdef"
+                .to_string(),
+        ),
         EdgeBindingAction::Rebound,
     );
-    rebind.dependency.registry = Some("git+https://user:secret@example.com/uuid#abcdef".into());
-    rebind.detail =
-        Some("the binding moved to git+https://another-secret@example.com/uuid#abcdef".to_string());
+    rebind.dependency.registry =
+        Some("git+https://user:secret@example.com/uuid?signature=signed#abcdef".into());
+    rebind.detail = Some(
+        "the binding moved to git+https://another-secret@example.com/uuid?token=hidden#abcdef"
+            .to_string(),
+    );
     let out = workspace(edge_reporting_fake(root, vec![rebind]), Baseline::default())
         .upgrade(&opts())
         .await;
@@ -1841,15 +1973,15 @@ async fn edge_report_redacts_source_credentials_at_the_app_boundary() -> color_e
 
     assert_eq!(
         edge.dependent_source.as_deref(),
-        Some("git+https://example.com/diesel#abcdef")
+        Some("git+https://example.com/diesel?branch=next&access_token=REDACTED#REDACTED")
     );
     assert_eq!(
         row.registry.as_deref(),
-        Some("git+https://example.com/uuid#abcdef")
+        Some("git+https://example.com/uuid?signature=REDACTED#REDACTED")
     );
     assert_eq!(
         edge.detail.as_deref(),
-        Some("the binding moved to git+https://example.com/uuid#abcdef")
+        Some("the binding moved to git+https://example.com/uuid?token=REDACTED#REDACTED")
     );
     Ok(())
 }
@@ -2635,8 +2767,9 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
 }
 
 #[tokio::test]
-async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
+async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> color_eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("warn-on-apply"), b"")?;
     let mut releases = HashMap::new();
     releases.insert(
         "a".to_string(),
@@ -2687,9 +2820,19 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() {
     // graph `check` would reject.
     assert_eq!(out.summary.applied, 0);
     assert_eq!(out.summary.skipped, 1);
-    let sk = out.items[0].skipped.as_ref().expect("a skip");
+    let sk = out
+        .items
+        .first()
+        .and_then(|item| item.skipped.as_ref())
+        .ok_or_else(|| color_eyre::eyre::eyre!("expected a skipped upgrade row"))?;
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(sk.offending.as_deref(), Some("t"));
+    assert!(
+        out.warnings
+            .iter()
+            .all(|warning| warning.message != "committed correction durability is uncertain")
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -3437,8 +3580,11 @@ impl ToolWrite for RepoScopedFake {
 }
 
 #[tokio::test]
-async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
+async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> color_eyre::Result<()>
+{
     let TmpRoot { guard: _dir, root } = tmp_root();
+    std::fs::create_dir_all(root.join("a"))?;
+    std::fs::create_dir_all(root.join("b"))?;
     let repo_writes = Arc::new(Mutex::new(0usize));
     let recoveries = Arc::new(Mutex::new(Vec::new()));
     let fake = RepoScopedFake {
@@ -3497,6 +3643,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
     assert_eq!(again.items.len(), 1);
     assert_eq!(again.items[0].status, cooldown::app::SyncStatus::Unchanged);
     assert_eq!(again.summary.unchanged, 1);
+    Ok(())
 }
 
 /// A minimal project-scoped fake tool used to assert `sync`'s `SyncScope::Project` dispatch: it
@@ -3609,8 +3756,10 @@ impl ToolWrite for ProjectScopedFake {
 }
 
 #[tokio::test]
-async fn sync_project_scope_writes_native_per_project() {
+async fn sync_project_scope_writes_native_per_project() -> color_eyre::Result<()> {
     let TmpRoot { guard: _dir, root } = tmp_root();
+    std::fs::create_dir_all(root.join("a"))?;
+    std::fs::create_dir_all(root.join("b"))?;
     let native_writes = Arc::new(Mutex::new(Vec::new()));
     let fake = ProjectScopedFake {
         root: root.clone(),
@@ -3659,6 +3808,7 @@ async fn sync_project_scope_writes_native_per_project() {
             .collect::<Vec<_>>(),
         vec!["a", "b"]
     );
+    Ok(())
 }
 
 /// A fake whose whole-graph `apply` HOLDS the `typer` candidate (the resolve cannot place

@@ -87,8 +87,13 @@ pub(crate) async fn apply_resilient_with_observer(
         .apply_with_observer(project, plan, journal, observer)
         .await
         .map_err(ApplyFailure::RestoreConflict)?;
-    let first_state = first.postimage;
-    match first.report {
+    let (first_report, first_state) = match first {
+        cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
+        cooldown_core::ApplyAttempt::PendingRecovery { error } => {
+            return Err(ApplyFailure::RestoreConflict(error));
+        }
+    };
+    match first_report {
         Ok(report) => {
             return Ok(AppliedMutation {
                 report,
@@ -138,8 +143,13 @@ pub(crate) async fn apply_resilient_with_observer(
             .apply_with_observer(project, &committed, journal, observer)
             .await
             .map_err(ApplyFailure::RestoreConflict)?;
-        let expected = result.postimage;
-        match result.report {
+        let (report, expected) = match result {
+            cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
+            cooldown_core::ApplyAttempt::PendingRecovery { error } => {
+                return Err(ApplyFailure::RestoreConflict(error));
+            }
+        };
+        match report {
             Ok(report) => (report, expected),
             Err(error) if is_mutation_state_conflict(&error) => {
                 return Err(ApplyFailure::RestoreConflict(error));
@@ -197,8 +207,16 @@ async fn verified_satisfiable_subset(
             .apply_with_observer(project, &trial, journal, observer)
             .await
             .map_err(ApplyFailure::RestoreConflict)?;
-        current_state = result.postimage;
-        match result.report {
+        let report = match result {
+            cooldown_core::ApplyAttempt::Finished { report, postimage } => {
+                current_state = postimage;
+                report
+            }
+            cooldown_core::ApplyAttempt::PendingRecovery { error } => {
+                return Err(ApplyFailure::RestoreConflict(error));
+            }
+        };
+        match report {
             Ok(_) => accepted.extend(group),
             Err(error) if is_mutation_state_conflict(&error) => {
                 return Err(ApplyFailure::RestoreConflict(error));
@@ -222,7 +240,9 @@ async fn verified_satisfiable_subset(
 fn is_mutation_state_conflict(error: &cooldown_core::CoreError) -> bool {
     matches!(
         error,
-        cooldown_core::CoreError::LockConflict(_) | cooldown_core::CoreError::LockUnreadable(_)
+        cooldown_core::CoreError::LockConflict(_)
+            | cooldown_core::CoreError::LockUnreadable(_)
+            | cooldown_core::CoreError::PendingRecovery(_)
     )
 }
 
@@ -436,7 +456,7 @@ mod tests {
             }
             let report = self.apply(project, plan, journal).await;
             let postimage = journal.capture_state(&project.root)?;
-            Ok(cooldown_core::ApplyAttempt { report, postimage })
+            Ok(cooldown_core::ApplyAttempt::Finished { report, postimage })
         }
 
         async fn build(&self, _project: &Project) -> Result<VerifyReport> {

@@ -599,7 +599,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
                 reason: match &edge.detail {
                     Some(detail) => format!(
                         "the re-resolve moved {subject}; left as bound: {}",
-                        cooldown_core::redact::url_credentials(detail)
+                        cooldown_core::redact::url_secrets(detail)
                     ),
                     None => format!("the re-resolve moved {subject}; left as bound"),
                 },
@@ -610,7 +610,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
                 reason: match &edge.detail {
                     Some(detail) => format!(
                         "{subject} left in place: {}",
-                        cooldown_core::redact::url_credentials(detail)
+                        cooldown_core::redact::url_secrets(detail)
                     ),
                     None => format!("{subject} left in place; correction withheld"),
                 },
@@ -621,7 +621,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
                 reason: match &edge.detail {
                     Some(detail) => format!(
                         "{subject} could not be corrected: {}",
-                        cooldown_core::redact::url_credentials(detail)
+                        cooldown_core::redact::url_secrets(detail)
                     ),
                     None => format!("{subject} could not be corrected safely"),
                 },
@@ -665,7 +665,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
 }
 
 fn abbreviated_source(source: &str) -> String {
-    let source = cooldown_core::redact::url_credentials(source);
+    let source = cooldown_core::redact::url_secrets(source);
     let source = source.as_str();
     if source == "registry+https://github.com/rust-lang/crates.io-index" {
         return "crates.io".to_string();
@@ -1075,6 +1075,8 @@ mod tests {
 
         assert!(status.reason.contains("git+https://example.com/foo"));
         assert!(!status.reason.contains("token"));
+        assert!(!status.reason.contains("aaaa"));
+        assert!(!status.reason.contains("bbbb"));
     }
 
     /// Members whose name is the given string and whose path is `path/<name>`.

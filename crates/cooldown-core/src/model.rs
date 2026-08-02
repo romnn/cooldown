@@ -613,7 +613,7 @@ pub enum RewriteMode {
     Always,
 }
 
-/// How an adapter treats resolved lock **edge bindings** after a whole-graph re-resolve.
+/// How an adapter treats addressable resolved lock **edge bindings** after a whole-graph re-resolve.
 ///
 /// A lock records not only which package versions exist but which coexisting version each
 /// dependent's edge is *bound* to (cargo's `dependencies = ["uuid 0.8.2"]` entries). When a
@@ -626,16 +626,17 @@ pub enum RewriteMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EdgePolicy {
-    /// Restore any edge the re-resolve rebound between two still-coexisting versions back to its
-    /// pre-apply binding (when that binding still satisfies the declared requirement) — an upgrade
-    /// touches only what it reports. The default.
+    /// Restore an addressable, unambiguous crates.io edge the re-resolve rebound between two
+    /// still-coexisting versions when its earlier binding still satisfies the active requirement.
+    /// This is the default.
     #[default]
     Preserve,
-    /// Bind every ambiguous edge to the **highest** locked version satisfying the dependent's
-    /// declared requirement, preferring candidates whose declared `rust-version` is
-    /// workspace-compatible (the adapter's owned normalization; matches a from-scratch resolve in
-    /// the common case). Unlike [`Preserve`](EdgePolicy::Preserve) this also heals bad bindings
-    /// that predate the run.
+    /// Bind each addressable, unambiguous crates.io edge to the **highest** locked version satisfying
+    /// the dependent's active requirement, preferring candidates whose declared `rust-version` is
+    /// workspace-compatible.
+    ///
+    /// This adapter-owned normalization matches a from-scratch resolve in the common case and also
+    /// heals eligible bad bindings that predate the run.
     Canonicalize,
     /// Leave every binding exactly as the resolver produced it. Unplanned rebinds are still
     /// *reported* (never silent), just not corrected.

@@ -11,6 +11,49 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STALE_LOCK_AGE: Duration = Duration::from_hours(720);
 const STALE_COLLECTION_INTERVAL: Duration = Duration::from_hours(24);
 
+/// The target-derived directory where every process rendezvouses for project access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoordinationRoot(PathBuf);
+
+impl CoordinationRoot {
+    fn resolve(target: &camino::Utf8Path) -> Result<(Self, camino::Utf8PathBuf), CoreError> {
+        let canonical = canonical_lock_root(target)?;
+        let root = Self::from_canonical(&canonical, git_marker(canonical.as_std_path())?)?;
+        Ok((root, canonical))
+    }
+
+    fn from_canonical(
+        canonical: &camino::Utf8Path,
+        marker: Option<PathBuf>,
+    ) -> Result<Self, CoreError> {
+        let directory = match marker {
+            Some(marker) => git_common_directory(&marker)?
+                .join("cooldown")
+                .join("locks"),
+            None => canonical
+                .join(".cooldown")
+                .join("locks")
+                .into_std_path_buf(),
+        };
+        Ok(CoordinationRoot(directory))
+    }
+
+    fn project_lock(&self, project: &camino::Utf8Path) -> PathBuf {
+        self.0.join(format!(
+            "{:016x}.lock",
+            cooldown_core::fs::fnv1a_64(project.as_str())
+        ))
+    }
+
+    fn repo_tool_lock(&self, repo: &camino::Utf8Path, tool: ToolId) -> PathBuf {
+        let identity = format!("{}\0{}", repo.as_str(), tool.as_str());
+        self.0.join(format!(
+            "repo-{:016x}.lock",
+            cooldown_core::fs::fnv1a_64(&identity)
+        ))
+    }
+}
+
 /// Holds an OS-backed shared lock for project reads.
 #[derive(Debug)]
 pub(crate) struct ProjectReadGuard {
@@ -74,7 +117,7 @@ impl ProjectReadGuard {
 
     #[cfg(test)]
     fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
-        let path = directory.join(lock_file_name(root));
+        let path = directory.join(lock_file_name(root)?);
         let file = open_lock_file(&path)?;
         Self::acquire_file(&path, file)
     }
@@ -117,7 +160,7 @@ impl ProjectWriteGuard {
 
     #[cfg(test)]
     fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
-        let path = directory.join(lock_file_name(root));
+        let path = directory.join(lock_file_name(root)?);
         let mut file = open_lock_file(&path)?;
         Self::acquire_file(root, &path, &mut file)?;
         Ok(ProjectWriteGuard { file })
@@ -139,7 +182,7 @@ impl RepoToolReadGuard {
         tool: ToolId,
         directory: &Path,
     ) -> Result<Self, CoreError> {
-        let path = directory.join(repo_tool_lock_file_name(root, tool));
+        let path = directory.join(repo_tool_lock_file_name(root, tool)?);
         let file = acquire_shared_file(&path, open_lock_file(&path)?)?;
         Ok(RepoToolReadGuard { file })
     }
@@ -161,7 +204,7 @@ impl RepoToolWriteGuard {
         tool: ToolId,
         directory: &Path,
     ) -> Result<Self, CoreError> {
-        let path = directory.join(repo_tool_lock_file_name(root, tool));
+        let path = directory.join(repo_tool_lock_file_name(root, tool)?);
         let identity = format!("{} repository resource at {root}", tool.as_str());
         let file = acquire_exclusive_file(&identity, &path, open_lock_file(&path)?)?;
         Ok(RepoToolWriteGuard { file })
@@ -204,7 +247,7 @@ fn open_project_lock(root: &camino::Utf8Path) -> Result<(PathBuf, File, File), C
     let path = lock_path(root)?;
     let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
         CoreError::Filesystem(format!(
-            "cannot open the project lock in the configured state namespace at {}: {error}",
+            "cannot open the project coordination lock at {}: {error}",
             path.display()
         ))
     })?;
@@ -215,10 +258,11 @@ fn open_repo_tool_lock(
     root: &camino::Utf8Path,
     tool: ToolId,
 ) -> Result<(PathBuf, File, File), CoreError> {
-    let path = state_lock_dir()?.join(repo_tool_lock_file_name(root, tool));
+    let (coordination, canonical) = CoordinationRoot::resolve(root)?;
+    let path = coordination.repo_tool_lock(&canonical, tool);
     let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
         CoreError::Filesystem(format!(
-            "cannot open the repository resource lock in the configured state namespace at {}: {error}",
+            "cannot open the repository resource coordination lock at {}: {error}",
             path.display()
         ))
     })?;
@@ -401,48 +445,92 @@ fn record_maintenance(file: &mut File, now: SystemTime) -> Result<(), CoreError>
 }
 
 fn lock_path(root: &camino::Utf8Path) -> Result<PathBuf, CoreError> {
-    Ok(state_lock_dir()?.join(lock_file_name(root)))
+    let (coordination, canonical) = CoordinationRoot::resolve(root)?;
+    Ok(coordination.project_lock(&canonical))
 }
 
-fn state_lock_dir() -> Result<PathBuf, CoreError> {
-    if let Some(path) = env_path("XDG_STATE_HOME") {
-        return Ok(path.join("cooldown").join("locks"));
+fn git_marker(root: &Path) -> Result<Option<PathBuf>, CoreError> {
+    for ancestor in root.ancestors() {
+        let marker = ancestor.join(".git");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => return Ok(Some(marker)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CoreError::Filesystem(format!(
+                    "cannot inspect the Git coordination marker at {}: {error}",
+                    marker.display()
+                )));
+            }
+        }
     }
-    if let Some(home) = env_path("HOME") {
-        return Ok(home
-            .join(".local")
-            .join("state")
-            .join("cooldown")
-            .join("locks"));
+    Ok(None)
+}
+
+fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
+    if marker.is_dir() {
+        return std::fs::canonicalize(marker).map_err(Into::into);
     }
-    Err(CoreError::Filesystem(
-        "cannot determine cooldown's state directory: neither XDG_STATE_HOME nor HOME is set"
-            .to_string(),
+    let contents = std::fs::read_to_string(marker)?;
+    let git_dir = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CoreError::Filesystem(format!(
+                "invalid Git directory pointer at {}",
+                marker.display()
+            ))
+        })?;
+    let git_dir = resolve_relative(marker.parent().unwrap_or_else(|| Path::new("")), git_dir);
+    let git_dir = std::fs::canonicalize(git_dir)?;
+    let common_marker = git_dir.join("commondir");
+    if !common_marker.is_file() {
+        return Ok(git_dir);
+    }
+    let common = std::fs::read_to_string(&common_marker)?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(CoreError::Filesystem(format!(
+            "empty Git common-directory pointer at {}",
+            common_marker.display()
+        )));
+    }
+    std::fs::canonicalize(resolve_relative(&git_dir, common)).map_err(Into::into)
+}
+
+fn resolve_relative(base: &Path, value: &str) -> PathBuf {
+    let value = Path::new(value);
+    if value.is_absolute() {
+        value.to_owned()
+    } else {
+        base.join(value)
+    }
+}
+
+#[cfg(test)]
+fn lock_file_name(root: &camino::Utf8Path) -> Result<String, CoreError> {
+    let root = canonical_lock_root(root)?;
+    Ok(format!(
+        "{:016x}.lock",
+        cooldown_core::fs::fnv1a_64(root.as_str())
     ))
 }
 
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn lock_file_name(root: &camino::Utf8Path) -> String {
-    let root = canonical_lock_root(root);
-    format!("{:016x}.lock", cooldown_core::fs::fnv1a_64(root.as_str()))
-}
-
-fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> String {
-    let root = canonical_lock_root(root);
+#[cfg(test)]
+fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> Result<String, CoreError> {
+    let root = canonical_lock_root(root)?;
     let identity = format!("{}\0{}", root.as_str(), tool.as_str());
-    format!("repo-{:016x}.lock", cooldown_core::fs::fnv1a_64(&identity))
+    Ok(format!(
+        "repo-{:016x}.lock",
+        cooldown_core::fs::fnv1a_64(&identity)
+    ))
 }
 
-fn canonical_lock_root(root: &camino::Utf8Path) -> camino::Utf8PathBuf {
-    std::fs::canonicalize(root)
-        .ok()
-        .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
-        .unwrap_or_else(|| root.to_owned())
+fn canonical_lock_root(root: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, CoreError> {
+    let path = std::fs::canonicalize(root)?;
+    camino::Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| CoreError::PathEncoding(format!("non-UTF-8 path: {}", path.display())))
 }
 
 impl Drop for ProjectReadGuard {
@@ -526,16 +614,50 @@ mod tests {
     }
 
     #[test]
-    fn project_access_does_not_create_repo_local_lock_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let locks = tempfile::tempdir().expect("lock dir");
-        let repo_local = root.join(".cooldown.lock");
+    fn git_projects_rendezvous_in_the_repository_metadata() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let nested = root.join("packages/app");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&nested)?;
 
-        let _guard = ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer acquired");
+        let (coordination, _) = CoordinationRoot::resolve(&nested)?;
 
-        assert!(!repo_local.exists());
-        assert!(!locks.path().join(".cooldown.lock").exists());
+        assert_eq!(coordination.0, root.join(".git/cooldown/locks"));
+        Ok(())
+    }
+
+    #[test]
+    fn linked_worktrees_share_the_git_common_directory() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let common = root.join("common.git");
+        let git_dir = common.join("worktrees/demo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&git_dir)?;
+        std::fs::create_dir_all(&worktree)?;
+        std::fs::write(git_dir.join("commondir"), "../..\n")?;
+        std::fs::write(worktree.join(".git"), format!("gitdir: {git_dir}\n"))?;
+
+        let (coordination, _) = CoordinationRoot::resolve(&worktree)?;
+
+        assert_eq!(coordination.0, common.join("cooldown/locks"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_git_projects_use_an_adjacent_coordination_directory() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let canonical = canonical_lock_root(root)?;
+
+        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+
+        assert_eq!(coordination.0, canonical.join(".cooldown/locks"));
+        Ok(())
     }
 
     #[test]

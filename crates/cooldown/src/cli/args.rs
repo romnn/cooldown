@@ -110,17 +110,18 @@ pub(crate) enum TransitiveMode {
 /// resolved lock **edge bindings** after the whole-graph re-resolve. An incremental re-resolve can
 /// silently rebind an edge between two coexisting versions a wide declared range admits — a
 /// build-affecting change the per-version report cannot see. `preserve` (the default) restores
-/// such churn to the pre-upgrade binding; `canonicalize` binds every ambiguous edge to the highest
-/// locked version satisfying its requirement (also healing pre-existing bad bindings); `none` only
-/// reports. Cargo-specific, so both the flag and the config key are cargo-scoped: in config it
-/// lives under `[tool.cargo]` as `edge-policy`.
+/// such churn to the pre-upgrade binding; `canonicalize` binds each addressable, unambiguous
+/// crates.io edge to the highest locked version satisfying its active requirement (also healing
+/// eligible pre-existing bad bindings); `none` only reports.
+/// Cargo-specific, so both the flag and the config key are cargo-scoped: in config it lives under
+/// `[tool.cargo]` as `edge-policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[value(rename_all = "kebab-case")]
 pub(crate) enum EdgePolicyArg {
-    /// Restore any edge the re-resolve rebound between still-coexisting versions (the default).
+    /// Restore an eligible crates.io edge rebound between still-coexisting versions (the default).
     #[default]
     Preserve,
-    /// Bind every ambiguous edge to the highest locked version satisfying its requirement.
+    /// Bind each eligible crates.io edge to its highest satisfying locked version.
     Canonicalize,
     /// Leave bindings as the resolver produced them; rebinds are still reported.
     None,

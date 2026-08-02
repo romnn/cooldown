@@ -98,9 +98,9 @@ enum BatchMutation {
     RestoreConflict,
 }
 
-struct RestoreConflict;
+struct MutationTerminated;
 
-type MutationFlow = ControlFlow<RestoreConflict>;
+type MutationFlow = ControlFlow<MutationTerminated>;
 
 /// One policy-violating resolved pin — the package and the exact too-fresh version the graph
 /// holds. The key the trial state machine tracks baseline and residual violations by.
@@ -158,6 +158,8 @@ struct VerifiedBatchReport {
     /// Lock edges the adapter's edge policy corrected or observed rebound (cargo only); committed
     /// as report rows alongside the applied/collateral changes.
     edge_rebinds: Vec<cooldown_core::EdgeRebind>,
+    /// Adapter warnings whose provenance is valid only if this batch commits.
+    warnings: Vec<Diagnostic>,
     planned_applied: bool,
 }
 
@@ -330,15 +332,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // The final pass reconciles run-level observation with committed correction evidence, so
         // temporary batch limitations and overwritten corrections cannot survive in the report.
         // Adapters without snapshots retain their existing per-batch reporting fallback.
-        if self.initial_edge_snapshot.is_some() || !self.lock_edges_enforced {
-            self.normalize_edges().await;
+        if (self.initial_edge_snapshot.is_some() || !self.lock_edges_enforced)
+            && self.normalize_edges().await.is_break()
+        {
+            return;
         }
 
         self.finalize().await;
     }
 
     /// Final edge-binding enforcement and run-level audit for this project.
-    async fn normalize_edges(&mut self) {
+    async fn normalize_edges(&mut self) -> MutationFlow {
         match self
             .ctx
             .writer
@@ -366,8 +370,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     let item = self.edge_rebind_item(rebind);
                     self.acc.edge_items.push(item);
                 }
+                ControlFlow::Continue(())
             }
-            Err(error) => self.record_project_error(&error, None),
+            Err(error) => {
+                self.record_project_error(&error, None);
+                ControlFlow::Break(MutationTerminated)
+            }
         }
     }
 
@@ -764,7 +772,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .extend(outcome.edge_rebinds.iter().cloned());
         outcome.merge_into(self.acc);
         if restore_conflict {
-            ControlFlow::Break(RestoreConflict)
+            ControlFlow::Break(MutationTerminated)
         } else {
             ControlFlow::Continue(())
         }
@@ -1440,14 +1448,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         };
 
-        self.commit_batch_report(
-            &mut outcome,
-            &changes,
-            &report.collateral,
-            &report.edge_rebinds,
-            &report.applied,
-            committed,
-        );
+        self.commit_batch_report(&mut outcome, &changes, report, committed);
         if let Some(rollback) = rollback {
             rollback.accept(expected);
         }
@@ -1485,14 +1486,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         outcome: &mut BatchOutcome,
     ) -> VerifiedBatchReport {
-        for warning in &report.warnings {
-            outcome.warnings.push(
-                warning
-                    .clone()
-                    .with_tool(self.ctx.tool_name())
-                    .with_project(self.project_label.clone()),
-            );
-        }
         let applied: HashSet<ChangeTargetKey> =
             report.applied.iter().map(change_target_key).collect();
         let planned_applied = planned_changes_landed(changes, &applied);
@@ -1507,6 +1500,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             applied,
             collateral,
             edge_rebinds: report.edge_rebinds,
+            warnings: report.warnings,
             planned_applied,
         }
     }
@@ -1556,27 +1550,37 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &self,
         outcome: &mut BatchOutcome,
         changes: &[Change],
-        collateral: &[Change],
-        edge_rebinds: &[cooldown_core::EdgeRebind],
-        applied: &HashSet<ChangeTargetKey>,
+        report: VerifiedBatchReport,
         committed: CommittedBatch,
     ) {
+        let VerifiedBatchReport {
+            applied,
+            collateral,
+            edge_rebinds,
+            warnings,
+            planned_applied: _,
+        } = report;
         outcome.lock_refreshed = self.ctx.writer.successful_apply_proves_lock_current();
         outcome.mutation = BatchMutation::Committed(committed);
+        outcome.warnings.extend(warnings.into_iter().map(|warning| {
+            warning
+                .with_tool(self.ctx.tool_name())
+                .with_project(self.project_label.clone())
+        }));
         for change in changes {
             if applied.contains(&change_target_key(change)) {
                 outcome.items.push(self.change_applied_item(change));
             }
         }
-        for change in collateral {
+        for change in &collateral {
             outcome.items.push(self.change_applied_item(change));
         }
         if self.initial_edge_snapshot.is_none() {
-            for rebind in edge_rebinds {
+            for rebind in &edge_rebinds {
                 outcome.edge_items.push(self.edge_rebind_item(rebind));
             }
         } else {
-            outcome.edge_rebinds.extend(edge_rebinds.iter().cloned());
+            outcome.edge_rebinds.extend(edge_rebinds);
         }
     }
 
@@ -1966,7 +1970,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .dependency
                 .registry
                 .as_deref()
-                .map(cooldown_core::redact::url_credentials),
+                .map(cooldown_core::redact::url_secrets),
             from: rebind.from.to_string(),
             to: rebind.to.to_string(),
             // Informational: the kind of the binding jump, when classifiable.
@@ -1984,12 +1988,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 dependent_source: rebind
                     .dependent_source
                     .as_deref()
-                    .map(cooldown_core::redact::url_credentials),
+                    .map(cooldown_core::redact::url_secrets),
                 action: rebind.action,
                 detail: rebind
                     .detail
                     .as_deref()
-                    .map(cooldown_core::redact::url_credentials),
+                    .map(cooldown_core::redact::url_secrets),
             }),
         }
     }

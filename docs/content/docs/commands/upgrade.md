@@ -66,10 +66,11 @@ build-affecting (the dependent compiles against the other copy) yet invisible at
 and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` decides what
 `upgrade`/`fix` do about it:
 
-- **`preserve`** (default) — restore any edge the re-resolve rebound between two still-coexisting
-  versions to its pre-upgrade binding: an upgrade touches only what it reports.
-- **`canonicalize`** — cooldown's owned normalization: bind every unambiguous crates.io edge to
-  the **highest** locked version satisfying the dependent's declared requirement, preferring
+- **`preserve`** (default) — restore an addressable, unambiguous crates.io edge the re-resolve
+  rebound between two still-coexisting versions when its earlier binding still satisfies the
+  active requirement.
+- **`canonicalize`** — cooldown's owned normalization: bind each addressable, unambiguous crates.io
+  edge to the **highest** locked version satisfying the dependent's active requirement, preferring
   candidates whose declared `rust-version` is workspace-compatible and falling back to the
   highest satisfying candidate when none is compatible — a cooldown-owned conservative tier
   inspired by cargo's `incompatible-rust-versions = "fallback"` rule. Unlike

@@ -253,17 +253,26 @@ pub trait ApplyObserver: Send + Sync {
 
 impl ApplyObserver for () {}
 
-/// One adapter apply attempt paired with the project state observed at the mutation boundary.
+/// The ownership state produced by one adapter apply attempt.
 ///
-/// The report remains an inner result because a resolver failure may still have rewritten files;
-/// callers need the postimage in both success and failure cases to restore without absorbing work
-/// performed after the adapter returned.
+/// A finished resolver failure may still have rewritten files, so it carries the postimage an
+/// outer journal may conditionally restore.
+/// A pending-recovery outcome deliberately carries no postimage because adapter-owned recovery
+/// evidence is the only authority allowed to restore that state.
 #[derive(Debug)]
-pub struct ApplyAttempt {
-    /// The adapter's apply result.
-    pub report: Result<ApplyReport>,
-    /// The journal write set captured immediately after the adapter finished mutating it.
-    pub postimage: ProjectMutationState,
+pub enum ApplyAttempt {
+    /// The adapter released mutation ownership to the application.
+    Finished {
+        /// The adapter's apply result.
+        report: Result<ApplyReport>,
+        /// The write set captured immediately after the adapter finished mutating it.
+        postimage: ProjectMutationState,
+    },
+    /// Adapter-owned recovery evidence still controls the project state.
+    PendingRecovery {
+        /// The error that prevented the adapter from completing or rolling back its transaction.
+        error: CoreError,
+    },
 }
 
 /// The mutation-side port for tools that can rewrite project state.
@@ -325,8 +334,8 @@ pub trait ToolWrite: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured. The
-    /// adapter's own apply error remains inside [`ApplyAttempt::report`] so the caller receives the
-    /// postimage even after a failed resolver mutates files.
+    /// adapter's own apply error remains inside [`ApplyAttempt::Finished`] so the caller receives
+    /// the postimage even after a failed resolver mutates files.
     async fn apply_with_observer(
         &self,
         project: &Project,
@@ -336,7 +345,7 @@ pub trait ToolWrite: Send + Sync {
     ) -> Result<ApplyAttempt> {
         let report = self.apply(project, plan, journal).await;
         let postimage = journal.capture_state(&project.root)?;
-        Ok(ApplyAttempt { report, postimage })
+        Ok(ApplyAttempt::Finished { report, postimage })
     }
 
     /// Opt-in compile/sync after re-locking (the `--build` step).
@@ -699,24 +708,51 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the file exists but cannot be read.
+    /// Returns a [`CoreError`](crate::CoreError) if the path is not a regular file, changes identity
+    /// during capture, or cannot be read.
     pub fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
         use std::io::Read as _;
 
         let path = root.join(rel);
-        let (contents, permissions) = match std::fs::File::open(&path) {
-            Ok(mut file) => {
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                (Some(bytes), Some(file.metadata()?.permissions()))
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ProjectMutationFile {
+                    path: rel.to_owned(),
+                    contents: None,
+                    permissions: None,
+                });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
-            Err(e) => return Err(e.into()),
+            Err(error) => return Err(error.into()),
         };
+        if !metadata.file_type().is_file() {
+            return Err(CoreError::Filesystem(format!(
+                "refusing to journal non-regular project path {path}"
+            )));
+        }
+        let mut file = std::fs::File::open(&path)?;
+        let opened = file.metadata()?;
+        let current = std::fs::symlink_metadata(&path)?;
+        if !current.file_type().is_file()
+            || !same_file_identity(&metadata, &opened)
+            || !same_file_identity(&opened, &current)
+        {
+            return Err(CoreError::LockConflict(format!(
+                "{path} changed identity while cooldown captured its mutation journal"
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let final_metadata = std::fs::symlink_metadata(&path)?;
+        if !final_metadata.file_type().is_file() || !same_file_identity(&opened, &final_metadata) {
+            return Err(CoreError::LockConflict(format!(
+                "{path} changed identity while cooldown read its mutation journal"
+            )));
+        }
         Ok(ProjectMutationFile {
             path: rel.to_owned(),
-            contents,
-            permissions,
+            contents: Some(bytes),
+            permissions: Some(opened.permissions()),
         })
     }
 
@@ -872,6 +908,17 @@ fn rollback_drift(root: &Utf8Path, path: &Utf8Path) -> CoreError {
 }
 
 #[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
+}
+
+#[cfg(unix)]
 fn permissions_equal(
     left: Option<&std::fs::Permissions>,
     right: Option<&std::fs::Permissions>,
@@ -965,6 +1012,26 @@ mod mutation_journal_tests {
 
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_journal_rejects_regular_and_dangling_symlinks() -> color_eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        std::fs::write(root.join("real.toml"), "contents")?;
+        symlink("real.toml", root.join("Cargo.toml"))?;
+        symlink("missing.lock", root.join("Cargo.lock"))?;
+
+        for relative in [Utf8Path::new("Cargo.toml"), Utf8Path::new("Cargo.lock")] {
+            let result = ProjectMutationJournal::capture_file(&root, relative);
+            assert!(matches!(result, Err(CoreError::Filesystem(_))));
+        }
+        assert!(root.join("Cargo.toml").is_symlink());
+        assert!(root.join("Cargo.lock").is_symlink());
         Ok(())
     }
 }

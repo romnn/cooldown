@@ -57,8 +57,8 @@ pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Ve
             let crates_io_move = from.source() == Some(crate::cargocmd::CRATES_IO_SOURCE)
                 && to.source() == Some(crate::cargocmd::CRATES_IO_SOURCE);
             let detail = (!crates_io_move).then(|| {
-                let from_entry = cooldown_core::redact::url_credentials(&from_entry);
-                let to_entry = cooldown_core::redact::url_credentials(&to_entry);
+                let from_entry = cooldown_core::redact::url_secrets(&from_entry);
+                let to_entry = cooldown_core::redact::url_secrets(&to_entry);
                 format!("the binding target changed: \"{from_entry}\" → \"{to_entry}\"")
             });
             changes.push(BindingChange {
@@ -403,11 +403,11 @@ mod tests {
         assert_eq!(changes.len(), 1);
         let detail = changes[0].detail.as_deref().unwrap_or_default();
         assert!(detail.contains("registry+https://github.com/rust-lang/crates.io-index"));
-        assert!(detail.contains("git+https://example.com/foo#abcdef"));
+        assert!(detail.contains("git+https://example.com/foo#REDACTED"));
     }
 
     #[test]
-    fn source_move_details_redact_url_credentials() {
+    fn source_move_details_redact_url_secrets() {
         let before_text = indoc::indoc! {r#"
             version = 4
 
@@ -442,5 +442,7 @@ mod tests {
         assert!(detail.contains("git+https://example.com/foo"));
         assert!(!detail.contains("old-token"));
         assert!(!detail.contains("new-token"));
+        assert!(!detail.contains("aaaaaa"));
+        assert!(!detail.contains("bbbbbb"));
     }
 }

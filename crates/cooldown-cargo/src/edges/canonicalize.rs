@@ -1,22 +1,25 @@
 //! [`EdgePolicy::Canonicalize`](cooldown_core::EdgePolicy::Canonicalize): cooldown's owned
-//! normalization of ambiguous edges — bind every unambiguous crates.io edge to the **highest**
-//! locked crates.io version satisfying the dependent's declared requirement, preferring candidates
-//! whose declared `rust-version` is workspace-compatible. Unlike `preserve` this needs no pre-apply
-//! snapshot and also heals a bad binding that predates the run. A successfully canonicalized edge
-//! is a fixed point; a correction blocked by a safety guard remains a reported hold on later runs.
+//! normalization of eligible edges — bind each addressable, unambiguous crates.io edge to the
+//! **highest** locked crates.io version satisfying the dependent's active requirement, preferring
+//! candidates whose declared `rust-version` is workspace-compatible.
+//! Unlike `preserve`, this needs no pre-apply snapshot and also heals a bad binding that predates
+//! the run.
+//! A successfully canonicalized edge is a fixed point.
+//! A correction blocked by a safety guard remains a reported hold on later runs.
 //!
 //! This is a deliberate policy over the *existing* package set, not a re-implementation of cargo's
-//! resolver (which would pick versions, not just bindings). It matches what a from-scratch resolve
-//! binds in the common case — the resolver tries candidates highest-first, and coexisting locked
-//! versions are semver-incompatible majors that never conflict — with one deliberate rule for MSRV:
+//! resolver, which would pick versions rather than only bindings.
+//! It matches what a from-scratch resolve binds in the common case — the resolver tries candidates
+//! highest-first, and coexisting locked versions are semver-incompatible majors that never
+//! conflict — with one deliberate rule for MSRV:
 //! candidates whose own `rust-version` exceeds the workspace minimum are deprioritized,
-//! falling back to the highest satisfying candidate when no compatible one exists. The tier is
-//! inspired by cargo's `incompatible-rust-versions = "fallback"` behavior; a
-//! workspace on resolver v1/v2 (default `allow`) or with a config override may see cargo fresh-bind
-//! a higher, MSRV-incompatible version where this policy keeps the compatible one. The effective
-//! resolver mode is deliberately not reconstructed from cargo config — the compatible-first choice
-//! is based on declared `rust-version` metadata, is verified with `cargo metadata --locked`, and
-//! can be opted out of via the edge policy itself.
+//! falling back to the highest satisfying candidate when no compatible one exists.
+//! The tier is inspired by cargo's `incompatible-rust-versions = "fallback"` behavior.
+//! A workspace on resolver v1/v2 (default `allow`) or with a config override may see cargo
+//! fresh-bind a higher, MSRV-incompatible version where this policy keeps the compatible one.
+//! The effective resolver mode is deliberately not reconstructed from cargo config — the
+//! compatible-first choice is based on declared `rust-version` metadata, is verified with
+//! `cargo metadata --locked`, and can be opted out of via the edge policy itself.
 
 use super::{EdgeRewrite, LockEdgeView, RequirementIndex};
 use crate::version;
@@ -25,6 +28,7 @@ use crate::version;
 /// version: the highest satisfying in-lock crates.io version whose declared `rust-version` is
 /// workspace-compatible — or, when no satisfying candidate is compatible by that metadata, the
 /// highest satisfying one (cooldown's fallback tier).
+///
 /// The orphan guard is applied by the caller via [`guard_rewrites`](super::guard_rewrites).
 pub(crate) fn rebindings(
     lock: &LockEdgeView,

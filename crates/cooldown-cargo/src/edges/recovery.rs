@@ -119,8 +119,26 @@ impl SpeculativeLockTransaction {
         )?;
         let recovery_path = recovery_path(lock_path);
         if !path_exists(&recovery_path)? {
-            clean_orphan_states(lock_path, None)?;
+            clean_orphan_artifacts(project, lock_path, None)?;
         }
+        let mut transaction = Self::publish_records(
+            project,
+            lock_path,
+            recovery_path,
+            original_lock,
+            candidate_lock,
+        )?;
+        transaction.install_initial_candidate(original_lock, candidate_lock, install)?;
+        Ok(transaction)
+    }
+
+    fn publish_records(
+        project: &Project,
+        lock_path: &Utf8Path,
+        recovery_path: Utf8PathBuf,
+        original_lock: &str,
+        candidate_lock: &str,
+    ) -> Result<Self> {
         let state_path = unique_state_path(lock_path);
         let state_file = state_path
             .file_name()
@@ -134,8 +152,21 @@ impl SpeculativeLockTransaction {
             original_lock: original_lock.to_string(),
         };
         let state = RecoveryState::new(original_lock, candidate_lock)?;
-        publish_exclusive_json(&state_path, &state)
-            .map_err(|error| error.into_core_error(&state_path))?;
+        if let Err(error) = publish_exclusive_json(&state_path, &state) {
+            if matches!(&error, PublicationError::DurabilityUncertain(_))
+                && let Err(cleanup) = remove_file(&state_path)
+            {
+                tracing::warn!(
+                    path = %state_path,
+                    error = %cleanup,
+                    "could not remove unpublished Cargo.lock recovery state"
+                );
+            }
+            return Err(CoreError::Filesystem(format!(
+                "could not publish private Cargo.lock recovery state at {state_path}: {}",
+                error.into_core_error(&state_path)
+            )));
+        }
         if let Err(error) = publish_exclusive_json(&recovery_path, &record) {
             return match error {
                 PublicationError::NotPublished(error) => {
@@ -149,12 +180,13 @@ impl SpeculativeLockTransaction {
                     Err(error)
                 }
                 uncertain @ PublicationError::DurabilityUncertain(_) => {
-                    Err(uncertain.into_core_error(&recovery_path))
+                    let error = uncertain.into_core_error(&recovery_path);
+                    Err(pending_recovery(&recovery_path, &error))
                 }
             };
         }
 
-        let mut transaction = SpeculativeLockTransaction {
+        Ok(SpeculativeLockTransaction {
             lock_path: lock_path.to_owned(),
             recovery_path,
             state_path,
@@ -163,21 +195,52 @@ impl SpeculativeLockTransaction {
             staged_lock: Some(candidate_lock.to_string()),
             record,
             state,
-        };
-        ensure_lock_equals(
-            &transaction.lock_path,
+        })
+    }
+
+    fn install_initial_candidate<F>(
+        &mut self,
+        original_lock: &str,
+        candidate_lock: &str,
+        install: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&std::path::Path, &[u8]) -> Result<()>,
+    {
+        if let Err(error) = ensure_lock_equals(
+            &self.lock_path,
             original_lock,
             "installing the first speculative correction",
-            Some(&transaction.recovery_path),
-        )?;
-        if let Err(error) = install(lock_path.as_std_path(), candidate_lock.as_bytes()) {
-            if lock_equals(lock_path, original_lock)? {
-                transaction.staged_lock = None;
-                transaction.remove_record()?;
-            }
-            return Err(error);
+            Some(&self.recovery_path),
+        ) {
+            return Err(pending_recovery(&self.recovery_path, &error));
         }
-        Ok(transaction)
+        if let Err(error) = install(self.lock_path.as_std_path(), candidate_lock.as_bytes()) {
+            match lock_equals(&self.lock_path, original_lock) {
+                Ok(true) => {
+                    self.staged_lock = None;
+                    return match self.remove_record() {
+                        Ok(CommitOutcome::Committed) => Err(error),
+                        Ok(CommitOutcome::DurabilityUncertain(durability)) => {
+                            let failure = CoreError::Filesystem(format!(
+                                "candidate installation failed: {error}; recovery-marker durability is uncertain: {durability}; outer rollback was refused"
+                            ));
+                            Err(pending_recovery(&self.recovery_path, &failure))
+                        }
+                        Err(cleanup) => Err(pending_recovery(&self.recovery_path, &cleanup)),
+                    };
+                }
+                Ok(false) => {}
+                Err(check) => {
+                    let failure = CoreError::Filesystem(format!(
+                        "candidate installation failed: {error}; live lock inspection also failed: {check}"
+                    ));
+                    return Err(pending_recovery(&self.recovery_path, &failure));
+                }
+            }
+            return Err(pending_recovery(&self.recovery_path, &error));
+        }
+        Ok(())
     }
 
     /// Installs another candidate from the last accepted or rejected state.
@@ -296,7 +359,7 @@ impl SpeculativeLockTransaction {
     }
 
     /// Restores the run-start lock from any recognized live transaction state.
-    pub(super) fn rollback(&mut self) -> Result<()> {
+    pub(super) fn rollback(&mut self) -> Result<CommitOutcome> {
         let expected = self
             .staged_lock
             .as_deref()
@@ -318,10 +381,7 @@ impl SpeculativeLockTransaction {
         )?;
         self.current_lock.clone_from(&self.original_lock);
         self.staged_lock = None;
-        match self.remove_record()? {
-            CommitOutcome::Committed => Ok(()),
-            CommitOutcome::DurabilityUncertain(error) => Err(error),
-        }
+        self.remove_record()
     }
 
     fn remove_record(&self) -> Result<CommitOutcome> {
@@ -395,7 +455,7 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
     let lock_path = project.root.join("Cargo.lock");
     let recovery_path = recovery_path(&lock_path);
     if !path_exists(&recovery_path)? {
-        return Ok(clean_orphan_states(&lock_path, None)? > 0);
+        return Ok(clean_orphan_artifacts(project, &lock_path, None)? > 0);
     }
     let record: RecoveryRecord = read_json(&recovery_path)?;
     record.validate(project, &lock_path, &recovery_path)?;
@@ -430,7 +490,7 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
             "could not remove recovered Cargo.lock state"
         );
     }
-    clean_orphan_states(&lock_path, None)?;
+    clean_orphan_artifacts(project, &lock_path, None)?;
     Ok(true)
 }
 
@@ -596,11 +656,14 @@ fn create_synced_private_file(path: &Utf8Path, contents: &[u8]) -> Result<Utf8Pa
             std::process::id(),
             attempt
         ));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -614,6 +677,69 @@ fn create_synced_private_file(path: &Utf8Path, contents: &[u8]) -> Result<Utf8Pa
     Err(CoreError::Filesystem(format!(
         "could not create a private recovery file for {path}"
     )))
+}
+
+fn clean_orphan_artifacts(
+    project: &Project,
+    lock_path: &Utf8Path,
+    referenced: Option<&str>,
+) -> Result<usize> {
+    let states = clean_orphan_states(lock_path, referenced)?;
+    let publications = clean_orphan_publications(project, lock_path)?;
+    Ok(states + publications)
+}
+
+fn clean_orphan_publications(project: &Project, lock_path: &Utf8Path) -> Result<usize> {
+    let parent = lock_path.parent().unwrap_or_else(|| Utf8Path::new(""));
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(target) = publication_target(&name) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let path = parent.join(&name);
+        let valid = if target == RECOVERY_MARKER {
+            read_json::<RecoveryRecord>(&path)
+                .and_then(|record| record.validate(project, lock_path, &path))
+                .is_ok()
+        } else if validated_state_path(lock_path, target).is_ok() {
+            read_json::<RecoveryState>(&path)
+                .and_then(|state| state.validate(&path))
+                .is_ok()
+        } else {
+            false
+        };
+        if valid {
+            remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn publication_target(name: &str) -> Option<&str> {
+    let body = name.strip_prefix('.')?.strip_suffix(".publish")?;
+    let (body, attempt) = body.rsplit_once('.')?;
+    let (target, process) = body.rsplit_once('.')?;
+    (!attempt.is_empty()
+        && !process.is_empty()
+        && attempt.bytes().all(|byte| byte.is_ascii_digit())
+        && process.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(target)
 }
 
 fn clean_orphan_states(lock_path: &Utf8Path, referenced: Option<&str>) -> Result<usize> {
@@ -709,6 +835,12 @@ fn sync_parent_directory(path: &Utf8Path) -> Result<()> {
 fn untrusted_record(path: &Utf8Path) -> CoreError {
     CoreError::LockUnreadable(format!(
         "untrusted Cargo.lock recovery record at {path}; left all files untouched"
+    ))
+}
+
+fn pending_recovery(path: &Utf8Path, error: &CoreError) -> CoreError {
+    CoreError::PendingRecovery(format!(
+        "{error}; recovery evidence at {path} remains authoritative; run `cooldown recover`"
     ))
 }
 
@@ -973,6 +1105,55 @@ mod tests {
         assert!(result.is_ok());
         assert!(marker.exists());
         assert!(!publication_temps(&lock_path)?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_artifacts_are_owner_only() -> color_eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, project, lock_path) = setup();
+        let transaction =
+            SpeculativeLockTransaction::begin(&project, &lock_path, "original", "candidate")?;
+
+        for path in [&transaction.recovery_path, &transaction.state_path] {
+            assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validated_orphan_publications_are_collected() -> color_eyre::Result<()> {
+        let (_dir, project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        let state_path = unique_state_path(&lock_path);
+        let record = RecoveryRecord {
+            format: RECOVERY_FORMAT.to_string(),
+            project_root: canonical_project_root(&project)?,
+            original_digest: lock_digest("original"),
+            state_file: state_path
+                .file_name()
+                .ok_or_else(|| color_eyre::eyre::eyre!("state path has no file name"))?
+                .to_string(),
+            original_lock: "original".to_string(),
+        };
+        publish_exclusive_json_with(
+            &marker,
+            &record,
+            |_path| Ok(()),
+            |_path| {
+                Err(CoreError::Filesystem(
+                    "injected cleanup failure".to_string(),
+                ))
+            },
+        )
+        .map_err(|error| color_eyre::eyre::eyre!("publish recovery marker: {error:?}"))?;
+        std::fs::remove_file(&marker)?;
+        assert_eq!(publication_temps(&lock_path)?.len(), 1);
+
+        assert_eq!(clean_orphan_publications(&project, &lock_path)?, 1);
+        assert!(publication_temps(&lock_path)?.is_empty());
         Ok(())
     }
 

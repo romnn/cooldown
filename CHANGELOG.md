@@ -12,10 +12,13 @@
   adapter fail a shared read session without performing recovery. `ProjectMutationState` pairs a
   rollback journal with the post-apply state observed before any conditional restore.
 - **Breaking library API:** `ToolWrite::apply_with_observer` returns an adapter-boundary postimage,
-  `ApplyReport` carries non-fatal committed warnings, and final edge audits return an
-  `EdgeNormalizationReport`. `ProjectMutationFile` also records standard file permissions so a
-  rollback can restore them with the file contents. Callers can therefore distinguish rollback
-  conflicts from visible corrections whose directory durability is uncertain.
+  using the `ApplyAttempt` enum to keep adapter-owned pending recovery outside the application's
+  rollback authority. `ApplyReport` carries non-fatal committed warnings, final edge audits return
+  an `EdgeNormalizationReport`, and `CoreError`/`DiagnosticKind` include `PendingRecovery`.
+  `ProjectMutationFile` also records standard file permissions and rejects non-regular paths so a
+  rollback can restore the file contents and modes without following a symlink. Callers can
+  therefore distinguish rollback conflicts from visible corrections whose directory durability is
+  uncertain.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.
@@ -40,12 +43,16 @@
   fails `--strict`. Speculative lock corrections use atomically published, drift-checked recovery
   records with parent-directory syncing on Unix, and outer manifest/lock rollback refuses to
   overwrite edits observed after its post-apply capture or run any later batch after a restore
-  conflict. The new
-  `recover` command discovers recovery artifacts without loading policy, manifests, baselines, or
-  registries, then restores a validated interrupted transaction without continuing into another
-  mutation. Project reads and native-policy sync share project leases, while repository-scoped
-  native state has its own tool-qualified lease independent of project discovery. Config follows
-  the per-project repository cascade, and the closed JSON contract is schema v4.
+  conflict. A pending adapter transaction also prevents outer rollback, final verification, and
+  build until explicit recovery completes. Recovery records are owner-only on Unix, and validated
+  private publication leftovers are collected. The new `recover` command discovers exact ignored
+  or hidden targets without loading policy, manifests, baselines, or registries, then restores a
+  validated interrupted transaction without continuing into another mutation. Project reads and
+  native-policy sync share target-derived project leases under the Git common directory (or a
+  project-local non-Git state directory), while repository-scoped native state has its own
+  tool-qualified lease independent of project discovery. User-visible source identities redact
+  credentials, non-provenance query values, and non-commit fragments. Config follows the
+  per-project repository cascade, and the closed JSON contract is schema v4.
 
 ## v0.0.12
 

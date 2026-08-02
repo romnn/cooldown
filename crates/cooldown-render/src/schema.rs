@@ -30,6 +30,7 @@ pub fn json_schema() -> Value {
                     "path_encoding",
                     "serialization",
                     "lock_conflict",
+                    "pending_recovery",
                     "system",
                     "config",
                     "parse",

@@ -149,6 +149,10 @@ pub enum CoreError {
     #[error("lock conflict: {0}")]
     LockConflict(String),
 
+    /// Adapter-owned recovery evidence remains authoritative, so no outer rollback may run.
+    #[error("pending recovery: {0}")]
+    PendingRecovery(String),
+
     /// A non-transient local runtime/environment setup step failed.
     #[error("system error: {0}")]
     System(String),
@@ -196,7 +200,8 @@ impl CoreError {
             | CoreError::PathEncoding(_)
             | CoreError::Serialization(_)
             | CoreError::System(_)
-            | CoreError::LockConflict(_) => true,
+            | CoreError::LockConflict(_)
+            | CoreError::PendingRecovery(_) => true,
             CoreError::Tool { stderr, .. } => detail_indicates_broken_environment(stderr),
             _ => false,
         }
@@ -224,6 +229,7 @@ impl CoreError {
             CoreError::PathEncoding(_) => DiagnosticKind::PathEncoding,
             CoreError::Serialization(_) => DiagnosticKind::Serialization,
             CoreError::LockConflict(_) => DiagnosticKind::LockConflict,
+            CoreError::PendingRecovery(_) => DiagnosticKind::PendingRecovery,
             CoreError::System(_) => DiagnosticKind::System,
         }
     }
@@ -331,6 +337,8 @@ pub enum DiagnosticKind {
     Serialization,
     /// Another cooldown process already holds the project mutation lock.
     LockConflict,
+    /// Adapter-owned recovery evidence still controls the project mutation state.
+    PendingRecovery,
     /// A non-transient local runtime/environment setup step failed.
     System,
     /// Invalid configuration or command input (the user must fix it).
@@ -360,6 +368,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::PathEncoding => "path_encoding",
             DiagnosticKind::Serialization => "serialization",
             DiagnosticKind::LockConflict => "lock_conflict",
+            DiagnosticKind::PendingRecovery => "pending_recovery",
             DiagnosticKind::System => "system",
             DiagnosticKind::Config => "config",
             DiagnosticKind::Parse => "parse",

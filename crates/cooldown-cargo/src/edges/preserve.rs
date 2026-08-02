@@ -1,15 +1,17 @@
-//! [`EdgePolicy::Preserve`](cooldown_core::EdgePolicy::Preserve): an upgrade touches only what it
-//! reports. Any edge the re-resolve rebound between two *still-coexisting* versions is restored to
+//! [`EdgePolicy::Preserve`](cooldown_core::EdgePolicy::Preserve) keeps an upgrade scoped to the
+//! relationships it reports.
+//! It restores an eligible edge the re-resolve rebound between two *still-coexisting* versions to
 //! its pre-apply binding — the churn cargo's incremental resolver introduces when a wide declared
 //! range (diesel's `uuid = ">=0.7, <2.0"`) admits several locked versions and preference order
 //! happens to land on a different one than last time.
 //!
-//! A binding change that reflects a *planned* move is never restored, structurally: a same-major
-//! move replaces the old version in the lock (the old binding target no longer exists, so the
-//! existence guard skips it), and a cross-major move only lands after the manifest requirement was
-//! widened (the old binding no longer satisfies the post-widen requirement, so the requirement
-//! guard skips it). What remains is exactly the gratuitous rebinding between versions that both
-//! still exist and both still satisfy the declared range.
+//! A binding change that reflects a *planned* move is never restored, structurally.
+//! A same-major move replaces the old version in the lock, so the existence guard skips its absent
+//! earlier target.
+//! A cross-major move only lands after the manifest requirement was widened, so the requirement
+//! guard rejects its earlier target.
+//! What remains is exactly the gratuitous rebinding between versions that both still exist and
+//! still satisfy the declared range.
 
 use super::{EdgeRewrite, LockEdgeView, RequirementIndex};
 
@@ -35,8 +37,9 @@ pub(crate) fn has_potential_restoration(before: &LockEdgeView, after: &LockEdgeV
 }
 
 /// The corrective rewrites that restore churned bindings of `after` back to their `before` state.
-/// Ambiguous pairs are already absent from the views; the orphan guard is applied by the caller
-/// via [`guard_rewrites`](super::guard_rewrites).
+///
+/// Ambiguous pairs are already absent from the views.
+/// The orphan guard is applied by the caller via [`guard_rewrites`](super::guard_rewrites).
 pub(crate) fn restorations(
     before: &LockEdgeView,
     after: &LockEdgeView,

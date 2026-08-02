@@ -757,8 +757,14 @@ impl ToolWrite for CargoTool {
         let report = self
             .apply_plan(project, plan, journal, Some(observer))
             .await;
+        let report = match report {
+            Err(error @ CoreError::PendingRecovery(_)) => {
+                return Ok(ApplyAttempt::PendingRecovery { error });
+            }
+            report => report,
+        };
         let postimage = journal.capture_state(&project.root)?;
-        Ok(ApplyAttempt { report, postimage })
+        Ok(ApplyAttempt::Finished { report, postimage })
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
