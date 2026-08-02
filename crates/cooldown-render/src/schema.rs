@@ -1,6 +1,7 @@
 //! The machine-readable JSON schema for `--json` output, printed by `cooldown schema`.
 
 use crate::model::SCHEMA_VERSION;
+use cooldown_core::DiagnosticKind;
 use serde_json::{Map, Value, json};
 
 /// A JSON Schema (draft 2020-12) describing the command-specific envelopes.
@@ -10,32 +11,16 @@ use serde_json::{Map, Value, json};
 )]
 #[must_use]
 pub fn json_schema() -> Value {
+    let diagnostic_kinds = DiagnosticKind::ALL
+        .iter()
+        .map(|kind| Value::String(kind.wire_value().to_string()))
+        .collect::<Vec<_>>();
     let diagnostic = json!({
         "type": "object",
         "required": ["kind", "message"],
         "properties": {
             "kind": {
-                "enum": [
-                    "transient",
-                    "not_found",
-                    "unknown_age",
-                    "stricter_native",
-                    "yanked",
-                    "stale_lock",
-                    "lock_unknown",
-                    "tool_failed",
-                    "tool_spawn_failed",
-                    "lockfile_unreadable",
-                    "filesystem",
-                    "path_encoding",
-                    "serialization",
-                    "lock_conflict",
-                    "pending_recovery",
-                    "system",
-                    "config",
-                    "parse",
-                    "held"
-                ]
+                "enum": diagnostic_kinds
             },
             "message": { "type": "string" },
             "tool": { "type": "string" },

@@ -279,6 +279,25 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
+    fn mutation_execution(&self) -> MutationExecution {
+        if self.root.join("use-isolated-mutation").exists() {
+            MutationExecution::Isolated {
+                output_filenames: &["Cargo.lock"],
+            }
+        } else {
+            MutationExecution::InPlace
+        }
+    }
+
+    async fn publish_accepted_state(
+        &self,
+        project: &Project,
+        accepted: &AcceptedProjectState,
+    ) -> Result<Vec<Diagnostic>> {
+        accepted.install(&project.root)?;
+        Ok(Vec::new())
+    }
+
     async fn ensure_no_pending_mutation(&self, _p: &Project) -> Result<()> {
         let state = self.state.lock().unwrap();
         if state.require_recovery_before_read && !state.recovery_completed {
@@ -323,6 +342,19 @@ impl ToolWrite for FakeEco {
     ) -> Result<ApplyReport> {
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
+        if self.root.join("use-isolated-mutation").exists() {
+            if p.root == self.root {
+                return Err(CoreError::System(
+                    "isolated fake resolver received the source project".to_string(),
+                ));
+            }
+            if std::fs::read_to_string(self.root.join("Cargo.lock"))? != "source lock" {
+                return Err(CoreError::LockConflict(
+                    "source lock changed before isolated fake resolution completed".to_string(),
+                ));
+            }
+            std::fs::write(p.root.join("Cargo.lock"), "accepted lock")?;
+        }
         let recorder = p.root.join("record-apply-batches");
         if recorder.exists() {
             let mut recorder = std::fs::OpenOptions::new().append(true).open(recorder)?;
@@ -386,9 +418,7 @@ impl ToolWrite for FakeEco {
         let report = self.apply(p, plan, journal).await;
         if p.root.join("pending-recovery-on-apply").exists() {
             return Ok(ApplyAttempt::PendingRecovery {
-                error: CoreError::PendingRecovery(
-                    "fake adapter retained authoritative recovery evidence".to_string(),
-                ),
+                detail: "fake adapter retained authoritative recovery evidence".to_string(),
             });
         }
         let postimage = journal.capture_state(&p.root)?;
@@ -720,6 +750,49 @@ async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Resul
         "build-tool\n"
     );
     assert_eq!(std::fs::read(root.join("fake.lock"))?, b"external edit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn isolated_mutation_publishes_once_then_builds_the_source() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("Cargo.lock"), "source lock")?;
+    std::fs::write(root.join("use-isolated-mutation"), "")?;
+    let adapter = fake(
+        root.clone(),
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        HashMap::from([(
+            "a".to_string(),
+            vec![
+                rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    2,
+                    Some("2025-02-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        )]),
+        HashMap::from([(
+            "a".to_string(),
+            rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+        )]),
+    );
+    let mut options = opts();
+    options.build = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&options)
+        .await;
+
+    assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+    assert_eq!(
+        std::fs::read_to_string(root.join("Cargo.lock"))?,
+        "accepted lock"
+    );
+    assert!(root.join("build-invoked").exists());
+    assert_eq!(outcome.summary.applied, 1);
     Ok(())
 }
 

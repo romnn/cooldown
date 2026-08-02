@@ -22,16 +22,19 @@ fn multiset_difference(left: &[String], right: &[String]) -> Vec<String> {
 }
 
 /// Bindings that moved between `before` and `after` for `[[package]]` blocks present in both locks
-/// under the same `(name, version, source)` identity — the rebinds an apply produced. Compares the
-/// per-block qualified-entry multisets verbatim (source suffixes included), so a rebind among
-/// entries too ambiguous to rewrite is still observed, and twin blocks sharing a `(name, version)`
-/// identity are diffed independently instead of merged. Vacated and adopted entries are paired in
-/// version order; a pair whose entries differ only in source (same bound version, another origin)
-/// is reported with the source move in `detail`. Excluded as *not* rebinds: a block whose own
-/// identity changed (its dependency list was legitimately re-resolved), an entry that appeared or
-/// vanished without a counterpart, and a pair whose endpoint versions do not exist in **both**
-/// locks — an edge merely following a slot-level version change the report already carries as an
-/// applied row. A genuine rebinding moves between versions that coexist throughout.
+/// under the same `(name, version, source)` identity.
+///
+/// The comparison uses per-block qualified-entry multisets verbatim, including source suffixes.
+/// It therefore observes rebinds among entries too ambiguous to rewrite and keeps twin blocks with
+/// the same `(name, version)` identity independent.
+/// Vacated and adopted entries are paired in version order.
+/// A pair whose entries differ only in source is reported with the source move in `detail`.
+///
+/// Changed block identities, unpaired entries, and endpoints absent from either lock are not
+/// rebinds.
+/// Those cases describe a legitimately re-resolved dependent or an edge following a slot-level
+/// version change already represented by an applied row.
+/// A genuine rebinding moves between versions that coexist throughout.
 pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Vec<BindingChange> {
     let mut changes = Vec::new();
     for ((block, dependency), after_entries) in &after.qualified {

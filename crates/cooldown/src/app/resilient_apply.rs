@@ -71,11 +71,12 @@ pub(crate) struct AppliedMutation {
 ///
 /// Returns the committed [`ApplyReport`]: the applied changes (plus any the resolve genuinely held)
 /// and, appended, every candidate the recovery dropped — so one unfetchable or conflicting
-/// candidate never blocks the rest. A local environment failure (missing binary, read-only tree,
-/// full disk) is not a candidate conflict and propagates unchanged. `journal` is the caller's
-/// pre-apply snapshot; it is restored before each recovery trial and before the final commit, so no
-/// partial widen or lock leaks. Native candidate work is forwarded to `observer` across both the
-/// first attempt and any recovery trials.
+/// candidate never blocks the rest.
+/// A local environment failure such as a missing binary, read-only tree, or full disk is not a
+/// candidate conflict and propagates unchanged.
+/// `journal` is the caller's pre-apply snapshot and is restored before each recovery trial and the
+/// final commit, so no partial widen or lock leaks.
+/// Native candidate work is forwarded to `observer` across the first attempt and recovery trials.
 pub(crate) async fn apply_resilient_with_observer(
     writer: &dyn ToolWrite,
     project: &Project,
@@ -89,8 +90,10 @@ pub(crate) async fn apply_resilient_with_observer(
         .map_err(ApplyFailure::RestoreConflict)?;
     let (first_report, first_state) = match first {
         cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
-        cooldown_core::ApplyAttempt::PendingRecovery { error } => {
-            return Err(ApplyFailure::RestoreConflict(error));
+        cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+            return Err(ApplyFailure::RestoreConflict(
+                cooldown_core::CoreError::PendingRecovery(detail),
+            ));
         }
     };
     match first_report {
@@ -145,8 +148,10 @@ pub(crate) async fn apply_resilient_with_observer(
             .map_err(ApplyFailure::RestoreConflict)?;
         let (report, expected) = match result {
             cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
-            cooldown_core::ApplyAttempt::PendingRecovery { error } => {
-                return Err(ApplyFailure::RestoreConflict(error));
+            cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+                return Err(ApplyFailure::RestoreConflict(
+                    cooldown_core::CoreError::PendingRecovery(detail),
+                ));
             }
         };
         match report {
@@ -212,8 +217,10 @@ async fn verified_satisfiable_subset(
                 current_state = postimage;
                 report
             }
-            cooldown_core::ApplyAttempt::PendingRecovery { error } => {
-                return Err(ApplyFailure::RestoreConflict(error));
+            cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+                return Err(ApplyFailure::RestoreConflict(
+                    cooldown_core::CoreError::PendingRecovery(detail),
+                ));
             }
         };
         match report {

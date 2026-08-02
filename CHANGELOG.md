@@ -19,6 +19,11 @@
   rollback can restore the file contents and modes without following a symlink. Callers can
   therefore distinguish rollback conflicts from visible corrections whose directory durability is
   uncertain.
+- **Breaking library API:** `ToolWrite::mutation_execution` lets an adapter require isolated
+  resolver trials, and `ToolWrite::publish_accepted_state` publishes the resulting
+  `AcceptedProjectState`. Cargo uses this boundary so resolver and edge-normalization trials touch
+  only a disposable project copy; the source project receives the accepted manifests and lock
+  through one adapter-owned recovery protocol after its complete preimage is revalidated.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.
@@ -40,14 +45,13 @@
   source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
   version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level
   `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
-  fails `--strict`. Speculative lock corrections use atomically published, drift-checked recovery
-  records with parent-directory syncing on Unix, and outer manifest/lock rollback refuses to
-  overwrite edits observed after its post-apply capture or run any later batch after a restore
-  conflict. A pending adapter transaction also prevents outer rollback, final verification, and
-  build until explicit recovery completes. Recovery records are owner-only on Unix, and validated
-  private publication leftovers are collected. The new `recover` command discovers exact ignored
-  or hidden targets without loading policy, manifests, baselines, or registries, then restores a
-  validated interrupted transaction without continuing into another mutation. Project reads and
+  fails `--strict`. Cargo resolver and correction trials run in an isolated project copy. Once the
+  complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
+  record guards checked, directory-durable publication of the accepted manifests and lock.
+  Unknown or unreferenced recovery artifacts are reported and left untouched. The new `recover`
+  command discovers exact ignored or hidden targets without loading policy, manifests, baselines,
+  or registries, then completes or restores a validated interrupted publication without continuing
+  into another mutation. Project reads and
   native-policy sync share target-derived project leases under the Git common directory (or a
   project-local non-Git state directory), while repository-scoped native state has its own
   tool-qualified lease independent of project discovery. User-visible source identities redact

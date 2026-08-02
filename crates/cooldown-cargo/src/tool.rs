@@ -26,12 +26,12 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
-    Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    AcceptedProjectState, ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change,
+    CoreError, DepScope, Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext,
+    LockVerifyReport, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -700,6 +700,20 @@ fn reached_after(
 
 #[async_trait]
 impl ToolWrite for CargoTool {
+    fn mutation_execution(&self) -> MutationExecution {
+        MutationExecution::Isolated {
+            output_filenames: &["Cargo.toml", "Cargo.lock"],
+        }
+    }
+
+    async fn publish_accepted_state(
+        &self,
+        project: &Project,
+        accepted: &AcceptedProjectState,
+    ) -> Result<Vec<cooldown_core::Diagnostic>> {
+        edges::recovery::publish_accepted(project, accepted)
+    }
+
     async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
         edges::enforce::ensure_no_pending(project)
     }
@@ -758,8 +772,8 @@ impl ToolWrite for CargoTool {
             .apply_plan(project, plan, journal, Some(observer))
             .await;
         let report = match report {
-            Err(error @ CoreError::PendingRecovery(_)) => {
-                return Ok(ApplyAttempt::PendingRecovery { error });
+            Err(CoreError::PendingRecovery(detail)) => {
+                return Ok(ApplyAttempt::PendingRecovery { detail });
             }
             report => report,
         };

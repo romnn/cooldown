@@ -83,6 +83,44 @@ where
     write_replacement_checked(path, bytes, permissions, validate)
 }
 
+/// Replaces `path` after validation and makes the directory entry durable when supported.
+///
+/// # Errors
+///
+/// Returns [`DurableWriteError::NotCommitted`] if validation or replacement fails before rename.
+/// Returns [`DurableWriteError::DurabilityUncertain`] if rename succeeds but the parent directory
+/// cannot be synced.
+pub fn atomic_write_durable_with_permissions_checked<F>(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+    validate: F,
+) -> Result<(), DurableWriteError>
+where
+    F: FnOnce() -> Result<(), CoreError>,
+{
+    write_replacement_checked(path, bytes, permissions, validate)
+        .map_err(DurableWriteError::NotCommitted)?;
+    sync_parent_after_commit(path)
+}
+
+/// Removes `path` and makes the directory-entry removal durable when supported.
+///
+/// A missing path is already in the requested state and succeeds without a directory sync.
+///
+/// # Errors
+///
+/// Returns [`DurableWriteError::NotCommitted`] if removal fails while the path remains visible.
+/// Returns [`DurableWriteError::DurabilityUncertain`] if removal succeeds but the parent directory
+/// cannot be synced.
+pub fn remove_file_durable(path: &Path) -> Result<(), DurableWriteError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent_after_commit(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DurableWriteError::NotCommitted(error.into())),
+    }
+}
+
 /// Writes `bytes` atomically and, on Unix, syncs the containing directory after replacement.
 ///
 /// Callers that maintain a recovery protocol can distinguish a failed replacement from a visible
@@ -106,6 +144,29 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), DurableWrit
     {
         write_replacement(path, bytes, permissions.as_ref())
             .map_err(DurableWriteError::NotCommitted)
+    }
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "the shared cross-platform signature remains fallible on Unix"
+    )
+)]
+fn sync_parent_after_commit(path: &Path) -> Result<(), DurableWriteError> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(CoreError::from)
+            .map_err(DurableWriteError::DurabilityUncertain)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 

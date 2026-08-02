@@ -26,15 +26,11 @@ impl CoordinationRoot {
         canonical: &camino::Utf8Path,
         marker: Option<PathBuf>,
     ) -> Result<Self, CoreError> {
-        let directory = match marker {
-            Some(marker) => git_common_directory(&marker)?
-                .join("cooldown")
-                .join("locks"),
-            None => canonical
-                .join(".cooldown")
-                .join("locks")
-                .into_std_path_buf(),
+        let (base, components): (PathBuf, &[&str]) = match marker {
+            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"]),
+            None => (canonical.as_std_path().to_owned(), &[".cooldown", "locks"]),
         };
+        let directory = secure_create_coordination_directory(&base, components)?;
         Ok(CoordinationRoot(directory))
     }
 
@@ -285,16 +281,63 @@ fn lock_error(path: &Path, error: &std::io::Error) -> CoreError {
 }
 
 fn open_lock_file(path: &Path) -> Result<File, CoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = path.parent().ok_or_else(|| {
+        CoreError::Filesystem(format!(
+            "coordination lock has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir() {
+        return Err(CoreError::Filesystem(format!(
+            "coordination lock parent is not a regular directory: {}",
+            parent.display()
+        )));
     }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(CoreError::from)
+    let parent_identity = same_file::Handle::from_path(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CoreError::Filesystem(format!(
+                "coordination lock is not a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(CoreError::Filesystem(format!(
+            "coordination lock did not open as a regular file: {}",
+            path.display()
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_path(path)?
+        || parent_identity != same_file::Handle::from_path(parent)?
+    {
+        return Err(CoreError::Filesystem(format!(
+            "coordination lock changed identity while opening: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn open_coordinated_lock_file(path: &Path) -> Result<(File, File), CoreError> {
@@ -344,22 +387,24 @@ fn acquire_exclusive_file(identity: &str, path: &Path, mut file: File) -> Result
 fn collect_stale_locks_once(directory: &Path) {
     static COLLECTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let collected = COLLECTED.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut collected) = collected.lock() else {
-        return;
-    };
-    if collected.contains(directory) {
-        return;
+    {
+        let Ok(mut collected) = collected.lock() else {
+            return;
+        };
+        if !collected.insert(directory.to_owned()) {
+            return;
+        }
     }
-    if matches!(
+    if !matches!(
         collect_stale_lock_files(directory, STALE_LOCK_AGE),
         Ok(true)
-    ) {
-        collected.insert(directory.to_owned());
+    ) && let Ok(mut collected) = collected.lock()
+    {
+        collected.remove(directory);
     }
 }
 
 fn collect_stale_lock_files(directory: &Path, minimum_age: Duration) -> Result<bool, CoreError> {
-    std::fs::create_dir_all(directory)?;
     let coordination_path = directory.join(".maintenance.lock");
     let mut coordination = open_lock_file(&coordination_path)?;
     match coordination.try_lock() {
@@ -508,6 +553,69 @@ fn resolve_relative(base: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn secure_create_coordination_directory(
+    base: &Path,
+    components: &[&str],
+) -> Result<PathBuf, CoreError> {
+    let mut current = base.to_owned();
+    let base_metadata = std::fs::symlink_metadata(&current)?;
+    if !base_metadata.file_type().is_dir() {
+        return Err(CoreError::Filesystem(format!(
+            "coordination root is not a regular directory: {}",
+            current.display()
+        )));
+    }
+    for component in components {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(CoreError::Filesystem(format!(
+                    "coordination path is not a regular directory: {}",
+                    current.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match create_coordination_directory(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if !metadata.file_type().is_dir() {
+                    return Err(CoreError::Filesystem(format!(
+                        "coordination path changed while it was created: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let canonical = std::fs::canonicalize(&current)?;
+    if canonical != current {
+        return Err(CoreError::Filesystem(format!(
+            "coordination directory traverses a symbolic link: {}",
+            current.display()
+        )));
+    }
+    Ok(current)
+}
+
+fn create_coordination_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(path)
+    }
+}
+
 #[cfg(test)]
 fn lock_file_name(root: &camino::Utf8Path) -> Result<String, CoreError> {
     let root = canonical_lock_root(root)?;
@@ -560,6 +668,76 @@ impl Drop for RepoToolWriteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_lock_symlink_cannot_truncate_a_project_file() -> color_eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"safe\"\n")?;
+        let canonical = canonical_lock_root(root)?;
+        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        symlink("../../Cargo.toml", coordination.0.join(".maintenance.lock"))?;
+
+        let result = open_coordinated_lock_file(&coordination.project_lock(&canonical));
+
+        assert!(matches!(result, Err(CoreError::Filesystem(_))));
+        assert_eq!(
+            std::fs::read_to_string(&manifest)?,
+            "[package]\nname = \"safe\"\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_lock_symlink_cannot_truncate_a_project_file() -> color_eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"safe\"\n")?;
+        let canonical = canonical_lock_root(root)?;
+        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        symlink("../../Cargo.toml", coordination.project_lock(&canonical))?;
+
+        let error = open_coordinated_lock_file(&coordination.project_lock(&canonical))
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("project-lock symlink was accepted"))?;
+
+        assert!(matches!(error, CoreError::Filesystem(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&manifest)?,
+            "[package]\nname = \"safe\"\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordination_directory_symlink_is_rejected() -> color_eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(outside.path().join("locks"))?;
+        symlink(outside.path(), root.join(".cooldown"))?;
+        let canonical = canonical_lock_root(root)?;
+
+        let error = CoordinationRoot::from_canonical(&canonical, None)
+            .err()
+            .ok_or_else(|| color_eyre::eyre::eyre!("coordination symlink was accepted"))?;
+        assert!(matches!(error, CoreError::Filesystem(_)), "{error:?}");
+        Ok(())
+    }
 
     #[test]
     fn readers_can_share_project_access() {

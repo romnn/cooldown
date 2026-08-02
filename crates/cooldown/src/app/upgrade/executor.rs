@@ -102,6 +102,12 @@ struct MutationTerminated;
 
 type MutationFlow = ControlFlow<MutationTerminated>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectRunStatus {
+    Complete,
+    Terminated,
+}
+
 /// One policy-violating resolved pin — the package and the exact too-fresh version the graph
 /// holds. The key the trial state machine tracks baseline and residual violations by.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -269,12 +275,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    pub(super) async fn run(&mut self) {
+    pub(super) async fn run(&mut self) -> ProjectRunStatus {
         let _guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
-                return;
+                return ProjectRunStatus::Terminated;
             }
         };
         if let Err(error) = self
@@ -284,11 +290,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             self.record_project_error(&error, None);
-            return;
+            return ProjectRunStatus::Terminated;
         }
         self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
-            return;
+            return ProjectRunStatus::Terminated;
         };
         let verb = match self.mode {
             PlanMode::Upgrade => "upgrades",
@@ -308,11 +314,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.record_project_error(&error, None);
-                return;
+                return ProjectRunStatus::Terminated;
             }
         };
         let Some(mut state) = self.initial_trial_state().await else {
-            return;
+            return ProjectRunStatus::Terminated;
         };
         let mutation = match self.mode {
             PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
@@ -326,7 +332,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         };
 
         if mutation.is_break() {
-            return;
+            return ProjectRunStatus::Terminated;
         }
 
         // The final pass reconciles run-level observation with committed correction evidence, so
@@ -335,10 +341,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if (self.initial_edge_snapshot.is_some() || !self.lock_edges_enforced)
             && self.normalize_edges().await.is_break()
         {
-            return;
+            return ProjectRunStatus::Terminated;
         }
 
-        self.finalize().await;
+        if self.finalize().await.is_break() {
+            ProjectRunStatus::Terminated
+        } else {
+            ProjectRunStatus::Complete
+        }
     }
 
     /// Final edge-binding enforcement and run-level audit for this project.
@@ -1761,7 +1771,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    async fn finalize(&mut self) {
+    async fn finalize(&mut self) -> MutationFlow {
+        let mut terminal = false;
         self.ctx.opts.progress.phase("verifying final lock state");
         match self
             .ctx
@@ -1783,6 +1794,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         self.acc.warnings.push(diag);
                     } else {
                         self.acc.errors.push(diag);
+                        terminal = true;
                     }
                 }
                 LockStatus::Unknown => {
@@ -1802,10 +1814,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Err(error) => {
                 self.record_lock_status(LockStatus::Stale);
                 self.record_project_error(&error, None);
+                terminal = true;
             }
         }
 
-        if self.ctx.opts.build {
+        if self.ctx.opts.build && !self.ctx.defer_build {
             self.acc.build_requested = true;
             self.ctx.opts.progress.phase("building updated project");
             match self.ctx.writer.build(&self.ctx.pctx.project).await {
@@ -1824,6 +1837,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     self.record_project_error(&error, None);
                 }
             }
+        }
+        if terminal {
+            ControlFlow::Break(MutationTerminated)
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
@@ -1904,6 +1922,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     fn project_diag(&self, error: &cooldown_core::CoreError, package: Option<&str>) -> Diagnostic {
+        if self.ctx.access.is_isolated()
+            && let cooldown_core::CoreError::PendingRecovery(detail) = error
+        {
+            let reason = detail
+                .split_once("; recovery evidence at ")
+                .map_or(detail.as_str(), |(reason, _)| reason);
+            let mut diagnostic = Diagnostic::new(
+                DiagnosticKind::Filesystem,
+                format!(
+                    "isolated resolver trial was discarded without changing the source project: {reason}"
+                ),
+            )
+            .with_tool(self.ctx.pctx.tool.as_str())
+            .with_project(self.project_label());
+            if let Some(package) = package {
+                diagnostic = diagnostic.with_package(package);
+            }
+            return diagnostic;
+        }
         diag_from_error(error, self.ctx.pctx.tool, self.project_label(), package)
     }
 

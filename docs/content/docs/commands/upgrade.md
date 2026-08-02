@@ -49,6 +49,11 @@ The lock-only default is honored where the tool can pin an exact in-range versio
 | npm, yarn, bun | *(no such command)* | always rewrites the manifest |
 | Go | `go.mod` *is* the version source | always rewrites the manifest |
 
+Cargo resolver and edge-normalization trials run in an isolated project copy. Cooldown compares the
+source manifests and lock with the preimage used for that trial, then publishes the accepted files
+under one durable recovery record. An interrupted publication can therefore recover the complete
+old or accepted state without treating a rejected resolver trial as source-project state.
+
 ## Transitive dependencies
 
 By default `upgrade` moves the **whole graph**: it advances each dependency to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. `--transitive` relaxes this:

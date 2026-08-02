@@ -12,13 +12,13 @@
 mod executor;
 
 pub(super) use self::executor::target_package_for;
-use self::executor::{PlanMode, ProjectUpgradeExecutor};
+use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
 use super::{
     BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    Change, Diagnostic, DiagnosticKind, EdgeBindingAction, LockStatus, PackageId, ToolRead,
-    ToolWrite,
+    Change, Diagnostic, DiagnosticKind, EdgeBindingAction, LockStatus, MutationExecution,
+    PackageId, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
 
@@ -67,12 +67,19 @@ pub(super) struct UpgradeCtx<'a> {
     pub(super) opts: &'a RunOpts,
     repo_root: &'a camino::Utf8Path,
     access: ProjectExecution,
+    defer_build: bool,
 }
 
 #[derive(Clone, Copy)]
 enum ProjectExecution {
     Source,
     Isolated,
+}
+
+impl ProjectExecution {
+    const fn is_isolated(self) -> bool {
+        matches!(self, ProjectExecution::Isolated)
+    }
 }
 
 impl<'a> UpgradeCtx<'a> {
@@ -83,6 +90,7 @@ impl<'a> UpgradeCtx<'a> {
         opts: &'a RunOpts,
         repo_root: &'a camino::Utf8Path,
         access: ProjectExecution,
+        defer_build: bool,
     ) -> Self {
         UpgradeCtx {
             reader,
@@ -91,6 +99,7 @@ impl<'a> UpgradeCtx<'a> {
             opts,
             repo_root,
             access,
+            defer_build,
         }
     }
 
@@ -160,6 +169,14 @@ impl Workspace {
                 acc.errors.push(read_only_mutator_diag(pctx));
                 continue;
             };
+            if !opts.dry_run
+                && let MutationExecution::Isolated { output_filenames } =
+                    writer.mutation_execution()
+            {
+                self.run_isolated_source_project(pctx, opts, mode, output_filenames, &mut acc)
+                    .await;
+                continue;
+            }
 
             // Under `--dry-run`, preview the TRUE outcome of the real run: run the identical
             // whole-graph mutation flow against a throwaway recursive copy of the project, then discard
@@ -219,6 +236,7 @@ impl Workspace {
                     opts,
                     self.repo_root(),
                     access,
+                    false,
                 ),
                 mode,
                 &mut acc,
@@ -285,6 +303,7 @@ impl Workspace {
                 &preview_opts,
                 self.repo_root(),
                 ProjectExecution::Isolated,
+                false,
             ),
             PlanMode::Upgrade,
             &mut acc,
@@ -292,6 +311,197 @@ impl Workspace {
         .run_policy(changes, manifest_only)
         .await;
         acc
+    }
+
+    async fn run_isolated_source_project(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        mode: PlanMode,
+        output_filenames: &'static [&'static str],
+        acc: &mut UpgradeAccum,
+    ) {
+        let Some(reader) = self.adapter(pctx.tool) else {
+            return;
+        };
+        let Some(writer) = self.mutator(pctx.tool) else {
+            return;
+        };
+        let (_guard, trial) = match self
+            .prepare_isolated_trial(writer, pctx, opts, output_filenames)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return;
+            }
+        };
+        let copied_pctx = super::ProjectCtx {
+            tool: pctx.tool,
+            project: trial.project().clone(),
+            rel_path: pctx.rel_path.clone(),
+            policy: pctx.policy.clone(),
+            edge_policy: pctx.edge_policy,
+        };
+        let mut trial_opts = opts.clone();
+        trial_opts.build = false;
+        let mut project_acc = UpgradeAccum::default();
+        let status = ProjectUpgradeExecutor::new(
+            self,
+            UpgradeCtx::new(
+                reader,
+                writer,
+                &copied_pctx,
+                &trial_opts,
+                self.repo_root(),
+                ProjectExecution::Isolated,
+                true,
+            ),
+            mode,
+            &mut project_acc,
+        )
+        .run()
+        .await;
+        if status == ProjectRunStatus::Terminated {
+            merge_discarded_trial(acc, project_acc);
+            return;
+        }
+        let accepted = match trial.accepted_state() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                merge_discarded_trial(acc, project_acc);
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return;
+            }
+        };
+        opts.progress.phase("publishing accepted project state");
+        let warnings = match writer
+            .publish_accepted_state(&pctx.project, &accepted)
+            .await
+        {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                merge_discarded_trial(acc, project_acc);
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return;
+            }
+        };
+        project_acc
+            .warnings
+            .extend(warnings.into_iter().map(|warning| {
+                warning
+                    .with_tool(pctx.tool.as_str())
+                    .with_project(pctx.rel_path.as_str())
+            }));
+        merge_upgrade_accum(acc, project_acc);
+        if opts.build {
+            build_published_project(writer, pctx, opts, acc).await;
+        }
+    }
+
+    async fn prepare_isolated_trial(
+        &self,
+        writer: &dyn ToolWrite,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        output_filenames: &'static [&'static str],
+    ) -> cooldown_core::Result<(
+        super::lock::ProjectAccessWriteGuard,
+        super::project_copy::MutationProjectCopy,
+    )> {
+        let guard = super::lock::ProjectAccessWriteGuard::acquire(
+            self.repo_root(),
+            &pctx.project.root,
+            pctx.tool,
+            writer.sync_scope() == cooldown_core::SyncScope::Repo,
+        )?;
+        writer.recover_pending_mutation(&pctx.project).await?;
+        opts.progress.phase("preparing isolated mutation project");
+        let trial = super::project_copy::MutationProjectCopy::create(
+            &pctx.project,
+            &writer.resolve_inputs(),
+            output_filenames,
+        )?;
+        Ok((guard, trial))
+    }
+}
+
+fn merge_upgrade_accum(target: &mut UpgradeAccum, mut source: UpgradeAccum) {
+    target.items.append(&mut source.items);
+    target.edge_items.append(&mut source.edge_items);
+    target.errors.append(&mut source.errors);
+    target.warnings.append(&mut source.warnings);
+    target.strict_incomplete |= source.strict_incomplete;
+    target.lock_status = combine_lock_status(target.lock_status, source.lock_status);
+}
+
+fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
+    target.errors.extend(source.errors);
+    target
+        .errors
+        .extend(source.items.into_iter().filter_map(|item| item.error));
+}
+
+const fn combine_lock_status(
+    left: Option<LockStatus>,
+    right: Option<LockStatus>,
+) -> Option<LockStatus> {
+    match (left, right) {
+        (Some(LockStatus::Stale), _) | (_, Some(LockStatus::Stale)) => Some(LockStatus::Stale),
+        (Some(LockStatus::Unknown), _) | (_, Some(LockStatus::Unknown)) => {
+            Some(LockStatus::Unknown)
+        }
+        (Some(LockStatus::Current), _) | (_, Some(LockStatus::Current)) => {
+            Some(LockStatus::Current)
+        }
+        (None, None) => None,
+    }
+}
+
+async fn build_published_project(
+    writer: &dyn ToolWrite,
+    pctx: &super::ProjectCtx,
+    opts: &RunOpts,
+    acc: &mut UpgradeAccum,
+) {
+    acc.build_requested = true;
+    opts.progress.phase("building updated project");
+    match writer.build(&pctx.project).await {
+        Ok(report) => {
+            acc.build_ok = Some(acc.build_ok.unwrap_or(true) && report.ok);
+            if !report.ok {
+                acc.errors.push(
+                    Diagnostic::new(DiagnosticKind::ToolFailed, report.detail)
+                        .with_tool(pctx.tool.as_str())
+                        .with_project(pctx.rel_path.as_str()),
+                );
+            }
+        }
+        Err(error) => {
+            acc.build_ok = Some(false);
+            acc.errors.push(diag_from_error(
+                &error,
+                pctx.tool,
+                pctx.rel_path.as_str(),
+                None,
+            ));
+        }
     }
 }
 
