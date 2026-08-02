@@ -147,7 +147,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
-        edges::enforce::recover_pending(project)?;
+        edges::enforce::ensure_no_pending(project)?;
         let graph = self.cargo.metadata(&project.root).await?;
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
@@ -199,7 +199,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
-        edges::enforce::recover_pending(project)?;
+        edges::enforce::ensure_no_pending(project)?;
         match self.cargo.verify_locked(&project.root).await {
             Ok(graph) => Ok(verify_current_report(
                 graph.is_some(),
@@ -546,8 +546,6 @@ impl CargoTool {
         if plan.changes.is_empty() {
             return Ok(report);
         }
-        edges::enforce::recover_pending(project)?;
-
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
         // the re-resolve), parsed once: its slot map feeds the version diff below and its edge view
         // feeds the edge policy. The batched precise pins emit one consistent lock; the report is the
@@ -715,7 +713,6 @@ impl ToolWrite for CargoTool {
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        edges::enforce::recover_pending(project)?;
         // Capture the lock and every manifest a rewrite could touch (the root, for
         // `[workspace.dependencies]`, plus each declaring member) so a rejected trial rolls back
         // both the re-lock and any constraint edit. Capturing an unmodified manifest is harmless —
@@ -759,8 +756,11 @@ impl ToolWrite for CargoTool {
         self.cargo.build(&project.root).await
     }
 
+    async fn recover_pending_mutation(&self, project: &Project) -> Result<()> {
+        edges::enforce::recover_pending(project)
+    }
+
     async fn lock_edge_snapshot(&self, project: &Project) -> Result<Option<Vec<u8>>> {
-        edges::enforce::recover_pending(project)?;
         std::fs::read(project.root.join("Cargo.lock"))
             .map(Some)
             .map_err(Into::into)

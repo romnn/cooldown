@@ -2,15 +2,14 @@
 //! normalization of ambiguous edges — bind every unambiguous crates.io edge to the **highest**
 //! locked crates.io version satisfying the dependent's declared requirement, preferring candidates
 //! whose declared `rust-version` is workspace-compatible. Unlike `preserve` this needs no pre-apply
-//! snapshot and also heals
-//! a bad binding that predates the run, so a canonicalized lock is a fixed point: re-running
-//! produces no rewrites.
+//! snapshot and also heals a bad binding that predates the run. A successfully canonicalized edge
+//! is a fixed point; a correction blocked by a safety guard remains a reported hold on later runs.
 //!
 //! This is a deliberate policy over the *existing* package set, not a re-implementation of cargo's
 //! resolver (which would pick versions, not just bindings). It matches what a from-scratch resolve
 //! binds in the common case — the resolver tries candidates highest-first, and coexisting locked
 //! versions are semver-incompatible majors that never conflict — with one deliberate rule for MSRV:
-//! candidates whose own `rust-version` exceeds the workspace minimum are preferred *against*,
+//! candidates whose own `rust-version` exceeds the workspace minimum are deprioritized,
 //! falling back to the highest satisfying candidate when no compatible one exists. That mirrors
 //! cargo's `incompatible-rust-versions = "fallback"` behavior (the resolver-v3 default); a
 //! workspace on resolver v1/v2 (default `allow`) or with a config override may see cargo fresh-bind
@@ -49,7 +48,12 @@ pub(crate) fn rebindings(
                     lock.dependency_source(binding.dependency, candidate)
                         .as_deref()
                         == Some(crate::cargocmd::CRATES_IO_SOURCE)
-                        && requirements.admits(binding.dependent, binding.dependency, candidate)
+                        && requirements.admits(
+                            binding.dependent,
+                            binding.dependency,
+                            binding.bound,
+                            candidate,
+                        )
                 })
                 .collect();
             let canonical = admitted
@@ -80,17 +84,24 @@ mod tests {
         let mut declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>> =
             HashMap::new();
         for (name, version, dependency, requirement) in requirements {
-            declared_requirements
-                .entry(LockPackageId::new(
-                    *name,
-                    *version,
-                    (*name != "app").then_some(CRATES_IO_SOURCE),
-                ))
-                .or_default()
-                .push(DeclaredRequirement {
-                    dependency: (*dependency).to_string(),
-                    requirement: (*requirement).to_string(),
-                });
+            for resolved_version in ["0.8.2", "1.24.0"] {
+                declared_requirements
+                    .entry(LockPackageId::new(
+                        *name,
+                        *version,
+                        (*name != "app").then_some(CRATES_IO_SOURCE),
+                    ))
+                    .or_default()
+                    .push(DeclaredRequirement {
+                        dependency: (*dependency).to_string(),
+                        resolved: LockPackageId::new(
+                            *dependency,
+                            resolved_version,
+                            Some(CRATES_IO_SOURCE),
+                        ),
+                        requirement: (*requirement).to_string(),
+                    });
+            }
         }
         ResolvedGraph {
             packages: HashMap::new(),
@@ -149,8 +160,8 @@ mod tests {
         assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
     }
 
-    /// When several requirements of one dependent name the same dependency (a normal dep beside a
-    /// target-gated one), the canonical version must satisfy them all.
+    /// When several active requirements of one dependent resolve to the same concrete edge, the
+    /// canonical version must satisfy them all.
     #[test]
     fn all_declared_requirements_must_admit_the_canonical_version() {
         let lock = view(CHURNED_LOCK);

@@ -218,12 +218,13 @@ pub fn json_schema() -> Value {
         },
         "upgradeSummary": {
             "type": "object",
-            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesHeld", "edgesUnaddressable"],
+            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesRebound", "edgesHeld", "edgesUnaddressable"],
             "properties": {
                 "applied": { "type": "integer", "minimum": 0 },
                 "skipped": { "type": "integer", "minimum": 0 },
                 "errors": { "type": "integer", "minimum": 0 },
                 "edgesCorrected": { "type": "integer", "minimum": 0 },
+                "edgesRebound": { "type": "integer", "minimum": 0 },
                 "edgesHeld": { "type": "integer", "minimum": 0 },
                 "edgesUnaddressable": { "type": "integer", "minimum": 0 }
             },
@@ -258,6 +259,22 @@ pub fn json_schema() -> Value {
                         }
                     },
                     "then": { "properties": { "applied": { "const": true } } }
+                },
+                {
+                    "if": { "required": ["edge"] },
+                    "then": {
+                        "properties": {
+                            "direct": { "const": false },
+                            "downgrade": { "const": false },
+                            "members": { "maxItems": 0 }
+                        },
+                        "not": {
+                            "anyOf": [
+                                { "required": ["skipped"] },
+                                { "required": ["error"] }
+                            ]
+                        }
+                    }
                 }
             ],
             "properties": {
@@ -549,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_action_conditions_fix_the_applied_invariant() {
+    fn edge_discriminator_conditions_enforce_row_invariants() {
         let schema = json_schema();
         let conditions = schema["$defs"]["upgradeItem"]["allOf"]
             .as_array()
@@ -571,6 +588,23 @@ mod tests {
             conditions[1]["then"]["properties"]["applied"]["const"],
             true
         );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["direct"]["const"],
+            false
+        );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["downgrade"]["const"],
+            false
+        );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["members"]["maxItems"],
+            0
+        );
+        let prohibited = conditions[2]["then"]["not"]["anyOf"]
+            .as_array()
+            .expect("edge-only prohibited properties");
+        assert_eq!(prohibited[0]["required"][0], "skipped");
+        assert_eq!(prohibited[1]["required"][0], "error");
     }
 
     #[test]
@@ -581,10 +615,7 @@ mod tests {
             SkipReason::MaxMajorHeld,
             SkipReason::DistTagHeld,
         ] {
-            let mut item = upgrade_item();
-            // The schema sample carries an `edge` block, which would rank the row as an
-            // edge-binding footnote; this test is about plain skip rows.
-            item.edge = None;
+            let mut item = upgrade_version_item();
             item.skipped = Some(SkippedInfo {
                 reason,
                 message: reason.message().to_string(),
@@ -628,7 +659,15 @@ mod tests {
         assert_def_keys(schema, "checkSummary", check_summary());
         assert_def_keys(schema, "checkItem", check_item());
         assert_def_keys(schema, "upgradeSummary", upgrade_summary());
-        assert_def_keys(schema, "upgradeItem", upgrade_item());
+        let upgrade_keys: BTreeSet<String> = serialized_keys(upgrade_version_item())
+            .union(&serialized_keys(upgrade_edge_item()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            upgrade_keys,
+            schema_keys(&schema["$defs"]["upgradeItem"]),
+            "$defs.upgradeItem is out of sync"
+        );
         assert_def_keys(schema, "upgradeEdgeInfo", upgrade_edge_info());
         assert_def_keys(schema, "explainSummary", ExplainSummary {});
         assert_def_keys(schema, "explainStep", explain_step());
@@ -672,7 +711,7 @@ mod tests {
                 generated_at(),
                 upgrade_meta(),
                 upgrade_summary(),
-                vec![upgrade_item()],
+                vec![upgrade_version_item()],
             ),
         );
         assert_envelope_keys(
@@ -684,7 +723,7 @@ mod tests {
                 generated_at(),
                 upgrade_meta(),
                 upgrade_summary(),
-                vec![upgrade_item()],
+                vec![upgrade_version_item()],
             ),
         );
         assert_envelope_keys(
@@ -909,12 +948,13 @@ mod tests {
             skipped: 1,
             errors: 0,
             edges_corrected: 1,
+            edges_rebound: 1,
             edges_held: 1,
             edges_unaddressable: 1,
         }
     }
 
-    fn upgrade_item() -> UpgradeItem {
+    fn upgrade_version_item() -> UpgradeItem {
         UpgradeItem {
             name: "serde".to_string(),
             tool: "cargo".to_string(),
@@ -929,6 +969,25 @@ mod tests {
             applied: false,
             skipped: Some(skipped_info()),
             error: Some(diagnostic()),
+            edge: None,
+        }
+    }
+
+    fn upgrade_edge_item() -> UpgradeItem {
+        UpgradeItem {
+            name: "serde".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            direct: false,
+            downgrade: false,
+            members: Vec::new(),
+            registry: Some("crates.io".to_string()),
+            from: "1.0.0".to_string(),
+            to: "1.2.3".to_string(),
+            kind: UpdateKind::Minor,
+            applied: false,
+            skipped: None,
+            error: None,
             edge: Some(upgrade_edge_info()),
         }
     }

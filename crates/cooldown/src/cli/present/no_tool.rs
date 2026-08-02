@@ -92,6 +92,7 @@ fn no_tool_mutation(
                 skipped: 0,
                 errors: 0,
                 edges_corrected: 0,
+                edges_rebound: 0,
                 edges_held: 0,
                 edges_unaddressable: 0,
             },

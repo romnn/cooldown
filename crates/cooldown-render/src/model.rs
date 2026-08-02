@@ -539,6 +539,8 @@ pub struct UpgradeSummary {
     /// `canonicalized` rows). Counted apart from [`applied`](UpgradeSummary::applied): an edge
     /// correction changes the lock without moving any package version.
     pub edges_corrected: usize,
+    /// The number of resolver-produced lock-edge moves that remain in the committed result.
+    pub edges_rebound: usize,
     /// The number of lock-edge corrections that were withheld (`held` rows). Under `--strict` a
     /// non-zero count fails the run — a requested correction could not be completed.
     pub edges_held: usize,
@@ -561,8 +563,8 @@ pub struct BuildInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeMeta {
-    /// Whether any mutation was applied — a package version change or a corrected lock-edge
-    /// binding (a dry run reports what the real run would apply).
+    /// Whether any reported package-version or lock-edge mutation is present in the committed
+    /// result (a dry run reports what the real run would apply).
     pub applied: bool,
     /// Re-lock status; `null` for `--dry-run` (which never mutates).
     pub lock_status: Option<LockStatus>,

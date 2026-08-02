@@ -73,6 +73,10 @@ struct State {
     fail_releases_after_apply_for: Option<String>,
     /// Make the fake mutate `fake.lock` so rollback can be asserted against real bytes.
     write_lock_on_apply: bool,
+    /// Require the mutation lifecycle hook to run before dependency discovery.
+    require_recovery_before_read: bool,
+    /// Whether the mutation lifecycle hook has run for this project.
+    recovery_completed: bool,
 }
 
 #[allow(
@@ -149,6 +153,11 @@ impl ToolRead for FakeEco {
     }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
+        if state.require_recovery_before_read && !state.recovery_completed {
+            return Err(CoreError::System(
+                "dependency discovery ran before mutation recovery".to_string(),
+            ));
+        }
         if scope == DepScope::Graph && self.fail_graph_after_apply && state.apply_attempted {
             return Err(CoreError::Transient("post-apply graph probe failed".into()));
         }
@@ -252,6 +261,11 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
+    async fn recover_pending_mutation(&self, _p: &Project) -> Result<()> {
+        self.state.lock().unwrap().recovery_completed = true;
+        Ok(())
+    }
+
     async fn lock_edge_snapshot(&self, p: &Project) -> Result<Option<Vec<u8>>> {
         let path = p.root.join("edge.snapshot");
         match std::fs::read(path) {
@@ -514,6 +528,23 @@ fn fake(
         state: Mutex::new(State::default()),
         root,
     }
+}
+
+#[tokio::test]
+async fn mutation_recovery_precedes_dependency_discovery() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+    adapter
+        .state
+        .get_mut()
+        .expect("exclusive fake state")
+        .require_recovery_before_read = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&opts())
+        .await;
+
+    assert!(outcome.errors.is_empty());
 }
 
 fn too_fresh_fix_releases() -> Vec<Release> {
@@ -1609,6 +1640,7 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
     assert_eq!(out.summary.skipped, 0);
     assert_eq!(out.summary.errors, 0);
     assert_eq!(out.summary.edges_corrected, 2);
+    assert_eq!(out.summary.edges_rebound, 1);
     assert_eq!(out.summary.edges_held, 0);
     assert_eq!(out.summary.edges_unaddressable, 0);
     assert_source_distinct_restorations(&out.items);

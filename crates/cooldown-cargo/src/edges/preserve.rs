@@ -71,7 +71,12 @@ pub(crate) fn restorations(
             // And it must still satisfy every requirement the dependent declares (post-widen
             // metadata): a cross-major planned move changed the requirement, and restoring the old
             // binding would violate it.
-            if !requirements.admits(binding.dependent, binding.dependency, earlier) {
+            if !requirements.admits(
+                binding.dependent,
+                binding.dependency,
+                binding.bound,
+                earlier,
+            ) {
                 return None;
             }
             Some(EdgeRewrite {
@@ -96,17 +101,24 @@ mod tests {
         let mut declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>> =
             HashMap::new();
         for (name, version, dependency, requirement) in requirements {
-            declared_requirements
-                .entry(LockPackageId::new(
-                    *name,
-                    *version,
-                    (*name != "app").then_some(CRATES_IO_SOURCE),
-                ))
-                .or_default()
-                .push(DeclaredRequirement {
-                    dependency: (*dependency).to_string(),
-                    requirement: (*requirement).to_string(),
-                });
+            for resolved_version in ["0.8.2", "1.24.0"] {
+                declared_requirements
+                    .entry(LockPackageId::new(
+                        *name,
+                        *version,
+                        (*name != "app").then_some(CRATES_IO_SOURCE),
+                    ))
+                    .or_default()
+                    .push(DeclaredRequirement {
+                        dependency: (*dependency).to_string(),
+                        resolved: LockPackageId::new(
+                            *dependency,
+                            resolved_version,
+                            Some(CRATES_IO_SOURCE),
+                        ),
+                        requirement: (*requirement).to_string(),
+                    });
+            }
         }
         ResolvedGraph {
             packages: HashMap::new(),
@@ -274,16 +286,31 @@ mod tests {
         let after = before.replace("\"dep 1.0.0\",", "\"dep 1.1.0\",");
         let graph = crate::cargocmd::Cargo::build_graph_from_json(indoc! {r#"
             {
-                "packages": [{
-                    "id": "git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef",
-                    "name": "ort",
-                    "version": "2.0.0",
-                    "source": "git+https://example.com/ort?branch=chore/ort-rc-12#abcdef",
-                    "dependencies": [{"name": "dep", "req": "^1"}]
-                }],
+                "packages": [
+                    {
+                        "id": "git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef",
+                        "name": "ort",
+                        "version": "2.0.0",
+                        "source": "git+https://example.com/ort?branch=chore/ort-rc-12#abcdef",
+                        "dependencies": [{"name": "dep", "req": "^1"}]
+                    },
+                    {
+                        "id": "dep 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                        "name": "dep",
+                        "version": "1.1.0",
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                        "dependencies": []
+                    }
+                ],
                 "workspace_members": [],
                 "workspace_root": "/workspace",
-                "resolve": {"nodes": []}
+                "resolve": {"nodes": [{
+                    "id": "git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef",
+                    "deps": [{
+                        "name": "dep",
+                        "pkg": "dep 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)"
+                    }]
+                }]}
             }
         "#});
 

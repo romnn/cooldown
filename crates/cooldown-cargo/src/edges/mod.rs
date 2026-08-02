@@ -73,23 +73,24 @@ impl<'a> RequirementIndex<'a> {
         RequirementIndex { graph }
     }
 
-    /// Whether every requirement `dependent` declares for `dependency` admits `candidate`.
-    /// A dependent or dependency the metadata does not know yields `false` — no known requirement
-    /// means no license to rewrite.
+    /// Whether every active requirement mapped to the current lock edge admits `candidate`.
+    /// A dependent or concrete edge the metadata does not know yields `false` because no known
+    /// requirement means no license to rewrite.
     pub(crate) fn admits(
         &self,
         dependent: &LockPackageId,
         dependency: &str,
+        current: &str,
         candidate: &str,
     ) -> bool {
         let Some(requirements) = self.graph.declared_requirements.get(dependent) else {
             return false;
         };
+        let target = LockPackageId::new(dependency, current, Some(CRATES_IO_SOURCE));
         let mut matched = false;
-        for requirement in requirements
-            .iter()
-            .filter(|requirement| requirement.dependency == dependency)
-        {
+        for requirement in requirements.iter().filter(|requirement| {
+            requirement.dependency == dependency && requirement.resolved == target
+        }) {
             matched = true;
             if !version::version_in_range(&requirement.requirement, candidate) {
                 return false;
@@ -98,15 +99,21 @@ impl<'a> RequirementIndex<'a> {
         matched
     }
 
-    /// Whether metadata identifies a declared requirement for this lock edge.
-    pub(crate) fn identifies(&self, dependent: &LockPackageId, dependency: &str) -> bool {
+    /// Whether metadata identifies an active declaration for this concrete lock edge.
+    pub(crate) fn identifies(
+        &self,
+        dependent: &LockPackageId,
+        dependency: &str,
+        current: &str,
+    ) -> bool {
+        let target = LockPackageId::new(dependency, current, Some(CRATES_IO_SOURCE));
         self.graph
             .declared_requirements
             .get(dependent)
             .is_some_and(|requirements| {
-                requirements
-                    .iter()
-                    .any(|requirement| requirement.dependency == dependency)
+                requirements.iter().any(|requirement| {
+                    requirement.dependency == dependency && requirement.resolved == target
+                })
             })
     }
 

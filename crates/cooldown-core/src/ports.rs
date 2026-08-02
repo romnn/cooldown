@@ -364,6 +364,19 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Recovers adapter-owned state left by an interrupted mutation.
+    ///
+    /// The application invokes this at the start of a mutation lifecycle while holding the
+    /// project's exclusive mutation lock. Read-side adapter methods must never perform recovery;
+    /// they should instead report pending state without modifying the project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if pending state cannot be validated or recovered.
+    async fn recover_pending_mutation(&self, _project: &Project) -> Result<()> {
+        Ok(())
+    }
+
     /// Captures the adapter-owned lock state needed to report edge bindings across a whole run.
     ///
     /// The application treats a returned snapshot as evidence that

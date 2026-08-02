@@ -30,36 +30,72 @@ impl PackageKey {
 }
 
 /// The equality identity of a Cargo package source.
-///
-/// Cargo metadata can leave reserved characters literal in a git query while package IDs and
-/// `Cargo.lock` percent-encode them. Git source equality decodes ASCII percent escapes so those
-/// spellings join, while the verbatim source remains available for reporting.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct SourceIdentity(String);
+enum SourceIdentity {
+    Verbatim(String),
+    Git(GitSourceIdentity),
+}
+
+/// A parsed git source whose query values are compared without conflating encoded delimiters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GitSourceIdentity {
+    repository: String,
+    query: Vec<(String, Option<String>)>,
+    precise: Option<String>,
+}
 
 impl SourceIdentity {
-    fn new(source: &str) -> Self {
+    fn from_lock_source(source: &str) -> Self {
         if source.starts_with("git+") {
-            SourceIdentity(canonical_git_source(source))
+            SourceIdentity::Git(parse_git_source(source, true))
         } else {
-            SourceIdentity(source.to_string())
+            SourceIdentity::Verbatim(source.to_string())
+        }
+    }
+
+    fn from_metadata_source(source: &str) -> Self {
+        if source.starts_with("git+") {
+            SourceIdentity::Git(parse_git_source(source, false))
+        } else {
+            SourceIdentity::Verbatim(source.to_string())
         }
     }
 }
 
-fn canonical_git_source(source: &str) -> String {
-    let Some(query_start) = source.find('?') else {
-        return source.to_string();
-    };
-    let query_end = source[query_start..]
-        .find('#')
-        .map_or(source.len(), |offset| query_start + offset);
-    let query = &source[query_start..query_end];
-    let mut canonical = String::with_capacity(source.len());
-    canonical.push_str(&source[..query_start]);
-    canonical.push_str(&decode_ascii_percent_escapes(query));
-    canonical.push_str(&source[query_end..]);
-    canonical
+fn parse_git_source(source: &str, decode_lock_query: bool) -> GitSourceIdentity {
+    let (without_precise, precise) = source
+        .split_once('#')
+        .map_or((source, None), |(base, precise)| {
+            (base, Some(precise.to_string()))
+        });
+    let (repository, query) = without_precise
+        .split_once('?')
+        .map_or((without_precise, ""), |(repository, query)| {
+            (repository, query)
+        });
+    let mut query: Vec<_> = query
+        .split('&')
+        .filter(|parameter| !parameter.is_empty())
+        .map(|parameter| {
+            let (key, value) = parameter
+                .split_once('=')
+                .map_or((parameter, None), |(key, value)| (key, Some(value)));
+            let normalize = |value: &str| {
+                if decode_lock_query {
+                    decode_ascii_percent_escapes(value)
+                } else {
+                    value.to_string()
+                }
+            };
+            (normalize(key), value.map(normalize))
+        })
+        .collect();
+    query.sort();
+    GitSourceIdentity {
+        repository: repository.to_string(),
+        query,
+        precise,
+    }
 }
 
 fn decode_ascii_percent_escapes(value: &str) -> String {
@@ -109,14 +145,30 @@ pub struct LockPackageId {
 }
 
 impl LockPackageId {
-    /// Builds a complete lock package identity.
+    /// Builds an identity from a `Cargo.lock` source spelling.
     pub fn new(
         name: impl Into<String>,
         version: impl Into<String>,
         source: Option<impl Into<String>>,
     ) -> Self {
         let source = source.map(Into::into);
-        let source_identity = source.as_deref().map(SourceIdentity::new);
+        let source_identity = source.as_deref().map(SourceIdentity::from_lock_source);
+        LockPackageId {
+            name: name.into(),
+            version: version.into(),
+            source,
+            source_identity,
+        }
+    }
+
+    /// Builds an identity from a `cargo metadata` source spelling.
+    pub(crate) fn from_metadata(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        source: Option<impl Into<String>>,
+    ) -> Self {
+        let source = source.map(Into::into);
+        let source_identity = source.as_deref().map(SourceIdentity::from_metadata_source);
         LockPackageId {
             name: name.into(),
             version: version.into(),
@@ -278,7 +330,7 @@ mod tests {
 
     #[test]
     fn git_source_identity_joins_metadata_and_lock_spellings() {
-        let metadata = LockPackageId::new(
+        let metadata = LockPackageId::from_metadata(
             "ort",
             "1.0.0",
             Some("git+https://example.com/ort?branch=chore/ort-rc-12#abcdef"),
@@ -293,6 +345,31 @@ mod tests {
         assert_eq!(
             lock.source(),
             Some("git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef")
+        );
+    }
+
+    #[test]
+    fn git_source_identity_decodes_only_the_lock_query_representation() {
+        let metadata = LockPackageId::from_metadata(
+            "ort",
+            "1.0.0",
+            Some("git+https://example.com/ort?branch=foo%2Fbar&rev=a%26b%3Dc#abcdef"),
+        );
+        let lock = LockPackageId::new(
+            "ort",
+            "1.0.0",
+            Some("git+https://example.com/ort?branch=foo%252Fbar&rev=a%2526b%253Dc#abcdef"),
+        );
+
+        assert_eq!(metadata, lock);
+        assert_ne!(
+            metadata,
+            LockPackageId::new(
+                "ort",
+                "1.0.0",
+                Some("git+https://example.com/ort?branch=foo%2Fbar&rev=a%26b%3Dc#abcdef"),
+            ),
+            "a lock spelling is decoded exactly once"
         );
     }
 

@@ -292,6 +292,7 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
             EdgeBindingAction::Canonicalized,
         ],
     );
+    let edges_rebound = count_edge_actions(&acc.items, &[EdgeBindingAction::Rebound]);
     let edges_held = count_edge_actions(&acc.items, &[EdgeBindingAction::Held]);
     let edges_unaddressable = count_edge_actions(&acc.items, &[EdgeBindingAction::Unaddressable]);
     // Held and unaddressable edges make a corrective policy incomplete. Plain `rebound` rows do
@@ -307,12 +308,14 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
         Exit::Ok
     };
 
-    let meta = upgrade_meta(opts, &acc, applied + edges_corrected);
+    let committed = acc.items.iter().filter(|item| item.applied).count();
+    let meta = upgrade_meta(opts, &acc, committed);
     let summary = UpgradeSummary {
         applied,
         skipped,
         errors: err_count,
         edges_corrected,
+        edges_rebound,
         edges_held,
         edges_unaddressable,
     };
@@ -361,8 +364,7 @@ fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
     });
 }
 
-/// `mutations` counts everything that wrote to the project: applied version changes plus
-/// corrected edge bindings.
+/// `mutations` counts every reported change present in the committed result.
 fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> UpgradeMeta {
     UpgradeMeta {
         applied: mutations > 0,
@@ -376,7 +378,8 @@ fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> Upgrade
 
 #[cfg(test)]
 mod tests {
-    use super::{UpgradeItem, dedupe_edge_items};
+    use super::{UpgradeAccum, UpgradeItem, dedupe_edge_items, finalize_outcome};
+    use crate::app::RunOpts;
     use crate::app::UpgradeEdgeInfo;
     use cooldown_core::{EdgeBindingAction, UpdateKind};
 
@@ -415,5 +418,17 @@ mod tests {
         dedupe_edge_items(&mut items);
 
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn committed_rebound_is_counted_and_marks_the_run_applied() {
+        let mut acc = UpgradeAccum::default();
+        acc.edge_items.push(edge_item("crates.io"));
+
+        let outcome = finalize_outcome(&RunOpts::default(), acc);
+
+        assert_eq!(outcome.summary.applied, 0);
+        assert_eq!(outcome.summary.edges_rebound, 1);
+        assert!(outcome.meta.applied);
     }
 }

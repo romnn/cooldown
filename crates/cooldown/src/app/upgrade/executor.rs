@@ -221,6 +221,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     pub(super) async fn run(&mut self) {
+        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return;
+            }
+        };
+        if let Err(error) = self
+            .ctx
+            .writer
+            .recover_pending_mutation(&self.ctx.pctx.project)
+            .await
+        {
+            self.record_project_error(&error, None);
+            return;
+        }
         self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
             return;
@@ -234,13 +250,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .progress
             .phase(format!("planning {verb} for {} dependencies", deps.len()));
 
-        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.record_project_error(&error, None);
-                return;
-            }
-        };
         self.initial_edge_snapshot = match self
             .ctx
             .writer
@@ -310,6 +319,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
     ) {
+        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return;
+            }
+        };
+        if let Err(error) = self
+            .ctx
+            .writer
+            .recover_pending_mutation(&self.ctx.pctx.project)
+            .await
+        {
+            self.record_project_error(&error, None);
+            return;
+        }
         self.manifest_only = manifest_only;
         sort_planned_changes(&mut changes);
         let Some(mut state) = self.initial_trial_state().await else {

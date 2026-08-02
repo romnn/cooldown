@@ -89,7 +89,7 @@ remain `applied`. Corrections are applied as targeted lock edits and re-verified
 `rebound` row records the committed move. If a renamed multi-version or source-qualified lock
 entry moves but cannot be mapped safely to one declared requirement, it is `unaddressable` rather
 than being mislabeled as an ordinary rebound. The JSON summary counts edge activity apart from
-version changes (`edgesCorrected`, `edgesHeld`, and `edgesUnaddressable`); each edge row's `applied`
+version changes (`edgesCorrected`, `edgesRebound`, `edgesHeld`, and `edgesUnaddressable`); each edge row's `applied`
 says whether its binding outcome is present in the committed lock, while top-level `applied` says
 whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a `--strict` run because
 the corrective policy is incomplete. The policy is cargo-specific, so its config placement is too:

@@ -21,7 +21,7 @@
   unaddressable, or surviving rebind is reported as its own
   `restored`/`canonicalized`/`held`/`unaddressable`/`rebound` row, preserving the dependent's full
   source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
-  version changes (`edgesCorrected`/`edgesHeld`/`edgesUnaddressable`); row-level `applied` says
+  version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level `applied` says
   whether the binding outcome is committed, and a `held` or `unaddressable` row fails `--strict`.
   Config follows the per-project repository cascade, and the closed JSON contract is schema v4.
 

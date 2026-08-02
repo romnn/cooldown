@@ -685,6 +685,9 @@ fn edge_summary_note(summary: &UpgradeSummary) -> String {
     if summary.edges_corrected > 0 {
         let _ = write!(note, " · {} edges corrected", summary.edges_corrected);
     }
+    if summary.edges_rebound > 0 {
+        let _ = write!(note, " · {} edges rebound", summary.edges_rebound);
+    }
     if summary.edges_held > 0 {
         let _ = write!(note, " · {} edges held", summary.edges_held);
     }
@@ -1505,6 +1508,7 @@ mod tests {
                 skipped: 0,
                 errors: 0,
                 edges_corrected: 0,
+                edges_rebound: 0,
                 edges_held: 0,
                 edges_unaddressable: 0,
             },
@@ -1608,6 +1612,7 @@ mod tests {
                 skipped: 0,
                 errors: 0,
                 edges_corrected: 0,
+                edges_rebound: 0,
                 edges_held: 0,
                 edges_unaddressable: 0,
             },
@@ -1688,6 +1693,7 @@ mod tests {
                 skipped: 1,
                 errors: 0,
                 edges_corrected: 0,
+                edges_rebound: 0,
                 edges_held: 0,
                 edges_unaddressable: 0,
             },
@@ -1730,6 +1736,7 @@ mod tests {
                 skipped: 0,
                 errors: 0,
                 edges_corrected: 0,
+                edges_rebound: 0,
                 edges_held: 0,
                 edges_unaddressable: 0,
             },

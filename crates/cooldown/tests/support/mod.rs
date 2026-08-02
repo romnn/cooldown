@@ -315,6 +315,10 @@ impl Envelope {
         self.summary_u64("edgesCorrected")
     }
 
+    pub fn summary_edges_rebound(&self) -> u64 {
+        self.summary_u64("edgesRebound")
+    }
+
     pub fn summary_edges_held(&self) -> u64 {
         self.summary_u64("edgesHeld")
     }
@@ -323,8 +327,7 @@ impl Envelope {
         self.summary_u64("edgesUnaddressable")
     }
 
-    /// `meta.applied` (flattened at the top level): whether any mutation was written — a version
-    /// change or a corrected lock-edge binding.
+    /// `meta.applied` (flattened at the top level): whether any reported mutation is committed.
     pub fn meta_applied(&self) -> bool {
         self.value
             .get("applied")
