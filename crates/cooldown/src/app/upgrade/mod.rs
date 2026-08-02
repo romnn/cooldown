@@ -44,6 +44,8 @@ pub struct UpgradeOutcome {
 #[derive(Default)]
 pub(super) struct UpgradeAccum {
     pub(super) items: Vec<UpgradeItem>,
+    /// Edge relationships remain separate until every version-only reduction is complete.
+    pub(super) edge_items: Vec<UpgradeItem>,
     pub(super) errors: Vec<Diagnostic>,
     /// Non-fatal advisories — `fix` records a too-fresh pin it left in place, or a violation with no
     /// matured older version to downgrade to.
@@ -257,10 +259,8 @@ fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
 /// Distills the accumulated per-project state into the final report: dedupes and sorts the rows,
 /// derives the counts, folds edge outcomes into strict/meta, and decides the exit.
 fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
-    // Successive batches can each re-correct churn the next re-resolve re-introduced, so
-    // identical edge rows collapse to one — the report describes the run's net effect, like
-    // the version legs collapsed by `collapse_applied_legs`.
-    dedupe_edge_items(&mut acc.items);
+    dedupe_edge_items(&mut acc.edge_items);
+    acc.items.append(&mut acc.edge_items);
     // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
     // items explicitly so the output is stable, status-first (errored/skipped lead, applied
     // last). A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its
@@ -349,6 +349,7 @@ fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
         seen.insert((
             item.project.clone(),
             item.name.clone(),
+            item.registry.clone(),
             item.from.clone(),
             item.to.clone(),
             edge.dependent.clone(),
@@ -370,5 +371,49 @@ fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> Upgrade
             requested: acc.build_requested,
             ok: acc.build_ok,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpgradeItem, dedupe_edge_items};
+    use crate::app::UpgradeEdgeInfo;
+    use cooldown_core::{EdgeBindingAction, UpdateKind};
+
+    fn edge_item(registry: &str) -> UpgradeItem {
+        UpgradeItem {
+            name: "dep".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            direct: false,
+            downgrade: false,
+            members: Vec::new(),
+            registry: Some(registry.to_string()),
+            from: "1.0.0".to_string(),
+            to: "2.0.0".to_string(),
+            kind: UpdateKind::Major,
+            applied: true,
+            skipped: None,
+            error: None,
+            edge: Some(UpgradeEdgeInfo {
+                dependent: "consumer".to_string(),
+                dependent_version: "1.0.0".to_string(),
+                dependent_source: None,
+                action: EdgeBindingAction::Rebound,
+                detail: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn edge_deduplication_preserves_distinct_target_sources() {
+        let mut items = vec![
+            edge_item("crates.io"),
+            edge_item("git+https://example.com/dep#abcdef"),
+        ];
+
+        dedupe_edge_items(&mut items);
+
+        assert_eq!(items.len(), 2);
     }
 }

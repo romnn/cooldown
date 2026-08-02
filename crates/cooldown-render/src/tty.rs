@@ -577,7 +577,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
         let source = edge
             .dependent_source
             .as_deref()
-            .map(|source| format!(" ({source})"))
+            .map(|source| format!(" ({})", abbreviated_source(source)))
             .unwrap_or_default();
         let subject = format!(
             "{} {}{source}'s {} edge binding",
@@ -649,6 +649,34 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
             reason: String::new(),
             color: Color::Cyan,
         }
+    }
+}
+
+fn abbreviated_source(source: &str) -> String {
+    if source == "registry+https://github.com/rust-lang/crates.io-index" {
+        return "crates.io".to_string();
+    }
+    let Some((kind, address)) = source.split_once('+') else {
+        return "source".to_string();
+    };
+    if address.starts_with("file:") {
+        return format!("{kind}:local");
+    }
+    let without_scheme = address
+        .split_once("://")
+        .map_or(address, |(_, location)| location);
+    let without_credentials = without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, location)| location);
+    let location = without_credentials
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git");
+    if location.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}:{location}")
     }
 }
 
@@ -981,7 +1009,7 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderOptions, check_cooldown_cell, has_distinct_project, members_cell,
+        RenderOptions, abbreviated_source, check_cooldown_cell, has_distinct_project, members_cell,
         outdated_status_cell, path_label, render_check, render_fix, render_outdated,
         render_upgrade,
     };
@@ -991,6 +1019,24 @@ mod tests {
         Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef, SkipReason, UpdateKind};
+
+    #[test]
+    fn edge_sources_are_short_and_credential_free() {
+        assert_eq!(
+            abbreviated_source("registry+https://github.com/rust-lang/crates.io-index"),
+            "crates.io"
+        );
+        assert_eq!(
+            abbreviated_source(
+                "git+https://token@example.com/private/repo.git?branch=release#abcdef"
+            ),
+            "git:example.com/private/repo"
+        );
+        assert_eq!(
+            abbreviated_source("git+file:///home/user/private/repo#abcdef"),
+            "git:local"
+        );
+    }
 
     /// Members whose name is the given string and whose path is `path/<name>`.
     fn members(names: &[&str]) -> Vec<MemberRef> {

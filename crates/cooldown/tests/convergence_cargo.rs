@@ -513,8 +513,9 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
     assert_eq!(stale.summary_errors(), 1);
     assert!(
         stale.error_kinds().contains("stale_lock"),
-        "expected a stale_lock diagnostic, got {:?}",
-        stale.error_kinds()
+        "expected a stale_lock diagnostic, got {:?}: {:?}",
+        stale.error_kinds(),
+        stale.error_messages()
     );
 
     let allowed = fixture.cooldown_json(&[

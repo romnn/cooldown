@@ -679,8 +679,8 @@ edge_binding_actions! {
     Unaddressable = "unaddressable",
 }
 
-/// A resolved lock edge the edge policy corrected, withheld a correction for, or observed rebound,
-/// reported by an adapter's `apply` so no build-affecting lock change is ever silent.
+/// A policy-relevant lock edge that enforcement corrected, withheld a correction for, or observed
+/// rebound.
 ///
 /// For [`Restored`](EdgeBindingAction::Restored)/[`Canonicalized`](EdgeBindingAction::Canonicalized)
 /// `to` is the binding the committed lock ends with and `from` the resolver-produced binding it

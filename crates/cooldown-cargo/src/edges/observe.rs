@@ -2,7 +2,6 @@
 //! per-block qualified-entry multisets so that moves among entries too ambiguous to *rewrite*
 //! (renamed multi-version deps and source-suffixed entries) are still reported.
 
-use super::lock_view::remainder_version;
 use super::{BindingChange, LockEdgeView};
 
 /// The elements of `left` minus `right` as multisets; both slices are version-sorted.
@@ -46,20 +45,24 @@ pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Ve
         let vacated = multiset_difference(before_entries, after_entries);
         let adopted = multiset_difference(after_entries, before_entries);
         for (from_entry, to_entry) in vacated.into_iter().zip(adopted) {
-            let from = remainder_version(&from_entry).to_string();
-            let to = remainder_version(&to_entry).to_string();
-            if !after.has_version(dependency, &from) || !before.has_version(dependency, &to) {
+            let Some(from) = before.dependency_target(dependency, &from_entry) else {
+                continue;
+            };
+            let Some(to) = after.dependency_target(dependency, &to_entry) else {
+                continue;
+            };
+            if !after.contains_package(&from) || !before.contains_package(&to) {
                 continue;
             }
-            let detail = (from == to)
-                .then(|| format!("the entry's source changed: \"{from_entry}\" → \"{to_entry}\""));
+            let crates_io_move = from.source() == Some(crate::cargocmd::CRATES_IO_SOURCE)
+                && to.source() == Some(crate::cargocmd::CRATES_IO_SOURCE);
+            let detail = (!crates_io_move)
+                .then(|| format!("the binding target changed: \"{from_entry}\" → \"{to_entry}\""));
             changes.push(BindingChange {
                 dependent: block.clone(),
                 dependency: dependency.clone(),
                 before: from,
                 after: to,
-                before_source: before.dependency_source(dependency, &from_entry),
-                after_source: after.dependency_source(dependency, &to_entry),
                 detail,
             });
         }
@@ -71,6 +74,14 @@ pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Ve
 mod tests {
     use super::super::tests::{CHURNED_LOCK, key, view};
     use super::*;
+
+    fn target(version: &str, source: &str) -> super::super::LockPackageId {
+        super::super::LockPackageId::new("uuid", version, Some(source))
+    }
+
+    fn dep_target(version: &str) -> super::super::LockPackageId {
+        super::super::LockPackageId::new("dep", version, Some(crate::cargocmd::CRATES_IO_SOURCE))
+    }
 
     #[test]
     fn binding_changes_report_moves_and_skip_changed_dependents() {
@@ -87,10 +98,8 @@ mod tests {
             vec![BindingChange {
                 dependent: key("diesel", "2.3.11"),
                 dependency: "uuid".to_string(),
-                before: "0.8.2".to_string(),
-                after: "1.24.0".to_string(),
-                before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
-                after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                before: target("0.8.2", crate::cargocmd::CRATES_IO_SOURCE),
+                after: target("1.24.0", crate::cargocmd::CRATES_IO_SOURCE),
                 detail: None,
             }]
         );
@@ -123,10 +132,8 @@ mod tests {
             vec![BindingChange {
                 dependent: super::super::tests::path_key("app", "0.1.0"),
                 dependency: "uuid".to_string(),
-                before: "1.24.0".to_string(),
-                after: "0.8.2".to_string(),
-                before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
-                after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                before: target("1.24.0", crate::cargocmd::CRATES_IO_SOURCE),
+                after: target("0.8.2", crate::cargocmd::CRATES_IO_SOURCE),
                 detail: None,
             }],
             "an ambiguous pair's move must still be observed"
@@ -188,10 +195,8 @@ mod tests {
                 BindingChange {
                     dependent: key("twin", "1.0.0"),
                     dependency: "dep".to_string(),
-                    before: "1.0.0".to_string(),
-                    after: "2.0.0".to_string(),
-                    before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
-                    after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                    before: dep_target("1.0.0"),
+                    after: dep_target("2.0.0"),
                     detail: None,
                 },
                 BindingChange {
@@ -201,10 +206,8 @@ mod tests {
                         Some("git+https://example.com/twin#abcdef"),
                     ),
                     dependency: "dep".to_string(),
-                    before: "2.0.0".to_string(),
-                    after: "1.0.0".to_string(),
-                    before_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
-                    after_source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                    before: dep_target("2.0.0"),
+                    after: dep_target("1.0.0"),
                     detail: None,
                 },
             ],
@@ -250,11 +253,13 @@ mod tests {
         let changes = binding_changes(&view(twins_before), &view(&twins_after));
         assert_eq!(changes.len(), 2);
         assert!(changes.iter().all(|change| {
-            change.before == "1.0.0" && change.after == "2.0.0" && change.dependent.name == "twin"
+            change.before.version == "1.0.0"
+                && change.after.version == "2.0.0"
+                && change.dependent.name == "twin"
         }));
         let sources: std::collections::BTreeSet<_> = changes
             .iter()
-            .map(|change| change.dependent.source.as_deref())
+            .map(|change| change.dependent.source())
             .collect();
         assert_eq!(
             sources,
@@ -297,14 +302,14 @@ mod tests {
 
         let changes = binding_changes(&view(before_text), &view(&after_text));
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].before, "1.0.0");
-        assert_eq!(changes[0].after, "1.0.0");
+        assert_eq!(changes[0].before.version, "1.0.0");
+        assert_eq!(changes[0].after.version, "1.0.0");
         assert_eq!(
-            changes[0].before_source.as_deref(),
+            changes[0].before.source(),
             Some(crate::cargocmd::CRATES_IO_SOURCE)
         );
         assert_eq!(
-            changes[0].after_source.as_deref(),
+            changes[0].after.source(),
             Some("git+https://example.com/foo#abcdef")
         );
         let detail = changes[0].detail.as_deref().unwrap_or_default();
@@ -312,5 +317,89 @@ mod tests {
             detail.contains("git+https://example.com/foo"),
             "the source move must be spelled out: {detail}"
         );
+    }
+
+    #[test]
+    fn source_swapped_package_sets_are_not_binding_only_moves() {
+        let before_text = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "foo"
+            version = "2.0.0"
+            source = "git+https://example.com/foo#abcdef"
+        "#};
+        let after_text = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "git+https://example.com/foo#abcdef"
+
+            [[package]]
+            name = "foo"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+        "#};
+
+        assert!(
+            binding_changes(&view(before_text), &view(after_text)).is_empty(),
+            "source-free version coexistence must not disguise a package-set replacement as a rebind"
+        );
+    }
+
+    #[test]
+    fn cross_version_non_registry_moves_report_both_target_spellings() {
+        let before_text = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "foo"
+            version = "2.0.0"
+            source = "git+https://example.com/foo#abcdef"
+        "#};
+        let after_text = before_text.replace(
+            "foo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+            "foo 2.0.0 (git+https://example.com/foo#abcdef)",
+        );
+
+        let changes = binding_changes(&view(before_text), &view(&after_text));
+
+        assert_eq!(changes.len(), 1);
+        let detail = changes[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("registry+https://github.com/rust-lang/crates.io-index"));
+        assert!(detail.contains("git+https://example.com/foo#abcdef"));
     }
 }

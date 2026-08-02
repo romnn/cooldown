@@ -919,7 +919,7 @@ impl Cargo {
         // `--locked` on a stale lock exits 101 with a clear message. A different failure (e.g.
         // missing offline index) is reported as a tool error.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("--locked") || stderr.contains("lock file") {
+        if stale_lock_diagnostic(&stderr) {
             Ok(None)
         } else {
             Err(CoreError::Tool {
@@ -979,10 +979,32 @@ impl Cargo {
     }
 }
 
+fn stale_lock_diagnostic(stderr: &str) -> bool {
+    stderr.contains("needs to be updated but --locked was passed")
+        || (stderr.contains("cannot update the lock file")
+            && stderr.contains("because --locked was passed to prevent this"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use indoc::indoc;
+
+    #[test]
+    fn stale_lock_classification_matches_only_cargos_update_diagnostic() {
+        assert!(stale_lock_diagnostic(
+            "the lock file /tmp/Cargo.lock needs to be updated but --locked was passed to prevent this"
+        ));
+        assert!(stale_lock_diagnostic(
+            "cannot update the lock file /tmp/Cargo.lock because --locked was passed to prevent this"
+        ));
+        assert!(!stale_lock_diagnostic(
+            "failed to read lock file while --locked was passed: permission denied"
+        ));
+        assert!(!stale_lock_diagnostic(
+            "failed to parse lock file: invalid TOML"
+        ));
+    }
 
     #[test]
     fn member_path_relativizes_workspace_members() {

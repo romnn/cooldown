@@ -364,12 +364,28 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
-    /// Enforces the lock **edge-binding** policy without any planned version change, so a policy
-    /// that can heal pre-existing state ([`EdgePolicy::Canonicalize`](crate::EdgePolicy)) is not
-    /// gated on an unrelated upgrade existing. `apply` already enforces the policy as part of its
-    /// re-resolve; the mutating commands call this when no committed apply ran for the project.
-    /// Returns the corrected (or held) rebinds; adapters without ambiguous edge bindings keep the
-    /// default no-op.
+    /// Captures the adapter-owned lock state needed to report edge bindings across a whole run.
+    ///
+    /// The application treats a returned snapshot as evidence that
+    /// [`normalize_lock_edges`](ToolWrite::normalize_lock_edges) can produce an authoritative final
+    /// edge report. Adapters without ambiguous lock edges return [`None`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the adapter's edge-bearing lock state cannot be
+    /// read.
+    async fn lock_edge_snapshot(&self, _project: &Project) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Enforces the final lock **edge-binding** policy and reports its net relationship changes.
+    ///
+    /// `before` is the adapter snapshot captured before the run's first mutation. `committed`
+    /// carries per-batch edge evidence whose corrective provenance may not be derivable from that
+    /// snapshot when a target package was introduced during the run. Adapters reconcile both with
+    /// the final saved lock, discarding superseded attempts. A healing policy such as
+    /// [`EdgePolicy::Canonicalize`](crate::EdgePolicy) still runs when no version change landed.
+    /// Adapters without ambiguous edge bindings keep the default no-op.
     ///
     /// # Errors
     ///
@@ -382,6 +398,8 @@ pub trait ToolWrite: Send + Sync {
         &self,
         _project: &Project,
         _policy: crate::EdgePolicy,
+        _before: Option<&[u8]>,
+        _committed: &[crate::EdgeRebind],
     ) -> Result<Vec<crate::EdgeRebind>> {
         Ok(Vec::new())
     }

@@ -139,8 +139,9 @@ pub(crate) fn rewrite_lock_text(lock_text: &str, rewrites: &[EdgeRewrite]) -> Op
 
 /// Groups rewrites whose dependency-version endpoints overlap.
 ///
-/// A component is the smallest retry unit that preserves reciprocal swaps and other refcount-
-/// balanced corrections which may be invalid when verified one edge at a time.
+/// Components are attempted together first so reciprocal swaps and other refcount-balanced
+/// corrections are not broken apart prematurely. If a component fails, enforcement searches its
+/// largest subsets before falling back to smaller groups.
 pub(crate) fn rewrite_components(mut rewrites: Vec<EdgeRewrite>) -> Vec<Vec<EdgeRewrite>> {
     let mut components = Vec::new();
     while !rewrites.is_empty() {

@@ -13,6 +13,27 @@
 
 use super::{EdgeRewrite, LockEdgeView, RequirementIndex};
 
+/// Whether the lock pair contains an addressable crates.io rebind that might need restoration.
+///
+/// This source-only preflight deliberately does not decide whether the earlier target still
+/// satisfies the declared requirement; metadata is fetched only after a potential move exists.
+pub(crate) fn has_potential_restoration(before: &LockEdgeView, after: &LockEdgeView) -> bool {
+    after.bindings().any(|binding| {
+        let Some(earlier) = before.binding(binding.dependent, binding.dependency) else {
+            return false;
+        };
+        earlier != binding.bound
+            && after
+                .dependency_source(binding.dependency, binding.bound)
+                .as_deref()
+                == Some(crate::cargocmd::CRATES_IO_SOURCE)
+            && after
+                .dependency_source(binding.dependency, earlier)
+                .as_deref()
+                == Some(crate::cargocmd::CRATES_IO_SOURCE)
+    })
+}
+
 /// The corrective rewrites that restore churned bindings of `after` back to their `before` state.
 /// Ambiguous pairs are already absent from the views; the orphan guard is applied by the caller
 /// via [`guard_rewrites`](super::guard_rewrites).
@@ -68,6 +89,7 @@ mod tests {
     use super::super::tests::{CHURNED_LOCK, key, view};
     use super::*;
     use crate::cargocmd::{CRATES_IO_SOURCE, DeclaredRequirement, LockPackageId, ResolvedGraph};
+    use indoc::indoc;
     use std::collections::{HashMap, HashSet};
 
     fn graph_with(requirements: &[(&str, &str, &str, &str)]) -> ResolvedGraph {
@@ -223,6 +245,58 @@ mod tests {
             )
             .is_empty(),
             "a source-changing move is outside the crates.io edge policy"
+        );
+    }
+
+    #[test]
+    fn git_dependent_joins_metadata_and_lock_source_spellings() {
+        let before = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "dep"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "dep"
+            version = "1.1.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "ort"
+            version = "2.0.0"
+            source = "git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef"
+            dependencies = [
+             "dep 1.0.0",
+            ]
+        "#};
+        let after = before.replace("\"dep 1.0.0\",", "\"dep 1.1.0\",");
+        let graph = crate::cargocmd::Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [{
+                    "id": "git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef",
+                    "name": "ort",
+                    "version": "2.0.0",
+                    "source": "git+https://example.com/ort?branch=chore/ort-rc-12#abcdef",
+                    "dependencies": [{"name": "dep", "req": "^1"}]
+                }],
+                "workspace_members": [],
+                "workspace_root": "/workspace",
+                "resolve": {"nodes": []}
+            }
+        "#});
+
+        let rewrites = restorations(&view(before), &view(&after), &RequirementIndex::new(&graph));
+
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(
+            rewrites[0].dependent.source(),
+            Some("git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef")
+        );
+        assert_eq!(
+            (rewrites[0].from.as_str(), rewrites[0].to.as_str()),
+            ("1.1.0", "1.0.0")
         );
     }
 }

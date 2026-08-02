@@ -252,6 +252,15 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
+    async fn lock_edge_snapshot(&self, p: &Project) -> Result<Option<Vec<u8>>> {
+        let path = p.root.join("edge.snapshot");
+        match std::fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         if self.state.lock().unwrap().write_lock_on_apply {
             return Ok(ProjectMutationJournal {
@@ -308,6 +317,28 @@ impl ToolWrite for FakeEco {
                 "ok".into()
             },
         })
+    }
+
+    async fn normalize_lock_edges(
+        &self,
+        _project: &Project,
+        _policy: EdgePolicy,
+        before: Option<&[u8]>,
+        committed: &[EdgeRebind],
+    ) -> Result<Vec<EdgeRebind>> {
+        if before.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(committed
+            .iter()
+            .filter(|rebind| {
+                matches!(
+                    rebind.action,
+                    EdgeBindingAction::Restored | EdgeBindingAction::Canonicalized
+                )
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -1673,6 +1704,36 @@ async fn upgrade_fails_strict_when_an_edge_policy_is_incomplete() {
         unaddressable.applied,
         "the resolver's observed edge move was committed even though policy could not address it"
     );
+}
+
+#[tokio::test]
+async fn final_edge_audit_replaces_superseded_batch_history() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("edge.snapshot"), b"run start").expect("edge snapshot");
+    let mut held = diesel_rebind(None, EdgeBindingAction::Held);
+    held.detail = Some("temporary verification failure".to_string());
+    let corrected = diesel_rebind(None, EdgeBindingAction::Canonicalized);
+    let fake = edge_reporting_fake(root, vec![held, corrected]);
+
+    let out = workspace(fake, Baseline::default())
+        .upgrade(&RunOpts {
+            strict: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.edges_held, 0);
+    assert_eq!(out.summary.edges_corrected, 1);
+    let edges: Vec<_> = out
+        .items
+        .iter()
+        .filter_map(|item| item.edge.as_ref())
+        .collect();
+    assert!(matches!(
+        edges.as_slice(),
+        [edge] if edge.action == EdgeBindingAction::Canonicalized
+    ));
 }
 
 /// Releases for package "a": the current v1.0.0 plus a long-matured cross-major v2.0.0. `kind =

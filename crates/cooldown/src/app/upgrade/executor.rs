@@ -74,6 +74,9 @@ struct FixPlan {
 #[derive(Default)]
 struct BatchOutcome {
     items: Vec<UpgradeItem>,
+    edge_items: Vec<UpgradeItem>,
+    /// Per-batch edge evidence retained only until the final adapter audit.
+    edge_rebinds: Vec<cooldown_core::EdgeRebind>,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
     strict_incomplete: bool,
@@ -158,6 +161,7 @@ impl BatchOutcome {
 
     fn merge_into(self, acc: &mut UpgradeAccum) {
         acc.items.extend(self.items);
+        acc.edge_items.extend(self.edge_items);
         acc.warnings.extend(self.warnings);
         acc.errors.extend(self.errors);
         acc.strict_incomplete |= self.strict_incomplete;
@@ -182,12 +186,13 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     mode: PlanMode,
     acc: &'a mut UpgradeAccum,
     lock_refreshed_by_apply: bool,
-    /// Whether a committed (kept, not rolled back) apply has already enforced the edge policy over
-    /// the current lock — every `apply_plan` enforces before returning, and a rollback restores a
-    /// state that itself was either initial or produced by a committed apply. When set, the
-    /// standalone [`normalize_edges`](Self::normalize_edges) pass would be a redundant re-run over
-    /// an already-enforced lock and is skipped.
+    /// Whether a committed apply already supplied edge rows for an adapter that cannot provide a
+    /// run-level edge snapshot.
     lock_edges_enforced: bool,
+    /// Adapter-owned edge state captured before this project's first mutation.
+    initial_edge_snapshot: Option<Vec<u8>>,
+    /// Correction provenance from committed batches, pending validation against the final lock.
+    committed_edge_rebinds: Vec<cooldown_core::EdgeRebind>,
     /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
@@ -209,6 +214,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             acc,
             lock_refreshed_by_apply: false,
             lock_edges_enforced: false,
+            initial_edge_snapshot: None,
+            committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
         }
     }
@@ -234,6 +241,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
+        self.initial_edge_snapshot = match self
+            .ctx
+            .writer
+            .lock_edge_snapshot(&self.ctx.pctx.project)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return;
+            }
+        };
         let Some(mut state) = self.initial_trial_state().await else {
             return;
         };
@@ -248,33 +267,33 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         }
 
-        // A healing edge policy must not be gated on an unrelated version change existing: apply
-        // enforces it during a batch, but a run that applied nothing (or rolled every batch back,
-        // taking the in-batch enforcement with it) still owes the lock its edge pass. A committed
-        // apply already enforced the policy over the lock it left behind, so the standalone pass
-        // runs only when no commit did — one enforcement owner per run, no redundant metadata
-        // spawn. Runs before `finalize` so the final lock probe verifies the result.
-        if !self.lock_edges_enforced {
+        // The final pass reconciles run-level observation with committed correction evidence, so
+        // temporary batch limitations and overwritten corrections cannot survive in the report.
+        // Adapters without snapshots retain their existing per-batch reporting fallback.
+        if self.initial_edge_snapshot.is_some() || !self.lock_edges_enforced {
             self.normalize_edges().await;
         }
 
         self.finalize().await;
     }
 
-    /// Standalone edge-binding enforcement for this project (see
-    /// [`normalize_lock_edges`](cooldown_core::ToolWrite::normalize_lock_edges)); corrected or
-    /// observed rebinds surface as report rows like the in-apply ones.
+    /// Final edge-binding enforcement and run-level audit for this project.
     async fn normalize_edges(&mut self) {
         match self
             .ctx
             .writer
-            .normalize_lock_edges(&self.ctx.pctx.project, self.ctx.pctx.edge_policy)
+            .normalize_lock_edges(
+                &self.ctx.pctx.project,
+                self.ctx.pctx.edge_policy,
+                self.initial_edge_snapshot.as_deref(),
+                &self.committed_edge_rebinds,
+            )
             .await
         {
             Ok(rebinds) => {
                 for rebind in &rebinds {
                     let item = self.edge_rebind_item(rebind);
-                    self.acc.items.push(item);
+                    self.acc.edge_items.push(item);
                 }
             }
             Err(error) => self.record_project_error(&error, None),
@@ -633,6 +652,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // so this records exactly "the current lock was produced by a committed apply" — which
         // enforced the edge policy on its way out.
         self.lock_edges_enforced |= outcome.committed.is_some();
+        self.committed_edge_rebinds
+            .extend(outcome.edge_rebinds.iter().cloned());
         outcome.merge_into(self.acc);
     }
 
@@ -1390,8 +1411,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         for change in collateral {
             outcome.items.push(self.change_applied_item(change));
         }
-        for rebind in edge_rebinds {
-            outcome.items.push(self.edge_rebind_item(rebind));
+        if self.initial_edge_snapshot.is_none() {
+            for rebind in edge_rebinds {
+                outcome.edge_items.push(self.edge_rebind_item(rebind));
+            }
+        } else {
+            outcome.edge_rebinds.extend(edge_rebinds.iter().cloned());
         }
     }
 
@@ -2124,7 +2149,8 @@ fn collapse_applied_legs(
 ) {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for (idx, item) in items.iter().enumerate() {
-        let applied = item.applied && item.skipped.is_none() && item.error.is_none();
+        let applied =
+            item.edge.is_none() && item.applied && item.skipped.is_none() && item.error.is_none();
         if applied && item.project == project && item.tool == tool {
             groups
                 .entry((item.name.clone(), item.registry.clone()))
@@ -2268,9 +2294,9 @@ mod tests {
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
-        ApplyReport, Change, DepScope, Dependency, LockStatus, MajorKey, MemberRef, PackageId,
-        ProjectMutationFile, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality,
-        SkipReason, ToolId, UpdateKind, Version,
+        ApplyReport, Change, DepScope, Dependency, EdgeBindingAction, LockStatus, MajorKey,
+        MemberRef, PackageId, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseOrder,
+        ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
     };
     use std::collections::HashSet;
 
@@ -2657,6 +2683,18 @@ mod tests {
         }
     }
 
+    fn edge_item(dependent: &str, from: &str, to: &str) -> UpgradeItem {
+        let mut item = applied_item("dep", from, to, false);
+        item.edge = Some(crate::app::UpgradeEdgeInfo {
+            dependent: dependent.to_string(),
+            dependent_version: "1.0.0".to_string(),
+            dependent_source: None,
+            action: EdgeBindingAction::Rebound,
+            detail: None,
+        });
+        item
+    }
+
     fn no_prior() -> HashSet<ViolationKey> {
         HashSet::new()
     }
@@ -2837,6 +2875,47 @@ mod tests {
             .collect();
         assert!(lines.contains(&("0.9.1".to_string(), "0.9.3".to_string())));
         assert!(lines.contains(&("1.0.0".to_string(), "1.0.5".to_string())));
+    }
+
+    #[test]
+    fn collapse_leaves_reciprocal_edge_rows_independent() {
+        let mut items = vec![
+            edge_item("consumer-a", "1.0.0", "2.0.0"),
+            edge_item("consumer-b", "2.0.0", "1.0.0"),
+        ];
+
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+
+        assert_eq!(items.len(), 2, "edge relationships are not version legs");
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| item.edge.as_ref().map(|edge| edge.dependent.as_str()))
+                .collect::<HashSet<_>>(),
+            HashSet::from(["consumer-a", "consumer-b"])
+        );
+    }
+
+    #[test]
+    fn collapse_does_not_chain_an_edge_row_with_a_version_row() {
+        let mut items = vec![
+            applied_item("dep", "1.0.0", "2.0.0", false),
+            edge_item("consumer", "2.0.0", "3.0.0"),
+        ];
+
+        collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            (items[0].from.as_str(), items[0].to.as_str()),
+            ("1.0.0", "2.0.0")
+        );
+        let edge = items[1].edge.as_ref().expect("edge row");
+        assert_eq!(edge.dependent, "consumer");
+        assert_eq!(
+            (items[1].from.as_str(), items[1].to.as_str()),
+            ("2.0.0", "3.0.0")
+        );
     }
 
     #[test]

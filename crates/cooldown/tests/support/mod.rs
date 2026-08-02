@@ -516,6 +516,10 @@ impl Envelope {
         self.diagnostic_values("errors", "kind")
     }
 
+    pub fn error_messages(&self) -> BTreeSet<String> {
+        self.diagnostic_values("errors", "message")
+    }
+
     pub fn warning_paths(&self) -> BTreeSet<String> {
         self.diagnostic_values("warnings", "path")
     }

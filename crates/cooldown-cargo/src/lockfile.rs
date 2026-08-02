@@ -2,7 +2,9 @@
 
 use crate::version;
 use cooldown_core::{CoreError, Result};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 /// The `source` string Cargo records for crates.io packages.
 pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -27,15 +29,83 @@ impl PackageKey {
     }
 }
 
-/// A `[[package]]` block's complete lockfile identity.
+/// The equality identity of a Cargo package source.
+///
+/// Cargo metadata can leave reserved characters literal in a git query while package IDs and
+/// `Cargo.lock` percent-encode them. Git source equality decodes ASCII percent escapes so those
+/// spellings join, while the verbatim source remains available for reporting.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SourceIdentity(String);
+
+impl SourceIdentity {
+    fn new(source: &str) -> Self {
+        if source.starts_with("git+") {
+            SourceIdentity(canonical_git_source(source))
+        } else {
+            SourceIdentity(source.to_string())
+        }
+    }
+}
+
+fn canonical_git_source(source: &str) -> String {
+    let Some(query_start) = source.find('?') else {
+        return source.to_string();
+    };
+    let query_end = source[query_start..]
+        .find('#')
+        .map_or(source.len(), |offset| query_start + offset);
+    let query = &source[query_start..query_end];
+    let mut canonical = String::with_capacity(source.len());
+    canonical.push_str(&source[..query_start]);
+    canonical.push_str(&decode_ascii_percent_escapes(query));
+    canonical.push_str(&source[query_end..]);
+    canonical
+}
+
+fn decode_ascii_percent_escapes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = bytes
+            .get(index..index.saturating_add(3))
+            .and_then(|escape| match escape {
+                [b'%', high, low] => hex_value(*high)
+                    .zip(hex_value(*low))
+                    .map(|(high, low)| (high << 4) | low)
+                    .filter(u8::is_ascii),
+                _ => None,
+            });
+        if let Some(byte) = escaped {
+            decoded.push(byte);
+            index += 3;
+        } else if let Some(byte) = bytes.get(index) {
+            decoded.push(*byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// A `[[package]]` block's complete lockfile identity.
+#[derive(Debug, Clone)]
 pub struct LockPackageId {
     /// The crate's package name.
     pub name: String,
     /// The resolved version.
     pub version: String,
     /// The package source, absent for path and workspace packages.
-    pub source: Option<String>,
+    source: Option<String>,
+    source_identity: Option<SourceIdentity>,
 }
 
 impl LockPackageId {
@@ -45,11 +115,53 @@ impl LockPackageId {
         version: impl Into<String>,
         source: Option<impl Into<String>>,
     ) -> Self {
+        let source = source.map(Into::into);
+        let source_identity = source.as_deref().map(SourceIdentity::new);
         LockPackageId {
             name: name.into(),
             version: version.into(),
-            source: source.map(Into::into),
+            source,
+            source_identity,
         }
+    }
+
+    /// Returns the source spelling carried by the metadata or lockfile that constructed the ID.
+    #[must_use]
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+}
+
+impl PartialEq for LockPackageId {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.version == other.version
+            && self.source_identity == other.source_identity
+    }
+}
+
+impl Eq for LockPackageId {}
+
+impl PartialOrd for LockPackageId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LockPackageId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.version.cmp(&other.version))
+            .then_with(|| self.source_identity.cmp(&other.source_identity))
+    }
+}
+
+impl Hash for LockPackageId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.version.hash(state);
+        self.source_identity.hash(state);
     }
 }
 
@@ -158,4 +270,41 @@ fn highest_versions(slots: LockedSlots) -> BTreeMap<SlotKey, String> {
                 .map(|version| (key, version))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LockPackageId;
+
+    #[test]
+    fn git_source_identity_joins_metadata_and_lock_spellings() {
+        let metadata = LockPackageId::new(
+            "ort",
+            "1.0.0",
+            Some("git+https://example.com/ort?branch=chore/ort-rc-12#abcdef"),
+        );
+        let lock = LockPackageId::new(
+            "ort",
+            "1.0.0",
+            Some("git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef"),
+        );
+
+        assert_eq!(metadata, lock);
+        assert_eq!(
+            lock.source(),
+            Some("git+https://example.com/ort?branch=chore%2Fort-rc-12#abcdef")
+        );
+    }
+
+    #[test]
+    fn source_distinct_packages_remain_distinct() {
+        let registry = LockPackageId::new(
+            "twin",
+            "1.0.0",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+        );
+        let git = LockPackageId::new("twin", "1.0.0", Some("git+https://example.com/twin#abcdef"));
+
+        assert_ne!(registry, git);
+    }
 }

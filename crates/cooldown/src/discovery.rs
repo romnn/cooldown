@@ -8,6 +8,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{ConfigDocument, ScanConfig};
 use cooldown_core::{CoreError, EdgePolicy, Origin, PolicyLayer};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
 /// detection.
@@ -72,6 +74,7 @@ pub struct ConfigSources {
     global: Option<LoadedConfigFile>,
     repo_root: Option<LoadedConfigFile>,
     explicit: Option<LoadedConfigFile>,
+    nested: Arc<Mutex<HashMap<Utf8PathBuf, Option<LoadedConfigFile>>>>,
 }
 
 /// The per-project projections of its repository config cascade.
@@ -122,6 +125,7 @@ impl ConfigSources {
             global,
             repo_root: repo_root_doc,
             explicit,
+            nested: Arc::default(),
         })
     }
 
@@ -219,7 +223,7 @@ impl ConfigSources {
             let maybe_doc = if path == repo_root_config {
                 self.repo_root.clone()
             } else {
-                read_document(&path, &Origin::Repo(path.clone()))?
+                self.nested_document(&path)?
             };
             if let Some(config) = maybe_doc {
                 cargo_edge_policy = config.document.cargo_edge_policy().or(cargo_edge_policy);
@@ -235,6 +239,18 @@ impl ConfigSources {
             policy_layers,
             cargo_edge_policy,
         })
+    }
+
+    fn nested_document(&self, path: &Utf8Path) -> Result<Option<LoadedConfigFile>, CoreError> {
+        let mut nested = self.nested.lock().map_err(|_| {
+            CoreError::Filesystem("config document cache lock was poisoned".to_string())
+        })?;
+        if let Some(document) = nested.get(path) {
+            return Ok(document.clone());
+        }
+        let document = read_document(path, &Origin::Repo(path.to_owned()))?;
+        nested.insert(path.to_owned(), document.clone());
+        Ok(document)
     }
 }
 
@@ -415,5 +431,42 @@ mod tests {
             .project_config(root, &project)
             .expect_err("misplaced nested edge policy");
         assert!(error.to_string().contains("[tool.cargo]"), "{error}");
+    }
+
+    #[test]
+    fn nested_config_is_parsed_once_for_the_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let project = root.join("apps/api");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let nested = project.join(CONFIG_FILE);
+        std::fs::write(
+            &nested,
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "preserve"
+            "#},
+        )
+        .expect("nested config");
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+        let first = configs
+            .project_config(root, &project)
+            .expect("first projection");
+
+        std::fs::write(
+            &nested,
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "canonicalize"
+            "#},
+        )
+        .expect("replace nested config");
+        let second = configs
+            .project_config(root, &project)
+            .expect("second projection");
+
+        assert_eq!(first.cargo_edge_policy, Some(EdgePolicy::Preserve));
+        assert_eq!(second.cargo_edge_policy, first.cargo_edge_policy);
     }
 }

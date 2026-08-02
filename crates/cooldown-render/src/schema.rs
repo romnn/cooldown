@@ -96,6 +96,11 @@ pub fn json_schema() -> Value {
         .iter()
         .map(|action| Value::String(action.wire_value().to_string()))
         .collect();
+    let applied_edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| **action != cooldown_core::EdgeBindingAction::Held)
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -227,6 +232,34 @@ pub fn json_schema() -> Value {
         "upgradeItem": {
             "type": "object",
             "required": ["name", "tool", "project", "direct", "downgrade", "from", "to", "kind", "applied"],
+            "allOf": [
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": { "action": { "const": "held" } }
+                            }
+                        }
+                    },
+                    "then": { "properties": { "applied": { "const": false } } }
+                },
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": {
+                                    "action": { "enum": applied_edge_actions }
+                                }
+                            }
+                        }
+                    },
+                    "then": { "properties": { "applied": { "const": true } } }
+                }
+            ],
             "properties": {
                 "name": { "type": "string" },
                 "tool": { "type": "string" },
@@ -513,6 +546,31 @@ mod tests {
     fn held_by_serializes_with_the_additive_camel_case_field() {
         let value = serde_json::to_value(outdated_item()).expect("item serializes");
         assert_eq!(value["heldBy"], "bound <2");
+    }
+
+    #[test]
+    fn edge_action_conditions_fix_the_applied_invariant() {
+        let schema = json_schema();
+        let conditions = schema["$defs"]["upgradeItem"]["allOf"]
+            .as_array()
+            .expect("edge action conditions");
+
+        assert_eq!(
+            conditions[0]["if"]["properties"]["edge"]["properties"]["action"]["const"],
+            "held"
+        );
+        assert_eq!(
+            conditions[0]["then"]["properties"]["applied"]["const"],
+            false
+        );
+        let applied = conditions[1]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("applied edge actions");
+        assert!(!applied.contains(&Value::String("held".to_string())));
+        assert_eq!(
+            conditions[1]["then"]["properties"]["applied"]["const"],
+            true
+        );
     }
 
     #[test]

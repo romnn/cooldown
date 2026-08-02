@@ -81,18 +81,20 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
 
 Every corrected, withheld, unaddressable, or surviving rebind is reported as its own row
 (`restored`, `canonicalized`, `held`, `unaddressable`, or `rebound`) naming the dependent whose
-edge moved. Corrections are applied as targeted lock edits and re-verified with
+edge moved. The report is audited from the run-start and final locks, so a temporary held attempt
+that a later batch resolves does not fail `--strict`, and a correction later overwritten does not
+remain `applied`. Corrections are applied as targeted lock edits and re-verified with
 `cargo metadata --locked`. A concrete correction rejected by the orphan guard or verification is
-`held`, with `to` naming the withheld target. If a renamed multi-version or source-qualified lock
+`held`, with `to` naming the withheld target; when the resolver also moved that edge, a separate
+`rebound` row records the committed move. If a renamed multi-version or source-qualified lock
 entry moves but cannot be mapped safely to one declared requirement, it is `unaddressable` rather
 than being mislabeled as an ordinary rebound. The JSON summary counts edge activity apart from
-version changes (`edgesCorrected`, `edgesHeld`, and `edgesUnaddressable`); each edge row's
-`applied` says whether its binding outcome is present in the committed lock, while top-level
-`applied` says whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a
-`--strict` run because the corrective policy is incomplete. The policy is cargo-specific, so its
-config placement is too: set `edge-policy` under `[tool.cargo]` in the nearest applicable
-`cooldown.toml`; nearer project config wins, then an explicit `--config`, and the CLI flag has
-highest precedence.
+version changes (`edgesCorrected`, `edgesHeld`, and `edgesUnaddressable`); each edge row's `applied`
+says whether its binding outcome is present in the committed lock, while top-level `applied` says
+whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a `--strict` run because
+the corrective policy is incomplete. The policy is cargo-specific, so its config placement is too:
+set `edge-policy` under `[tool.cargo]` in the nearest applicable `cooldown.toml`; nearer project
+config wins, then an explicit `--config`, and the CLI flag has highest precedence.
 
 ## Major versions
 

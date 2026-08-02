@@ -49,12 +49,10 @@ pub(crate) struct LockEdgeView {
     /// Versions present per crate name, restricted to crates.io packages — the only versions a
     /// rewrite may bind to.
     pub(super) crates_io_versions: BTreeMap<String, BTreeSet<String>>,
-    /// Versions present per crate name across ALL sources. The observation diff uses this to tell
-    /// a genuine rebinding (both endpoint versions locked on both sides) from an edge merely
-    /// *following* a slot-level version change the report already carries as an applied row.
-    pub(super) versions: BTreeMap<String, BTreeSet<String>>,
     /// Sources present for each `(name, version)` package identity.
     package_sources: BTreeMap<PackageKey, BTreeSet<Option<String>>>,
+    /// Every source-bearing package identity present in the lock.
+    packages: BTreeSet<LockPackageId>,
     /// How many dependency entries reference each locked `(name, version)`, counting every entry
     /// form (qualified, source-suffixed, and unqualified resolved via the single package of that
     /// name). The orphan guard keeps rewrites from dropping a still-locked version's last
@@ -96,14 +94,15 @@ struct PackageSurvey<'a> {
     /// Version list per name across ALL sources, to resolve unqualified entries: cargo only
     /// writes a bare `"name"` entry when the lock holds exactly one package of that name.
     versions_by_name: BTreeMap<&'a str, Vec<&'a str>>,
-    versions: BTreeMap<String, BTreeSet<String>>,
     package_sources: BTreeMap<PackageKey, BTreeSet<Option<String>>>,
+    packages: BTreeSet<LockPackageId>,
 }
 
 fn survey_packages(lock: &CargoLock) -> PackageSurvey<'_> {
     let mut crates_io_versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut versions_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut package_sources: BTreeMap<PackageKey, BTreeSet<Option<String>>> = BTreeMap::new();
+    let mut packages = BTreeSet::new();
     for package in &lock.package {
         let Some(package_version) = package.version.as_deref() else {
             continue;
@@ -116,6 +115,11 @@ fn survey_packages(lock: &CargoLock) -> PackageSurvey<'_> {
             .entry(PackageKey::new(&*package.name, package_version))
             .or_default()
             .insert(package.source.clone());
+        packages.insert(LockPackageId::new(
+            &package.name,
+            package_version,
+            package.source.as_deref(),
+        ));
         if package.source.as_deref() == Some(crate::cargocmd::CRATES_IO_SOURCE) {
             crates_io_versions
                 .entry(package.name.clone())
@@ -123,20 +127,11 @@ fn survey_packages(lock: &CargoLock) -> PackageSurvey<'_> {
                 .insert(package_version.to_string());
         }
     }
-    let versions: BTreeMap<String, BTreeSet<String>> = versions_by_name
-        .iter()
-        .map(|(name, list)| {
-            (
-                (*name).to_string(),
-                list.iter().map(|version| (*version).to_string()).collect(),
-            )
-        })
-        .collect();
     PackageSurvey {
         crates_io_versions,
         versions_by_name,
-        versions,
         package_sources,
+        packages,
     }
 }
 
@@ -145,8 +140,8 @@ impl LockEdgeView {
         let PackageSurvey {
             crates_io_versions,
             versions_by_name,
-            versions,
             package_sources,
+            packages,
         } = survey_packages(lock);
 
         let mut bindings: BTreeMap<(LockPackageId, String), String> = BTreeMap::new();
@@ -219,16 +214,10 @@ impl LockEdgeView {
             qualified,
             unaddressable,
             crates_io_versions,
-            versions,
             package_sources,
+            packages,
             refcounts,
         }
-    }
-
-    pub(super) fn has_version(&self, name: &str, version: &str) -> bool {
-        self.versions
-            .get(name)
-            .is_some_and(|versions| versions.contains(version))
     }
 
     /// The unambiguous bindings, in deterministic order.
@@ -267,16 +256,31 @@ impl LockEdgeView {
             .map(String::as_str)
     }
 
-    pub(crate) fn dependency_source(&self, dependency: &str, remainder: &str) -> Option<String> {
+    pub(crate) fn dependency_target(
+        &self,
+        dependency: &str,
+        remainder: &str,
+    ) -> Option<LockPackageId> {
+        let version = remainder_version(remainder);
         if let Some(source) = remainder_source(remainder) {
-            return Some(source.to_string());
+            return Some(LockPackageId::new(dependency, version, Some(source)));
         }
-        let key = PackageKey::new(dependency, remainder_version(remainder));
+        let key = PackageKey::new(dependency, version);
         let sources = self.package_sources.get(&key)?;
         if sources.len() != 1 {
             return None;
         }
-        sources.iter().next().cloned().flatten()
+        let source = sources.iter().next()?.as_deref();
+        Some(LockPackageId::new(dependency, version, source))
+    }
+
+    pub(crate) fn dependency_source(&self, dependency: &str, remainder: &str) -> Option<String> {
+        self.dependency_target(dependency, remainder)
+            .and_then(|target| target.source().map(str::to_string))
+    }
+
+    pub(crate) fn contains_package(&self, package: &LockPackageId) -> bool {
+        self.packages.contains(package)
     }
 }
 

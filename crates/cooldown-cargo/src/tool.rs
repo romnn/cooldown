@@ -26,11 +26,11 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, EdgePolicy, EdgeRebind,
-    FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
-    ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite,
-    UpdateKind, VerifyReport, Version,
+    ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EdgePolicy,
+    EdgeRebind, FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry,
+    Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -147,6 +147,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        edges::enforce::recover_pending(project)?;
         let graph = self.cargo.metadata(&project.root).await?;
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
@@ -198,6 +199,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        edges::enforce::recover_pending(project)?;
         match self.cargo.verify_locked(&project.root).await {
             Ok(graph) => Ok(verify_current_report(
                 graph.is_some(),
@@ -544,6 +546,7 @@ impl CargoTool {
         if plan.changes.is_empty() {
             return Ok(report);
         }
+        edges::enforce::recover_pending(project)?;
 
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
         // the re-resolve), parsed once: its slot map feeds the version diff below and its edge view
@@ -577,18 +580,26 @@ impl CargoTool {
             Err(err) => return Err(err),
         }
 
+        let resolver_lock = read_lock(project)?;
+
         // The resolved graph supplies declared requirements to edge enforcement and proves which
-        // direct member edges reached their targets. A corrective policy makes the initial fetch
-        // mandatory; successful lock verification returns a fresh graph after any correction.
+        // direct member edges reached their targets. Preserve needs requirements only when the
+        // before/resolver lock pair contains an addressable rebind; successful lock verification
+        // returns a fresh graph after any correction.
         let needs_graph = plan.changes.iter().any(needs_member_graph);
-        let corrective_edges = matches!(
-            plan.edge_policy,
-            EdgePolicy::Preserve | EdgePolicy::Canonicalize
-        );
+        let preserve_needs_graph = matches!(plan.edge_policy, EdgePolicy::Preserve)
+            && before_lock.as_ref().is_some_and(|before_lock| {
+                edges::preserve::has_potential_restoration(
+                    &edges::LockEdgeView::from_lock(before_lock),
+                    &edges::LockEdgeView::from_lock(&resolver_lock),
+                )
+            });
+        let corrective_edges =
+            matches!(plan.edge_policy, EdgePolicy::Canonicalize) || preserve_needs_graph;
         let graph = if needs_graph || corrective_edges {
             Some(self.cargo.metadata(&project.root).await?)
         } else {
-            self.cargo.metadata(&project.root).await.ok()
+            None
         };
 
         // Enforce the plan's edge policy over the re-resolved lock and collect every edge binding
@@ -704,6 +715,7 @@ impl ToolWrite for CargoTool {
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
+        edges::enforce::recover_pending(project)?;
         // Capture the lock and every manifest a rewrite could touch (the root, for
         // `[workspace.dependencies]`, plus each declaring member) so a rejected trial rolls back
         // both the re-lock and any constraint edit. Capturing an unmodified manifest is harmless —
@@ -747,26 +759,56 @@ impl ToolWrite for CargoTool {
         self.cargo.build(&project.root).await
     }
 
-    /// Standalone edge-binding enforcement for a project with nothing to apply, so
-    /// [`EdgePolicy::Canonicalize`] can heal a pre-existing bad binding without an unrelated
-    /// upgrade. `Preserve` is inherently a no-op here (there is no re-resolve whose churn could be
-    /// restored), so the metadata spawn is skipped for it entirely.
+    async fn lock_edge_snapshot(&self, project: &Project) -> Result<Option<Vec<u8>>> {
+        edges::enforce::recover_pending(project)?;
+        std::fs::read(project.root.join("Cargo.lock"))
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    /// Final edge-binding enforcement and run-start-to-final audit.
     async fn normalize_lock_edges(
         &self,
         project: &Project,
         policy: EdgePolicy,
+        before: Option<&[u8]>,
+        committed: &[EdgeRebind],
     ) -> Result<Vec<EdgeRebind>> {
-        if !matches!(policy, EdgePolicy::Canonicalize) {
-            return Ok(Vec::new());
-        }
-        // A metadata failure is the project error it is: swallowed, the requested healing would
-        // degrade to a successful no-op — nothing proposed, nothing reported, exit 0.
-        let graph = self.cargo.metadata(&project.root).await?;
-        // No journal snapshot exists outside an apply: enforcement runs against the current lock
-        // alone (no churn to restore or diff), and rolls its own surgery back on a failed verify.
-        edges::enforce::enforce(&self.cargo, project, policy, None, Some(graph))
-            .await
-            .map(|result| result.rebinds)
+        let before_lock = before
+            .map(|contents| {
+                std::str::from_utf8(contents)
+                    .map_err(|error| {
+                        CoreError::LockUnreadable(format!("Cargo.lock snapshot: {error}"))
+                    })
+                    .and_then(CargoLock::parse)
+            })
+            .transpose()?;
+        let current_lock = read_lock(project)?;
+        let graph = match policy {
+            EdgePolicy::None => None,
+            EdgePolicy::Preserve => {
+                let needs_graph = before_lock.as_ref().is_some_and(|before_lock| {
+                    edges::preserve::has_potential_restoration(
+                        &edges::LockEdgeView::from_lock(before_lock),
+                        &edges::LockEdgeView::from_lock(&current_lock),
+                    )
+                });
+                if needs_graph {
+                    Some(self.cargo.metadata(&project.root).await?)
+                } else {
+                    None
+                }
+            }
+            // A metadata failure must remain a project error; otherwise requested canonical
+            // healing would degrade to a successful no-op.
+            EdgePolicy::Canonicalize => Some(self.cargo.metadata(&project.root).await?),
+        };
+        let mut result =
+            edges::enforce::enforce(&self.cargo, project, policy, before_lock.as_ref(), graph)
+                .await?;
+        let final_view = edges::LockEdgeView::from_lock(&read_lock(project)?);
+        edges::enforce::reconcile_committed_outcomes(&final_view, &mut result.rebinds, committed);
+        Ok(result.rebinds)
     }
 }
 

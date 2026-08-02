@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Breaking library API:** adapter parsing and lookup helpers now return named records instead of
+  positional tuples. This affects Go path-version splitting; npm lock parsing and install-tree
+  resolution; and the public Hex, Maven, pip, and RubyGems resolved-pin parsers. Callers should use
+  the documented fields on `PathVersionSplit`, `NameVersion`, `ResolvedInstance`, `ResolvedDep`,
+  and `ResolvedPin`.
 - Add a cargo `--cargo-edge-policy` for resolved lock **edge bindings** (`preserve` |
   `canonicalize` | `none`; config `[tool.cargo] edge-policy` — cargo-specific, so the key is
   tool-scoped and rejected under any other selector). An incremental re-resolve can silently

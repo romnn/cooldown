@@ -54,16 +54,11 @@ pub(crate) struct BindingChange {
     pub(crate) dependent: LockPackageId,
     /// The depended-on crate name.
     pub(crate) dependency: String,
-    /// The bound version in the earlier lock.
-    pub(crate) before: String,
-    /// The bound version in the later lock.
-    pub(crate) after: String,
-    /// The earlier binding target's source, when it can be identified unambiguously.
-    pub(crate) before_source: Option<String>,
-    /// The later binding target's source, when it can be identified unambiguously.
-    pub(crate) after_source: Option<String>,
-    /// Extra context when the versions alone understate the move — a same-version entry swap
-    /// between two sources. Carried into the report row's detail.
+    /// The complete binding target in the earlier lock.
+    pub(crate) before: LockPackageId,
+    /// The complete binding target in the later lock.
+    pub(crate) after: LockPackageId,
+    /// Extra context when versions alone understate the source-bearing move.
     pub(crate) detail: Option<String>,
 }
 
@@ -101,6 +96,18 @@ impl<'a> RequirementIndex<'a> {
             }
         }
         matched
+    }
+
+    /// Whether metadata identifies a declared requirement for this lock edge.
+    pub(crate) fn identifies(&self, dependent: &LockPackageId, dependency: &str) -> bool {
+        self.graph
+            .declared_requirements
+            .get(dependent)
+            .is_some_and(|requirements| {
+                requirements
+                    .iter()
+                    .any(|requirement| requirement.dependency == dependency)
+            })
     }
 
     /// Whether binding `dependency` at `candidate` respects the workspace's declared MSRV: a
