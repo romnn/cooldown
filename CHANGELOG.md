@@ -10,7 +10,10 @@
 - **Breaking library API:** `ToolWrite::recover_pending_mutation` now returns whether recovery
   changed project state, and `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side
   adapter fail a shared read session without performing recovery. `ProjectMutationState` pairs a
-  rollback journal with the exact post-apply state it may replace.
+  rollback journal with the post-apply state observed before any conditional restore.
+- **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
+  project mutation state and other access-session failures cannot be silently reduced to a missing
+  registry.
 - Add a cargo `--cargo-edge-policy` for resolved lock **edge bindings** (`preserve` |
   `canonicalize` | `none`; config `[tool.cargo] edge-policy` — cargo-specific, so the key is
   tool-scoped and rejected under any other selector). An incremental re-resolve can silently
@@ -29,11 +32,14 @@
   version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level
   `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
   fails `--strict`. Speculative lock corrections use atomically published, drift-checked recovery
-  records, and outer manifest/lock rollback refuses to overwrite independent edits. The new
+  records with parent-directory syncing on Unix, and outer manifest/lock rollback refuses to
+  overwrite edits observed after its post-apply capture or run any later batch after a restore
+  conflict. The new
   `recover` command discovers recovery artifacts without loading policy, manifests, baselines, or
   registries, then restores a validated interrupted transaction without continuing into another
-  mutation. Project reads and native-policy sync share the same resource leases. Config follows the
-  per-project repository cascade, and the closed JSON contract is schema v4.
+  mutation. Project reads and native-policy sync share project leases, while repository-scoped
+  native state has its own tool-qualified lease independent of project discovery. Config follows
+  the per-project repository cascade, and the closed JSON contract is schema v4.
 
 ## v0.0.12
 

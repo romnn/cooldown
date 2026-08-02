@@ -1,6 +1,6 @@
 use super::Window;
 use super::baseline::Baseline;
-use super::lock::{ProjectReadGuard, ProjectWriteGuard};
+use super::lock::{ProjectAccessReadGuard, ProjectAccessWriteGuard};
 use super::progress::Progress;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use crate::scan::{FolderExcludeSet, PackageExcludeSet};
@@ -501,7 +501,12 @@ impl Workspace {
             return Ok(None);
         }
         opts.progress.phase("refreshing lock state");
-        let _guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
+        let _guard = ProjectAccessWriteGuard::acquire(
+            self.repo_root(),
+            &pctx.project.root,
+            pctx.tool,
+            writer.sync_scope() == cooldown_core::SyncScope::Repo,
+        )?;
         writer.recover_pending_mutation(&pctx.project).await?;
         writer.refresh_lock(&pctx.project).await
     }
@@ -510,9 +515,15 @@ impl Workspace {
     pub(crate) async fn project_read_guard(
         &self,
         pctx: &ProjectCtx,
-    ) -> cooldown_core::Result<ProjectReadGuard> {
-        let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
-        if let Some(writer) = self.mutator(pctx.tool) {
+    ) -> cooldown_core::Result<ProjectAccessReadGuard> {
+        let writer = self.mutator(pctx.tool);
+        let guard = ProjectAccessReadGuard::acquire(
+            self.repo_root(),
+            &pctx.project.root,
+            pctx.tool,
+            writer.is_some_and(|writer| writer.sync_scope() == cooldown_core::SyncScope::Repo),
+        )?;
+        if let Some(writer) = writer {
             writer.ensure_no_pending_mutation(&pctx.project).await?;
         }
         Ok(guard)

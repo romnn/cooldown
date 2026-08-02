@@ -161,7 +161,7 @@ pub(super) async fn run_explain(
     ctx: &CommandContext<'_>,
     package: &str,
 ) -> Result<Exit, CoreError> {
-    let out = ctx.ws.explain(package, ctx.opts).await;
+    let out = ctx.ws.explain(package, ctx.opts).await?;
     let meta = out.meta.clone();
     let steps = out.steps.clone();
     let env = render::Envelope::new(

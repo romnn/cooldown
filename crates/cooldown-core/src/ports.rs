@@ -620,11 +620,13 @@ pub struct ProjectMutationJournal {
     pub files: Vec<ProjectMutationFile>,
 }
 
-/// The exact post-apply contents expected at a rollback boundary.
+/// The post-apply contents observed at a rollback boundary.
 ///
-/// A mutation journal captures the pre-image. This state captures the corresponding post-image so
-/// rollback can refuse to overwrite a file changed independently while cooldown was verifying the
-/// candidate.
+/// A mutation journal captures the pre-image.
+/// This state captures the corresponding post-image so rollback can refuse to overwrite a later
+/// independent change while cooldown is verifying the candidate.
+/// Because adapters may mutate through an external process, this observation does not prove who
+/// produced an edit made before capture completed.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectMutationState {
     files: Vec<ProjectMutationFile>,

@@ -424,6 +424,7 @@ version = "0.0.14"
 dependencies = [
  "async-trait",
  "camino",
+ "color-eyre",
  "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
@@ -464,6 +465,7 @@ version = "0.0.14"
 dependencies = [
  "async-trait",
  "camino",
+ "color-eyre",
  "globset",
  "indoc",
  "jiff",
@@ -580,6 +582,7 @@ dependencies = [
 name = "cooldown-render"
 version = "0.0.14"
 dependencies = [
+ "color-eyre",
  "comfy-table",
  "cooldown-core",
  "jiff",

@@ -714,6 +714,38 @@ pub struct RecoveryItem {
     pub tool: String,
     /// The project path relative to the repository root.
     pub project: String,
-    /// The lowercase recovery outcome.
-    pub status: String,
+    /// The recovery outcome.
+    pub status: RecoveryStatus,
+}
+
+macro_rules! recovery_statuses {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// The status of one recovery target.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        pub enum RecoveryStatus {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl RecoveryStatus {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [RecoveryStatus] = &[ $( RecoveryStatus::$variant, )+ ];
+
+            /// Returns the serialized wire token for this status.
+            #[must_use]
+            pub const fn wire_value(self) -> &'static str {
+                match self {
+                    $( RecoveryStatus::$variant => $wire, )+
+                }
+            }
+        }
+    };
+}
+
+recovery_statuses! {
+    /// Interrupted state was validated and restored.
+    Recovered = "recovered",
+    /// No interrupted state was present.
+    Unchanged = "unchanged",
+    /// Recovery could not safely complete.
+    Error = "error",
 }

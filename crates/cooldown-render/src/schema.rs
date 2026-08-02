@@ -98,14 +98,18 @@ pub fn json_schema() -> Value {
         .collect();
     let applied_edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
         .iter()
-        .filter(|action| **action != cooldown_core::EdgeBindingAction::Held)
+        .filter(|action| action.is_applied())
         .map(|action| Value::String(action.wire_value().to_string()))
         .collect();
-    let reasoned_edge_actions = [
-        cooldown_core::EdgeBindingAction::Held,
-        cooldown_core::EdgeBindingAction::Unaddressable,
-    ]
-    .map(|action| Value::String(action.wire_value().to_string()));
+    let reasoned_edge_actions = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| action.requires_detail())
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect::<Vec<_>>();
+    let recovery_statuses: Vec<Value> = crate::model::RecoveryStatus::ALL
+        .iter()
+        .map(|status| Value::String(status.wire_value().to_string()))
+        .collect();
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -410,7 +414,7 @@ pub fn json_schema() -> Value {
             "properties": {
                 "tool": { "type": "string" },
                 "project": { "type": "string" },
-                "status": { "enum": ["recovered", "unchanged", "error"] }
+                "status": { "enum": recovery_statuses }
             },
             "additionalProperties": false
         }
@@ -586,8 +590,8 @@ mod tests {
         BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
         CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
         ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
-        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoverySummary, SkippedInfo, UpgradeEdgeInfo,
-        UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus, RecoverySummary, SkippedInfo,
+        UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
     use cooldown_core::{
         Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
@@ -631,7 +635,10 @@ mod tests {
         let applied = conditions[1]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
             .expect("applied edge actions");
-        assert!(!applied.contains(&Value::String("held".to_string())));
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = applied.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(listed, action.is_applied());
+        }
         assert_eq!(
             conditions[1]["then"]["properties"]["applied"]["const"],
             true
@@ -662,14 +669,7 @@ mod tests {
         );
         for action in cooldown_core::EdgeBindingAction::ALL {
             let listed = reasoned.contains(&Value::String(action.wire_value().to_string()));
-            assert_eq!(
-                listed,
-                matches!(
-                    action,
-                    cooldown_core::EdgeBindingAction::Held
-                        | cooldown_core::EdgeBindingAction::Unaddressable
-                )
-            );
+            assert_eq!(listed, action.requires_detail());
         }
     }
 
@@ -711,6 +711,19 @@ mod tests {
             SkipReason::ALL.len(),
             "the schema enum must not carry stale extra values either"
         );
+    }
+
+    #[test]
+    fn recovery_status_schema_accepts_every_typed_variant() -> color_eyre::Result<()> {
+        let schema = json_schema();
+        let allowed = schema["$defs"]["recoveryItem"]["properties"]["status"]["enum"]
+            .as_array()
+            .ok_or_else(|| color_eyre::eyre::eyre!("recovery status enum is not an array"))?;
+        for status in RecoveryStatus::ALL {
+            assert!(allowed.contains(&Value::String(status.wire_value().to_string())));
+        }
+        assert_eq!(allowed.len(), RecoveryStatus::ALL.len());
+        Ok(())
     }
 
     fn assert_definition_keys_match(schema: &Value) {
@@ -911,7 +924,7 @@ mod tests {
         RecoveryItem {
             tool: "cargo".to_string(),
             project: ".".to_string(),
-            status: "recovered".to_string(),
+            status: RecoveryStatus::Recovered,
         }
     }
 

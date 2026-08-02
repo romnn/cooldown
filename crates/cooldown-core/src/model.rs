@@ -661,6 +661,29 @@ macro_rules! edge_binding_actions {
                     $( EdgeBindingAction::$variant => $wire, )+
                 }
             }
+
+            /// Whether a row with this action describes state committed to the project.
+            #[must_use]
+            pub const fn is_applied(self) -> bool {
+                match self {
+                    EdgeBindingAction::Restored
+                    | EdgeBindingAction::Canonicalized
+                    | EdgeBindingAction::Rebound
+                    | EdgeBindingAction::Unaddressable => true,
+                    EdgeBindingAction::Held => false,
+                }
+            }
+
+            /// Whether a row with this action must explain its policy limitation.
+            #[must_use]
+            pub const fn requires_detail(self) -> bool {
+                match self {
+                    EdgeBindingAction::Held | EdgeBindingAction::Unaddressable => true,
+                    EdgeBindingAction::Restored
+                    | EdgeBindingAction::Canonicalized
+                    | EdgeBindingAction::Rebound => false,
+                }
+            }
         }
     };
 }
@@ -706,8 +729,38 @@ pub struct EdgeRebind {
     pub to: Version,
     /// What the policy did (or observed) about the rebind.
     pub action: EdgeBindingAction,
-    /// Why a correction was withheld or could not be addressed; `None` otherwise.
+    /// Source-transition or policy-limitation context.
+    /// Required for [`Held`](EdgeBindingAction::Held) and
+    /// [`Unaddressable`](EdgeBindingAction::Unaddressable); observed source moves may also carry it.
     pub detail: Option<String>,
+}
+
+impl EdgeRebind {
+    /// Validates the action-specific invariants required by the report contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Serialization`](crate::CoreError::Serialization) when a required detail
+    /// is absent or any provided detail is empty.
+    pub fn validate(&self) -> crate::Result<()> {
+        let detail = self
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty());
+        if self.detail.is_some() && detail.is_none() {
+            return Err(crate::CoreError::Serialization(format!(
+                "edge action `{}` has an empty detail",
+                self.action.wire_value()
+            )));
+        }
+        if self.action.requires_detail() && detail.is_none() {
+            return Err(crate::CoreError::Serialization(format!(
+                "edge action `{}` requires a detail",
+                self.action.wire_value()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// A resolved package version already rejected by the active policy before an apply trial begins.
@@ -1065,5 +1118,49 @@ mod tests {
                 "ALL must list every wire token once"
             );
         }
+    }
+
+    #[test]
+    fn edge_binding_action_report_invariants_are_exhaustive() {
+        use super::EdgeBindingAction;
+
+        for action in EdgeBindingAction::ALL {
+            assert_eq!(
+                action.is_applied(),
+                !matches!(action, EdgeBindingAction::Held)
+            );
+            assert_eq!(
+                action.requires_detail(),
+                matches!(
+                    action,
+                    EdgeBindingAction::Held | EdgeBindingAction::Unaddressable
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn edge_rebind_validation_requires_non_empty_policy_reasons() {
+        use super::{EdgeBindingAction, EdgeRebind, PackageId, ToolId, Version};
+
+        let mut rebind = EdgeRebind {
+            dependent: "consumer".to_string(),
+            dependent_version: Version::new("1.0.0"),
+            dependent_source: None,
+            dependency: PackageId::new(ToolId("cargo"), "dependency", None),
+            from: Version::new("1.0.0"),
+            to: Version::new("2.0.0"),
+            action: EdgeBindingAction::Held,
+            detail: None,
+        };
+
+        assert!(rebind.validate().is_err());
+        rebind.detail = Some("   ".to_string());
+        assert!(rebind.validate().is_err());
+        rebind.detail = Some("candidate would orphan a lock block".to_string());
+        assert!(rebind.validate().is_ok());
+        rebind.action = EdgeBindingAction::Rebound;
+        rebind.detail = None;
+        assert!(rebind.validate().is_ok());
     }
 }

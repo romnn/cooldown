@@ -15,6 +15,7 @@ use cooldown::app::{
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -67,6 +68,8 @@ struct State {
     fresh_transitive_present: bool,
     /// Whether `apply` has already mutated the project once.
     apply_attempted: bool,
+    /// Direct manifest constraints that have no resolved graph entry.
+    manifest_constraints: Vec<Dependency>,
     /// Package versions pinned by a successful fake apply, surfaced by the next graph probe.
     applied_versions: HashMap<String, Version>,
     /// Release metadata failure armed only after the forward batch reaches the fake lock.
@@ -77,6 +80,8 @@ struct State {
     require_recovery_before_read: bool,
     /// Whether the mutation lifecycle hook has run for this project.
     recovery_completed: bool,
+    /// Simulate an independent lock edit immediately before a graph-probe failure.
+    drift_lock_before_graph_failure: bool,
 }
 
 #[allow(
@@ -151,7 +156,7 @@ impl ToolRead for FakeEco {
             workspace_root: true,
         }
     }
-    async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+    async fn dependencies(&self, p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
         if state.require_recovery_before_read && !state.recovery_completed {
             return Err(CoreError::System(
@@ -159,6 +164,9 @@ impl ToolRead for FakeEco {
             ));
         }
         if scope == DepScope::Graph && self.fail_graph_after_apply && state.apply_attempted {
+            if state.drift_lock_before_graph_failure {
+                std::fs::write(p.root.join("fake.lock"), b"external edit")?;
+            }
             return Err(CoreError::Transient("post-apply graph probe failed".into()));
         }
         let mut out = apply_versions(self.direct.clone(), &state.applied_versions);
@@ -176,6 +184,16 @@ impl ToolRead for FakeEco {
             }
         }
         Ok(out)
+    }
+    async fn manifest_constraints(&self, _p: &Project) -> Result<Vec<Dependency>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CoreError::System("fake state mutex poisoned".to_string()))?;
+        Ok(apply_versions(
+            state.manifest_constraints.clone(),
+            &state.applied_versions,
+        ))
     }
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
@@ -305,6 +323,19 @@ impl ToolWrite for FakeEco {
     ) -> Result<ApplyReport> {
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
+        let recorder = p.root.join("record-apply-batches");
+        if recorder.exists() {
+            let mut recorder = std::fs::OpenOptions::new().append(true).open(recorder)?;
+            writeln!(
+                recorder,
+                "{}",
+                plan.changes
+                    .iter()
+                    .map(|change| change.package.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?;
+        }
         if state.write_lock_on_apply {
             std::fs::write(p.root.join("fake.lock"), b"mutated lock")?;
         }
@@ -576,6 +607,79 @@ async fn dry_run_refuses_pending_source_state_without_recovering_it() {
 
     assert_eq!(outcome.errors.len(), 1);
     assert!(outcome.items.is_empty());
+}
+
+#[tokio::test]
+async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("fake.lock"), b"original lock")?;
+    std::fs::write(root.join("record-apply-batches"), b"")?;
+    let runtime = dep("runtime", "1.0.0", true);
+    let build_tool = dep("build-tool", "1.0.0", true);
+    let mut adapter = fake(
+        root.clone(),
+        vec![runtime],
+        Vec::new(),
+        HashMap::from([
+            (
+                "runtime".to_string(),
+                vec![
+                    rel("1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+                    rel(
+                        "1.1.0",
+                        2,
+                        Some("2025-02-01T00:00:00Z"),
+                        Some(UpdateKind::Minor),
+                    ),
+                ],
+            ),
+            (
+                "build-tool".to_string(),
+                vec![
+                    rel("1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+                    rel(
+                        "1.1.0",
+                        2,
+                        Some("2025-02-01T00:00:00Z"),
+                        Some(UpdateKind::Minor),
+                    ),
+                ],
+            ),
+        ]),
+        HashMap::from([
+            (
+                "runtime".to_string(),
+                rel("1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+            ),
+            (
+                "build-tool".to_string(),
+                rel("1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+            ),
+        ]),
+    );
+    adapter.fail_graph_after_apply = true;
+    // The manifest-only batch mutates first, then a simulated editor changes its lock before the
+    // failing graph probe asks cooldown to roll the batch back.
+    let state = adapter
+        .state
+        .get_mut()
+        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?;
+    state.manifest_constraints = vec![build_tool];
+    state.drift_lock_before_graph_failure = true;
+    state.write_lock_on_apply = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&opts())
+        .await;
+
+    // The editor's bytes survive and the later runtime lock batch never reaches the adapter.
+    assert!(!outcome.errors.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(root.join("record-apply-batches"))?,
+        "build-tool\n"
+    );
+    assert_eq!(std::fs::read(root.join("fake.lock"))?, b"external edit");
+    Ok(())
 }
 
 fn too_fresh_fix_releases() -> Vec<Release> {
@@ -1633,6 +1737,18 @@ fn incomplete_edge_fake(root: Utf8PathBuf, action: EdgeBindingAction) -> FakeEco
     rebind.detail =
         Some("rebinding away from uuid v0.8.2 would orphan its last lock reference".to_string());
     edge_reporting_fake(root, vec![rebind])
+}
+
+#[tokio::test]
+async fn invalid_edge_outcomes_fail_at_the_apply_boundary() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let fake = edge_reporting_fake(root, vec![diesel_rebind(None, EdgeBindingAction::Held)]);
+
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.errors, 1);
+    assert!(out.items.iter().all(|item| item.edge.is_none()));
 }
 
 #[tokio::test]
@@ -3035,7 +3151,7 @@ async fn upgrade_reports_final_lock_and_build_failures() {
 }
 
 #[tokio::test]
-async fn explain_traces_the_default_window() {
+async fn explain_traces_the_default_window() -> color_eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
@@ -3055,17 +3171,42 @@ async fn explain_traces_the_default_window() {
         root,
     };
     let ws = workspace(fake, Baseline::default());
-    let out = ws.explain("a", &opts()).await;
+    let out = ws.explain("a", &opts()).await?;
     assert_eq!(out.exit, Exit::Ok);
     assert!((out.meta.effective.min_age_days - 7.0).abs() < 1e-9);
     assert_eq!(out.meta.effective.decided_by, "default");
     assert!(out.steps.iter().any(|s| s.applied && s.field == "default"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_refuses_pending_mutation_state() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut adapter = fake(
+        root,
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    adapter
+        .state
+        .get_mut()
+        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?
+        .require_recovery_before_read = true;
+
+    let result = workspace(adapter, Baseline::default())
+        .explain("a", &opts())
+        .await;
+
+    assert!(matches!(result, Err(CoreError::StaleLock(_))));
+    Ok(())
 }
 
 /// `explain` resolves the package's registry from the dependency graph, so a `[registry."…"]`
 /// rule is applied (it would be silently skipped if explain resolved with no registry).
 #[tokio::test]
-async fn explain_applies_registry_scoped_rule() {
+async fn explain_applies_registry_scoped_rule() -> color_eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)], // dep `a` is published from registry "proxy.example"
@@ -3115,7 +3256,7 @@ async fn explain_applies_registry_scoped_rule() {
         Vec::new(),
     );
 
-    let out = ws.explain("a", &opts()).await;
+    let out = ws.explain("a", &opts()).await?;
     assert_eq!(out.exit, Exit::Ok);
     // The resolved registry is surfaced and the registry rule (30d) beats the 7d default.
     assert_eq!(out.meta.registry.as_deref(), Some("proxy.example"));
@@ -3129,6 +3270,7 @@ async fn explain_applies_registry_scoped_rule() {
             .iter()
             .any(|s| s.applied && s.selector.as_deref() == Some("registry=proxy.example"))
     );
+    Ok(())
 }
 
 /// A minimal repo-scoped fake tool used to assert `sync`'s `SyncScope::Repo` dispatch: it counts

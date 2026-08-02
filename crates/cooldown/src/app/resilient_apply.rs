@@ -7,22 +7,45 @@
 //! Reporting that as "every candidate is held" is wrong: one bad candidate would block every other.
 //!
 //! [`apply_resilient_with_observer`] wraps `apply` so that, on such a failure, it isolates the
-//! offending candidates by **delta-debugging partitioning** (the ddmin idea) and applies the maximal
-//! satisfiable subset, reporting only the genuine culprits as held. The oracle is the tool's own
-//! `apply` (async, and it mutates the project), so each trial restores the caller-provided journal
-//! first; a generic binary-search/delta-debugging crate cannot drive that side-effecting async
-//! oracle, so the small partitioning loop lives here. The happy path — the whole set resolves — is a
-//! single `apply` with no extra cost, and the per-package managers (npm/yarn/bun), which never fail
-//! atomically, always take it.
+//! offending candidates by **delta-debugging partitioning** (the ddmin idea) and applies a
+//! deterministic satisfiable subset, reporting the candidates this bounded search rejects as held.
+//! The oracle is the tool's own `apply` (async, and it mutates the project), so each trial restores
+//! the caller-provided journal first; a generic binary-search/delta-debugging crate cannot drive that
+//! side-effecting async oracle, so the small partitioning loop lives here.
+//! The happy path — the whole set resolves — is a single `apply` with no extra cost, and the
+//! per-package managers (npm/yarn/bun), which never fail atomically, always take it.
 
 use std::collections::HashSet;
 
+#[cfg(test)]
+use cooldown_core::Result;
 use cooldown_core::{
     ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal,
-    ProjectMutationState, Result, SkipReason, Skipped, ToolWrite,
+    ProjectMutationState, SkipReason, Skipped, ToolWrite,
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
+
+#[derive(Debug)]
+pub(crate) enum ApplyFailure {
+    /// The native apply failed after its observed state was restored successfully.
+    Failed(cooldown_core::CoreError),
+    /// The native apply may have mutated the project, but its state could not be observed or
+    /// restored safely.
+    /// No later mutation may run.
+    RestoreConflict(cooldown_core::CoreError),
+}
+
+impl ApplyFailure {
+    #[cfg(test)]
+    fn into_core_error(self) -> cooldown_core::CoreError {
+        match self {
+            ApplyFailure::Failed(error) | ApplyFailure::RestoreConflict(error) => error,
+        }
+    }
+}
+
+type ApplyResult<T> = std::result::Result<T, ApplyFailure>;
 
 #[cfg(test)]
 async fn apply_resilient(
@@ -34,9 +57,10 @@ async fn apply_resilient(
     apply_resilient_with_observer(writer, project, plan, journal, &())
         .await
         .map(|mutation| mutation.report)
+        .map_err(ApplyFailure::into_core_error)
 }
 
-/// A successful apply and the exact project state it left for later verification.
+/// A successful apply and the project state observed immediately afterwards for later drift checks.
 pub(crate) struct AppliedMutation {
     pub(crate) report: ApplyReport,
     pub(crate) expected: ProjectMutationState,
@@ -58,11 +82,19 @@ pub(crate) async fn apply_resilient_with_observer(
     plan: &Plan,
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
-) -> Result<AppliedMutation> {
-    let first = writer
+) -> ApplyResult<AppliedMutation> {
+    let first = match writer
         .apply_with_observer(project, plan, journal, observer)
-        .await;
-    let first_state = journal.capture_state(&project.root)?;
+        .await
+    {
+        Err(error) if is_mutation_state_conflict(&error) => {
+            return Err(ApplyFailure::RestoreConflict(error));
+        }
+        result => result,
+    };
+    let first_state = journal
+        .capture_state(&project.root)
+        .map_err(ApplyFailure::RestoreConflict)?;
     match first {
         Ok(report) => {
             return Ok(AppliedMutation {
@@ -74,41 +106,57 @@ pub(crate) async fn apply_resilient_with_observer(
         // unreadable lock) is not a per-candidate conflict — propagate it rather than bisecting the
         // plan and misreporting every candidate as held.
         Err(error) if error.is_local_environment_failure() => {
-            journal.restore_if_unchanged(&project.root, &first_state)?;
-            return Err(error);
+            journal
+                .restore_if_unchanged(&project.root, &first_state)
+                .map_err(ApplyFailure::RestoreConflict)?;
+            return Err(ApplyFailure::Failed(error));
         }
         // The set is unsatisfiable as a whole. Fall through to isolate the culprits and apply the rest.
         Err(_) => {}
     }
 
     let (accepted, trial_state) =
-        maximal_satisfiable_subset(writer, project, plan, journal, first_state, observer).await?;
+        verified_satisfiable_subset(writer, project, plan, journal, first_state, observer).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
     let accepted_keys: HashSet<ChangeTargetKey> = accepted.iter().map(change_target_key).collect();
 
     // Commit exactly the accepted subset (restore first so the failed full-set attempt leaves nothing).
-    journal.restore_if_unchanged(&project.root, &trial_state)?;
+    journal
+        .restore_if_unchanged(&project.root, &trial_state)
+        .map_err(ApplyFailure::RestoreConflict)?;
     let (mut report, expected) = if accepted.is_empty() {
         (
             ApplyReport::default(),
-            journal.capture_state(&project.root)?,
+            journal
+                .capture_state(&project.root)
+                .map_err(ApplyFailure::RestoreConflict)?,
         )
     } else {
         let committed = Plan {
             changes: accepted,
             ..plan.clone()
         };
-        let result = writer
+        let result = match writer
             .apply_with_observer(project, &committed, journal, observer)
-            .await;
-        let expected = journal.capture_state(&project.root)?;
+            .await
+        {
+            Err(error) if is_mutation_state_conflict(&error) => {
+                return Err(ApplyFailure::RestoreConflict(error));
+            }
+            result => result,
+        };
+        let expected = journal
+            .capture_state(&project.root)
+            .map_err(ApplyFailure::RestoreConflict)?;
         match result {
             Ok(report) => (report, expected),
             Err(error) => {
-                journal.restore_if_unchanged(&project.root, &expected)?;
-                return Err(error);
+                journal
+                    .restore_if_unchanged(&project.root, &expected)
+                    .map_err(ApplyFailure::RestoreConflict)?;
+                return Err(ApplyFailure::Failed(error));
             }
         }
     };
@@ -123,44 +171,57 @@ pub(crate) async fn apply_resilient_with_observer(
     Ok(AppliedMutation { report, expected })
 }
 
-/// The largest subset of `changes` that `apply` can resolve together, found by delta-debugging
-/// partitioning.
+/// A deterministic subset of `changes` that `apply` can resolve together, found by
+/// delta-debugging partitioning.
 ///
 /// `accepted` is grown from the empty set and always stays satisfiable. A work-list of candidate
 /// groups is seeded with the two halves of the full set (the full set is already known to fail, so
 /// testing it again is skipped). For each group, `accepted + group` is trialled: if it resolves, the
 /// group folds into `accepted`; a singleton group that still fails is an irreducible culprit and is
-/// dropped; a larger failing group is split in half and re-queued. This isolates per-candidate culprits
-/// in O(log n) trials and resolves conflicts-with-accepted by dropping the conflicting side.
-async fn maximal_satisfiable_subset(
+/// dropped; a larger failing group is split in half and re-queued.
+/// The partition search is bounded by its tree of groups, but it does not establish that no larger
+/// non-contiguous subset would pass.
+async fn verified_satisfiable_subset(
     writer: &dyn ToolWrite,
     project: &Project,
     plan: &Plan,
     journal: &ProjectMutationJournal,
     mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
-) -> Result<(Vec<Change>, ProjectMutationState)> {
+) -> ApplyResult<(Vec<Change>, ProjectMutationState)> {
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
     push_halves(&mut work, plan.changes.clone());
 
     while let Some(group) = work.pop() {
-        journal.restore_if_unchanged(&project.root, &current_state)?;
+        journal
+            .restore_if_unchanged(&project.root, &current_state)
+            .map_err(ApplyFailure::RestoreConflict)?;
         let trial = Plan {
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
             ..plan.clone()
         };
-        let result = writer
+        let result = match writer
             .apply_with_observer(project, &trial, journal, observer)
-            .await;
-        current_state = journal.capture_state(&project.root)?;
+            .await
+        {
+            Err(error) if is_mutation_state_conflict(&error) => {
+                return Err(ApplyFailure::RestoreConflict(error));
+            }
+            result => result,
+        };
+        current_state = journal
+            .capture_state(&project.root)
+            .map_err(ApplyFailure::RestoreConflict)?;
         match result {
             Ok(_) => accepted.extend(group),
             // A broken local environment surfacing mid-recovery must propagate, not be charged to
             // whichever candidates happen to be in this trial group.
             Err(error) if error.is_local_environment_failure() => {
-                journal.restore_if_unchanged(&project.root, &current_state)?;
-                return Err(error);
+                journal
+                    .restore_if_unchanged(&project.root, &current_state)
+                    .map_err(ApplyFailure::RestoreConflict)?;
+                return Err(ApplyFailure::Failed(error));
             }
             // The group cannot join `accepted`: split it, or drop it if it is a single culprit.
             Err(_) if group.len() > 1 => push_halves(&mut work, group),
@@ -168,6 +229,13 @@ async fn maximal_satisfiable_subset(
         }
     }
     Ok((accepted, current_state))
+}
+
+fn is_mutation_state_conflict(error: &cooldown_core::CoreError) -> bool {
+    matches!(
+        error,
+        cooldown_core::CoreError::LockConflict(_) | cooldown_core::CoreError::LockUnreadable(_)
+    )
 }
 
 /// Split `group` in two and push the halves so the left half is processed first (LIFO work-list).

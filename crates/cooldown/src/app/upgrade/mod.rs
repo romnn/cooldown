@@ -65,6 +65,7 @@ pub(super) struct UpgradeCtx<'a> {
     pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
+    repo_root: &'a camino::Utf8Path,
     access: ProjectExecution,
 }
 
@@ -80,6 +81,7 @@ impl<'a> UpgradeCtx<'a> {
         writer: &'a dyn ToolWrite,
         pctx: &'a super::ProjectCtx,
         opts: &'a RunOpts,
+        repo_root: &'a camino::Utf8Path,
         access: ProjectExecution,
     ) -> Self {
         UpgradeCtx {
@@ -87,6 +89,7 @@ impl<'a> UpgradeCtx<'a> {
             writer,
             pctx,
             opts,
+            repo_root,
             access,
         }
     }
@@ -95,11 +98,15 @@ impl<'a> UpgradeCtx<'a> {
         self.pctx.tool.as_str()
     }
 
-    fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectWriteGuard>> {
+    fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
         match self.access {
-            ProjectExecution::Source => {
-                super::lock::ProjectWriteGuard::acquire(&self.pctx.project.root).map(Some)
-            }
+            ProjectExecution::Source => super::lock::ProjectAccessWriteGuard::acquire(
+                self.repo_root,
+                &self.pctx.project.root,
+                self.pctx.tool,
+                self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
+            )
+            .map(Some),
             ProjectExecution::Isolated => Ok(None),
         }
     }
@@ -205,7 +212,14 @@ impl Workspace {
             };
             ProjectUpgradeExecutor::new(
                 self,
-                UpgradeCtx::new(reader, writer, effective_pctx, opts, access),
+                UpgradeCtx::new(
+                    reader,
+                    writer,
+                    effective_pctx,
+                    opts,
+                    self.repo_root(),
+                    access,
+                ),
                 mode,
                 &mut acc,
             )
@@ -269,6 +283,7 @@ impl Workspace {
                 writer,
                 &copied_pctx,
                 &preview_opts,
+                self.repo_root(),
                 ProjectExecution::Isolated,
             ),
             PlanMode::Upgrade,

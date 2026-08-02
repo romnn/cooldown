@@ -1,10 +1,36 @@
-//! Filesystem helpers shared across the workspace: crash-safe file writes and stable file-name
-//! hashing. Both exist so trust-bearing state files (the publish-time floor, HTTP cache entries,
-//! the committed baseline) and per-path lock/cache names are produced the same way everywhere.
+//! Filesystem helpers shared across the workspace: atomic file replacement, Unix parent-directory
+//! syncing, and stable file-name hashing.
+//! They keep trust-bearing state transitions and per-path lock/cache names consistent across
+//! crates.
 
 use crate::error::CoreError;
 use std::io::Write;
 use std::path::Path;
+
+/// The commit state of a directory-durable atomic replacement that failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DurableWriteError {
+    /// The public path was not replaced.
+    #[error("the replacement was not committed: {0}")]
+    NotCommitted(CoreError),
+    /// The public path was replaced, but syncing its parent directory failed.
+    #[error("the replacement is visible but its directory durability is uncertain: {0}")]
+    DurabilityUncertain(CoreError),
+}
+
+impl DurableWriteError {
+    /// Converts the commit-aware failure into the workspace error type.
+    #[must_use]
+    pub fn into_core_error(self, path: &Path) -> CoreError {
+        match self {
+            DurableWriteError::NotCommitted(error) => error,
+            DurableWriteError::DurabilityUncertain(error) => CoreError::LockConflict(format!(
+                "{} was replaced, but syncing its parent directory failed; the replacement is visible but power-loss durability is uncertain: {error}",
+                path.display()
+            )),
+        }
+    }
+}
 
 /// Writes `bytes` to `path` atomically: readers observe either the old contents or the new ones,
 /// never a torn file. The bytes go to a `.{name}.{pid}.{attempt}.tmp` sibling first (created with
@@ -17,6 +43,48 @@ use std::path::Path;
 /// [`CoreError::Filesystem`] when no temp file could be created after 100 attempts, or the
 /// underlying I/O error from writing, syncing, or renaming (the temp file is removed on failure).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    write_replacement(path, bytes)
+}
+
+/// Writes `bytes` atomically and, on Unix, syncs the containing directory after replacement.
+///
+/// Callers that maintain a recovery protocol can distinguish a failed replacement from a visible
+/// replacement whose directory entry may not survive power loss.
+///
+/// # Errors
+///
+/// Returns [`DurableWriteError::NotCommitted`] if the public path was not replaced, or
+/// [`DurableWriteError::DurabilityUncertain`] if replacement succeeded but the parent directory
+/// could not be synced.
+pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), DurableWriteError> {
+    #[cfg(unix)]
+    {
+        atomic_write_durable_with(path, bytes, |parent| {
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        write_replacement(path, bytes).map_err(DurableWriteError::NotCommitted)
+    }
+}
+
+#[cfg(unix)]
+fn atomic_write_durable_with<F>(
+    path: &Path,
+    bytes: &[u8],
+    sync_parent: F,
+) -> Result<(), DurableWriteError>
+where
+    F: FnOnce(&Path) -> Result<(), CoreError>,
+{
+    write_replacement(path, bytes).map_err(DurableWriteError::NotCommitted)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    sync_parent(parent).map_err(DurableWriteError::DurabilityUncertain)
+}
+
+fn write_replacement(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -72,6 +140,8 @@ pub fn fnv1a_64(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::atomic_write;
+    #[cfg(unix)]
+    use super::{CoreError, DurableWriteError};
 
     #[test]
     fn atomic_write_writes_exact_bytes_and_leaves_no_temp_file() {
@@ -92,5 +162,27 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_write_reports_a_visible_replacement_when_directory_sync_fails()
+    -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.json");
+        atomic_write(&path, b"first")?;
+
+        let result = super::atomic_write_durable_with(&path, b"second", |_parent| {
+            Err(CoreError::Filesystem(
+                "injected directory sync failure".to_string(),
+            ))
+        });
+
+        assert!(matches!(
+            result,
+            Err(DurableWriteError::DurabilityUncertain(_))
+        ));
+        assert_eq!(std::fs::read(path)?, b"second");
+        Ok(())
     }
 }

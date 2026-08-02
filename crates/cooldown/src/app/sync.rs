@@ -3,7 +3,7 @@
 //! someone runs by hand still respects the window. Tools without a native cooldown concept (Go,
 //! Cargo) report `unsupported`; nothing is written for them.
 
-use super::lock::{ProjectReadGuard, ProjectWriteGuard};
+use super::lock::{ProjectReadGuard, ProjectWriteGuard, RepoToolReadGuard, RepoToolWriteGuard};
 use super::{Exit, RunOpts, Workspace, diag_from_error};
 use camino::Utf8Path;
 use cooldown_core::{
@@ -12,8 +12,38 @@ use cooldown_core::{
 };
 
 enum SyncAccessGuard {
-    Read { _guard: ProjectReadGuard },
-    Write { _guard: ProjectWriteGuard },
+    Read {
+        #[expect(dead_code, reason = "the field keeps the project read lease alive")]
+        guard: ProjectReadGuard,
+    },
+    Write {
+        #[expect(dead_code, reason = "the field keeps the project write lease alive")]
+        guard: ProjectWriteGuard,
+    },
+}
+
+enum RepoSyncResourceGuard {
+    Read {
+        #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
+        guard: RepoToolReadGuard,
+    },
+    Write {
+        #[expect(dead_code, reason = "the field keeps the repository write lease alive")]
+        guard: RepoToolWriteGuard,
+    },
+}
+
+struct RepoSyncAccess {
+    #[expect(
+        dead_code,
+        reason = "the field keeps the repository resource lease alive"
+    )]
+    resource: RepoSyncResourceGuard,
+    #[expect(
+        dead_code,
+        reason = "the field keeps every consumer project lease alive"
+    )]
+    projects: Vec<SyncAccessGuard>,
 }
 
 /// What happened when syncing one project's native config.
@@ -299,14 +329,17 @@ impl Workspace {
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
         };
-        let result = match acquire_repo_sync_access(writer, projects, opts.dry_run).await {
-            Ok(_guards) => {
-                writer
-                    .write_repo_native(self.repo_root(), &policy, opts.dry_run)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let result =
+            match acquire_repo_sync_access(writer, self.repo_root(), tool, projects, opts.dry_run)
+                .await
+            {
+                Ok(_guards) => {
+                    writer
+                        .write_repo_native(self.repo_root(), &policy, opts.dry_run)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
         match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
@@ -344,19 +377,30 @@ async fn acquire_sync_access(
     if dry_run {
         let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
         writer.ensure_no_pending_mutation(&pctx.project).await?;
-        Ok(SyncAccessGuard::Read { _guard: guard })
+        Ok(SyncAccessGuard::Read { guard })
     } else {
         let guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
         writer.recover_pending_mutation(&pctx.project).await?;
-        Ok(SyncAccessGuard::Write { _guard: guard })
+        Ok(SyncAccessGuard::Write { guard })
     }
 }
 
 async fn acquire_repo_sync_access(
     writer: &dyn ToolWrite,
+    repo_root: &Utf8Path,
+    tool: ToolId,
     projects: &[&super::ProjectCtx],
     dry_run: bool,
-) -> cooldown_core::Result<Vec<SyncAccessGuard>> {
+) -> cooldown_core::Result<RepoSyncAccess> {
+    let resource = if dry_run {
+        RepoSyncResourceGuard::Read {
+            guard: RepoToolReadGuard::acquire(repo_root, tool)?,
+        }
+    } else {
+        RepoSyncResourceGuard::Write {
+            guard: RepoToolWriteGuard::acquire(repo_root, tool)?,
+        }
+    };
     let mut projects = projects.to_vec();
     projects.sort_by(|left, right| left.project.root.cmp(&right.project.root));
     projects.dedup_by(|left, right| left.project.root == right.project.root);
@@ -364,7 +408,10 @@ async fn acquire_repo_sync_access(
     for project in projects {
         guards.push(acquire_sync_access(writer, project, dry_run).await?);
     }
-    Ok(guards)
+    Ok(RepoSyncAccess {
+        resource,
+        projects: guards,
+    })
 }
 
 /// The repo root as a repo-relative path: always `.`.

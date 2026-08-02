@@ -5,9 +5,9 @@ use crate::app::{
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, EdgeBindingAction, LockStatus, MajorKey, PackageId, Plan,
-    ProjectMutationJournal, ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason,
-    Skipped, Status, UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
+    DiagnosticKind, LockStatus, MajorKey, PackageId, Plan, ProjectMutationJournal,
+    ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
+    UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -80,9 +80,21 @@ struct BatchOutcome {
     errors: Vec<Diagnostic>,
     strict_incomplete: bool,
     lock_refreshed: bool,
-    /// Present iff the batch's mutation was kept: the lock landed and the post-apply graph
-    /// verification ran. `None` means the journal was restored (or nothing was attempted).
-    committed: Option<CommittedBatch>,
+    mutation: BatchMutation,
+}
+
+/// The physical project state left by one resolver batch.
+#[derive(Default)]
+enum BatchMutation {
+    /// No mutation was attempted or retained.
+    #[default]
+    Unchanged,
+    /// The journal was restored to its pre-batch state.
+    Restored,
+    /// The post-apply graph was verified and retained.
+    Committed(CommittedBatch),
+    /// Independent drift prevented restoration, so no later mutation may run.
+    RestoreConflict,
 }
 
 /// One policy-violating resolved pin — the package and the exact too-fresh version the graph
@@ -158,6 +170,10 @@ impl BatchOutcome {
                 .count()
     }
 
+    fn has_restore_conflict(&self) -> bool {
+        matches!(&self.mutation, BatchMutation::RestoreConflict)
+    }
+
     fn merge_into(self, acc: &mut UpgradeAccum) {
         acc.items.extend(self.items);
         acc.edge_items.extend(self.edge_items);
@@ -219,6 +235,9 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     initial_edge_snapshot: Option<Vec<u8>>,
     /// Correction provenance from committed batches, pending validation against the final lock.
     committed_edge_rebinds: Vec<cooldown_core::EdgeRebind>,
+    /// Independent drift made the physical project state unknown, so no later adapter call may
+    /// mutate it.
+    mutation_blocked: bool,
     /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
@@ -242,6 +261,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             lock_edges_enforced: false,
             initial_edge_snapshot: None,
             committed_edge_rebinds: Vec::new(),
+            mutation_blocked: false,
             manifest_only: HashSet::new(),
         }
     }
@@ -302,6 +322,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         }
 
+        if self.mutation_blocked {
+            return;
+        }
+
         // The final pass reconciles run-level observation with committed correction evidence, so
         // temporary batch limitations and overwritten corrections cannot survive in the report.
         // Adapters without snapshots retain their existing per-batch reporting fallback.
@@ -327,6 +351,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(rebinds) => {
                 for rebind in &rebinds {
+                    if let Err(error) = rebind.validate() {
+                        self.record_project_error(&error, Some(&rebind.dependency.name));
+                        continue;
+                    }
                     let item = self.edge_rebind_item(rebind);
                     self.acc.edge_items.push(item);
                 }
@@ -415,6 +443,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.opts.progress.candidates_decided(&decided);
             Self::advance_trial_state(&outcome, state);
             self.merge_batch_outcome(outcome);
+            if self.mutation_blocked {
+                return;
+            }
         }
         if lock_changes.is_empty() {
             return;
@@ -427,9 +458,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     ///
     /// The fast path is one trial of the complete batch: settled outcomes commit as-is. A policy
     /// residual restores the fixed pre-lock baseline and — for more than one candidate —
-    /// partitions the batch to find the maximal safe subset, which is then replayed jointly from
-    /// that same baseline; only the replay commits. Errors abort recovery and restore the
-    /// baseline: an infrastructure failure must surface as an error, never as a cooldown skip.
+    /// partitions the batch to find a deterministic verified subset, which is then replayed jointly
+    /// from that same baseline; only the replay commits.
+    /// Errors abort recovery and restore the baseline: an infrastructure failure must surface as an
+    /// error, never as a cooldown skip.
     async fn run_lock_upgrades(&mut self, lock_changes: Vec<Change>, state: &mut TrialState) {
         let baseline_before_lock = state.clone();
         self.ctx
@@ -514,9 +546,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    /// Partitions a policy-blocked batch into the maximal safe subset and rejected singletons —
-    /// delta-debugging partitioning over `accepted + group` trials, like `apply_resilient`, with
-    /// the tool's whole pipeline (apply, reconcile, residual gate) as the oracle.
+    /// Partitions a policy-blocked batch into a deterministic verified subset and rejected
+    /// singletons — delta-debugging partitioning over `accepted + group` trials, like
+    /// `apply_resilient`, with the tool's whole pipeline (apply, reconcile, residual gate) as the
+    /// oracle.
     async fn select_safe_upgrade_changes(
         &mut self,
         lock_changes: Vec<Change>,
@@ -650,7 +683,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let upgraded_cleanly =
             lock_outcome.applied_count() > 0 && lock_outcome.errored_count() == 0;
         Self::advance_trial_state(&lock_outcome, state);
-        let lock_committed = lock_outcome.committed.is_some();
+        let lock_committed = matches!(&lock_outcome.mutation, BatchMutation::Committed(_));
         pending.push(lock_outcome);
         if pending.iter().any(|outcome| outcome.errored_count() > 0) {
             return UpgradeTrialResult::Aborted(trial_errors(pending));
@@ -698,11 +731,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// once, via [`advance_trial_state`](Self::advance_trial_state) right after the batch runs, so
     /// merging (which may happen later, after buffering) can never re-apply or clobber it.
     fn merge_batch_outcome(&mut self, outcome: BatchOutcome) {
+        self.mutation_blocked |= outcome.has_restore_conflict();
         self.lock_refreshed_by_apply |= outcome.lock_refreshed;
-        // Only kept batches reach the merge with `committed` intact (rolled-back trials strip it),
-        // so this records exactly "the current lock was produced by a committed apply" — which
-        // enforced the edge policy on its way out.
-        self.lock_edges_enforced |= outcome.committed.is_some();
+        // Only kept batches reach the merge as committed, so this records exactly "the current lock
+        // was produced by a committed apply" — which enforced the edge policy on its way out.
+        self.lock_edges_enforced |= matches!(&outcome.mutation, BatchMutation::Committed(_));
         self.committed_edge_rebinds
             .extend(outcome.edge_rebinds.iter().cloned());
         outcome.merge_into(self.acc);
@@ -718,7 +751,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// outcome, immediately after [`apply_batch`](Self::apply_batch) returns; a rolled-back run
     /// resets the state explicitly instead of un-applying outcomes.
     fn advance_trial_state(outcome: &BatchOutcome, state: &mut TrialState) {
-        if let Some(committed) = &outcome.committed {
+        if let BatchMutation::Committed(committed) = &outcome.mutation {
             state
                 .baseline_violations
                 .clone_from(&committed.violations_after);
@@ -778,6 +811,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
             Err(error) => {
                 outcome.errors.push(self.project_diag(&error, None));
+                outcome.mutation = BatchMutation::RestoreConflict;
                 false
             }
         }
@@ -1292,9 +1326,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .phase(format!("applying {} planned changes", changes.len()));
         self.ctx.opts.progress.policy_pass(&changes);
         let journal = match self
-            .ctx
-            .writer
-            .mutation_journal(&self.ctx.pctx.project, &plan)
+            .prepare_batch_journal(&plan, rollback.as_deref_mut())
             .await
         {
             Ok(journal) => journal,
@@ -1305,14 +1337,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcome;
             }
         };
-        if let Some(rollback) = rollback.as_deref_mut()
-            && let Err(error) = rollback.preserve(&self.ctx.pctx.project.root, &journal)
-        {
-            outcome
-                .errors
-                .push(self.project_diag(&error, Some(&primary)));
-            return outcome;
-        }
 
         // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
         // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
@@ -1326,13 +1350,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         .await
         {
             Ok(mutation) => mutation,
-            Err(error) => {
+            Err(super::super::resilient_apply::ApplyFailure::Failed(error)) => {
+                self.add_change_errors(&mut outcome, &error, &changes);
+                return outcome;
+            }
+            Err(super::super::resilient_apply::ApplyFailure::RestoreConflict(error)) => {
+                outcome.mutation = BatchMutation::RestoreConflict;
                 self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
         };
         let expected = mutation.expected;
         let report = mutation.report;
+        if let Err(error) = validate_edge_rebinds(&report.edge_rebinds) {
+            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+            self.add_change_errors(&mut outcome, &error, &changes);
+            return outcome;
+        }
         if report.applied.is_empty() {
             self.add_batch_skips(&mut outcome, report.skipped);
             self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
@@ -1380,6 +1414,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             rollback.accept(expected);
         }
         outcome
+    }
+
+    async fn prepare_batch_journal(
+        &self,
+        plan: &Plan,
+        rollback: Option<&mut TrialRollback>,
+    ) -> cooldown_core::Result<cooldown_core::ProjectMutationJournal> {
+        let journal = self
+            .ctx
+            .writer
+            .mutation_journal(&self.ctx.pctx.project, plan)
+            .await?;
+        if let Some(rollback) = rollback {
+            rollback.preserve(&self.ctx.pctx.project.root, &journal)?;
+        }
+        Ok(journal)
     }
 
     fn batch_plan(&self, changes: &[Change], state: &TrialState) -> Plan {
@@ -1466,7 +1516,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         committed: CommittedBatch,
     ) {
         outcome.lock_refreshed = self.ctx.writer.successful_apply_proves_lock_current();
-        outcome.committed = Some(committed);
+        outcome.mutation = BatchMutation::Committed(committed);
         for change in changes {
             if applied.contains(&change_target_key(change)) {
                 outcome.items.push(self.change_applied_item(change));
@@ -1652,8 +1702,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         expected: &cooldown_core::ProjectMutationState,
         outcome: &mut BatchOutcome,
     ) {
-        if let Err(error) = journal.restore_if_unchanged(&self.ctx.pctx.project.root, expected) {
-            outcome.errors.push(self.project_diag(&error, None));
+        match journal.restore_if_unchanged(&self.ctx.pctx.project.root, expected) {
+            Ok(()) => outcome.mutation = BatchMutation::Restored,
+            Err(error) => {
+                outcome.errors.push(self.project_diag(&error, None));
+                outcome.mutation = BatchMutation::RestoreConflict;
+            }
         }
     }
 
@@ -1871,7 +1925,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .reader
                 .classify_update_kind(rebind.from.as_str(), rebind.to.as_str())
                 .unwrap_or(UpdateKind::Minor),
-            applied: rebind.action != EdgeBindingAction::Held,
+            applied: rebind.action.is_applied(),
             skipped: None,
             error: None,
             edge: Some(crate::app::UpgradeEdgeInfo {
@@ -1917,6 +1971,9 @@ fn push_upgrade_halves(work: &mut Vec<Vec<Change>>, mut changes: Vec<Change>) {
 fn trial_errors(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
     let mut errors = BatchOutcome::default();
     for outcome in outcomes {
+        if outcome.has_restore_conflict() {
+            errors.mutation = BatchMutation::RestoreConflict;
+        }
         errors.errors.extend(outcome.errors);
         errors.items.extend(
             outcome
@@ -1927,6 +1984,13 @@ fn trial_errors(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
     }
     errors.strict_incomplete = errors.errored_count() > 0;
     errors
+}
+
+fn validate_edge_rebinds(rebinds: &[cooldown_core::EdgeRebind]) -> cooldown_core::Result<()> {
+    for rebind in rebinds {
+        rebind.validate()?;
+    }
+    Ok(())
 }
 
 /// Folds a batch journal into the trial-wide rollback journal, keeping the first snapshot per

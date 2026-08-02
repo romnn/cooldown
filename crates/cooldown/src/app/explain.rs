@@ -34,12 +34,20 @@ struct ExplainService<'a> {
 }
 
 impl Workspace {
-    /// Explain the window for `pkg` in the first in-scope project. If `pkg` is a resolved
-    /// dependency, its registry is looked up from the dependency graph so that registry-scoped
-    /// rules (`[registry."…"]`) participate in the derivation. The lookup is best-effort: a missing
-    /// lock or a tool failure falls back to a registry-less resolution, so `explain` still answers
-    /// for a package that is not (yet) a dependency.
-    pub async fn explain(&self, pkg: &str, opts: &RunOpts) -> ExplainOutcome {
+    /// Explains the window for `pkg` in the first in-scope project.
+    ///
+    /// A resolved dependency's registry participates in registry-scoped rules.
+    /// Missing dependency data falls back to registry-less resolution, but a conflicting project
+    /// access lease or pending mutation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a project-access error when package state cannot be read consistently.
+    pub async fn explain(
+        &self,
+        pkg: &str,
+        opts: &RunOpts,
+    ) -> cooldown_core::Result<ExplainOutcome> {
         ExplainService::new(self, opts).explain(pkg).await
     }
 
@@ -55,13 +63,13 @@ impl<'a> ExplainService<'a> {
         ExplainService { ws, opts }
     }
 
-    async fn explain(&self, pkg: &str) -> ExplainOutcome {
+    async fn explain(&self, pkg: &str) -> cooldown_core::Result<ExplainOutcome> {
         let Some(pctx) = self.ws.scoped_projects(self.opts).next() else {
-            return ExplainOutcome {
+            return Ok(ExplainOutcome {
                 meta: empty_meta(),
                 steps: Vec::new(),
                 exit: Exit::NoTool,
-            };
+            });
         };
 
         let _progress = self
@@ -71,7 +79,7 @@ impl<'a> ExplainService<'a> {
         self.opts
             .progress
             .phase(format!("resolving dependency context for {pkg}"));
-        let registry = self.registry_of(pctx, pkg).await;
+        let registry = self.registry_of(pctx, pkg).await?;
         let q = ResolveQuery {
             tool: pctx.tool,
             package: pkg,
@@ -106,11 +114,11 @@ impl<'a> ExplainService<'a> {
             },
         };
 
-        ExplainOutcome {
+        Ok(ExplainOutcome {
             meta,
             steps,
             exit: Exit::Ok,
-        }
+        })
     }
 
     fn config(&self) -> ConfigOutcome {
@@ -156,21 +164,30 @@ impl<'a> ExplainService<'a> {
         }
     }
 
-    /// The registry a package resolves to within a project, if it is a known dependency. Reads the
-    /// resolved graph (which may invoke the toolchain but never the registry network); any error or
-    /// a no-match yields `None` so callers degrade to a registry-less resolution.
-    async fn registry_of(&self, pctx: &ProjectCtx, pkg: &str) -> Option<String> {
-        let adapter = self.ws.adapter(pctx.tool)?;
-        let _guard = self.ws.project_read_guard(pctx).await.ok()?;
+    /// The registry a package resolves to within a project, if it is a known dependency.
+    async fn registry_of(
+        &self,
+        pctx: &ProjectCtx,
+        pkg: &str,
+    ) -> cooldown_core::Result<Option<String>> {
+        let Some(adapter) = self.ws.adapter(pctx.tool) else {
+            return Ok(None);
+        };
+        let _guard = self.ws.project_read_guard(pctx).await?;
         // The raw graph on purpose: this finds one package's registry by name (never displayed and
         // not list output), so `exclude`/`-p` scoping is irrelevant and would only hide the target.
-        let deps = adapter
-            .dependencies(&pctx.project, DepScope::Graph)
-            .await
-            .ok()?;
-        deps.into_iter()
+        let deps = match adapter.dependencies(&pctx.project, DepScope::Graph).await {
+            Ok(deps) => deps,
+            Err(
+                error @ (cooldown_core::CoreError::StaleLock(_)
+                | cooldown_core::CoreError::LockConflict(_)),
+            ) => return Err(error),
+            Err(_) => return Ok(None),
+        };
+        Ok(deps
+            .into_iter()
             .find(|dep| dep.package.name == pkg)
-            .and_then(|dep| dep.package.registry)
+            .and_then(|dep| dep.package.registry))
     }
 }
 

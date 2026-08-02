@@ -1,6 +1,7 @@
 //! Owns restart-visible and live state transitions for speculative `Cargo.lock` corrections.
 
 use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_core::fs::DurableWriteError;
 use cooldown_core::{CoreError, Project, Result};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -42,6 +43,40 @@ struct RecoveryState {
     candidate_digest: String,
 }
 
+#[derive(Debug)]
+enum PublicationError {
+    NotPublished(CoreError),
+    DurabilityUncertain(CoreError),
+}
+
+#[derive(Debug)]
+enum RemovalError {
+    NotRemoved(CoreError),
+    DurabilityUncertain(CoreError),
+}
+
+impl PublicationError {
+    fn into_core_error(self, path: &Utf8Path) -> CoreError {
+        match self {
+            PublicationError::NotPublished(error) => error,
+            PublicationError::DurabilityUncertain(error) => CoreError::LockConflict(format!(
+                "published recovery state at {path}, but syncing its directory failed; recovery evidence was left intact: {error}"
+            )),
+        }
+    }
+}
+
+impl RemovalError {
+    fn into_core_error(self, path: &Utf8Path) -> CoreError {
+        match self {
+            RemovalError::NotRemoved(error) => error,
+            RemovalError::DurabilityUncertain(error) => CoreError::LockConflict(format!(
+                "removed recovery state at {path}, but syncing its directory failed; remaining recovery evidence was left intact: {error}"
+            )),
+        }
+    }
+}
+
 impl SpeculativeLockTransaction {
     /// Starts a transaction with `candidate_lock` installed as its staged state.
     pub(super) fn begin(
@@ -55,7 +90,7 @@ impl SpeculativeLockTransaction {
             lock_path,
             original_lock,
             candidate_lock,
-            cooldown_core::fs::atomic_write,
+            durable_write,
         )
     }
 
@@ -92,10 +127,24 @@ impl SpeculativeLockTransaction {
             original_lock: original_lock.to_string(),
         };
         let state = RecoveryState::new(original_lock, candidate_lock)?;
-        publish_exclusive_json(&state_path, &state)?;
+        publish_exclusive_json(&state_path, &state)
+            .map_err(|error| error.into_core_error(&state_path))?;
         if let Err(error) = publish_exclusive_json(&recovery_path, &record) {
-            let _ = remove_file(&state_path);
-            return Err(error);
+            return match error {
+                PublicationError::NotPublished(error) => {
+                    if let Err(cleanup_error) = remove_file(&state_path) {
+                        tracing::warn!(
+                            path = %state_path,
+                            error = %cleanup_error,
+                            "could not remove unpublished Cargo.lock recovery state"
+                        );
+                    }
+                    Err(error)
+                }
+                uncertain @ PublicationError::DurabilityUncertain(_) => {
+                    Err(uncertain.into_core_error(&recovery_path))
+                }
+            };
         }
 
         let mut transaction = SpeculativeLockTransaction {
@@ -141,8 +190,15 @@ impl SpeculativeLockTransaction {
         let state = RecoveryState::new(&self.current_lock, candidate_lock)?;
         let contents = serde_json::to_vec(&state)
             .map_err(|error| CoreError::Serialization(error.to_string()))?;
-        cooldown_core::fs::atomic_write(self.state_path.as_std_path(), &contents)?;
-        self.state = state;
+        match cooldown_core::fs::atomic_write_durable(self.state_path.as_std_path(), &contents) {
+            Ok(()) => self.state = state,
+            Err(DurableWriteError::NotCommitted(error)) => return Err(error),
+            Err(DurableWriteError::DurabilityUncertain(error)) => {
+                self.state = state;
+                return Err(DurableWriteError::DurabilityUncertain(error)
+                    .into_core_error(self.state_path.as_std_path()));
+            }
+        }
         ensure_lock_equals(
             &self.lock_path,
             &self.current_lock,
@@ -150,13 +206,20 @@ impl SpeculativeLockTransaction {
             Some(&self.recovery_path),
         )?;
         self.staged_lock = Some(candidate_lock.to_string());
-        if let Err(error) =
-            cooldown_core::fs::atomic_write(self.lock_path.as_std_path(), candidate_lock.as_bytes())
-        {
-            if lock_equals(&self.lock_path, &self.current_lock)? {
-                self.staged_lock = None;
+        match cooldown_core::fs::atomic_write_durable(
+            self.lock_path.as_std_path(),
+            candidate_lock.as_bytes(),
+        ) {
+            Ok(()) => {}
+            Err(DurableWriteError::NotCommitted(error)) => {
+                if lock_equals(&self.lock_path, &self.current_lock)? {
+                    self.staged_lock = None;
+                }
+                return Err(error);
             }
-            return Err(error);
+            Err(error @ DurableWriteError::DurabilityUncertain(_)) => {
+                return Err(error.into_core_error(self.lock_path.as_std_path()));
+            }
         }
         Ok(())
     }
@@ -188,10 +251,17 @@ impl SpeculativeLockTransaction {
             "rejecting an unverified correction",
             Some(&self.recovery_path),
         )?;
-        cooldown_core::fs::atomic_write(
+        match cooldown_core::fs::atomic_write_durable(
             self.lock_path.as_std_path(),
             self.current_lock.as_bytes(),
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(DurableWriteError::NotCommitted(error)) => return Err(error),
+            Err(error @ DurableWriteError::DurabilityUncertain(_)) => {
+                self.staged_lock = None;
+                return Err(error.into_core_error(self.lock_path.as_std_path()));
+            }
+        }
         ensure_lock_equals(
             &self.lock_path,
             &self.current_lock,
@@ -231,10 +301,7 @@ impl SpeculativeLockTransaction {
             Some(&self.recovery_path),
         )?;
         if expected != self.original_lock {
-            cooldown_core::fs::atomic_write(
-                self.lock_path.as_std_path(),
-                self.original_lock.as_bytes(),
-            )?;
+            durable_write(self.lock_path.as_std_path(), self.original_lock.as_bytes())?;
         }
         ensure_lock_equals(
             &self.lock_path,
@@ -334,7 +401,7 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
         )));
     }
     if current != record.original_lock {
-        cooldown_core::fs::atomic_write(lock_path.as_std_path(), record.original_lock.as_bytes())?;
+        durable_write(lock_path.as_std_path(), record.original_lock.as_bytes())?;
     }
     ensure_lock_equals(
         &lock_path,
@@ -450,24 +517,59 @@ fn path_exists(path: &Utf8Path) -> Result<bool> {
     }
 }
 
-fn publish_exclusive_json<T: serde::Serialize>(path: &Utf8Path, value: &T) -> Result<()> {
-    let contents =
-        serde_json::to_vec(value).map_err(|error| CoreError::Serialization(error.to_string()))?;
-    let temp = create_synced_private_file(path, &contents)?;
+fn publish_exclusive_json<T: serde::Serialize>(
+    path: &Utf8Path,
+    value: &T,
+) -> std::result::Result<(), PublicationError> {
+    #[cfg(unix)]
+    let sync_parent = sync_parent_directory;
+    #[cfg(not(unix))]
+    let sync_parent = |_path: &Utf8Path| Ok(());
+    publish_exclusive_json_with(path, value, sync_parent, remove_file)
+}
+
+fn publish_exclusive_json_with<T, S, C>(
+    path: &Utf8Path,
+    value: &T,
+    sync_parent: S,
+    cleanup_private: C,
+) -> std::result::Result<(), PublicationError>
+where
+    T: serde::Serialize,
+    S: FnOnce(&Utf8Path) -> Result<()>,
+    C: FnOnce(&Utf8Path) -> Result<()>,
+{
+    let contents = serde_json::to_vec(value).map_err(|error| {
+        PublicationError::NotPublished(CoreError::Serialization(error.to_string()))
+    })?;
+    let temp =
+        create_synced_private_file(path, &contents).map_err(PublicationError::NotPublished)?;
     if let Err(error) = std::fs::hard_link(&temp, path) {
         let _ = std::fs::remove_file(&temp);
-        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-            CoreError::LockConflict(format!(
-                "pending Cargo.lock transaction state already exists at {path}"
-            ))
-        } else {
-            error.into()
-        });
+        return Err(PublicationError::NotPublished(
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                CoreError::LockConflict(format!(
+                    "pending Cargo.lock transaction state already exists at {path}"
+                ))
+            } else {
+                error.into()
+            },
+        ));
     }
-    #[cfg(unix)]
-    sync_parent_directory(path)?;
-    remove_file(&temp)?;
+    sync_parent(path).map_err(PublicationError::DurabilityUncertain)?;
+    if let Err(error) = cleanup_private(&temp) {
+        tracing::warn!(
+            path = %temp,
+            error = %error,
+            "could not remove private Cargo.lock recovery publication file"
+        );
+    }
     Ok(())
+}
+
+fn durable_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    cooldown_core::fs::atomic_write_durable(path, bytes)
+        .map_err(|error| error.into_core_error(path))
 }
 
 fn create_synced_private_file(path: &Utf8Path, contents: &[u8]) -> Result<Utf8PathBuf> {
@@ -545,14 +647,21 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Utf8Path) -> Result<T> {
 }
 
 fn remove_file(path: &Utf8Path) -> Result<()> {
+    #[cfg(unix)]
+    let sync_parent = sync_parent_directory;
+    #[cfg(not(unix))]
+    let sync_parent = |_path: &Utf8Path| Ok(());
+    remove_file_with(path, sync_parent).map_err(|error| error.into_core_error(path))
+}
+
+fn remove_file_with<S>(path: &Utf8Path, sync_parent: S) -> std::result::Result<(), RemovalError>
+where
+    S: FnOnce(&Utf8Path) -> Result<()>,
+{
     match std::fs::remove_file(path) {
-        Ok(()) => {
-            #[cfg(unix)]
-            sync_parent_directory(path)?;
-            Ok(())
-        }
+        Ok(()) => sync_parent(path).map_err(RemovalError::DurabilityUncertain),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(RemovalError::NotRemoved(error.into())),
     }
 }
 
@@ -768,11 +877,99 @@ mod tests {
 
         let error = publish_exclusive_json(&marker, &state).expect_err("reject existing marker");
 
-        assert!(matches!(error, CoreError::LockConflict(_)));
+        assert!(matches!(
+            error,
+            PublicationError::NotPublished(CoreError::LockConflict(_))
+        ));
         assert_eq!(
             std::fs::read_to_string(&marker).expect("read marker"),
             "user data"
         );
+    }
+
+    #[test]
+    fn publication_reports_uncertain_durability_without_removing_evidence() -> color_eyre::Result<()>
+    {
+        let (_dir, _project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        let state = RecoveryState::new("original", "candidate")?;
+
+        // Publication has crossed its visible commit point before the injected directory failure.
+        let result = publish_exclusive_json_with(
+            &marker,
+            &state,
+            |_path| {
+                Err(CoreError::Filesystem(
+                    "injected directory sync failure".to_string(),
+                ))
+            },
+            remove_file,
+        );
+
+        // Both names remain so restart recovery can inspect the uncertain publication safely.
+        assert!(matches!(
+            result,
+            Err(PublicationError::DurabilityUncertain(_))
+        ));
+        assert!(marker.exists());
+        assert!(!publication_temps(&lock_path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_cleanup_failure_does_not_hide_a_committed_publication() -> color_eyre::Result<()>
+    {
+        let (_dir, _project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        let state = RecoveryState::new("original", "candidate")?;
+
+        // Private-name cleanup occurs after the public marker is durably committed.
+        let result = publish_exclusive_json_with(
+            &marker,
+            &state,
+            |_path| Ok(()),
+            |_path| {
+                Err(CoreError::Filesystem(
+                    "injected cleanup failure".to_string(),
+                ))
+            },
+        );
+
+        // Cleanup failure cannot turn an already committed publication into an apparent failure.
+        assert!(result.is_ok());
+        assert!(marker.exists());
+        assert!(!publication_temps(&lock_path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_reports_uncertain_durability_after_unlink() -> color_eyre::Result<()> {
+        let (_dir, _project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        std::fs::write(&marker, b"recovery evidence")?;
+
+        // The unlink is visible before the injected parent-directory sync failure.
+        let result = remove_file_with(&marker, |_path| {
+            Err(CoreError::Filesystem(
+                "injected directory sync failure".to_string(),
+            ))
+        });
+
+        // The typed outcome prevents callers from mistaking uncertain durability for no mutation.
+        assert!(matches!(result, Err(RemovalError::DurabilityUncertain(_))));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    fn publication_temps(lock_path: &Utf8Path) -> color_eyre::Result<Vec<std::fs::DirEntry>> {
+        let parent = lock_path
+            .parent()
+            .ok_or_else(|| color_eyre::eyre::eyre!("lock path has no parent: {lock_path}"))?;
+        let entries = std::fs::read_dir(parent)?.collect::<std::io::Result<Vec<_>>>()?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".publish"))
+            .collect())
     }
 
     #[test]

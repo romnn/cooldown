@@ -1,4 +1,6 @@
-//! Verifies correction batches and isolates the largest safe subset within a fixed Cargo budget.
+//! Verifies correction batches and isolates a deterministic safe subset within a fixed Cargo
+//! budget.
+//! Partition and singleton probes improve coverage without claiming optimality.
 
 use super::recovery::SpeculativeLockTransaction;
 use super::{

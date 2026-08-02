@@ -1,12 +1,12 @@
 use super::options::{ResolvedInvocation, StrictNativeMode};
-use crate::app::lock::ProjectReadGuard;
+use crate::app::lock::{ProjectReadGuard, RepoToolReadGuard};
 use crate::app::{AdapterSet, ProjectCtx};
 use crate::discovery::ConfigSources;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{builtin_default_layer, layer_from_fields};
 use cooldown_core::{
-    CoreError, Origin, PolicyLayer, PolicyStack, Project, ResolveKind, ResolveQuery, ToolId,
-    normalize_native, resolve, window_exclude_newer,
+    CoreError, Origin, PolicyLayer, PolicyStack, Project, ResolveKind, ResolveQuery, SyncScope,
+    ToolId, normalize_native, resolve, window_exclude_newer,
 };
 use jiff::Timestamp;
 
@@ -88,16 +88,24 @@ async fn assemble_ctx(
     tool: ToolId,
     mut project: Project,
 ) -> Result<ProjectCtx, CoreError> {
-    let native = if assembly.no_native {
-        None
-    } else {
-        let _guard = ProjectReadGuard::acquire(&project.root)?;
+    let native = {
+        let _repo_guard = assembly
+            .adapters
+            .writer(tool)
+            .filter(|writer| writer.sync_scope() == SyncScope::Repo)
+            .map(|_| RepoToolReadGuard::acquire(assembly.repo_root, tool))
+            .transpose()?;
+        let _project_guard = ProjectReadGuard::acquire(&project.root)?;
         if let Some(writer) = assembly.adapters.writer(tool) {
             writer.ensure_no_pending_mutation(&project).await?;
         }
-        match assembly.adapters.reader(tool) {
-            Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
-            None => None,
+        if assembly.no_native {
+            None
+        } else {
+            match assembly.adapters.reader(tool) {
+                Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
+                None => None,
+            }
         }
     };
     let project_config = assembly

@@ -23,6 +23,7 @@ thiserror.workspace = true
 camino.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 jiff.workspace = true
 tempfile.workspace = true
 camino.workspace = true

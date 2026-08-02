@@ -1,5 +1,8 @@
 use crate::app::{RecoveryItem, RecoverySummary};
-use cooldown_render::{RecoveryItem as RecoveryItemJson, RecoverySummary as RecoverySummaryJson};
+use cooldown_render::{
+    RecoveryItem as RecoveryItemJson, RecoveryStatus as RecoveryStatusJson,
+    RecoverySummary as RecoverySummaryJson,
+};
 use std::fmt::Write as _;
 
 pub(in crate::cli) fn recovery_summary(summary: &RecoverySummary) -> RecoverySummaryJson {
@@ -16,7 +19,11 @@ pub(in crate::cli) fn recovery_items(items: &[RecoveryItem]) -> Vec<RecoveryItem
         .map(|item| RecoveryItemJson {
             tool: item.tool.clone(),
             project: item.project.clone(),
-            status: item.status.token().to_string(),
+            status: match item.status {
+                crate::app::RecoveryStatus::Recovered => RecoveryStatusJson::Recovered,
+                crate::app::RecoveryStatus::Unchanged => RecoveryStatusJson::Unchanged,
+                crate::app::RecoveryStatus::Error => RecoveryStatusJson::Error,
+            },
         })
         .collect()
 }
