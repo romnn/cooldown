@@ -13,10 +13,27 @@ pub(in crate::cli) fn no_tool_json(command: &'static str) -> Result<String, Core
         "explain" => no_tool_explain(generated_at, error),
         "config" => no_tool_config(generated_at, error),
         "baseline" => no_tool_baseline(generated_at, error),
+        "recover" => no_tool_recover(generated_at, error),
         _ => Err(CoreError::Config(format!(
             "command `{command}` does not produce a workspace JSON envelope"
         ))),
     }
+}
+
+fn no_tool_recover(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    let summary = super::recovery_summary(&crate::app::RecoverySummary::default());
+    let items = super::recovery_items(&[]);
+    serialize_no_tool(&with_error(
+        render::Envelope::new(
+            "recover",
+            false,
+            generated_at,
+            super::RecoveryMeta {},
+            summary,
+            items,
+        ),
+        error,
+    ))
 }
 
 fn no_tool_outdated(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {

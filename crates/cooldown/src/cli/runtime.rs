@@ -69,6 +69,12 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let repo_root = prepared.repo_root;
     let ws = prepared.ws;
     let opts = prepared.opts;
+    if matches!(cli.command, Command::Recover) && opts.dry_run {
+        return Err(CoreError::Config(
+            "`recover` cannot be combined with `--dry-run`; omit it to perform recovery"
+                .to_string(),
+        ));
+    }
     // `--json` is itself config-resolvable, so color and the no-tool output key off the
     // resolved value rather than the raw flag. `--color` then forces/suppresses (default: auto).
     let color = global.color.resolve(opts.json);
@@ -147,6 +153,7 @@ fn requires_tool_match(command: &Command) -> bool {
         Command::Upgrade { .. }
             | Command::Fix { .. }
             | Command::Baseline { .. }
+            | Command::Recover
             | Command::Explain { .. }
     )
 }
@@ -173,6 +180,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Init => "init",
         Command::Schema => "schema",
+        Command::Recover => "recover",
         Command::Sync => "sync",
     }
 }

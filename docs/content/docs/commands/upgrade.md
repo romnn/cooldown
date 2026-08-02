@@ -71,8 +71,8 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
 - **`canonicalize`** — cooldown's owned normalization: bind every unambiguous crates.io edge to
   the **highest** locked version satisfying the dependent's declared requirement, preferring
   candidates whose declared `rust-version` is workspace-compatible and falling back to the
-  highest satisfying candidate when none is compatible — the same preference cargo's
-  `incompatible-rust-versions = "fallback"` rule (the resolver-v3 default) applies. Unlike
+  highest satisfying candidate when none is compatible — a cooldown-owned conservative tier
+  inspired by cargo's `incompatible-rust-versions = "fallback"` rule. Unlike
   `preserve` this also heals bad bindings that predate the run, including on a run that applies no
   version change at all. It is a policy over the existing package set, not a re-run of cargo's
   resolver: a workspace on resolver v1/v2 (default `allow`) may see a fresh cargo resolve bind a

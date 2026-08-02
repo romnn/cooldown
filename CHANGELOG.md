@@ -7,6 +7,9 @@
   resolution; and the public Hex, Maven, pip, and RubyGems resolved-pin parsers. Callers should use
   the documented fields on `PathVersionSplit`, `NameVersion`, `ResolvedInstance`, `ResolvedDep`,
   and `ResolvedPin`.
+- **Breaking library API:** `ToolWrite::recover_pending_mutation` now returns whether recovery
+  changed project state, and `ToolRead::ensure_no_pending_mutation` lets adapters fail a shared read
+  session without performing recovery.
 - Add a cargo `--cargo-edge-policy` for resolved lock **edge bindings** (`preserve` |
   `canonicalize` | `none`; config `[tool.cargo] edge-policy` — cargo-specific, so the key is
   tool-scoped and rejected under any other selector). An incremental re-resolve can silently
@@ -15,15 +18,19 @@
   invisible per-version and passes `cargo metadata --locked`. `preserve` (the default) restores
   such churn to the pre-upgrade binding; `canonicalize` binds each unambiguous crates.io edge to
   the highest satisfying locked version — preferring candidates whose declared `rust-version` is
-  workspace-compatible and falling back to the highest satisfying one when none is, mirroring cargo's
-  `incompatible-rust-versions = "fallback"` rule — healing pre-existing bad bindings too, also on
-  a run with no version change to apply; `none` only observes. Every corrected, withheld,
+  workspace-compatible and falling back to the highest satisfying one when none is, using a
+  cooldown-owned conservative tier inspired by cargo's `incompatible-rust-versions = "fallback"`
+  rule — healing pre-existing bad bindings too, also on a run with no version change to apply;
+  `none` only observes. Every corrected, withheld,
   unaddressable, or surviving rebind is reported as its own
   `restored`/`canonicalized`/`held`/`unaddressable`/`rebound` row, preserving the dependent's full
   source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
-  version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level `applied` says
-  whether the binding outcome is committed, and a `held` or `unaddressable` row fails `--strict`.
-  Config follows the per-project repository cascade, and the closed JSON contract is schema v4.
+  version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level
+  `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
+  fails `--strict`. Speculative lock corrections use durable, drift-checked transactions; the new
+  `recover` command restores a validated interrupted transaction without continuing into another
+  mutation. Config follows the per-project repository cascade, and the closed JSON contract is
+  schema v4.
 
 ## v0.0.12
 

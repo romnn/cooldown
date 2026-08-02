@@ -176,7 +176,23 @@ impl<'a> CheckRunner<'a> {
             return;
         };
 
-        let lock_probe = match self.refresh_lock(pctx, &read.project_label).await {
+        let refreshed = self.refresh_lock(pctx, &read.project_label).await;
+        if matches!(&refreshed, Some(LockProbe::Skip)) {
+            return;
+        }
+        let read_guard = match self.ws.project_read_guard(read.adapter, pctx).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
+                return;
+            }
+        };
+        let lock_probe = match refreshed {
             Some(probe) => probe,
             None => {
                 self.probe_lock(read.adapter, pctx, &read.project_label)
@@ -203,6 +219,7 @@ impl<'a> CheckRunner<'a> {
                 return;
             }
         };
+        drop(read_guard);
 
         self.opts
             .progress

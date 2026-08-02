@@ -16,6 +16,7 @@ mod outdated;
 mod progress;
 mod project_copy;
 mod read;
+mod recover;
 mod release_cache;
 mod resilient_apply;
 mod sync;
@@ -31,6 +32,7 @@ pub use cooldown_render::{
     Window,
 };
 pub use progress::Progress;
+pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace};
 

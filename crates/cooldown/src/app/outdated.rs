@@ -104,6 +104,19 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
 
+        let read_guard = match self.ws.project_read_guard(read.adapter, pctx).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
+                return;
+            }
+        };
+
         self.opts.progress.phase("resolving dependency graph");
         let mut deps = match self
             .ws
@@ -156,6 +169,7 @@ impl<'a> OutdatedRunner<'a> {
                 ));
             }
         }
+        drop(read_guard);
         let fetched = self
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;

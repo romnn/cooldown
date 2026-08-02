@@ -1901,9 +1901,9 @@ fn members_overlap(change_members: &[MemberRef], dependent_members: &[String]) -
 /// same best-effort contract as uv's `unique_edge_requirer`.
 fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     let mut blockers: BTreeSet<String> = BTreeSet::new();
-    for key in pnpm_peer_suffixed_keys(lock) {
-        if key.name != held {
-            blockers.insert(key.name);
+    for name in pnpm_peer_suffixed_names(lock) {
+        if name != held {
+            blockers.insert(name);
         }
     }
     match blockers.len() {
@@ -1912,24 +1912,10 @@ fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     }
 }
 
-/// One `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer disambiguation suffix — a
-/// resolved entry whose identity depends on a peer resolution.
-struct PeerSuffixedKey {
-    /// The package name of the suffixed key (`chalk` for `chalk@4.0.0(supports-color@7.2.0)`).
-    name: String,
-    /// The trailing parenthesized peer group(s), exactly as written in the key
-    /// (`(supports-color@7.2.0)`).
-    #[expect(
-        dead_code,
-        reason = "the suffix completes the extracted key's identity; blame attribution reads only the name"
-    )]
-    peer_suffix: String,
-}
-
 /// Every `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer disambiguation suffix —
-/// the resolved entries whose identity depends on a peer resolution (see [`PeerSuffixedKey`]). Used
-/// to attribute a held peer conflict to the sibling that forced the peer choice.
-fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<PeerSuffixedKey> {
+/// returned as the package names used to attribute a held peer conflict to the sibling that forced
+/// the peer choice.
+fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_packages = false;
     for line in lock.lines() {
@@ -1946,13 +1932,9 @@ fn pnpm_peer_suffixed_keys(lock: &str) -> Vec<PeerSuffixedKey> {
                 .trim_matches('\'')
                 .trim_matches('"');
             let Some(open) = key.find('(') else { continue };
-            let suffix = key[open..].to_string();
             let base = key[..open].to_string();
             if let Some(NameVersion { name, .. }) = crate::lock::split_name_version(&base) {
-                out.push(PeerSuffixedKey {
-                    name,
-                    peer_suffix: suffix,
-                });
+                out.push(name);
             }
         } else {
             in_packages = line.starts_with("packages:");

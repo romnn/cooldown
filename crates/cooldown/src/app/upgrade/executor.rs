@@ -1,6 +1,6 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
-use crate::app::lock::ProjectLock;
+use crate::app::lock::ProjectWriteGuard;
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
 };
@@ -221,7 +221,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     pub(super) async fn run(&mut self) {
-        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
+        let _guard = match ProjectWriteGuard::acquire(&self.ctx.pctx.project.root) {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
@@ -319,7 +319,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
     ) {
-        let _guard = match ProjectLock::acquire(&self.ctx.pctx.project.root) {
+        let _guard = match ProjectWriteGuard::acquire(&self.ctx.pctx.project.root) {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);

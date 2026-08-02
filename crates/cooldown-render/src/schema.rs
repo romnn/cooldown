@@ -101,6 +101,11 @@ pub fn json_schema() -> Value {
         .filter(|action| **action != cooldown_core::EdgeBindingAction::Held)
         .map(|action| Value::String(action.wire_value().to_string()))
         .collect();
+    let reasoned_edge_actions = [
+        cooldown_core::EdgeBindingAction::Held,
+        cooldown_core::EdgeBindingAction::Unaddressable,
+    ]
+    .map(|action| Value::String(action.wire_value().to_string()));
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -275,6 +280,24 @@ pub fn json_schema() -> Value {
                             ]
                         }
                     }
+                },
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": {
+                                    "action": { "enum": reasoned_edge_actions }
+                                }
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "edge": { "required": ["detail"] }
+                        }
+                    }
                 }
             ],
             "properties": {
@@ -370,6 +393,26 @@ pub fn json_schema() -> Value {
                 "registry": { "type": "string" }
             },
             "additionalProperties": false
+        },
+        "recoverySummary": {
+            "type": "object",
+            "required": ["recovered", "unchanged", "errors"],
+            "properties": {
+                "recovered": { "type": "integer", "minimum": 0 },
+                "unchanged": { "type": "integer", "minimum": 0 },
+                "errors": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+        },
+        "recoveryItem": {
+            "type": "object",
+            "required": ["tool", "project", "status"],
+            "properties": {
+                "tool": { "type": "string" },
+                "project": { "type": "string" },
+                "status": { "enum": ["recovered", "unchanged", "error"] }
+            },
+            "additionalProperties": false
         }
     });
 
@@ -449,7 +492,8 @@ pub fn json_schema() -> Value {
                 vec!["path", "dryRun"],
                 "#/$defs/baselineSummary",
                 "#/$defs/baselineItem"
-            )
+            ),
+            envelope("recover", Map::new(), vec![], "#/$defs/recoverySummary", "#/$defs/recoveryItem")
         ]
     })
 }
@@ -605,6 +649,24 @@ mod tests {
             .expect("edge-only prohibited properties");
         assert_eq!(prohibited[0]["required"][0], "skipped");
         assert_eq!(prohibited[1]["required"][0], "error");
+        let reasoned = conditions[3]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("reasoned edge actions");
+        assert_eq!(
+            conditions[3]["then"]["properties"]["edge"]["required"][0],
+            "detail"
+        );
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = reasoned.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(
+                listed,
+                matches!(
+                    action,
+                    cooldown_core::EdgeBindingAction::Held
+                        | cooldown_core::EdgeBindingAction::Unaddressable
+                )
+            );
+        }
     }
 
     #[test]

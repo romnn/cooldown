@@ -10,8 +10,8 @@
 //! binds in the common case — the resolver tries candidates highest-first, and coexisting locked
 //! versions are semver-incompatible majors that never conflict — with one deliberate rule for MSRV:
 //! candidates whose own `rust-version` exceeds the workspace minimum are deprioritized,
-//! falling back to the highest satisfying candidate when no compatible one exists. That mirrors
-//! cargo's `incompatible-rust-versions = "fallback"` behavior (the resolver-v3 default); a
+//! falling back to the highest satisfying candidate when no compatible one exists. The tier is
+//! inspired by cargo's `incompatible-rust-versions = "fallback"` behavior; a
 //! workspace on resolver v1/v2 (default `allow`) or with a config override may see cargo fresh-bind
 //! a higher, MSRV-incompatible version where this policy keeps the compatible one. The effective
 //! resolver mode is deliberately not reconstructed from cargo config — the compatible-first choice
@@ -24,7 +24,7 @@ use crate::version;
 /// The corrective rewrites that bind each unambiguous crates.io edge of `lock` to its canonical
 /// version: the highest satisfying in-lock crates.io version whose declared `rust-version` is
 /// workspace-compatible — or, when no satisfying candidate is compatible by that metadata, the
-/// highest satisfying one (cargo's fallback tier).
+/// highest satisfying one (cooldown's fallback tier).
 /// The orphan guard is applied by the caller via [`guard_rewrites`](super::guard_rewrites).
 pub(crate) fn rebindings(
     lock: &LockEdgeView,
@@ -120,7 +120,7 @@ mod tests {
 
     /// The healing case `preserve` cannot cover: diesel's wide-range edge sits on 0.8.2 from a
     /// *previous* re-resolve (no pre-apply diff shows it), and canonicalize rebinds it to the
-    /// highest satisfying locked version — what a fresh resolve picks.
+    /// highest satisfying locked version — what a fresh resolve generally prefers.
     #[test]
     fn a_pre_existing_bad_binding_is_healed() {
         let lock = view(CHURNED_LOCK);
@@ -181,7 +181,7 @@ mod tests {
         assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
     }
 
-    /// The compatibility tier of cargo's MSRV fallback rule: with a workspace `rust-version`
+    /// Cooldown's conservative MSRV tier: with a workspace `rust-version`
     /// declared, a candidate whose own `rust-version` exceeds it is not preferred, so the
     /// canonical binding is the highest satisfying version with a workspace-compatible declared
     /// `rust-version` — never an override of a deliberate MSRV-aware downgrade.
@@ -196,7 +196,7 @@ mod tests {
         );
 
         // uuid 1.24.0 demands rustc 1.63 > the workspace's 1.60; the current 0.8.2 (no declared
-        // MSRV, which cargo treats as compatible) stays canonical — nothing to rewrite.
+        // MSRV, which cooldown treats as unconstrained) stays canonical — nothing to rewrite.
         assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
 
         // Without a workspace MSRV the rule is inert and the highest satisfying version wins.
@@ -205,8 +205,8 @@ mod tests {
     }
 
     /// The fallback tier of the same rule: when no satisfying candidate has a compatible declared
-    /// `rust-version`, cargo uses an incompatible one rather than failing — so canonicalization
-    /// also falls back to the highest satisfying candidate instead of doing nothing.
+    /// `rust-version`, canonicalization uses the highest satisfying candidate instead of doing
+    /// nothing.
     #[test]
     fn canonicalize_falls_back_when_no_candidate_is_msrv_compatible() {
         let lock = view(CHURNED_LOCK);

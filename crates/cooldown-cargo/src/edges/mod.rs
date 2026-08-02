@@ -5,22 +5,26 @@
 //! `"uuid 1.24.0"`). When a dependent's declared range admits several locked versions — diesel's
 //! `uuid = ">=0.7.0, <2.0.0"` beside both a `0.8` and a `1.x` line — cargo's *incremental*
 //! re-resolves (`cargo update -p … --precise`) can rebind such an edge between them depending on
-//! graph-traversal order, while a from-scratch resolve deterministically picks the highest
-//! satisfying version. The rebinding is build-affecting (`rustc` receives the other copy as
+//! graph-traversal order, while a from-scratch resolve generally prefers the highest satisfying
+//! version subject to Cargo's other constraints and heuristics. The rebinding is build-affecting
+//! (`rustc` receives the other copy as
 //! `--extern`) yet invisible at the per-version level, and `cargo metadata --locked` accepts either
 //! binding as long as no package is orphaned — so nothing downstream catches it.
 //!
 //! The submodules split the pipeline: [`lock_view`] parses each lock's bindings and reference
 //! structure, the policy modules ([`preserve`], [`canonicalize`]) compute corrective rewrites over
 //! them, [`rewrite`] filters those rewrites through the safety guards and applies them as targeted
-//! textual surgery that leaves the rest of the lock byte-identical, and [`observe`] diffs the final
+//! textual surgery that leaves the rest of the lock byte-identical, [`isolate`] finds a verified
+//! safe subset, [`recovery`] owns speculative state transitions, and [`observe`] diffs the final
 //! bindings per `[[package]]` block so a rebind that no policy corrected is still reported.
 
 pub(crate) mod canonicalize;
 pub(crate) mod enforce;
+mod isolate;
 mod lock_view;
 mod observe;
 pub(crate) mod preserve;
+mod recovery;
 mod rewrite;
 
 pub(crate) use lock_view::LockEdgeView;
@@ -119,9 +123,9 @@ impl<'a> RequirementIndex<'a> {
 
     /// Whether binding `dependency` at `candidate` respects the workspace's declared MSRV: a
     /// candidate whose own `rust-version` exceeds the workspace minimum is not *preferred*. This is
-    /// the compatibility tier of cargo's `incompatible-rust-versions = "fallback"` rule (the
-    /// resolver-v3 default); [`canonicalize`] applies the fallback tier itself — when no compatible
-    /// candidate satisfies the requirement, the highest satisfying one is used regardless. A
+    /// a conservative compatibility tier inspired by cargo's
+    /// `incompatible-rust-versions = "fallback"` rule. [`canonicalize`] applies its own fallback:
+    /// when no compatible candidate satisfies the requirement, the highest satisfying one is used. A
     /// candidate declaring no `rust-version` imposes nothing, and a workspace without one disables
     /// the rule entirely.
     pub(crate) fn msrv_admits(&self, dependency: &str, candidate: &str) -> bool {

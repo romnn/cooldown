@@ -98,6 +98,18 @@ pub trait ToolRead: Send + Sync {
         None
     }
 
+    /// Refuses a read when adapter-owned interrupted mutation state is pending.
+    ///
+    /// The application calls this while holding shared project access. Implementations must not
+    /// recover or otherwise mutate project state through this read-side hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) describing the pending transaction.
+    async fn ensure_no_pending_mutation(&self, _project: &Project) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns the **raw, unscoped** resolved dependencies for `project`.
     ///
     /// `scope` selects between direct-only dependencies and the full resolved graph, but this method
@@ -373,8 +385,9 @@ pub trait ToolWrite: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if pending state cannot be validated or recovered.
-    async fn recover_pending_mutation(&self, _project: &Project) -> Result<()> {
-        Ok(())
+    /// Returns `true` when recovery changed project state.
+    async fn recover_pending_mutation(&self, _project: &Project) -> Result<bool> {
+        Ok(false)
     }
 
     /// Captures the adapter-owned lock state needed to report edge bindings across a whole run.

@@ -15,7 +15,7 @@ Every command shares the same policy engine and the same global flags; they diff
 | [`fix`]({{< relref "fix.md" >}}) | Downgrade too-fresh dependencies to a matured version to clear a violation. |
 | [`check`]({{< relref "check.md" >}}) | The CI gate over the resolved lockfile graph (fail-closed). |
 
-The smaller commands — `baseline`, `explain`, `config`, `init`, `schema`, and `sync` — are covered in [Other commands]({{< relref "other.md" >}}). The [CLI reference]({{< relref "cli-reference.md" >}}) lists the global flags and the exit-code contract.
+The smaller commands — `baseline`, `explain`, `config`, `init`, `schema`, `sync`, and `recover` — are covered in [Other commands]({{< relref "other.md" >}}). The [CLI reference]({{< relref "cli-reference.md" >}}) lists the global flags and the exit-code contract.
 
 ## How they relate
 

@@ -1,6 +1,6 @@
 use super::Window;
 use super::baseline::Baseline;
-use super::lock::ProjectLock;
+use super::lock::{ProjectReadGuard, ProjectWriteGuard};
 use super::progress::Progress;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use crate::scan::{FolderExcludeSet, PackageExcludeSet};
@@ -501,8 +501,20 @@ impl Workspace {
             return Ok(None);
         }
         opts.progress.phase("refreshing lock state");
-        let _guard = ProjectLock::acquire(&pctx.project.root)?;
+        let _guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
+        writer.recover_pending_mutation(&pctx.project).await?;
         writer.refresh_lock(&pctx.project).await
+    }
+
+    /// Starts a read session and checks adapter-owned pending state without mutating it.
+    pub(crate) async fn project_read_guard(
+        &self,
+        adapter: &dyn ToolRead,
+        pctx: &ProjectCtx,
+    ) -> cooldown_core::Result<ProjectReadGuard> {
+        let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
+        adapter.ensure_no_pending_mutation(&pctx.project).await?;
+        Ok(guard)
     }
 
     /// Projects in scope for this run (filtered by `--tool`).

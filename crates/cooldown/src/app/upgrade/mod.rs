@@ -147,10 +147,14 @@ impl Workspace {
             let dry_pctx;
             let effective_pctx = if opts.dry_run {
                 opts.progress.phase("preparing isolated dry-run project");
-                match super::project_copy::ProjectCopy::create(
-                    &pctx.project,
-                    &writer.resolve_inputs(),
-                ) {
+                let copy = match self.project_read_guard(reader, pctx).await {
+                    Ok(_guard) => super::project_copy::ProjectCopy::create(
+                        &pctx.project,
+                        &writer.resolve_inputs(),
+                    ),
+                    Err(error) => Err(error),
+                };
+                match copy {
                     Ok(copy) => {
                         dry_pctx = super::ProjectCtx {
                             tool: pctx.tool,
@@ -205,20 +209,24 @@ impl Workspace {
             acc.errors.push(read_only_mutator_diag(pctx));
             return acc;
         };
-        let copy =
-            match super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
-            {
-                Ok(copy) => copy,
-                Err(error) => {
-                    acc.errors.push(diag_from_error(
-                        &error,
-                        pctx.tool,
-                        pctx.rel_path.as_str(),
-                        None,
-                    ));
-                    return acc;
-                }
-            };
+        let copy = match self.project_read_guard(reader, pctx).await {
+            Ok(_guard) => {
+                super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
+            }
+            Err(error) => Err(error),
+        };
+        let copy = match copy {
+            Ok(copy) => copy,
+            Err(error) => {
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return acc;
+            }
+        };
         let copied_pctx = super::ProjectCtx {
             tool: pctx.tool,
             project: copy.project.clone(),

@@ -1,63 +1,46 @@
-//! A per-project filesystem lock so concurrent `cooldown` mutating runs cannot overlap on the same
-//! project state.
+//! Shared read and exclusive write access for project-local package-manager state.
 
 use cooldown_core::CoreError;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Holds an OS-backed exclusive lock for a project root for the lifetime of the value.
+/// Holds an OS-backed shared lock for project reads.
 #[derive(Debug)]
-pub struct ProjectLock {
+pub(crate) struct ProjectReadGuard {
     file: File,
 }
 
-impl ProjectLock {
-    /// Acquire this project's state-dir lock, failing immediately if another process already holds it.
-    pub fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
-        let preferred = lock_path(root);
-        let (path, mut file) = match open_lock_file(&preferred) {
-            Ok(file) => (preferred, file),
-            Err(preferred_error) => {
-                let fallback = fallback_lock_path(root);
-                match open_lock_file(&fallback) {
-                    Ok(file) => {
-                        tracing::debug!(
-                            preferred = %preferred.display(),
-                            error = %preferred_error,
-                            "state-dir lock unavailable; using temp-dir fallback"
-                        );
-                        (fallback, file)
-                    }
-                    Err(fallback_error) => {
-                        return Err(CoreError::Filesystem(format!(
-                            "cannot open a lock file: {} ({preferred_error}); fallback {} ({fallback_error})",
-                            preferred.display(),
-                            fallback.display()
-                        )));
-                    }
-                }
+/// Holds an OS-backed exclusive lock for project mutations.
+#[derive(Debug)]
+pub(crate) struct ProjectWriteGuard {
+    file: File,
+}
+
+impl ProjectReadGuard {
+    /// Acquires shared access, failing immediately while a writer owns the project.
+    pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
+        let (path, file) = open_project_lock(root)?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(ProjectReadGuard { file }),
+            Err(TryLockError::WouldBlock) => {
+                Err(lock_conflict(&path, "a mutating cooldown run", true))
             }
-        };
-        let file_path = path.display().to_string();
+            Err(TryLockError::Error(error)) => Err(lock_error(&path, &error)),
+        }
+    }
+}
+
+impl ProjectWriteGuard {
+    /// Acquires exclusive access, failing immediately while another reader or writer is active.
+    pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
+        let (path, mut file) = open_project_lock(root)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                // Best-effort: name the holder recorded in the lock file, so "who is blocking me?"
-                // (and any hash-collision surprise between two roots) is self-diagnosing.
-                let holder = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|contents| contents.lines().next().map(str::to_string))
-                    .filter(|line| !line.is_empty())
-                    .map(|line| format!(" ({line})"))
-                    .unwrap_or_default();
-                return Err(CoreError::LockConflict(format!(
-                    "{file_path} is locked by another mutating cooldown run{holder}"
-                )));
+                return Err(lock_conflict(&path, "another cooldown run", false));
             }
-            Err(TryLockError::Error(e)) => {
-                return Err(CoreError::Filesystem(format!("{file_path}: {e}")));
-            }
+            Err(TryLockError::Error(error)) => return Err(lock_error(&path, &error)),
         }
 
         file.set_len(0)?;
@@ -69,8 +52,54 @@ impl ProjectLock {
             root
         );
         let _ = file.sync_data();
-        Ok(ProjectLock { file })
+        tracing::trace!(path = %path.display(), "acquired exclusive project access");
+        Ok(ProjectWriteGuard { file })
     }
+
+    #[cfg(test)]
+    fn path_for_test(root: &camino::Utf8Path) -> PathBuf {
+        lock_path(root)
+    }
+}
+
+fn open_project_lock(root: &camino::Utf8Path) -> Result<(PathBuf, File), CoreError> {
+    let preferred = lock_path(root);
+    match open_lock_file(&preferred) {
+        Ok(file) => Ok((preferred, file)),
+        Err(preferred_error) => {
+            let fallback = fallback_lock_path(root);
+            match open_lock_file(&fallback) {
+                Ok(file) => {
+                    tracing::debug!(
+                        preferred = %preferred.display(),
+                        error = %preferred_error,
+                        "state-dir lock unavailable; using temp-dir fallback"
+                    );
+                    Ok((fallback, file))
+                }
+                Err(fallback_error) => Err(CoreError::Filesystem(format!(
+                    "cannot open a lock file: {} ({preferred_error}); fallback {} ({fallback_error})",
+                    preferred.display(),
+                    fallback.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn lock_conflict(path: &Path, owner: &str, include_holder: bool) -> CoreError {
+    let holder = include_holder
+        .then(|| std::fs::read_to_string(path).ok())
+        .flatten()
+        .and_then(|contents| contents.lines().next().map(str::to_string))
+        .filter(|line| !line.is_empty())
+        .map(|line| format!(" ({line})"))
+        .unwrap_or_default();
+    CoreError::LockConflict(format!("{} is locked by {owner}{holder}", path.display()))
+}
+
+fn lock_error(path: &Path, error: &std::io::Error) -> CoreError {
+    CoreError::Filesystem(format!("{}: {error}", path.display()))
 }
 
 fn open_lock_file(path: &Path) -> Result<File, CoreError> {
@@ -125,14 +154,13 @@ fn lock_file_name(root: &camino::Utf8Path) -> String {
     format!("{:016x}.lock", cooldown_core::fs::fnv1a_64(root.as_str()))
 }
 
-impl ProjectLock {
-    #[cfg(test)]
-    fn path_for_test(root: &camino::Utf8Path) -> PathBuf {
-        lock_path(root)
+impl Drop for ProjectReadGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
-impl Drop for ProjectLock {
+impl Drop for ProjectWriteGuard {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
@@ -143,36 +171,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn second_acquire_fails_while_first_is_held() {
+    fn readers_can_share_project_access() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let _first = ProjectLock::acquire(root).expect("first lock");
+        let _first = ProjectReadGuard::acquire(root).expect("first reader");
 
-        let err = ProjectLock::acquire(root).expect_err("second lock must fail");
-        assert!(matches!(err, CoreError::LockConflict(_)));
+        ProjectReadGuard::acquire(root).expect("second reader");
     }
 
     #[test]
-    fn lock_can_be_reacquired_after_drop() {
+    fn reader_and_writer_exclude_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let _reader = ProjectReadGuard::acquire(root).expect("reader");
+
+        let error = ProjectWriteGuard::acquire(root).expect_err("writer must fail");
+        assert!(matches!(error, CoreError::LockConflict(_)));
+    }
+
+    #[test]
+    fn writer_excludes_readers_and_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let _writer = ProjectWriteGuard::acquire(root).expect("writer");
+
+        assert!(matches!(
+            ProjectReadGuard::acquire(root).expect_err("reader must fail"),
+            CoreError::LockConflict(_)
+        ));
+        assert!(matches!(
+            ProjectWriteGuard::acquire(root).expect_err("second writer must fail"),
+            CoreError::LockConflict(_)
+        ));
+    }
+
+    #[test]
+    fn write_access_can_be_reacquired_after_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
 
         {
-            let _lock = ProjectLock::acquire(root).expect("first lock");
+            let _guard = ProjectWriteGuard::acquire(root).expect("first writer");
         }
 
-        ProjectLock::acquire(root).expect("lock reacquired");
+        ProjectWriteGuard::acquire(root).expect("writer reacquired");
     }
 
     #[test]
-    fn project_lock_does_not_create_repo_local_lock_file() {
+    fn project_access_does_not_create_repo_local_lock_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
         let repo_local = root.join(".cooldown.lock");
 
-        let _lock = ProjectLock::acquire(root).expect("lock acquired");
+        let _guard = ProjectWriteGuard::acquire(root).expect("writer acquired");
 
         assert!(!repo_local.exists());
-        assert_ne!(ProjectLock::path_for_test(root), repo_local.as_std_path());
+        assert_ne!(
+            ProjectWriteGuard::path_for_test(root),
+            repo_local.as_std_path()
+        );
     }
 }

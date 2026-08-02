@@ -25,6 +25,7 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
         Command::Fix { .. } => report::run_fix(&ctx).await,
         Command::Explain { package } => report::run_explain(&ctx, &package).await,
         Command::Config { .. } => report::run_config(&ctx),
+        Command::Recover => report::run_recover(&ctx).await,
         Command::Sync => report::run_sync(&ctx).await,
         Command::Baseline { prune } => baseline::run_baseline(&ctx, prune).await,
         #[allow(

@@ -200,6 +200,33 @@ pub(super) async fn run_sync(ctx: &CommandContext<'_>) -> Result<Exit, CoreError
     Ok(out.exit)
 }
 
+pub(super) async fn run_recover(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
+    let out = ctx.ws.recover(ctx.opts).await;
+    let summary = present::recovery_summary(&out.summary);
+    let items = present::recovery_items(&out.items);
+    let errors = out
+        .items
+        .iter()
+        .filter_map(|item| item.error.clone())
+        .collect();
+    let env = with_diags(
+        render::Envelope::new(
+            "recover",
+            out.exit.is_ok(),
+            ctx.generated_at.to_owned(),
+            present::RecoveryMeta {},
+            summary,
+            items,
+        ),
+        Vec::new(),
+        errors,
+    );
+    emit_envelope(ctx.opts.json, &env, || {
+        present::render_recovery_text(&out.summary, &out.items)
+    })?;
+    Ok(out.exit)
+}
+
 pub(super) fn run_config(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.config(ctx.opts);
     let summary = out.summary.clone();

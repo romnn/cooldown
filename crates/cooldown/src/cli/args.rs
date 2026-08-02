@@ -282,6 +282,8 @@ pub(in crate::cli) enum Command {
     Init,
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
+    /// Recover interrupted package-manager state without performing any other mutation.
+    Recover,
     /// Write the resolved policy down into native configs.
     Sync,
 }
@@ -990,6 +992,12 @@ mod tests {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
         assert!(matches!(cli.command, super::Command::Check { .. }));
         assert!(cli.global.json);
+    }
+
+    #[test]
+    fn parser_accepts_recovery_only_command() {
+        let cli = Cli::parse_from(["cooldown", "recover"]);
+        assert!(matches!(cli.command, super::Command::Recover));
     }
 
     #[test]

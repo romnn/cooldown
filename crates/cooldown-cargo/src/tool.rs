@@ -146,6 +146,10 @@ impl ToolRead for CargoTool {
         version::classify_kind(from, to)
     }
 
+    async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
+        edges::enforce::ensure_no_pending(project)
+    }
+
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         edges::enforce::ensure_no_pending(project)?;
         let graph = self.cargo.metadata(&project.root).await?;
@@ -756,7 +760,7 @@ impl ToolWrite for CargoTool {
         self.cargo.build(&project.root).await
     }
 
-    async fn recover_pending_mutation(&self, project: &Project) -> Result<()> {
+    async fn recover_pending_mutation(&self, project: &Project) -> Result<bool> {
         edges::enforce::recover_pending(project)
     }
 

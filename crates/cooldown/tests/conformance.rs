@@ -151,6 +151,15 @@ impl ToolRead for FakeEco {
             workspace_root: true,
         }
     }
+    async fn ensure_no_pending_mutation(&self, _p: &Project) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        if state.require_recovery_before_read && !state.recovery_completed {
+            return Err(CoreError::StaleLock(
+                "pending fake mutation; run `cooldown recover`".to_string(),
+            ));
+        }
+        Ok(())
+    }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
         if state.require_recovery_before_read && !state.recovery_completed {
@@ -261,9 +270,9 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
-    async fn recover_pending_mutation(&self, _p: &Project) -> Result<()> {
+    async fn recover_pending_mutation(&self, _p: &Project) -> Result<bool> {
         self.state.lock().unwrap().recovery_completed = true;
-        Ok(())
+        Ok(true)
     }
 
     async fn lock_edge_snapshot(&self, p: &Project) -> Result<Option<Vec<u8>>> {
@@ -545,6 +554,46 @@ async fn mutation_recovery_precedes_dependency_discovery() {
         .await;
 
     assert!(outcome.errors.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_command_runs_only_the_recovery_lifecycle() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+
+    let outcome = workspace(adapter, Baseline::default())
+        .recover(&opts())
+        .await;
+
+    assert_eq!(outcome.summary.recovered, 1);
+    assert_eq!(outcome.summary.unchanged, 0);
+    assert_eq!(outcome.summary.errors, 0);
+    assert!(matches!(
+        outcome.items[0].status,
+        cooldown::app::RecoveryStatus::Recovered
+    ));
+    assert_eq!(outcome.exit, Exit::Ok);
+}
+
+#[tokio::test]
+async fn dry_run_refuses_pending_source_state_without_recovering_it() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+    adapter
+        .state
+        .get_mut()
+        .expect("exclusive fake state")
+        .require_recovery_before_read = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(outcome.items.is_empty());
 }
 
 fn too_fresh_fix_releases() -> Vec<Release> {
