@@ -1,5 +1,6 @@
 mod baseline;
 mod common;
+mod recover;
 mod report;
 
 use super::{Command, present};
@@ -25,15 +26,20 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
         Command::Fix { .. } => report::run_fix(&ctx).await,
         Command::Explain { package } => report::run_explain(&ctx, &package).await,
         Command::Config { .. } => report::run_config(&ctx),
-        Command::Recover => report::run_recover(&ctx).await,
         Command::Sync => report::run_sync(&ctx).await,
         Command::Baseline { prune } => baseline::run_baseline(&ctx, prune).await,
         #[allow(
             clippy::unreachable,
             reason = "schema/init are dispatched before any workspace exists"
         )]
-        Command::Schema | Command::Init => unreachable!("handled earlier"),
+        Command::Schema | Command::Init | Command::Recover => unreachable!("handled earlier"),
     }
+}
+
+pub(crate) fn run_recover(
+    prepared: crate::cli::setup::PreparedRecovery,
+) -> Result<Exit, CoreError> {
+    recover::run(prepared)
 }
 
 pub(crate) fn no_tool_json(command: &'static str) -> Result<String, CoreError> {

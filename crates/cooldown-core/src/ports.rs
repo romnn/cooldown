@@ -7,7 +7,7 @@
 //! used only by commands that rewrite project state. [`PackageRegistry`] is the finer-grained port
 //! each adapter is built from (constructor-injected, reusable and fakeable in unit tests).
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, Plan, Project, ProjectMarker, Release, ToolId, UpdateKind, VerifyReport,
@@ -96,18 +96,6 @@ pub trait ToolRead: Send + Sync {
     /// the original leg's kind.
     fn classify_update_kind(&self, _from: &str, _to: &str) -> Option<UpdateKind> {
         None
-    }
-
-    /// Refuses a read when adapter-owned interrupted mutation state is pending.
-    ///
-    /// The application calls this while holding shared project access. Implementations must not
-    /// recover or otherwise mutate project state through this read-side hook.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) describing the pending transaction.
-    async fn ensure_no_pending_mutation(&self, _project: &Project) -> Result<()> {
-        Ok(())
     }
 
     /// Returns the **raw, unscoped** resolved dependencies for `project`.
@@ -376,6 +364,18 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Refuses a read when adapter-owned interrupted mutation state is pending.
+    ///
+    /// The application calls this while holding shared project access. Implementations must not
+    /// recover or otherwise mutate project state through this read-side hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) describing the pending transaction.
+    async fn ensure_no_pending_mutation(&self, _project: &Project) -> Result<()> {
+        Ok(())
+    }
+
     /// Recovers adapter-owned state left by an interrupted mutation.
     ///
     /// The application invokes this at the start of a mutation lifecycle while holding the
@@ -464,10 +464,11 @@ pub trait ToolWrite: Send + Sync {
     /// Writes the resolved repo-wide policy into a single repo-level native config file (the `sync`
     /// operation for [`SyncScope::Repo`] adapters, e.g. uv's root `uv.toml`).
     ///
-    /// Called **once per repo**, not per project, so concurrent project upgrades never race on the
-    /// shared file. The default returns [`SyncReport::Unsupported`]; only [`SyncScope::Repo`]
-    /// adapters override it. As with [`write_native`](ToolWrite::write_native), `dry_run` must report
-    /// what it *would* do without touching any file.
+    /// Called **once per repo**, not per project. The application holds access to every project that
+    /// consumes the shared file for the duration of the call. The default returns
+    /// [`SyncReport::Unsupported`]; only [`SyncScope::Repo`] adapters override it. As with
+    /// [`write_native`](ToolWrite::write_native), `dry_run` must report what it *would* do without
+    /// touching any file.
     ///
     /// # Errors
     ///
@@ -599,7 +600,7 @@ pub enum SyncScope {
     /// [`ToolWrite::write_native`].
     Project,
     /// A single repo-level native file (e.g. uv's root `uv.toml`); `sync` writes it exactly once per
-    /// repo via [`ToolWrite::write_repo_native`], so concurrent project upgrades never race on it.
+    /// repo via [`ToolWrite::write_repo_native`].
     Repo,
 }
 
@@ -617,6 +618,42 @@ impl<T> Tool for T where T: ToolRead + ReleaseFetcher + ToolWrite {}
 pub struct ProjectMutationJournal {
     /// The captured file entries the application layer can restore on rollback.
     pub files: Vec<ProjectMutationFile>,
+}
+
+/// The exact post-apply contents expected at a rollback boundary.
+///
+/// A mutation journal captures the pre-image. This state captures the corresponding post-image so
+/// rollback can refuse to overwrite a file changed independently while cooldown was verifying the
+/// candidate.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectMutationState {
+    files: Vec<ProjectMutationFile>,
+}
+
+impl ProjectMutationState {
+    /// Adds paths absent from this state without changing existing expected contents.
+    pub fn extend_missing(&mut self, other: ProjectMutationState) {
+        for file in other.files {
+            if self.files.iter().all(|existing| existing.path != file.path) {
+                self.files.push(file);
+            }
+        }
+    }
+
+    /// Replaces expected contents for every path carried by `other`.
+    pub fn replace(&mut self, other: ProjectMutationState) {
+        for file in other.files {
+            if let Some(existing) = self
+                .files
+                .iter_mut()
+                .find(|existing| existing.path == file.path)
+            {
+                *existing = file;
+            } else {
+                self.files.push(file);
+            }
+        }
+    }
 }
 
 /// One file entry recorded in a [`ProjectMutationJournal`].
@@ -651,6 +688,63 @@ impl ProjectMutationJournal {
         })
     }
 
+    /// Captures the current state of every file in this journal's write set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if a file exists but cannot be read.
+    pub fn capture_state(&self, root: &Utf8Path) -> Result<ProjectMutationState> {
+        let files = self
+            .files
+            .iter()
+            .map(|file| Self::capture_file(root, &file.path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ProjectMutationState { files })
+    }
+
+    /// Restores this journal only when every live file still matches `expected`.
+    ///
+    /// Validation covers the complete write set before any file is changed. Existing files are
+    /// then replaced atomically, so readers never observe partial bytes. A multi-file restore is
+    /// not globally atomic, but independent drift detected before restoration leaves every file
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when the expected state
+    /// does not describe this journal or a live file has changed independently. Returns a filesystem
+    /// error if validation or restoration cannot read, replace, or remove a file.
+    pub fn restore_if_unchanged(
+        &self,
+        root: &Utf8Path,
+        expected: &ProjectMutationState,
+    ) -> Result<()> {
+        if self.files.len() != expected.files.len()
+            || self
+                .files
+                .iter()
+                .zip(&expected.files)
+                .any(|(before, after)| before.path != after.path)
+        {
+            return Err(CoreError::LockConflict(
+                "rollback state does not match the mutation journal write set; left project files untouched"
+                    .to_string(),
+            ));
+        }
+
+        for expected_file in &expected.files {
+            let live = Self::capture_file(root, &expected_file.path)?;
+            if live.contents != expected_file.contents {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently while cooldown was verifying a mutation; left project files untouched",
+                    root.join(&expected_file.path)
+                )));
+            }
+        }
+
+        self.restore(root)
+    }
+
     /// Restore every captured file entry under `root`.
     ///
     /// Entries whose captured contents are `None` are removed if they now exist.
@@ -666,7 +760,7 @@ impl ProjectMutationJournal {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(path, bytes)?;
+                    crate::fs::atomic_write(path.as_std_path(), bytes)?;
                 }
                 None => match std::fs::remove_file(&path) {
                     Ok(()) => {}
@@ -676,6 +770,69 @@ impl ProjectMutationJournal {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mutation_journal_tests {
+    use super::*;
+
+    fn root(directory: &tempfile::TempDir) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 tempdir")
+    }
+
+    #[test]
+    fn checked_restore_refuses_independent_drift() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = root(&directory);
+        let relative = Utf8Path::new("Cargo.toml");
+        std::fs::write(root.join(relative), "original").expect("write original");
+        let journal = ProjectMutationJournal {
+            files: vec![
+                ProjectMutationJournal::capture_file(&root, relative).expect("capture original"),
+            ],
+        };
+        std::fs::write(root.join(relative), "candidate").expect("write candidate");
+        let expected = journal.capture_state(&root).expect("capture candidate");
+        std::fs::write(root.join(relative), "external").expect("write external change");
+
+        let error = journal
+            .restore_if_unchanged(&root, &expected)
+            .expect_err("drift must block rollback");
+
+        assert!(matches!(error, CoreError::LockConflict(_)));
+        assert_eq!(
+            std::fs::read_to_string(root.join(relative)).expect("read live file"),
+            "external"
+        );
+    }
+
+    #[test]
+    fn checked_restore_replaces_and_removes_only_expected_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = root(&directory);
+        let existing = Utf8Path::new("Cargo.toml");
+        let created = Utf8Path::new("Cargo.lock");
+        std::fs::write(root.join(existing), "original").expect("write original");
+        let journal = ProjectMutationJournal {
+            files: vec![
+                ProjectMutationJournal::capture_file(&root, existing).expect("capture original"),
+                ProjectMutationJournal::capture_file(&root, created).expect("capture absence"),
+            ],
+        };
+        std::fs::write(root.join(existing), "candidate").expect("write candidate manifest");
+        std::fs::write(root.join(created), "candidate").expect("write candidate lock");
+        let expected = journal.capture_state(&root).expect("capture candidate");
+
+        journal
+            .restore_if_unchanged(&root, &expected)
+            .expect("restore journal");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(existing)).expect("read restored manifest"),
+            "original"
+        );
+        assert!(!root.join(created).exists());
     }
 }
 

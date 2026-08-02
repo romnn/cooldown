@@ -24,7 +24,7 @@ mod isolate;
 mod lock_view;
 mod observe;
 pub(crate) mod preserve;
-mod recovery;
+pub(crate) mod recovery;
 mod rewrite;
 
 pub(crate) use lock_view::LockEdgeView;

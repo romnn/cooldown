@@ -1,4 +1,5 @@
 use super::options::{ResolvedInvocation, StrictNativeMode};
+use crate::app::lock::ProjectReadGuard;
 use crate::app::{AdapterSet, ProjectCtx};
 use crate::discovery::ConfigSources;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -90,6 +91,10 @@ async fn assemble_ctx(
     let native = if assembly.no_native {
         None
     } else {
+        let _guard = ProjectReadGuard::acquire(&project.root)?;
+        if let Some(writer) = assembly.adapters.writer(tool) {
+            writer.ensure_no_pending_mutation(&project).await?;
+        }
         match assembly.adapters.reader(tool) {
             Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
             None => None,

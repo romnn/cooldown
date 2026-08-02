@@ -104,7 +104,7 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
 
-        let read_guard = match self.ws.project_read_guard(read.adapter, pctx).await {
+        let read_guard = match self.ws.project_read_guard(pctx).await {
             Ok(guard) => guard,
             Err(error) => {
                 self.errors.push(diag_from_error(

@@ -1,14 +1,13 @@
 use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
-use crate::app::lock::ProjectWriteGuard;
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
     DiagnosticKind, EdgeBindingAction, LockStatus, MajorKey, PackageId, Plan,
-    ProjectMutationJournal, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
-    UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
+    ProjectMutationJournal, ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason,
+    Skipped, Status, UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -177,6 +176,33 @@ struct TrialState {
     reconcile_needed: bool,
 }
 
+/// The pre-trial journal paired with the exact cooldown-produced state it may replace.
+#[derive(Default)]
+struct TrialRollback {
+    journal: ProjectMutationJournal,
+    expected: ProjectMutationState,
+}
+
+impl TrialRollback {
+    fn preserve(
+        &mut self,
+        root: &camino::Utf8Path,
+        journal: &ProjectMutationJournal,
+    ) -> cooldown_core::Result<()> {
+        preserve_rollback_entries(&mut self.journal, journal);
+        self.expected.extend_missing(journal.capture_state(root)?);
+        Ok(())
+    }
+
+    fn accept(&mut self, state: ProjectMutationState) {
+        self.expected.replace(state);
+    }
+
+    fn restore(&self, root: &camino::Utf8Path) -> cooldown_core::Result<()> {
+        self.journal.restore_if_unchanged(root, &self.expected)
+    }
+}
+
 /// The cohesive per-project upgrade state machine: dependency discovery, planning, group trials,
 /// rollback, and final verification.
 pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
@@ -221,7 +247,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     pub(super) async fn run(&mut self) {
-        let _guard = match ProjectWriteGuard::acquire(&self.ctx.pctx.project.root) {
+        let _guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
@@ -319,7 +345,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
     ) {
-        let _guard = match ProjectWriteGuard::acquire(&self.ctx.pctx.project.root) {
+        let _guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
@@ -410,7 +436,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .opts
             .progress
             .candidates(&lock_changes, "checking upgrade policy");
-        let mut rollback = ProjectMutationJournal::default();
+        let mut rollback = TrialRollback::default();
         let initial = self
             .try_upgrade_group(
                 lock_changes.clone(),
@@ -471,7 +497,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         lock_changes: Vec<Change>,
         baseline: &TrialState,
         state: &mut TrialState,
-        rollback: &mut ProjectMutationJournal,
+        rollback: &mut TrialRollback,
     ) {
         let selection = self
             .select_safe_upgrade_changes(lock_changes, baseline, state, rollback)
@@ -496,7 +522,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         lock_changes: Vec<Change>,
         baseline: &TrialState,
         state: &mut TrialState,
-        rollback: &mut ProjectMutationJournal,
+        rollback: &mut TrialRollback,
     ) -> UpgradeSelectionResult {
         // Selection trials always start from the same pre-lock graph and include every previously
         // accepted candidate. A later whole-graph resolve therefore cannot silently displace an
@@ -562,7 +588,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         rejected: Vec<RejectedUpgrade>,
         baseline: &TrialState,
         state: &mut TrialState,
-        rollback: &mut ProjectMutationJournal,
+        rollback: &mut TrialRollback,
     ) {
         self.ctx
             .opts
@@ -613,7 +639,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: Vec<Change>,
         policy_baseline: &HashSet<ViolationKey>,
         state: &mut TrialState,
-        rollback: &mut ProjectMutationJournal,
+        rollback: &mut TrialRollback,
     ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
         let lock_outcome = self
@@ -740,7 +766,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// the caller must stop recovering instead of running further trials.
     fn restore_upgrade_trial(
         &self,
-        snapshot: &ProjectMutationJournal,
+        snapshot: &TrialRollback,
         baseline: &TrialState,
         state: &mut TrialState,
         outcome: &mut BatchOutcome,
@@ -1156,7 +1182,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn reconcile_to_fixpoint(
         &mut self,
         state: &mut TrialState,
-        rollback: &mut ProjectMutationJournal,
+        rollback: &mut TrialRollback,
     ) -> Vec<BatchOutcome> {
         let mut outcomes = Vec::new();
         if !state.reconcile_needed {
@@ -1249,18 +1275,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &mut self,
         changes: Vec<Change>,
         state: &TrialState,
-        rollback: Option<&mut ProjectMutationJournal>,
+        mut rollback: Option<&mut TrialRollback>,
     ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
             return outcome;
         }
-        let plan = Plan {
-            changes: changes.clone(),
-            rewrite: self.ctx.opts.rewrite,
-            edge_policy: self.ctx.pctx.edge_policy,
-            baseline_violations: plan_baseline_violations(&state.baseline_violations),
-        };
+        let plan = self.batch_plan(&changes, state);
         let primary = changes
             .first()
             .map(|change| change.package.name.clone())
@@ -1284,13 +1305,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcome;
             }
         };
-        if let Some(rollback) = rollback {
-            preserve_rollback_entries(rollback, &journal);
+        if let Some(rollback) = rollback.as_deref_mut()
+            && let Err(error) = rollback.preserve(&self.ctx.pctx.project.root, &journal)
+        {
+            outcome
+                .errors
+                .push(self.project_diag(&error, Some(&primary)));
+            return outcome;
         }
 
         // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
         // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
-        let report = match super::super::resilient_apply::apply_resilient_with_observer(
+        let mutation = match super::super::resilient_apply::apply_resilient_with_observer(
             self.ctx.writer,
             &self.ctx.pctx.project,
             &plan,
@@ -1299,22 +1325,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         )
         .await
         {
-            Ok(report) => report,
+            Ok(mutation) => mutation,
             Err(error) => {
-                self.restore_journal_into_outcome(&journal, &mut outcome);
                 self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
         };
+        let expected = mutation.expected;
+        let report = mutation.report;
         if report.applied.is_empty() {
             self.add_batch_skips(&mut outcome, report.skipped);
-            self.restore_journal_into_outcome(&journal, &mut outcome);
+            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
             return outcome;
         }
         let report = match self.verify_apply_report(report, &changes).await {
             Ok(report) => report,
             Err(error) => {
-                self.restore_journal_into_outcome(&journal, &mut outcome);
+                self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
                 self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
@@ -1324,7 +1351,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if !report.planned_applied {
             // No requested target landed: roll any incidental resolver movement back to the captured
             // state instead of committing a collateral-only mutation.
-            self.restore_journal_into_outcome(&journal, &mut outcome);
+            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
             return outcome;
         }
 
@@ -1337,7 +1364,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await
         else {
-            self.restore_journal_into_outcome(&journal, &mut outcome);
+            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
             return outcome;
         };
 
@@ -1349,7 +1376,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             &report.applied,
             committed,
         );
+        if let Some(rollback) = rollback {
+            rollback.accept(expected);
+        }
         outcome
+    }
+
+    fn batch_plan(&self, changes: &[Change], state: &TrialState) -> Plan {
+        Plan {
+            changes: changes.to_vec(),
+            rewrite: self.ctx.opts.rewrite,
+            edge_policy: self.ctx.pctx.edge_policy,
+            baseline_violations: plan_baseline_violations(&state.baseline_violations),
+        }
     }
 
     fn classify_batch_report(
@@ -1610,9 +1649,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn restore_journal_into_outcome(
         &self,
         journal: &cooldown_core::ProjectMutationJournal,
+        expected: &cooldown_core::ProjectMutationState,
         outcome: &mut BatchOutcome,
     ) {
-        if let Err(error) = journal.restore(&self.ctx.pctx.project.root) {
+        if let Err(error) = journal.restore_if_unchanged(&self.ctx.pctx.project.root, expected) {
             outcome.errors.push(self.project_diag(&error, None));
         }
     }
@@ -2312,10 +2352,10 @@ fn plan_item(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlanMode, ViolationKey, candidate_scope, collapse_applied_legs, collateral_rows,
-        combine_lock_status, conflict_skip_message, is_downgrade, newly_introduced_violations,
-        planned_changes_landed, preserve_rollback_entries, sort_planned_changes, target_package,
-        verify_applied_targets,
+        PlanMode, TrialRollback, ViolationKey, candidate_scope, collapse_applied_legs,
+        collateral_rows, combine_lock_status, conflict_skip_message, is_downgrade,
+        newly_introduced_violations, planned_changes_landed, preserve_rollback_entries,
+        sort_planned_changes, target_package, verify_applied_targets,
     };
     use crate::app::{TransitiveGate, UpgradeItem};
     use cooldown_core::{
@@ -2388,6 +2428,36 @@ mod tests {
             Some(b"baseline lock".as_slice())
         );
         assert_eq!(rollback.files[1].path, "package.json");
+    }
+
+    #[test]
+    fn trial_rollback_refuses_to_overwrite_external_drift() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 tempdir");
+        let path = root.join("Cargo.toml");
+        std::fs::write(&path, b"original").expect("write original");
+        let journal = ProjectMutationJournal {
+            files: vec![ProjectMutationFile {
+                path: "Cargo.toml".into(),
+                contents: Some(b"original".to_vec()),
+            }],
+        };
+        let mut rollback = TrialRollback::default();
+        rollback.preserve(&root, &journal).expect("preserve trial");
+
+        std::fs::write(&path, b"cooldown candidate").expect("write candidate");
+        rollback.accept(journal.capture_state(&root).expect("capture candidate"));
+        std::fs::write(&path, b"external edit").expect("write external edit");
+
+        let error = rollback
+            .restore(&root)
+            .expect_err("drift must block rollback");
+        assert!(matches!(error, cooldown_core::CoreError::LockConflict(_)));
+        assert_eq!(
+            std::fs::read(path).expect("read external edit"),
+            b"external edit"
+        );
     }
 
     #[test]

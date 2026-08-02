@@ -146,10 +146,6 @@ impl ToolRead for CargoTool {
         version::classify_kind(from, to)
     }
 
-    async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
-        edges::enforce::ensure_no_pending(project)
-    }
-
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         edges::enforce::ensure_no_pending(project)?;
         let graph = self.cargo.metadata(&project.root).await?;
@@ -702,6 +698,10 @@ fn reached_after(
 
 #[async_trait]
 impl ToolWrite for CargoTool {
+    async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
+        edges::enforce::ensure_no_pending(project)
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `cargo update`/`generate-lockfile` validates every workspace member's declared targets, so
         // the throwaway copy must include `.rs` source — a member with an empty `src/` errors with "no

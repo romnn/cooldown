@@ -689,3 +689,31 @@ pub struct BaselineMeta {
     /// Whether the command computed the would-be baseline without writing it.
     pub dry_run: bool,
 }
+
+/// The flattened top-level `meta` for `recover`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryMeta {}
+
+/// Per-status counts for a recovery-only report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverySummary {
+    /// Projects whose interrupted state was restored.
+    pub recovered: usize,
+    /// Projects without interrupted state.
+    pub unchanged: usize,
+    /// Projects that could not be safely recovered.
+    pub errors: usize,
+}
+
+/// One project result in a recovery-only report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryItem {
+    /// The package manager token.
+    pub tool: String,
+    /// The project path relative to the repository root.
+    pub project: String,
+    /// The lowercase recovery outcome.
+    pub status: String,
+}

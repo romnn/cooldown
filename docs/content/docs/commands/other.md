@@ -89,3 +89,5 @@ cooldown recover
 Read-only commands fail closed when they find a pending transaction; they never repair it as a
 side effect. Recovery validates the recorded project and lock states before restoring anything,
 and leaves both the lock and recovery files untouched if the saved lock has changed independently.
+It discovers adapter-owned recovery artifacts directly, so malformed policy, manifest, baseline,
+or cache state cannot prevent the command from reporting and recovering an interrupted mutation.

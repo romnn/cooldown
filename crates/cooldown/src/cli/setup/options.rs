@@ -272,7 +272,7 @@ fn resolve_globs(cfg: &CommandConfig) -> Result<Vec<PatternGlob>, CoreError> {
 
 /// Select an interactive terminal display or a plain automation-friendly transcript. Diagnostic
 /// logging uses the plain form because tracing writes directly to stderr between progress events.
-fn progress_mode(global: &GlobalArgs) -> Progress {
+pub(super) fn progress_mode(global: &GlobalArgs) -> Progress {
     use std::io::IsTerminal;
 
     if global.no_progress {

@@ -65,6 +65,13 @@ pub(super) struct UpgradeCtx<'a> {
     pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
+    access: ProjectExecution,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectExecution {
+    Source,
+    Isolated,
 }
 
 impl<'a> UpgradeCtx<'a> {
@@ -73,17 +80,28 @@ impl<'a> UpgradeCtx<'a> {
         writer: &'a dyn ToolWrite,
         pctx: &'a super::ProjectCtx,
         opts: &'a RunOpts,
+        access: ProjectExecution,
     ) -> Self {
         UpgradeCtx {
             reader,
             writer,
             pctx,
             opts,
+            access,
         }
     }
 
     pub(super) fn tool_name(&self) -> &'static str {
         self.pctx.tool.as_str()
+    }
+
+    fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectWriteGuard>> {
+        match self.access {
+            ProjectExecution::Source => {
+                super::lock::ProjectWriteGuard::acquire(&self.pctx.project.root).map(Some)
+            }
+            ProjectExecution::Isolated => Ok(None),
+        }
     }
 }
 
@@ -147,7 +165,7 @@ impl Workspace {
             let dry_pctx;
             let effective_pctx = if opts.dry_run {
                 opts.progress.phase("preparing isolated dry-run project");
-                let copy = match self.project_read_guard(reader, pctx).await {
+                let copy = match self.project_read_guard(pctx).await {
                     Ok(_guard) => super::project_copy::ProjectCopy::create(
                         &pctx.project,
                         &writer.resolve_inputs(),
@@ -180,9 +198,14 @@ impl Workspace {
                 pctx
             };
 
+            let access = if opts.dry_run {
+                ProjectExecution::Isolated
+            } else {
+                ProjectExecution::Source
+            };
             ProjectUpgradeExecutor::new(
                 self,
-                UpgradeCtx::new(reader, writer, effective_pctx, opts),
+                UpgradeCtx::new(reader, writer, effective_pctx, opts, access),
                 mode,
                 &mut acc,
             )
@@ -209,7 +232,7 @@ impl Workspace {
             acc.errors.push(read_only_mutator_diag(pctx));
             return acc;
         };
-        let copy = match self.project_read_guard(reader, pctx).await {
+        let copy = match self.project_read_guard(pctx).await {
             Ok(_guard) => {
                 super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
             }
@@ -241,7 +264,13 @@ impl Workspace {
 
         ProjectUpgradeExecutor::new(
             self,
-            UpgradeCtx::new(reader, writer, &copied_pctx, &preview_opts),
+            UpgradeCtx::new(
+                reader,
+                writer,
+                &copied_pctx,
+                &preview_opts,
+                ProjectExecution::Isolated,
+            ),
             PlanMode::Upgrade,
             &mut acc,
         )

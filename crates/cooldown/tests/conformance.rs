@@ -151,15 +151,6 @@ impl ToolRead for FakeEco {
             workspace_root: true,
         }
     }
-    async fn ensure_no_pending_mutation(&self, _p: &Project) -> Result<()> {
-        let state = self.state.lock().unwrap();
-        if state.require_recovery_before_read && !state.recovery_completed {
-            return Err(CoreError::StaleLock(
-                "pending fake mutation; run `cooldown recover`".to_string(),
-            ));
-        }
-        Ok(())
-    }
     async fn dependencies(&self, _p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
         if state.require_recovery_before_read && !state.recovery_completed {
@@ -270,6 +261,16 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
+    async fn ensure_no_pending_mutation(&self, _p: &Project) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        if state.require_recovery_before_read && !state.recovery_completed {
+            return Err(CoreError::StaleLock(
+                "pending fake mutation; run `cooldown recover`".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn recover_pending_mutation(&self, _p: &Project) -> Result<bool> {
         self.state.lock().unwrap().recovery_completed = true;
         Ok(true)
@@ -554,25 +555,6 @@ async fn mutation_recovery_precedes_dependency_discovery() {
         .await;
 
     assert!(outcome.errors.is_empty());
-}
-
-#[tokio::test]
-async fn recovery_command_runs_only_the_recovery_lifecycle() {
-    let TmpRoot { guard: _g, root } = tmp_root();
-    let adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
-
-    let outcome = workspace(adapter, Baseline::default())
-        .recover(&opts())
-        .await;
-
-    assert_eq!(outcome.summary.recovered, 1);
-    assert_eq!(outcome.summary.unchanged, 0);
-    assert_eq!(outcome.summary.errors, 0);
-    assert!(matches!(
-        outcome.items[0].status,
-        cooldown::app::RecoveryStatus::Recovered
-    ));
-    assert_eq!(outcome.exit, Exit::Ok);
 }
 
 #[tokio::test]
@@ -3155,6 +3137,7 @@ async fn explain_applies_registry_scoped_rule() {
 struct RepoScopedFake {
     root: Utf8PathBuf,
     repo_writes: Arc<Mutex<usize>>,
+    recoveries: Arc<Mutex<Vec<Utf8PathBuf>>>,
     already_written: Mutex<bool>,
 }
 
@@ -3226,6 +3209,11 @@ impl ReleaseFetcher for RepoScopedFake {
 
 #[async_trait]
 impl ToolWrite for RepoScopedFake {
+    async fn recover_pending_mutation(&self, project: &Project) -> Result<bool> {
+        self.recoveries.lock().unwrap().push(project.root.clone());
+        Ok(false)
+    }
+
     async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         Ok(ProjectMutationJournal::default())
     }
@@ -3268,12 +3256,14 @@ impl ToolWrite for RepoScopedFake {
 async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
     let TmpRoot { guard: _dir, root } = tmp_root();
     let repo_writes = Arc::new(Mutex::new(0usize));
+    let recoveries = Arc::new(Mutex::new(Vec::new()));
     let fake = RepoScopedFake {
         root: root.clone(),
         repo_writes: Arc::clone(&repo_writes),
+        recoveries: Arc::clone(&recoveries),
         already_written: Mutex::new(false),
     };
-    // Two in-scope projects of the same repo-scoped tool must still trigger a single repo write.
+    // Two projects of the same repo-scoped tool must still trigger a single repo write.
     let contexts = ["a", "b"]
         .into_iter()
         .map(|rel| ProjectCtx {
@@ -3298,13 +3288,22 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() {
         vec![builtin_default_layer()],
     );
 
-    let out = ws.sync(&opts()).await;
+    let out = ws
+        .sync(&RunOpts {
+            source_dir: Some(root.join("a")),
+            ..opts()
+        })
+        .await;
     // Exactly one repo write and one item (labelled "." for the repo root), not one per project.
     assert_eq!(*repo_writes.lock().unwrap(), 1);
     assert_eq!(out.items.len(), 1);
     assert_eq!(out.items[0].project, ".");
     assert_eq!(out.items[0].status, cooldown::app::SyncStatus::Written);
     assert_eq!(out.summary.written, 1);
+    assert_eq!(
+        *recoveries.lock().unwrap(),
+        vec![root.join("a"), root.join("b")]
+    );
     // The default 7d window renders as the relative span uv re-evaluates each run.
     assert_eq!(out.items[0].window.as_deref(), Some("7d"));
 

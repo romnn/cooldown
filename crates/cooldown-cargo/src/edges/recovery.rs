@@ -1,4 +1,4 @@
-//! Owns durable and live state transitions for speculative `Cargo.lock` corrections.
+//! Owns restart-visible and live state transitions for speculative `Cargo.lock` corrections.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, Project, Result};
@@ -7,8 +7,9 @@ use std::io::Write;
 
 const RECOVERY_FORMAT: &str = "cooldown-cargo-lock-recovery-v2";
 const RECOVERY_STATE_FORMAT: &str = "cooldown-cargo-lock-recovery-state-v1";
+pub(crate) const RECOVERY_MARKER: &str = "Cargo.lock.cooldown-recovery";
 
-/// A speculative lock correction whose durable record remains authoritative until commit.
+/// A speculative lock correction whose recovery record remains authoritative until commit.
 ///
 /// The transaction keeps the original bytes immutable on disk and rewrites only a small digest
 /// record between isolation probes. Every transition verifies the live lock against its expected
@@ -75,6 +76,9 @@ impl SpeculativeLockTransaction {
             None,
         )?;
         let recovery_path = recovery_path(lock_path);
+        if !path_exists(&recovery_path)? {
+            clean_orphan_states(lock_path, None)?;
+        }
         let state_path = unique_state_path(lock_path);
         let state_file = state_path
             .file_name()
@@ -88,8 +92,8 @@ impl SpeculativeLockTransaction {
             original_lock: original_lock.to_string(),
         };
         let state = RecoveryState::new(original_lock, candidate_lock)?;
-        write_exclusive_json(&state_path, &state)?;
-        if let Err(error) = write_exclusive_json(&recovery_path, &record) {
+        publish_exclusive_json(&state_path, &state)?;
+        if let Err(error) = publish_exclusive_json(&recovery_path, &record) {
             let _ = remove_file(&state_path);
             return Err(error);
         }
@@ -250,6 +254,7 @@ impl SpeculativeLockTransaction {
         if read_json::<RecoveryState>(&self.state_path)? != self.state {
             return Err(untrusted_record(&self.state_path));
         }
+        clean_orphan_states(&self.lock_path, Some(&self.record.state_file))?;
         remove_file(&self.recovery_path)?;
         if let Err(error) = remove_file(&self.state_path) {
             tracing::warn!(
@@ -310,7 +315,7 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
     let lock_path = project.root.join("Cargo.lock");
     let recovery_path = recovery_path(&lock_path);
     if !path_exists(&recovery_path)? {
-        return Ok(false);
+        return Ok(clean_orphan_states(&lock_path, None)? > 0);
     }
     let record: RecoveryRecord = read_json(&recovery_path)?;
     record.validate(project, &lock_path, &recovery_path)?;
@@ -345,6 +350,7 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
             "could not remove recovered Cargo.lock state"
         );
     }
+    clean_orphan_states(&lock_path, None)?;
     Ok(true)
 }
 
@@ -361,7 +367,7 @@ pub(crate) fn ensure_no_pending(project: &Project) -> Result<()> {
 }
 
 fn recovery_path(lock_path: &Utf8Path) -> Utf8PathBuf {
-    lock_path.with_extension("lock.cooldown-recovery")
+    lock_path.with_file_name(RECOVERY_MARKER)
 }
 
 fn unique_state_path(lock_path: &Utf8Path) -> Utf8PathBuf {
@@ -444,27 +450,89 @@ fn path_exists(path: &Utf8Path) -> Result<bool> {
     }
 }
 
-fn write_exclusive_json<T: serde::Serialize>(path: &Utf8Path, value: &T) -> Result<()> {
+fn publish_exclusive_json<T: serde::Serialize>(path: &Utf8Path, value: &T) -> Result<()> {
     let contents =
         serde_json::to_vec(value).map_err(|error| CoreError::Serialization(error.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                CoreError::LockConflict(format!(
-                    "pending Cargo.lock transaction state already exists at {path}"
-                ))
-            } else {
-                error.into()
-            }
-        })?;
-    if let Err(error) = file.write_all(&contents).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(path);
-        return Err(error.into());
+    let temp = create_synced_private_file(path, &contents)?;
+    if let Err(error) = std::fs::hard_link(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CoreError::LockConflict(format!(
+                "pending Cargo.lock transaction state already exists at {path}"
+            ))
+        } else {
+            error.into()
+        });
     }
+    #[cfg(unix)]
+    sync_parent_directory(path)?;
+    remove_file(&temp)?;
     Ok(())
+}
+
+fn create_synced_private_file(path: &Utf8Path, contents: &[u8]) -> Result<Utf8PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Utf8Path::new(""));
+    let name = path
+        .file_name()
+        .ok_or_else(|| CoreError::PathEncoding(format!("path has no file name: {path}")))?;
+    for attempt in 0..100_u8 {
+        let temp = parent.join(format!(
+            ".{name}.{}.{}.publish",
+            std::process::id(),
+            attempt
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        return Ok(temp);
+    }
+    Err(CoreError::Filesystem(format!(
+        "could not create a private recovery file for {path}"
+    )))
+}
+
+fn clean_orphan_states(lock_path: &Utf8Path, referenced: Option<&str>) -> Result<usize> {
+    let parent = lock_path.parent().unwrap_or_else(|| Utf8Path::new(""));
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if referenced == Some(name.as_str()) {
+            continue;
+        }
+        let Ok(path) = validated_state_path(lock_path, &name) else {
+            continue;
+        };
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_slice::<RecoveryState>(&contents) else {
+            continue;
+        };
+        if state.validate(&path).is_err() {
+            continue;
+        }
+        remove_file(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Utf8Path) -> Result<T> {
@@ -478,10 +546,21 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Utf8Path) -> Result<T> {
 
 fn remove_file(path: &Utf8Path) -> Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(unix)]
+            sync_parent_directory(path)?;
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Utf8Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Utf8Path::new(""));
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn untrusted_record(path: &Utf8Path) -> CoreError {
@@ -662,6 +741,38 @@ mod tests {
         assert_eq!(marker.original_lock, "original");
         assert_eq!(state.previous_digest, lock_digest("original"));
         assert_eq!(state.candidate_digest, lock_digest("candidate"));
+    }
+
+    #[test]
+    fn recovery_cleans_a_valid_unreferenced_state_file() {
+        let (_dir, project, lock_path) = setup();
+        let state_path = unique_state_path(&lock_path);
+        let state = RecoveryState::new("original", "candidate").expect("build state");
+        publish_exclusive_json(&state_path, &state).expect("publish orphan state");
+
+        assert!(recover_pending(&project).expect("clean orphan state"));
+        assert!(!state_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("read lock"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn exclusive_publication_never_clobbers_an_existing_marker() {
+        let (_dir, _project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        cooldown_core::fs::atomic_write(marker.as_std_path(), b"user data")
+            .expect("write existing marker");
+        let state = RecoveryState::new("original", "candidate").expect("build state");
+
+        let error = publish_exclusive_json(&marker, &state).expect_err("reject existing marker");
+
+        assert!(matches!(error, CoreError::LockConflict(_)));
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "user data"
+        );
     }
 
     #[test]

@@ -18,8 +18,8 @@
 use std::collections::HashSet;
 
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal, Result, SkipReason,
-    Skipped, ToolWrite,
+    ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal,
+    ProjectMutationState, Result, SkipReason, Skipped, ToolWrite,
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
@@ -31,7 +31,15 @@ async fn apply_resilient(
     plan: &Plan,
     journal: &ProjectMutationJournal,
 ) -> Result<ApplyReport> {
-    apply_resilient_with_observer(writer, project, plan, journal, &()).await
+    apply_resilient_with_observer(writer, project, plan, journal, &())
+        .await
+        .map(|mutation| mutation.report)
+}
+
+/// A successful apply and the exact project state it left for later verification.
+pub(crate) struct AppliedMutation {
+    pub(crate) report: ApplyReport,
+    pub(crate) expected: ProjectMutationState,
 }
 
 /// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the
@@ -50,38 +58,59 @@ pub(crate) async fn apply_resilient_with_observer(
     plan: &Plan,
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
-) -> Result<ApplyReport> {
-    match writer
+) -> Result<AppliedMutation> {
+    let first = writer
         .apply_with_observer(project, plan, journal, observer)
-        .await
-    {
-        Ok(report) => return Ok(report),
+        .await;
+    let first_state = journal.capture_state(&project.root)?;
+    match first {
+        Ok(report) => {
+            return Ok(AppliedMutation {
+                report,
+                expected: first_state,
+            });
+        }
         // A broken local environment (missing binary, full disk, read-only tree, corrupt store, an
         // unreadable lock) is not a per-candidate conflict — propagate it rather than bisecting the
         // plan and misreporting every candidate as held.
-        Err(err) if err.is_local_environment_failure() => return Err(err),
+        Err(error) if error.is_local_environment_failure() => {
+            journal.restore_if_unchanged(&project.root, &first_state)?;
+            return Err(error);
+        }
         // The set is unsatisfiable as a whole. Fall through to isolate the culprits and apply the rest.
         Err(_) => {}
     }
 
-    let accepted = maximal_satisfiable_subset(writer, project, plan, journal, observer).await?;
+    let (accepted, trial_state) =
+        maximal_satisfiable_subset(writer, project, plan, journal, first_state, observer).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
     let accepted_keys: HashSet<ChangeTargetKey> = accepted.iter().map(change_target_key).collect();
 
     // Commit exactly the accepted subset (restore first so the failed full-set attempt leaves nothing).
-    journal.restore(&project.root)?;
-    let mut report = if accepted.is_empty() {
-        ApplyReport::default()
+    journal.restore_if_unchanged(&project.root, &trial_state)?;
+    let (mut report, expected) = if accepted.is_empty() {
+        (
+            ApplyReport::default(),
+            journal.capture_state(&project.root)?,
+        )
     } else {
         let committed = Plan {
             changes: accepted,
             ..plan.clone()
         };
-        writer
+        let result = writer
             .apply_with_observer(project, &committed, journal, observer)
-            .await?
+            .await;
+        let expected = journal.capture_state(&project.root)?;
+        match result {
+            Ok(report) => (report, expected),
+            Err(error) => {
+                journal.restore_if_unchanged(&project.root, &expected)?;
+                return Err(error);
+            }
+        }
     };
 
     // Every candidate the subset excluded is held: the resolve could not place it.
@@ -91,7 +120,7 @@ pub(crate) async fn apply_resilient_with_observer(
             report.skipped.push(held(change));
         }
     }
-    Ok(report)
+    Ok(AppliedMutation { report, expected })
 }
 
 /// The largest subset of `changes` that `apply` can resolve together, found by delta-debugging
@@ -108,32 +137,37 @@ async fn maximal_satisfiable_subset(
     project: &Project,
     plan: &Plan,
     journal: &ProjectMutationJournal,
+    mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
-) -> Result<Vec<Change>> {
+) -> Result<(Vec<Change>, ProjectMutationState)> {
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
     push_halves(&mut work, plan.changes.clone());
 
     while let Some(group) = work.pop() {
-        journal.restore(&project.root)?;
+        journal.restore_if_unchanged(&project.root, &current_state)?;
         let trial = Plan {
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
             ..plan.clone()
         };
-        match writer
+        let result = writer
             .apply_with_observer(project, &trial, journal, observer)
-            .await
-        {
+            .await;
+        current_state = journal.capture_state(&project.root)?;
+        match result {
             Ok(_) => accepted.extend(group),
             // A broken local environment surfacing mid-recovery must propagate, not be charged to
             // whichever candidates happen to be in this trial group.
-            Err(err) if err.is_local_environment_failure() => return Err(err),
+            Err(error) if error.is_local_environment_failure() => {
+                journal.restore_if_unchanged(&project.root, &current_state)?;
+                return Err(error);
+            }
             // The group cannot join `accepted`: split it, or drop it if it is a single culprit.
             Err(_) if group.len() > 1 => push_halves(&mut work, group),
             Err(_) => {}
         }
     }
-    Ok(accepted)
+    Ok((accepted, current_state))
 }
 
 /// Split `group` in two and push the halves so the left half is processed first (LIFO work-list).

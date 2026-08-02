@@ -17,5 +17,29 @@ use cooldown_core::ToolId;
 /// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
 pub const CARGO_ID: ToolId = ToolId("cargo");
 
+/// The project-relative marker for an interrupted Cargo lock-edge transaction.
+pub const RECOVERY_MARKER: &str = edges::recovery::RECOVERY_MARKER;
+
+/// Restores an interrupted Cargo lock-edge transaction rooted at `project_root`.
+///
+/// This recovery-only entry point performs no manifest parsing, registry setup, or Cargo command.
+/// The caller must hold exclusive access for the project root.
+///
+/// # Errors
+///
+/// Returns a [`cooldown_core::CoreError`] when recovery state is malformed, belongs to another
+/// project, no longer matches the live lock, or cannot be read or restored safely.
+pub fn recover_interrupted_mutation(
+    project_root: &camino::Utf8Path,
+) -> cooldown_core::Result<bool> {
+    let project = cooldown_core::Project {
+        root: project_root.to_owned(),
+        manifest: project_root.join("Cargo.toml"),
+        kind: CARGO_ID,
+        exclude_newer: None,
+    };
+    edges::enforce::recover_pending(&project)
+}
+
 pub use index::CratesIoIndex;
 pub use tool::CargoTool;

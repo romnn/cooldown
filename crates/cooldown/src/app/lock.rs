@@ -21,13 +21,24 @@ impl ProjectReadGuard {
     /// Acquires shared access, failing immediately while a writer owns the project.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
         let (path, file) = open_project_lock(root)?;
+        Self::acquire_file(&path, file)
+    }
+
+    fn acquire_file(path: &Path, file: File) -> Result<Self, CoreError> {
         match file.try_lock_shared() {
             Ok(()) => Ok(ProjectReadGuard { file }),
             Err(TryLockError::WouldBlock) => {
-                Err(lock_conflict(&path, "a mutating cooldown run", true))
+                Err(lock_conflict(path, "a mutating cooldown run", true))
             }
-            Err(TryLockError::Error(error)) => Err(lock_error(&path, &error)),
+            Err(TryLockError::Error(error)) => Err(lock_error(path, &error)),
         }
+    }
+
+    #[cfg(test)]
+    fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
+        let path = directory.join(lock_file_name(root));
+        let file = open_lock_file(&path)?;
+        Self::acquire_file(&path, file)
     }
 }
 
@@ -35,12 +46,21 @@ impl ProjectWriteGuard {
     /// Acquires exclusive access, failing immediately while another reader or writer is active.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
         let (path, mut file) = open_project_lock(root)?;
+        Self::acquire_file(root, &path, &mut file)?;
+        Ok(ProjectWriteGuard { file })
+    }
+
+    fn acquire_file(
+        root: &camino::Utf8Path,
+        path: &Path,
+        file: &mut File,
+    ) -> Result<(), CoreError> {
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                return Err(lock_conflict(&path, "another cooldown run", false));
+                return Err(lock_conflict(path, "another cooldown run", false));
             }
-            Err(TryLockError::Error(error)) => return Err(lock_error(&path, &error)),
+            Err(TryLockError::Error(error)) => return Err(lock_error(path, &error)),
         }
 
         file.set_len(0)?;
@@ -53,12 +73,15 @@ impl ProjectWriteGuard {
         );
         let _ = file.sync_data();
         tracing::trace!(path = %path.display(), "acquired exclusive project access");
-        Ok(ProjectWriteGuard { file })
+        Ok(())
     }
 
     #[cfg(test)]
-    fn path_for_test(root: &camino::Utf8Path) -> PathBuf {
-        lock_path(root)
+    fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
+        let path = directory.join(lock_file_name(root));
+        let mut file = open_lock_file(&path)?;
+        Self::acquire_file(root, &path, &mut file)?;
+        Ok(ProjectWriteGuard { file })
     }
 }
 
@@ -174,18 +197,21 @@ mod tests {
     fn readers_can_share_project_access() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let _first = ProjectReadGuard::acquire(root).expect("first reader");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let _first = ProjectReadGuard::acquire_in(root, locks.path()).expect("first reader");
 
-        ProjectReadGuard::acquire(root).expect("second reader");
+        ProjectReadGuard::acquire_in(root, locks.path()).expect("second reader");
     }
 
     #[test]
     fn reader_and_writer_exclude_each_other() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let _reader = ProjectReadGuard::acquire(root).expect("reader");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let _reader = ProjectReadGuard::acquire_in(root, locks.path()).expect("reader");
 
-        let error = ProjectWriteGuard::acquire(root).expect_err("writer must fail");
+        let error =
+            ProjectWriteGuard::acquire_in(root, locks.path()).expect_err("writer must fail");
         assert!(matches!(error, CoreError::LockConflict(_)));
     }
 
@@ -193,14 +219,15 @@ mod tests {
     fn writer_excludes_readers_and_writers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let _writer = ProjectWriteGuard::acquire(root).expect("writer");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let _writer = ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer");
 
         assert!(matches!(
-            ProjectReadGuard::acquire(root).expect_err("reader must fail"),
+            ProjectReadGuard::acquire_in(root, locks.path()).expect_err("reader must fail"),
             CoreError::LockConflict(_)
         ));
         assert!(matches!(
-            ProjectWriteGuard::acquire(root).expect_err("second writer must fail"),
+            ProjectWriteGuard::acquire_in(root, locks.path()).expect_err("second writer must fail"),
             CoreError::LockConflict(_)
         ));
     }
@@ -209,26 +236,25 @@ mod tests {
     fn write_access_can_be_reacquired_after_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let locks = tempfile::tempdir().expect("lock dir");
 
         {
-            let _guard = ProjectWriteGuard::acquire(root).expect("first writer");
+            let _guard = ProjectWriteGuard::acquire_in(root, locks.path()).expect("first writer");
         }
 
-        ProjectWriteGuard::acquire(root).expect("writer reacquired");
+        ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer reacquired");
     }
 
     #[test]
     fn project_access_does_not_create_repo_local_lock_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let locks = tempfile::tempdir().expect("lock dir");
         let repo_local = root.join(".cooldown.lock");
 
-        let _guard = ProjectWriteGuard::acquire(root).expect("writer acquired");
+        let _guard = ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer acquired");
 
         assert!(!repo_local.exists());
-        assert_ne!(
-            ProjectWriteGuard::path_for_test(root),
-            repo_local.as_std_path()
-        );
+        assert!(!locks.path().join(".cooldown.lock").exists());
     }
 }

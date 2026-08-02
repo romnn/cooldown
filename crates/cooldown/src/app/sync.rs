@@ -3,12 +3,18 @@
 //! someone runs by hand still respects the window. Tools without a native cooldown concept (Go,
 //! Cargo) report `unsupported`; nothing is written for them.
 
+use super::lock::{ProjectReadGuard, ProjectWriteGuard};
 use super::{Exit, RunOpts, Workspace, diag_from_error};
 use camino::Utf8Path;
 use cooldown_core::{
     Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, SyncScope, ToolId,
-    WindowSpec, resolve,
+    ToolWrite, WindowSpec, resolve,
 };
+
+enum SyncAccessGuard {
+    Read { _guard: ProjectReadGuard },
+    Write { _guard: ProjectWriteGuard },
+}
 
 /// What happened when syncing one project's native config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +104,8 @@ impl Workspace {
     /// A [`SyncScope::Project`] tool is synced per in-scope project (its manifest's native field).
     /// A [`SyncScope::Repo`] tool's single repo-level file (uv's root `uv.toml`) is resolved against
     /// the repo-wide cascade and written **exactly once per tool**, no matter how many of its
-    /// projects are in scope — so concurrent project upgrades never race on the shared file. A
+    /// projects are in scope. Its write lease covers every detected project that consumes that
+    /// shared file. A
     /// [`SyncScope::None`] tool reports a single `unsupported` item.
     ///
     /// Idempotent: a target already in sync is reported `unchanged` and not rewritten. Fail-soft: a
@@ -149,13 +156,24 @@ impl Workspace {
                     }
                 }
                 SyncScope::Repo => {
-                    let _progress: Vec<_> = self
+                    let scoped_projects: Vec<_> = self
                         .scoped_projects(opts)
                         .filter(|project| project.tool == tool)
+                        .collect();
+                    let _progress: Vec<_> = scoped_projects
+                        .iter()
                         .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
                         .collect();
+                    let protected_projects: Vec<_> = self
+                        .projects()
+                        .iter()
+                        .filter(|project| project.tool == tool)
+                        .collect();
                     opts.progress.phase("syncing repository-native policy");
-                    items.push(self.sync_repo(writer, tool, opts, &mut summary).await);
+                    items.push(
+                        self.sync_repo(writer, tool, opts, &protected_projects, &mut summary)
+                            .await,
+                    );
                 }
                 SyncScope::None => {
                     let _progress: Vec<_> = self
@@ -219,10 +237,15 @@ impl Workspace {
             // alongside the default window, so a cooldown-exempt package is exempt natively too.
             exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
         };
-        match writer
-            .write_native(&pctx.project, &policy, opts.dry_run)
-            .await
-        {
+        let result = match acquire_sync_access(writer, pctx, opts.dry_run).await {
+            Ok(_guard) => {
+                writer
+                    .write_native(&pctx.project, &policy, opts.dry_run)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
@@ -256,6 +279,7 @@ impl Workspace {
         writer: &dyn cooldown_core::ToolWrite,
         tool: ToolId,
         opts: &RunOpts,
+        projects: &[&super::ProjectCtx],
         summary: &mut SyncSummary,
     ) -> SyncItem {
         let project = repo_relative_root();
@@ -275,10 +299,15 @@ impl Workspace {
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
         };
-        match writer
-            .write_repo_native(self.repo_root(), &policy, opts.dry_run)
-            .await
-        {
+        let result = match acquire_repo_sync_access(writer, projects, opts.dry_run).await {
+            Ok(_guards) => {
+                writer
+                    .write_repo_native(self.repo_root(), &policy, opts.dry_run)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
@@ -305,6 +334,37 @@ impl Workspace {
             }
         }
     }
+}
+
+async fn acquire_sync_access(
+    writer: &dyn ToolWrite,
+    pctx: &super::ProjectCtx,
+    dry_run: bool,
+) -> cooldown_core::Result<SyncAccessGuard> {
+    if dry_run {
+        let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
+        writer.ensure_no_pending_mutation(&pctx.project).await?;
+        Ok(SyncAccessGuard::Read { _guard: guard })
+    } else {
+        let guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
+        writer.recover_pending_mutation(&pctx.project).await?;
+        Ok(SyncAccessGuard::Write { _guard: guard })
+    }
+}
+
+async fn acquire_repo_sync_access(
+    writer: &dyn ToolWrite,
+    projects: &[&super::ProjectCtx],
+    dry_run: bool,
+) -> cooldown_core::Result<Vec<SyncAccessGuard>> {
+    let mut projects = projects.to_vec();
+    projects.sort_by(|left, right| left.project.root.cmp(&right.project.root));
+    projects.dedup_by(|left, right| left.project.root == right.project.root);
+    let mut guards = Vec::with_capacity(projects.len());
+    for project in projects {
+        guards.push(acquire_sync_access(writer, project, dry_run).await?);
+    }
+    Ok(guards)
 }
 
 /// The repo root as a repo-relative path: always `.`.

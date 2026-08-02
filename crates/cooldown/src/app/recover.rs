@@ -1,8 +1,10 @@
 //! `recover` — restore adapter-owned project state left by an interrupted mutation, then stop.
 
 use super::lock::ProjectWriteGuard;
-use super::{Exit, RunOpts, Workspace, diag_from_error};
-use cooldown_core::Diagnostic;
+use super::progress::Progress;
+use super::{Exit, diag_from_error};
+use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_core::{Diagnostic, ToolId};
 
 /// What happened while recovering one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,70 +63,78 @@ pub struct RecoveryOutcome {
     pub exit: Exit,
 }
 
-impl Workspace {
-    /// Recovers interrupted adapter mutations under exclusive project access without continuing
-    /// into dependency resolution or another mutation.
-    pub async fn recover(&self, opts: &RunOpts) -> RecoveryOutcome {
-        let mut summary = RecoverySummary::default();
-        let mut items = Vec::new();
-        for pctx in self.scoped_projects(opts) {
-            let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
-            opts.progress.phase("checking interrupted project state");
-            let project = pctx.rel_path.to_string();
-            let Some(writer) = self.mutator(pctx.tool) else {
-                summary.unchanged += 1;
-                items.push(RecoveryItem {
-                    tool: pctx.tool.as_str().to_string(),
-                    project,
-                    status: RecoveryStatus::Unchanged,
-                    error: None,
-                });
-                continue;
-            };
-            let result = match ProjectWriteGuard::acquire(&pctx.project.root) {
-                Ok(_guard) => writer.recover_pending_mutation(&pctx.project).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(true) => {
-                    summary.recovered += 1;
-                    items.push(RecoveryItem {
-                        tool: pctx.tool.as_str().to_string(),
-                        project,
-                        status: RecoveryStatus::Recovered,
-                        error: None,
-                    });
-                }
-                Ok(false) => {
-                    summary.unchanged += 1;
-                    items.push(RecoveryItem {
-                        tool: pctx.tool.as_str().to_string(),
-                        project,
-                        status: RecoveryStatus::Unchanged,
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    summary.errors += 1;
-                    let diagnostic = diag_from_error(&error, pctx.tool, &project, None);
-                    items.push(RecoveryItem {
-                        tool: pctx.tool.as_str().to_string(),
-                        project,
-                        status: RecoveryStatus::Error,
-                        error: Some(diagnostic),
-                    });
-                }
+type RecoverProject = fn(&Utf8Path) -> cooldown_core::Result<bool>;
+
+/// A project found from adapter-owned recovery artifacts without normal policy bootstrap.
+pub(crate) struct RecoveryTarget {
+    pub(crate) tool: ToolId,
+    pub(crate) root: Utf8PathBuf,
+    pub(crate) project: String,
+    recover: RecoverProject,
+}
+
+impl RecoveryTarget {
+    pub(crate) fn new(
+        tool: ToolId,
+        root: Utf8PathBuf,
+        project: String,
+        recover: RecoverProject,
+    ) -> Self {
+        RecoveryTarget {
+            tool,
+            root,
+            project,
+            recover,
+        }
+    }
+}
+
+/// Recovers pre-discovered targets without loading policy, manifests, baselines, or registries.
+pub(crate) fn recover_targets(
+    targets: Vec<RecoveryTarget>,
+    progress: &Progress,
+) -> RecoveryOutcome {
+    let mut summary = RecoverySummary::default();
+    let mut items = Vec::new();
+    for target in targets {
+        let _progress = progress.project(target.tool, &target.project);
+        progress.phase("checking interrupted project state");
+        let result = match ProjectWriteGuard::acquire(&target.root) {
+            Ok(_guard) => (target.recover)(&target.root),
+            Err(error) => Err(error),
+        };
+        let (status, error) = match result {
+            Ok(true) => {
+                summary.recovered += 1;
+                (RecoveryStatus::Recovered, None)
             }
-        }
-        items.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.tool.cmp(&b.tool)));
-        RecoveryOutcome {
-            summary,
-            items,
-            exit: if summary.errors == 0 {
-                Exit::Ok
-            } else {
-                Exit::Environment
-            },
-        }
+            Ok(false) => {
+                summary.unchanged += 1;
+                (RecoveryStatus::Unchanged, None)
+            }
+            Err(error) => {
+                summary.errors += 1;
+                (
+                    RecoveryStatus::Error,
+                    Some(diag_from_error(&error, target.tool, &target.project, None)),
+                )
+            }
+        };
+        items.push(RecoveryItem {
+            tool: target.tool.as_str().to_string(),
+            project: target.project,
+            status,
+            error,
+        });
+    }
+    items.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.tool.cmp(&b.tool)));
+    RecoveryOutcome {
+        summary,
+        items,
+        exit: if summary.errors == 0 {
+            Exit::Ok
+        } else {
+            Exit::Environment
+        },
     }
 }

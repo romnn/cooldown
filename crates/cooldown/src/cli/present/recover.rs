@@ -1,28 +1,6 @@
 use crate::app::{RecoveryItem, RecoverySummary};
-use serde::Serialize;
+use cooldown_render::{RecoveryItem as RecoveryItemJson, RecoverySummary as RecoverySummaryJson};
 use std::fmt::Write as _;
-
-/// The `recover` JSON metadata object.
-#[derive(Serialize, Clone)]
-pub(in crate::cli) struct RecoveryMeta {}
-
-/// Per-status recovery counts in JSON output.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::cli) struct RecoverySummaryJson {
-    recovered: usize,
-    unchanged: usize,
-    errors: usize,
-}
-
-/// One project recovery result in JSON output.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::cli) struct RecoveryItemJson {
-    tool: String,
-    project: String,
-    status: String,
-}
 
 pub(in crate::cli) fn recovery_summary(summary: &RecoverySummary) -> RecoverySummaryJson {
     RecoverySummaryJson {
@@ -57,6 +35,9 @@ pub(in crate::cli) fn render_recovery_text(
             item.tool,
             item.status.token()
         );
+        if let Some(error) = &item.error {
+            let _ = writeln!(out, "    error [{}]: {}", error.kind, error.message);
+        }
     }
     if !items.is_empty() {
         out.push('\n');
@@ -67,4 +48,38 @@ pub(in crate::cli) fn render_recovery_text(
         summary.recovered, summary.unchanged, summary.errors
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::RecoveryStatus;
+    use cooldown_core::{Diagnostic, DiagnosticKind};
+
+    #[test]
+    fn recovery_error_text_includes_the_actionable_diagnostic() {
+        let item = RecoveryItem {
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            status: RecoveryStatus::Error,
+            error: Some(Diagnostic::new(
+                DiagnosticKind::LockConflict,
+                "Cargo.lock changed independently; left recovery state untouched",
+            )),
+        };
+
+        let rendered = render_recovery_text(
+            &RecoverySummary {
+                recovered: 0,
+                unchanged: 0,
+                errors: 1,
+            },
+            &[item],
+        );
+
+        assert!(rendered.contains(". (cargo): error"));
+        assert!(rendered.contains(
+            "error [lock_conflict]: Cargo.lock changed independently; left recovery state untouched"
+        ));
+    }
 }

@@ -8,8 +8,9 @@
   the documented fields on `PathVersionSplit`, `NameVersion`, `ResolvedInstance`, `ResolvedDep`,
   and `ResolvedPin`.
 - **Breaking library API:** `ToolWrite::recover_pending_mutation` now returns whether recovery
-  changed project state, and `ToolRead::ensure_no_pending_mutation` lets adapters fail a shared read
-  session without performing recovery.
+  changed project state, and `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side
+  adapter fail a shared read session without performing recovery. `ProjectMutationState` pairs a
+  rollback journal with the exact post-apply state it may replace.
 - Add a cargo `--cargo-edge-policy` for resolved lock **edge bindings** (`preserve` |
   `canonicalize` | `none`; config `[tool.cargo] edge-policy` — cargo-specific, so the key is
   tool-scoped and rejected under any other selector). An incremental re-resolve can silently
@@ -27,10 +28,12 @@
   source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
   version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level
   `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
-  fails `--strict`. Speculative lock corrections use durable, drift-checked transactions; the new
-  `recover` command restores a validated interrupted transaction without continuing into another
-  mutation. Config follows the per-project repository cascade, and the closed JSON contract is
-  schema v4.
+  fails `--strict`. Speculative lock corrections use atomically published, drift-checked recovery
+  records, and outer manifest/lock rollback refuses to overwrite independent edits. The new
+  `recover` command discovers recovery artifacts without loading policy, manifests, baselines, or
+  registries, then restores a validated interrupted transaction without continuing into another
+  mutation. Project reads and native-policy sync share the same resource leases. Config follows the
+  per-project repository cascade, and the closed JSON contract is schema v4.
 
 ## v0.0.12
 

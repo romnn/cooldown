@@ -180,7 +180,7 @@ impl<'a> CheckRunner<'a> {
         if matches!(&refreshed, Some(LockProbe::Skip)) {
             return;
         }
-        let read_guard = match self.ws.project_read_guard(read.adapter, pctx).await {
+        let read_guard = match self.ws.project_read_guard(pctx).await {
             Ok(guard) => guard,
             Err(error) => {
                 self.acc.errors.push(diag_from_error(

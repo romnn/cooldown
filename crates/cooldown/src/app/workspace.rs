@@ -509,11 +509,12 @@ impl Workspace {
     /// Starts a read session and checks adapter-owned pending state without mutating it.
     pub(crate) async fn project_read_guard(
         &self,
-        adapter: &dyn ToolRead,
         pctx: &ProjectCtx,
     ) -> cooldown_core::Result<ProjectReadGuard> {
         let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
-        adapter.ensure_no_pending_mutation(&pctx.project).await?;
+        if let Some(writer) = self.mutator(pctx.tool) {
+            writer.ensure_no_pending_mutation(&pctx.project).await?;
+        }
         Ok(guard)
     }
 

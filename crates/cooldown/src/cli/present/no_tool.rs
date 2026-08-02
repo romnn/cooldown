@@ -28,7 +28,7 @@ fn no_tool_recover(generated_at: String, error: Diagnostic) -> Result<String, Co
             "recover",
             false,
             generated_at,
-            super::RecoveryMeta {},
+            render::RecoveryMeta {},
             summary,
             items,
         ),

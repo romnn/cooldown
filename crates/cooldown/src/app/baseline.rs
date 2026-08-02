@@ -183,7 +183,7 @@ impl crate::app::Workspace {
             let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
-            let read_guard = self.project_read_guard(adapter, pctx).await?;
+            let read_guard = self.project_read_guard(pctx).await?;
             let deps = self
                 .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
                 .await?;

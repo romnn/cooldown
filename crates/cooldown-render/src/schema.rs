@@ -329,7 +329,7 @@ pub fn json_schema() -> Value {
                 "dependentVersion": { "type": "string" },
                 "dependentSource": { "type": "string" },
                 "action": { "enum": edge_actions },
-                "detail": { "type": "string" }
+                "detail": { "type": "string", "minLength": 1 }
             },
             "additionalProperties": false
         },
@@ -586,8 +586,8 @@ mod tests {
         BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
         CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
         ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
-        OutdatedSummary, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
-        Window,
+        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoverySummary, SkippedInfo, UpgradeEdgeInfo,
+        UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
     use cooldown_core::{
         Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
@@ -612,6 +612,10 @@ mod tests {
     #[test]
     fn edge_discriminator_conditions_enforce_row_invariants() {
         let schema = json_schema();
+        assert_eq!(
+            schema["$defs"]["upgradeEdgeInfo"]["properties"]["detail"]["minLength"],
+            1
+        );
         let conditions = schema["$defs"]["upgradeItem"]["allOf"]
             .as_array()
             .expect("edge action conditions");
@@ -737,6 +741,8 @@ mod tests {
         assert_def_keys(schema, "configItem", config_item());
         assert_def_keys(schema, "baselineSummary", baseline_summary());
         assert_def_keys(schema, "baselineItem", baseline_item());
+        assert_def_keys(schema, "recoverySummary", recovery_summary());
+        assert_def_keys(schema, "recoveryItem", recovery_item());
     }
 
     fn assert_envelope_keys_match(schema: &Value) {
@@ -824,6 +830,18 @@ mod tests {
                 vec![baseline_item()],
             ),
         );
+        assert_envelope_keys(
+            schema,
+            "recover",
+            Envelope::new(
+                "recover",
+                true,
+                generated_at(),
+                RecoveryMeta {},
+                recovery_summary(),
+                vec![recovery_item()],
+            ),
+        );
     }
 
     fn assert_def_keys<T: Serialize>(schema: &Value, def_name: &str, value: T) {
@@ -879,6 +897,22 @@ mod tests {
             .with_version("1.0.0")
             .with_registry("crates.io")
             .with_path("Cargo.toml")
+    }
+
+    fn recovery_summary() -> RecoverySummary {
+        RecoverySummary {
+            recovered: 1,
+            unchanged: 2,
+            errors: 0,
+        }
+    }
+
+    fn recovery_item() -> RecoveryItem {
+        RecoveryItem {
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            status: "recovered".to_string(),
+        }
     }
 
     fn member() -> MemberRef {
