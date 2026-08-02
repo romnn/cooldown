@@ -361,6 +361,7 @@ impl ToolWrite for FakeEco {
             applied,
             skipped: Vec::new(),
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
+            warnings: Vec::new(),
         })
     }
     async fn build(&self, _p: &Project) -> Result<VerifyReport> {
@@ -380,20 +381,23 @@ impl ToolWrite for FakeEco {
         _policy: EdgePolicy,
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
-    ) -> Result<Vec<EdgeRebind>> {
+    ) -> Result<cooldown_core::EdgeNormalizationReport> {
         if before.is_none() {
-            return Ok(Vec::new());
+            return Ok(cooldown_core::EdgeNormalizationReport::default());
         }
-        Ok(committed
-            .iter()
-            .filter(|rebind| {
-                matches!(
-                    rebind.action,
-                    EdgeBindingAction::Restored | EdgeBindingAction::Canonicalized
-                )
-            })
-            .cloned()
-            .collect())
+        Ok(cooldown_core::EdgeNormalizationReport {
+            rebinds: committed
+                .iter()
+                .filter(|rebind| {
+                    matches!(
+                        rebind.action,
+                        EdgeBindingAction::Restored | EdgeBindingAction::Canonicalized
+                    )
+                })
+                .cloned()
+                .collect(),
+            warnings: Vec::new(),
+        })
     }
 }
 
@@ -1810,6 +1814,44 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
     let a_position = out.items.iter().position(|item| item.name == "a");
     let uuid_position = out.items.iter().position(|item| item.name == "uuid");
     assert!(a_position < uuid_position);
+}
+
+#[tokio::test]
+async fn edge_report_redacts_source_credentials_at_the_app_boundary() -> color_eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut rebind = diesel_rebind(
+        Some("git+https://token@example.com/diesel#abcdef".to_string()),
+        EdgeBindingAction::Rebound,
+    );
+    rebind.dependency.registry = Some("git+https://user:secret@example.com/uuid#abcdef".into());
+    rebind.detail =
+        Some("the binding moved to git+https://another-secret@example.com/uuid#abcdef".to_string());
+    let out = workspace(edge_reporting_fake(root, vec![rebind]), Baseline::default())
+        .upgrade(&opts())
+        .await;
+    let row = out
+        .items
+        .iter()
+        .find(|item| item.name == "uuid")
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing edge report row"))?;
+    let edge = row
+        .edge
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing edge report detail"))?;
+
+    assert_eq!(
+        edge.dependent_source.as_deref(),
+        Some("git+https://example.com/diesel#abcdef")
+    );
+    assert_eq!(
+        row.registry.as_deref(),
+        Some("git+https://example.com/uuid#abcdef")
+    );
+    assert_eq!(
+        edge.detail.as_deref(),
+        Some("the binding moved to git+https://example.com/uuid#abcdef")
+    );
+    Ok(())
 }
 
 #[tokio::test]

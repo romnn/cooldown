@@ -4,6 +4,7 @@
 //! update-kind relative to the current pin.
 
 use crate::duration::since;
+use crate::error::Diagnostic;
 use crate::policy::ResolvedWindow;
 use camino::Utf8PathBuf;
 use std::fmt;
@@ -929,6 +930,18 @@ pub struct ApplyReport {
     /// Lock edges whose binding moved between coexisting versions, with what the
     /// [`EdgePolicy`] did about each. Empty for adapters without ambiguous edge bindings.
     pub edge_rebinds: Vec<EdgeRebind>,
+    /// Non-fatal adapter warnings about a mutation that is already visible and must still be
+    /// reported as committed.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// The authoritative final edge audit plus non-fatal durability warnings.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeNormalizationReport {
+    /// Final lock-edge outcomes after reconciling run-level observation and batch provenance.
+    pub rebinds: Vec<EdgeRebind>,
+    /// Warnings raised after a verified correction crossed its visible commit point.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Whether to gate only environment-relevant artifacts or every recorded artifact (`--all-artifacts`).

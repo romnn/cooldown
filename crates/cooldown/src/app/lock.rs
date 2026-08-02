@@ -3,12 +3,13 @@
 use cooldown_core::{CoreError, ToolId};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STALE_LOCK_AGE: Duration = Duration::from_hours(720);
+const STALE_COLLECTION_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Holds an OS-backed shared lock for project reads.
 #[derive(Debug)]
@@ -200,59 +201,28 @@ impl ProjectAccessWriteGuard {
 }
 
 fn open_project_lock(root: &camino::Utf8Path) -> Result<(PathBuf, File, File), CoreError> {
-    let preferred = lock_path(root);
-    match open_coordinated_lock_file(&preferred) {
-        Ok((file, coordination)) => Ok((preferred, file, coordination)),
-        Err(preferred_error) => {
-            let fallback = fallback_lock_path(root);
-            match open_coordinated_lock_file(&fallback) {
-                Ok((file, coordination)) => {
-                    tracing::debug!(
-                        preferred = %preferred.display(),
-                        error = %preferred_error,
-                        "state-dir lock unavailable; using temp-dir fallback"
-                    );
-                    Ok((fallback, file, coordination))
-                }
-                Err(fallback_error) => Err(CoreError::Filesystem(format!(
-                    "cannot open a lock file: {} ({preferred_error}); fallback {} ({fallback_error})",
-                    preferred.display(),
-                    fallback.display()
-                ))),
-            }
-        }
-    }
+    let path = lock_path(root)?;
+    let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
+        CoreError::Filesystem(format!(
+            "cannot open the project lock in the configured state namespace at {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((path, file, coordination))
 }
 
 fn open_repo_tool_lock(
     root: &camino::Utf8Path,
     tool: ToolId,
 ) -> Result<(PathBuf, File, File), CoreError> {
-    let preferred = state_lock_dir().join(repo_tool_lock_file_name(root, tool));
-    match open_coordinated_lock_file(&preferred) {
-        Ok((file, coordination)) => Ok((preferred, file, coordination)),
-        Err(preferred_error) => {
-            let fallback = std::env::temp_dir()
-                .join("cooldown")
-                .join("locks")
-                .join(repo_tool_lock_file_name(root, tool));
-            match open_coordinated_lock_file(&fallback) {
-                Ok((file, coordination)) => {
-                    tracing::debug!(
-                        preferred = %preferred.display(),
-                        error = %preferred_error,
-                        "state-dir resource lock unavailable; using temp-dir fallback"
-                    );
-                    Ok((fallback, file, coordination))
-                }
-                Err(fallback_error) => Err(CoreError::Filesystem(format!(
-                    "cannot open a resource lock file: {} ({preferred_error}); fallback {} ({fallback_error})",
-                    preferred.display(),
-                    fallback.display()
-                ))),
-            }
-        }
-    }
+    let path = state_lock_dir()?.join(repo_tool_lock_file_name(root, tool));
+    let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
+        CoreError::Filesystem(format!(
+            "cannot open the repository resource lock in the configured state namespace at {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((path, file, coordination))
 }
 
 fn lock_conflict(path: &Path, owner: &str, include_holder: bool) -> CoreError {
@@ -347,11 +317,16 @@ fn collect_stale_locks_once(directory: &Path) {
 fn collect_stale_lock_files(directory: &Path, minimum_age: Duration) -> Result<bool, CoreError> {
     std::fs::create_dir_all(directory)?;
     let coordination_path = directory.join(".maintenance.lock");
-    let coordination = open_lock_file(&coordination_path)?;
+    let mut coordination = open_lock_file(&coordination_path)?;
     match coordination.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Ok(false),
         Err(TryLockError::Error(error)) => return Err(lock_error(&coordination_path, &error)),
+    }
+
+    let now = SystemTime::now();
+    if maintenance_is_recent(&mut coordination, now, STALE_COLLECTION_INTERVAL)? {
+        return Ok(true);
     }
 
     for entry in std::fs::read_dir(directory)? {
@@ -391,32 +366,59 @@ fn collect_stale_lock_files(directory: &Path, minimum_age: Duration) -> Result<b
             tracing::debug!(path = %path.display(), %error, "could not remove stale access lock");
         }
     }
+    record_maintenance(&mut coordination, now)?;
     Ok(true)
 }
 
-fn lock_path(root: &camino::Utf8Path) -> PathBuf {
-    state_lock_dir().join(lock_file_name(root))
+fn maintenance_is_recent(
+    file: &mut File,
+    now: SystemTime,
+    interval: Duration,
+) -> Result<bool, CoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut timestamp = String::new();
+    file.read_to_string(&mut timestamp)?;
+    let Some(previous) = timestamp.trim().parse::<u64>().ok() else {
+        return Ok(false);
+    };
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    Ok(previous <= now && now - previous < interval.as_secs())
 }
 
-fn fallback_lock_path(root: &camino::Utf8Path) -> PathBuf {
-    std::env::temp_dir()
-        .join("cooldown")
-        .join("locks")
-        .join(lock_file_name(root))
+fn record_maintenance(file: &mut File, now: SystemTime) -> Result<(), CoreError> {
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{timestamp}")?;
+    file.sync_data()?;
+    Ok(())
 }
 
-fn state_lock_dir() -> PathBuf {
+fn lock_path(root: &camino::Utf8Path) -> Result<PathBuf, CoreError> {
+    Ok(state_lock_dir()?.join(lock_file_name(root)))
+}
+
+fn state_lock_dir() -> Result<PathBuf, CoreError> {
     if let Some(path) = env_path("XDG_STATE_HOME") {
-        return path.join("cooldown").join("locks");
+        return Ok(path.join("cooldown").join("locks"));
     }
     if let Some(home) = env_path("HOME") {
-        return home
+        return Ok(home
             .join(".local")
             .join("state")
             .join("cooldown")
-            .join("locks");
+            .join("locks"));
     }
-    std::env::temp_dir().join("cooldown").join("locks")
+    Err(CoreError::Filesystem(
+        "cannot determine cooldown's state directory: neither XDG_STATE_HOME nor HOME is set"
+            .to_string(),
+    ))
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -569,6 +571,22 @@ mod tests {
         // Maintenance removes only an inactive inode and preserves the one with a live lease.
         assert!(!stale.exists());
         assert!(held.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_timestamp_throttles_collection_across_calls() -> color_eyre::Result<()> {
+        let locks = tempfile::tempdir()?;
+        let first = locks.path().join("first.lock");
+        drop(open_lock_file(&first)?);
+        assert!(collect_stale_lock_files(locks.path(), Duration::ZERO)?);
+        assert!(!first.exists());
+
+        let second = locks.path().join("second.lock");
+        drop(open_lock_file(&second)?);
+        assert!(collect_stale_lock_files(locks.path(), Duration::ZERO)?);
+
+        assert!(second.exists());
         Ok(())
     }
 }

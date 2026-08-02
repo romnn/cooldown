@@ -43,7 +43,44 @@ impl DurableWriteError {
 /// [`CoreError::Filesystem`] when no temp file could be created after 100 attempts, or the
 /// underlying I/O error from writing, syncing, or renaming (the temp file is removed on failure).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    write_replacement(path, bytes)
+    let permissions = existing_permissions(path)?;
+    write_replacement(path, bytes, permissions.as_ref())
+}
+
+/// Writes `bytes` atomically using the supplied permissions for the replacement.
+///
+/// # Errors
+///
+/// Returns the same errors as [`atomic_write`], plus an I/O error if applying `permissions` to the
+/// temporary replacement fails.
+pub fn atomic_write_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+) -> Result<(), CoreError> {
+    write_replacement(path, bytes, permissions)
+}
+
+/// Prepares an atomic replacement, calls `validate` after the temporary file is synced, and only
+/// then renames it over `path`.
+///
+/// This supports compare-before-restore protocols without opening a long validation window while a
+/// large replacement is written. Filesystems do not provide a portable compare-and-swap rename, so
+/// writers that ignore the caller's lease can still race the final validation and rename.
+///
+/// # Errors
+///
+/// Returns the same errors as [`atomic_write_with_permissions`] or the error returned by `validate`.
+pub fn atomic_write_with_permissions_checked<F>(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+    validate: F,
+) -> Result<(), CoreError>
+where
+    F: FnOnce() -> Result<(), CoreError>,
+{
+    write_replacement_checked(path, bytes, permissions, validate)
 }
 
 /// Writes `bytes` atomically and, on Unix, syncs the containing directory after replacement.
@@ -57,16 +94,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
 /// [`DurableWriteError::DurabilityUncertain`] if replacement succeeded but the parent directory
 /// could not be synced.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), DurableWriteError> {
+    let permissions = existing_permissions(path).map_err(DurableWriteError::NotCommitted)?;
     #[cfg(unix)]
     {
-        atomic_write_durable_with(path, bytes, |parent| {
+        atomic_write_durable_with(path, bytes, permissions.as_ref(), |parent| {
             std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })
     }
     #[cfg(not(unix))]
     {
-        write_replacement(path, bytes).map_err(DurableWriteError::NotCommitted)
+        write_replacement(path, bytes, permissions.as_ref())
+            .map_err(DurableWriteError::NotCommitted)
     }
 }
 
@@ -74,23 +113,49 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), DurableWrit
 fn atomic_write_durable_with<F>(
     path: &Path,
     bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
     sync_parent: F,
 ) -> Result<(), DurableWriteError>
 where
     F: FnOnce(&Path) -> Result<(), CoreError>,
 {
-    write_replacement(path, bytes).map_err(DurableWriteError::NotCommitted)?;
+    write_replacement(path, bytes, permissions).map_err(DurableWriteError::NotCommitted)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     sync_parent(parent).map_err(DurableWriteError::DurabilityUncertain)
 }
 
-fn write_replacement(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+fn existing_permissions(path: &Path) -> Result<Option<std::fs::Permissions>, CoreError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_replacement(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+) -> Result<(), CoreError> {
+    write_replacement_checked(path, bytes, permissions, || Ok(()))
+}
+
+fn write_replacement_checked<F>(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+    validate: F,
+) -> Result<(), CoreError>
+where
+    F: FnOnce() -> Result<(), CoreError>,
+{
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| CoreError::PathEncoding(format!("non-utf8 path: {}", path.display())))?;
 
+    let mut validate = Some(validate);
     for attempt in 0..100_u8 {
         let tmp = parent.join(format!(
             ".{file_name}.{}.{}.tmp",
@@ -106,9 +171,22 @@ fn write_replacement(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let written = file.write_all(bytes).and_then(|()| {
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions.clone())?;
+            }
+            file.sync_all()
+        });
+        if let Err(error) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(error.into());
+        }
+        let validation = validate.take().ok_or_else(|| {
+            CoreError::System("atomic replacement validation was already consumed".to_string())
+        })?;
+        if let Err(error) = validation() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
         }
         if let Err(error) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -139,21 +217,21 @@ pub fn fnv1a_64(s: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_write;
+    use super::CoreError;
     #[cfg(unix)]
-    use super::{CoreError, DurableWriteError};
+    use super::DurableWriteError;
+    use super::{atomic_write, atomic_write_with_permissions_checked};
 
     #[test]
-    fn atomic_write_writes_exact_bytes_and_leaves_no_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
+    fn atomic_write_writes_exact_bytes_and_leaves_no_temp_file() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
 
-        atomic_write(&path, b"first").unwrap();
-        atomic_write(&path, b"second").unwrap();
+        atomic_write(&path, b"first")?;
+        atomic_write(&path, b"second")?;
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
+        assert_eq!(std::fs::read(&path)?, b"second");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".tmp"))
@@ -162,6 +240,22 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_atomic_write_validates_after_preparing_the_replacement() -> color_eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.json");
+        atomic_write(&path, b"external")?;
+
+        let result = atomic_write_with_permissions_checked(&path, b"rollback", None, || {
+            Err(CoreError::LockConflict("external edit".to_string()))
+        });
+
+        assert!(matches!(result, Err(CoreError::LockConflict(_))));
+        assert_eq!(std::fs::read(path)?, b"external");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -172,7 +266,7 @@ mod tests {
         let path = dir.path().join("state.json");
         atomic_write(&path, b"first")?;
 
-        let result = super::atomic_write_durable_with(&path, b"second", |_parent| {
+        let result = super::atomic_write_durable_with(&path, b"second", None, |_parent| {
             Err(CoreError::Filesystem(
                 "injected directory sync failure".to_string(),
             ))

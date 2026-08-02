@@ -26,11 +26,12 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope, Dependency, EdgePolicy,
-    EdgeRebind, FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry,
-    Plan, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
+    Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
+    NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
+    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -600,8 +601,8 @@ impl CargoTool {
             None
         };
 
-        // Enforce the plan's edge policy over the re-resolved lock and collect every edge binding
-        // that moved between coexisting versions — corrected or not, never silent.
+        // Enforce the plan's edge policy over the re-resolved lock and collect the moves observation
+        // can pair across stable dependent identities and coexisting endpoints.
         let enforced = edges::enforce::enforce(
             &self.cargo,
             project,
@@ -612,6 +613,7 @@ impl CargoTool {
         .await?;
         let graph = enforced.graph;
         let edge_rebinds = enforced.rebinds;
+        report.warnings.extend(enforced.warnings);
 
         let after_lock = read_lock(project)?;
         let after = after_lock.locked_versions();
@@ -751,9 +753,12 @@ impl ToolWrite for CargoTool {
         plan: &Plan,
         journal: &ProjectMutationJournal,
         observer: &dyn ApplyObserver,
-    ) -> Result<ApplyReport> {
-        self.apply_plan(project, plan, journal, Some(observer))
-            .await
+    ) -> Result<ApplyAttempt> {
+        let report = self
+            .apply_plan(project, plan, journal, Some(observer))
+            .await;
+        let postimage = journal.capture_state(&project.root)?;
+        Ok(ApplyAttempt { report, postimage })
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
@@ -777,7 +782,7 @@ impl ToolWrite for CargoTool {
         policy: EdgePolicy,
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
-    ) -> Result<Vec<EdgeRebind>> {
+    ) -> Result<EdgeNormalizationReport> {
         let before_lock = before
             .map(|contents| {
                 std::str::from_utf8(contents)
@@ -812,7 +817,10 @@ impl ToolWrite for CargoTool {
                 .await?;
         let final_view = edges::LockEdgeView::from_lock(&read_lock(project)?);
         edges::enforce::reconcile_committed_outcomes(&final_view, &mut result.rebinds, committed);
-        Ok(result.rebinds)
+        Ok(EdgeNormalizationReport {
+            rebinds: result.rebinds,
+            warnings: result.warnings,
+        })
     }
 }
 

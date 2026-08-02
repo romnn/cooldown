@@ -10,7 +10,7 @@ use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
 use crate::index::CRATES_IO;
 use crate::lockfile::CargoLock;
 use cooldown_core::{
-    EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
+    Diagnostic, EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct EnforcementResult {
     pub(crate) rebinds: Vec<EdgeRebind>,
     pub(crate) graph: Option<ResolvedGraph>,
+    pub(crate) warnings: Vec<Diagnostic>,
 }
 
 enum BindingOutcome {
@@ -68,8 +69,9 @@ pub(crate) async fn enforce(
         }
     };
     let mut guarded = guard_rewrites(&resolver_view, proposed);
-    let committed =
+    let application =
         apply_rewrites(cargo, project, &lock_path, &resolver_text, &mut guarded).await?;
+    let committed = application.committed;
 
     let (corrected, final_text, verified_graph) = match committed {
         CommittedRewrites::Unchanged => (Vec::new(), None, None),
@@ -122,6 +124,7 @@ pub(crate) async fn enforce(
     Ok(EnforcementResult {
         rebinds: outcomes.into_iter().map(outcome_row).collect(),
         graph,
+        warnings: application.warnings,
     })
 }
 

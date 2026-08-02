@@ -56,8 +56,11 @@ pub(crate) fn binding_changes(before: &LockEdgeView, after: &LockEdgeView) -> Ve
             }
             let crates_io_move = from.source() == Some(crate::cargocmd::CRATES_IO_SOURCE)
                 && to.source() == Some(crate::cargocmd::CRATES_IO_SOURCE);
-            let detail = (!crates_io_move)
-                .then(|| format!("the binding target changed: \"{from_entry}\" → \"{to_entry}\""));
+            let detail = (!crates_io_move).then(|| {
+                let from_entry = cooldown_core::redact::url_credentials(&from_entry);
+                let to_entry = cooldown_core::redact::url_credentials(&to_entry);
+                format!("the binding target changed: \"{from_entry}\" → \"{to_entry}\"")
+            });
             changes.push(BindingChange {
                 dependent: block.clone(),
                 dependency: dependency.clone(),
@@ -401,5 +404,43 @@ mod tests {
         let detail = changes[0].detail.as_deref().unwrap_or_default();
         assert!(detail.contains("registry+https://github.com/rust-lang/crates.io-index"));
         assert!(detail.contains("git+https://example.com/foo#abcdef"));
+    }
+
+    #[test]
+    fn source_move_details_redact_url_credentials() {
+        let before_text = indoc::indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0 (git+https://old-token@example.com/foo#aaaaaa)",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "git+https://old-token@example.com/foo#aaaaaa"
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "git+https://user:new-token@example.com/foo#bbbbbb"
+        "#};
+        let after_text = before_text.replace(
+            "\"foo 1.0.0 (git+https://old-token@example.com/foo#aaaaaa)\",",
+            "\"foo 1.0.0 (git+https://user:new-token@example.com/foo#bbbbbb)\",",
+        );
+
+        let changes = binding_changes(&view(before_text), &view(&after_text));
+        let detail = changes
+            .first()
+            .and_then(|change| change.detail.as_deref())
+            .unwrap_or_default();
+
+        assert!(detail.contains("git+https://example.com/foo"));
+        assert!(!detail.contains("old-token"));
+        assert!(!detail.contains("new-token"));
     }
 }

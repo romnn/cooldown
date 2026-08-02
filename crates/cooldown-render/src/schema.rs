@@ -101,6 +101,11 @@ pub fn json_schema() -> Value {
         .filter(|action| action.is_applied())
         .map(|action| Value::String(action.wire_value().to_string()))
         .collect();
+    let unapplied_edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| !action.is_applied())
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
     let reasoned_edge_actions = cooldown_core::EdgeBindingAction::ALL
         .iter()
         .filter(|action| action.requires_detail())
@@ -249,7 +254,9 @@ pub fn json_schema() -> Value {
                         "properties": {
                             "edge": {
                                 "required": ["action"],
-                                "properties": { "action": { "const": "held" } }
+                                "properties": {
+                                    "action": { "enum": unapplied_edge_actions }
+                                }
                             }
                         }
                     },
@@ -614,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_discriminator_conditions_enforce_row_invariants() {
+    fn edge_discriminator_conditions_enforce_row_invariants() -> color_eyre::Result<()> {
         let schema = json_schema();
         assert_eq!(
             schema["$defs"]["upgradeEdgeInfo"]["properties"]["detail"]["minLength"],
@@ -622,19 +629,22 @@ mod tests {
         );
         let conditions = schema["$defs"]["upgradeItem"]["allOf"]
             .as_array()
-            .expect("edge action conditions");
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing edge action conditions"))?;
 
-        assert_eq!(
-            conditions[0]["if"]["properties"]["edge"]["properties"]["action"]["const"],
-            "held"
-        );
+        let unapplied = conditions[0]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing unapplied edge actions"))?;
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = unapplied.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(listed, !action.is_applied());
+        }
         assert_eq!(
             conditions[0]["then"]["properties"]["applied"]["const"],
             false
         );
         let applied = conditions[1]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
-            .expect("applied edge actions");
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing applied edge actions"))?;
         for action in cooldown_core::EdgeBindingAction::ALL {
             let listed = applied.contains(&Value::String(action.wire_value().to_string()));
             assert_eq!(listed, action.is_applied());
@@ -657,12 +667,12 @@ mod tests {
         );
         let prohibited = conditions[2]["then"]["not"]["anyOf"]
             .as_array()
-            .expect("edge-only prohibited properties");
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing edge-only prohibited properties"))?;
         assert_eq!(prohibited[0]["required"][0], "skipped");
         assert_eq!(prohibited[1]["required"][0], "error");
         let reasoned = conditions[3]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
-            .expect("reasoned edge actions");
+            .ok_or_else(|| color_eyre::eyre::eyre!("missing reasoned edge actions"))?;
         assert_eq!(
             conditions[3]["then"]["properties"]["edge"]["required"][0],
             "detail"
@@ -671,6 +681,7 @@ mod tests {
             let listed = reasoned.contains(&Value::String(action.wire_value().to_string()));
             assert_eq!(listed, action.requires_detail());
         }
+        Ok(())
     }
 
     #[test]

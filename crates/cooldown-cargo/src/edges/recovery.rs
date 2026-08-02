@@ -55,6 +55,13 @@ enum RemovalError {
     DurabilityUncertain(CoreError),
 }
 
+/// The visible commit state after consuming a recovery marker.
+#[derive(Debug)]
+pub(super) enum CommitOutcome {
+    Committed,
+    DurabilityUncertain(CoreError),
+}
+
 impl PublicationError {
     fn into_core_error(self, path: &Utf8Path) -> CoreError {
         match self {
@@ -273,7 +280,7 @@ impl SpeculativeLockTransaction {
     }
 
     /// Commits the last accepted state and consumes its recovery marker.
-    pub(super) fn commit(&mut self) -> Result<()> {
+    pub(super) fn commit(&mut self) -> Result<CommitOutcome> {
         if self.staged_lock.is_some() {
             return Err(CoreError::System(
                 "cannot commit a Cargo.lock transaction with an undecided candidate".to_string(),
@@ -311,10 +318,13 @@ impl SpeculativeLockTransaction {
         )?;
         self.current_lock.clone_from(&self.original_lock);
         self.staged_lock = None;
-        self.remove_record()
+        match self.remove_record()? {
+            CommitOutcome::Committed => Ok(()),
+            CommitOutcome::DurabilityUncertain(error) => Err(error),
+        }
     }
 
-    fn remove_record(&self) -> Result<()> {
+    fn remove_record(&self) -> Result<CommitOutcome> {
         if read_json::<RecoveryRecord>(&self.recovery_path)? != self.record {
             return Err(untrusted_record(&self.recovery_path));
         }
@@ -322,7 +332,10 @@ impl SpeculativeLockTransaction {
             return Err(untrusted_record(&self.state_path));
         }
         clean_orphan_states(&self.lock_path, Some(&self.record.state_file))?;
-        remove_file(&self.recovery_path)?;
+        let outcome = remove_transaction_marker(&self.recovery_path)?;
+        if let CommitOutcome::DurabilityUncertain(_) = outcome {
+            return Ok(outcome);
+        }
         if let Err(error) = remove_file(&self.state_path) {
             tracing::warn!(
                 path = %self.state_path,
@@ -330,7 +343,7 @@ impl SpeculativeLockTransaction {
                 "could not remove completed Cargo.lock recovery state"
             );
         }
-        Ok(())
+        Ok(CommitOutcome::Committed)
     }
 }
 
@@ -654,6 +667,27 @@ fn remove_file(path: &Utf8Path) -> Result<()> {
     remove_file_with(path, sync_parent).map_err(|error| error.into_core_error(path))
 }
 
+fn remove_transaction_marker(path: &Utf8Path) -> Result<CommitOutcome> {
+    #[cfg(unix)]
+    let sync_parent = sync_parent_directory;
+    #[cfg(not(unix))]
+    let sync_parent = |_path: &Utf8Path| Ok(());
+    remove_transaction_marker_with(path, sync_parent)
+}
+
+fn remove_transaction_marker_with<S>(path: &Utf8Path, sync_parent: S) -> Result<CommitOutcome>
+where
+    S: FnOnce(&Utf8Path) -> Result<()>,
+{
+    match remove_file_with(path, sync_parent) {
+        Ok(()) => Ok(CommitOutcome::Committed),
+        Err(RemovalError::NotRemoved(error)) => Err(error),
+        Err(error @ RemovalError::DurabilityUncertain(_)) => Ok(
+            CommitOutcome::DurabilityUncertain(error.into_core_error(path)),
+        ),
+    }
+}
+
 fn remove_file_with<S>(path: &Utf8Path, sync_parent: S) -> std::result::Result<(), RemovalError>
 where
     S: FnOnce(&Utf8Path) -> Result<()>,
@@ -957,6 +991,28 @@ mod tests {
 
         // The typed outcome prevents callers from mistaking uncertain durability for no mutation.
         assert!(matches!(result, Err(RemovalError::DurabilityUncertain(_))));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn marker_sync_failure_becomes_a_committed_warning() -> color_eyre::Result<()> {
+        let (_dir, _project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        std::fs::write(&marker, b"recovery evidence")?;
+
+        let outcome = remove_transaction_marker_with(&marker, |_path| {
+            Err(CoreError::Filesystem(
+                "injected directory sync failure".to_string(),
+            ))
+        })?;
+        let CommitOutcome::DurabilityUncertain(error) = outcome else {
+            return Err(color_eyre::eyre::eyre!(
+                "post-unlink sync failure was not reported as committed"
+            ));
+        };
+
+        assert!(error.to_string().contains("syncing its directory failed"));
         assert!(!marker.exists());
         Ok(())
     }

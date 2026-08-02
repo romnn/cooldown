@@ -2,14 +2,14 @@
 //! budget.
 //! Partition and singleton probes improve coverage without claiming optimality.
 
-use super::recovery::SpeculativeLockTransaction;
+use super::recovery::{CommitOutcome, SpeculativeLockTransaction};
 use super::{
     EdgeRewrite, GuardedRewrites, LockEdgeView, RejectedRewrite, guard_rewrites, rewrite_lock_text,
 };
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::lockfile::CargoLock;
 use camino::Utf8Path;
-use cooldown_core::{Project, Result};
+use cooldown_core::{Diagnostic, Project, Result};
 use std::collections::{BTreeSet, VecDeque};
 
 /// Bounds every Cargo validation spawned after the initial all-rewrites candidate fails.
@@ -26,6 +26,11 @@ pub(super) enum CommittedRewrites {
     },
 }
 
+pub(super) struct RewriteApplication {
+    pub(super) committed: CommittedRewrites,
+    pub(super) warnings: Vec<Diagnostic>,
+}
+
 #[derive(Clone, Copy)]
 enum CandidateFailure {
     TextMismatch,
@@ -38,35 +43,47 @@ pub(super) async fn apply_rewrites(
     lock_path: &Utf8Path,
     resolver_text: &str,
     guarded: &mut GuardedRewrites,
-) -> Result<CommittedRewrites> {
+) -> Result<RewriteApplication> {
     if guarded.accepted.is_empty() {
-        return Ok(CommittedRewrites::Unchanged);
+        return Ok(RewriteApplication {
+            committed: CommittedRewrites::Unchanged,
+            warnings: Vec::new(),
+        });
     }
     let Some(rewritten) = rewrite_lock_text(resolver_text, &guarded.accepted) else {
         reject_all(
             guarded,
             "the lock text did not match the parsed entry; correction skipped",
         );
-        return Ok(CommittedRewrites::Unchanged);
+        return Ok(RewriteApplication {
+            committed: CommittedRewrites::Unchanged,
+            warnings: Vec::new(),
+        });
     };
     let mut transaction =
         SpeculativeLockTransaction::begin(project, lock_path, resolver_text, &rewritten)?;
     match cargo.verify_locked(&project.root).await {
         Ok(Some(graph)) => {
             transaction.accept()?;
-            transaction.commit()?;
-            Ok(CommittedRewrites::Changed {
-                corrected: std::mem::take(&mut guarded.accepted),
-                lock_text: rewritten,
-                graph: Box::new(graph),
+            let warnings = commit_warnings(transaction.commit()?);
+            Ok(RewriteApplication {
+                committed: CommittedRewrites::Changed {
+                    corrected: std::mem::take(&mut guarded.accepted),
+                    lock_text: rewritten,
+                    graph: Box::new(graph),
+                },
+                warnings,
             })
         }
         Ok(None) => {
             transaction.reject()?;
             match isolate_rewrites(cargo, project, resolver_text, guarded, &mut transaction).await {
                 Ok(result) => {
-                    transaction.commit()?;
-                    Ok(result)
+                    let warnings = commit_warnings(transaction.commit()?);
+                    Ok(RewriteApplication {
+                        committed: result,
+                        warnings,
+                    })
                 }
                 Err(error) => {
                     transaction.rollback()?;
@@ -77,6 +94,15 @@ pub(super) async fn apply_rewrites(
         Err(error) => {
             transaction.rollback()?;
             Err(error)
+        }
+    }
+}
+
+fn commit_warnings(outcome: CommitOutcome) -> Vec<Diagnostic> {
+    match outcome {
+        CommitOutcome::Committed => Vec::new(),
+        CommitOutcome::DurabilityUncertain(error) => {
+            vec![Diagnostic::new(error.diagnostic_kind(), error.to_string())]
         }
     }
 }

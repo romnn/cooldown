@@ -444,7 +444,7 @@ pub struct UpgradeEdgeInfo {
     pub dependent_source: Option<String>,
     /// What the edge policy did or observed.
     pub action: EdgeBindingAction,
-    /// Why a correction was withheld or could not be addressed.
+    /// Source-transition context or the reason a correction was withheld or unaddressable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }

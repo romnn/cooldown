@@ -11,6 +11,11 @@
   changed project state, and `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side
   adapter fail a shared read session without performing recovery. `ProjectMutationState` pairs a
   rollback journal with the post-apply state observed before any conditional restore.
+- **Breaking library API:** `ToolWrite::apply_with_observer` returns an adapter-boundary postimage,
+  `ApplyReport` carries non-fatal committed warnings, and final edge audits return an
+  `EdgeNormalizationReport`. `ProjectMutationFile` also records standard file permissions so a
+  rollback can restore them with the file contents. Callers can therefore distinguish rollback
+  conflicts from visible corrections whose directory durability is uncertain.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.
@@ -25,8 +30,9 @@
   workspace-compatible and falling back to the highest satisfying one when none is, using a
   cooldown-owned conservative tier inspired by cargo's `incompatible-rust-versions = "fallback"`
   rule — healing pre-existing bad bindings too, also on a run with no version change to apply;
-  `none` only observes. Every corrected, withheld,
-  unaddressable, or surviving rebind is reported as its own
+  `none` only observes. Every corrected, withheld, unaddressable, or surviving rebind that can be
+  paired across a stable dependent identity and endpoints coexisting in both snapshots is reported
+  as its own
   `restored`/`canonicalized`/`held`/`unaddressable`/`rebound` row, preserving the dependent's full
   source-bearing lock identity. The `upgrade`/`fix` summary counts edge activity apart from
   version changes (`edgesCorrected`/`edgesRebound`/`edgesHeld`/`edgesUnaddressable`); row-level

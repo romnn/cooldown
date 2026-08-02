@@ -596,13 +596,22 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
             },
             cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
                 status: "rebound",
-                reason: format!("the re-resolve moved {subject}; left as bound"),
+                reason: match &edge.detail {
+                    Some(detail) => format!(
+                        "the re-resolve moved {subject}; left as bound: {}",
+                        cooldown_core::redact::url_credentials(detail)
+                    ),
+                    None => format!("the re-resolve moved {subject}; left as bound"),
+                },
                 color: Color::Yellow,
             },
             cooldown_core::EdgeBindingAction::Held => MutationStatus {
                 status: "held",
                 reason: match &edge.detail {
-                    Some(detail) => format!("{subject} left in place: {detail}"),
+                    Some(detail) => format!(
+                        "{subject} left in place: {}",
+                        cooldown_core::redact::url_credentials(detail)
+                    ),
                     None => format!("{subject} left in place; correction withheld"),
                 },
                 color: Color::Yellow,
@@ -610,7 +619,10 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
             cooldown_core::EdgeBindingAction::Unaddressable => MutationStatus {
                 status: "unaddressable",
                 reason: match &edge.detail {
-                    Some(detail) => format!("{subject} could not be corrected: {detail}"),
+                    Some(detail) => format!(
+                        "{subject} could not be corrected: {}",
+                        cooldown_core::redact::url_credentials(detail)
+                    ),
                     None => format!("{subject} could not be corrected safely"),
                 },
                 color: Color::Yellow,
@@ -653,6 +665,8 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
 }
 
 fn abbreviated_source(source: &str) -> String {
+    let source = cooldown_core::redact::url_credentials(source);
+    let source = source.as_str();
     if source == "registry+https://github.com/rust-lang/crates.io-index" {
         return "crates.io".to_string();
     }
@@ -1013,8 +1027,8 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 mod tests {
     use super::{
         RenderOptions, abbreviated_source, check_cooldown_cell, has_distinct_project, members_cell,
-        outdated_status_cell, path_label, render_check, render_fix, render_outdated,
-        render_upgrade,
+        mutation_status, outdated_status_cell, path_label, render_check, render_fix,
+        render_outdated, render_upgrade,
     };
     use crate::{
         BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
@@ -1039,6 +1053,28 @@ mod tests {
             abbreviated_source("git+file:///home/user/private/repo#abcdef"),
             "git:local"
         );
+    }
+
+    #[test]
+    fn rebound_status_shows_sanitized_source_detail() {
+        let mut item = needs_major_item("foo", "1.0.0", "1.0.0", UpdateKind::Patch, ".");
+        item.applied = true;
+        item.skipped = None;
+        item.edge = Some(crate::UpgradeEdgeInfo {
+            dependent: "app".to_string(),
+            dependent_version: "0.1.0".to_string(),
+            dependent_source: None,
+            action: cooldown_core::EdgeBindingAction::Rebound,
+            detail: Some(
+                "source git+https://token@example.com/foo#aaaa → git+https://example.com/foo#bbbb"
+                    .to_string(),
+            ),
+        });
+
+        let status = mutation_status(&item);
+
+        assert!(status.reason.contains("git+https://example.com/foo"));
+        assert!(!status.reason.contains("token"));
     }
 
     /// Members whose name is the given string and whose path is `path/<name>`.

@@ -253,6 +253,19 @@ pub trait ApplyObserver: Send + Sync {
 
 impl ApplyObserver for () {}
 
+/// One adapter apply attempt paired with the project state observed at the mutation boundary.
+///
+/// The report remains an inner result because a resolver failure may still have rewritten files;
+/// callers need the postimage in both success and failure cases to restore without absorbing work
+/// performed after the adapter returned.
+#[derive(Debug)]
+pub struct ApplyAttempt {
+    /// The adapter's apply result.
+    pub report: Result<ApplyReport>,
+    /// The journal write set captured immediately after the adapter finished mutating it.
+    pub postimage: ProjectMutationState,
+}
+
 /// The mutation-side port for tools that can rewrite project state.
 ///
 /// Read-only commands depend only on [`ToolRead`]. Commands such as `upgrade` and `sync` opt
@@ -306,19 +319,24 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// The default delegates to [`apply`](ToolWrite::apply), which is correct for adapters that run
     /// one native command for the whole plan. An adapter that internally invokes its resolver once
-    /// per candidate should override this method and notify the observer before each invocation.
+    /// per candidate should override this method, notify the observer before each invocation, and
+    /// capture the returned postimage immediately after its final owned write.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`apply`](ToolWrite::apply).
+    /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured. The
+    /// adapter's own apply error remains inside [`ApplyAttempt::report`] so the caller receives the
+    /// postimage even after a failed resolver mutates files.
     async fn apply_with_observer(
         &self,
         project: &Project,
         plan: &Plan,
         journal: &ProjectMutationJournal,
         _observer: &dyn ApplyObserver,
-    ) -> Result<ApplyReport> {
-        self.apply(project, plan, journal).await
+    ) -> Result<ApplyAttempt> {
+        let report = self.apply(project, plan, journal).await;
+        let postimage = journal.capture_state(&project.root)?;
+        Ok(ApplyAttempt { report, postimage })
     }
 
     /// Opt-in compile/sync after re-locking (the `--build` step).
@@ -426,8 +444,8 @@ pub trait ToolWrite: Send + Sync {
         _policy: crate::EdgePolicy,
         _before: Option<&[u8]>,
         _committed: &[crate::EdgeRebind],
-    ) -> Result<Vec<crate::EdgeRebind>> {
-        Ok(Vec::new())
+    ) -> Result<crate::EdgeNormalizationReport> {
+        Ok(crate::EdgeNormalizationReport::default())
     }
 
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
@@ -613,20 +631,21 @@ pub trait Tool: ToolRead + ReleaseFetcher + ToolWrite {}
 
 impl<T> Tool for T where T: ToolRead + ReleaseFetcher + ToolWrite {}
 
-/// The pre-change contents of the files a planned mutation may rewrite.
+/// The pre-change file state a planned mutation may rewrite.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectMutationJournal {
     /// The captured file entries the application layer can restore on rollback.
     pub files: Vec<ProjectMutationFile>,
 }
 
-/// The post-apply contents observed at a rollback boundary.
+/// The post-apply state observed at a rollback boundary.
 ///
 /// A mutation journal captures the pre-image.
 /// This state captures the corresponding post-image so rollback can refuse to overwrite a later
 /// independent change while cooldown is verifying the candidate.
-/// Because adapters may mutate through an external process, this observation does not prove who
-/// produced an edit made before capture completed.
+/// This observation closes cooldown's ownership boundary at adapter return. A writer that does not
+/// honor cooldown's project lease can still race the adapter's own final write; rollback detects
+/// later drift but cannot prove authorship for bytes already present at this boundary.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectMutationState {
     files: Vec<ProjectMutationFile>,
@@ -666,6 +685,10 @@ pub struct ProjectMutationFile {
     /// The captured bytes when the file existed, or `None` when it was absent and must be removed
     /// on restore.
     pub contents: Option<Vec<u8>>,
+    /// The captured standard permissions when the file existed.
+    ///
+    /// ACLs and extended attributes are outside the journal's portable rollback contract.
+    pub permissions: Option<std::fs::Permissions>,
 }
 
 impl ProjectMutationJournal {
@@ -678,15 +701,22 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the file exists but cannot be read.
     pub fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
+        use std::io::Read as _;
+
         let path = root.join(rel);
-        let contents = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        let (contents, permissions) = match std::fs::File::open(&path) {
+            Ok(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                (Some(bytes), Some(file.metadata()?.permissions()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
             Err(e) => return Err(e.into()),
         };
         Ok(ProjectMutationFile {
             path: rel.to_owned(),
             contents,
+            permissions,
         })
     }
 
@@ -706,10 +736,9 @@ impl ProjectMutationJournal {
 
     /// Restores this journal only when every live file still matches `expected`.
     ///
-    /// Validation covers the complete write set before any file is changed. Existing files are
-    /// then replaced atomically, so readers never observe partial bytes. A multi-file restore is
-    /// not globally atomic, but independent drift detected before restoration leaves every file
-    /// untouched.
+    /// Validation covers the complete write set before any file is changed. Each path is checked
+    /// again immediately before its own atomic replacement, so drift during a multi-file restore
+    /// stops before that path is overwritten. The multi-file operation is not globally atomic.
     ///
     /// # Errors
     ///
@@ -736,7 +765,7 @@ impl ProjectMutationJournal {
 
         for expected_file in &expected.files {
             let live = Self::capture_file(root, &expected_file.path)?;
-            if live.contents != expected_file.contents {
+            if !live.matches(expected_file) {
                 return Err(CoreError::LockConflict(format!(
                     "{} changed independently while cooldown was verifying a mutation; left project files untouched",
                     root.join(&expected_file.path)
@@ -744,7 +773,17 @@ impl ProjectMutationJournal {
             }
         }
 
-        self.restore(root)
+        for (file, expected_file) in self.files.iter().zip(&expected.files) {
+            let live = Self::capture_file(root, &expected_file.path)?;
+            if !live.matches(expected_file) {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently during rollback; stopped before replacing it",
+                    root.join(&expected_file.path)
+                )));
+            }
+            file.restore_if_unchanged(root, expected_file)?;
+        }
+        Ok(())
     }
 
     /// Restore every captured file entry under `root`.
@@ -756,85 +795,177 @@ impl ProjectMutationJournal {
     /// Returns a [`CoreError`](crate::CoreError) if a file cannot be written back or removed.
     pub fn restore(&self, root: &Utf8Path) -> Result<()> {
         for file in &self.files {
-            let path = root.join(&file.path);
-            match &file.contents {
-                Some(bytes) => {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    crate::fs::atomic_write(path.as_std_path(), bytes)?;
+            file.restore(root)?;
+        }
+        Ok(())
+    }
+}
+
+impl ProjectMutationFile {
+    fn matches(&self, other: &ProjectMutationFile) -> bool {
+        self.path == other.path
+            && self.contents == other.contents
+            && permissions_equal(self.permissions.as_ref(), other.permissions.as_ref())
+    }
+
+    fn restore(&self, root: &Utf8Path) -> Result<()> {
+        let path = root.join(&self.path);
+        match &self.contents {
+            Some(bytes) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                None => match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+                crate::fs::atomic_write_with_permissions(
+                    path.as_std_path(),
+                    bytes,
+                    self.permissions.as_ref(),
+                )?;
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(())
+    }
+
+    fn restore_if_unchanged(&self, root: &Utf8Path, expected: &ProjectMutationFile) -> Result<()> {
+        let path = root.join(&self.path);
+        if let Some(bytes) = &self.contents {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::fs::atomic_write_with_permissions_checked(
+                path.as_std_path(),
+                bytes,
+                self.permissions.as_ref(),
+                || {
+                    let live = ProjectMutationJournal::capture_file(root, &expected.path)?;
+                    if live.matches(expected) {
+                        Ok(())
+                    } else {
+                        Err(rollback_drift(root, &expected.path))
+                    }
                 },
+            )?;
+        } else {
+            let live = ProjectMutationJournal::capture_file(root, &expected.path)?;
+            if !live.matches(expected) {
+                return Err(rollback_drift(root, &expected.path));
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())
     }
 }
 
+fn rollback_drift(root: &Utf8Path, path: &Utf8Path) -> CoreError {
+    CoreError::LockConflict(format!(
+        "{} changed independently during rollback; stopped before replacing it",
+        root.join(path)
+    ))
+}
+
+#[cfg(unix)]
+fn permissions_equal(
+    left: Option<&std::fs::Permissions>,
+    right: Option<&std::fs::Permissions>,
+) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    left.map(PermissionsExt::mode) == right.map(PermissionsExt::mode)
+}
+
+#[cfg(not(unix))]
+fn permissions_equal(
+    left: Option<&std::fs::Permissions>,
+    right: Option<&std::fs::Permissions>,
+) -> bool {
+    left.map(std::fs::Permissions::readonly) == right.map(std::fs::Permissions::readonly)
+}
+
 #[cfg(test)]
 mod mutation_journal_tests {
     use super::*;
 
-    fn root(directory: &tempfile::TempDir) -> Utf8PathBuf {
-        Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 tempdir")
+    fn root(directory: &tempfile::TempDir) -> color_eyre::Result<Utf8PathBuf> {
+        Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|_| color_eyre::eyre::eyre!("temporary path is not UTF-8"))
     }
 
     #[test]
-    fn checked_restore_refuses_independent_drift() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = root(&directory);
+    fn checked_restore_refuses_independent_drift() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
         let relative = Utf8Path::new("Cargo.toml");
-        std::fs::write(root.join(relative), "original").expect("write original");
+        std::fs::write(root.join(relative), "original")?;
         let journal = ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&root, relative).expect("capture original"),
-            ],
+            files: vec![ProjectMutationJournal::capture_file(&root, relative)?],
         };
-        std::fs::write(root.join(relative), "candidate").expect("write candidate");
-        let expected = journal.capture_state(&root).expect("capture candidate");
-        std::fs::write(root.join(relative), "external").expect("write external change");
+        std::fs::write(root.join(relative), "candidate")?;
+        let expected = journal.capture_state(&root)?;
+        std::fs::write(root.join(relative), "external")?;
 
-        let error = journal
-            .restore_if_unchanged(&root, &expected)
-            .expect_err("drift must block rollback");
+        let Err(error) = journal.restore_if_unchanged(&root, &expected) else {
+            color_eyre::eyre::bail!("drift unexpectedly allowed rollback");
+        };
 
         assert!(matches!(error, CoreError::LockConflict(_)));
-        assert_eq!(
-            std::fs::read_to_string(root.join(relative)).expect("read live file"),
-            "external"
-        );
+        assert_eq!(std::fs::read_to_string(root.join(relative))?, "external");
+        Ok(())
     }
 
     #[test]
-    fn checked_restore_replaces_and_removes_only_expected_files() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = root(&directory);
+    fn checked_restore_replaces_and_removes_only_expected_files() -> color_eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
         let existing = Utf8Path::new("Cargo.toml");
         let created = Utf8Path::new("Cargo.lock");
-        std::fs::write(root.join(existing), "original").expect("write original");
+        std::fs::write(root.join(existing), "original")?;
         let journal = ProjectMutationJournal {
             files: vec![
-                ProjectMutationJournal::capture_file(&root, existing).expect("capture original"),
-                ProjectMutationJournal::capture_file(&root, created).expect("capture absence"),
+                ProjectMutationJournal::capture_file(&root, existing)?,
+                ProjectMutationJournal::capture_file(&root, created)?,
             ],
         };
-        std::fs::write(root.join(existing), "candidate").expect("write candidate manifest");
-        std::fs::write(root.join(created), "candidate").expect("write candidate lock");
-        let expected = journal.capture_state(&root).expect("capture candidate");
+        std::fs::write(root.join(existing), "candidate")?;
+        std::fs::write(root.join(created), "candidate")?;
+        let expected = journal.capture_state(&root)?;
 
-        journal
-            .restore_if_unchanged(&root, &expected)
-            .expect("restore journal");
+        journal.restore_if_unchanged(&root, &expected)?;
 
-        assert_eq!(
-            std::fs::read_to_string(root.join(existing)).expect("read restored manifest"),
-            "original"
-        );
+        assert_eq!(std::fs::read_to_string(root.join(existing))?, "original");
         assert!(!root.join(created).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_restore_restores_unix_permissions() -> color_eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let relative = Utf8Path::new("Cargo.lock");
+        let path = root.join(relative);
+        std::fs::write(&path, "original")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        let journal = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(&root, relative)?],
+        };
+
+        std::fs::write(&path, "candidate")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let expected = journal.capture_state(&root)?;
+        journal.restore_if_unchanged(&root, &expected)?;
+
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        Ok(())
     }
 }
 

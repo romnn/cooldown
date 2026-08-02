@@ -12,6 +12,7 @@ pub mod fs;
 pub mod model;
 pub mod policy;
 pub mod ports;
+pub mod redact;
 
 pub use error::{CoreError, Diagnostic, DiagnosticKind, Result, ToolTermination, failure_detail};
 pub use evaluate::{
@@ -25,8 +26,8 @@ pub use policy::{
     resolve, resolve_max_major, window_exclude_newer,
 };
 pub use ports::{
-    ApplyObserver, Capabilities, Clock, NativePolicyLayer, NativeRule, PackageRegistry,
-    ProjectMutationFile, ProjectMutationJournal, ProjectMutationState, RawArtifact, RawRelease,
-    RawWindow, ReleaseFetcher, ResolveInputs, ResolvedPolicy, SyncReport, SyncScope, Tool,
-    ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
+    ApplyAttempt, ApplyObserver, Capabilities, Clock, NativePolicyLayer, NativeRule,
+    PackageRegistry, ProjectMutationFile, ProjectMutationJournal, ProjectMutationState,
+    RawArtifact, RawRelease, RawWindow, ReleaseFetcher, ResolveInputs, ResolvedPolicy, SyncReport,
+    SyncScope, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
 };

@@ -83,24 +83,20 @@ pub(crate) async fn apply_resilient_with_observer(
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<AppliedMutation> {
-    let first = match writer
+    let first = writer
         .apply_with_observer(project, plan, journal, observer)
         .await
-    {
-        Err(error) if is_mutation_state_conflict(&error) => {
-            return Err(ApplyFailure::RestoreConflict(error));
-        }
-        result => result,
-    };
-    let first_state = journal
-        .capture_state(&project.root)
         .map_err(ApplyFailure::RestoreConflict)?;
-    match first {
+    let first_state = first.postimage;
+    match first.report {
         Ok(report) => {
             return Ok(AppliedMutation {
                 report,
                 expected: first_state,
             });
+        }
+        Err(error) if is_mutation_state_conflict(&error) => {
+            return Err(ApplyFailure::RestoreConflict(error));
         }
         // A broken local environment (missing binary, full disk, read-only tree, corrupt store, an
         // unreadable lock) is not a per-candidate conflict — propagate it rather than bisecting the
@@ -138,20 +134,16 @@ pub(crate) async fn apply_resilient_with_observer(
             changes: accepted,
             ..plan.clone()
         };
-        let result = match writer
+        let result = writer
             .apply_with_observer(project, &committed, journal, observer)
             .await
-        {
+            .map_err(ApplyFailure::RestoreConflict)?;
+        let expected = result.postimage;
+        match result.report {
+            Ok(report) => (report, expected),
             Err(error) if is_mutation_state_conflict(&error) => {
                 return Err(ApplyFailure::RestoreConflict(error));
             }
-            result => result,
-        };
-        let expected = journal
-            .capture_state(&project.root)
-            .map_err(ApplyFailure::RestoreConflict)?;
-        match result {
-            Ok(report) => (report, expected),
             Err(error) => {
                 journal
                     .restore_if_unchanged(&project.root, &expected)
@@ -201,20 +193,16 @@ async fn verified_satisfiable_subset(
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
             ..plan.clone()
         };
-        let result = match writer
+        let result = writer
             .apply_with_observer(project, &trial, journal, observer)
             .await
-        {
+            .map_err(ApplyFailure::RestoreConflict)?;
+        current_state = result.postimage;
+        match result.report {
+            Ok(_) => accepted.extend(group),
             Err(error) if is_mutation_state_conflict(&error) => {
                 return Err(ApplyFailure::RestoreConflict(error));
             }
-            result => result,
-        };
-        current_state = journal
-            .capture_state(&project.root)
-            .map_err(ApplyFailure::RestoreConflict)?;
-        match result {
-            Ok(_) => accepted.extend(group),
             // A broken local environment surfacing mid-recovery must propagate, not be charged to
             // whichever candidates happen to be in this trial group.
             Err(error) if error.is_local_environment_failure() => {
@@ -442,11 +430,13 @@ mod tests {
             plan: &Plan,
             journal: &ProjectMutationJournal,
             observer: &dyn ApplyObserver,
-        ) -> Result<ApplyReport> {
+        ) -> Result<cooldown_core::ApplyAttempt> {
             for change in &plan.changes {
                 observer.candidate_started(change);
             }
-            self.apply(project, plan, journal).await
+            let report = self.apply(project, plan, journal).await;
+            let postimage = journal.capture_state(&project.root)?;
+            Ok(cooldown_core::ApplyAttempt { report, postimage })
         }
 
         async fn build(&self, _project: &Project) -> Result<VerifyReport> {

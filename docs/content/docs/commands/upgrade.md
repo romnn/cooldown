@@ -81,7 +81,10 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
 
 Every corrected, withheld, unaddressable, or surviving rebind is reported as its own row
 (`restored`, `canonicalized`, `held`, `unaddressable`, or `rebound`) naming the dependent whose
-edge moved. The report is audited from the run-start and final locks, so a temporary held attempt
+edge moved. Observation excludes a dependent whose own lock identity changed, an unpaired entry
+that appeared or vanished, and an endpoint that did not coexist in both snapshots; those are
+package-set changes rather than attributable binding-only moves. The report is audited from the
+run-start and final locks, so a temporary held attempt
 that a later batch resolves does not fail `--strict`, and a correction later overwritten does not
 remain `applied`. Corrections are applied as targeted lock edits and re-verified with
 `cargo metadata --locked`. A concrete correction rejected by the orphan guard or verification is

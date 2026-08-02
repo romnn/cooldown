@@ -10,6 +10,7 @@ use cooldown_core::{
     UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 /// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
 /// version (`fix`). The trial/rollback/verify machinery is shared; only planning differs.
@@ -96,6 +97,10 @@ enum BatchMutation {
     /// Independent drift prevented restoration, so no later mutation may run.
     RestoreConflict,
 }
+
+struct RestoreConflict;
+
+type MutationFlow = ControlFlow<RestoreConflict>;
 
 /// One policy-violating resolved pin — the package and the exact too-fresh version the graph
 /// holds. The key the trial state machine tracks baseline and residual violations by.
@@ -235,9 +240,6 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     initial_edge_snapshot: Option<Vec<u8>>,
     /// Correction provenance from committed batches, pending validation against the final lock.
     committed_edge_rebinds: Vec<cooldown_core::EdgeRebind>,
-    /// Independent drift made the physical project state unknown, so no later adapter call may
-    /// mutate it.
-    mutation_blocked: bool,
     /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
@@ -261,7 +263,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             lock_edges_enforced: false,
             initial_edge_snapshot: None,
             committed_edge_rebinds: Vec::new(),
-            mutation_blocked: false,
             manifest_only: HashSet::new(),
         }
     }
@@ -311,18 +312,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(mut state) = self.initial_trial_state().await else {
             return;
         };
-        match self.mode {
+        let mutation = match self.mode {
             PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
             PlanMode::Fix {
                 transitive,
                 downgrade_pinned,
             } => {
                 self.fix_to_fixpoint(deps, transitive, downgrade_pinned, &mut state)
-                    .await;
+                    .await
             }
-        }
+        };
 
-        if self.mutation_blocked {
+        if mutation.is_break() {
             return;
         }
 
@@ -349,8 +350,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await
         {
-            Ok(rebinds) => {
-                for rebind in &rebinds {
+            Ok(report) => {
+                for warning in report.warnings {
+                    self.acc.warnings.push(
+                        warning
+                            .with_tool(self.ctx.tool_name())
+                            .with_project(self.project_label.clone()),
+                    );
+                }
+                for rebind in &report.rebinds {
                     if let Err(error) = rebind.validate() {
                         self.record_project_error(&error, Some(&rebind.dependency.name));
                         continue;
@@ -394,7 +402,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(mut state) = self.initial_trial_state().await else {
             return;
         };
-        self.apply_upgrade_changes(changes, &mut state).await;
+        let _ = self.apply_upgrade_changes(changes, &mut state).await;
     }
 
     async fn initial_trial_state(&mut self) -> Option<TrialState> {
@@ -419,14 +427,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Apply the forward moves, then (under the default transitive mode) reconcile the graph the
     /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
     /// `upgrade` ends gate-clean — no separate `fix` needed.
-    async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) {
+    async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) -> MutationFlow {
         let planned = self.plan_upgrade_changes(&deps).await;
-        self.apply_upgrade_changes(planned, state).await;
+        self.apply_upgrade_changes(planned, state).await
     }
 
     /// Applies planned changes: manifest-only build-backend floors in their own batch, then the
     /// lock batch through the policy trials. Shared by the real `upgrade` and the policy preview.
-    async fn apply_upgrade_changes(&mut self, planned: Vec<Change>, state: &mut TrialState) {
+    async fn apply_upgrade_changes(
+        &mut self,
+        planned: Vec<Change>,
+        state: &mut TrialState,
+    ) -> MutationFlow {
         // Build-backend floor raises ([build-system].requires) have no lock interaction, so apply them
         // in their own batch: a transitive-cooldown rollback of the lock batch must not revert (or
         // mislabel as a conflict) an independent, valid build-backend adoption.
@@ -442,16 +454,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let outcome = self.apply_batch(build_changes, state).await;
             self.ctx.opts.progress.candidates_decided(&decided);
             Self::advance_trial_state(&outcome, state);
-            self.merge_batch_outcome(outcome);
-            if self.mutation_blocked {
-                return;
+            if let ControlFlow::Break(conflict) = self.merge_batch_outcome(outcome) {
+                return ControlFlow::Break(conflict);
             }
         }
         if lock_changes.is_empty() {
-            return;
+            return ControlFlow::Continue(());
         }
 
-        self.run_lock_upgrades(lock_changes, state).await;
+        self.run_lock_upgrades(lock_changes, state).await
     }
 
     /// Applies the lock batch, isolating candidates when the joint result violates cooldown policy.
@@ -462,7 +473,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// from that same baseline; only the replay commits.
     /// Errors abort recovery and restore the baseline: an infrastructure failure must surface as an
     /// error, never as a cooldown skip.
-    async fn run_lock_upgrades(&mut self, lock_changes: Vec<Change>, state: &mut TrialState) {
+    async fn run_lock_upgrades(
+        &mut self,
+        lock_changes: Vec<Change>,
+        state: &mut TrialState,
+    ) -> MutationFlow {
         let baseline_before_lock = state.clone();
         self.ctx
             .opts
@@ -480,15 +495,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         match initial {
             UpgradeTrialResult::Settled(outcomes) => {
                 self.ctx.opts.progress.candidates_decided(&lock_changes);
-                self.merge_batch_outcomes(outcomes);
+                let flow = self.merge_batch_outcomes(outcomes);
                 self.collapse_collateral(&baseline_before_lock.baseline_violations);
-                return;
+                return flow;
             }
             UpgradeTrialResult::Aborted(mut outcome) => {
                 self.restore_upgrade_trial(&rollback, &baseline_before_lock, state, &mut outcome);
-                self.merge_batch_outcome(outcome);
+                let flow = self.merge_batch_outcome(outcome);
                 self.collapse_collateral(&baseline_before_lock.baseline_violations);
-                return;
+                return flow;
             }
             UpgradeTrialResult::PolicyBlocked(violations) => {
                 let mut outcome = BatchOutcome::default();
@@ -498,27 +513,28 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     state,
                     &mut outcome,
                 ) {
-                    self.merge_batch_outcome(outcome);
-                    return;
+                    return self.merge_batch_outcome(outcome);
                 }
                 // A singleton batch has nothing to isolate: the lone candidate is the culprit.
                 if lock_changes.len() == 1 {
                     self.ctx.opts.progress.candidates_decided(&lock_changes);
                     self.record_unreconciled_skips(&lock_changes, &violations);
                     self.collapse_collateral(&baseline_before_lock.baseline_violations);
-                    return;
+                    return ControlFlow::Continue(());
                 }
             }
         }
 
-        self.recover_policy_blocked_upgrade(
-            lock_changes,
-            &baseline_before_lock,
-            state,
-            &mut rollback,
-        )
-        .await;
+        let flow = self
+            .recover_policy_blocked_upgrade(
+                lock_changes,
+                &baseline_before_lock,
+                state,
+                &mut rollback,
+            )
+            .await;
         self.collapse_collateral(&baseline_before_lock.baseline_violations);
+        flow
     }
 
     /// Isolates a policy-blocked multi-candidate batch, then commits its safe subset via one joint
@@ -530,17 +546,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         baseline: &TrialState,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
-    ) {
+    ) -> MutationFlow {
         let selection = self
             .select_safe_upgrade_changes(lock_changes, baseline, state, rollback)
             .await;
         match selection {
             UpgradeSelectionResult::Selected { accepted, rejected } if accepted.is_empty() => {
                 self.record_rejected_upgrade_changes(rejected);
+                ControlFlow::Continue(())
             }
             UpgradeSelectionResult::Selected { accepted, rejected } => {
                 self.replay_selected_upgrade_changes(accepted, rejected, baseline, state, rollback)
-                    .await;
+                    .await
             }
             UpgradeSelectionResult::Aborted(outcome) => self.merge_batch_outcome(outcome),
         }
@@ -622,7 +639,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         baseline: &TrialState,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
-    ) {
+    ) -> MutationFlow {
         self.ctx
             .opts
             .progress
@@ -638,23 +655,30 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             UpgradeTrialResult::Settled(outcomes) => {
                 self.ctx.opts.progress.candidates_decided(&accepted);
-                self.merge_batch_outcomes(outcomes);
+                if let ControlFlow::Break(conflict) = self.merge_batch_outcomes(outcomes) {
+                    return ControlFlow::Break(conflict);
+                }
                 self.record_rejected_upgrade_changes(rejected);
+                ControlFlow::Continue(())
             }
             UpgradeTrialResult::PolicyBlocked(violations) => {
                 let mut outcome = BatchOutcome::default();
                 if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
-                    self.merge_batch_outcome(outcome);
-                    return;
+                    return self.merge_batch_outcome(outcome);
                 }
                 self.ctx.opts.progress.candidates_decided(&accepted);
                 self.record_unreconciled_skips(&accepted, &violations);
                 self.record_rejected_upgrade_changes(rejected);
+                ControlFlow::Continue(())
             }
             UpgradeTrialResult::Aborted(mut outcome) => {
                 self.restore_upgrade_trial(rollback, baseline, state, &mut outcome);
-                self.merge_batch_outcome(outcome);
+                let flow = self.merge_batch_outcome(outcome);
+                if flow.is_break() {
+                    return flow;
+                }
                 self.record_rejected_upgrade_changes(rejected);
+                ControlFlow::Continue(())
             }
         }
     }
@@ -730,8 +754,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Fold a batch's report into the run accumulator. Report-only: trial state advances exactly
     /// once, via [`advance_trial_state`](Self::advance_trial_state) right after the batch runs, so
     /// merging (which may happen later, after buffering) can never re-apply or clobber it.
-    fn merge_batch_outcome(&mut self, outcome: BatchOutcome) {
-        self.mutation_blocked |= outcome.has_restore_conflict();
+    fn merge_batch_outcome(&mut self, outcome: BatchOutcome) -> MutationFlow {
+        let restore_conflict = outcome.has_restore_conflict();
         self.lock_refreshed_by_apply |= outcome.lock_refreshed;
         // Only kept batches reach the merge as committed, so this records exactly "the current lock
         // was produced by a committed apply" — which enforced the edge policy on its way out.
@@ -739,12 +763,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.committed_edge_rebinds
             .extend(outcome.edge_rebinds.iter().cloned());
         outcome.merge_into(self.acc);
+        if restore_conflict {
+            ControlFlow::Break(RestoreConflict)
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 
-    fn merge_batch_outcomes(&mut self, outcomes: impl IntoIterator<Item = BatchOutcome>) {
+    fn merge_batch_outcomes(
+        &mut self,
+        outcomes: impl IntoIterator<Item = BatchOutcome>,
+    ) -> MutationFlow {
         for outcome in outcomes {
-            self.merge_batch_outcome(outcome);
+            if let ControlFlow::Break(conflict) = self.merge_batch_outcome(outcome) {
+                return ControlFlow::Break(conflict);
+            }
         }
+        ControlFlow::Continue(())
     }
 
     /// Advance the trial state with a committed batch's after-graph. Called exactly once per
@@ -1168,7 +1203,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         transitive: TransitiveGate,
         downgrade_pinned: bool,
         state: &mut TrialState,
-    ) {
+    ) -> MutationFlow {
         for _ in 0..MAX_FIX_ROUNDS {
             let FixPlan {
                 changes,
@@ -1180,7 +1215,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.acc.errors.extend(errors);
             if changes.is_empty() {
                 self.emit_fix_warnings(warnings);
-                return;
+                return ControlFlow::Continue(());
             }
             self.ctx
                 .opts
@@ -1191,16 +1226,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.opts.progress.candidates_decided(&decided);
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
-            self.merge_batch_outcome(outcome);
+            if let ControlFlow::Break(conflict) = self.merge_batch_outcome(outcome) {
+                return ControlFlow::Break(conflict);
+            }
             if applied == 0 {
                 self.emit_fix_warnings(warnings);
-                return;
+                return ControlFlow::Continue(());
             }
             let Some(next) = self.scoped_deps().await else {
-                return;
+                return ControlFlow::Continue(());
             };
             deps = next;
         }
+        ControlFlow::Continue(())
     }
 
     /// Downgrade any too-fresh transitive a forward `upgrade` move floated up, to a fixpoint — the
@@ -1447,6 +1485,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         outcome: &mut BatchOutcome,
     ) -> VerifiedBatchReport {
+        for warning in &report.warnings {
+            outcome.warnings.push(
+                warning
+                    .clone()
+                    .with_tool(self.ctx.tool_name())
+                    .with_project(self.project_label.clone()),
+            );
+        }
         let applied: HashSet<ChangeTargetKey> =
             report.applied.iter().map(change_target_key).collect();
         let planned_applied = planned_changes_landed(changes, &applied);
@@ -1916,7 +1962,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             direct: false,
             downgrade: false,
             members: Vec::new(),
-            registry: rebind.dependency.registry.clone(),
+            registry: rebind
+                .dependency
+                .registry
+                .as_deref()
+                .map(cooldown_core::redact::url_credentials),
             from: rebind.from.to_string(),
             to: rebind.to.to_string(),
             // Informational: the kind of the binding jump, when classifiable.
@@ -1931,9 +1981,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             edge: Some(crate::app::UpgradeEdgeInfo {
                 dependent: rebind.dependent.clone(),
                 dependent_version: rebind.dependent_version.to_string(),
-                dependent_source: rebind.dependent_source.clone(),
+                dependent_source: rebind
+                    .dependent_source
+                    .as_deref()
+                    .map(cooldown_core::redact::url_credentials),
                 action: rebind.action,
-                detail: rebind.detail.clone(),
+                detail: rebind
+                    .detail
+                    .as_deref()
+                    .map(cooldown_core::redact::url_credentials),
             }),
         }
     }
@@ -2139,6 +2195,7 @@ fn verify_applied_targets(
         applied: Vec::new(),
         skipped: report.skipped,
         edge_rebinds: report.edge_rebinds,
+        warnings: report.warnings,
     };
 
     for change in report.applied {
@@ -2469,6 +2526,7 @@ mod tests {
             files: vec![ProjectMutationFile {
                 path: "package-lock.json".into(),
                 contents: Some(b"baseline lock".to_vec()),
+                permissions: None,
             }],
         };
         let later = ProjectMutationJournal {
@@ -2476,10 +2534,12 @@ mod tests {
                 ProjectMutationFile {
                     path: "package-lock.json".into(),
                     contents: Some(b"trial lock".to_vec()),
+                    permissions: None,
                 },
                 ProjectMutationFile {
                     path: "package.json".into(),
                     contents: Some(b"baseline manifest".to_vec()),
+                    permissions: None,
                 },
             ],
         };
@@ -2505,6 +2565,7 @@ mod tests {
             files: vec![ProjectMutationFile {
                 path: "Cargo.toml".into(),
                 contents: Some(b"original".to_vec()),
+                permissions: None,
             }],
         };
         let mut rollback = TrialRollback::default();
