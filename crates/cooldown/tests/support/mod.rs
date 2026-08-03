@@ -628,8 +628,8 @@ impl Envelope {
             .collect()
     }
 
-    /// The lock-edge rows of an `upgrade`/`fix` report, in report order. Empty when no edge
-    /// binding moved (or the tool has no edge policy).
+    /// The lock-edge rows of an `upgrade`/`fix` report, in report order.
+    /// Empty when no edge binding moved (or the tool has no edge policy).
     pub fn edge_rows(&self) -> Vec<EdgeRow> {
         self.items()
             .iter()

@@ -224,7 +224,8 @@ pub(crate) type SlotKey = (String, String);
 pub(crate) type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
 
 /// The `Cargo.lock`'s `[[package]]` array, parsed for the before/after version diff and the
-/// edge-binding policies. Only the fields those need are read; Cargo owns the canonical format.
+/// edge-binding policies.
+/// Only the fields those need are read; Cargo owns the canonical format.
 #[derive(serde::Deserialize)]
 pub(crate) struct CargoLock {
     #[serde(default)]
@@ -237,13 +238,16 @@ pub(crate) struct LockPackage {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) version: Option<String>,
-    /// The source URL. Absent for path/workspace members; present for registry and git crates. Only
-    /// registry crates have a comparable, fetchable version, so the version diff keeps only those.
+    /// The source URL.
+    /// Absent for path/workspace members; present for registry and git crates.
+    /// Only registry crates have a comparable, fetchable version, so the version diff keeps only
+    /// those.
     #[serde(default)]
     pub(crate) source: Option<String>,
     /// The package's resolved dependency entries — `"name"`, `"name x.y.z"` when the lock holds
-    /// several versions of the name, or `"name x.y.z (source)"` when several sources coexist. The
-    /// version-qualified form is an edge *binding* the edge-policy module inspects and may rewrite.
+    /// several versions of the name, or `"name x.y.z (source)"` when several sources coexist.
+    /// The version-qualified form is an edge *binding* the edge-policy module inspects and may
+    /// rewrite.
     #[serde(default)]
     pub(crate) dependencies: Vec<String>,
 }
@@ -257,8 +261,8 @@ impl LockPackage {
     }
 
     /// Whether this locked package came from a registry (crates.io or an alternate registry), the
-    /// only source kind whose version the cooldown diff can move and compare. Git and path/workspace
-    /// sources are excluded.
+    /// only source kind whose version the cooldown diff can move and compare.
+    /// Git and path/workspace sources are excluded.
     fn is_registry(&self) -> bool {
         self.source
             .as_deref()

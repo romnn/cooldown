@@ -16,8 +16,9 @@ use crate::model::{
 use crate::mutation::{AcceptedProjectState, ProjectMutationJournal, ProjectMutationState};
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use jiff::{SignedDuration, Timestamp};
+use std::sync::Arc;
 
 /// What an adapter can express, so the conformance suite can capability-gate the right invariants.
 ///
@@ -88,22 +89,25 @@ pub trait ToolRead: Send + Sync {
     /// An adapter neither walks the tree nor decides `.gitignore` or exclude policy itself.
     fn project_detection(&self) -> ProjectDetection;
 
-    /// Validates a manifest root found without the adapter's declared lockfile marker.
+    /// Validates manifest roots found without the adapter's declared lockfile marker.
     ///
-    /// The orchestrator calls this only for the validation marker declared by
+    /// The orchestrator calls this only for validation markers declared by
     /// [`Self::project_detection`].
-    /// It lets an adapter reject unsupported alternate state without treating a validation-only
-    /// marker as a detected project.
+    /// It lets an adapter audit shared discovery inputs once and reject unsupported alternate state
+    /// without treating validation-only markers as detected projects.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the manifest selects project state outside
-    /// the adapter's supported filesystem model.
-    fn validate_manifest_without_lock(&self, root: &Utf8Path) -> Result<()> {
-        Err(CoreError::Config(format!(
-            "tool `{}` declared a validation-only project marker at {root} without implementing its validator",
-            self.id().as_str()
-        )))
+    /// Returns a [`CoreError`](crate::CoreError) when a manifest selects project state outside the
+    /// adapter's supported filesystem model.
+    fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {
+        if let Some(root) = roots.first() {
+            return Err(CoreError::Config(format!(
+                "tool `{}` declared a validation-only project marker at {root} without implementing its validator",
+                self.id().as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Classifies a version-to-version movement using the adapter's native version semantics.
@@ -363,10 +367,11 @@ pub trait IsolatedMutation: Send {
     async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication>;
 }
 
-/// A project produced by an adapter-owned isolated mutation stage.
+/// A project produced by an isolated mutation stage.
 ///
-/// The private field makes isolated-only adapter operations require provenance from an
-/// [`IsolatedMutation`] rather than an arbitrary [`Project`].
+/// The private field prevents callers from wrapping an arbitrary [`Project`].
+/// [`PreparedMutation::prepare_isolated`] separately checks that its tool family matches the
+/// consuming writer and that the writer still declares isolated execution.
 #[derive(Debug, Clone)]
 pub struct IsolatedMutationProject {
     project: Project,
@@ -416,13 +421,14 @@ pub enum ApplyAttempt {
 ///
 /// Callers prepare this value through [`PreparedMutation::prepare`] and may derive only checked
 /// plan subsets from it.
-/// Its private fields prevent a plan from being paired with another project's journal at an
-/// adapter boundary.
+/// Its private fields prevent a plan from being paired with another project's journal at a
+/// mutation boundary.
+/// Dispatch is bound to a tool family, not to one concrete adapter instance.
 #[derive(Debug, Clone)]
 pub struct PreparedMutation {
     project: Project,
     plan: Plan,
-    journal: ProjectMutationJournal,
+    journal: Arc<ProjectMutationJournal>,
     tool: ToolId,
     execution: PreparedMutationExecution,
 }
@@ -438,9 +444,15 @@ impl PreparedMutation {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`] when the adapter cannot capture the write set or the resulting
-    /// journal does not authorize the supplied project.
+    /// Returns a [`CoreError`] when the writer requires isolated execution, cannot capture the
+    /// write set, or produces a journal that does not authorize the supplied project.
     pub async fn prepare(writer: &dyn ToolWrite, project: &Project, plan: &Plan) -> Result<Self> {
+        if !matches!(writer.mutation_execution(), MutationExecution::InPlace) {
+            return Err(CoreError::LockConflict(format!(
+                "{} mutations require an adapter-prepared isolated project",
+                writer.mutation_tool().as_str()
+            )));
+        }
         Self::prepare_for(writer, project, plan, PreparedMutationExecution::InPlace).await
     }
 
@@ -489,56 +501,78 @@ impl PreparedMutation {
         Ok(PreparedMutation {
             project: project.clone(),
             plan: plan.clone(),
-            journal,
+            journal: Arc::new(journal),
             tool,
             execution,
         })
     }
 
-    /// Revalidates the adapter, project, and write set for one dispatch.
+    /// Revalidates an in-place tool-family operation and its write set for one dispatch.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`] when another adapter receives the operation or when the
-    /// project identity or writable topology changed after preparation.
+    /// Returns [`CoreError::LockConflict`] when the writer's tool family or execution mode differs,
+    /// or when the project identity or writable topology changed after preparation.
     pub fn parts_for(
+        &self,
+        writer: &(impl ToolWrite + ?Sized),
+    ) -> Result<(&Project, &Plan, &ProjectMutationJournal)> {
+        if self.execution != PreparedMutationExecution::InPlace
+            || !matches!(writer.mutation_execution(), MutationExecution::InPlace)
+        {
+            return Err(CoreError::LockConflict(
+                "operation requires in-place mutation execution".to_string(),
+            ));
+        }
+        self.validated_parts_for(writer)
+    }
+
+    fn validated_parts_for(
         &self,
         writer: &(impl ToolWrite + ?Sized),
     ) -> Result<(&Project, &Plan, &ProjectMutationJournal)> {
         let tool = writer.mutation_tool();
         if tool != self.tool {
             return Err(CoreError::LockConflict(format!(
-                "{} mutation authority cannot dispatch an operation prepared for {}",
+                "{} tool family cannot dispatch an operation prepared for {}",
                 tool.as_str(),
                 self.tool.as_str()
             )));
         }
         self.journal.validate_project(&self.project.root)?;
-        Ok((&self.project, &self.plan, &self.journal))
+        Ok((&self.project, &self.plan, self.journal.as_ref()))
+    }
+
+    /// The plan carried by this prepared operation.
+    #[must_use]
+    pub fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     /// The project-bound rollback journal for this operation.
     #[must_use]
     pub fn journal(&self) -> &ProjectMutationJournal {
-        &self.journal
+        self.journal.as_ref()
     }
 
     /// Revalidates and exposes an operation whose adapter requires isolated mutation execution.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`] when the adapter did not declare isolated execution or
-    /// the prepared project's mutation authority is no longer valid.
+    /// Returns [`CoreError::LockConflict`] when the writer's tool family or execution mode differs,
+    /// or when the prepared project's mutation authority is no longer valid.
     pub fn isolated_parts_for(
         &self,
         writer: &(impl ToolWrite + ?Sized),
     ) -> Result<(&Project, &Plan, &ProjectMutationJournal)> {
-        if self.execution != PreparedMutationExecution::Isolated {
+        if self.execution != PreparedMutationExecution::Isolated
+            || !matches!(writer.mutation_execution(), MutationExecution::Isolated(_))
+        {
             return Err(CoreError::LockConflict(
                 "operation requires an adapter-prepared isolated mutation project".to_string(),
             ));
         }
-        self.parts_for(writer)
+        self.validated_parts_for(writer)
     }
 
     /// Derives a retry operation containing only changes authorized by this operation.
@@ -565,7 +599,7 @@ impl PreparedMutation {
         Ok(PreparedMutation {
             project: self.project.clone(),
             plan,
-            journal: self.journal.clone(),
+            journal: Arc::clone(&self.journal),
             tool: self.tool,
             execution: self.execution,
         })
@@ -579,7 +613,7 @@ impl PreparedMutation {
 /// mechanics.
 #[async_trait]
 pub trait ToolWrite: Send + Sync {
-    /// Returns the stable identifier of the adapter authorized to consume prepared mutations.
+    /// Returns the stable tool-family identifier authorized to consume prepared mutations.
     fn mutation_tool(&self) -> ToolId;
 
     /// Selects whether resolver trials mutate the source project or a disposable copy.
@@ -628,7 +662,8 @@ pub trait ToolWrite: Send + Sync {
     /// re-locking fails.
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport>;
 
-    /// Applies `plan` while reporting sequential native candidate work through `observer`.
+    /// Applies a prepared operation while reporting sequential native candidate work through
+    /// `observer`.
     ///
     /// The default delegates to [`apply`](ToolWrite::apply), which is correct for adapters that run
     /// one native command for the whole plan. An adapter that internally invokes its resolver once
@@ -637,17 +672,16 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured. The
-    /// adapter's own apply error remains inside [`ApplyAttempt::Finished`] so the caller receives
-    /// the postimage even after a failed resolver mutates files.
+    /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured.
+    /// The adapter's own apply error remains inside [`ApplyAttempt::Finished`] so the caller
+    /// receives the postimage even after a failed resolver mutates files.
     async fn apply_with_observer(
         &self,
         mutation: &PreparedMutation,
         _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        let (_, _, journal) = mutation.parts_for(self)?;
         let report = self.apply(mutation).await;
-        let postimage = journal.capture_state()?;
+        let postimage = mutation.journal().capture_state()?;
         Ok(ApplyAttempt::Finished { report, postimage })
     }
 
@@ -696,8 +730,9 @@ pub trait ToolWrite: Send + Sync {
 
     /// Refuses a read when adapter-owned interrupted mutation state is pending.
     ///
-    /// The application calls this while holding shared project access. Implementations must not
-    /// recover or otherwise mutate project state through this read-side hook.
+    /// The application calls this while holding shared project access.
+    /// Implementations must not recover or otherwise mutate project state through this read-side
+    /// hook.
     ///
     /// # Errors
     ///
@@ -709,8 +744,9 @@ pub trait ToolWrite: Send + Sync {
     /// Recovers adapter-owned state left by an interrupted mutation.
     ///
     /// The application invokes this at the start of a mutation lifecycle while holding the
-    /// project's exclusive mutation lock. Read-side adapter methods must never perform recovery;
-    /// they should instead report pending state without modifying the project.
+    /// project's exclusive mutation lock.
+    /// Read-side adapter methods must never perform recovery; they should instead report pending
+    /// state without modifying the project.
     ///
     /// # Errors
     ///
@@ -723,7 +759,8 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// The application treats a returned snapshot as evidence that
     /// [`normalize_lock_edges`](ToolWrite::normalize_lock_edges) can produce an authoritative final
-    /// edge report. Adapters without ambiguous lock edges return [`None`].
+    /// edge report.
+    /// Adapters without ambiguous lock edges return [`None`].
     ///
     /// # Errors
     ///
@@ -735,10 +772,11 @@ pub trait ToolWrite: Send + Sync {
 
     /// Enforces the final lock **edge-binding** policy and reports its net relationship changes.
     ///
-    /// `before` is the adapter snapshot captured before the run's first mutation. `committed`
-    /// carries per-batch edge evidence whose corrective provenance may not be derivable from that
-    /// snapshot when a target package was introduced during the run. Adapters reconcile both with
-    /// the final saved lock, discarding superseded attempts. A healing policy such as
+    /// `before` is the adapter snapshot captured before the run's first mutation.
+    /// `committed` carries per-batch edge evidence whose corrective provenance may not be derivable
+    /// from that snapshot when a target package was introduced during the run.
+    /// Adapters reconcile both with the final saved lock, discarding superseded attempts.
+    /// A healing policy such as
     /// [`EdgePolicy::Canonicalize`](crate::EdgePolicy) still runs when no version change landed.
     /// Adapters without ambiguous edge bindings keep the default no-op.
     /// A mutating implementation must require [`PreparedMutation::isolated_parts_for`] before
@@ -749,8 +787,9 @@ pub trait ToolWrite: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned, the
     /// lock cannot be read, or the metadata the policy's requirement checks need cannot be fetched
     /// — a failed prerequisite must surface as the project error it is, never as a successful
-    /// no-op. A correction that fails the adapter's own lock verification is rolled back and
-    /// reported as held, not an error.
+    /// no-op.
+    /// A correction that fails the adapter's own lock verification is rolled back and reported as
+    /// held, not an error.
     async fn normalize_lock_edges(
         &self,
         _mutation: &PreparedMutation,
@@ -795,9 +834,12 @@ pub trait ToolWrite: Send + Sync {
     /// Writes the resolved repo-wide policy into a single repo-level native config file (the `sync`
     /// operation for [`SyncScope::Repo`] adapters, e.g. uv's root `uv.toml`).
     ///
-    /// Called **once per repo**, not per project. The application holds access to every project that
-    /// consumes the shared file for the duration of the call. The default returns
-    /// [`SyncReport::Unsupported`]; only [`SyncScope::Repo`] adapters override it. As with
+    /// Called **once per repo**, not per project.
+    /// The application holds access to every project that consumes the shared file for the duration
+    /// of the call.
+    /// The default returns [`SyncReport::Unsupported`]; only [`SyncScope::Repo`] adapters override
+    /// it.
+    /// As with
     /// [`write_native`](ToolWrite::write_native), `dry_run` must report what it *would* do without
     /// touching any file.
     ///

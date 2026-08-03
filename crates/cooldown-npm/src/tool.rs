@@ -522,7 +522,8 @@ impl<L: NodeLock> NpmTool<L> {
     /// authorized manifest edits, then reports collateral lock movements.
     ///
     /// npm's `--before` constrains the complete resolved tree, so even a per-package command can move
-    /// transitives. Diffing the journaled lock against the final lock keeps those movements visible.
+    /// transitives.
+    /// Diffing the journaled lock against the final lock keeps those movements visible.
     async fn apply_per_package(
         &self,
         project: &Project,
@@ -537,8 +538,9 @@ impl<L: NodeLock> NpmTool<L> {
         let mut violation_baseline: Option<PeerViolations> = None;
         for change in &plan.changes {
             // A failed later candidate must not leak its widened manifest when an earlier sibling
-            // succeeded and makes the outer batch committable. Capture the state after those earlier
-            // successes so this candidate can be restored independently.
+            // succeeded and makes the outer batch committable.
+            // Capture the state after those earlier successes so this candidate can be restored
+            // independently.
             let candidate_plan = Plan {
                 changes: vec![change.clone()],
                 ..plan.clone()
@@ -603,29 +605,36 @@ impl<L: NodeLock> NpmTool<L> {
 
     /// Re-resolve the **whole** importer graph jointly (pnpm), pinning every planned candidate to
     /// its EXACT per-package target, then report the full before/after lock diff — the proven
-    /// cargo/go pattern ported to pnpm. Peer verification can reject candidates and re-resolve,
-    /// so one apply may run several native resolves (see [`Self::resolve_and_verify_peers`]).
+    /// cargo/go pattern ported to pnpm.
+    /// Peer verification can reject candidates and re-resolve, so one apply may run several native
+    /// resolves (see [`Self::resolve_and_verify_peers`]).
     ///
     /// One importer-filtered `pnpm update <pkg>@<target> … --lockfile-only --no-save` jointly
     /// re-resolves the affected graph, settling mutually-exclusive peer conflicts at a single fixed
-    /// point instead of ping-ponging between per-package updates. Each `<pkg>@<target>` is the
-    /// candidate's own `change.to`, computed by cooldown-core under that package's window, so a package
-    /// with a *stricter* per-package window lands at its older per-package target rather than
+    /// point instead of ping-ponging between per-package updates.
+    /// Each `<pkg>@<target>` is the candidate's own `change.to`, computed by cooldown-core under that
+    /// package's window, so a package with a *stricter* per-package window lands at its older target
+    /// rather than
     /// overshooting onto the global-window-newest — the gap a bare `--latest` left, since pnpm's
-    /// `minimumReleaseAge` is a single global knob with no per-package publish-date cutoff. This mirrors
-    /// cargo's `update --precise <to>` and go's `get module@<to>`: the per-package target already
+    /// `minimumReleaseAge` is a single global knob with no per-package publish-date cutoff.
+    /// This mirrors cargo's `update --precise <to>` and go's `get module@<to>`: the per-package target
+    /// already
     /// encodes the per-package window, so pinning it enforces that window exactly.
     ///
-    /// `minimumReleaseAge` is passed as the *transitive* floor. A persisted native policy can reject
-    /// an older lock before applying the exact pins that would repair it. For that migration state,
+    /// `minimumReleaseAge` is passed as the *transitive* floor.
+    /// A persisted native policy can reject an older lock before applying the exact pins that would
+    /// repair it.
+    /// For that migration state,
     /// pnpm is rerun with temporary exact overrides for the planned targets and `--trust-lockfile`;
     /// this skips only the rejected starting-lock preflight while the age floor still governs the
-    /// replacement graph. The original native config is restored before pnpm settles the lock again.
+    /// replacement graph.
+    /// The original native config is restored before pnpm settles the lock again.
     ///
     /// The report is the diff of the journal's pre-apply lock against the result, so every planned
     /// candidate is reported reached or held (naming the conflicting peer where attributable) and
-    /// every collateral move of an unplanned package surfaces as its own row. A resolver failure
-    /// after the repair retry marks the conflicting candidates held. The accepted result is
+    /// every collateral move of an unplanned package surfaces as its own row.
+    /// A resolver failure after the repair retry marks the conflicting candidates held.
+    /// The accepted result is
     /// post-verified against the pre-apply peer contracts *between workspace-declared packages in
     /// a context that demonstrably binds them* — the lock's own records plus every workspace
     /// member manifest's ([`proven_peer_violations`]): pnpm only warns on a peer mismatch, so a
@@ -643,21 +652,22 @@ impl<L: NodeLock> NpmTool<L> {
             return Ok(report);
         }
 
-        // The pre-apply lock, captured in the journal. Both the newest-version map (for the move diff)
-        // and the multi-version set (for the exact-pin-vs-float decision) are derived from this one
-        // copy — no extra disk read, and both see exactly the lock the resolve starts from.
+        // The pre-apply lock is captured in the journal.
+        // Both the newest-version map and the multi-version set are derived from this one copy, so
+        // both see exactly the lock the resolve starts from without another disk read.
         let before_content = journaled_lock::<L>(journal);
         let before = before_content.map(locked_versions::<L>).unwrap_or_default();
         let multi_version = before_content
             .map(multi_version_names::<L>)
             .unwrap_or_default();
 
-        // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the current
-        // instant. An absolute `--freeze` cutoff becomes `now - freeze` minutes — equivalent to the
+        // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the
+        // current instant.
+        // An absolute `--freeze` cutoff becomes `now - freeze` minutes — equivalent to the
         // freeze date as long as the same `now` governs both the seed and this resolve (it does:
-        // wall-clock advances only seconds between them, far below the day-scale window under test). It
-        // is passed only as the *transitive* floor here; each planned candidate is pinned to its exact
-        // per-package target, so its own (possibly stricter) window is enforced by the pin, not this cap.
+        // wall-clock advances only seconds between them, far below the day-scale window under test).
+        // It is passed only as the *transitive* floor here; each planned candidate is pinned to its
+        // exact per-package target, so its own window is enforced by the pin rather than this cap.
         let window_minutes =
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
 
@@ -692,8 +702,9 @@ impl<L: NodeLock> NpmTool<L> {
             if peer_rejected.contains(&(name, change.to.as_str())) {
                 continue;
             }
-            // Whether the lock's version for this name actually moved. A name can resolve to several
-            // copies in a pnpm graph; `before`/`after` track its *newest* copy, so a candidate planned
+            // Whether the lock's version for this name actually moved.
+            // A name can resolve to several copies in a pnpm graph; `before`/`after` track its
+            // *newest* copy, so a candidate planned
             // off a stale duplicate copy whose newest copy is already at the target shows no net move.
             // Reporting only genuine moves keeps the report set equal to the lock-diff set: a converged
             // re-run, where nothing moved, reports zero applied (no oscillation).
@@ -706,13 +717,14 @@ impl<L: NodeLock> NpmTool<L> {
                 if moved {
                     report.applied.push(change.clone());
                 }
-                // Reached its target without a net lock move — already satisfied (a duplicate copy of
-                // the same name is at the target). A no-op, neither applied nor held.
+                // Reached its target without a net lock move because a duplicate copy of the same
+                // name is at the target.
+                // This is a no-op, neither applied nor held.
             } else if multi_version.contains(name) {
-                // A dependency declared at multiple versions across the workspace is deliberately kept
-                // in range, not pinned to the target. That is a conservative hold, not a resolver
-                // conflict, and it must not be advertised as adoptable: `outdated`'s verify
-                // reclassifies it blocked.
+                // A dependency declared at multiple versions across the workspace is deliberately
+                // kept in range instead of pinned to the target.
+                // That is a conservative hold, not a resolver conflict, and it must not be advertised
+                // as adoptable: `outdated`'s verify reclassifies it blocked.
                 report.skipped.push(Skipped {
                     change: change.clone(),
                     reason: SkipReason::MultiVersionHeld,
@@ -720,10 +732,11 @@ impl<L: NodeLock> NpmTool<L> {
                     detail: None,
                 });
             } else {
-                // The joint resolve could not place this candidate at its target without breaking the
-                // lock — a mutually-exclusive peer won. Name the sibling whose peer choice excluded it
-                // so the report says "held: conflicts with <pkg>"; absent a unique blocker it falls
-                // back to the candidate itself (the generic "resolver rejected" form).
+                // The joint resolve could not place this candidate at its target without breaking
+                // the lock because a mutually-exclusive peer won.
+                // Name the sibling whose peer choice excluded it so the report says
+                // "held: conflicts with <pkg>"; absent a unique blocker it falls back to the
+                // candidate itself.
                 let offender =
                     peer_conflict_blocker(&after_content, name).unwrap_or_else(|| name.to_string());
                 report.skipped.push(Skipped {
@@ -737,8 +750,8 @@ impl<L: NodeLock> NpmTool<L> {
 
         report.skipped.extend(peer_skips);
 
-        // The hard requirement: no net version change to *any* package may be omitted. Every moved
-        // package the applied rows above do not already report is surfaced as its own collateral
+        // The hard requirement is that no net version change to any package may be omitted.
+        // Every moved package the applied rows above do not already report is surfaced as its own collateral
         // applied row — including a *held* candidate the resolve still floated off its baseline
         // (whose skip row alone would hide that real move).
         let collateral = collateral_changes::<L>(&before, &after, &report.applied);
@@ -756,8 +769,9 @@ impl<L: NodeLock> NpmTool<L> {
     /// baseline (gathered once — see [`PeerBaseline`]) and rejects every candidate a violation
     /// uniquely proves culpable ([`plan_peer_rejections`]) with structured `peer_held` blame; the
     /// journal is restored and the remainder re-resolved, so unrelated moves survive without the
-    /// caller's bisect and extra rounds correspond only to real cascades. An unattributable
-    /// violation propagates as a non-local rejection for candidate isolation. The rounds are
+    /// caller's bisect and extra rounds correspond only to real cascades.
+    /// An unattributable violation propagates as a non-local rejection for candidate isolation.
+    /// The rounds are
     /// bounded by the plan length (each continuing round removes at least one candidate); when
     /// every candidate is rejected, the restored pre-apply lock is the result.
     async fn resolve_and_verify_peers(
@@ -792,8 +806,9 @@ impl<L: NodeLock> NpmTool<L> {
                         && window_minutes.is_some_and(|minutes| minutes > 0)
                         && L::NATIVE_MIN_AGE_FILE.is_some() =>
                 {
-                    // A persisted minimumReleaseAge validates the starting lock before pnpm
-                    // applies the exact pins. Restore any partial resolver work, then rebuild
+                    // A persisted minimumReleaseAge validates the starting lock before pnpm applies
+                    // the exact pins.
+                    // Restore any partial resolver work, then rebuild
                     // through temporary exact overrides while retaining the age floor.
                     restore_after_owned_step(journal, &resolve.postimage)?;
                     self.repair_policy_rejected_graph(
@@ -805,11 +820,12 @@ impl<L: NodeLock> NpmTool<L> {
                     .await?;
                     resolve.postimage = journal.capture_state()?;
                 }
-                // The joint resolve is unsatisfiable as a whole. Propagate the failure so the
+                // The joint resolve is unsatisfiable as a whole.
+                // Propagate the failure so the
                 // caller's `apply_resilient` can isolate the offending candidate(s) (an
                 // unfetchable version, one side of a conflict) and apply the rest, instead of
-                // holding every candidate. The caller restores the journal, so no partial lock
-                // is kept.
+                // holding every candidate.
+                // The caller restores the journal, so no partial lock is kept.
                 Err(error) => {
                     restore_after_owned_step(journal, &resolve.postimage)?;
                     return Err(error);
@@ -848,22 +864,27 @@ impl<L: NodeLock> NpmTool<L> {
     ///
     /// A candidate held at a single version across the workspace is **exact-pinned** to its
     /// per-package target (`name@target`): the resolve lands it at exactly that version, honoring a
-    /// stricter-than-global per-package window with no overshoot. A candidate a member declares at a
+    /// stricter-than-global per-package window with no overshoot.
+    /// A candidate a member declares at a
     /// version *other* members also hold at a different version (a v4/v5 split, which pnpm keeps like
     /// cargo) is skipped instead: exact-pinning one target would collapse every other copy onto it, and
     /// pnpm's bare `update <name>` can write an out-of-range lock entry while `--no-save` leaves the
-    /// manifest unchanged. The pre-apply lock identifies those multi-version names; a missing/unparsable
-    /// lock means nothing is multi-version yet, so every pin is exact.
+    /// manifest unchanged.
+    /// The pre-apply lock identifies those multi-version names; a missing or unparsable lock means
+    /// nothing is multi-version yet, so every pin is exact.
     ///
     /// Widen is for the exact pins only, and only when their target is out of the declared range
-    /// (`Auto`) or always (`Always`). It is mandatory there: `pnpm update <pkg>@<target> --no-save`
+    /// (`Auto`) or always (`Always`).
+    /// It is mandatory there: `pnpm update <pkg>@<target> --no-save`
     /// re-pins the lock to an out-of-range target but leaves the manifest as written, so the next
     /// resolve (which re-resolves any package it is not pinning, against its manifest range) snaps the
-    /// candidate back into range and breaks the fixed point. A multi-version candidate is never widened
-    /// — widening would let it cross its own range boundary, the very line we are preserving.
+    /// candidate back into range and breaks the fixed point.
+    /// A multi-version candidate is never widened because widening would let it cross its own range
+    /// boundary, the very line we are preserving.
     ///
-    /// Each declaring member becomes a pnpm portable location filter. This reaches root and member
-    /// importers without relying on package names or running the update in unrelated workspace
+    /// Each declaring member becomes a pnpm portable location filter.
+    /// This reaches root and member importers without relying on package names or running the update
+    /// in unrelated workspace
     /// packages, where an unmatched package selector can otherwise move unrelated direct
     /// dependencies.
     async fn whole_graph_resolve(
@@ -887,7 +908,8 @@ impl<L: NodeLock> NpmTool<L> {
         // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
         // still left short of its target is blocked by *another* package's requirement (a peer
         // conflict), which widening its own declared range cannot resolve — the lock diff reports it
-        // held. No post-resolve re-widen loop is needed.
+        // held.
+        // No post-resolve re-widen loop is needed.
         Ok(())
     }
 
@@ -901,14 +923,16 @@ impl<L: NodeLock> NpmTool<L> {
         for change in &plan.changes {
             let name = change.package.name.clone();
             if multi_version.contains(&name) {
-                // Preserve every distinct line. A bare pnpm update can write an out-of-range lock
-                // entry while leaving package.json untouched.
+                // Preserve every distinct line.
+                // A bare pnpm update can write an out-of-range lock entry while leaving package.json
+                // untouched.
                 continue;
             }
             // Exact-pin: widen the owning manifest when the target is out of range so the exact lock
-            // pin stays consistent with `package.json`. A candidate not declared in any owning manifest
-            // (`target_in_declared_range` returns `false`) is widened too, so the pin is never left
-            // dangling against a range that excludes it.
+            // pin stays consistent with `package.json`.
+            // A candidate not declared in any owning manifest (`target_in_declared_range` returns
+            // `false`) is widened too, so the pin is never left dangling against a range that
+            // excludes it.
             let widen = match plan.rewrite {
                 RewriteMode::Always => true,
                 RewriteMode::Auto => !target_in_declared_range(project, change)?,
@@ -1039,9 +1063,9 @@ fn minimum_age_lock_rejected(error: &CoreError) -> bool {
 
 /// Keeps a failed repair out of resilient apply's candidate-conflict isolation.
 ///
-/// The retry already grants every known starting violation a narrow exemption. Seeing the same
-/// preflight error again means the repair mechanism itself failed, not that one planned version is
-/// unsatisfiable.
+/// The retry already grants every known starting violation a narrow exemption.
+/// Seeing the same preflight error again means the repair mechanism itself failed, not that one
+/// planned version is unsatisfiable.
 fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
     if minimum_age_lock_rejected(&error) {
         CoreError::System(format!(
@@ -1053,9 +1077,9 @@ fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
 }
 
 /// pnpm stops at the first matching exclusion rule, so one package's exact versions must share a
-/// `version||version` union rather than appearing as separate entries. A targeted package excludes
-/// only its approved destination; allowing its rejected starting version would let the settlement
-/// resolve float back to it after the temporary override is removed.
+/// `version||version` union rather than appearing as separate entries.
+/// A targeted package excludes only its approved destination; allowing its rejected starting version
+/// would let the settlement resolve float back to it after the temporary override is removed.
 fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
     let mut exclusions = configured_exclusions.into_iter().collect::<BTreeSet<_>>();
     let targeted = plan
@@ -1094,9 +1118,9 @@ fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>
 /// A mismatch already present in the pre-apply lock (e.g. a pnpm `overrides` entry that legally pins
 /// a direct dependency outside its declared range — `--frozen-lockfile` accepts that via the lock's
 /// `overrides:` section, which the cheap check does not read) must not fail apply: every recovery
-/// trial would fail identically and the run would misreport all candidates as held. The before/after
-/// gate also absorbs any node-semver vs rust-semver divergence: whatever the check misjudges, it
-/// misjudges identically on both sides.
+/// trial would fail identically and the run would misreport all candidates as held.
+/// The before/after gate also absorbs any node-semver vs rust-semver divergence: whatever the check
+/// misjudges, it misjudges identically on both sides.
 fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Option<String> {
     let detail = L::lock_consistency_error(after)?;
     before
@@ -1106,7 +1130,8 @@ fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Opt
 
 /// Names workspace importers DECLARE on more than one distinct line — a genuine split that must be
 /// skipped (exact-pinning one target would collapse the other line), unlike everything else which is
-/// exact-pinned. A name splits when importers resolve it to different versions (a v4/v5
+/// exact-pinned.
+/// A name splits when importers resolve it to different versions (a v4/v5
 /// split) OR declare it with different range specifiers (`~7.3.0` vs `^7.0.0`, `"<4"` vs `^4`) — the
 /// latter even at one resolved version, since exact-pinning would still drag the narrower member off
 /// its declared range.
@@ -1114,8 +1139,9 @@ fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Opt
 /// Derived from per-importer declarations (`member_sources`), NOT the full resolved package set: a
 /// direct dependency that merely shares a name with a transitive copy resolved at another version is
 /// single-declared, so it stays exact-pinned — its per-package window and any out-of-range widen are
-/// honored. Counting the whole resolved graph instead would misclassify such a dep as multi-version
-/// and float it, dropping the widen so a cross-major/out-of-range target can never land.
+/// honored.
+/// Counting the whole resolved graph instead would misclassify such a dep as multi-version and float
+/// it, dropping the widen so a cross-major/out-of-range target can never land.
 fn multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
     L::member_sources(content).names_declared_at_multiple_versions()
 }
@@ -1139,10 +1165,10 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
         // work: a cross-major target a still-present dependent's peer range excludes is held up
         // front — pnpm's resolver only *warns* on the mismatch, and npm (which rejects it by
-        // default) commits it under relaxed enforcement. The gated changes never reach the
-        // resolve (no manifest widen, no pin). Workspace member manifests are read from disk here
-        // — still pre-apply state — because the lock is not authoritative for a local package's
-        // peer contracts.
+        // default) commits it under relaxed enforcement.
+        // The gated changes never reach the resolve (no manifest widen, no pin).
+        // Workspace member manifests are read from disk here — still pre-apply state — because the
+        // lock is not authoritative for a local package's peer contracts.
         let lock = journaled_lock::<L>(journal);
         let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock);
         let PeerPartition {
@@ -1151,9 +1177,10 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         } = partition_peer_held::<L>(plan, &evidence);
         // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
         // jointly (peer verification may reject candidates and re-resolve) and reports the full
-        // before/after lock diff, so a candidate can never silently move
-        // another package and mutually-exclusive peers settle at a single fixed point. The others
-        // (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock path.
+        // before/after lock diff, so a candidate can never silently move another package and
+        // mutually-exclusive peers settle at a single fixed point.
+        // The others (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock
+        // path.
         let mut report = if L::supports_whole_graph_resolve() {
             self.apply_whole_graph(project, &plan, journal, &evidence.workspace)
                 .await?
@@ -1225,8 +1252,9 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
         // The cooldown.toml `latest`/`allow` packages become pnpm's native per-package exemption list,
         // so a package cooldown's own policy exempts is also exempt from pnpm's rolling
-        // minimumReleaseAge gate (otherwise the native window would still quarantine it). An empty list
-        // removes the key, so toggling a package back under the cooldown cleans up after itself.
+        // minimumReleaseAge gate (otherwise the native window would still quarantine it).
+        // An empty list removes the key, so toggling a package back under the cooldown cleans up
+        // after itself.
         changed |= set_yaml_block_list(
             &path,
             "minimumReleaseAgeExclude",
@@ -1275,7 +1303,8 @@ mod tests {
     }
 
     /// A tag naming a version absent from the release list (a registry inconsistency) fails open:
-    /// nothing is marked, so no ceiling applies. Same for no tag at all.
+    /// nothing is marked, so no ceiling applies.
+    /// The same applies when there is no tag.
     #[test]
     fn unknown_or_absent_latest_tag_marks_nothing() {
         for tag in [Some("99.0.0"), None] {
@@ -1321,10 +1350,12 @@ mod tests {
         // stricter-windowed package lands at its own (possibly older) target rather than overshooting.
         // The window rides inline as `minimumReleaseAge`, the floor for any fresh transitive the pins
         // drag in.
-        // Each exact pin becomes `name@target`. Multi-version candidates stay out of this command
-        // before construction because bare `pnpm update <name>` can write an out-of-range lock entry
-        // while `--no-save` leaves the manifest unchanged. Importer filters cover both root and member
-        // declarations without running the command in unrelated workspace packages.
+        // Each exact pin becomes `name@target`.
+        // Multi-version candidates stay out of this command before construction because bare
+        // `pnpm update <name>` can write an out-of-range lock entry while `--no-save` leaves the
+        // manifest unchanged.
+        // Importer filters cover both root and member declarations without running the command in
+        // unrelated workspace packages.
         let pins = vec![
             ("eslint".to_string(), "9.5.0".to_string()),
             (
@@ -1540,9 +1571,10 @@ mod tests {
 
     #[test]
     fn reached_checks_the_declaring_member_not_the_names_newest_copy() {
-        // A multi-version dependency: `pkgs/low` is on the v22 line, `pkgs/high` on v25. A candidate
-        // bumping `pkgs/low` to 25 must be judged at `pkgs/low`'s own copy (still 22) — NOT the name's
-        // newest copy (25, owned by `pkgs/high`), which would falsely report it landed.
+        // A multi-version dependency has `pkgs/low` on the v22 line and `pkgs/high` on v25.
+        // A candidate bumping `pkgs/low` to 25 must be judged at `pkgs/low`'s own copy (still 22),
+        // not the name's newest copy (25, owned by `pkgs/high`), which would falsely report it
+        // landed.
         let lock = "\
 importers:
 
@@ -1609,8 +1641,9 @@ packages:
         let after = HashMap::from([("shared".to_string(), "1.4.3".to_string())]);
 
         // A held planned candidate has no applied row, yet the resolve still floated it off its
-        // baseline. That net move must surface as a collateral row beside the held skip instead of
-        // being silently dropped behind the planned name.
+        // baseline.
+        // That net move must surface as a collateral row beside the held skip instead of being
+        // silently dropped behind the planned name.
         let collateral = collateral_changes::<Pnpm>(&before, &after, &[]);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "shared");

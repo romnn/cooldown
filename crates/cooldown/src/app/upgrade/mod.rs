@@ -617,9 +617,9 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
     dedupe_edge_items(&mut acc.edge_items);
     acc.items.append(&mut acc.edge_items);
     // Changes are planned/applied in the (now-sorted) dependency order, but sort the report
-    // items explicitly so the output is stable, status-first (errored/skipped lead, applied
-    // last). A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its
-    // items carry the real applied/skipped outcome and sort identically to the real run.
+    // items explicitly so the output is stable, status-first (errored/skipped lead, applied last).
+    // A `--dry-run` runs the same whole-graph resolve against a throwaway copy, so its items carry
+    // the real applied/skipped outcome and sort identically to the real run.
     acc.items.sort_by(|a, b| {
         a.project
             .cmp(&b.project)
@@ -632,8 +632,9 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
         .iter()
         .filter(|item| item.edge.is_none() && item.applied)
         .count();
-    // Every non-applied, non-errored change is a skip — including the `needs --major` rows (a
-    // held-back cross-major *is* a skip). The renderer breaks out how many of them need `--major`.
+    // Every non-applied, non-errored change is a skip — including the `needs --major` rows because a
+    // held-back cross-major is a skip.
+    // The renderer breaks out how many of them need `--major`.
     let skipped = acc
         .items
         .iter()
@@ -650,9 +651,9 @@ fn finalize_outcome(opts: &RunOpts, mut acc: UpgradeAccum) -> UpgradeOutcome {
     let edges_rebound = count_edge_actions(&acc.items, &[EdgeBindingAction::Rebound]);
     let edges_held = count_edge_actions(&acc.items, &[EdgeBindingAction::Held]);
     let edges_unaddressable = count_edge_actions(&acc.items, &[EdgeBindingAction::Unaddressable]);
-    // Held and unaddressable edges make a corrective policy incomplete. Plain `rebound` rows do
-    // not: under a corrective policy they are allowed planned follows, and under policy `none`
-    // observation is the contract.
+    // Held and unaddressable edges make a corrective policy incomplete.
+    // Plain `rebound` rows do not: under a corrective policy they are allowed planned follows, and
+    // under policy `none` observation is the contract.
     acc.strict_incomplete |= edges_held > 0 || edges_unaddressable > 0;
 
     let exit = if err_count > 0 || acc.build_ok == Some(false) {
@@ -697,7 +698,8 @@ fn count_edge_actions(items: &[UpgradeItem], actions: &[EdgeBindingAction]) -> u
 }
 
 /// Drops edge rows that duplicate an earlier one exactly (same project, packages, versions, and
-/// outcome). Version rows are never touched.
+/// outcome).
+/// Version rows are never touched.
 fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
     let mut seen = HashSet::new();
     items.retain(|item| {

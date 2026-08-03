@@ -143,8 +143,8 @@ mod tests {
         );
     }
 
-    /// An exact `=0.8.2` requirement makes 0.8.2 itself canonical: nothing to rewrite. The policy
-    /// respects requirements, it does not blindly maximize.
+    /// An exact `=0.8.2` requirement makes 0.8.2 itself canonical: nothing to rewrite.
+    /// The policy respects requirements instead of blindly maximizing.
     #[test]
     fn an_exact_requirement_keeps_the_pinned_binding() {
         let lock = view(CHURNED_LOCK);

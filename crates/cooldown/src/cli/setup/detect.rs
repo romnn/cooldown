@@ -63,33 +63,33 @@ pub(super) fn adapter_set(
     )?;
 
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())))?;
     adapters.register_target_verified_mutator(Arc::new(
         NpmCliTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         PnpmTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         YarnTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         BunTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     // Deno applies no dist-tag ceiling (`has_dist_tags` is false on that adapter), so it has
     // nothing to keep fresh — it stays on the cached listing path.
-    adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(MavenTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(GradleTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PipTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PoetryTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(MavenTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(GradleTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PipTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PoetryTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())))?;
     Ok(adapters)
 }
 
@@ -164,11 +164,14 @@ pub(super) fn detect_projects(
                 pending.id.as_str()
             ))
         })?;
-        for dir in found.validation_only {
-            if found.primary.binary_search(&dir).is_err() {
-                pending.adapter.validate_manifest_without_lock(&dir)?;
-            }
-        }
+        let validation_only = found
+            .validation_only
+            .into_iter()
+            .filter(|dir| found.primary.binary_search(dir).is_err())
+            .collect::<Vec<_>>();
+        pending
+            .adapter
+            .validate_manifests_without_lock(&validation_only)?;
         let dirs = found.primary;
         tracing::info!(
             tool = pending.id.as_str(),

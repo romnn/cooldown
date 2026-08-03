@@ -27,9 +27,9 @@ pub struct ResolvedPin {
     pub version: String,
 }
 
-/// Parses the `<dependency>` entries of a `pom.xml` into resolved [`ResolvedPin`]s. Dependencies
-/// whose version is absent or a `${property}`/BOM-managed placeholder are skipped, since cooldown
-/// cannot resolve those to a concrete version without running Maven.
+/// Parses the `<dependency>` entries of a `pom.xml` into resolved [`ResolvedPin`]s.
+/// Dependencies whose version is absent or a `${property}`/BOM-managed placeholder are skipped,
+/// since cooldown cannot resolve those to a concrete version without running Maven.
 #[must_use]
 pub fn parse_pom(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
@@ -56,9 +56,9 @@ pub fn parse_pom(content: &str) -> Vec<ResolvedPin> {
     out
 }
 
-/// Parses a `gradle.lockfile` into resolved [`ResolvedPin`]s. Each non-comment line is
-/// `group:artifact:version=configurations`; the trailing `empty=` line and `#` comments are
-/// skipped.
+/// Parses a `gradle.lockfile` into resolved [`ResolvedPin`]s.
+/// Each non-comment line is `group:artifact:version=configurations`; the trailing `empty=` line and
+/// `#` comments are skipped.
 #[must_use]
 pub fn parse_gradle_lock(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();

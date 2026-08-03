@@ -3,10 +3,10 @@
 //! per-manager differences (lockfile name, driver binary, parse, and lock refresh args) so a single
 //! generic adapter can serve all of them.
 //!
-//! Every parser returns the flat list of resolved [`NameVersion`] pairs the lock pins. Where the
-//! lock records importer/member declarations (npm v2/v3, pnpm), the adapter uses that same data for
-//! both direct/transitive classification and source attribution; older formats fall back to the root
-//! manifest's declared dependency names.
+//! Every parser returns the flat list of resolved [`NameVersion`] pairs the lock pins.
+//! Where the lock records importer/member declarations (npm v2/v3, pnpm), the adapter uses that same
+//! data for both direct/transitive classification and source attribution; older formats fall back to
+//! the root manifest's declared dependency names.
 
 use cooldown_core::{CoreError, Result, ToolId};
 use std::collections::{HashMap, HashSet};

@@ -59,14 +59,15 @@ pub struct ResolvedGraph {
     /// compatible).
     pub rust_versions: HashMap<LockPackageId, RustVersion>,
     /// The lowest `rust-version` any workspace member declares, used as cooldown's conservative
-    /// compatibility preference. Cargo uses heuristics for mixed-MSRV workspaces and may select a
-    /// dependency above or below an individual member's needs.
+    /// compatibility preference.
+    /// Cargo uses heuristics for mixed-MSRV workspaces and may select a dependency above or below
+    /// an individual member's needs.
     pub workspace_rust_version: Option<RustVersion>,
 }
 
-/// A declared `rust-version` (MSRV) as a release triple. The derived ordering compares
-/// `major`, then `minor`, then `patch` — semver precedence, since the manifest field forbids
-/// prereleases and build metadata.
+/// A declared `rust-version` (MSRV) as a release triple.
+/// The derived ordering compares `major`, then `minor`, then `patch` — semver precedence, since the
+/// manifest field forbids prereleases and build metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RustVersion {
     /// The major component (`1` in `1.70.3`).
@@ -90,8 +91,9 @@ impl RustVersion {
 }
 
 /// Parses a manifest `rust-version` value (`"1.70"`, `"1.70.0"`) into a comparable
-/// [`RustVersion`], with missing components zeroed. `None` for anything else — the field forbids
-/// ranges and prereleases, so an unparsable value is treated as undeclared.
+/// [`RustVersion`], with missing components zeroed.
+/// Returns `None` for anything else because the field forbids ranges and prereleases, so an
+/// unparsable value is treated as undeclared.
 fn parse_rust_version(value: &str) -> Option<RustVersion> {
     let mut components = value.trim().splitn(3, '.');
     let major = components.next()?.parse().ok()?;
@@ -407,8 +409,9 @@ type PackageEdges = HashMap<String, Vec<String>>;
 type NamedPackageEdges = HashMap<String, Vec<ActiveEdge>>;
 
 /// One declared `=x.y.z` requirement, as a *candidate* ceiling edge: the requirer's package id and
-/// the dependency name and exact version it pins. Resolved against the activated graph before it
-/// caps anything — a pin behind a disabled feature or non-matching `target` is not a real edge.
+/// the dependency name and exact version it pins.
+/// Resolved against the activated graph before it caps anything — a pin behind a disabled feature
+/// or non-matching `target` is not a real edge.
 struct ExactEdge {
     requirer: String,
     dependency: String,
@@ -416,8 +419,9 @@ struct ExactEdge {
 }
 
 /// One lower-bound requirement, as a *candidate* floor edge: the requirer's package id and the
-/// dependency name and floor version its requirement demands. Resolved against the activated
-/// graph before it floors anything, for the same activation reasons as [`ExactEdge`].
+/// dependency name and floor version its requirement demands.
+/// Resolved against the activated graph before it floors anything, for the same activation reasons
+/// as [`ExactEdge`].
 struct FloorEdge {
     requirer: String,
     dependency: String,
@@ -983,11 +987,12 @@ impl Cargo {
         let mut exact_pins = HashSet::new();
         // Every non-dev `=x.y.z` requirement, as a candidate list — not the final ceiling set.
         let mut exact_edges: Vec<ExactEdge> = Vec::new();
-        // Every non-root, non-dev requirement with a parseable lower bound. Like `exact_edges`, a
-        // candidate list resolved against the activated graph below: a requirement behind a
-        // disabled feature or non-matching `target` is not a real edge and demands no floor. Root
-        // requirements are intentionally excluded: they are direct project constraints cooldown
-        // may rewrite, not structural third-party graph floors.
+        // Every non-root, non-dev requirement with a parseable lower bound.
+        // Like `exact_edges`, this is a candidate list resolved against the activated graph below:
+        // a requirement behind a disabled feature or non-matching `target` is not a real edge and
+        // demands no floor.
+        // Root requirements are intentionally excluded because they are direct project constraints
+        // cooldown may rewrite, not structural third-party graph floors.
         let mut floor_edges: Vec<FloorEdge> = Vec::new();
         let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
         let mut declared_requirement_edges: Vec<DeclaredRequirementEdge> = Vec::new();

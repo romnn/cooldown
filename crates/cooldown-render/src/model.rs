@@ -1,8 +1,8 @@
 //! The serializable view model — the stable `--json` contract. One common envelope, with
 //! command-specific `summary`, `items[]`, and a flattened command-specific top-level `meta`.
 //!
-//! [`SCHEMA_VERSION`] identifies the exact closed JSON Schema contract. Any output field or enum
-//! change bumps it because schema objects reject unknown properties.
+//! [`SCHEMA_VERSION`] identifies the exact closed JSON Schema contract.
+//! Any output field or enum change bumps it because schema objects reject unknown properties.
 
 use cooldown_core::{
     Diagnostic, EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status,
@@ -433,9 +433,9 @@ pub struct SkippedInfo {
 }
 
 /// The lock-edge block on an [`UpgradeItem`]: which dependent's edge was rebound between two
-/// coexisting versions of the row's package, and what the edge policy did about it. Present iff
-/// the row reports an edge *binding* move rather than a package version change (cargo only; see
-/// [`cooldown_core::EdgePolicy`]).
+/// coexisting versions of the row's package, and what the edge policy did about it.
+/// Present iff the row reports an edge *binding* move rather than a package version change (cargo
+/// only; see [`cooldown_core::EdgePolicy`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeEdgeInfo {
@@ -486,16 +486,16 @@ pub struct UpgradeItem {
     pub kind: UpdateKind,
     /// Whether this row's version or edge-binding change is present in the committed result.
     pub applied: bool,
-    /// Why a package version change was not applied. Edge outcomes carry their explanation in
-    /// [`UpgradeEdgeInfo::detail`] instead.
+    /// Why a package version change was not applied.
+    /// Edge outcomes carry their explanation in [`UpgradeEdgeInfo::detail`] instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<SkippedInfo>,
     /// The error that prevented the change, if one occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
     /// The lock-edge block, present iff this row reports an edge *binding* move between coexisting
-    /// versions rather than a package version change. [`from`](UpgradeItem::from)/
-    /// [`to`](UpgradeItem::to) then carry the binding versions.
+    /// versions rather than a package version change.
+    /// [`from`](UpgradeItem::from)/[`to`](UpgradeItem::to) then carry the binding versions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge: Option<UpgradeEdgeInfo>,
 }
@@ -533,23 +533,26 @@ impl UpgradeItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeSummary {
-    /// The number of package version changes that were applied. Edge rows are counted separately.
+    /// The number of package version changes that were applied.
+    /// Edge rows are counted separately.
     pub applied: usize,
     /// The number of planned changes that were skipped.
     pub skipped: usize,
     /// The number of changes that errored.
     pub errors: usize,
     /// The number of lock-edge bindings a corrective edge policy wrote back (`restored` or
-    /// `canonicalized` rows). Counted apart from [`applied`](UpgradeSummary::applied): an edge
-    /// correction changes the lock without moving any package version.
+    /// `canonicalized` rows).
+    /// Counted apart from [`applied`](UpgradeSummary::applied): an edge correction changes the lock
+    /// without moving any package version.
     pub edges_corrected: usize,
     /// The number of resolver-produced lock-edge moves that remain in the committed result.
     pub edges_rebound: usize,
-    /// The number of lock-edge corrections that were withheld (`held` rows). Under `--strict` a
-    /// non-zero count fails the run — a requested correction could not be completed.
+    /// The number of lock-edge corrections that were withheld (`held` rows).
+    /// Under `--strict` a non-zero count fails the run — a requested correction could not be
+    /// completed.
     pub edges_held: usize,
-    /// The number of committed edge moves a corrective policy could not address safely. Under
-    /// `--strict` a non-zero count fails the run.
+    /// The number of committed edge moves a corrective policy could not address safely.
+    /// Under `--strict` a non-zero count fails the run.
     pub edges_unaddressable: usize,
 }
 

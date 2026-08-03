@@ -107,12 +107,14 @@ pub(crate) enum TransitiveMode {
 }
 
 /// `upgrade`/`fix --cargo-edge-policy <preserve|canonicalize|none>`: how the cargo adapter treats
-/// resolved lock **edge bindings** after the whole-graph re-resolve. An incremental re-resolve can
-/// silently rebind an edge between two coexisting versions a wide declared range admits — a
-/// build-affecting change the per-version report cannot see. `preserve` (the default) restores
-/// such churn to the pre-upgrade binding; `canonicalize` binds each addressable, unambiguous
-/// crates.io edge to the highest locked version satisfying its active requirement (also healing
-/// eligible pre-existing bad bindings); `none` only reports.
+/// resolved lock **edge bindings** after the whole-graph re-resolve.
+/// An incremental re-resolve can silently rebind an edge between two coexisting versions a wide
+/// declared range admits — a build-affecting change the per-version report cannot see.
+/// `preserve` (the default) restores
+/// such churn to the pre-upgrade binding; `canonicalize` prefers the highest satisfying locked
+/// version whose declared `rust-version` is workspace-compatible, then falls back to the highest
+/// satisfying version when none is compatible (also healing eligible pre-existing bad bindings);
+/// `none` only reports.
 /// Cargo-specific, so both the flag and the config key are cargo-scoped: in config it lives under
 /// `[tool.cargo]` as `edge-policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -121,7 +123,8 @@ pub(crate) enum EdgePolicyArg {
     /// Restore an eligible crates.io edge rebound between still-coexisting versions (the default).
     #[default]
     Preserve,
-    /// Bind each eligible crates.io edge to its highest satisfying locked version.
+    /// Prefer the highest satisfying locked version with a workspace-compatible `rust-version`,
+    /// falling back to the highest satisfying version when none is compatible.
     Canonicalize,
     /// Leave bindings as the resolver produced them; rebinds are still reported.
     None,
@@ -217,8 +220,9 @@ pub(in crate::cli) enum Command {
         rewrite: bool,
         /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
         /// `preserve` restores bindings the resolver churned between coexisting versions
-        /// (default), `canonicalize` binds each ambiguous edge to the highest version satisfying
-        /// its requirement, `none` only reports rebinds. Config: `[tool.cargo] edge-policy`.
+        /// (default), `canonicalize` prefers the highest satisfying workspace-compatible version
+        /// and falls back to the highest satisfying version, `none` only reports rebinds.
+        /// Config: `[tool.cargo] edge-policy`.
         #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
         edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]
@@ -237,8 +241,9 @@ pub(in crate::cli) enum Command {
         downgrade_pinned: bool,
         /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
         /// `preserve` restores bindings the resolver churned between coexisting versions
-        /// (default), `canonicalize` binds each ambiguous edge to the highest version satisfying
-        /// its requirement, `none` only reports rebinds. Config: `[tool.cargo] edge-policy`.
+        /// (default), `canonicalize` prefers the highest satisfying workspace-compatible version
+        /// and falls back to the highest satisfying version, `none` only reports rebinds.
+        /// Config: `[tool.cargo] edge-policy`.
         #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
         edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]

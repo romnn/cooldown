@@ -203,8 +203,9 @@ struct RequirePair {
     version: String,
 }
 
-/// Parse a `module/path v1.2.3` pair into a [`RequirePair`]. Returns `None` for a malformed line
-/// (no second field, or a second field that is not a valid Go version).
+/// Parse a `module/path v1.2.3` pair into a [`RequirePair`].
+/// Returns `None` for a malformed line (no second field, or a second field that is not a valid Go
+/// version).
 fn parse_require_pair(line: &str) -> Option<RequirePair> {
     let mut fields = line.split_whitespace();
     let path = fields.next()?;

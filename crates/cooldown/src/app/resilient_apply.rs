@@ -70,9 +70,6 @@ async fn apply_checked(
     mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<cooldown_core::ApplyAttempt> {
-    mutation
-        .parts_for(writer)
-        .map_err(ApplyFailure::RestoreConflict)?;
     writer
         .apply_with_observer(mutation, observer)
         .await
@@ -96,9 +93,8 @@ pub(crate) async fn apply_resilient_with_observer(
     mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<AppliedMutation> {
-    let (_, plan, journal) = mutation
-        .parts_for(writer)
-        .map_err(ApplyFailure::RestoreConflict)?;
+    let plan = mutation.plan();
+    let journal = mutation.journal();
     let first = apply_checked(writer, mutation, observer).await?;
     let (first_report, first_state) = match first {
         cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
@@ -202,9 +198,8 @@ async fn verified_satisfiable_subset(
     mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<(Vec<Change>, ProjectMutationState)> {
-    let (_, plan, journal) = mutation
-        .parts_for(writer)
-        .map_err(ApplyFailure::RestoreConflict)?;
+    let plan = mutation.plan();
+    let journal = mutation.journal();
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
     push_halves(&mut work, plan.changes.clone());
@@ -286,11 +281,13 @@ mod tests {
     use super::{ApplyFailure, apply_resilient, apply_resilient_with_observer};
     use async_trait::async_trait;
     use camino::Utf8Path;
+    use color_eyre::eyre;
     use cooldown_core::{
         ApplyObserver, ApplyReport, Change, CoreError, PackageId, Plan, PreparedMutation, Project,
         ProjectMutationJournal, Result, RewriteMode, ToolId, ToolTermination, ToolWrite,
         UpdateKind, VerifyReport, Version,
     };
+    use std::assert_matches;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -526,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_operation_rejects_another_adapter() -> color_eyre::eyre::Result<()> {
+    async fn prepared_operation_rejects_another_adapter() -> eyre::Result<()> {
         let writer = MockWriter::new(|_| true);
         let other = MockWriter::new(|_| true).with_tool(ToolId("other"));
         let TempProject {
@@ -539,15 +536,31 @@ mod tests {
 
         let result = other.apply(&mutation).await;
 
-        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(other.apply_calls(), 0);
         Ok(())
     }
 
     #[tokio::test]
+    async fn prepared_operation_rejects_an_unauthorized_retry_subset() -> eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        std::fs::write(project.root.join("requirements.txt"), "original")?;
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan(&["a"])).await?;
+
+        let result = mutation.subset(vec![change("b")]);
+
+        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
-    async fn retargeted_file_symlink_stops_an_in_place_adapter_before_dispatch()
-    -> color_eyre::eyre::Result<()> {
+    async fn retargeted_file_symlink_stops_an_in_place_adapter_before_dispatch() -> eyre::Result<()>
+    {
         use std::os::unix::fs::symlink;
 
         let writer = MockWriter::new(|_| true);
@@ -557,7 +570,7 @@ mod tests {
         } = temp_project();
         let external = tempfile::tempdir()?;
         let external = camino::Utf8PathBuf::from_path_buf(external.path().to_owned())
-            .map_err(|path| color_eyre::eyre::eyre!("path is not UTF-8: {}", path.display()))?;
+            .map_err(|path| eyre::eyre!("path is not UTF-8: {}", path.display()))?;
         let relative = Utf8Path::new("requirements.txt");
         std::fs::write(project.root.join(relative), "original")?;
         std::fs::write(external.join(relative), "external")?;
@@ -568,7 +581,7 @@ mod tests {
 
         let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
 
-        std::assert_matches!(
+        assert_matches!(
             result,
             Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
         );
@@ -582,8 +595,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn new_hard_link_stops_an_in_place_adapter_before_dispatch()
-    -> color_eyre::eyre::Result<()> {
+    async fn new_hard_link_stops_an_in_place_adapter_before_dispatch() -> eyre::Result<()> {
         let writer = MockWriter::new(|_| true);
         let TempProject {
             directory: _directory,
@@ -591,7 +603,7 @@ mod tests {
         } = temp_project();
         let external = tempfile::tempdir()?;
         let external = camino::Utf8PathBuf::from_path_buf(external.path().to_owned())
-            .map_err(|path| color_eyre::eyre::eyre!("path is not UTF-8: {}", path.display()))?;
+            .map_err(|path| eyre::eyre!("path is not UTF-8: {}", path.display()))?;
         let relative = Utf8Path::new("requirements.txt");
         std::fs::write(project.root.join(relative), "original")?;
         let plan = plan(&["a"]);
@@ -600,7 +612,7 @@ mod tests {
 
         let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
 
-        std::assert_matches!(
+        assert_matches!(
             result,
             Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
         );
@@ -613,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_apply_forwards_every_native_candidate() -> color_eyre::eyre::Result<()> {
+    async fn observed_apply_forwards_every_native_candidate() -> eyre::Result<()> {
         struct Counter(AtomicUsize);
 
         impl ApplyObserver for Counter {
@@ -837,7 +849,7 @@ mod tests {
         let plan = plan(&["a", "b"]);
         let result = apply_resilient(&writer, &project, &plan).await;
 
-        std::assert_matches!(&result, Err(err) if expected(err));
+        assert_matches!(&result, Err(err) if expected(err));
         assert_eq!(writer.apply_calls(), 1);
     }
 

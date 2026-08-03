@@ -425,14 +425,31 @@ impl AdapterSet {
 
     /// Register one concrete adapter as read/fetch ports plus a mutator whose writes are verified
     /// by the application layer's post-apply graph proof before they are committed.
-    pub fn register_target_verified_mutator<T>(&mut self, adapter: Arc<T>)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`cooldown_core::CoreError::System`] when the adapter's read and write sides declare
+    /// different tool-family identifiers.
+    pub fn register_target_verified_mutator<T>(
+        &mut self,
+        adapter: Arc<T>,
+    ) -> cooldown_core::Result<()>
     where
         T: cooldown_core::Tool + 'static,
     {
-        let id = adapter.id();
+        let read_id = adapter.id();
+        let write_id = adapter.mutation_tool();
+        if read_id != write_id {
+            return Err(cooldown_core::CoreError::System(format!(
+                "adapter registration mismatched read tool {} and write tool {}",
+                read_id.as_str(),
+                write_id.as_str()
+            )));
+        }
         self.register_read(adapter.clone());
         let writer: Arc<dyn ToolWrite> = adapter;
-        self.writers.insert(id, writer);
+        self.writers.insert(read_id, writer);
+        Ok(())
     }
 
     /// Iterate the read-side adapters in registration order.
@@ -942,6 +959,7 @@ mod tests {
         Capabilities, DepScope, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
         PackageId, ProjectMarker, ReleaseQuality, Version,
     };
+    use std::assert_matches;
 
     const CARGO: ToolId = ToolId("cargo");
     const PNPM: ToolId = ToolId("pnpm");
@@ -950,6 +968,121 @@ mod tests {
     struct FakeReader {
         id: ToolId,
         deps: Vec<Dependency>,
+    }
+
+    struct MismatchedAdapter;
+
+    #[async_trait]
+    impl ToolRead for MismatchedAdapter {
+        fn id(&self) -> ToolId {
+            CARGO
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn project_detection(&self) -> cooldown_core::ProjectDetection {
+            cooldown_core::ProjectDetection::Primary(ProjectMarker {
+                lockfile: "lock",
+                manifest: "manifest",
+                alternate_manifests: &[],
+                workspace_root: true,
+            })
+        }
+
+        async fn dependencies(
+            &self,
+            _project: &Project,
+            _scope: DepScope,
+        ) -> cooldown_core::Result<Vec<Dependency>> {
+            Ok(Vec::new())
+        }
+
+        async fn native_policy(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<Option<NativePolicyLayer>> {
+            Ok(None)
+        }
+
+        async fn verify_lock_current(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<LockVerifyReport> {
+            Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "current".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl cooldown_core::ReleaseFetcher for MismatchedAdapter {
+        async fn releases(
+            &self,
+            _dep: &Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+            _candidates: cooldown_core::CandidateScope,
+        ) -> cooldown_core::Result<Vec<cooldown_core::Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn locked_release(
+            &self,
+            dep: &Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+        ) -> cooldown_core::Result<cooldown_core::Release> {
+            Err(cooldown_core::CoreError::NotFound(dep.package.name.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl ToolWrite for MismatchedAdapter {
+        fn mutation_tool(&self) -> ToolId {
+            PNPM
+        }
+
+        async fn mutation_journal(
+            &self,
+            project: &Project,
+            _plan: &cooldown_core::Plan,
+        ) -> cooldown_core::Result<cooldown_core::ProjectMutationJournal> {
+            cooldown_core::ProjectMutationJournal::capture(
+                &project.root,
+                std::iter::empty::<&camino::Utf8Path>(),
+            )
+        }
+
+        async fn apply(
+            &self,
+            mutation: &cooldown_core::PreparedMutation,
+        ) -> cooldown_core::Result<cooldown_core::ApplyReport> {
+            mutation.parts_for(self)?;
+            Ok(cooldown_core::ApplyReport::default())
+        }
+
+        async fn build(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<cooldown_core::VerifyReport> {
+            Ok(cooldown_core::VerifyReport {
+                ok: true,
+                detail: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn adapter_registration_rejects_mismatched_read_and_write_tool_families() {
+        let mut adapters = AdapterSet::new();
+
+        let result = adapters.register_target_verified_mutator(Arc::new(MismatchedAdapter));
+
+        assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        assert_eq!(adapters.readers().count(), 0);
+        assert!(adapters.writer(CARGO).is_none());
+        assert!(adapters.writer(PNPM).is_none());
     }
 
     #[async_trait]

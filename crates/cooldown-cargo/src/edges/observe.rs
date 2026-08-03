@@ -221,8 +221,9 @@ mod tests {
         );
     }
 
-    /// Source-distinct twins can make the same move. The rows remain distinct because their full
-    /// dependent identities survive observation instead of collapsing to `(name, version)`.
+    /// Source-distinct twins can make the same move.
+    /// The rows remain distinct because their full dependent identities survive observation instead
+    /// of collapsing to `(name, version)`.
     #[test]
     fn binding_changes_keep_same_direction_twin_moves_distinct() {
         let twins_before = indoc::indoc! {r#"

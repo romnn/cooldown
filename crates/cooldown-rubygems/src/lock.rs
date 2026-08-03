@@ -14,8 +14,9 @@ pub struct ResolvedPin {
     pub version: String,
 }
 
-/// Returns the [`ResolvedPin`] of every gem in a `specs:` block. Nested lines (a gem's
-/// own dependencies, indented past four spaces) are skipped, as are non-spec lines.
+/// Returns the [`ResolvedPin`] of every gem in a `specs:` block.
+/// Nested lines (a gem's own dependencies, indented past four spaces) are skipped, as are non-spec
+/// lines.
 #[must_use]
 pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();

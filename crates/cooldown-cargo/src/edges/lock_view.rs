@@ -55,10 +55,11 @@ pub(crate) struct LockEdgeView {
     packages: BTreeSet<LockPackageId>,
     /// How many dependency entries reference each locked `(name, version)`, counting every entry
     /// form (qualified, source-suffixed, and unqualified resolved via the single package of that
-    /// name). The orphan guard keeps rewrites from dropping a still-locked version's last
-    /// reference — `cargo metadata --locked` rejects an orphaned entry. Same-identity duplicates
-    /// merge their counts, which can only over-count; the post-surgery `--locked` verification is
-    /// the backstop for that rarity.
+    /// name).
+    /// The orphan guard keeps rewrites from dropping a still-locked version's last reference —
+    /// `cargo metadata --locked` rejects an orphaned entry.
+    /// Same-identity duplicates merge their counts, which can only over-count; the post-surgery
+    /// `--locked` verification is the backstop for that rarity.
     pub(super) refcounts: HashMap<PackageKey, usize>,
 }
 

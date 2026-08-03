@@ -65,8 +65,9 @@ pub fn atomic_write_with_permissions(
 /// then renames it over `path`.
 ///
 /// This supports compare-before-restore protocols without opening a long validation window while a
-/// large replacement is written. Filesystems do not provide a portable compare-and-swap rename, so
-/// writers that ignore the caller's lease can still race the final validation and rename.
+/// large replacement is written.
+/// Filesystems do not provide a portable compare-and-swap rename, so writers that ignore the
+/// caller's lease can still race the final validation and rename.
 ///
 /// # Errors
 ///

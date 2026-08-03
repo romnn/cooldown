@@ -52,9 +52,10 @@ pub(crate) fn restorations(
             if earlier == binding.bound {
                 return None;
             }
-            // Preserve never crosses package sources. The metadata requirement does not encode the
-            // source constraint, so both the resolver-produced and restored endpoints must be
-            // positively identified as crates.io packages by the lock itself.
+            // Preserve never crosses package sources.
+            // The metadata requirement does not encode the source constraint, so both the
+            // resolver-produced and restored endpoints must be positively identified as crates.io
+            // packages by the lock itself.
             if after
                 .dependency_source(binding.dependency, binding.bound)
                 .as_deref()
@@ -139,7 +140,8 @@ mod tests {
     }
 
     /// The luup regression shape: diesel's wide `uuid >=0.7,<2.0` edge was bound to 1.24.0 before
-    /// the apply; the re-resolve collapsed it onto the coexisting 0.8.2. Preserve restores it.
+    /// the apply; the re-resolve collapsed it onto the coexisting 0.8.2.
+    /// Preserve restores it.
     #[test]
     fn a_churned_wide_range_binding_is_restored() {
         let after = view(CHURNED_LOCK);

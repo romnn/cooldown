@@ -531,18 +531,19 @@ pub struct PathVersionSplit {
     /// The trailing major-version element (`/vN`, or `.vN` for `gopkg.in` paths);
     /// empty for a base path at major v0/v1.
     pub path_major: String,
-    /// Whether the path's version element is well-formed. `false` when the path carries
-    /// a malformed element (e.g. a dotted `/v2.0.0`, a leading-zero major, or an
-    /// explicit `/v1`).
+    /// Whether the path's version element is well-formed.
+    /// `false` when the path carries a malformed element (e.g. a dotted `/v2.0.0`, a leading-zero
+    /// major, or an explicit `/v1`).
     pub well_formed: bool,
 }
 
 /// Splits a module `path` into a [`PathVersionSplit`], mirroring `module.SplitPathVersion`.
 ///
 /// `path_major` is the trailing major-version element (`/vN`, or `.vN` for `gopkg.in`
-/// paths), and is empty for a base path at major v0/v1. `well_formed` is `false` when
-/// the path carries a malformed version element (e.g. a dotted `/v2.0.0`, a leading-zero
-/// major, or an explicit `/v1`), in which case `prefix` is the unchanged `path`.
+/// paths), and is empty for a base path at major v0/v1.
+/// `well_formed` is `false` when the path carries a malformed version element (e.g. a dotted
+/// `/v2.0.0`, a leading-zero major, or an explicit `/v1`), in which case `prefix` is the unchanged
+/// `path`.
 ///
 /// # Examples
 ///

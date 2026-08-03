@@ -14,8 +14,8 @@ pub struct ResolvedPin {
     pub version: String,
 }
 
-/// Returns the [`ResolvedPin`] of every hex.pm-sourced entry in a `mix.lock`. Non-hex
-/// sources (`:git`, `:path`) are skipped, as cooldown has no registry publish time for them.
+/// Returns the [`ResolvedPin`] of every hex.pm-sourced entry in a `mix.lock`.
+/// Non-hex sources (`:git`, `:path`) are skipped, as cooldown has no registry publish time for them.
 #[must_use]
 pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
@@ -70,10 +70,12 @@ struct ExactDepPin<'a> {
     version: &'a str,
 }
 
-/// Every exact (`== X`) dependency edge on a `mix.lock` line. A dependency
-/// tuple is `{:name, "requirement", …}`: an atom immediately followed by a quoted requirement. This
-/// distinguishes it from the entry's own opening tuple `{:hex, :name, "version", …}` (whose second
-/// element is another atom, not a quoted string), so that is never mistaken for a dependency edge.
+/// Every exact (`== X`) dependency edge on a `mix.lock` line.
+/// A dependency tuple is `{:name, "requirement", …}`: an atom immediately followed by a quoted
+/// requirement.
+/// This distinguishes it from the entry's own opening tuple `{:hex, :name, "version", …}` (whose
+/// second element is another atom, not a quoted string), so that is never mistaken for a dependency
+/// edge.
 fn exact_dep_pins(line: &str) -> Vec<ExactDepPin<'_>> {
     let mut pins = Vec::new();
     for piece in line.split("{:").skip(1) {

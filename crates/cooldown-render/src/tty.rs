@@ -576,12 +576,13 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
-/// The Status/Reason cells of one mutation row — both cells share the color. The applied word is
-/// per-item, not per-command: a too-fresh pin an `upgrade` rolls back is `downgraded`, not
-/// `upgraded`. A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean
-/// apply has an empty reason (Status says it). An edge row reports a lock-edge *binding* move (the
-/// From/To cells are binding versions), so its status word names the edge-policy outcome and its
-/// reason names the dependent whose edge moved.
+/// The Status/Reason cells of one mutation row — both cells share the color.
+/// The applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is
+/// `downgraded`, not `upgraded`.
+/// A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean apply has an
+/// empty reason because Status says it.
+/// An edge row reports a lock-edge *binding* move (the From/To cells are binding versions), so its
+/// status word names the edge-policy outcome and its reason names the dependent whose edge moved.
 struct MutationStatus {
     /// The one-word status cell.
     status: &'static str,

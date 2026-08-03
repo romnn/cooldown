@@ -616,13 +616,14 @@ pub enum RewriteMode {
 /// How an adapter treats addressable resolved lock **edge bindings** after a whole-graph re-resolve.
 ///
 /// A lock records not only which package versions exist but which coexisting version each
-/// dependent's edge is *bound* to (cargo's `dependencies = ["uuid 0.8.2"]` entries). When a
-/// dependent's declared range admits several locked versions (e.g. diesel's
+/// dependent's edge is *bound* to (cargo's `dependencies = ["uuid 0.8.2"]` entries).
+/// When a dependent's declared range admits several locked versions (e.g. diesel's
 /// `uuid = ">=0.7, <2.0"` with both `0.8.2` and `1.x` in the lock), an incremental re-resolve can
 /// silently rebind such an edge between them — a build-affecting change (`rustc` receives the other
 /// copy as `--extern`) that is invisible at the per-version level and passes the tool's own lock
-/// verification. This policy decides what the adapter does about it. Currently enforced by the
-/// cargo adapter; adapters without ambiguous edge bindings ignore it.
+/// verification.
+/// This policy decides what the adapter does about it.
+/// Currently enforced by the cargo adapter; adapters without ambiguous edge bindings ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EdgePolicy {
@@ -638,8 +639,8 @@ pub enum EdgePolicy {
     /// This adapter-owned normalization matches a from-scratch resolve in the common case and also
     /// heals eligible bad bindings that predate the run.
     Canonicalize,
-    /// Leave every binding exactly as the resolver produced it. Unplanned rebinds are still
-    /// *reported* (never silent), just not corrected.
+    /// Leave every binding exactly as the resolver produced it.
+    /// Unplanned rebinds are still *reported* (never silent), just not corrected.
     None,
 }
 
@@ -780,11 +781,12 @@ pub struct Plan {
     /// The planned version changes.
     pub changes: Vec<Change>,
     /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
-    /// flag). Defaults to [`RewriteMode::Auto`].
+    /// flag).
+    /// Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
     /// How the adapter treats resolved lock edge bindings after the re-resolve (the
-    /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key). Defaults to
-    /// [`EdgePolicy::Preserve`].
+    /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key).
+    /// Defaults to [`EdgePolicy::Preserve`].
     pub edge_policy: EdgePolicy,
     /// Policy violations already present before this trial.
     ///
@@ -929,7 +931,8 @@ pub struct ApplyReport {
     /// The changes that were skipped, with reasons.
     pub skipped: Vec<Skipped>,
     /// Lock edges whose binding moved between coexisting versions, with what the
-    /// [`EdgePolicy`] did about each. Empty for adapters without ambiguous edge bindings.
+    /// [`EdgePolicy`] did about each.
+    /// Empty for adapters without ambiguous edge bindings.
     pub edge_rebinds: Vec<EdgeRebind>,
     /// Non-fatal adapter warnings about a mutation that is already visible and must still be
     /// reported as committed.

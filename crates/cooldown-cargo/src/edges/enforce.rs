@@ -141,9 +141,10 @@ pub(crate) fn ensure_no_pending(project: &Project) -> Result<()> {
 /// Reconciles committed batch corrections with the final saved binding state.
 ///
 /// A later state-changing batch outcome supersedes an earlier correction even when the final
-/// binding eventually returns to the same version. Final-pass corrections win over batch
-/// provenance; otherwise a surviving batch correction replaces the generic run-level observation
-/// for that edge while final held attempts remain visible beside it.
+/// binding eventually returns to the same version.
+/// Final-pass corrections win over batch provenance; otherwise a surviving batch correction
+/// replaces the generic run-level observation for that edge while final held attempts remain
+/// visible beside it.
 pub(crate) fn reconcile_committed_outcomes(
     final_view: &LockEdgeView,
     final_outcomes: &mut Vec<EdgeRebind>,

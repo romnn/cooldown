@@ -156,8 +156,8 @@ impl ToolRead for CargoTool {
         }
     }
 
-    fn validate_manifest_without_lock(&self, root: &Utf8Path) -> Result<()> {
-        crate::staging::reject_custom_lockfile(root)
+    fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {
+        crate::staging::reject_custom_lockfiles(roots)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -578,8 +578,9 @@ impl CargoTool {
         }
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
         // the re-resolve), parsed once: its slot map feeds the version diff below and its edge view
-        // feeds the edge policy. The batched precise pins emit one consistent lock; the report is the
-        // paired version-slot diff of this snapshot against the result.
+        // feeds the edge policy.
+        // The batched precise pins emit one consistent lock; the report is the paired version-slot
+        // diff of this snapshot against the result.
         // A missing or unparsable snapshot leaves `before` empty.
         // Planned target reporting still uses the resolved result, but collateral comparison then
         // has no baseline.
@@ -607,18 +608,19 @@ impl CargoTool {
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
             // version). Propagate so the caller's `apply_resilient` can isolate the offending
-            // candidate(s) and apply the rest, instead of holding every candidate. Local environment
-            // failures propagate through `apply_resilient` without bisection. The caller restores the
-            // journal, so no partial lock is kept.
+            // candidate(s) and apply the rest, instead of holding every candidate.
+            // Local environment failures propagate through `apply_resilient` without bisection.
+            // The caller restores the journal, so no partial lock is kept.
             Err(err) => return Err(err),
         }
 
         let resolver_lock = read_lock(project)?;
 
         // The resolved graph supplies declared requirements to edge enforcement and proves which
-        // direct member edges reached their targets. Preserve needs requirements only when the
-        // before/resolver lock pair contains an addressable rebind; successful lock verification
-        // returns a fresh graph after any correction.
+        // direct member edges reached their targets.
+        // Preserve needs requirements only when the before/resolver lock pair contains an
+        // addressable rebind; successful lock verification returns a fresh graph after any
+        // correction.
         let needs_graph = plan.changes.iter().any(needs_member_graph);
         let preserve_needs_graph = matches!(plan.edge_policy, EdgePolicy::Preserve)
             && before_lock.as_ref().is_some_and(|before_lock| {
@@ -779,7 +781,7 @@ impl ToolWrite for CargoTool {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
-        let (project, plan, journal) = mutation.parts_for(self)?;
+        let (project, plan, journal) = mutation.isolated_parts_for(self)?;
         self.apply_plan(project, plan, journal, None).await
     }
 
@@ -788,7 +790,7 @@ impl ToolWrite for CargoTool {
         mutation: &PreparedMutation,
         observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        let (project, plan, journal) = mutation.parts_for(self)?;
+        let (project, plan, journal) = mutation.isolated_parts_for(self)?;
         let report = self
             .apply_plan(project, plan, journal, Some(observer))
             .await;
@@ -872,11 +874,13 @@ impl ToolWrite for CargoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
+    use std::assert_matches;
 
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
         use std::fmt::Write as _;
@@ -900,6 +904,38 @@ mod tests {
             downgrade,
             direct: true,
             members: Vec::new(),
+        }
+    }
+
+    struct InPlaceCargoFamilyWriter;
+
+    #[async_trait]
+    impl ToolWrite for InPlaceCargoFamilyWriter {
+        fn mutation_tool(&self) -> ToolId {
+            CARGO_ID
+        }
+
+        async fn mutation_journal(
+            &self,
+            project: &Project,
+            _plan: &Plan,
+        ) -> Result<ProjectMutationJournal> {
+            ProjectMutationJournal::capture(
+                &project.root,
+                [Utf8Path::new("Cargo.toml"), Utf8Path::new("Cargo.lock")],
+            )
+        }
+
+        async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+            mutation.parts_for(self)?;
+            Ok(ApplyReport::default())
+        }
+
+        async fn build(&self, _project: &Project) -> Result<VerifyReport> {
+            Ok(VerifyReport {
+                ok: true,
+                detail: String::new(),
+            })
         }
     }
 
@@ -1157,8 +1193,9 @@ mod tests {
     }
 
     /// A corrective edge rewrite can be the operation that makes a direct member reach its planned
-    /// target. Success classification must therefore consume the graph returned by verification,
-    /// not the metadata snapshot taken before enforcement.
+    /// target.
+    /// Success classification must therefore consume the graph returned by verification, not the
+    /// metadata snapshot taken before enforcement.
     #[test]
     fn member_reach_classification_changes_with_the_verified_edge_graph() {
         let graph = |app_target: &str| {
@@ -1305,11 +1342,11 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
+        assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
     #[tokio::test]
-    async fn prepared_apply_rejects_an_unauthorized_plan_subset() -> eyre::Result<()> {
+    async fn direct_cargo_preparation_requires_an_isolated_project() -> eyre::Result<()> {
         let other = tempfile::tempdir()?;
         let other_root = Utf8PathBuf::from_path_buf(other.path().to_owned())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
@@ -1325,12 +1362,9 @@ mod tests {
             cache.path(),
             cooldown_registry::HttpOptions::default(),
         )?);
-        let plan = Plan::default();
-        let mutation = PreparedMutation::prepare(&tool, &other_project, &plan).await?;
+        let result = PreparedMutation::prepare(&tool, &other_project, &Plan::default()).await;
 
-        let result = mutation.subset(vec![change("serde", "1.0.0", "1.0.1", false)]);
-
-        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 
@@ -1351,26 +1385,27 @@ mod tests {
             cache.path(),
             cooldown_registry::HttpOptions::default(),
         )?);
-        let plan = Plan::default();
-        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let mutation =
+            PreparedMutation::prepare(&InPlaceCargoFamilyWriter, &project, &Plan::default())
+                .await?;
 
         let result = tool
             .normalize_lock_edges(&mutation, EdgePolicy::None, None, &[])
             .await;
 
-        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 
     #[tokio::test]
-    async fn direct_apply_revalidates_a_recreated_root_on_every_attempt() -> eyre::Result<()> {
-        let parent = tempfile::tempdir()?;
-        let root = Utf8PathBuf::from_path_buf(parent.path().join("project"))
+    async fn direct_cargo_apply_rejects_an_in_place_tool_family_capability() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        let moved = Utf8PathBuf::from_path_buf(parent.path().join("moved"))
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        std::fs::create_dir(&root)?;
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = \"1\"\n",
+        )?;
         let project = Project {
             root: root.clone(),
             kind: CARGO_ID,
@@ -1382,17 +1417,16 @@ mod tests {
             cache.path(),
             cooldown_registry::HttpOptions::default(),
         )?);
-        let plan = Plan::default();
-        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-
-        tool.apply(&mutation).await?;
-        std::fs::rename(&root, &moved)?;
-        std::fs::create_dir(&root)?;
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        let plan = Plan {
+            changes: vec![change("serde", "1.0.0", "1.0.1", false)],
+            ..Plan::default()
+        };
+        let mutation =
+            PreparedMutation::prepare(&InPlaceCargoFamilyWriter, &project, &plan).await?;
 
         let result = tool.apply(&mutation).await;
 
-        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 

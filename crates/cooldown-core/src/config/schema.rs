@@ -31,9 +31,9 @@ pub(crate) struct SelectorToml {
     /// Package-name globs whose workspace members are dropped from reports under `[tool.<name>]`.
     #[serde(rename = "exclude-packages")]
     pub(crate) exclude_packages: Option<Vec<String>>,
-    /// How `upgrade`/`fix` treat resolved lock edge bindings after the re-resolve. Cargo-specific:
-    /// accepted only under `[tool.cargo]` and rejected under every other selector, so the
-    /// tool-scoped placement is explicit rather than a global key that only one tool reads.
+    /// How `upgrade`/`fix` treat resolved lock edge bindings after the re-resolve.
+    /// Cargo-specific: accepted only under `[tool.cargo]` and rejected under every other selector,
+    /// so the tool-scoped placement is explicit rather than a global key that only one tool reads.
     #[serde(rename = "edge-policy")]
     pub(crate) edge_policy: Option<crate::EdgePolicy>,
 }

@@ -15,6 +15,7 @@ use cooldown::app::{
 };
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
+use std::assert_matches;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -121,6 +122,17 @@ impl FakeEco {
             kind: GO,
             manifest: self.root.join("go.mod"),
             exclude_newer: None,
+        }
+    }
+
+    fn mutation_parts<'a>(
+        &self,
+        mutation: &'a PreparedMutation,
+    ) -> Result<(&'a Project, &'a Plan, &'a ProjectMutationJournal)> {
+        if matches!(self.mutation_execution(), MutationExecution::Isolated(_)) {
+            mutation.isolated_parts_for(self)
+        } else {
+            mutation.parts_for(self)
         }
     }
 }
@@ -396,7 +408,7 @@ impl ToolWrite for FakeEco {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
-        let (p, plan, _) = mutation.parts_for(self)?;
+        let (p, plan, _) = self.mutation_parts(mutation)?;
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
         if self.root.join("use-isolated-mutation").exists() {
@@ -470,7 +482,7 @@ impl ToolWrite for FakeEco {
         mutation: &PreparedMutation,
         _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        let (p, _, journal) = mutation.parts_for(self)?;
+        let (p, _, journal) = self.mutation_parts(mutation)?;
         let report = self.apply(mutation).await;
         if p.root.join("pending-recovery-on-apply").exists() {
             return Ok(ApplyAttempt::PendingRecovery {
@@ -500,7 +512,7 @@ impl ToolWrite for FakeEco {
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<cooldown_core::EdgeNormalizationReport> {
-        let (project, _, _) = mutation.parts_for(self)?;
+        let (project, _, _) = self.mutation_parts(mutation)?;
         if project.root.join("fail-edge-normalization").exists() {
             return Err(CoreError::PendingRecovery(
                 "fake edge normalization retained recovery evidence".to_string(),
@@ -542,7 +554,10 @@ fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLa
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     Workspace::new(
         adapters,
         vec![ctx],
@@ -640,7 +655,10 @@ fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     Workspace::new(
         adapters,
         vec![ctx],
@@ -2073,9 +2091,9 @@ async fn invalid_edge_outcomes_fail_at_the_apply_boundary() {
 
 #[tokio::test]
 async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts() {
-    // An adapter's apply can report lock-edge *binding* moves beside the version changes (the cargo
-    // edge policy). Each rebind must surface as its own report row — carrying the dependent and the
-    // policy outcome — while the version counts remain separate.
+    // An adapter's apply can report lock-edge binding moves beside the version changes.
+    // Each rebind must surface as its own report row — carrying the dependent and the policy outcome
+    // — while the version counts remain separate.
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = edge_reporting_fake(
         root,
@@ -2273,7 +2291,7 @@ async fn final_edge_audit_replaces_superseded_batch_history() {
         .iter()
         .filter_map(|item| item.edge.as_ref())
         .collect();
-    std::assert_matches!(edges.as_slice(),
+    assert_matches!(edges.as_slice(),
     [edge] if edge.action == EdgeBindingAction::Canonicalized);
 }
 
@@ -3572,7 +3590,7 @@ async fn explain_refuses_pending_mutation_state() -> eyre::Result<()> {
         .explain("a", &opts())
         .await;
 
-    std::assert_matches!(result, Err(CoreError::StaleLock(_)));
+    assert_matches!(result, Err(CoreError::StaleLock(_)));
     Ok(())
 }
 
@@ -3619,7 +3637,10 @@ async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     let ws = Workspace::new(
         adapters,
         vec![ctx],
@@ -3795,7 +3816,10 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     let ws = Workspace::new(
         adapters,
         contexts,
@@ -3968,7 +3992,10 @@ async fn sync_project_scope_writes_native_per_project() -> eyre::Result<()> {
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     let ws = Workspace::new(
         adapters,
         contexts,
@@ -4148,7 +4175,10 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(fake));
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
     Workspace::new(
         adapters,
         vec![ctx],

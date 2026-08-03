@@ -5,7 +5,7 @@
 - **Breaking library API:** `ToolRead::project_detection` replaces `project_marker` and
   `probe_manifest_without_lock`. Ordinary adapters should wrap their marker in
   `ProjectDetection::Primary`; adapters that must inspect manifest-only roots should use
-  `PrimaryWithValidation` and implement `validate_manifest_without_lock`.
+  `PrimaryWithValidation` and implement the batched `validate_manifests_without_lock` hook.
 - **Breaking library API:** adapter parsing and lookup helpers now return named records instead of
   positional tuples. This affects Go path-version splitting; npm lock parsing and install-tree
   resolution; and the public Hex, Maven, pip, and RubyGems resolved-pin parsers. Callers should use
@@ -19,12 +19,15 @@
   post-apply state observed before any conditional restore.
 - **Breaking library API:** `ToolWrite::apply` and `apply_with_observer` now accept a
   `PreparedMutation` instead of independently supplied project, plan, and journal values. Callers
-  construct it through `PreparedMutation::prepare`; resilient retries derive authorized subsets
-  through `PreparedMutation::subset`. `ToolWrite::mutation_tool` binds the capability to its
-  consuming adapter. `apply_with_observer` returns an adapter-boundary postimage,
-  using the `ApplyAttempt` enum to keep adapter-owned pending recovery outside the application's
-  rollback authority. `ToolWrite::normalize_lock_edges` also accepts the prepared capability, and
-  Cargo requires one carrying provenance from an adapter-created isolated project. `ApplyReport`
+  construct in-place operations through `PreparedMutation::prepare`; isolated adapters require
+  `PreparedMutation::prepare_isolated` and reject in-place dispatch. Resilient retries derive
+  authorized subsets through `PreparedMutation::subset` while sharing one immutable journal.
+  `ToolWrite::mutation_tool` binds the capability to its tool family, and `AdapterSet` registration
+  now fails when an adapter's read and write identifiers differ. `apply_with_observer` returns an
+  adapter-boundary postimage, using the `ApplyAttempt` enum to keep adapter-owned pending recovery
+  outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also accepts the
+  prepared capability, and Cargo requires one carrying provenance from an adapter-created isolated
+  project. `ApplyReport`
   carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
   `CoreError`/`DiagnosticKind` include `PendingRecovery`.
   `ProjectMutationFile` also records standard file permissions and rejects non-regular or

@@ -377,9 +377,11 @@ fn collect_vendor_files(
     Ok(())
 }
 
-fn cargo_config_dirs(
-    workspace: &Utf8Path,
-) -> Result<(BTreeSet<Utf8PathBuf>, BTreeSet<Utf8PathBuf>)> {
+struct CargoConfigEnvironment {
+    cargo_home: Option<(Utf8PathBuf, bool)>,
+}
+
+fn cargo_config_environment() -> Result<CargoConfigEnvironment> {
     let cargo_home = match std::env::var_os("CARGO_HOME") {
         Some(path) => Some((utf8_path(std::path::PathBuf::from(path))?, true)),
         None => std::env::var_os("HOME")
@@ -388,20 +390,36 @@ fn cargo_config_dirs(
             .transpose()?
             .map(|path| (path, false)),
     };
+    Ok(CargoConfigEnvironment { cargo_home })
+}
+
+fn cargo_config_dirs(
+    workspace: &Utf8Path,
+) -> Result<(BTreeSet<Utf8PathBuf>, BTreeSet<Utf8PathBuf>)> {
+    Ok(cargo_config_dirs_with_environment(
+        workspace,
+        &cargo_config_environment()?,
+    ))
+}
+
+fn cargo_config_dirs_with_environment(
+    workspace: &Utf8Path,
+    environment: &CargoConfigEnvironment,
+) -> (BTreeSet<Utf8PathBuf>, BTreeSet<Utf8PathBuf>) {
     let mut config_dirs = workspace
         .ancestors()
         .map(|ancestor| ancestor.join(".cargo"))
         .collect::<BTreeSet<_>>();
     let mut ambient_config_dirs = BTreeSet::new();
-    if let Some((cargo_home, configured)) = cargo_home {
-        if configured && !cargo_home.is_absolute() {
+    if let Some((cargo_home, configured)) = &environment.cargo_home {
+        if *configured && !cargo_home.is_absolute() {
             config_dirs.insert(workspace.join(cargo_home));
         } else {
-            config_dirs.remove(&cargo_home);
-            ambient_config_dirs.insert(cargo_home);
+            config_dirs.remove(cargo_home);
+            ambient_config_dirs.insert(cargo_home.clone());
         }
     }
-    Ok((config_dirs, ambient_config_dirs))
+    (config_dirs, ambient_config_dirs)
 }
 
 fn cargo_config_paths(config_dirs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf8PathBuf>> {
@@ -618,17 +636,39 @@ fn cargo_registry_index_variable(key: &OsStr) -> bool {
 }
 
 pub(crate) fn reject_custom_lockfile(workspace: &Utf8Path) -> Result<()> {
+    reject_custom_lockfile_roots(&[workspace])
+}
+
+pub(crate) fn reject_custom_lockfiles(workspaces: &[Utf8PathBuf]) -> Result<()> {
+    let workspaces = workspaces
+        .iter()
+        .map(Utf8PathBuf::as_path)
+        .collect::<Vec<_>>();
+    reject_custom_lockfile_roots(&workspaces)
+}
+
+fn reject_custom_lockfile_roots(workspaces: &[&Utf8Path]) -> Result<()> {
+    if workspaces.is_empty() {
+        return Ok(());
+    }
     if std::env::var_os("CARGO_RESOLVER_LOCKFILE_PATH").is_some() {
         return Err(CoreError::Config(
             "`CARGO_RESOLVER_LOCKFILE_PATH` is set; cooldown currently requires Cargo's workspace-root `Cargo.lock`"
                 .to_string(),
         ));
     }
-    let (config_dirs, ambient_config_dirs) = cargo_config_dirs(workspace)?;
-    let configs = cargo_config_paths(&config_dirs)?
-        .into_iter()
-        .chain(cargo_config_paths(&ambient_config_dirs)?)
-        .collect::<BTreeSet<_>>();
+    let environment = cargo_config_environment()?;
+    let mut configs = BTreeSet::new();
+    for workspace in workspaces {
+        let (config_dirs, ambient_config_dirs) =
+            cargo_config_dirs_with_environment(workspace, &environment);
+        for config in cargo_config_paths(&config_dirs)?
+            .into_iter()
+            .chain(cargo_config_paths(&ambient_config_dirs)?)
+        {
+            configs.insert(canonical_utf8(&config)?);
+        }
+    }
     for config in configs {
         let contents = std::fs::read_to_string(&config).map_err(|error| {
             isolation_error(format!("cannot read Cargo configuration {config}: {error}"))
@@ -933,6 +973,30 @@ mod tests {
             .err()
             .ok_or_else(|| eyre::eyre!("included Cargo configuration was accepted"))?;
         assert!(error.to_string().contains("uses `include`"));
+        Ok(())
+    }
+
+    #[test]
+    fn batched_custom_lockfile_audit_checks_shared_configuration() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("repository"))?;
+        let first = root.join("crates/first");
+        let second = root.join("crates/second");
+        write(&first.join("Cargo.toml"), "[workspace]\n")?;
+        write(&second.join("Cargo.toml"), "[workspace]\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            indoc! {r#"
+                [resolver]
+                lockfile-path = "state/Cargo.lock"
+            "#},
+        )?;
+
+        let error = reject_custom_lockfiles(&[first, second])
+            .err()
+            .ok_or_else(|| eyre::eyre!("shared custom-lock configuration was accepted"))?;
+
+        assert!(error.to_string().contains("resolver.lockfile-path"));
         Ok(())
     }
 

@@ -1,11 +1,13 @@
 //! End-to-end tests for the cargo `--cargo-edge-policy` enforcement, driving the REAL `cargo` resolver
 //! against a fixture shaped like the production regression that motivated it: a registry crate
 //! (`diesel`) whose wide `uuid = ">=0.7.0, <2.0.0"` range admits **two coexisting locked majors**
-//! (`0.8.2` pinned by one root dep, a `1.x` line declared by another). Cargo's incremental
+//! (`0.8.2` pinned by one root dep, a `1.x` line declared by another).
+//! Cargo's incremental
 //! re-resolves may bind diesel's edge to either one — a build-affecting choice that is invisible at
 //! the per-version level and that `cargo metadata --locked` accepts both ways (neither binding
-//! orphans a package). The tests seed the *bad* binding deliberately (a lock-text edit, exactly how
-//! the regression was produced and later hand-fixed) and assert what each policy does about it.
+//! orphans a package).
+//! The tests seed the *bad* binding deliberately (a lock-text edit, exactly how the regression was
+//! produced and later hand-fixed) and assert what each policy does about it.
 //!
 //! Cargo's rebinding churn itself is chaotic — it depends on resolver traversal order in large
 //! graphs and cannot be forced deterministically from a small fixture — so the *churn-restoration*
@@ -36,7 +38,8 @@ const FREEZE: &str = "2024-06-01T00:00:00Z";
 const SEED_UUID: &str = "1.2.2";
 
 /// `diesel` is `=`-pinned (it is scenery, not an upgrade candidate) and enables its `uuid` feature,
-/// giving the lock a registry crate with the wide `uuid >=0.7.0, <2.0.0` edge. `uuid_old` pins the
+/// giving the lock a registry crate with the wide `uuid >=0.7.0, <2.0.0` edge.
+/// `uuid_old` pins the
 /// `0.8` major into the lock; `uuid_new` keeps a `1.x` line that both majors' requirements keep
 /// referenced whichever way diesel's edge binds (so neither binding orphans a package).
 const EDGE_MANIFEST: &str = indoc! {r#"
@@ -267,8 +270,9 @@ fn preserve_default_keeps_a_pre_existing_binding_and_stays_verifiable() {
     skip_if_missing!("cargo");
     let fixture = edge_fixture();
 
-    // No --edge-policy flag: `preserve` is the default. A binding that already sat on 0.8.2
-    // *before* the run is pre-existing state, not churn this apply introduced — preserve restores
+    // No --edge-policy flag means `preserve` is the default.
+    // A binding that already sat on 0.8.2 before the run is pre-existing state, not churn this apply
+    // introduced — preserve restores
     // only what the run's own re-resolve moved, so whichever way cargo's incremental resolver
     // jumps during the upgrade, the committed binding deterministically stays 0.8.2.
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--package", "uuid"]);
@@ -329,9 +333,10 @@ fn edge_policy_none_reports_without_correcting() {
     );
     assert!(upgrade.applied_names().contains("uuid"));
 
-    // `none` never corrects: the committed binding is whatever the resolver produced. When the
-    // resolver moved it off the seeded 0.8.2, exactly that move must surface as a `rebound` row;
-    // when it did not, no edge row may appear. Either way nothing is corrected and nothing silent.
+    // `none` never corrects: the committed binding is whatever the resolver produced.
+    // When the resolver moved it off the seeded 0.8.2, exactly that move must surface as a `rebound`
+    // row; when it did not, no edge row may appear.
+    // Either way nothing is corrected and nothing is silent.
     let binding_after = edge_binding(&fixture.read_bytes("Cargo.lock"), "diesel", "uuid");
     let edge_rows = upgrade.edge_rows();
     assert!(
@@ -370,8 +375,9 @@ fn canonicalize_heals_without_any_planned_change() {
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    // No SEED_UUID downgrade: the 1.x line stays at newest-now, so under the past freeze nothing
-    // is adoptable and the plan is empty. Only the bad binding is seeded.
+    // Without the seeded UUID downgrade, the 1.x line stays at newest-now, so under the past freeze
+    // nothing is adoptable and the plan is empty.
+    // Only the bad binding is seeded.
     seed_edge_binding(&fixture, "diesel", "uuid", "0.8.2");
 
     let upgrade = fixture.cooldown_json(&[
