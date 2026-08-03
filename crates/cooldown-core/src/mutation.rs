@@ -4,9 +4,10 @@ use crate::error::{CoreError, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest as _, Sha256};
 
-/// The pre-change file state a planned mutation may rewrite.
-#[derive(Debug, Clone, Default)]
+/// The project-bound pre-change state a planned mutation may rewrite.
+#[derive(Debug, Clone)]
 pub struct ProjectMutationJournal {
+    project: ProjectMutationRoot,
     files: Vec<ProjectMutationFile>,
 }
 
@@ -20,9 +21,16 @@ pub struct ProjectMutationJournal {
 /// write.
 /// Rollback detects later drift but cannot prove authorship for bytes already present at this
 /// boundary.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectMutationState {
+    project: ProjectMutationRoot,
     files: Vec<ProjectMutationFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectMutationRoot {
+    path: Utf8PathBuf,
+    identity: std::sync::Arc<same_file::Handle>,
 }
 
 impl ProjectMutationState {
@@ -33,16 +41,27 @@ impl ProjectMutationState {
     }
 
     /// Adds paths absent from this state without changing existing expected contents.
-    pub fn extend_missing(&mut self, other: ProjectMutationState) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the states belong to different projects.
+    pub fn extend_missing(&mut self, other: ProjectMutationState) -> Result<()> {
+        self.ensure_same_project(&other.project)?;
         for file in other.files {
             if self.files.iter().all(|existing| existing.path != file.path) {
                 self.files.push(file);
             }
         }
+        Ok(())
     }
 
     /// Replaces expected contents for every path carried by `other`.
-    pub fn replace(&mut self, other: ProjectMutationState) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the states belong to different projects.
+    pub fn replace(&mut self, other: ProjectMutationState) -> Result<()> {
+        self.ensure_same_project(&other.project)?;
         for file in other.files {
             if let Some(existing) = self
                 .files
@@ -54,6 +73,7 @@ impl ProjectMutationState {
                 self.files.push(file);
             }
         }
+        Ok(())
     }
 
     /// Projects this observed state onto a journal's ordered write set.
@@ -66,9 +86,32 @@ impl ProjectMutationState {
     /// Returns [`CoreError::LockConflict`] when the requested write set is invalid or is not a
     /// subset of this state.
     pub fn state_for(&self, write_set: &ProjectMutationJournal) -> Result<Self> {
+        self.ensure_same_project(&write_set.project)?;
         Ok(ProjectMutationState {
+            project: self.project.clone(),
             files: projected_files(&self.files, &write_set.files)?,
         })
+    }
+
+    /// Captures a portable write set under another project root.
+    ///
+    /// This is the explicit boundary used to inspect an isolated project copy without transferring
+    /// the source journal's restore authority to that copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the project identity or any file cannot be captured safely.
+    pub fn capture(root: &Utf8Path, write_set: &[ProjectMutationFile]) -> Result<Self> {
+        let project = ProjectMutationRoot::capture(root)?;
+        let files = write_set
+            .iter()
+            .map(|file| ProjectMutationFile::capture(project.path(), &file.path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ProjectMutationState { project, files })
+    }
+
+    fn ensure_same_project(&self, other: &ProjectMutationRoot) -> Result<()> {
+        self.project.ensure_same(other)
     }
 }
 
@@ -300,6 +343,7 @@ impl AcceptedProjectState {
     ///
     /// Returns [`CoreError::LockConflict`] when any source file changed independently.
     pub fn validate_source(&self, root: &Utf8Path) -> Result<()> {
+        self.original.ensure_root(root)?;
         self.inputs.validate()?;
         validate_state(
             root,
@@ -347,20 +391,49 @@ pub struct ProjectMutationFile {
 }
 
 impl ProjectMutationJournal {
-    /// Builds a journal from validated captured file entries.
+    /// Captures a project-bound journal for the requested relative paths.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when a path is unsafe or duplicated, or when a
-    /// snapshot is inconsistent.
-    pub fn new(files: Vec<ProjectMutationFile>) -> Result<Self> {
+    /// Returns a [`CoreError`](crate::CoreError) when the project identity or a file cannot be
+    /// captured safely.
+    pub fn capture<I, P>(root: &Utf8Path, paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Utf8Path>,
+    {
+        let project = ProjectMutationRoot::capture(root)?;
+        let files = paths
+            .into_iter()
+            .map(|path| ProjectMutationFile::capture(project.path(), path.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_bound_snapshot(project, files)
+    }
+
+    /// Binds validated portable snapshots to one project restore authority.
+    ///
+    /// Recovery formats use this boundary after validating their project identity and file set.
+    /// Normal adapters should prefer [`Self::capture`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) when the project identity, a path, or a snapshot is
+    /// invalid.
+    pub fn from_snapshot(root: &Utf8Path, files: Vec<ProjectMutationFile>) -> Result<Self> {
+        Self::from_bound_snapshot(ProjectMutationRoot::capture(root)?, files)
+    }
+
+    fn from_bound_snapshot(
+        project: ProjectMutationRoot,
+        files: Vec<ProjectMutationFile>,
+    ) -> Result<Self> {
         if !valid_mutation_files(&files) {
             return Err(CoreError::Filesystem(
                 "mutation journal contains an unsafe, duplicate, or inconsistent project file"
                     .to_string(),
             ));
         }
-        Ok(ProjectMutationJournal { files })
+        Ok(ProjectMutationJournal { project, files })
     }
 
     /// The ordered captured entries in this journal's write set.
@@ -370,12 +443,18 @@ impl ProjectMutationJournal {
     }
 
     /// Adds paths absent from this journal while preserving its earlier snapshots.
-    pub fn extend_missing(&mut self, other: &ProjectMutationJournal) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the journals belong to different projects.
+    pub fn extend_missing(&mut self, other: &ProjectMutationJournal) -> Result<()> {
+        self.project.ensure_same(&other.project)?;
         for file in &other.files {
             if self.files.iter().all(|existing| existing.path != file.path) {
                 self.files.push(file.clone());
             }
         }
+        Ok(())
     }
 
     /// Capture the current contents of one project-relative file.
@@ -387,7 +466,121 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the path is not a regular file, changes identity
     /// during capture, or cannot be read.
-    pub fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
+    fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
+        ProjectMutationFile::capture(root, rel)
+    }
+
+    /// Captures the current state of every file in this journal's write set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the project identity changed or a file cannot
+    /// be read safely.
+    pub fn capture_state(&self) -> Result<ProjectMutationState> {
+        self.project.validate_live()?;
+        let files = self
+            .files
+            .iter()
+            .map(|file| Self::capture_file(self.project.path(), &file.path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ProjectMutationState {
+            project: self.project.clone(),
+            files,
+        })
+    }
+
+    /// Projects this captured preimage onto another journal's ordered write set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the journals belong to different projects or the
+    /// requested write set is invalid or absent.
+    pub fn state_for(&self, write_set: &ProjectMutationJournal) -> Result<ProjectMutationState> {
+        self.project.ensure_same(&write_set.project)?;
+        Ok(ProjectMutationState {
+            project: self.project.clone(),
+            files: projected_files(&self.files, &write_set.files)?,
+        })
+    }
+
+    /// Restores this journal only when every live file still matches `expected`.
+    ///
+    /// Validation covers the complete write set before any file is changed.
+    /// Each path is checked again immediately before its own atomic replacement, so drift during a
+    /// multi-file restore stops before that path is overwritten.
+    /// The multi-file operation is not globally atomic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when the expected state
+    /// belongs to another project, does not describe this journal, or a live file changed
+    /// independently.
+    /// Returns a filesystem error if validation or restoration cannot read, replace, or remove a
+    /// file.
+    pub fn restore_if_unchanged(&self, expected: &ProjectMutationState) -> Result<()> {
+        self.project.ensure_same(&expected.project)?;
+        self.project.validate_live()?;
+        let root = self.project.path();
+        if !matching_write_sets(&self.files, &expected.files) || !valid_mutation_files(&self.files)
+        {
+            return Err(CoreError::LockConflict(
+                "rollback state does not match the mutation journal write set; left project files untouched"
+                    .to_string(),
+            ));
+        }
+
+        for expected_file in &expected.files {
+            let live = Self::capture_file(root, &expected_file.path)?;
+            if !live.matches(expected_file) {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently while cooldown was verifying a mutation; left project files untouched",
+                    root.join(&expected_file.path)
+                )));
+            }
+        }
+
+        for (file, expected_file) in self.files.iter().zip(&expected.files) {
+            let live = Self::capture_file(root, &expected_file.path)?;
+            if !live.matches(expected_file) {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently during rollback; stopped before replacing it",
+                    root.join(&expected_file.path)
+                )));
+            }
+            file.restore_if_unchanged(root, expected_file)?;
+        }
+        Ok(())
+    }
+
+    /// Restores every captured file entry in this journal's project.
+    ///
+    /// Entries whose captured contents are `None` are removed if they now exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the project identity changed or a file cannot
+    /// be restored safely.
+    pub fn restore(&self) -> Result<()> {
+        self.project.validate_live()?;
+        if !valid_mutation_files(&self.files) {
+            return Err(CoreError::Filesystem(
+                "mutation journal contains an unsafe or duplicate project path".to_string(),
+            ));
+        }
+        for file in &self.files {
+            file.restore(self.project.path())?;
+        }
+        Ok(())
+    }
+
+    fn ensure_root(&self, root: &Utf8Path) -> Result<()> {
+        self.project
+            .ensure_same(&ProjectMutationRoot::capture(root)?)
+    }
+}
+
+impl ProjectMutationFile {
+    fn capture(root: &Utf8Path, rel: &Utf8Path) -> Result<Self> {
         use std::io::Read as _;
 
         if !safe_mutation_path(rel) {
@@ -429,105 +622,53 @@ impl ProjectMutationJournal {
         }
         ProjectMutationFile::from_snapshot(rel.to_owned(), Some(bytes), Some(opened.permissions()))
     }
+}
 
-    /// Captures the current state of every file in this journal's write set.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if a file exists but cannot be read.
-    pub fn capture_state(&self, root: &Utf8Path) -> Result<ProjectMutationState> {
-        if !valid_mutation_files(&self.files) {
-            return Err(CoreError::Filesystem(
-                "mutation journal contains an unsafe or duplicate project path".to_string(),
-            ));
-        }
-        let files = self
-            .files
-            .iter()
-            .map(|file| Self::capture_file(root, &file.path))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(ProjectMutationState { files })
-    }
-
-    /// Projects this captured preimage onto another journal's ordered write set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::LockConflict`] when the requested write set is invalid or is not a
-    /// subset of this journal.
-    pub fn state_for(&self, write_set: &ProjectMutationJournal) -> Result<ProjectMutationState> {
-        Ok(ProjectMutationState {
-            files: projected_files(&self.files, &write_set.files)?,
+impl ProjectMutationRoot {
+    fn capture(root: &Utf8Path) -> Result<Self> {
+        let canonical = std::fs::canonicalize(root)?;
+        let path = Utf8PathBuf::from_path_buf(canonical).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "project mutation root is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        let identity = same_file::Handle::from_path(&path)?;
+        Ok(ProjectMutationRoot {
+            path,
+            identity: std::sync::Arc::new(identity),
         })
     }
 
-    /// Restores this journal only when every live file still matches `expected`.
-    ///
-    /// Validation covers the complete write set before any file is changed.
-    /// Each path is checked
-    /// again immediately before its own atomic replacement, so drift during a multi-file restore
-    /// stops before that path is overwritten.
-    /// The multi-file operation is not globally atomic.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when the expected state
-    /// does not describe this journal or a live file has changed independently.
-    /// Returns a filesystem
-    /// error if validation or restoration cannot read, replace, or remove a file.
-    pub fn restore_if_unchanged(
-        &self,
-        root: &Utf8Path,
-        expected: &ProjectMutationState,
-    ) -> Result<()> {
-        if !matching_write_sets(&self.files, &expected.files) || !valid_mutation_files(&self.files)
-        {
-            return Err(CoreError::LockConflict(
-                "rollback state does not match the mutation journal write set; left project files untouched"
-                    .to_string(),
-            ));
-        }
-
-        for expected_file in &expected.files {
-            let live = Self::capture_file(root, &expected_file.path)?;
-            if !live.matches(expected_file) {
-                return Err(CoreError::LockConflict(format!(
-                    "{} changed independently while cooldown was verifying a mutation; left project files untouched",
-                    root.join(&expected_file.path)
-                )));
-            }
-        }
-
-        for (file, expected_file) in self.files.iter().zip(&expected.files) {
-            let live = Self::capture_file(root, &expected_file.path)?;
-            if !live.matches(expected_file) {
-                return Err(CoreError::LockConflict(format!(
-                    "{} changed independently during rollback; stopped before replacing it",
-                    root.join(&expected_file.path)
-                )));
-            }
-            file.restore_if_unchanged(root, expected_file)?;
-        }
-        Ok(())
+    fn path(&self) -> &Utf8Path {
+        &self.path
     }
 
-    /// Restore every captured file entry under `root`.
-    ///
-    /// Entries whose captured contents are `None` are removed if they now exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if a file cannot be written back or removed.
-    pub fn restore(&self, root: &Utf8Path) -> Result<()> {
-        if !valid_mutation_files(&self.files) {
-            return Err(CoreError::Filesystem(
-                "mutation journal contains an unsafe or duplicate project path".to_string(),
-            ));
+    fn ensure_same(&self, other: &ProjectMutationRoot) -> Result<()> {
+        if self == other {
+            return Ok(());
         }
-        for file in &self.files {
-            file.restore(root)?;
+        Err(CoreError::LockConflict(format!(
+            "mutation authority for {} cannot be used with project {}",
+            self.path, other.path
+        )))
+    }
+
+    fn validate_live(&self) -> Result<()> {
+        let live = same_file::Handle::from_path(&self.path).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate mutation project {}: {error}",
+                self.path
+            ))
+        })?;
+        if *self.identity == live {
+            Ok(())
+        } else {
+            Err(CoreError::LockConflict(format!(
+                "mutation project {} changed identity; left project files untouched",
+                self.path
+            )))
         }
-        Ok(())
     }
 }
 
@@ -740,19 +881,37 @@ mod mutation_journal_tests {
         let root = root(&directory)?;
         let relative = Utf8Path::new("Cargo.toml");
         std::fs::write(root.join(relative), "original")?;
-        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-            &root, relative,
-        )?])?;
+        let journal = ProjectMutationJournal::capture(&root, [relative])?;
         std::fs::write(root.join(relative), "candidate")?;
-        let expected = journal.capture_state(&root)?;
+        let expected = journal.capture_state()?;
         std::fs::write(root.join(relative), "external")?;
 
-        let Err(error) = journal.restore_if_unchanged(&root, &expected) else {
+        let Err(error) = journal.restore_if_unchanged(&expected) else {
             color_eyre::eyre::bail!("drift unexpectedly allowed rollback");
         };
 
         std::assert_matches!(error, CoreError::LockConflict(_));
         assert_eq!(std::fs::read_to_string(root.join(relative))?, "external");
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_authority_rejects_another_projects_state() -> eyre::Result<()> {
+        let project_a = tempfile::tempdir()?;
+        let project_b = tempfile::tempdir()?;
+        let root_a = root(&project_a)?;
+        let root_b = root(&project_b)?;
+        let relative = Utf8Path::new("Cargo.lock");
+        std::fs::write(root_a.join(relative), "project-a")?;
+        std::fs::write(root_b.join(relative), "project-b")?;
+        let journal = ProjectMutationJournal::capture(&root_a, [relative])?;
+        let state_b = ProjectMutationState::capture(&root_b, journal.files())?;
+
+        let result = journal.restore_if_unchanged(&state_b);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_eq!(std::fs::read_to_string(root_a.join(relative))?, "project-a");
+        assert_eq!(std::fs::read_to_string(root_b.join(relative))?, "project-b");
         Ok(())
     }
 
@@ -787,9 +946,9 @@ mod mutation_journal_tests {
         let root = root(&directory)?;
         let relative = Utf8Path::new("Cargo.lock");
         std::fs::write(root.join(relative), "lock")?;
-        let file = ProjectMutationJournal::capture_file(&root, relative)?;
+        let file = ProjectMutationFile::capture(&root, relative)?;
 
-        let result = ProjectMutationJournal::new(vec![file.clone(), file]);
+        let result = ProjectMutationJournal::from_snapshot(&root, vec![file.clone(), file]);
 
         std::assert_matches!(result, Err(CoreError::Filesystem(_)));
         Ok(())
@@ -819,15 +978,12 @@ mod mutation_journal_tests {
         let existing = Utf8Path::new("Cargo.toml");
         let created = Utf8Path::new("Cargo.lock");
         std::fs::write(root.join(existing), "original")?;
-        let journal = ProjectMutationJournal::new(vec![
-            ProjectMutationJournal::capture_file(&root, existing)?,
-            ProjectMutationJournal::capture_file(&root, created)?,
-        ])?;
+        let journal = ProjectMutationJournal::capture(&root, [existing, created])?;
         std::fs::write(root.join(existing), "candidate")?;
         std::fs::write(root.join(created), "candidate")?;
-        let expected = journal.capture_state(&root)?;
+        let expected = journal.capture_state()?;
 
-        journal.restore_if_unchanged(&root, &expected)?;
+        journal.restore_if_unchanged(&expected)?;
 
         assert_eq!(std::fs::read_to_string(root.join(existing))?, "original");
         assert!(!root.join(created).exists());
@@ -845,14 +1001,12 @@ mod mutation_journal_tests {
         let path = root.join(relative);
         std::fs::write(&path, "original")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
-        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-            &root, relative,
-        )?])?;
+        let journal = ProjectMutationJournal::capture(&root, [relative])?;
 
         std::fs::write(&path, "candidate")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let expected = journal.capture_state(&root)?;
-        journal.restore_if_unchanged(&root, &expected)?;
+        let expected = journal.capture_state()?;
+        journal.restore_if_unchanged(&expected)?;
 
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
@@ -871,7 +1025,7 @@ mod mutation_journal_tests {
         symlink("missing.lock", root.join("Cargo.lock"))?;
 
         for relative in [Utf8Path::new("Cargo.toml"), Utf8Path::new("Cargo.lock")] {
-            let result = ProjectMutationJournal::capture_file(&root, relative);
+            let result = ProjectMutationFile::capture(&root, relative);
             std::assert_matches!(result, Err(CoreError::Filesystem(_)));
         }
         assert!(root.join("Cargo.toml").is_symlink());

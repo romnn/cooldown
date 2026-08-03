@@ -748,11 +748,7 @@ impl ToolWrite for CargoTool {
                 relative.insert(manifest::member_manifest_rel(&member.path));
             }
         }
-        let mut files = Vec::with_capacity(relative.len());
-        for rel in relative {
-            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
-        }
-        ProjectMutationJournal::new(files)
+        ProjectMutationJournal::capture(&project.root, relative)
     }
 
     async fn apply(
@@ -780,7 +776,7 @@ impl ToolWrite for CargoTool {
             }
             report => report,
         };
-        let postimage = journal.capture_state(&project.root)?;
+        let postimage = journal.capture_state()?;
         Ok(ApplyAttempt::Finished { report, postimage })
     }
 
@@ -854,6 +850,7 @@ impl ToolWrite for CargoTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
@@ -1289,23 +1286,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_journal_restore_removes_lock_created_after_capture() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+    async fn mutation_journal_restore_removes_lock_created_after_capture() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let manifest = root.join("Cargo.toml");
         std::fs::write(
             &manifest,
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("write manifest");
-        let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = CargoTool::from_http(
-            cooldown_registry::SharedHttp::new(
-                cache_dir.path(),
-                cooldown_registry::HttpOptions::default(),
-            )
-            .expect("http"),
-        );
+        )?;
+        let cache_dir = tempfile::tempdir()?;
+        let eco = CargoTool::from_http(cooldown_registry::SharedHttp::new(
+            cache_dir.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let project = Project {
             root: root.clone(),
             kind: CARGO_ID,
@@ -1313,14 +1307,12 @@ mod tests {
             exclude_newer: None,
         };
 
-        let journal = eco
-            .mutation_journal(&project, &Plan::default())
-            .await
-            .expect("journal");
+        let journal = eco.mutation_journal(&project, &Plan::default()).await?;
         let lock = root.join("Cargo.lock");
-        std::fs::write(&lock, "generated").expect("write lock");
+        std::fs::write(&lock, "generated")?;
 
-        journal.restore(&project.root).expect("restore");
+        journal.restore()?;
         assert!(!lock.exists());
+        Ok(())
     }
 }

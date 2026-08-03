@@ -249,3 +249,183 @@ pub(crate) fn set_yaml_string_map(
         .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+    use color_eyre::eyre;
+
+    #[test]
+    fn configured_string_list_accepts_pnpm_singletons_and_arrays() -> eyre::Result<()> {
+        let one = serde_json::from_str::<ConfigStringList>("\"nanoid\"")?;
+        let many = serde_json::from_str::<ConfigStringList>("[\"nanoid\", \"eslint\"]")?;
+
+        assert_eq!(one.into_vec(), vec!["nanoid".to_string()]);
+        assert_eq!(
+            many.into_vec(),
+            vec!["nanoid".to_string(), "eslint".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_yaml_scalar_adds_updates_and_is_idempotent() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(&path, "packages:\n  - \"a\"\n# keep me\n")?;
+
+        // Absent key → prepended, comments and existing content preserved.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", false)?);
+        let after = std::fs::read_to_string(&path)?;
+        assert!(after.contains("minimumReleaseAge: 20160"));
+        assert!(after.contains("# keep me"), "comments preserved");
+        assert!(after.contains("packages:"), "existing content preserved");
+
+        // Idempotent.
+        assert!(!set_yaml_scalar(
+            &path,
+            "minimumReleaseAge",
+            "20160",
+            false
+        )?);
+
+        // Update in place.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "30", false)?);
+        let updated = std::fs::read_to_string(&path)?;
+        assert!(updated.contains("minimumReleaseAge: 30"));
+        assert!(!updated.contains("20160"));
+        Ok(())
+    }
+
+    #[test]
+    fn set_yaml_scalar_dry_run_reports_change_without_writing() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let before = "packages:\n  - \"a\"\n";
+        std::fs::write(&path, before)?;
+
+        // Dry run on an absent key reports it would change but writes nothing.
+        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", true)?);
+        assert_eq!(std::fs::read_to_string(&path)?, before);
+
+        // Dry run on a missing file reports a change but does not create the file.
+        let missing = Utf8PathBuf::from_path_buf(dir.path().join("absent.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        assert!(set_yaml_scalar(
+            &missing,
+            "minimumReleaseAge",
+            "20160",
+            true
+        )?);
+        assert!(!missing.exists(), "dry run must not create the file");
+        Ok(())
+    }
+
+    #[test]
+    fn set_yaml_block_list_adds_updates_removes_and_is_idempotent() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            "minimumReleaseAge: 20160\npackages:\n  - \"a\"\n# keep me\n",
+        )?;
+
+        // Absent key → block appended, the rest of the document (scalar, packages, comment) preserved.
+        let items = vec![
+            "@typescript/native-preview".to_string(),
+            "@scope/*".to_string(),
+        ];
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &items,
+            false
+        )?);
+        let after = std::fs::read_to_string(&path)?;
+        assert!(after.contains(
+            "minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\"\n  - \"@scope/*\""
+        ));
+        assert!(
+            after.contains("minimumReleaseAge: 20160"),
+            "scalar preserved"
+        );
+        assert!(after.contains("packages:"), "packages preserved");
+        assert!(after.contains("# keep me"), "comment preserved");
+
+        // Idempotent: the same items rewrite nothing.
+        assert!(!set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &items,
+            false
+        )?);
+
+        // Update in place: a different list replaces the block.
+        let fewer = vec!["@typescript/native-preview".to_string()];
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &fewer,
+            false
+        )?);
+        let updated = std::fs::read_to_string(&path)?;
+        assert!(
+            updated.contains("minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\"\n")
+        );
+        assert!(!updated.contains("@scope/*"), "dropped item is gone");
+        assert!(updated.contains("# keep me"), "comment still preserved");
+
+        // Empty list → the key and its block are removed entirely.
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &[],
+            false
+        )?);
+        let removed = std::fs::read_to_string(&path)?;
+        assert!(!removed.contains("minimumReleaseAgeExclude"), "key removed");
+        assert!(
+            removed.contains("minimumReleaseAge: 20160"),
+            "scalar untouched"
+        );
+        // Removing again is a no-op.
+        assert!(!set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &[],
+            false
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn set_yaml_string_map_replaces_only_the_requested_block() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            "minimumReleaseAge: 20160\noverrides:\n  existing: \"1.0.0\"\npackages:\n  - \"a\"\n# keep me\n",
+        )?;
+        let items = BTreeMap::from([
+            ("@scope/pkg".to_string(), "2.0.0".to_string()),
+            ("existing".to_string(), "1.1.0".to_string()),
+        ]);
+
+        assert!(set_yaml_string_map(&path, "overrides", &items)?);
+        let written = std::fs::read_to_string(&path)?;
+        assert!(
+            written
+                .contains("overrides:\n  \"@scope/pkg\": \"2.0.0\"\n  \"existing\": \"1.1.0\"\n")
+        );
+        assert!(written.contains("minimumReleaseAge: 20160"));
+        assert!(written.contains("packages:\n  - \"a\""));
+        assert!(written.contains("# keep me"));
+        assert!(!set_yaml_string_map(&path, "overrides", &items)?);
+        Ok(())
+    }
+}

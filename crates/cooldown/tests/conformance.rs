@@ -141,10 +141,8 @@ impl IsolatedMutationStrategy for FakeEco {
             CoreError::PathEncoding(format!("non-UTF-8 test path: {}", path.display()))
         })?;
         std::fs::copy(source.root.join("Cargo.lock"), root.join("Cargo.lock"))?;
-        let preimage = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-            &source.root,
-            camino::Utf8Path::new("Cargo.lock"),
-        )?])?;
+        let preimage =
+            ProjectMutationJournal::capture(&source.root, [camino::Utf8Path::new("Cargo.lock")])?;
         let staged = Project {
             root: root.clone(),
             manifest: root.join("go.mod"),
@@ -168,7 +166,8 @@ impl IsolatedMutation for FakeMutationStage {
     }
 
     fn accepted_state(&self) -> Result<AcceptedProjectState> {
-        let candidate = self.preimage.capture_state(&self.staged.root)?;
+        let candidate =
+            cooldown_core::ProjectMutationState::capture(&self.staged.root, self.preimage.files())?;
         AcceptedProjectState::new(
             self.preimage.clone(),
             candidate,
@@ -387,12 +386,9 @@ impl ToolWrite for FakeEco {
 
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         if self.state.lock().unwrap().write_lock_on_apply {
-            return ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-                &p.root,
-                camino::Utf8Path::new("fake.lock"),
-            )?]);
+            return ProjectMutationJournal::capture(&p.root, [camino::Utf8Path::new("fake.lock")]);
         }
-        Ok(ProjectMutationJournal::default())
+        ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
 
     async fn apply(
@@ -482,7 +478,7 @@ impl ToolWrite for FakeEco {
                 detail: "fake adapter retained authoritative recovery evidence".to_string(),
             });
         }
-        let postimage = journal.capture_state(&p.root)?;
+        let postimage = journal.capture_state()?;
         Ok(ApplyAttempt::Finished { report, postimage })
     }
 
@@ -3734,8 +3730,8 @@ impl ToolWrite for RepoScopedFake {
         Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
     }
 
-    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal::default())
+    async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
     async fn apply(
         &self,
@@ -3915,8 +3911,8 @@ impl ReleaseFetcher for ProjectScopedFake {
 
 #[async_trait]
 impl ToolWrite for ProjectScopedFake {
-    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal::default())
+    async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
     async fn apply(
         &self,
@@ -4099,8 +4095,8 @@ impl ReleaseFetcher for HeldConflictFake {
 
 #[async_trait]
 impl ToolWrite for HeldConflictFake {
-    async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal::default())
+    async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
     async fn apply(
         &self,

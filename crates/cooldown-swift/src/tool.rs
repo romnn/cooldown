@@ -190,10 +190,7 @@ impl ToolWrite for SwiftTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new("Package.resolved"),
-        )?])
+        ProjectMutationJournal::capture(&project.root, [Utf8Path::new("Package.resolved")])
     }
 
     async fn apply(

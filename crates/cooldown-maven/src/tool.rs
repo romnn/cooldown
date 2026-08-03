@@ -273,17 +273,11 @@ impl<L: JavaLayout> ToolWrite for JavaTool<L> {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        let mut files = vec![ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new(L::LOCKFILE),
-        )?];
+        let mut paths = vec![Utf8Path::new(L::LOCKFILE)];
         if L::MANIFEST != L::LOCKFILE {
-            files.push(ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new(L::MANIFEST),
-            )?);
+            paths.push(Utf8Path::new(L::MANIFEST));
         }
-        ProjectMutationJournal::new(files)
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
     async fn apply(

@@ -189,7 +189,7 @@ impl ProjectRecoveryRecord {
             .iter()
             .map(|file| file.original_file(root))
             .collect::<Result<Vec<_>>>()?;
-        ProjectMutationJournal::new(files)
+        ProjectMutationJournal::from_snapshot(root, files)
     }
 }
 
@@ -513,7 +513,7 @@ fn recover_project_publication(
     let record: ProjectRecoveryRecord = read_json(recovery_path)?;
     record.validate(project, recovery_path)?;
     let original = record.original_journal(&project.root)?;
-    let live = original.capture_state(&project.root)?;
+    let live = original.capture_state()?;
     let mut saw_original = false;
     let mut saw_candidate = false;
     for (recorded, live) in record.files.iter().zip(live.files()) {
@@ -538,7 +538,7 @@ fn recover_project_publication(
         }
     }
     let disposition = if saw_original && saw_candidate {
-        original.restore_if_unchanged(&project.root, &live)?;
+        original.restore_if_unchanged(&live)?;
         RecoveryDisposition::Restored
     } else if saw_candidate {
         RecoveryDisposition::Accepted
@@ -956,21 +956,19 @@ mod tests {
         let candidate = tempfile::tempdir()?;
         let candidate_root = Utf8PathBuf::from_path_buf(candidate.path().to_owned())
             .map_err(|path| eyre::eyre!("non-UTF-8 candidate path: {path:?}"))?;
-        let mut files = Vec::new();
+        let mut relative_paths = Vec::new();
         for (path, contents) in paths {
             let relative = Utf8Path::new(path);
-            files.push(ProjectMutationJournal::capture_file(
-                &project.root,
-                relative,
-            )?);
+            relative_paths.push(relative);
             let target = candidate_root.join(relative);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(target, contents)?;
         }
-        let original = ProjectMutationJournal::new(files)?;
-        let candidate = original.capture_state(&candidate_root)?;
+        let original = ProjectMutationJournal::capture(&project.root, relative_paths)?;
+        let candidate =
+            cooldown_core::ProjectMutationState::capture(&candidate_root, original.files())?;
         Ok(AcceptedProjectState::new(
             original,
             candidate,

@@ -460,7 +460,7 @@ pub trait ToolWrite: Send + Sync {
         _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
         let report = self.apply(project, plan, journal).await;
-        let postimage = journal.capture_state(&project.root)?;
+        let postimage = journal.capture_state()?;
         Ok(ApplyAttempt::Finished { report, postimage })
     }
 

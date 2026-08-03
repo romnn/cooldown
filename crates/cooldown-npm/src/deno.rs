@@ -492,15 +492,9 @@ impl ToolWrite for DenoTool {
         // workspace member's pair (an absent one is a no-op to restore) plus the lock, since the
         // resolve narrows whichever manifest declares a pinned import and re-locks. Capturing the
         // member manifests keeps rollback correct when a member-declared candidate is the one pinned.
-        let mut files = Vec::new();
-        for rel in workspace_manifest_rels(&project.root) {
-            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
-        }
-        files.push(ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new("deno.lock"),
-        )?);
-        ProjectMutationJournal::new(files)
+        let mut paths = workspace_manifest_rels(&project.root);
+        paths.push(Utf8PathBuf::from("deno.lock"));
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
     /// Re-resolve the **whole** dependency graph once under cooldown's window, pinning every planned

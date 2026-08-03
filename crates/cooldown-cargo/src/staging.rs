@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     AcceptedProjectState, AcceptedPublication, CoreError, IsolatedMutation,
-    IsolatedMutationStrategy, Project, ProjectInputSnapshot, ProjectMutationJournal, Result,
+    IsolatedMutationStrategy, Project, ProjectInputSnapshot, ProjectMutationJournal,
+    ProjectMutationState, Result,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -54,7 +55,7 @@ impl IsolatedMutation for CargoMutationStage {
     }
 
     fn accepted_state(&self) -> Result<AcceptedProjectState> {
-        let candidate = self.preimage.capture_state(&self.staged.root)?;
+        let candidate = ProjectMutationState::capture(&self.staged.root, self.preimage.files())?;
         AcceptedProjectState::new(self.preimage.clone(), candidate, self.inputs.clone())
     }
 
@@ -124,7 +125,7 @@ impl CargoMutationStage {
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
         };
-        let initial = preimage.capture_state(&staged.root)?;
+        let initial = ProjectMutationState::capture(&staged.root, preimage.files())?;
         let initial =
             AcceptedProjectState::new(preimage.clone(), initial, ProjectInputSnapshot::default())?;
         if initial.changed_files().next().is_some() {
@@ -751,11 +752,7 @@ fn require_regular_file(path: &Utf8Path, label: &str) -> Result<()> {
 }
 
 fn capture_outputs(root: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<ProjectMutationJournal> {
-    let files = paths
-        .iter()
-        .map(|path| ProjectMutationJournal::capture_file(root, path))
-        .collect::<Result<Vec<_>>>()?;
-    ProjectMutationJournal::new(files)
+    ProjectMutationJournal::capture(root, paths)
 }
 
 fn common_ancestor(paths: &[Utf8PathBuf]) -> Result<Utf8PathBuf> {

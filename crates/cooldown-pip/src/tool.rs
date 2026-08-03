@@ -276,17 +276,11 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        let mut files = vec![ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new(L::LOCKFILE),
-        )?];
+        let mut paths = vec![Utf8Path::new(L::LOCKFILE)];
         if L::MANIFEST != L::LOCKFILE {
-            files.push(ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new(L::MANIFEST),
-            )?);
+            paths.push(Utf8Path::new(L::MANIFEST));
         }
-        ProjectMutationJournal::new(files)
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
     async fn apply(
@@ -349,30 +343,32 @@ fn not_eligible(change: &Change) -> Skipped {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use indoc::indoc;
 
     #[tokio::test]
-    async fn pip_apply_rewrites_requirements_without_invoking_pip_install() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+    async fn pip_apply_rewrites_requirements_without_invoking_pip_install() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         std::fs::write(
             root.join("requirements.txt"),
             indoc! {"
                 requests==2.28.0
                 flask==2.2.0
             "},
-        )
-        .expect("requirements");
+        )?;
         let project = Project {
             root: root.clone(),
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
         };
-        let cache = tempfile::tempdir().expect("cache");
-        let tool = PyTool::<Pip>::from_http(
-            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
-        );
+        let cache = tempfile::tempdir()?;
+        let tool = PyTool::<Pip>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let change = Change {
             package: PackageId::new(Pip::ID, "requests", Some(PYPI.to_string())),
             from: Version::new("2.28.0"),
@@ -388,16 +384,15 @@ mod tests {
             ..Plan::default()
         };
 
-        let report = tool
-            .apply(&project, &plan, &ProjectMutationJournal::default())
-            .await
-            .expect("apply");
+        let journal =
+            ProjectMutationJournal::capture(&project.root, std::iter::empty::<&Utf8Path>())?;
+        let report = tool.apply(&project, &plan, &journal).await?;
 
         assert_eq!(report.applied.len(), 1);
         assert!(report.skipped.is_empty());
-        let rewritten =
-            std::fs::read_to_string(root.join("requirements.txt")).expect("requirements");
+        let rewritten = std::fs::read_to_string(root.join("requirements.txt"))?;
         assert!(rewritten.contains("requests==2.31.0"));
+        Ok(())
     }
 
     #[tokio::test]

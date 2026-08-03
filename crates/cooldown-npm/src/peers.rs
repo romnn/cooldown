@@ -322,7 +322,7 @@ pub(crate) fn settle_landed_candidate<L: NodeLock>(
             report.applied.push(change.clone());
         }
         Some(violation) => {
-            restore_after_owned_step(candidate_journal, &project.root, candidate_postimage)?;
+            restore_after_owned_step(candidate_journal, candidate_postimage)?;
             let offending = if violation.dependent == change.package.name {
                 violation.package.clone()
             } else {
@@ -1216,3 +1216,7 @@ fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "peers/tests.rs"]
+mod tests;

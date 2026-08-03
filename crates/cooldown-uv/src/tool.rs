@@ -695,10 +695,10 @@ impl ToolWrite for UvTool {
         // Capture the lock and the manifest: `apply` re-locks (uv.lock) and, when the target falls
         // outside the declared requirement, rewrites the constraint (pyproject.toml). Capturing the
         // manifest unconditionally is harmless — restore runs only on rollback.
-        ProjectMutationJournal::new(vec![
-            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("uv.lock"))?,
-            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("pyproject.toml"))?,
-        ])
+        ProjectMutationJournal::capture(
+            &project.root,
+            [Utf8Path::new("uv.lock"), Utf8Path::new("pyproject.toml")],
+        )
     }
 
     async fn apply(
@@ -887,6 +887,7 @@ impl ToolWrite for UvTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::{ArtifactId, Change, CoreError, FetchContext, RawArtifact, RawRelease};
     use indoc::indoc;
@@ -1276,23 +1277,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_journal_restore_removes_lock_created_after_capture() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+    async fn mutation_journal_restore_removes_lock_created_after_capture() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let manifest = root.join("pyproject.toml");
         std::fs::write(
             &manifest,
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("write manifest");
-        let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = UvTool::from_http(
-            cooldown_registry::SharedHttp::new(
-                cache_dir.path(),
-                cooldown_registry::HttpOptions::default(),
-            )
-            .expect("http"),
-        );
+        )?;
+        let cache_dir = tempfile::tempdir()?;
+        let eco = UvTool::from_http(cooldown_registry::SharedHttp::new(
+            cache_dir.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let project = Project {
             root: root.clone(),
             kind: UV_ID,
@@ -1300,15 +1298,13 @@ mod tests {
             exclude_newer: None,
         };
 
-        let journal = eco
-            .mutation_journal(&project, &Plan::default())
-            .await
-            .expect("journal");
+        let journal = eco.mutation_journal(&project, &Plan::default()).await?;
         let lock = root.join("uv.lock");
-        std::fs::write(&lock, "generated").expect("write lock");
+        std::fs::write(&lock, "generated")?;
 
-        journal.restore(&project.root).expect("restore");
+        journal.restore()?;
         assert!(!lock.exists());
+        Ok(())
     }
 
     fn uv_tool() -> UvTool {

@@ -109,7 +109,7 @@ pub(crate) async fn apply_resilient_with_observer(
         // plan and misreporting every candidate as held.
         Err(error) if error.is_local_environment_failure() => {
             journal
-                .restore_if_unchanged(&project.root, &first_state)
+                .restore_if_unchanged(&first_state)
                 .map_err(ApplyFailure::RestoreConflict)?;
             return Err(ApplyFailure::Failed(error));
         }
@@ -126,13 +126,13 @@ pub(crate) async fn apply_resilient_with_observer(
 
     // Commit exactly the accepted subset (restore first so the failed full-set attempt leaves nothing).
     journal
-        .restore_if_unchanged(&project.root, &trial_state)
+        .restore_if_unchanged(&trial_state)
         .map_err(ApplyFailure::RestoreConflict)?;
     let (mut report, expected) = if accepted.is_empty() {
         (
             ApplyReport::default(),
             journal
-                .capture_state(&project.root)
+                .capture_state()
                 .map_err(ApplyFailure::RestoreConflict)?,
         )
     } else {
@@ -159,7 +159,7 @@ pub(crate) async fn apply_resilient_with_observer(
             }
             Err(error) => {
                 journal
-                    .restore_if_unchanged(&project.root, &expected)
+                    .restore_if_unchanged(&expected)
                     .map_err(ApplyFailure::RestoreConflict)?;
                 return Err(ApplyFailure::Failed(error));
             }
@@ -200,7 +200,7 @@ async fn verified_satisfiable_subset(
 
     while let Some(group) = work.pop() {
         journal
-            .restore_if_unchanged(&project.root, &current_state)
+            .restore_if_unchanged(&current_state)
             .map_err(ApplyFailure::RestoreConflict)?;
         let trial = Plan {
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
@@ -230,7 +230,7 @@ async fn verified_satisfiable_subset(
             // whichever candidates happen to be in this trial group.
             Err(error) if error.is_local_environment_failure() => {
                 journal
-                    .restore_if_unchanged(&project.root, &current_state)
+                    .restore_if_unchanged(&current_state)
                     .map_err(ApplyFailure::RestoreConflict)?;
                 return Err(ApplyFailure::Failed(error));
             }
@@ -278,6 +278,7 @@ fn held(change: &Change) -> Skipped {
 mod tests {
     use super::{apply_resilient, apply_resilient_with_observer};
     use async_trait::async_trait;
+    use camino::Utf8Path;
     use cooldown_core::{
         ApplyObserver, ApplyReport, Change, CoreError, PackageId, Plan, Project,
         ProjectMutationJournal, Result, RewriteMode, ToolId, ToolTermination, ToolWrite,
@@ -396,10 +397,10 @@ mod tests {
     impl ToolWrite for MockWriter {
         async fn mutation_journal(
             &self,
-            _project: &Project,
+            project: &Project,
             _plan: &Plan,
         ) -> Result<ProjectMutationJournal> {
-            Ok(ProjectMutationJournal::default())
+            ProjectMutationJournal::capture(&project.root, std::iter::empty::<&Utf8Path>())
         }
 
         async fn apply(
@@ -460,7 +461,7 @@ mod tests {
                 observer.candidate_started(change);
             }
             let report = self.apply(project, plan, journal).await;
-            let postimage = journal.capture_state(&project.root)?;
+            let postimage = journal.capture_state()?;
             Ok(cooldown_core::ApplyAttempt::Finished { report, postimage })
         }
 

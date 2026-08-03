@@ -6,167 +6,85 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::{CARGO_ID, RECOVERY_MARKER, recover_interrupted_mutation};
 use cooldown_core::{CoreError, ToolId, recognized_tool_names, tool_id};
 
-#[cfg(test)]
-const RECOVERY_RELEVANT_GLOBAL_ARGUMENTS: &[&str] = &[
-    "tool",
-    "cargo",
-    "no_gitignore",
-    "log_level",
-    "no_progress",
-    "dir",
-    "json",
-    "color",
-];
-
-struct RejectedRecoveryOption {
+struct RecoveryOption {
     id: &'static str,
-    flag: &'static str,
-    is_set: fn(&GlobalArgs) -> bool,
+    class: RecoveryOptionClass,
 }
 
-const RECOVERY_REJECTED_OPTIONS: &[RejectedRecoveryOption] = &[
-    RejectedRecoveryOption {
-        id: "min_age",
-        flag: "--min-age",
-        is_set: |global| global.min_age.is_some(),
+#[derive(Clone, Copy)]
+enum RecoveryOptionClass {
+    Used,
+    Rejected {
+        flag: &'static str,
+        is_set: fn(&GlobalArgs) -> bool,
     },
-    RejectedRecoveryOption {
-        id: "min_age_major",
-        flag: "--min-age-major",
-        is_set: |global| global.min_age_major.is_some(),
-    },
-    RejectedRecoveryOption {
-        id: "min_age_minor",
-        flag: "--min-age-minor",
-        is_set: |global| global.min_age_minor.is_some(),
-    },
-    RejectedRecoveryOption {
-        id: "min_age_patch",
-        flag: "--min-age-patch",
-        is_set: |global| global.min_age_patch.is_some(),
-    },
-    RejectedRecoveryOption {
-        id: "latest",
-        flag: "--latest",
-        is_set: |global| global.latest,
-    },
-    RejectedRecoveryOption {
-        id: "freeze",
-        flag: "--freeze",
-        is_set: |global| global.freeze.is_some(),
-    },
-    RejectedRecoveryOption {
-        id: "allow",
-        flag: "--allow",
-        is_set: |global| !global.allow.is_empty(),
-    },
-    RejectedRecoveryOption {
-        id: "major",
-        flag: "--major",
-        is_set: |global| global.major,
-    },
-    RejectedRecoveryOption {
-        id: "no_major",
-        flag: "--no-major",
-        is_set: |global| global.no_major,
-    },
-    RejectedRecoveryOption {
-        id: "respect_dist_tags",
-        flag: "--respect-dist-tags",
-        is_set: |global| global.respect_dist_tags,
-    },
-    RejectedRecoveryOption {
-        id: "no_respect_dist_tags",
-        flag: "--no-respect-dist-tags",
-        is_set: |global| global.no_respect_dist_tags,
-    },
-    RejectedRecoveryOption {
-        id: "package",
-        flag: "--package",
-        is_set: |global| !global.package.is_empty(),
-    },
-    RejectedRecoveryOption {
-        id: "exclude_folders",
-        flag: "--exclude-folders",
-        is_set: |global| !global.exclude_folders.is_empty(),
-    },
-    RejectedRecoveryOption {
-        id: "exclude_packages",
-        flag: "--exclude-packages",
-        is_set: |global| !global.exclude_packages.is_empty(),
-    },
-    RejectedRecoveryOption {
-        id: "list_packages",
-        flag: "--list-packages",
-        is_set: |global| global.list_packages,
-    },
-    RejectedRecoveryOption {
-        id: "paths",
-        flag: "--paths",
-        is_set: |global| global.paths,
-    },
-    RejectedRecoveryOption {
-        id: "show_projects",
-        flag: "--show-projects",
-        is_set: |global| global.show_projects,
-    },
-    RejectedRecoveryOption {
-        id: "no_suggestions",
-        flag: "--no-suggestions",
-        is_set: |global| global.no_suggestions,
-    },
-    RejectedRecoveryOption {
-        id: "allow_stale_lock",
-        flag: "--allow-stale-lock",
-        is_set: |global| global.allow_stale_lock,
-    },
-    RejectedRecoveryOption {
-        id: "sync",
-        flag: "--sync",
-        is_set: |global| global.sync,
-    },
-    RejectedRecoveryOption {
-        id: "dry_run",
-        flag: "--dry-run",
-        is_set: |global| global.dry_run,
-    },
-    RejectedRecoveryOption {
-        id: "offline",
-        flag: "--offline",
-        is_set: |global| global.offline,
-    },
-    RejectedRecoveryOption {
-        id: "fresh",
-        flag: "--fresh",
-        is_set: |global| global.fresh,
-    },
-    RejectedRecoveryOption {
-        id: "concurrency",
-        flag: "--concurrency",
-        is_set: |global| global.concurrency.is_some(),
-    },
-    RejectedRecoveryOption {
-        id: "no_native",
-        flag: "--no-native",
-        is_set: |global| global.no_native,
-    },
-    RejectedRecoveryOption {
-        id: "no_global",
-        flag: "--no-global",
-        is_set: |global| global.no_global,
-    },
-    RejectedRecoveryOption {
-        id: "config",
-        flag: "--config",
-        is_set: |global| global.config.is_some(),
-    },
-    #[cfg(debug_assertions)]
-    RejectedRecoveryOption {
-        id: "now",
-        flag: "--now",
-        is_set: |global| global.now.is_some(),
-    },
-];
+}
+
+macro_rules! recovery_options {
+    (
+        used: [$($used:literal),* $(,)?],
+        rejected: [$($(#[$meta:meta])* $id:literal => ($flag:literal, $is_set:expr)),* $(,)?],
+    ) => {
+        const RECOVERY_OPTIONS: &[RecoveryOption] = &[
+            $(RecoveryOption {
+                id: $used,
+                class: RecoveryOptionClass::Used,
+            },)*
+            $($(#[$meta])*
+            RecoveryOption {
+                id: $id,
+                class: RecoveryOptionClass::Rejected {
+                    flag: $flag,
+                    is_set: $is_set,
+                },
+            },)*
+        ];
+    };
+}
+
+recovery_options! {
+    used: [
+        "tool",
+        "cargo",
+        "no_gitignore",
+        "log_level",
+        "no_progress",
+        "dir",
+        "json",
+        "color",
+    ],
+    rejected: [
+        "min_age" => ("--min-age", |global| global.min_age.is_some()),
+        "min_age_major" => ("--min-age-major", |global| global.min_age_major.is_some()),
+        "min_age_minor" => ("--min-age-minor", |global| global.min_age_minor.is_some()),
+        "min_age_patch" => ("--min-age-patch", |global| global.min_age_patch.is_some()),
+        "latest" => ("--latest", |global| global.latest),
+        "freeze" => ("--freeze", |global| global.freeze.is_some()),
+        "allow" => ("--allow", |global| !global.allow.is_empty()),
+        "major" => ("--major", |global| global.major),
+        "no_major" => ("--no-major", |global| global.no_major),
+        "respect_dist_tags" => ("--respect-dist-tags", |global| global.respect_dist_tags),
+        "no_respect_dist_tags" => ("--no-respect-dist-tags", |global| global.no_respect_dist_tags),
+        "package" => ("--package", |global| !global.package.is_empty()),
+        "exclude_folders" => ("--exclude-folders", |global| !global.exclude_folders.is_empty()),
+        "exclude_packages" => ("--exclude-packages", |global| !global.exclude_packages.is_empty()),
+        "list_packages" => ("--list-packages", |global| global.list_packages),
+        "paths" => ("--paths", |global| global.paths),
+        "show_projects" => ("--show-projects", |global| global.show_projects),
+        "no_suggestions" => ("--no-suggestions", |global| global.no_suggestions),
+        "allow_stale_lock" => ("--allow-stale-lock", |global| global.allow_stale_lock),
+        "sync" => ("--sync", |global| global.sync),
+        "dry_run" => ("--dry-run", |global| global.dry_run),
+        "offline" => ("--offline", |global| global.offline),
+        "fresh" => ("--fresh", |global| global.fresh),
+        "concurrency" => ("--concurrency", |global| global.concurrency.is_some()),
+        "no_native" => ("--no-native", |global| global.no_native),
+        "no_global" => ("--no-global", |global| global.no_global),
+        "config" => ("--config", |global| global.config.is_some()),
+        #[cfg(debug_assertions)]
+        "now" => ("--now", |global| global.now.is_some()),
+    ],
+}
 
 pub(in crate::cli) struct PreparedRecovery {
     pub(in crate::cli) targets: Vec<RecoveryTarget>,
@@ -207,14 +125,15 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
 }
 
 fn validate_recovery_options(global: &GlobalArgs) -> Result<(), CoreError> {
-    if let Some(option) = RECOVERY_REJECTED_OPTIONS
-        .iter()
-        .find(|option| (option.is_set)(global))
-    {
+    if let Some((option, flag)) = RECOVERY_OPTIONS.iter().find_map(|option| {
+        let RecoveryOptionClass::Rejected { flag, is_set } = option.class else {
+            return None;
+        };
+        is_set(global).then_some((option, flag))
+    }) {
         tracing::debug!(argument = option.id, "rejecting irrelevant recovery option");
         return Err(CoreError::Config(format!(
-            "`recover` does not use `{}`; remove it so recovery depends only on project location and recovery artifacts",
-            option.flag
+            "`recover` does not use `{flag}`; remove it so recovery depends only on project location and recovery artifacts"
         )));
     }
     Ok(())
@@ -318,10 +237,9 @@ mod tests {
             .filter(|argument| argument.is_global_set())
             .map(|argument| argument.get_id().as_str().to_string())
             .collect::<std::collections::BTreeSet<_>>();
-        let classified = RECOVERY_RELEVANT_GLOBAL_ARGUMENTS
+        let classified = RECOVERY_OPTIONS
             .iter()
-            .copied()
-            .chain(RECOVERY_REJECTED_OPTIONS.iter().map(|option| option.id))
+            .map(|option| option.id)
             .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>();
 

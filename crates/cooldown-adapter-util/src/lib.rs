@@ -154,7 +154,7 @@ pub fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipp
 ///
 /// Returns a [`CoreError`](cooldown_core::CoreError) if the lock file state cannot be captured.
 pub fn single_lock_journal(root: &Utf8Path, lockfile: &Utf8Path) -> Result<ProjectMutationJournal> {
-    ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(root, lockfile)?])
+    ProjectMutationJournal::capture(root, [lockfile])
 }
 
 /// Build a standard lock-currency verification report from a boolean probe.

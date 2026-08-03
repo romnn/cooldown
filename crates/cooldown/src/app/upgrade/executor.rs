@@ -208,28 +208,50 @@ struct TrialState {
 
 /// The pre-trial journal paired with the exact cooldown-produced state it may replace.
 #[derive(Default)]
-struct TrialRollback {
-    journal: ProjectMutationJournal,
-    expected: ProjectMutationState,
+enum TrialRollback {
+    #[default]
+    Empty,
+    Captured {
+        journal: ProjectMutationJournal,
+        expected: ProjectMutationState,
+    },
 }
 
 impl TrialRollback {
-    fn preserve(
-        &mut self,
-        root: &camino::Utf8Path,
-        journal: &ProjectMutationJournal,
-    ) -> cooldown_core::Result<()> {
-        preserve_rollback_entries(&mut self.journal, journal);
-        self.expected.extend_missing(journal.capture_state(root)?);
+    fn preserve(&mut self, journal: &ProjectMutationJournal) -> cooldown_core::Result<()> {
+        let state = journal.capture_state()?;
+        match self {
+            TrialRollback::Captured {
+                journal: rollback,
+                expected,
+            } => {
+                preserve_rollback_entries(rollback, journal)?;
+                expected.extend_missing(state)?;
+            }
+            TrialRollback::Empty => {
+                *self = TrialRollback::Captured {
+                    journal: journal.clone(),
+                    expected: state,
+                };
+            }
+        }
         Ok(())
     }
 
-    fn accept(&mut self, state: ProjectMutationState) {
-        self.expected.replace(state);
+    fn accept(&mut self, state: ProjectMutationState) -> cooldown_core::Result<()> {
+        let TrialRollback::Captured { expected, .. } = self else {
+            return Err(cooldown_core::CoreError::System(
+                "cannot accept a trial before preserving its rollback state".to_string(),
+            ));
+        };
+        expected.replace(state)
     }
 
-    fn restore(&self, root: &camino::Utf8Path) -> cooldown_core::Result<()> {
-        self.journal.restore_if_unchanged(root, &self.expected)
+    fn restore(&self) -> cooldown_core::Result<()> {
+        match self {
+            TrialRollback::Empty => Ok(()),
+            TrialRollback::Captured { journal, expected } => journal.restore_if_unchanged(expected),
+        }
     }
 }
 
@@ -874,7 +896,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
         outcome: &mut BatchOutcome,
     ) -> bool {
-        match snapshot.restore(&self.ctx.pctx.project.root) {
+        match snapshot.restore() {
             Ok(()) => {
                 state.clone_from(baseline);
                 true
@@ -1476,8 +1498,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         };
 
         self.commit_batch_report(&mut outcome, &changes, report, committed);
-        if let Some(rollback) = rollback {
-            rollback.accept(expected);
+        if let Some(rollback) = rollback
+            && let Err(error) = rollback.accept(expected)
+        {
+            outcome.errors.push(self.project_diag(&error, None));
+            outcome.mutation = BatchMutation::RestoreConflict;
         }
         outcome
     }
@@ -1493,7 +1518,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .mutation_journal(&self.ctx.pctx.project, plan)
             .await?;
         if let Some(rollback) = rollback {
-            rollback.preserve(&self.ctx.pctx.project.root, &journal)?;
+            rollback.preserve(&journal)?;
         }
         Ok(journal)
     }
@@ -1779,7 +1804,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         expected: &cooldown_core::ProjectMutationState,
         outcome: &mut BatchOutcome,
     ) {
-        match journal.restore_if_unchanged(&self.ctx.pctx.project.root, expected) {
+        match journal.restore_if_unchanged(expected) {
             Ok(()) => outcome.mutation = BatchMutation::Restored,
             Err(error) => {
                 outcome.errors.push(self.project_diag(&error, None));
@@ -2112,12 +2137,12 @@ fn validate_edge_rebinds(rebinds: &[cooldown_core::EdgeRebind]) -> cooldown_core
 fn preserve_rollback_entries(
     rollback: &mut ProjectMutationJournal,
     journal: &ProjectMutationJournal,
-) {
+) -> cooldown_core::Result<()> {
     // By the mutation-journal contract, an earlier plan could not have changed a path it did not
     // capture.
     // Its first appearance therefore still contains the pre-trial bytes even when a reconciliation
     // plan expands the write set.
-    rollback.extend_missing(journal);
+    rollback.extend_missing(journal)
 }
 
 /// Restores deterministic mutation order after concurrent registry fetches return in completion
@@ -2579,18 +2604,18 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         std::fs::write(root.join("package-lock.json"), b"baseline lock")?;
         let mut rollback =
-            ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-                root,
-                camino::Utf8Path::new("package-lock.json"),
-            )?])?;
+            ProjectMutationJournal::capture(root, [camino::Utf8Path::new("package-lock.json")])?;
         std::fs::write(root.join("package-lock.json"), b"trial lock")?;
         std::fs::write(root.join("package.json"), b"baseline manifest")?;
-        let later = ProjectMutationJournal::new(vec![
-            ProjectMutationJournal::capture_file(root, camino::Utf8Path::new("package-lock.json"))?,
-            ProjectMutationJournal::capture_file(root, camino::Utf8Path::new("package.json"))?,
-        ])?;
+        let later = ProjectMutationJournal::capture(
+            root,
+            [
+                camino::Utf8Path::new("package-lock.json"),
+                camino::Utf8Path::new("package.json"),
+            ],
+        )?;
 
-        preserve_rollback_entries(&mut rollback, &later);
+        preserve_rollback_entries(&mut rollback, &later)?;
 
         assert_eq!(rollback.files().len(), 2);
         let mut files = rollback.files().iter();
@@ -2613,19 +2638,17 @@ mod tests {
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let path = root.join("Cargo.toml");
         std::fs::write(&path, b"original")?;
-        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
-            &root,
-            camino::Utf8Path::new("Cargo.toml"),
-        )?])?;
+        let journal =
+            ProjectMutationJournal::capture(&root, [camino::Utf8Path::new("Cargo.toml")])?;
         let mut rollback = TrialRollback::default();
-        rollback.preserve(&root, &journal)?;
+        rollback.preserve(&journal)?;
 
         std::fs::write(&path, b"cooldown candidate")?;
-        rollback.accept(journal.capture_state(&root)?);
+        rollback.accept(journal.capture_state()?)?;
         std::fs::write(&path, b"external edit")?;
 
         let error = rollback
-            .restore(&root)
+            .restore()
             .err()
             .ok_or_else(|| eyre::eyre!("independent drift unexpectedly allowed trial rollback"))?;
         std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));

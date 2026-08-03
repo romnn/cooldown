@@ -2,6 +2,7 @@ use super::releases::{build_releases, classify_kind, classify_quality, major_key
 use super::*;
 use crate::proxy::ProxyBase;
 use camino::{Utf8Path, Utf8PathBuf};
+use color_eyre::eyre;
 use cooldown_core::{
     ArtifactScope, CandidateScope, Change, Dependency, FetchContext, MajorKey, PackageId, Plan,
     Project, RawRelease, ReleaseQuality, UpdateKind, Version,
@@ -346,15 +347,17 @@ fn fetch_ctx(project: &Project) -> FetchContext<'_> {
 }
 
 #[tokio::test]
-async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go_sum() {
-    let repo = tempfile::tempdir().expect("tempdir");
-    let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf()).expect("utf8 path");
+async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go_sum()
+-> eyre::Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf())
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
     let manifest = root.join("go.mod");
     let source = root.join("main.go");
-    std::fs::write(&manifest, "module example.com/demo\n\ngo 1.24\n").expect("write go.mod");
-    std::fs::write(&source, "package main\n\nimport \"example.com/foo\"\n").expect("write source");
-    let cache_dir = tempfile::tempdir().expect("cache tempdir");
-    let http = SharedHttp::new(cache_dir.path(), HttpOptions::default()).expect("http");
+    std::fs::write(&manifest, "module example.com/demo\n\ngo 1.24\n")?;
+    std::fs::write(&source, "package main\n\nimport \"example.com/foo\"\n")?;
+    let cache_dir = tempfile::tempdir()?;
+    let http = SharedHttp::new(cache_dir.path(), HttpOptions::default())?;
     let tool = GoTool::new(crate::proxy::GoProxy::new(http, Vec::new()));
     let project = Project {
         root: root.clone(),
@@ -380,18 +383,17 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
                 ..Plan::default()
             },
         )
-        .await
-        .expect("journal");
-    std::fs::write(&source, "package main\n\nimport \"example.com/foo/v2\"\n")
-        .expect("rewrite source");
-    std::fs::write(root.join("go.sum"), "generated").expect("write go.sum");
+        .await?;
+    std::fs::write(&source, "package main\n\nimport \"example.com/foo/v2\"\n")?;
+    std::fs::write(root.join("go.sum"), "generated")?;
 
-    journal.restore(&project.root).expect("restore");
+    journal.restore()?;
     assert_eq!(
-        std::fs::read_to_string(&source).expect("read restored source"),
+        std::fs::read_to_string(&source)?,
         "package main\n\nimport \"example.com/foo\"\n"
     );
     assert!(!root.join("go.sum").exists());
+    Ok(())
 }
 
 #[tokio::test]

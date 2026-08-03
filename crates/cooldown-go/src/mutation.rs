@@ -1,14 +1,14 @@
 use crate::semver;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::{Change, CoreError, Plan, ProjectMutationFile, ProjectMutationJournal, Result};
+use cooldown_core::{Change, CoreError, Plan, ProjectMutationJournal, Result};
 use std::collections::HashSet;
 
 pub(crate) fn mutation_journal(root: &Utf8Path, plan: &Plan) -> Result<ProjectMutationJournal> {
     let mut seen = HashSet::new();
-    let mut files = Vec::new();
+    let mut paths = Vec::new();
     for rel in [Utf8Path::new("go.mod"), Utf8Path::new("go.sum")] {
-        if let Some(file) = capture_once(root, rel, &mut seen)? {
-            files.push(file);
+        if let Some(path) = capture_once(rel, &mut seen) {
+            paths.push(path);
         }
     }
     for change in &plan.changes {
@@ -18,9 +18,9 @@ pub(crate) fn mutation_journal(root: &Utf8Path, plan: &Plan) -> Result<ProjectMu
         if old_path == change.package.name {
             continue;
         }
-        capture_import_targets(root, root, &old_path, &mut seen, &mut files)?;
+        capture_import_targets(root, root, &old_path, &mut seen, &mut paths)?;
     }
-    ProjectMutationJournal::new(files)
+    ProjectMutationJournal::capture(root, paths)
 }
 
 pub(crate) fn rewrite_imports(
@@ -76,7 +76,7 @@ fn capture_import_targets(
     dir: &Utf8Path,
     old: &str,
     seen: &mut HashSet<Utf8PathBuf>,
-    out: &mut Vec<ProjectMutationFile>,
+    out: &mut Vec<Utf8PathBuf>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -110,23 +110,19 @@ fn capture_import_targets(
         let rel = utf8
             .strip_prefix(root)
             .map_err(|e| CoreError::PathEncoding(format!("{utf8}: {e}")))?;
-        if let Some(file) = capture_once(root, rel, seen)? {
-            out.push(file);
+        if let Some(path) = capture_once(rel, seen) {
+            out.push(path);
         }
     }
     Ok(())
 }
 
-fn capture_once(
-    root: &Utf8Path,
-    rel: &Utf8Path,
-    seen: &mut HashSet<Utf8PathBuf>,
-) -> Result<Option<ProjectMutationFile>> {
+fn capture_once(rel: &Utf8Path, seen: &mut HashSet<Utf8PathBuf>) -> Option<Utf8PathBuf> {
     let rel = rel.to_owned();
     if !seen.insert(rel.clone()) {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(ProjectMutationJournal::capture_file(root, &rel)?))
+    Some(rel)
 }
 
 fn utf8_path(path: std::path::PathBuf) -> Result<Utf8PathBuf> {
@@ -195,7 +191,7 @@ mod tests {
         capture_import_targets(root, root, "example.com/foo/v2", &mut seen, &mut out)
             .expect("scan succeeds");
 
-        let captured: Vec<&str> = out.iter().map(|file| file.path().as_str()).collect();
+        let captured: Vec<&str> = out.iter().map(|path| path.as_str()).collect();
         assert_eq!(
             captured,
             vec!["main.go"],

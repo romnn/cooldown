@@ -23,10 +23,12 @@
   an `EdgeNormalizationReport`, and `CoreError`/`DiagnosticKind` include `PendingRecovery`.
   `ProjectMutationFile` also records standard file permissions and rejects non-regular paths so a
   rollback can restore the file contents and modes without following a symlink. Its fields and the
-  journal's file list are now private; callers should use `ProjectMutationFile::from_snapshot`,
-  `ProjectMutationJournal::new`, and the read-only accessors so invalid write sets cannot be
-  constructed. Callers can therefore distinguish rollback conflicts from visible corrections
-  whose directory durability is uncertain.
+  journal's file list are now private; callers should use `ProjectMutationJournal::capture`, the
+  recovery-only `ProjectMutationJournal::from_snapshot`, and the read-only accessors. Journals and
+  observed states are bound to the canonical source-project identity, preventing malformed write
+  sets and cross-project restoration. `capture_state`, `restore_if_unchanged`, and `restore` now use
+  that bound identity instead of accepting a project root at each call. Callers can therefore
+  distinguish rollback conflicts from visible corrections whose directory durability is uncertain.
 - **Breaking library API:** `ToolWrite::mutation_execution` can provide an
   `IsolatedMutationStrategy` that stages and publishes its own faithful resolver trial. Cargo uses
   this boundary so resolver and edge-normalization trials touch only a disposable project copy;
