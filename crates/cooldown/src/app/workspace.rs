@@ -962,13 +962,13 @@ mod tests {
             Capabilities::default()
         }
 
-        fn project_marker(&self) -> ProjectMarker {
-            ProjectMarker {
+        fn project_detection(&self) -> cooldown_core::ProjectDetection {
+            cooldown_core::ProjectDetection::Primary(ProjectMarker {
                 lockfile: "lock",
                 manifest: "manifest",
                 alternate_manifests: &[],
                 workspace_root: true,
-            }
+            })
         }
 
         async fn dependencies(

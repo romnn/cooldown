@@ -443,8 +443,9 @@ fn push_outdated_summary(out: &mut String, summary: &OutdatedSummary) {
     if summary.skipped_stale_projects > 0 {
         let _ = write!(
             out,
-            " · {} stale projects skipped",
-            summary.skipped_stale_projects
+            " · {} stale {} skipped",
+            summary.skipped_stale_projects,
+            stale_project_word(summary.skipped_stale_projects),
         );
     }
     out.push('\n');
@@ -529,10 +530,11 @@ pub fn render_check(
     }
     let _ = writeln!(
         out,
-        "\nchecked {} ({} direct) · {} stale projects skipped · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
+        "\nchecked {} ({} direct) · {} stale {} skipped · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
         summary.checked,
         summary.direct,
         summary.skipped_stale_projects,
+        stale_project_word(summary.skipped_stale_projects),
         summary.violations,
         summary.acknowledged,
         summary.allowed,
@@ -542,6 +544,10 @@ pub fn render_check(
     );
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
+}
+
+fn stale_project_word(count: usize) -> &'static str {
+    if count == 1 { "project" } else { "projects" }
 }
 
 /// Render the `upgrade` report.
@@ -1040,7 +1046,7 @@ mod tests {
     use super::{
         RenderOptions, abbreviated_source, check_cooldown_cell, has_distinct_project, members_cell,
         mutation_status, outdated_status_cell, path_label, render_check, render_fix,
-        render_outdated, render_upgrade,
+        render_outdated, render_upgrade, stale_project_word,
     };
     use crate::{
         BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
@@ -1221,6 +1227,13 @@ mod tests {
     fn distinct_project_only_hides_actual_root_path() {
         assert!(!has_distinct_project(&["."], |path| *path));
         assert!(has_distinct_project(&["root"], |path| *path));
+    }
+
+    #[test]
+    fn stale_project_summary_uses_singular_and_plural_words() {
+        assert_eq!(stale_project_word(1), "project");
+        assert_eq!(stale_project_word(0), "projects");
+        assert_eq!(stale_project_word(2), "projects");
     }
 
     #[test]

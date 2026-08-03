@@ -56,6 +56,21 @@ impl ProjectMutationState {
             }
         }
     }
+
+    /// Projects this observed state onto a journal's ordered write set.
+    ///
+    /// This lets a nested transaction validate only the files it owns while retaining the exact
+    /// postimage captured at the outer command boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the requested write set is invalid or is not a
+    /// subset of this state.
+    pub fn state_for(&self, write_set: &ProjectMutationJournal) -> Result<Self> {
+        Ok(ProjectMutationState {
+            files: projected_files(&self.files, &write_set.files)?,
+        })
+    }
 }
 
 /// Resolution inputs whose identity and contents must still match before publication.
@@ -418,6 +433,18 @@ impl ProjectMutationJournal {
         Ok(ProjectMutationState { files })
     }
 
+    /// Projects this captured preimage onto another journal's ordered write set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the requested write set is invalid or is not a
+    /// subset of this journal.
+    pub fn state_for(&self, write_set: &ProjectMutationJournal) -> Result<ProjectMutationState> {
+        Ok(ProjectMutationState {
+            files: projected_files(&self.files, &write_set.files)?,
+        })
+    }
+
     /// Restores this journal only when every live file still matches `expected`.
     ///
     /// Validation covers the complete write set before any file is changed.
@@ -486,6 +513,32 @@ impl ProjectMutationJournal {
         }
         Ok(())
     }
+}
+
+fn projected_files(
+    source: &[ProjectMutationFile],
+    write_set: &[ProjectMutationFile],
+) -> Result<Vec<ProjectMutationFile>> {
+    if !valid_mutation_paths(source) || !valid_mutation_paths(write_set) {
+        return Err(CoreError::LockConflict(
+            "cannot project an invalid mutation write set".to_string(),
+        ));
+    }
+    write_set
+        .iter()
+        .map(|requested| {
+            source
+                .iter()
+                .find(|candidate| candidate.path == requested.path)
+                .cloned()
+                .ok_or_else(|| {
+                    CoreError::LockConflict(format!(
+                        "mutation state does not contain requested path {}",
+                        requested.path
+                    ))
+                })
+        })
+        .collect()
 }
 
 impl ProjectMutationFile {

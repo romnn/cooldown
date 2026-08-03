@@ -1,8 +1,9 @@
-//! The pure policy core: domain model, the two decision functions
-//! ([`evaluate`](evaluate::evaluate) and [`check_pin`](evaluate::check_pin)), the policy
-//! [`resolve`](policy::resolve), the ports, and config parsing. No concrete I/O, no clock, no
-//! version parsing — everything that decides "is this version too fresh?" lives here, once, for
-//! every tool.
+//! Shared dependency policy, adapter contracts, and portable mutation lifecycle.
+//!
+//! The crate owns the domain model, policy resolution, decision functions, and filesystem state
+//! used to validate or restore accepted project mutations.
+//! Concrete package-manager commands, network clients, clocks, and ecosystem-specific version
+//! parsing remain outside the core.
 
 pub mod config;
 pub mod duration;

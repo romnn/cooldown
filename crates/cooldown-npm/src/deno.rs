@@ -424,13 +424,13 @@ impl ToolRead for DenoTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
-        ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: "deno.lock",
             manifest: "deno.json",
             alternate_manifests: &["deno.jsonc"],
             workspace_root: true,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {

@@ -6,6 +6,51 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::{CARGO_ID, RECOVERY_MARKER, recover_interrupted_mutation};
 use cooldown_core::{CoreError, ToolId, recognized_tool_names, tool_id};
 
+#[cfg(test)]
+const RECOVERY_RELEVANT_GLOBAL_ARGUMENTS: &[&str] = &[
+    "tool",
+    "cargo",
+    "no_gitignore",
+    "log_level",
+    "no_progress",
+    "dir",
+    "json",
+    "color",
+];
+
+#[cfg(test)]
+const RECOVERY_REJECTED_GLOBAL_ARGUMENTS: &[&str] = &[
+    "min_age",
+    "min_age_major",
+    "min_age_minor",
+    "min_age_patch",
+    "latest",
+    "freeze",
+    "allow",
+    "major",
+    "no_major",
+    "respect_dist_tags",
+    "no_respect_dist_tags",
+    "package",
+    "exclude_folders",
+    "exclude_packages",
+    "list_packages",
+    "paths",
+    "show_projects",
+    "no_suggestions",
+    "allow_stale_lock",
+    "sync",
+    "dry_run",
+    "offline",
+    "fresh",
+    "concurrency",
+    "no_native",
+    "no_global",
+    "config",
+    #[cfg(debug_assertions)]
+    "now",
+];
+
 pub(in crate::cli) struct PreparedRecovery {
     pub(in crate::cli) targets: Vec<RecoveryTarget>,
     pub(in crate::cli) json: bool,
@@ -162,7 +207,7 @@ fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
 mod tests {
     use super::*;
     use crate::cli::Cli;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use color_eyre::eyre;
 
     #[test]
@@ -175,6 +220,22 @@ mod tests {
 
         assert!(error.to_string().contains("--offline"));
         Ok(())
+    }
+
+    #[test]
+    fn every_global_argument_has_an_explicit_recovery_classification() {
+        let actual = Cli::command()
+            .get_arguments()
+            .filter(|argument| argument.is_global_set())
+            .map(|argument| argument.get_id().as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let classified = RECOVERY_RELEVANT_GLOBAL_ARGUMENTS
+            .iter()
+            .chain(RECOVERY_REJECTED_GLOBAL_ARGUMENTS)
+            .map(|argument| (*argument).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(actual, classified);
     }
 
     #[test]

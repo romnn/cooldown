@@ -1,13 +1,13 @@
 //! Gitignore-aware project-root discovery shared by the tool adapters' `detect`.
 //!
-//! Each adapter looks for its own marker file (`Cargo.lock`, `go.mod`, `uv.lock`), but the walk is
-//! identical: descend from a root, skip what shouldn't be scanned, and collect the directories that
-//! hold the marker. Centralizing it here means `.gitignore` handling, the exclude list, and the
-//! workspace-root rule are implemented (and tested) once.
+//! Each adapter declares a primary marker and may add a validation-only marker.
+//! The shared walk descends from a root, skips excluded inputs, and collects both marker sets in one
+//! traversal.
+//! Centralizing it here keeps `.gitignore`, exclude, and workspace-root policy consistent.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::CoreError;
 use cooldown_core::config::{compile_folder_globset, compile_package_globset};
+use cooldown_core::{CoreError, ProjectDetection};
 use globset::GlobSet;
 use ignore::WalkBuilder;
 
@@ -42,6 +42,45 @@ pub fn find_marker_dirs(
     exclude: &[String],
     topmost_only: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
+    Ok(scan_marker_dirs(root, marker, None, respect_gitignore, exclude, topmost_only)?.primary)
+}
+
+/// Directly detected roots and validation-only roots found during one repository traversal.
+pub(crate) struct ProjectMarkerDirs {
+    pub(crate) primary: Vec<Utf8PathBuf>,
+    pub(crate) validation_only: Vec<Utf8PathBuf>,
+}
+
+/// Finds an adapter's primary and validation-only markers during one filesystem traversal.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+pub(crate) fn find_project_marker_dirs(
+    root: &Utf8Path,
+    detection: ProjectDetection,
+    respect_gitignore: bool,
+    exclude: &[String],
+) -> Result<ProjectMarkerDirs, CoreError> {
+    let primary = detection.primary();
+    scan_marker_dirs(
+        root,
+        primary.lockfile,
+        detection.validation_marker(),
+        respect_gitignore,
+        exclude,
+        primary.workspace_root,
+    )
+}
+
+fn scan_marker_dirs(
+    root: &Utf8Path,
+    primary_marker: &str,
+    validation_marker: Option<&str>,
+    respect_gitignore: bool,
+    exclude: &[String],
+    topmost_only: bool,
+) -> Result<ProjectMarkerDirs, CoreError> {
     let excludes = compile_folder_globset(exclude)?;
     let root_owned = root.to_owned();
 
@@ -67,7 +106,8 @@ pub fn find_marker_dirs(
         !is_excluded(entry.path(), &root_owned, &excludes)
     });
 
-    let mut dirs = Vec::new();
+    let mut primary = Vec::new();
+    let mut validation_only = Vec::new();
     for result in builder.build() {
         let entry = match result {
             Ok(entry) => entry,
@@ -82,18 +122,28 @@ pub fn find_marker_dirs(
         // common for libraries that don't commit `Cargo.lock` — is still detected.
         if entry.file_type().is_some_and(|t| t.is_dir())
             && let Some(dir) = Utf8Path::from_path(entry.path())
-            && marker_entry_exists(&dir.join(marker))
         {
-            dirs.push(dir.to_owned());
+            if marker_entry_exists(&dir.join(primary_marker)) {
+                primary.push(dir.to_owned());
+            }
+            if validation_marker.is_some_and(|marker| marker_entry_exists(&dir.join(marker))) {
+                validation_only.push(dir.to_owned());
+            }
         }
     }
 
-    dirs.sort();
-    dirs.dedup();
+    primary.sort();
+    primary.dedup();
+    validation_only.sort();
+    validation_only.dedup();
     if topmost_only {
-        dirs = keep_topmost(dirs);
+        primary = keep_topmost(primary);
+        validation_only = keep_topmost(validation_only);
     }
-    Ok(dirs)
+    Ok(ProjectMarkerDirs {
+        primary,
+        validation_only,
+    })
 }
 
 /// Finds exact recovery artifacts without applying normal project-discovery ignore policy.
@@ -299,6 +349,36 @@ mod tests {
 
         let found = find_marker_dirs(&root, "Cargo.lock", false, &[], true).expect("scan");
         assert_eq!(found, vec![root]);
+    }
+
+    #[test]
+    fn project_scan_separates_primary_and_validation_only_markers() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir_all(root.join("with-lock"))?;
+        std::fs::create_dir_all(root.join("custom-lock"))?;
+        std::fs::write(root.join("with-lock/Cargo.lock"), "")?;
+        std::fs::write(root.join("with-lock/Cargo.toml"), "")?;
+        std::fs::write(root.join("custom-lock/Cargo.toml"), "")?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert_eq!(found.primary, vec![root.join("with-lock")]);
+        assert_eq!(
+            found.validation_only,
+            vec![root.join("custom-lock"), root.join("with-lock")]
+        );
+        Ok(())
     }
 
     #[test]

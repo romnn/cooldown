@@ -218,13 +218,13 @@ impl ToolRead for FakeEco {
             ..Default::default()
         }
     }
-    fn project_marker(&self) -> cooldown_core::ProjectMarker {
-        cooldown_core::ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(cooldown_core::ProjectMarker {
             lockfile: "fake.lock",
             manifest: "fake.toml",
             alternate_manifests: &[],
             workspace_root: true,
-        }
+        })
     }
     async fn dependencies(&self, p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
@@ -579,8 +579,8 @@ impl ToolRead for UnknownLockFake {
         self.0.capabilities()
     }
 
-    fn project_marker(&self) -> cooldown_core::ProjectMarker {
-        self.0.project_marker()
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        self.0.project_detection()
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -3690,13 +3690,13 @@ impl ToolRead for RepoScopedFake {
             ..Default::default()
         }
     }
-    fn project_marker(&self) -> cooldown_core::ProjectMarker {
-        cooldown_core::ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(cooldown_core::ProjectMarker {
             lockfile: "repo.lock",
             manifest: "pyproject.toml",
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
     async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
         Ok(Vec::new())
@@ -3876,13 +3876,13 @@ impl ToolRead for ProjectScopedFake {
             ..Default::default()
         }
     }
-    fn project_marker(&self) -> cooldown_core::ProjectMarker {
-        cooldown_core::ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(cooldown_core::ProjectMarker {
             lockfile: "project.lock",
             manifest: "pyproject.toml",
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
     async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
         Ok(Vec::new())
@@ -4052,13 +4052,13 @@ impl ToolRead for HeldConflictFake {
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
     }
-    fn project_marker(&self) -> cooldown_core::ProjectMarker {
-        cooldown_core::ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(cooldown_core::ProjectMarker {
             lockfile: "uv.lock",
             manifest: "pyproject.toml",
             alternate_manifests: &[],
             workspace_root: true,
-        }
+        })
     }
     async fn dependencies(&self, _p: &Project, _scope: DepScope) -> Result<Vec<Dependency>> {
         Ok(vec![dep("typer", "0.25.1", true)])

@@ -9,6 +9,7 @@ use cooldown_core::{
     IsolatedMutationStrategy, Project, ProjectInputSnapshot, ProjectMutationJournal, Result,
 };
 use std::collections::{BTreeSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 
 /// A Cargo trial paired with every source input and output that authorized it.
 struct CargoMutationStage {
@@ -68,6 +69,7 @@ impl IsolatedMutation for CargoMutationStage {
 impl CargoMutationStage {
     async fn prepare(cargo: &Cargo, source: &Project) -> Result<Self> {
         reject_custom_lockfile(&source.root)?;
+        reject_unsupported_config_environment(std::env::vars_os())?;
         let metadata = cargo
             .staging_metadata(&source.root)
             .await
@@ -556,10 +558,7 @@ fn config_uses_file_registry(value: &toml::Value) -> bool {
         candidate
             .get(key)
             .and_then(toml::Value::as_str)
-            .is_some_and(|url| {
-                let url = url.trim_start().to_ascii_lowercase();
-                url.starts_with("file:") || url.starts_with("sparse+file:")
-            })
+            .is_some_and(is_file_registry_url)
     };
     value
         .get("source")
@@ -577,6 +576,42 @@ fn config_uses_file_registry(value: &toml::Value) -> bool {
                     .values()
                     .any(|registry| is_file_url(registry, "index"))
             })
+}
+
+fn is_file_registry_url(value: &str) -> bool {
+    let value = value.trim_start().to_ascii_lowercase();
+    value.starts_with("file:") || value.starts_with("sparse+file:")
+}
+
+fn reject_unsupported_config_environment(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<()> {
+    for (key, value) in variables {
+        if !cargo_registry_index_variable(&key) {
+            continue;
+        }
+        let value = value.into_string().map_err(|_| {
+            CoreError::Config(format!(
+                "Cargo registry index environment variable {} is not valid UTF-8; cooldown cannot audit its resolver input",
+                key.to_string_lossy()
+            ))
+        })?;
+        if is_file_registry_url(&value) {
+            return Err(CoreError::Config(format!(
+                "Cargo registry index environment variable {} uses a file-backed URL, whose local input closure is not yet supported",
+                key.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cargo_registry_index_variable(key: &OsStr) -> bool {
+    key.to_str().is_some_and(|key| {
+        key.starts_with("CARGO_REGISTRIES_")
+            && key.ends_with("_INDEX")
+            && key.len() > "CARGO_REGISTRIES__INDEX".len()
+    })
 }
 
 pub(crate) fn reject_custom_lockfile(workspace: &Utf8Path) -> Result<()> {
@@ -600,12 +635,23 @@ pub(crate) fn reject_custom_lockfile(workspace: &Utf8Path) -> Result<()> {
                 "cannot parse Cargo configuration {config}: {error}"
             ))
         })?;
-        if custom_lockfile_configured(&value) {
-            return Err(unsupported_config(
-                &config,
-                "sets `resolver.lockfile-path`; cooldown currently requires the workspace-root `Cargo.lock`",
-            ));
-        }
+        reject_custom_lockfile_config(&config, &value)?;
+    }
+    Ok(())
+}
+
+fn reject_custom_lockfile_config(config: &Utf8Path, value: &toml::Value) -> Result<()> {
+    if custom_lockfile_configured(value) {
+        return Err(unsupported_config(
+            config,
+            "sets `resolver.lockfile-path`; cooldown currently requires the workspace-root `Cargo.lock`",
+        ));
+    }
+    if value.get("include").is_some() {
+        return Err(unsupported_config(
+            config,
+            "uses `include`; cooldown cannot prove that included configuration preserves the workspace-root `Cargo.lock`",
+        ));
     }
     Ok(())
 }
@@ -867,6 +913,57 @@ mod tests {
             .err()
             .ok_or_else(|| eyre::eyre!("custom lockfile configuration was accepted"))?;
         assert!(error.to_string().contains("resolver.lockfile-path"));
+        Ok(())
+    }
+
+    #[test]
+    fn included_cargo_config_is_rejected_before_project_use() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("workspace"))?;
+        write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            "include = [\"custom-lock.toml\"]\n",
+        )?;
+        write(
+            &root.join(".cargo/custom-lock.toml"),
+            "[resolver]\nlockfile-path = \"../state/Cargo.lock\"\n",
+        )?;
+
+        let error = reject_custom_lockfile(&root)
+            .err()
+            .ok_or_else(|| eyre::eyre!("included Cargo configuration was accepted"))?;
+        assert!(error.to_string().contains("uses `include`"));
+        Ok(())
+    }
+
+    #[test]
+    fn file_registry_environment_is_rejected_before_staging() -> eyre::Result<()> {
+        let error = reject_unsupported_config_environment([(
+            OsString::from("CARGO_REGISTRIES_PRIVATE_INDEX"),
+            OsString::from("sparse+file:///srv/registry/index"),
+        )])
+        .err()
+        .ok_or_else(|| eyre::eyre!("file-backed registry environment was accepted"))?;
+
+        assert!(error.to_string().contains("CARGO_REGISTRIES_PRIVATE_INDEX"));
+        assert!(error.to_string().contains("file-backed URL"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_registry_environment_fails_closed() -> eyre::Result<()> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let error = reject_unsupported_config_environment([(
+            OsString::from("CARGO_REGISTRIES_PRIVATE_INDEX"),
+            OsString::from_vec(vec![b'f', b'i', b'l', b'e', b':', 0xff]),
+        )])
+        .err()
+        .ok_or_else(|| eyre::eyre!("non-UTF-8 registry environment was accepted"))?;
+
+        assert!(error.to_string().contains("not valid UTF-8"));
         Ok(())
     }
 

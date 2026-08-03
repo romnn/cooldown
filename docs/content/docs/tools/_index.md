@@ -32,6 +32,9 @@ Cargo projects must currently use the workspace-root `Cargo.lock`.
 Cooldown fails explicitly when Cargo's `resolver.lockfile-path` configuration or
 `CARGO_RESOLVER_LOCKFILE_PATH` selects a custom location, because safely staging, normalizing, and
 recovering that alternate file requires it to become part of the adapter's typed lock identity.
+Cargo configuration `include`, legacy `paths`, path-backed config patches, local registries, and
+file-backed registry indices are also rejected until cooldown can snapshot their complete local
+input closure. This includes `CARGO_REGISTRIES_<NAME>_INDEX` overrides.
 
 ## How each is driven
 

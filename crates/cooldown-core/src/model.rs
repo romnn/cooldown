@@ -965,12 +965,11 @@ pub enum CandidateScope {
     AllowCrossMajor,
 }
 
-/// How an tool's project roots are recognized on disk.
+/// The primary filesystem markers that directly identify a tool's project root.
 ///
-/// Adapters *declare* this rather than scanning themselves: the orchestrator runs one
-/// gitignore-aware, exclude-aware walk per tool from these markers, so detection policy
-/// (`.gitignore` honoring, the exclude list) is owned in one agnostic place and an adapter cannot
-/// bypass it.
+/// Adapters carry this inside [`ProjectDetection`] rather than scanning themselves.
+/// The orchestrator owns gitignore-aware and exclude-aware traversal, so an adapter cannot bypass
+/// shared detection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectMarker {
     /// The lock/manifest filename whose presence marks a project root (e.g. `"Cargo.lock"`).
@@ -982,6 +981,44 @@ pub struct ProjectMarker {
     /// When `true`, a marked root's descendants are not also reported — a workspace root already
     /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
     pub workspace_root: bool,
+}
+
+/// The complete filesystem-marker specification for one adapter's project discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDetection {
+    /// A primary marker directly identifies every project root.
+    Primary(ProjectMarker),
+    /// A second marker identifies roots that must be validated but not automatically accepted.
+    PrimaryWithValidation {
+        /// The marker that directly identifies project roots.
+        primary: ProjectMarker,
+        /// The validation-only filename inspected during the same repository traversal.
+        validation_marker: &'static str,
+    },
+}
+
+impl ProjectDetection {
+    /// Returns the primary marker that directly identifies project roots.
+    #[must_use]
+    pub fn primary(self) -> ProjectMarker {
+        match self {
+            ProjectDetection::Primary(marker)
+            | ProjectDetection::PrimaryWithValidation {
+                primary: marker, ..
+            } => marker,
+        }
+    }
+
+    /// Returns the optional validation-only marker scanned alongside the primary marker.
+    #[must_use]
+    pub fn validation_marker(self) -> Option<&'static str> {
+        match self {
+            ProjectDetection::Primary(_) => None,
+            ProjectDetection::PrimaryWithValidation {
+                validation_marker, ..
+            } => Some(validation_marker),
+        }
+    }
 }
 
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.

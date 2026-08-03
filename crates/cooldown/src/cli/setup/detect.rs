@@ -1,7 +1,6 @@
 use crate::app::AdapterSet;
 use crate::cli::GlobalArgs;
 use crate::discovery;
-use crate::scan::find_marker_dirs;
 use camino::Utf8PathBuf;
 use cooldown_cargo::CargoTool;
 use cooldown_conda::{CondaTool, PixiTool};
@@ -109,31 +108,19 @@ pub(super) fn detect_projects(
             tracing::debug!(tool = id.as_str(), "skipping detection (filtered out)");
             continue;
         }
-        // The orchestrator owns the scan: the adapter only declares its marker, and we apply the
+        // The orchestrator owns the scan: the adapter only declares its markers, and we apply the
         // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
-        let marker = adapter.project_marker();
+        let detection = adapter.project_detection();
+        let marker = detection.primary();
         let exclude = scan.exclude_folders_for(exclude_folders_base, id.as_str());
-        let dirs = find_marker_dirs(
-            workdir,
-            marker.lockfile,
-            respect_gitignore,
-            &exclude,
-            marker.workspace_root,
-        )?;
-        if adapter.probe_manifest_without_lock() {
-            let manifest_dirs = find_marker_dirs(
-                workdir,
-                marker.manifest,
-                respect_gitignore,
-                &exclude,
-                marker.workspace_root,
-            )?;
-            for dir in manifest_dirs {
-                if !dirs.contains(&dir) {
-                    adapter.validate_manifest_without_lock(&dir)?;
-                }
+        let found =
+            crate::scan::find_project_marker_dirs(workdir, detection, respect_gitignore, &exclude)?;
+        for dir in found.validation_only {
+            if found.primary.binary_search(&dir).is_err() {
+                adapter.validate_manifest_without_lock(&dir)?;
             }
         }
+        let dirs = found.primary;
         tracing::info!(
             tool = id.as_str(),
             projects = dirs.len(),

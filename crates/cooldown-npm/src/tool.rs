@@ -253,6 +253,18 @@ impl OwnedStep {
     }
 }
 
+#[async_trait]
+trait CandidateCommand {
+    async fn run_candidate(&self, root: &Utf8Path, args: &[String]) -> Result<()>;
+}
+
+#[async_trait]
+impl CandidateCommand for NodeCmd {
+    async fn run_candidate(&self, root: &Utf8Path, args: &[String]) -> Result<()> {
+        self.run(root, args).await
+    }
+}
+
 /// Restores a snapshot after an adapter-owned step while refusing subsequent filesystem drift.
 fn restore_after_owned_step(
     journal: &ProjectMutationJournal,
@@ -290,14 +302,14 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // The lockfile sits at the workspace root; nested `package.json`s share it (no nested lock).
-        ProjectMarker {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: "package.json",
             alternate_manifests: &[],
             workspace_root: true,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -1972,6 +1984,74 @@ fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
     out
 }
 
+async fn run_candidate_landing_with<C: CandidateCommand>(
+    command: &C,
+    project: &Project,
+    candidate_journal: &ProjectMutationJournal,
+    landing: &CandidateLanding,
+) -> Result<OwnedStep> {
+    let authorized_baseline = candidate_journal.state_for(landing.authorized_manifests())?;
+    let first_result = command
+        .run_candidate(&project.root, landing.command())
+        .await;
+    let first = OwnedStep::capture(first_result, candidate_journal, &project.root)?;
+    let (attempt, retried_without_cutoff) = match first.result {
+        Ok(()) => (first, false),
+        Err(error) => {
+            let fallback = matches!(&error, CoreError::Tool { .. })
+                .then(|| without_before(landing.command()))
+                .flatten();
+            if let Some(fallback) = fallback {
+                // An existing, baselined post-cutoff package can make npm's historical-tree
+                // resolve impossible.
+                // Restore the candidate baseline and reapply cooldown's authorized manifests
+                // before retrying without the native cutoff.
+                restore_after_owned_step(candidate_journal, &project.root, &first.postimage)?;
+                landing
+                    .authorized_manifests()
+                    .restore_if_unchanged(&project.root, &authorized_baseline)?;
+                let fallback_result = command.run_candidate(&project.root, &fallback).await;
+                (
+                    OwnedStep::capture(fallback_result, candidate_journal, &project.root)?,
+                    true,
+                )
+            } else {
+                (
+                    OwnedStep {
+                        result: Err(error),
+                        postimage: first.postimage,
+                    },
+                    false,
+                )
+            }
+        }
+    };
+    match (&attempt.result, landing) {
+        (
+            Ok(()),
+            CandidateLanding::PinRestoreResync {
+                authorized_manifests,
+                resync,
+                ..
+            },
+        ) => {
+            let authorized_postimage = attempt.postimage.state_for(authorized_manifests)?;
+            restore_after_owned_step(authorized_manifests, &project.root, &authorized_postimage)?;
+            // The resync must use the same resolver regime as the successful pin.
+            // Restoring `--before` here would recreate the historical-tree failure that triggered
+            // fallback.
+            let resync = if retried_without_cutoff {
+                without_before(resync).unwrap_or_else(|| resync.clone())
+            } else {
+                resync.clone()
+            };
+            let result = command.run_candidate(&project.root, &resync).await;
+            OwnedStep::capture(result, candidate_journal, &project.root)
+        }
+        _ => Ok(attempt),
+    }
+}
+
 impl<L: NodeLock> NpmTool<L> {
     async fn run_candidate_landing(
         &self,
@@ -1979,65 +2059,7 @@ impl<L: NodeLock> NpmTool<L> {
         candidate_journal: &ProjectMutationJournal,
         landing: &CandidateLanding,
     ) -> Result<OwnedStep> {
-        let first_result = self.cmd.run(&project.root, landing.command()).await;
-        let authorized_postimage = landing
-            .authorized_manifests()
-            .capture_state(&project.root)?;
-        let first = OwnedStep::capture(first_result, candidate_journal, &project.root)?;
-        let (attempt, retried_without_cutoff) = match first.result {
-            Ok(()) => (first, false),
-            Err(error) => {
-                let fallback = matches!(&error, CoreError::Tool { .. })
-                    .then(|| without_before(landing.command()))
-                    .flatten();
-                if let Some(fallback) = fallback {
-                    // An existing, baselined post-cutoff package can make npm's historical-tree
-                    // resolve impossible. Retry from a clean candidate snapshot without the
-                    // native cutoff and let the application policy gate accept, reconcile, or
-                    // roll back the resulting graph against that baseline.
-                    restore_after_owned_step(candidate_journal, &project.root, &first.postimage)?;
-                    let fallback_result = self.cmd.run(&project.root, &fallback).await;
-                    (
-                        OwnedStep::capture(fallback_result, candidate_journal, &project.root)?,
-                        true,
-                    )
-                } else {
-                    (
-                        OwnedStep {
-                            result: Err(error),
-                            postimage: first.postimage,
-                        },
-                        false,
-                    )
-                }
-            }
-        };
-        match (&attempt.result, landing) {
-            (
-                Ok(()),
-                CandidateLanding::PinRestoreResync {
-                    authorized_manifests,
-                    resync,
-                    ..
-                },
-            ) => {
-                restore_after_owned_step(
-                    authorized_manifests,
-                    &project.root,
-                    &authorized_postimage,
-                )?;
-                // The resync must use the same resolver regime as the successful pin; restoring
-                // `--before` here would recreate the historical-tree failure that triggered fallback.
-                let resync = if retried_without_cutoff {
-                    without_before(resync).unwrap_or_else(|| resync.clone())
-                } else {
-                    resync.clone()
-                };
-                let result = self.cmd.run(&project.root, &resync).await;
-                OwnedStep::capture(result, candidate_journal, &project.root)
-            }
-            _ => Ok(attempt),
-        }
+        run_candidate_landing_with(&self.cmd, project, candidate_journal, landing).await
     }
 
     /// For each change, moves the lock with a lock-only update or an exact pin around cooldown's
@@ -3004,6 +3026,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::{formatdoc, indoc};
+    use std::sync::Mutex;
 
     #[test]
     fn candidate_restore_refuses_drift_after_the_owned_command() -> eyre::Result<()> {
@@ -3023,6 +3046,176 @@ mod tests {
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(std::fs::read_to_string(root.join(relative))?, "independent");
+        Ok(())
+    }
+
+    struct CutoffFallbackCommand {
+        authorized_manifest: String,
+        pin_saves_manifest: bool,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CandidateCommand for CutoffFallbackCommand {
+        async fn run_candidate(&self, root: &Utf8Path, args: &[String]) -> Result<()> {
+            let call_index = {
+                let mut calls = self.calls.lock().map_err(|_| {
+                    CoreError::Filesystem("candidate command call log was poisoned".to_string())
+                })?;
+                let index = calls.len();
+                calls.push(args.to_vec());
+                index
+            };
+            let manifest = root.join("package.json");
+            match call_index {
+                0 => {
+                    std::fs::write(&manifest, r#"{"range":"first-attempt-save"}"#)?;
+                    Err(CoreError::Tool {
+                        tool: "npm".to_string(),
+                        termination: cooldown_core::ToolTermination::ExitCode(1),
+                        stderr: "historical tree unavailable".to_string(),
+                    })
+                }
+                1 => {
+                    let live = std::fs::read_to_string(&manifest)?;
+                    if live != self.authorized_manifest {
+                        return Err(CoreError::LockConflict(format!(
+                            "fallback saw `{live}` instead of the authorized manifest"
+                        )));
+                    }
+                    if self.pin_saves_manifest {
+                        std::fs::write(&manifest, r#"{"range":"fallback-pin-save"}"#)?;
+                    }
+                    Ok(())
+                }
+                2 => {
+                    let live = std::fs::read_to_string(&manifest)?;
+                    if live != self.authorized_manifest {
+                        return Err(CoreError::LockConflict(format!(
+                            "resync saw `{live}` instead of the authorized manifest"
+                        )));
+                    }
+                    Ok(())
+                }
+                _ => Err(CoreError::LockConflict(
+                    "candidate landing ran more commands than expected".to_string(),
+                )),
+            }
+        }
+    }
+
+    fn retry_journals(
+        root: &Utf8Path,
+        authorized_manifest: &str,
+    ) -> eyre::Result<(ProjectMutationJournal, ProjectMutationJournal)> {
+        let relative = Utf8Path::new("package.json");
+        std::fs::write(root.join(relative), r#"{"range":"baseline"}"#)?;
+        let candidate = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(root, relative)?],
+        };
+        std::fs::write(root.join(relative), authorized_manifest)?;
+        let authorized = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(root, relative)?],
+        };
+        Ok((candidate, authorized))
+    }
+
+    fn fallback_project(root: &Utf8Path) -> Project {
+        Project {
+            root: root.to_owned(),
+            manifest: root.join("package.json"),
+            kind: Npm::ID,
+            exclude_newer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_cutoff_fallback_reapplies_the_authorized_manifest() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let authorized_manifest = r#"{"range":"authorized"}"#;
+        let (candidate_journal, authorized_manifests) = retry_journals(root, authorized_manifest)?;
+        let landing = CandidateLanding::Direct {
+            command: vec!["install".to_string(), "--before=2026-01-01".to_string()],
+            authorized_manifests,
+        };
+        let command = CutoffFallbackCommand {
+            authorized_manifest: authorized_manifest.to_string(),
+            pin_saves_manifest: false,
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let attempt = run_candidate_landing_with(
+            &command,
+            &fallback_project(root),
+            &candidate_journal,
+            &landing,
+        )
+        .await?;
+        attempt.result?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json"))?,
+            authorized_manifest
+        );
+        let calls = command
+            .calls
+            .lock()
+            .map_err(|_| eyre::eyre!("candidate command call log was poisoned"))?;
+        assert_eq!(calls.len(), 2);
+        let fallback = calls
+            .get(1)
+            .ok_or_else(|| eyre::eyre!("fallback command was not recorded"))?;
+        assert!(fallback.iter().all(|arg| !arg.starts_with("--before=")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pin_cutoff_fallback_restores_the_final_attempt_before_resync() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let authorized_manifest = r#"{"range":"authorized"}"#;
+        let (candidate_journal, authorized_manifests) = retry_journals(root, authorized_manifest)?;
+        let landing = CandidateLanding::PinRestoreResync {
+            pin: vec!["install".to_string(), "--before=2026-01-01".to_string()],
+            authorized_manifests,
+            resync: vec!["install".to_string(), "--before=2026-01-01".to_string()],
+        };
+        let command = CutoffFallbackCommand {
+            authorized_manifest: authorized_manifest.to_string(),
+            pin_saves_manifest: true,
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let attempt = run_candidate_landing_with(
+            &command,
+            &fallback_project(root),
+            &candidate_journal,
+            &landing,
+        )
+        .await?;
+        attempt.result?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json"))?,
+            authorized_manifest
+        );
+        let calls = command
+            .calls
+            .lock()
+            .map_err(|_| eyre::eyre!("candidate command call log was poisoned"))?;
+        assert_eq!(calls.len(), 3);
+        let fallback_and_resync = calls
+            .get(1..)
+            .ok_or_else(|| eyre::eyre!("fallback commands were not recorded"))?;
+        assert!(
+            fallback_and_resync
+                .iter()
+                .flatten()
+                .all(|arg| !arg.starts_with("--before="))
+        );
         Ok(())
     }
 

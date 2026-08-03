@@ -10,7 +10,7 @@
 use crate::error::{CoreError, Result};
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, Plan, Project, ProjectMarker, Release, ToolId, UpdateKind, VerifyReport,
+    LockVerifyReport, Plan, Project, ProjectDetection, Release, ToolId, UpdateKind, VerifyReport,
     Version,
 };
 use crate::mutation::{AcceptedProjectState, ProjectMutationJournal, ProjectMutationState};
@@ -81,31 +81,29 @@ pub trait ToolRead: Send + Sync {
     /// returned value must accurately reflect the features this adapter actually supports.
     fn capabilities(&self) -> Capabilities;
 
-    /// Detects the projects of this tool rooted under `root`.
+    /// Declares how projects of this tool are detected below a scan root.
     ///
-    /// Declares the filesystem [marker](ProjectMarker) that identifies this tool's project
-    /// roots. The orchestrator performs a single gitignore-aware, exclude-aware scan from it, so an
-    /// adapter neither walks the tree nor decides `.gitignore`/exclude policy itself — that concern
-    /// lives in one agnostic place and is enforced by this interface.
-    fn project_marker(&self) -> ProjectMarker;
+    /// The orchestrator performs one gitignore-aware, exclude-aware scan for both primary and
+    /// validation-only markers.
+    /// An adapter neither walks the tree nor decides `.gitignore` or exclude policy itself.
+    fn project_detection(&self) -> ProjectDetection;
 
     /// Validates a manifest root found without the adapter's declared lockfile marker.
     ///
-    /// The orchestrator calls this only when [`Self::probe_manifest_without_lock`] returns `true`.
-    /// It lets an adapter reject an unsupported alternate lock location without treating ordinary
-    /// manifest-only packages as detected projects.
+    /// The orchestrator calls this only for the validation marker declared by
+    /// [`Self::project_detection`].
+    /// It lets an adapter reject unsupported alternate state without treating a validation-only
+    /// marker as a detected project.
     ///
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) when the manifest selects project state outside
     /// the adapter's supported filesystem model.
-    fn validate_manifest_without_lock(&self, _root: &Utf8Path) -> Result<()> {
-        Ok(())
-    }
-
-    /// Whether discovery must validate manifest roots that lack the declared lockfile marker.
-    fn probe_manifest_without_lock(&self) -> bool {
-        false
+    fn validate_manifest_without_lock(&self, root: &Utf8Path) -> Result<()> {
+        Err(CoreError::Config(format!(
+            "tool `{}` declared a validation-only project marker at {root} without implementing its validator",
+            self.id().as_str()
+        )))
     }
 
     /// Classifies a version-to-version movement using the adapter's native version semantics.

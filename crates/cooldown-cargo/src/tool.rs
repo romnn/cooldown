@@ -136,23 +136,22 @@ impl ToolRead for CargoTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // A `Cargo.lock` marks a workspace root: `cargo metadata` there already covers every
         // member, so nested lockfiles below it are not separate projects.
-        ProjectMarker {
-            lockfile: "Cargo.lock",
-            manifest: "Cargo.toml",
-            alternate_manifests: &[],
-            workspace_root: true,
+        cooldown_core::ProjectDetection::PrimaryWithValidation {
+            primary: ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
         }
     }
 
     fn validate_manifest_without_lock(&self, root: &Utf8Path) -> Result<()> {
         crate::staging::reject_custom_lockfile(root)
-    }
-
-    fn probe_manifest_without_lock(&self) -> bool {
-        true
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
