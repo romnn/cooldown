@@ -167,7 +167,7 @@ impl IsolatedMutation for FakeMutationStage {
 
     fn accepted_state(&self) -> Result<AcceptedProjectState> {
         let candidate =
-            cooldown_core::ProjectMutationState::capture(&self.staged.root, self.preimage.files())?;
+            cooldown_core::ProjectMutationState::capture(&self.staged.root, &self.preimage)?;
         AcceptedProjectState::new(
             self.preimage.clone(),
             candidate,

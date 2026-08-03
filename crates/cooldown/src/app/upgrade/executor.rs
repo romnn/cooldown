@@ -1517,6 +1517,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .writer
             .mutation_journal(&self.ctx.pctx.project, plan)
             .await?;
+        journal.validate_project(&self.ctx.pctx.project.root)?;
         if let Some(rollback) = rollback {
             rollback.preserve(&journal)?;
         }

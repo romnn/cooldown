@@ -55,7 +55,7 @@ impl IsolatedMutation for CargoMutationStage {
     }
 
     fn accepted_state(&self) -> Result<AcceptedProjectState> {
-        let candidate = ProjectMutationState::capture(&self.staged.root, self.preimage.files())?;
+        let candidate = ProjectMutationState::capture(&self.staged.root, &self.preimage)?;
         AcceptedProjectState::new(self.preimage.clone(), candidate, self.inputs.clone())
     }
 
@@ -125,7 +125,7 @@ impl CargoMutationStage {
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
         };
-        let initial = ProjectMutationState::capture(&staged.root, preimage.files())?;
+        let initial = ProjectMutationState::capture(&staged.root, &preimage)?;
         let initial =
             AcceptedProjectState::new(preimage.clone(), initial, ProjectInputSnapshot::default())?;
         if initial.changed_files().next().is_some() {
@@ -1067,8 +1067,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinked_workspace_member_is_staged_without_following_it_in_place() -> eyre::Result<()>
-    {
+    async fn symlinked_workspace_member_is_rejected_as_a_writable_output() -> eyre::Result<()> {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir()?;
@@ -1086,11 +1085,17 @@ mod tests {
         symlink("../member", root.join("linked"))?;
         generate_lock(&root)?;
 
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let result = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await;
 
-        assert!(stage.staged.root.join("linked/Cargo.toml").is_file());
-        Cargo::new().staging_metadata(&stage.staged.root).await?;
-        stage.accepted_state()?;
+        let Err(error) = result else {
+            eyre::bail!("symlinked writable workspace member unexpectedly entered a trial");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked writable project paths are unsupported")
+        );
+        assert!(member.join("Cargo.toml").is_file());
         Ok(())
     }
 

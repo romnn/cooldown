@@ -26,9 +26,12 @@
   journal's file list are now private; callers should use `ProjectMutationJournal::capture`, the
   recovery-only `ProjectMutationJournal::from_snapshot`, and the read-only accessors. Journals and
   observed states are bound to the canonical source-project identity, preventing malformed write
-  sets and cross-project restoration. `capture_state`, `restore_if_unchanged`, and `restore` now use
-  that bound identity instead of accepting a project root at each call. Callers can therefore
-  distinguish rollback conflicts from visible corrections whose directory durability is uncertain.
+  sets and cross-project restoration. `ProjectMutationState::capture` now accepts a validated
+  journal instead of an arbitrary file slice. Writable outputs whose ancestors are symbolic links
+  are rejected because they cannot be governed by the selected project's mutation lease.
+  `capture_state`, `restore_if_unchanged`, and `restore` now use that bound identity instead of
+  accepting a project root at each call. Callers can therefore distinguish rollback conflicts from
+  visible corrections whose directory durability is uncertain.
 - **Breaking library API:** `ToolWrite::mutation_execution` can provide an
   `IsolatedMutationStrategy` that stages and publishes its own faithful resolver trial. Cargo uses
   this boundary so resolver and edge-normalization trials touch only a disposable project copy;

@@ -82,6 +82,9 @@ pub(crate) async fn apply_resilient_with_observer(
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<AppliedMutation> {
+    journal
+        .validate_project(&project.root)
+        .map_err(ApplyFailure::RestoreConflict)?;
     let first = writer
         .apply_with_observer(project, plan, journal, observer)
         .await
@@ -514,6 +517,27 @@ mod tests {
         assert_eq!(names(&report.applied), names(&plan.changes));
         assert!(report.skipped.is_empty());
         assert_eq!(writer.apply_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_mismatched_journal_is_rejected_before_apply() -> color_eyre::eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _source_directory,
+            project,
+        } = temp_project();
+        let TempProject {
+            directory: _other_directory,
+            project: other_project,
+        } = temp_project();
+        let plan = plan(&["a"]);
+        let journal = writer.mutation_journal(&other_project, &plan).await?;
+
+        let result = apply_resilient(&writer, &project, &plan, &journal).await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_eq!(writer.apply_calls(), 0);
+        Ok(())
     }
 
     #[tokio::test]

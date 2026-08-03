@@ -967,8 +967,7 @@ mod tests {
             std::fs::write(target, contents)?;
         }
         let original = ProjectMutationJournal::capture(&project.root, relative_paths)?;
-        let candidate =
-            cooldown_core::ProjectMutationState::capture(&candidate_root, original.files())?;
+        let candidate = cooldown_core::ProjectMutationState::capture(&candidate_root, &original)?;
         Ok(AcceptedProjectState::new(
             original,
             candidate,

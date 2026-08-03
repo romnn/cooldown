@@ -400,9 +400,10 @@ pub trait ToolWrite: Send + Sync {
     /// Captures the current contents of only the files `plan` may mutate.
     ///
     /// The returned [`ProjectMutationJournal`] is the rollback token the application layer restores
-    /// if the trial is rejected or if `apply` fails after mutating files. The journal is scoped to
-    /// this exact `plan`, so adapters should capture the smallest file set they may rewrite. The
-    /// same journal is then handed back to [`apply`](ToolWrite::apply), so adapters may also
+    /// if the trial is rejected or if `apply` fails after mutating files.
+    /// The journal is scoped to this exact `project` and `plan`, so adapters should capture the
+    /// smallest file set they may rewrite under `project.root`.
+    /// The same journal is then handed back to [`apply`](ToolWrite::apply), so adapters may also
     /// treat it as the precomputed write-set for the trial.
     ///
     /// # Errors
@@ -459,6 +460,7 @@ pub trait ToolWrite: Send + Sync {
         journal: &ProjectMutationJournal,
         _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
+        journal.validate_project(&project.root)?;
         let report = self.apply(project, plan, journal).await;
         let postimage = journal.capture_state()?;
         Ok(ApplyAttempt::Finished { report, postimage })

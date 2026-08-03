@@ -93,7 +93,7 @@ impl ProjectMutationState {
         })
     }
 
-    /// Captures a portable write set under another project root.
+    /// Captures a journal's portable write set under another project root.
     ///
     /// This is the explicit boundary used to inspect an isolated project copy without transferring
     /// the source journal's restore authority to that copy.
@@ -101,9 +101,12 @@ impl ProjectMutationState {
     /// # Errors
     ///
     /// Returns a [`CoreError`] when the project identity or any file cannot be captured safely.
-    pub fn capture(root: &Utf8Path, write_set: &[ProjectMutationFile]) -> Result<Self> {
+    /// Writable paths with a symbolic-link ancestor are rejected because another project lease may
+    /// govern their resolved target.
+    pub fn capture(root: &Utf8Path, write_set: &ProjectMutationJournal) -> Result<Self> {
         let project = ProjectMutationRoot::capture(root)?;
         let files = write_set
+            .files
             .iter()
             .map(|file| ProjectMutationFile::capture(project.path(), &file.path))
             .collect::<Result<Vec<_>>>()?;
@@ -343,10 +346,10 @@ impl AcceptedProjectState {
     ///
     /// Returns [`CoreError::LockConflict`] when any source file changed independently.
     pub fn validate_source(&self, root: &Utf8Path) -> Result<()> {
-        self.original.ensure_root(root)?;
+        self.original.validate_project(root)?;
         self.inputs.validate()?;
         validate_state(
-            root,
+            self.original.project.path(),
             &self.original.files,
             "before publishing the accepted project state",
         )
@@ -362,6 +365,7 @@ impl AcceptedProjectState {
     /// Returns a filesystem error when a candidate cannot be installed.
     pub fn install(&self, root: &Utf8Path) -> Result<()> {
         self.validate_source(root)?;
+        let root = self.original.project.path();
         for (original, candidate) in self.changed_files() {
             candidate.restore_if_unchanged(root, original)?;
         }
@@ -374,8 +378,9 @@ impl AcceptedProjectState {
     ///
     /// Returns [`CoreError::LockConflict`] when publication is incomplete or drifted.
     pub fn validate_candidate(&self, root: &Utf8Path) -> Result<()> {
+        self.original.validate_project(root)?;
         validate_state(
-            root,
+            self.original.project.path(),
             &self.candidate.files,
             "after publishing the accepted project state",
         )
@@ -397,6 +402,7 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) when the project identity or a file cannot be
     /// captured safely.
+    /// Writable paths with a symbolic-link ancestor are rejected.
     pub fn capture<I, P>(root: &Utf8Path, paths: I) -> Result<Self>
     where
         I: IntoIterator<Item = P>,
@@ -419,6 +425,7 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) when the project identity, a path, or a snapshot is
     /// invalid.
+    /// Writable paths with a symbolic-link ancestor are rejected.
     pub fn from_snapshot(root: &Utf8Path, files: Vec<ProjectMutationFile>) -> Result<Self> {
         Self::from_bound_snapshot(ProjectMutationRoot::capture(root)?, files)
     }
@@ -433,6 +440,9 @@ impl ProjectMutationJournal {
                     .to_string(),
             ));
         }
+        for file in &files {
+            validate_mutation_ancestors(project.path(), &file.path)?;
+        }
         Ok(ProjectMutationJournal { project, files })
     }
 
@@ -440,6 +450,17 @@ impl ProjectMutationJournal {
     #[must_use]
     pub fn files(&self) -> &[ProjectMutationFile] {
         &self.files
+    }
+
+    /// Checks that this journal belongs to `root`'s current project identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when `root` names another project or its directory was
+    /// replaced after journal capture.
+    pub fn validate_project(&self, root: &Utf8Path) -> Result<()> {
+        self.project
+            .ensure_same(&ProjectMutationRoot::capture(root)?)
     }
 
     /// Adds paths absent from this journal while preserving its earlier snapshots.
@@ -572,22 +593,13 @@ impl ProjectMutationJournal {
         }
         Ok(())
     }
-
-    fn ensure_root(&self, root: &Utf8Path) -> Result<()> {
-        self.project
-            .ensure_same(&ProjectMutationRoot::capture(root)?)
-    }
 }
 
 impl ProjectMutationFile {
     fn capture(root: &Utf8Path, rel: &Utf8Path) -> Result<Self> {
         use std::io::Read as _;
 
-        if !safe_mutation_path(rel) {
-            return Err(CoreError::Filesystem(format!(
-                "refusing to journal unsafe project-relative path `{rel}`"
-            )));
-        }
+        validate_mutation_ancestors(root, rel)?;
         let path = root.join(rel);
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -750,6 +762,7 @@ impl ProjectMutationFile {
     }
 
     fn restore(&self, root: &Utf8Path) -> Result<()> {
+        validate_mutation_ancestors(root, &self.path)?;
         let path = root.join(&self.path);
         match &self.contents {
             Some(bytes) => {
@@ -772,6 +785,7 @@ impl ProjectMutationFile {
     }
 
     fn restore_if_unchanged(&self, root: &Utf8Path, expected: &ProjectMutationFile) -> Result<()> {
+        validate_mutation_ancestors(root, &self.path)?;
         let path = root.join(&self.path);
         if let Some(bytes) = &self.contents {
             if let Some(parent) = path.parent() {
@@ -833,6 +847,42 @@ fn safe_mutation_path(path: &Utf8Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, camino::Utf8Component::Normal(_)))
+}
+
+fn validate_mutation_ancestors(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
+    if !safe_mutation_path(path) {
+        return Err(CoreError::Filesystem(format!(
+            "refusing unsafe project-relative mutation path `{path}`"
+        )));
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut current = root.to_owned();
+    for component in parent.components() {
+        let camino::Utf8Component::Normal(component) = component else {
+            return Err(CoreError::Filesystem(format!(
+                "refusing unsafe project-relative mutation path `{path}`"
+            )));
+        };
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CoreError::Filesystem(format!(
+                    "cannot safely mutate `{path}` because its ancestor {current} is a symbolic link; symlinked writable project paths are unsupported"
+                )));
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(CoreError::Filesystem(format!(
+                    "cannot safely mutate `{path}` because its ancestor {current} is not a directory"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_state(root: &Utf8Path, expected: &[ProjectMutationFile], context: &str) -> Result<()> {
@@ -905,8 +955,12 @@ mod mutation_journal_tests {
         std::fs::write(root_a.join(relative), "project-a")?;
         std::fs::write(root_b.join(relative), "project-b")?;
         let journal = ProjectMutationJournal::capture(&root_a, [relative])?;
-        let state_b = ProjectMutationState::capture(&root_b, journal.files())?;
+        let state_b = ProjectMutationState::capture(&root_b, &journal)?;
 
+        std::assert_matches!(
+            journal.validate_project(&root_b),
+            Err(CoreError::LockConflict(_))
+        );
         let result = journal.restore_if_unchanged(&state_b);
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
@@ -1030,6 +1084,74 @@ mod mutation_journal_tests {
         }
         assert!(root.join("Cargo.toml").is_symlink());
         assert!(root.join("Cargo.lock").is_symlink());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_journal_rejects_a_symlinked_writable_ancestor() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let project_root = root(&project)?;
+        let external_root = root(&external)?;
+        std::fs::write(external_root.join("Cargo.toml"), "external")?;
+        symlink(&external_root, project_root.join("linked"))?;
+
+        let result =
+            ProjectMutationJournal::capture(&project_root, [Utf8Path::new("linked/Cargo.toml")]);
+
+        let Err(error) = result else {
+            eyre::bail!("symlinked writable ancestor unexpectedly entered a journal");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked writable project paths are unsupported")
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_root.join("Cargo.toml"))?,
+            "external"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_publication_rejects_a_retargeted_output_ancestor() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir()?;
+        let candidate = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let source_root = root(&source)?;
+        let candidate_root = root(&candidate)?;
+        let external_root = root(&external)?;
+        let relative = Utf8Path::new("member/Cargo.toml");
+        std::fs::create_dir_all(source_root.join("member"))?;
+        std::fs::create_dir_all(candidate_root.join("member"))?;
+        std::fs::write(source_root.join(relative), "original")?;
+        std::fs::write(candidate_root.join(relative), "accepted")?;
+        std::fs::write(external_root.join("Cargo.toml"), "external")?;
+        let journal = ProjectMutationJournal::capture(&source_root, [relative])?;
+        let candidate = ProjectMutationState::capture(&candidate_root, &journal)?;
+        let accepted =
+            AcceptedProjectState::new(journal, candidate, ProjectInputSnapshot::default())?;
+
+        std::fs::rename(
+            source_root.join("member"),
+            source_root.join("original-member"),
+        )?;
+        symlink(&external_root, source_root.join("member"))?;
+
+        let result = accepted.install(&source_root);
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        assert_eq!(
+            std::fs::read_to_string(external_root.join("Cargo.toml"))?,
+            "external"
+        );
         Ok(())
     }
 }
