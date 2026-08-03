@@ -2,11 +2,13 @@
 //!
 //! A `Cargo.lock` records more than which package versions exist: each `[[package]]` block's
 //! `dependencies` array binds every edge to a concrete coexisting version (`"uuid 0.8.2"` vs
-//! `"uuid 1.24.0"`). When a dependent's declared range admits several locked versions — diesel's
+//! `"uuid 1.24.0"`).
+//! When a dependent's declared range admits several locked versions — diesel's
 //! `uuid = ">=0.7.0, <2.0.0"` beside both a `0.8` and a `1.x` line — cargo's *incremental*
 //! re-resolves (`cargo update -p … --precise`) can rebind such an edge between them depending on
 //! graph-traversal order, while a from-scratch resolve generally prefers the highest satisfying
-//! version subject to Cargo's other constraints and heuristics. The rebinding is build-affecting
+//! version subject to Cargo's other constraints and heuristics.
+//! The rebinding is build-affecting
 //! (`rustc` receives the other copy as
 //! `--extern`) yet invisible at the per-version level, and `cargo metadata --locked` accepts either
 //! binding as long as no package is orphaned — so nothing downstream catches it.
@@ -37,7 +39,8 @@ use crate::version;
 pub(crate) use crate::cargocmd::{LockPackageId, PackageKey};
 
 /// One corrective binding rewrite a policy proposes: rebind `dependent`'s edge to `dependency`
-/// from its current bound version to `to`. `from` is the binding as the (post-apply) lock has it.
+/// from its current bound version to `to`.
+/// `from` is the binding as the (post-apply) lock has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EdgeRewrite {
     /// The dependent package whose edge is rewritten.
@@ -122,11 +125,12 @@ impl<'a> RequirementIndex<'a> {
     }
 
     /// Whether binding `dependency` at `candidate` respects the workspace's declared MSRV: a
-    /// candidate whose own `rust-version` exceeds the workspace minimum is not *preferred*. This is
-    /// a conservative compatibility tier inspired by cargo's
-    /// `incompatible-rust-versions = "fallback"` rule. [`canonicalize`] applies its own fallback:
-    /// when no compatible candidate satisfies the requirement, the highest satisfying one is used. A
-    /// candidate declaring no `rust-version` imposes nothing, and a workspace without one disables
+    /// candidate whose own `rust-version` exceeds the workspace minimum is not *preferred*.
+    /// This is a conservative compatibility tier inspired by cargo's
+    /// `incompatible-rust-versions = "fallback"` rule.
+    /// [`canonicalize`] applies its own fallback:
+    /// when no compatible candidate satisfies the requirement, the highest satisfying one is used.
+    /// A candidate declaring no `rust-version` imposes nothing, and a workspace without one disables
     /// the rule entirely.
     pub(crate) fn msrv_admits(&self, dependency: &str, candidate: &str) -> bool {
         let Some(workspace) = self.graph.workspace_rust_version else {

@@ -67,6 +67,7 @@ impl IsolatedMutation for CargoMutationStage {
 
 impl CargoMutationStage {
     async fn prepare(cargo: &Cargo, source: &Project) -> Result<Self> {
+        reject_custom_lockfile(&source.root)?;
         let metadata = cargo
             .staging_metadata(&source.root)
             .await
@@ -78,16 +79,35 @@ impl CargoMutationStage {
         let layout = StagingLayout::new(source, metadata.clone())?;
         let source_files = layout.source_files()?;
         let preimage = capture_outputs(&source.root, &layout.output_paths)?;
+        let scratch = tempfile::tempdir()?;
+        let topology = utf8_path(scratch.path().join("tree"))?;
+        std::fs::create_dir_all(&topology)?;
         let input_paths = source_files
             .iter()
             .filter(|path| !layout.is_output(path))
             .cloned()
             .collect::<Vec<_>>();
-        let inputs = ProjectInputSnapshot::capture(&input_paths)?;
-        let scratch = tempfile::tempdir()?;
-        let topology = utf8_path(scratch.path().join("tree"))?;
-        std::fs::create_dir_all(&topology)?;
-        layout.copy_to(&topology, &source_files)?;
+        let inputs = ProjectInputSnapshot::capture_with_contents(
+            &input_paths,
+            |source, contents, permissions| {
+                if layout.is_ambient(source) {
+                    return Ok(());
+                }
+                let destination = layout.staged_path(&topology, source)?;
+                let parent = destination.parent().ok_or_else(|| {
+                    isolation_error(format!("staged Cargo input has no parent: {destination}"))
+                })?;
+                std::fs::create_dir_all(parent)?;
+                std::fs::write(&destination, contents).map_err(|error| {
+                    isolation_error(format!(
+                        "cannot faithfully isolate Cargo input {source}: {error}"
+                    ))
+                })?;
+                std::fs::set_permissions(&destination, permissions.clone())?;
+                Ok(())
+            },
+        )?;
+        layout.copy_outputs_to(&topology, &source_files)?;
         inputs.validate().map_err(|error| {
             isolation_error(format!(
                 "Cargo's resolution inputs changed while cooldown staged them: {error}"
@@ -283,9 +303,9 @@ impl StagingLayout {
         Ok(files)
     }
 
-    fn copy_to(&self, topology: &Utf8Path, files: &BTreeSet<Utf8PathBuf>) -> Result<()> {
+    fn copy_outputs_to(&self, topology: &Utf8Path, files: &BTreeSet<Utf8PathBuf>) -> Result<()> {
         for source in files {
-            if self.is_ambient(source) {
+            if !self.is_output(source) {
                 continue;
             }
             let destination = self.staged_path(topology, source)?;
@@ -453,15 +473,29 @@ fn discover_vendor_roots(configs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf
 }
 
 fn reject_unsupported_config_inputs(config: &Utf8Path, value: &toml::Value) -> Result<()> {
+    if custom_lockfile_configured(value) {
+        return Err(unsupported_config(
+            config,
+            "sets `resolver.lockfile-path`; cooldown currently requires the workspace-root `Cargo.lock`",
+        ));
+    }
     if value.get("include").is_some() {
-        return Err(isolation_error(format!(
-            "Cargo configuration {config} uses `include`, whose recursive input closure is not yet supported"
-        )));
+        return Err(unsupported_config(
+            config,
+            "uses `include`, whose recursive input closure is not yet supported",
+        ));
     }
     if value.get("paths").is_some() {
-        return Err(isolation_error(format!(
-            "Cargo configuration {config} uses local `paths` overrides, which are not yet supported"
-        )));
+        return Err(unsupported_config(
+            config,
+            "uses local `paths` overrides, which are not yet supported",
+        ));
+    }
+    if config_patch_uses_path(value) {
+        return Err(unsupported_config(
+            config,
+            "uses a path-based `[patch]`, whose local source closure is not yet supported",
+        ));
     }
     let has_local_registry = value
         .get("source")
@@ -475,9 +509,103 @@ fn reject_unsupported_config_inputs(config: &Utf8Path, value: &toml::Value) -> R
             })
         });
     if has_local_registry {
-        return Err(isolation_error(format!(
-            "Cargo configuration {config} uses a `local-registry` source, which is not yet supported"
-        )));
+        return Err(unsupported_config(
+            config,
+            "uses a `local-registry` source, which is not yet supported",
+        ));
+    }
+    if config_uses_file_registry(value) {
+        return Err(unsupported_config(
+            config,
+            "uses a file-backed registry URL, whose local input closure is not yet supported",
+        ));
+    }
+    Ok(())
+}
+
+fn unsupported_config(config: &Utf8Path, detail: &str) -> CoreError {
+    CoreError::Config(format!("Cargo configuration {config} {detail}"))
+}
+
+fn custom_lockfile_configured(value: &toml::Value) -> bool {
+    value
+        .get("resolver")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|resolver| resolver.contains_key("lockfile-path"))
+}
+
+fn config_patch_uses_path(value: &toml::Value) -> bool {
+    value
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|registries| {
+            registries.values().any(|registry| {
+                registry.as_table().is_some_and(|dependencies| {
+                    dependencies.values().any(|dependency| {
+                        dependency
+                            .as_table()
+                            .is_some_and(|specification| specification.contains_key("path"))
+                    })
+                })
+            })
+        })
+}
+
+fn config_uses_file_registry(value: &toml::Value) -> bool {
+    let is_file_url = |candidate: &toml::Value, key: &str| {
+        candidate
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .is_some_and(|url| {
+                let url = url.trim_start().to_ascii_lowercase();
+                url.starts_with("file:") || url.starts_with("sparse+file:")
+            })
+    };
+    value
+        .get("source")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|sources| {
+            sources
+                .values()
+                .any(|source| is_file_url(source, "registry"))
+        })
+        || value
+            .get("registries")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|registries| {
+                registries
+                    .values()
+                    .any(|registry| is_file_url(registry, "index"))
+            })
+}
+
+pub(crate) fn reject_custom_lockfile(workspace: &Utf8Path) -> Result<()> {
+    if std::env::var_os("CARGO_RESOLVER_LOCKFILE_PATH").is_some() {
+        return Err(CoreError::Config(
+            "`CARGO_RESOLVER_LOCKFILE_PATH` is set; cooldown currently requires Cargo's workspace-root `Cargo.lock`"
+                .to_string(),
+        ));
+    }
+    let (config_dirs, ambient_config_dirs) = cargo_config_dirs(workspace)?;
+    let configs = cargo_config_paths(&config_dirs)?
+        .into_iter()
+        .chain(cargo_config_paths(&ambient_config_dirs)?)
+        .collect::<BTreeSet<_>>();
+    for config in configs {
+        let contents = std::fs::read_to_string(&config).map_err(|error| {
+            isolation_error(format!("cannot read Cargo configuration {config}: {error}"))
+        })?;
+        let value: toml::Value = toml::from_str(&contents).map_err(|error| {
+            CoreError::Config(format!(
+                "cannot parse Cargo configuration {config}: {error}"
+            ))
+        })?;
+        if custom_lockfile_configured(&value) {
+            return Err(unsupported_config(
+                &config,
+                "sets `resolver.lockfile-path`; cooldown currently requires the workspace-root `Cargo.lock`",
+            ));
+        }
     }
     Ok(())
 }
@@ -697,8 +825,20 @@ mod tests {
             ("include = [\"shared.toml\"]", "uses `include`"),
             ("paths = [\"../override\"]", "uses local `paths`"),
             (
+                "[resolver]\nlockfile-path = \"../state/Cargo.lock\"",
+                "sets `resolver.lockfile-path`",
+            ),
+            (
+                "[patch.crates-io]\nlocal = { path = \"../local\" }",
+                "uses a path-based `[patch]`",
+            ),
+            (
                 "[source.local]\nlocal-registry = \"registry\"",
                 "uses a `local-registry`",
+            ),
+            (
+                "[registries.private]\nindex = \"sparse+file:///srv/index\"",
+                "uses a file-backed registry URL",
             ),
         ] {
             let value: toml::Value = toml::from_str(contents)?;
@@ -710,6 +850,23 @@ mod tests {
                 "unexpected diagnostic for {contents:?}: {error}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn custom_lockfile_config_is_rejected_before_project_use() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("workspace"))?;
+        write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            "[resolver]\nlockfile-path = \"../state/Cargo.lock\"\n",
+        )?;
+
+        let error = reject_custom_lockfile(&root)
+            .err()
+            .ok_or_else(|| eyre::eyre!("custom lockfile configuration was accepted"))?;
+        assert!(error.to_string().contains("resolver.lockfile-path"));
         Ok(())
     }
 

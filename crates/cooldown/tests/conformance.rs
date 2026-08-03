@@ -368,8 +368,14 @@ impl ToolWrite for FakeEco {
     }
 
     async fn recover_pending_mutation(&self, _p: &Project) -> Result<MutationRecovery> {
-        self.state.lock().unwrap().recovery_completed = true;
-        Ok(MutationRecovery::settled(RecoveryDisposition::Restored))
+        let mut state = self.state.lock().unwrap();
+        let disposition = if state.require_recovery_before_read && !state.recovery_completed {
+            RecoveryDisposition::Restored
+        } else {
+            RecoveryDisposition::Unchanged
+        };
+        state.recovery_completed = true;
+        Ok(MutationRecovery::settled(disposition))
     }
 
     async fn lock_edge_snapshot(&self, p: &Project) -> Result<Option<Vec<u8>>> {
@@ -1701,6 +1707,18 @@ async fn check_fails_closed_on_stale_lock() {
     assert_eq!(out.exit, Exit::Environment);
     assert_eq!(out.errors.len(), 1);
     assert_eq!(out.errors[0].kind, DiagnosticKind::StaleLock);
+
+    let mut allowed = opts();
+    allowed.allow_stale_lock = true;
+    let out = ws.check(&allowed).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.checked, 0);
+    assert_eq!(out.summary.skipped_stale_projects, 1);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("evaluation was skipped"))
+    );
 }
 
 #[tokio::test]

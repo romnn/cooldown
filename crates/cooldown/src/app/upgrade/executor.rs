@@ -2,6 +2,7 @@ use super::{UpgradeAccum, UpgradeCtx};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
+    recovery_diagnostics,
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
@@ -295,13 +296,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return ProjectRunStatus::Terminated;
             }
         };
-        self.acc
-            .warnings
-            .extend(recovery.warnings.into_iter().map(|warning| {
-                warning
-                    .with_tool(self.ctx.pctx.tool.as_str())
-                    .with_project(self.ctx.pctx.rel_path.as_str())
-            }));
+        self.acc.warnings.extend(recovery_diagnostics(
+            recovery,
+            self.ctx.pctx.tool,
+            self.ctx.pctx.rel_path.as_str(),
+        ));
         self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
             return ProjectRunStatus::Terminated;
@@ -428,13 +427,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
-        self.acc
-            .warnings
-            .extend(recovery.warnings.into_iter().map(|warning| {
-                warning
-                    .with_tool(self.ctx.pctx.tool.as_str())
-                    .with_project(self.ctx.pctx.rel_path.as_str())
-            }));
+        self.acc.warnings.extend(recovery_diagnostics(
+            recovery,
+            self.ctx.pctx.tool,
+            self.ctx.pctx.rel_path.as_str(),
+        ));
         self.manifest_only = manifest_only;
         sort_planned_changes(&mut changes);
         let Some(mut state) = self.initial_trial_state().await else {

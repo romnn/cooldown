@@ -131,9 +131,10 @@ pub fn json_schema() -> Value {
         "effectiveInfo": effective,
         "outdatedSummary": {
             "type": "object",
-            "required": ["total", "adoptable", "blocked", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
+            "required": ["total", "skippedStaleProjects", "adoptable", "blocked", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
             "properties": {
                 "total": { "type": "integer", "minimum": 0 },
+                "skippedStaleProjects": { "type": "integer", "minimum": 0 },
                 "adoptable": { "type": "integer", "minimum": 0 },
                 "blocked": { "type": "integer", "minimum": 0 },
                 "inCooldown": { "type": "integer", "minimum": 0 },
@@ -182,9 +183,10 @@ pub fn json_schema() -> Value {
         },
         "checkSummary": {
             "type": "object",
-            "required": ["checked", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
+            "required": ["checked", "skippedStaleProjects", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
             "properties": {
                 "checked": { "type": "integer", "minimum": 0 },
+                "skippedStaleProjects": { "type": "integer", "minimum": 0 },
                 "direct": { "type": "integer", "minimum": 0 },
                 "exempt": { "type": "integer", "minimum": 0 },
                 "acknowledged": { "type": "integer", "minimum": 0 },
@@ -975,6 +977,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         }
     }
 
@@ -1016,6 +1019,7 @@ mod tests {
             unknown_age: 0,
             errors: 0,
             violations: 1,
+            skipped_stale_projects: 0,
         }
     }
 

@@ -44,6 +44,7 @@ use serde::Serialize;
 ///         held: 0,
 ///         unknown_age: 0,
 ///         errors: 0,
+///         skipped_stale_projects: 0,
 ///     },
 ///     Vec::<OutdatedItem>::new(),
 /// );
@@ -78,6 +79,7 @@ mod tests {
                 held: 0,
                 unknown_age: 0,
                 errors: 0,
+                skipped_stale_projects: 0,
             },
             vec![OutdatedItem {
                 name: "golang.org/x/mod".into(),
@@ -137,6 +139,7 @@ mod tests {
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,
+                skipped_stale_projects: 0,
             },
             Vec::<CheckItem>::new(),
         );

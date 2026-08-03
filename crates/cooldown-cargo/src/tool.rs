@@ -147,11 +147,20 @@ impl ToolRead for CargoTool {
         }
     }
 
+    fn validate_manifest_without_lock(&self, root: &Utf8Path) -> Result<()> {
+        crate::staging::reject_custom_lockfile(root)
+    }
+
+    fn probe_manifest_without_lock(&self) -> bool {
+        true
+    }
+
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
         version::classify_kind(from, to)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
         let graph = self.cargo.metadata_locked(&project.root).await?;
         let mut deps = Vec::new();
@@ -204,6 +213,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
         match self.cargo.verify_locked(&project.root).await {
             Ok(graph) => Ok(verify_current_report(
@@ -708,6 +718,7 @@ impl ToolWrite for CargoTool {
     }
 
     async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)
     }
 

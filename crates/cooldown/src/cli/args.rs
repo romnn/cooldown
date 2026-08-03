@@ -284,6 +284,9 @@ pub(in crate::cli) enum Command {
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
     /// Recover interrupted package-manager state without performing any other mutation.
+    ///
+    /// Recovery uses only project location, tool selection, and reporting options.
+    /// Normal policy, registry, sync, stale-lock, and dry-run options are rejected.
     Recover,
     /// Write the resolved policy down into native configs.
     Sync,
@@ -425,7 +428,8 @@ pub(in crate::cli) struct GlobalArgs {
     /// cross-major update). The reports and their counts are unaffected.
     #[arg(long = "no-suggestions", global = true)]
     pub(in crate::cli) no_suggestions: bool,
-    /// Downgrade a stale/absent lock from failure (the default) to a warning.
+    /// Downgrade a stale/absent lock from failure to a warning and skip that project's dependency
+    /// evaluation.
     #[arg(
         long = "allow-stale-lock",
         global = true,

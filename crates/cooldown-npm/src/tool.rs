@@ -234,6 +234,34 @@ fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutatio
     Ok(ProjectMutationJournal { files })
 }
 
+/// The result and exact write-set state observed when an adapter-owned command returned.
+struct OwnedStep {
+    result: Result<()>,
+    postimage: cooldown_core::ProjectMutationState,
+}
+
+impl OwnedStep {
+    fn capture(
+        result: Result<()>,
+        journal: &ProjectMutationJournal,
+        root: &Utf8Path,
+    ) -> Result<Self> {
+        Ok(OwnedStep {
+            result,
+            postimage: journal.capture_state(root)?,
+        })
+    }
+}
+
+/// Restores a snapshot after an adapter-owned step while refusing subsequent filesystem drift.
+fn restore_after_owned_step(
+    journal: &ProjectMutationJournal,
+    root: &Utf8Path,
+    postimage: &cooldown_core::ProjectMutationState,
+) -> Result<()> {
+    journal.restore_if_unchanged(root, postimage)
+}
+
 fn push_journal_rel(
     rels: &mut Vec<Utf8PathBuf>,
     seen: &mut BTreeSet<Utf8PathBuf>,
@@ -1052,6 +1080,7 @@ fn settle_landed_candidate<L: NodeLock>(
     project: &Project,
     change: &Change,
     candidate_journal: &ProjectMutationJournal,
+    candidate_postimage: &cooldown_core::ProjectMutationState,
     workspace: &[WorkspacePeer],
     baseline: &mut Option<PeerViolations>,
     report: &mut ApplyReport,
@@ -1075,7 +1104,7 @@ fn settle_landed_candidate<L: NodeLock>(
             report.applied.push(change.clone());
         }
         Some(violation) => {
-            candidate_journal.restore(&project.root)?;
+            restore_after_owned_step(candidate_journal, &project.root, candidate_postimage)?;
             let offending = if violation.dependent == change.package.name {
                 violation.package.clone()
             } else {
@@ -1949,28 +1978,41 @@ impl<L: NodeLock> NpmTool<L> {
         project: &Project,
         candidate_journal: &ProjectMutationJournal,
         landing: &CandidateLanding,
-    ) -> Result<()> {
-        let (result, retried_without_cutoff) =
-            match self.cmd.run(&project.root, landing.command()).await {
-                Ok(()) => (Ok(()), false),
-                Err(error) => {
-                    let fallback = matches!(&error, CoreError::Tool { .. })
-                        .then(|| without_before(landing.command()))
-                        .flatten();
-                    if let Some(fallback) = fallback {
-                        // An existing, baselined post-cutoff package can make npm's historical-tree
-                        // resolve impossible. Retry from a clean candidate snapshot without the
-                        // native cutoff and let the application policy gate accept, reconcile, or
-                        // roll back the resulting graph against that baseline.
-                        candidate_journal.restore(&project.root)?;
-                        landing.authorized_manifests().restore(&project.root)?;
-                        (self.cmd.run(&project.root, &fallback).await, true)
-                    } else {
-                        (Err(error), false)
-                    }
+    ) -> Result<OwnedStep> {
+        let first_result = self.cmd.run(&project.root, landing.command()).await;
+        let authorized_postimage = landing
+            .authorized_manifests()
+            .capture_state(&project.root)?;
+        let first = OwnedStep::capture(first_result, candidate_journal, &project.root)?;
+        let (attempt, retried_without_cutoff) = match first.result {
+            Ok(()) => (first, false),
+            Err(error) => {
+                let fallback = matches!(&error, CoreError::Tool { .. })
+                    .then(|| without_before(landing.command()))
+                    .flatten();
+                if let Some(fallback) = fallback {
+                    // An existing, baselined post-cutoff package can make npm's historical-tree
+                    // resolve impossible. Retry from a clean candidate snapshot without the
+                    // native cutoff and let the application policy gate accept, reconcile, or
+                    // roll back the resulting graph against that baseline.
+                    restore_after_owned_step(candidate_journal, &project.root, &first.postimage)?;
+                    let fallback_result = self.cmd.run(&project.root, &fallback).await;
+                    (
+                        OwnedStep::capture(fallback_result, candidate_journal, &project.root)?,
+                        true,
+                    )
+                } else {
+                    (
+                        OwnedStep {
+                            result: Err(error),
+                            postimage: first.postimage,
+                        },
+                        false,
+                    )
                 }
-            };
-        match (result, landing) {
+            }
+        };
+        match (&attempt.result, landing) {
             (
                 Ok(()),
                 CandidateLanding::PinRestoreResync {
@@ -1979,7 +2021,11 @@ impl<L: NodeLock> NpmTool<L> {
                     ..
                 },
             ) => {
-                authorized_manifests.restore(&project.root)?;
+                restore_after_owned_step(
+                    authorized_manifests,
+                    &project.root,
+                    &authorized_postimage,
+                )?;
                 // The resync must use the same resolver regime as the successful pin; restoring
                 // `--before` here would recreate the historical-tree failure that triggered fallback.
                 let resync = if retried_without_cutoff {
@@ -1987,9 +2033,10 @@ impl<L: NodeLock> NpmTool<L> {
                 } else {
                     resync.clone()
                 };
-                self.cmd.run(&project.root, &resync).await
+                let result = self.cmd.run(&project.root, &resync).await;
+                OwnedStep::capture(result, candidate_journal, &project.root)
             }
-            (result, _) => result,
+            _ => Ok(attempt),
         }
     }
 
@@ -2028,22 +2075,27 @@ impl<L: NodeLock> NpmTool<L> {
                 });
                 continue;
             };
-            let result = self
+            let attempt = self
                 .run_candidate_landing(project, &candidate_journal, &landing)
-                .await;
-            match result {
+                .await?;
+            match attempt.result {
                 Ok(()) if exact_target_reached::<L>(project, change)? => {
                     settle_landed_candidate::<L>(
                         project,
                         change,
                         &candidate_journal,
+                        &attempt.postimage,
                         workspace,
                         &mut violation_baseline,
                         &mut report,
                     )?;
                 }
                 Ok(()) => {
-                    candidate_journal.restore(&project.root)?;
+                    restore_after_owned_step(
+                        &candidate_journal,
+                        &project.root,
+                        &attempt.postimage,
+                    )?;
                     report.skipped.push(Skipped {
                         change: change.clone(),
                         reason: SkipReason::ResolverConflict,
@@ -2051,8 +2103,20 @@ impl<L: NodeLock> NpmTool<L> {
                         detail: None,
                     });
                 }
+                Err(error) if error.is_local_environment_failure() => {
+                    restore_after_owned_step(
+                        &candidate_journal,
+                        &project.root,
+                        &attempt.postimage,
+                    )?;
+                    return Err(error);
+                }
                 Err(error) => {
-                    candidate_journal.restore(&project.root)?;
+                    restore_after_owned_step(
+                        &candidate_journal,
+                        &project.root,
+                        &attempt.postimage,
+                    )?;
                     report.skipped.push(skipped_on_apply_error(change, error)?);
                 }
             }
@@ -2247,12 +2311,16 @@ impl<L: NodeLock> NpmTool<L> {
         let baseline = PeerBaseline::gather::<L>(before_content, workspace);
         let mut active = plan.clone();
         loop {
-            let resolve = self
+            let resolve_result = self
                 .whole_graph_resolve(project, &active, multi_version, window_minutes)
                 .await;
-            match resolve {
+            let mut resolve = OwnedStep::capture(resolve_result, journal, &project.root)?;
+            match resolve.result {
                 Ok(()) => {}
-                Err(error) if error.is_local_environment_failure() => return Err(error),
+                Err(error) if error.is_local_environment_failure() => {
+                    restore_after_owned_step(journal, &project.root, &resolve.postimage)?;
+                    return Err(error);
+                }
                 Err(error)
                     if minimum_age_lock_rejected(&error)
                         && window_minutes.is_some_and(|minutes| minutes > 0)
@@ -2261,7 +2329,7 @@ impl<L: NodeLock> NpmTool<L> {
                     // A persisted minimumReleaseAge validates the starting lock before pnpm
                     // applies the exact pins. Restore any partial resolver work, then rebuild
                     // through temporary exact overrides while retaining the age floor.
-                    journal.restore(&project.root)?;
+                    restore_after_owned_step(journal, &project.root, &resolve.postimage)?;
                     self.repair_policy_rejected_graph(
                         project,
                         &active,
@@ -2269,13 +2337,17 @@ impl<L: NodeLock> NpmTool<L> {
                         window_minutes,
                     )
                     .await?;
+                    resolve.postimage = journal.capture_state(&project.root)?;
                 }
                 // The joint resolve is unsatisfiable as a whole. Propagate the failure so the
                 // caller's `apply_resilient` can isolate the offending candidate(s) (an
                 // unfetchable version, one side of a conflict) and apply the rest, instead of
                 // holding every candidate. The caller restores the journal, so no partial lock
                 // is kept.
-                Err(error) => return Err(error),
+                Err(error) => {
+                    restore_after_owned_step(journal, &project.root, &resolve.postimage)?;
+                    return Err(error);
+                }
             }
 
             let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
@@ -2297,7 +2369,7 @@ impl<L: NodeLock> NpmTool<L> {
                     rejection.offending,
                 ));
             }
-            journal.restore(&project.root)?;
+            restore_after_owned_step(journal, &project.root, &resolve.postimage)?;
             if active.changes.is_empty() {
                 // Every candidate was rejected; the restored journal is the result.
                 return Ok(before_content.unwrap_or_default().to_string());
@@ -2462,7 +2534,9 @@ impl<L: NodeLock> NpmTool<L> {
                 .map_err(propagate_repeated_minimum_age_rejection)
         }
         .await;
-        let restore_result = native_snapshot.restore(&project.root);
+        let native_postimage = native_snapshot.capture_state(&project.root)?;
+        let restore_result =
+            restore_after_owned_step(&native_snapshot, &project.root, &native_postimage);
         restore_result?;
         temporary_result?;
 
@@ -2928,7 +3002,29 @@ mod tests {
     use super::*;
     use crate::lock::{Npm, Pnpm};
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use indoc::{formatdoc, indoc};
+
+    #[test]
+    fn candidate_restore_refuses_drift_after_the_owned_command() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let relative = Utf8Path::new("package-lock.json");
+        std::fs::write(root.join(relative), "original")?;
+        let journal = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(root, relative)?],
+        };
+        std::fs::write(root.join(relative), "candidate")?;
+        let postimage = journal.capture_state(root)?;
+        std::fs::write(root.join(relative), "independent")?;
+
+        let result = restore_after_owned_step(&journal, root, &postimage);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_eq!(std::fs::read_to_string(root.join(relative))?, "independent");
+        Ok(())
+    }
 
     fn raw(version: &str) -> RawRelease {
         RawRelease {

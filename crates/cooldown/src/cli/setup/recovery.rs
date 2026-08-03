@@ -14,12 +14,7 @@ pub(in crate::cli) struct PreparedRecovery {
 
 /// Discovers recovery artifacts without loading normal run configuration or package state.
 pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRecovery, CoreError> {
-    if global.dry_run {
-        return Err(CoreError::Config(
-            "`recover` cannot be combined with `--dry-run`; omit it to perform recovery"
-                .to_string(),
-        ));
-    }
+    validate_recovery_options(global)?;
     let tools = selected_tools(global)?;
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
@@ -47,6 +42,48 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
         json: global.json,
         progress: super::options::progress_mode(global),
     })
+}
+
+fn validate_recovery_options(global: &GlobalArgs) -> Result<(), CoreError> {
+    let unsupported = [
+        (global.min_age.is_some(), "--min-age"),
+        (global.min_age_major.is_some(), "--min-age-major"),
+        (global.min_age_minor.is_some(), "--min-age-minor"),
+        (global.min_age_patch.is_some(), "--min-age-patch"),
+        (global.latest, "--latest"),
+        (global.freeze.is_some(), "--freeze"),
+        (!global.allow.is_empty(), "--allow"),
+        (global.major, "--major"),
+        (global.no_major, "--no-major"),
+        (global.respect_dist_tags, "--respect-dist-tags"),
+        (global.no_respect_dist_tags, "--no-respect-dist-tags"),
+        (!global.package.is_empty(), "--package"),
+        (!global.exclude_folders.is_empty(), "--exclude-folders"),
+        (!global.exclude_packages.is_empty(), "--exclude-packages"),
+        (global.list_packages, "--list-packages"),
+        (global.paths, "--paths"),
+        (global.show_projects, "--show-projects"),
+        (global.no_suggestions, "--no-suggestions"),
+        (global.allow_stale_lock, "--allow-stale-lock"),
+        (global.sync, "--sync"),
+        (global.dry_run, "--dry-run"),
+        (global.offline, "--offline"),
+        (global.fresh, "--fresh"),
+        (global.concurrency.is_some(), "--concurrency"),
+        (global.no_native, "--no-native"),
+        (global.no_global, "--no-global"),
+        (global.config.is_some(), "--config"),
+    ]
+    .into_iter()
+    .find_map(|(set, name)| set.then_some(name));
+    #[cfg(debug_assertions)]
+    let unsupported = unsupported.or(global.now.is_some().then_some("--now"));
+    if let Some(name) = unsupported {
+        return Err(CoreError::Config(format!(
+            "`recover` does not use `{name}`; remove it so recovery depends only on project location and recovery artifacts"
+        )));
+    }
+    Ok(())
 }
 
 fn direct_cargo_recovery_roots(workdir: &Utf8Path, repo_root: &Utf8Path) -> Vec<Utf8PathBuf> {
@@ -85,9 +122,7 @@ fn cargo_recovery_roots(
     root: &Utf8Path,
     respect_gitignore: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
-    let recovery_roots =
-        scan::find_marker_dirs(root, RECOVERY_MARKER, respect_gitignore, &[], false)?;
-    let mut authoritative = recovery_roots;
+    let mut authoritative = scan::find_recovery_marker_dirs(root, RECOVERY_MARKER)?;
     authoritative.extend(scan::find_marker_dirs(
         root,
         "Cargo.lock",
@@ -129,6 +164,18 @@ mod tests {
     use crate::cli::Cli;
     use clap::Parser;
     use color_eyre::eyre;
+
+    #[test]
+    fn recovery_rejects_normal_run_options_it_does_not_use() -> eyre::Result<()> {
+        let cli = Cli::parse_from(["cooldown", "recover", "--offline"]);
+
+        let error = prepare_recovery(&cli.global)
+            .err()
+            .ok_or_else(|| eyre::eyre!("recovery accepted an unused registry option"))?;
+
+        assert!(error.to_string().contains("--offline"));
+        Ok(())
+    }
 
     #[test]
     fn recovery_marker_finds_project_without_cargo_lock() {
@@ -227,6 +274,31 @@ mod tests {
 
         assert_eq!(prepared.targets.len(), 1);
         assert_eq!(prepared.targets[0].root, project);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_recovery_finds_hidden_and_ignored_descendants() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let hidden = root.join(".hidden/project");
+        let ignored = root.join("ignored/project");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&hidden)?;
+        std::fs::create_dir_all(&ignored)?;
+        std::fs::write(root.join(".gitignore"), "ignored/\n")?;
+        std::fs::write(hidden.join(RECOVERY_MARKER), "{}")?;
+        std::fs::write(ignored.join(RECOVERY_MARKER), "{}")?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", root.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+        let roots = prepared
+            .targets
+            .into_iter()
+            .map(|target| target.root)
+            .collect::<Vec<_>>();
+        assert_eq!(roots, vec![hidden, ignored]);
         Ok(())
     }
 }

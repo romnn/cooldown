@@ -39,5 +39,5 @@ pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Works
 pub(crate) use recover::{RecoveryTarget, recover_targets};
 pub(crate) use workspace::{
     FetchedRelease, LockReportAction, age_days, diag_from_error, lock_report_outcome,
-    render_window, round2,
+    recovery_diagnostics, render_window, round2,
 };

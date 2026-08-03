@@ -367,6 +367,8 @@ diagnostic_kinds! {
     LockConflict = "lock_conflict",
     /// Adapter-owned recovery evidence still controls the project mutation state.
     PendingRecovery = "pending_recovery",
+    /// An interrupted mutation was settled before the requested operation continued.
+    Recovery = "recovery",
     /// A non-transient local runtime or environment setup step failed.
     System = "system",
     /// Invalid configuration or command input requires a user correction.

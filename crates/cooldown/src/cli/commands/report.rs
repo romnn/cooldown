@@ -2,7 +2,7 @@ use super::CommandContext;
 use super::common::{emit_envelope, with_diags};
 use crate::app::Exit;
 use crate::cli::present;
-use cooldown_core::{CoreError, HeldReason};
+use cooldown_core::{CoreError, Diagnostic, HeldReason};
 use cooldown_render as render;
 
 /// The shared presentation flags for the dependency-table renderers.
@@ -20,6 +20,14 @@ fn is_pin_hold(held_by: Option<&HeldReason>) -> bool {
     matches!(held_by, Some(HeldReason::ExactPin | HeldReason::CommitPin))
 }
 
+fn command_warnings(ctx: &CommandContext<'_>, warnings: &[Diagnostic]) -> Vec<Diagnostic> {
+    ctx.pre_sync_warnings
+        .iter()
+        .chain(warnings)
+        .cloned()
+        .collect()
+}
+
 pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreError> {
     let out = ctx.ws.outdated(ctx.opts).await;
     // `--exit-code N` turns the informational report into a CI gate: a non-zero exit when there is
@@ -31,6 +39,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
     };
     let summary = out.summary.clone();
     let items = out.items.clone();
+    let warnings = command_warnings(ctx, &out.warnings);
     let env = with_diags(
         render::Envelope::new(
             "outdated",
@@ -40,7 +49,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
             summary.clone(),
             items.clone(),
         ),
-        out.warnings.clone(),
+        warnings.clone(),
         out.errors.clone(),
     );
     // The JSON envelope keeps every item (machine consumers filter themselves); the human table
@@ -59,7 +68,7 @@ pub(super) async fn run_outdated(ctx: &CommandContext<'_>) -> Result<Exit, CoreE
         render::tty::render_outdated(
             &summary,
             &table_items,
-            &out.warnings,
+            &warnings,
             &out.errors,
             &render_options(ctx),
         )
@@ -72,6 +81,7 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
     let meta = out.meta.clone();
     let summary = out.summary.clone();
     let items = out.items.clone();
+    let warnings = command_warnings(ctx, &out.warnings);
     let env = with_diags(
         render::Envelope::new(
             "check",
@@ -81,7 +91,7 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
             summary.clone(),
             items.clone(),
         ),
-        out.warnings.clone(),
+        warnings.clone(),
         out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
@@ -89,7 +99,7 @@ pub(super) async fn run_check(ctx: &CommandContext<'_>) -> Result<Exit, CoreErro
             &meta,
             &summary,
             &items,
-            &out.warnings,
+            &warnings,
             &out.errors,
             &render_options(ctx),
         )
@@ -102,6 +112,7 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
     let meta = out.meta.clone();
     let summary = out.summary.clone();
     let items = out.items.clone();
+    let warnings = command_warnings(ctx, &out.warnings);
     let env = with_diags(
         render::Envelope::new(
             "upgrade",
@@ -111,7 +122,7 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
             summary.clone(),
             items.clone(),
         ),
-        out.warnings.clone(),
+        warnings.clone(),
         out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
@@ -119,7 +130,7 @@ pub(super) async fn run_upgrade(ctx: &CommandContext<'_>) -> Result<Exit, CoreEr
             &meta,
             &summary,
             &items,
-            &out.warnings,
+            &warnings,
             &out.errors,
             &render_options(ctx),
         )
@@ -132,6 +143,7 @@ pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError>
     let meta = out.meta.clone();
     let summary = out.summary.clone();
     let items = out.items.clone();
+    let warnings = command_warnings(ctx, &out.warnings);
     let env = with_diags(
         render::Envelope::new(
             "fix",
@@ -141,7 +153,7 @@ pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError>
             summary.clone(),
             items.clone(),
         ),
-        out.warnings.clone(),
+        warnings.clone(),
         out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
@@ -149,7 +161,7 @@ pub(super) async fn run_fix(ctx: &CommandContext<'_>) -> Result<Exit, CoreError>
             &meta,
             &summary,
             &items,
-            &out.warnings,
+            &warnings,
             &out.errors,
             &render_options(ctx),
         )
@@ -191,11 +203,11 @@ pub(super) async fn run_sync(ctx: &CommandContext<'_>) -> Result<Exit, CoreError
             summary.clone(),
             items.clone(),
         ),
-        Vec::new(),
+        out.warnings.clone(),
         out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
-        present::render_sync_text(&out.summary, &out.items)
+        present::render_sync_text(&out.summary, &out.items, &out.warnings)
     })?;
     Ok(out.exit)
 }

@@ -96,6 +96,65 @@ pub fn find_marker_dirs(
     Ok(dirs)
 }
 
+/// Finds exact recovery artifacts without applying normal project-discovery ignore policy.
+///
+/// Hidden and gitignored projects remain visible because recovery must follow durable ownership
+/// evidence rather than the current discovery configuration.
+/// Known metadata, dependency, build, and cache trees are pruned to keep a repository-root safety
+/// scan bounded.
+pub fn find_recovery_marker_dirs(
+    root: &Utf8Path,
+    marker: &str,
+) -> Result<Vec<Utf8PathBuf>, CoreError> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .ignore(false)
+        .require_git(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || entry.file_type().is_none_or(|kind| !kind.is_dir()) {
+                return true;
+            }
+            !matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | ".hg"
+                        | ".svn"
+                        | ".cache"
+                        | ".venv"
+                        | "node_modules"
+                        | "target"
+                        | "vendor"
+                )
+            )
+        });
+    let mut dirs = Vec::new();
+    for result in builder.build() {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(CoreError::Filesystem(format!(
+                    "cannot inspect recovery artifacts below {root}: {error}"
+                )));
+            }
+        };
+        if entry.file_type().is_some_and(|kind| kind.is_dir())
+            && let Some(dir) = Utf8Path::from_path(entry.path())
+            && std::fs::symlink_metadata(dir.join(marker)).is_ok()
+        {
+            dirs.push(dir.to_owned());
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
 fn marker_entry_exists(path: &Utf8Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| {
         let file_type = metadata.file_type();
@@ -181,6 +240,7 @@ impl PackageExcludeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
 
     fn utf8(p: &std::path::Path) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(p.to_path_buf()).expect("utf8 path")
@@ -346,5 +406,34 @@ mod tests {
         let err = find_marker_dirs(&root, "Cargo.lock", false, &["a/**/[".to_string()], false)
             .expect_err("bad glob");
         std::assert_matches!(err, CoreError::Config(_));
+    }
+
+    #[test]
+    fn recovery_scan_finds_hidden_and_ignored_projects_but_prunes_bulk_trees() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".gitignore"), "ignored/\n")?;
+        for marker in [
+            "ignored/project/recovery",
+            ".hidden/project/recovery",
+            "target/fixture/recovery",
+        ] {
+            let marker = root.join(marker);
+            std::fs::create_dir_all(
+                marker
+                    .parent()
+                    .ok_or_else(|| eyre::eyre!("recovery marker has no parent"))?,
+            )?;
+            std::fs::write(marker, "")?;
+        }
+
+        let found = find_recovery_marker_dirs(root, "recovery")?;
+        assert_eq!(
+            found,
+            vec![root.join(".hidden/project"), root.join("ignored/project")]
+        );
+        Ok(())
     }
 }

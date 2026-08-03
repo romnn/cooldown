@@ -6,7 +6,7 @@ mod report;
 use super::{Command, present};
 use crate::app::{Exit, RunOpts, Workspace};
 use camino::Utf8Path;
-use cooldown_core::CoreError;
+use cooldown_core::{CoreError, Diagnostic};
 
 pub(crate) struct CommandContext<'a> {
     pub(crate) ws: &'a Workspace,
@@ -14,6 +14,7 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) repo_root: &'a Utf8Path,
     pub(crate) color: bool,
     pub(crate) generated_at: &'a str,
+    pub(crate) pre_sync_warnings: &'a [Diagnostic],
 }
 
 pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Result<Exit, CoreError> {

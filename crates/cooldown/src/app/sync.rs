@@ -1,10 +1,11 @@
 //! `sync` — write the resolved cooldown policy into each project's native config (uv
 //! `exclude-newer`, …), so `cooldown.toml` is the single source of truth and even a bare `uv sync`
-//! someone runs by hand still respects the window. Tools without a native cooldown concept (Go,
+//! someone runs by hand still respects the window.
+//! Tools without a native cooldown concept (Go,
 //! Cargo) report `unsupported`; nothing is written for them.
 
 use super::lock::{ProjectReadGuard, ProjectWriteGuard, RepoToolReadGuard, RepoToolWriteGuard};
-use super::{Exit, RunOpts, Workspace, diag_from_error};
+use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
 use camino::Utf8Path;
 use cooldown_core::{
     Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, SyncScope, ToolId,
@@ -20,6 +21,11 @@ enum SyncAccessGuard {
         #[expect(dead_code, reason = "the field keeps the project write lease alive")]
         guard: ProjectWriteGuard,
     },
+}
+
+struct SyncAccess {
+    guard: SyncAccessGuard,
+    recovery: Vec<Diagnostic>,
 }
 
 enum RepoSyncResourceGuard {
@@ -44,6 +50,7 @@ struct RepoSyncAccess {
         reason = "the field keeps every consumer project lease alive"
     )]
     projects: Vec<SyncAccessGuard>,
+    recovery: Vec<Diagnostic>,
 }
 
 /// What happened when syncing one project's native config.
@@ -103,7 +110,8 @@ pub struct SyncSummary {
 }
 
 impl SyncSummary {
-    /// Tally one non-error outcome. An [`SyncStatus::Error`] is counted at the failing call site
+    /// Tally one non-error outcome.
+    /// An [`SyncStatus::Error`] is counted at the failing call site
     /// (which also carries the diagnostic), so it is a no-op here.
     fn record(&mut self, status: SyncStatus) {
         match status {
@@ -121,10 +129,33 @@ pub struct SyncOutcome {
     pub summary: SyncSummary,
     /// The per-project results.
     pub items: Vec<SyncItem>,
+    /// Recovery notices and non-fatal recovery cleanup or durability diagnostics.
+    pub warnings: Vec<Diagnostic>,
     /// Project-level errors (none today; per-project failures live on their [`SyncItem`]).
     pub errors: Vec<Diagnostic>,
     /// The process exit: non-zero if any project failed to sync.
     pub exit: Exit,
+}
+
+fn scoped_tools(workspace: &Workspace, opts: &RunOpts) -> Vec<ToolId> {
+    let mut tools = Vec::new();
+    for project in workspace.scoped_projects(opts) {
+        if !tools.contains(&project.tool) {
+            tools.push(project.tool);
+        }
+    }
+    tools
+}
+
+fn unsupported_item(tool: ToolId) -> SyncItem {
+    SyncItem {
+        tool: tool.as_str().to_string(),
+        project: repo_relative_root(),
+        status: SyncStatus::Unsupported,
+        path: None,
+        window: None,
+        error: None,
+    }
 }
 
 impl Workspace {
@@ -134,25 +165,24 @@ impl Workspace {
     /// A [`SyncScope::Project`] tool is synced per in-scope project (its manifest's native field).
     /// A [`SyncScope::Repo`] tool's single repo-level file (uv's root `uv.toml`) is resolved against
     /// the repo-wide cascade and written **exactly once per tool**, no matter how many of its
-    /// projects are in scope. Its write lease covers every detected project that consumes that
-    /// shared file. A
-    /// [`SyncScope::None`] tool reports a single `unsupported` item.
+    /// projects are in scope.
+    /// Its write lease covers every detected project that consumes that shared file.
+    /// A [`SyncScope::None`] tool reports a single `unsupported` item.
     ///
-    /// Idempotent: a target already in sync is reported `unchanged` and not rewritten. Fail-soft: a
+    /// Idempotent: a target already in sync is reported `unchanged` and not rewritten.
+    /// Fail-soft: a
     /// write failure becomes one `error` item (and a non-zero exit) without aborting the rest.
     pub async fn sync(&self, opts: &RunOpts) -> SyncOutcome {
         let mut items = Vec::new();
         let mut summary = SyncSummary::default();
+        let mut warnings = Vec::new();
 
-        // The distinct in-scope tools, in first-seen order. Each is handled once: a repo-scoped tool
+        // The distinct in-scope tools, in first-seen order.
+        // Each is handled once: a repo-scoped tool
         // is written exactly once (never per project), a project-scoped tool iterates its own
-        // projects. The final item list is sorted below, so this order is not load-bearing.
-        let mut tools: Vec<ToolId> = Vec::new();
-        for pctx in self.scoped_projects(opts) {
-            if !tools.contains(&pctx.tool) {
-                tools.push(pctx.tool);
-            }
-        }
+        // projects.
+        // The final item list is sorted below, so this order is not load-bearing.
+        let tools = scoped_tools(self, opts);
 
         for tool in tools {
             let Some(writer) = self.mutator(tool) else {
@@ -163,14 +193,7 @@ impl Workspace {
                     .collect();
                 opts.progress.phase("checking native policy support");
                 summary.unsupported += 1;
-                items.push(SyncItem {
-                    tool: tool.as_str().to_string(),
-                    project: repo_relative_root(),
-                    status: SyncStatus::Unsupported,
-                    path: None,
-                    window: None,
-                    error: None,
-                });
+                items.push(unsupported_item(tool));
                 continue;
             };
 
@@ -180,8 +203,15 @@ impl Workspace {
                         let _progress = opts.progress.project(tool, pctx.rel_path.as_str());
                         opts.progress.phase("syncing native policy");
                         items.push(
-                            self.sync_project(writer, pctx, tool, opts, &mut summary)
-                                .await,
+                            self.sync_project(
+                                writer,
+                                pctx,
+                                tool,
+                                opts,
+                                &mut summary,
+                                &mut warnings,
+                            )
+                            .await,
                         );
                     }
                 }
@@ -201,8 +231,15 @@ impl Workspace {
                         .collect();
                     opts.progress.phase("syncing repository-native policy");
                     items.push(
-                        self.sync_repo(writer, tool, opts, &protected_projects, &mut summary)
-                            .await,
+                        self.sync_repo(
+                            writer,
+                            tool,
+                            opts,
+                            &protected_projects,
+                            &mut summary,
+                            &mut warnings,
+                        )
+                        .await,
                     );
                 }
                 SyncScope::None => {
@@ -213,14 +250,7 @@ impl Workspace {
                         .collect();
                     opts.progress.phase("checking native policy support");
                     summary.unsupported += 1;
-                    items.push(SyncItem {
-                        tool: tool.as_str().to_string(),
-                        project: repo_relative_root(),
-                        status: SyncStatus::Unsupported,
-                        path: None,
-                        window: None,
-                        error: None,
-                    });
+                    items.push(unsupported_item(tool));
                 }
             }
         }
@@ -234,6 +264,7 @@ impl Workspace {
         SyncOutcome {
             summary,
             items,
+            warnings,
             errors: Vec::new(),
             exit,
         }
@@ -247,9 +278,11 @@ impl Workspace {
         tool: ToolId,
         opts: &RunOpts,
         summary: &mut SyncSummary,
+        warnings: &mut Vec<Diagnostic>,
     ) -> SyncItem {
         let project = pctx.rel_path.to_string();
-        // Resolve the policy's default (bare) window for this project. The empty package name
+        // Resolve the policy's default (bare) window for this project.
+        // The empty package name
         // matches no package-specific rule, so this is the window `sync` bakes into the single
         // native field; per-package and per-kind windows are not expressible there.
         let query = ResolveQuery {
@@ -268,7 +301,8 @@ impl Workspace {
             exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
         };
         let result = match acquire_sync_access(writer, pctx, opts.dry_run).await {
-            Ok(_guard) => {
+            Ok(access) => {
+                warnings.extend(access.recovery);
                 writer
                     .write_native(&pctx.project, &policy, opts.dry_run)
                     .await
@@ -311,10 +345,12 @@ impl Workspace {
         opts: &RunOpts,
         projects: &[&super::ProjectCtx],
         summary: &mut SyncSummary,
+        warnings: &mut Vec<Diagnostic>,
     ) -> SyncItem {
         let project = repo_relative_root();
         // Resolve the repo-wide default window once against the repo-root cascade (no native layer),
-        // independent of any single project's layers. The empty package name and `.` project keep it
+        // independent of any single project's layers.
+        // The empty package name and `.` project keep it
         // to the bare default window — the only thing a single native field can carry.
         let query = ResolveQuery {
             tool,
@@ -333,7 +369,8 @@ impl Workspace {
             match acquire_repo_sync_access(writer, self.repo_root(), tool, projects, opts.dry_run)
                 .await
             {
-                Ok(_guards) => {
+                Ok(access) => {
+                    warnings.extend(access.recovery);
                     writer
                         .write_repo_native(self.repo_root(), &policy, opts.dry_run)
                         .await
@@ -373,15 +410,21 @@ async fn acquire_sync_access(
     writer: &dyn ToolWrite,
     pctx: &super::ProjectCtx,
     dry_run: bool,
-) -> cooldown_core::Result<SyncAccessGuard> {
+) -> cooldown_core::Result<SyncAccess> {
     if dry_run {
         let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
         writer.ensure_no_pending_mutation(&pctx.project).await?;
-        Ok(SyncAccessGuard::Read { guard })
+        Ok(SyncAccess {
+            guard: SyncAccessGuard::Read { guard },
+            recovery: Vec::new(),
+        })
     } else {
         let guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
-        writer.recover_pending_mutation(&pctx.project).await?;
-        Ok(SyncAccessGuard::Write { guard })
+        let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+        Ok(SyncAccess {
+            guard: SyncAccessGuard::Write { guard },
+            recovery: recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str()),
+        })
     }
 }
 
@@ -405,12 +448,16 @@ async fn acquire_repo_sync_access(
     projects.sort_by(|left, right| left.project.root.cmp(&right.project.root));
     projects.dedup_by(|left, right| left.project.root == right.project.root);
     let mut guards = Vec::with_capacity(projects.len());
+    let mut recovery = Vec::new();
     for project in projects {
-        guards.push(acquire_sync_access(writer, project, dry_run).await?);
+        let access = acquire_sync_access(writer, project, dry_run).await?;
+        guards.push(access.guard);
+        recovery.extend(access.recovery);
     }
     Ok(RepoSyncAccess {
         resource,
         projects: guards,
+        recovery,
     })
 }
 

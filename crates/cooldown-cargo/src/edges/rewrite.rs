@@ -7,9 +7,10 @@ use super::{
 };
 use std::collections::HashMap;
 
-/// Filters policy-proposed rewrites through the shared safety guards, in deterministic order. A
-/// rewrite is withheld when the rewrite set's **net** effect would leave a still-locked version
-/// with no reference (an orphan `cargo metadata --locked` rejects). Withheld rewrites are returned,
+/// Filters policy-proposed rewrites through the shared safety guards, in deterministic order.
+/// A rewrite is withheld when the rewrite set's **net** effect would leave a still-locked version
+/// with no reference (an orphan `cargo metadata --locked` rejects).
+/// Withheld rewrites are returned,
 /// not dropped — the caller reports them.
 pub(crate) fn guard_rewrites(
     view: &LockEdgeView,
@@ -25,7 +26,8 @@ pub(crate) fn guard_rewrites(
 
     // Orphan validation over the NET effect of the whole candidate set: a version's final
     // reference count is its current count minus the edges rebound away plus the edges rebound
-    // onto it. Validating rewrite-by-rewrite in application order would reject a legitimate swap —
+    // onto it.
+    // Validating rewrite-by-rewrite in application order would reject a legitimate swap —
     // two dependents exchanging two single-reference versions leave both final counts at one.
     // When a version's final count does reach zero, the last candidate (in sorted order) draining
     // it is withheld and the remainder re-validated, so the outcome is deterministic and only
@@ -72,7 +74,8 @@ pub(crate) fn guard_rewrites(
 }
 
 /// Applies `rewrites` to the lock's verbatim text as targeted line surgery, leaving every other
-/// byte identical. Entries keep their position: only the version component changes, and entries of
+/// byte identical.
+/// Entries keep their position: only the version component changes, and entries of
 /// one name sort adjacently regardless of version, so the array stays cargo-sorted.
 ///
 /// Returns `None` when any rewrite's entry line cannot be found in its dependent's block — the
@@ -174,7 +177,8 @@ mod tests {
     #[test]
     fn guard_withholds_a_rewrite_that_would_orphan_the_from_version() {
         let view = view(CHURNED_LOCK);
-        // `uuid 1.24.0` has exactly one reference (app's renamed dep). Rebinding it away would
+        // `uuid 1.24.0` has exactly one reference (app's renamed dep).
+        // Rebinding it away would
         // orphan the 1.24.0 block, so the guard withholds the rewrite — with a reported reason,
         // never a silent drop.
         let orphaning = guard_rewrites(
@@ -240,7 +244,8 @@ mod tests {
             source = "registry+https://github.com/rust-lang/crates.io-index"
         "#};
         // `shared 1.1.0` starts unreferenced only in this synthetic shape; the point is the two
-        // rewrites together would take `shared 1.0.0` from 2 references to 0. Exactly one may pass.
+        // rewrites together would take `shared 1.0.0` from 2 references to 0.
+        // Exactly one may pass.
         let view = view(lock);
         let rewrite = |dependent: &str| EdgeRewrite {
             dependent: key(dependent, "1.0.0"),
@@ -259,7 +264,8 @@ mod tests {
     }
 
     /// A reciprocal swap of two single-reference versions is a valid atomic set: every final
-    /// reference count equals the initial one. Sequential per-rewrite validation would reject the
+    /// reference count equals the initial one.
+    /// Sequential per-rewrite validation would reject the
     /// first leg (its source momentarily looks like a last reference); net validation accepts both.
     #[test]
     fn guard_accepts_a_reciprocal_swap() {

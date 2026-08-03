@@ -37,6 +37,7 @@ struct OutdatedRunner<'a> {
     items: Vec<OutdatedItem>,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
+    skipped_stale_projects: usize,
 }
 
 impl Workspace {
@@ -63,6 +64,7 @@ impl<'a> OutdatedRunner<'a> {
             items: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
+            skipped_stale_projects: 0,
         }
     }
 
@@ -85,7 +87,8 @@ impl<'a> OutdatedRunner<'a> {
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.current.cmp(&b.current))
         });
-        let summary = summarize(&self.items);
+        let mut summary = summarize(&self.items);
+        summary.skipped_stale_projects = self.skipped_stale_projects;
         OutdatedOutcome {
             summary,
             items: self.items,
@@ -136,7 +139,8 @@ impl<'a> OutdatedRunner<'a> {
                 if self.opts.allow_stale_lock
                     && matches!(error, cooldown_core::CoreError::StaleLock(_))
                 {
-                    self.warnings.push(diagnostic);
+                    self.skipped_stale_projects += 1;
+                    self.warnings.push(stale_evaluation_skipped(diagnostic));
                 } else {
                     self.errors.push(diagnostic);
                 }
@@ -305,8 +309,20 @@ impl<'a> OutdatedRunner<'a> {
 
     async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
-            Ok(Some(report)) => self.handle_lock_report(report, pctx, project_label),
-            Ok(None) => true,
+            Ok(refresh) => {
+                self.warnings.extend(refresh.recovery);
+                match refresh.report {
+                    Ok(report) => report
+                        .is_none_or(|report| self.handle_lock_report(report, pctx, project_label)),
+                    Err(error) => {
+                        self.errors.push(
+                            diag_from_error(&error, pctx.tool, project_label, None)
+                                .with_path(pctx.project.manifest.as_str()),
+                        );
+                        false
+                    }
+                }
+            }
             Err(error) => {
                 self.errors.push(
                     diag_from_error(&error, pctx.tool, project_label, None)
@@ -323,6 +339,7 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &'a super::ProjectCtx,
         project_label: &str,
     ) -> bool {
+        let stale = report.status == cooldown_core::LockStatus::Stale;
         let outcome = lock_report_outcome(
             report,
             pctx.tool,
@@ -333,9 +350,18 @@ impl<'a> OutdatedRunner<'a> {
         match outcome.action {
             LockReportAction::Continue => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.warnings.push(diagnostic);
+                    self.warnings.push(if stale {
+                        stale_evaluation_skipped(diagnostic)
+                    } else {
+                        diagnostic
+                    });
                 }
-                true
+                if stale {
+                    self.skipped_stale_projects += 1;
+                    false
+                } else {
+                    true
+                }
             }
             LockReportAction::Skip => {
                 if let Some(diagnostic) = outcome.diagnostic {
@@ -626,6 +652,7 @@ fn apply_held(
 fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
     let mut s = OutdatedSummary {
         total: items.len(),
+        skipped_stale_projects: 0,
         adoptable: 0,
         blocked: 0,
         in_cooldown: 0,
@@ -650,6 +677,13 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
         }
     }
     s
+}
+
+fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
+    diagnostic
+        .message
+        .push_str("; dependency evaluation was skipped for this project");
+    diagnostic
 }
 
 #[cfg(test)]

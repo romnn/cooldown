@@ -98,13 +98,18 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     // `--sync` (opt-in) writes the policy into native config first, so the command runs against an
     // up-to-date lock and cooldown.toml stays the source of truth. Skipped under `--dry-run` (a dry
     // run must not mutate). Only the dependency commands pre-sync; `sync`/`config`/etc. do not.
+    let mut pre_sync_warnings = Vec::new();
     if global.sync && !opts.dry_run && pre_syncs(&cli.command) {
         let synced = ws.sync(&opts).await;
         if !synced.exit.is_ok() {
             opts.progress.finish_run();
+            for warning in &synced.warnings {
+                eprintln!("warning [{}]: {}", warning.kind, warning.message);
+            }
             eprintln!("sync failed before {}", command_name(&cli.command));
             return Ok(synced.exit);
         }
+        pre_sync_warnings = synced.warnings;
         if synced.summary.written > 0 {
             opts.progress.phase(format!(
                 "synced policy into {} native config(s)",
@@ -127,6 +132,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
             repo_root: &repo_root,
             color,
             generated_at: &generated_at,
+            pre_sync_warnings: &pre_sync_warnings,
         },
     )
     .await;

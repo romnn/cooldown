@@ -55,6 +55,7 @@ pub struct CheckOutcome {
 #[derive(Default)]
 struct CheckAccum {
     checked: usize,
+    skipped_stale_projects: usize,
     direct: usize,
     exempt: usize,
     acknowledged: usize,
@@ -141,6 +142,7 @@ impl<'a> CheckRunner<'a> {
             + self.acc.errors.len();
         let summary = CheckSummary {
             checked: self.acc.checked,
+            skipped_stale_projects: self.acc.skipped_stale_projects,
             direct: self.acc.direct,
             exempt: self.acc.exempt,
             acknowledged: self.acc.acknowledged,
@@ -201,7 +203,11 @@ impl<'a> CheckRunner<'a> {
                     .await
             }
         };
-        if matches!(lock_probe, LockProbe::Skip | LockProbe::StaleAllowed) {
+        if matches!(lock_probe, LockProbe::StaleAllowed) {
+            self.acc.skipped_stale_projects += 1;
+            return;
+        }
+        if matches!(lock_probe, LockProbe::Skip) {
             return;
         }
 
@@ -267,8 +273,15 @@ impl<'a> CheckRunner<'a> {
         project_label: &str,
     ) -> Option<LockProbe> {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
-            Ok(Some(report)) => Some(self.handle_lock_report(report, pctx, project_label)),
-            Ok(None) => None,
+            Ok(refresh) => {
+                self.acc.warnings.extend(refresh.recovery);
+                match refresh.report {
+                    Ok(report) => {
+                        report.map(|report| self.handle_lock_report(report, pctx, project_label))
+                    }
+                    Err(error) => Some(self.handle_lock_error(&error, pctx, project_label)),
+                }
+            }
             Err(err) => Some(self.handle_lock_error(&err, pctx, project_label)),
         }
     }
@@ -290,7 +303,11 @@ impl<'a> CheckRunner<'a> {
         match outcome.action {
             LockReportAction::Continue => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.acc.warnings.push(diagnostic);
+                    self.acc.warnings.push(if stale {
+                        stale_evaluation_skipped(diagnostic)
+                    } else {
+                        diagnostic
+                    });
                 }
                 if stale {
                     LockProbe::StaleAllowed
@@ -320,7 +337,7 @@ impl<'a> CheckRunner<'a> {
             DiagnosticKind::StaleLock | DiagnosticKind::NotFound
         );
         if self.opts.allow_stale_lock && downgradable {
-            self.acc.warnings.push(diag);
+            self.acc.warnings.push(stale_evaluation_skipped(diag));
             LockProbe::StaleAllowed
         } else {
             self.acc.errors.push(diag);
@@ -456,6 +473,13 @@ impl<'a> CheckRunner<'a> {
             .with_package(&dep.package.name),
         )
     }
+}
+
+fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
+    diagnostic
+        .message
+        .push_str("; dependency evaluation was skipped for this project");
+    diagnostic
 }
 
 /// Map the tallies to the fail-closed exit code: errors/unknown-age first, then a tripped

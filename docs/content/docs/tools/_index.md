@@ -28,6 +28,11 @@ bookCollapseSection: false
 | Java (Gradle) | `gradle` | Maven Central | `gradle.lockfile` |
 | Swift | `swift` | GitHub Releases | `Package.resolved` |
 
+Cargo projects must currently use the workspace-root `Cargo.lock`.
+Cooldown fails explicitly when Cargo's `resolver.lockfile-path` configuration or
+`CARGO_RESOLVER_LOCKFILE_PATH` selects a custom location, because safely staging, normalizing, and
+recovering that alternate file requires it to become part of the adapter's typed lock identity.
+
 ## How each is driven
 
 `cooldown` never treats a native package manager as the source of policy — the cooldown verdict is computed in one core evaluator. The native tool is used only to **resolve** a lockfile graph and to **apply** changes back to it. That is what keeps "adoptable" identical across ecosystems.

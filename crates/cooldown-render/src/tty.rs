@@ -420,6 +420,12 @@ pub fn render_outdated(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
+    push_outdated_summary(&mut out, summary);
+    push_diagnostics(&mut out, warnings, errors, use_color);
+    out
+}
+
+fn push_outdated_summary(out: &mut String, summary: &OutdatedSummary) {
     let _ = write!(
         out,
         "\n{} adoptable · {} blocked · {} in cooldown · {} up-to-date · {} exempt · {} held · {} unknown-age",
@@ -434,9 +440,14 @@ pub fn render_outdated(
     if summary.errors > 0 {
         let _ = write!(out, " · {} errors", summary.errors);
     }
+    if summary.skipped_stale_projects > 0 {
+        let _ = write!(
+            out,
+            " · {} stale projects skipped",
+            summary.skipped_stale_projects
+        );
+    }
     out.push('\n');
-    push_diagnostics(&mut out, warnings, errors, use_color);
-    out
 }
 
 /// Render the `check` report.
@@ -458,13 +469,13 @@ pub fn render_check(
         no_suggestions: _,
     } = *opts;
     let mut out = String::new();
-    if items.is_empty() && errors.is_empty() {
+    if items.is_empty() && errors.is_empty() && summary.skipped_stale_projects == 0 {
         let _ = writeln!(
             out,
             "✓ {} dependencies pass the cooldown gate ({} scope).",
             summary.checked, meta.scope
         );
-    } else {
+    } else if !items.is_empty() {
         let used_by = has_attribution(items, |it| &it.members);
         let project = project_column_needed(
             items,
@@ -518,9 +529,10 @@ pub fn render_check(
     }
     let _ = writeln!(
         out,
-        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
+        "\nchecked {} ({} direct) · {} stale projects skipped · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
         summary.checked,
         summary.direct,
+        summary.skipped_stale_projects,
         summary.violations,
         summary.acknowledged,
         summary.allowed,
@@ -1227,6 +1239,7 @@ mod tests {
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,
+                skipped_stale_projects: 0,
             },
             &[CheckItem {
                 name: "github.com/example/pkg".into(),
@@ -1273,6 +1286,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let item = OutdatedItem {
             name: "ruff".into(),
@@ -1322,6 +1336,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let item = OutdatedItem {
             name: "once_cell".into(),
@@ -1403,6 +1418,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         }
     }
 
@@ -1482,6 +1498,7 @@ mod tests {
             held: 6,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
 
         let out = render_outdated(
@@ -1799,6 +1816,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let errors = [Diagnostic::new(
             DiagnosticKind::LockfileUnreadable,

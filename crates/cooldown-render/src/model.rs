@@ -266,6 +266,8 @@ impl Serialize for HeldBy {
 pub struct OutdatedSummary {
     /// The total number of dependencies evaluated.
     pub total: usize,
+    /// Projects skipped because their stale lock was allowed but could not be evaluated safely.
+    pub skipped_stale_projects: usize,
     /// The number with status [`OutdatedStatus::Adoptable`].
     pub adoptable: usize,
     /// The number with status [`OutdatedStatus::Blocked`] — matured but held out of the graph by a
@@ -388,6 +390,8 @@ pub struct CheckItem {
 pub struct CheckSummary {
     /// The total number of dependencies checked.
     pub checked: usize,
+    /// Projects skipped because their stale lock was allowed but could not be evaluated safely.
+    pub skipped_stale_projects: usize,
     /// How many of [`checked`](CheckSummary::checked) are direct dependencies.
     pub direct: usize,
     /// The number exempted by an `allow` rule or a pseudo/commit pin (passing, not findings).

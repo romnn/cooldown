@@ -540,6 +540,7 @@ version = "0.0.14"
 dependencies = [
  "async-trait",
  "camino",
+ "color-eyre",
  "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",

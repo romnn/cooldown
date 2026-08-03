@@ -7,8 +7,9 @@ use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext,
-    LockStatus, LockVerifyReport, PatternGlob, PolicyLayer, PolicyStack, Project, Release,
-    ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
+    LockStatus, LockVerifyReport, MutationRecovery, PatternGlob, PolicyLayer, PolicyStack, Project,
+    RecoveryDisposition, Release, ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead,
+    ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
@@ -28,6 +29,43 @@ pub struct ProjectCtx {
     pub policy: PolicyStack,
     /// The Cargo edge policy resolved for this project's config cascade.
     pub edge_policy: cooldown_core::EdgePolicy,
+}
+
+pub(crate) struct LockRefresh {
+    pub(crate) report: cooldown_core::Result<Option<LockVerifyReport>>,
+    pub(crate) recovery: Vec<Diagnostic>,
+}
+
+pub(crate) fn recovery_diagnostics(
+    recovery: MutationRecovery,
+    tool: ToolId,
+    project: &str,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = recovery
+        .warnings
+        .into_iter()
+        .map(|warning| warning.with_tool(tool.as_str()).with_project(project))
+        .collect::<Vec<_>>();
+    let message = match recovery.disposition {
+        RecoveryDisposition::Unchanged => None,
+        RecoveryDisposition::Accepted => {
+            Some("completed an interrupted accepted publication before continuing")
+        }
+        RecoveryDisposition::Restored => {
+            Some("restored an interrupted mutation to its preimage before continuing")
+        }
+        RecoveryDisposition::CleanupOnly => {
+            Some("removed recovery artifacts for an already settled mutation before continuing")
+        }
+    };
+    if let Some(message) = message {
+        diagnostics.push(
+            Diagnostic::new(DiagnosticKind::Recovery, message)
+                .with_tool(tool.as_str())
+                .with_project(project),
+        );
+    }
+    diagnostics
 }
 
 /// The exit-code taxonomy. `check` is the CI gate, so non-zero is its contract.
@@ -490,15 +528,24 @@ impl Workspace {
         &self,
         pctx: &ProjectCtx,
         opts: &RunOpts,
-    ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+    ) -> cooldown_core::Result<LockRefresh> {
         if !opts.lock || opts.dry_run {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+            });
         }
         let Some(writer) = self.mutator(pctx.tool) else {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+            });
         };
         if !writer.supports_lock_refresh() {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+            });
         }
         opts.progress.phase("refreshing lock state");
         let _guard = ProjectAccessWriteGuard::acquire(
@@ -507,8 +554,10 @@ impl Workspace {
             pctx.tool,
             writer.sync_scope() == cooldown_core::SyncScope::Repo,
         )?;
-        writer.recover_pending_mutation(&pctx.project).await?;
-        writer.refresh_lock(&pctx.project).await
+        let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+        let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
+        let report = writer.refresh_lock(&pctx.project).await;
+        Ok(LockRefresh { report, recovery })
     }
 
     /// Starts a read session and checks adapter-owned pending state without mutating it.

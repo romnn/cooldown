@@ -352,12 +352,7 @@ impl Workspace {
                 return;
             }
         };
-        acc.warnings
-            .extend(recovery_warnings.into_iter().map(|warning| {
-                warning
-                    .with_tool(pctx.tool.as_str())
-                    .with_project(pctx.rel_path.as_str())
-            }));
+        acc.warnings.extend(recovery_warnings);
         let copied_pctx = super::ProjectCtx {
             tool: pctx.tool,
             project: trial.project().clone(),
@@ -415,7 +410,9 @@ impl Workspace {
                 writer.sync_scope() == cooldown_core::SyncScope::Repo,
             )?;
             let recovery = writer.recover_pending_mutation(&pctx.project).await?;
-            (IsolatedAccessGuard::Write(guard), recovery.warnings)
+            let diagnostics =
+                super::recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
+            (IsolatedAccessGuard::Write(guard), diagnostics)
         };
         opts.progress.phase("preparing isolated mutation project");
         let trial = strategy.prepare(&pctx.project).await?;

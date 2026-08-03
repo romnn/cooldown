@@ -120,6 +120,20 @@ pub(super) fn detect_projects(
             &exclude,
             marker.workspace_root,
         )?;
+        if adapter.probe_manifest_without_lock() {
+            let manifest_dirs = find_marker_dirs(
+                workdir,
+                marker.manifest,
+                respect_gitignore,
+                &exclude,
+                marker.workspace_root,
+            )?;
+            for dir in manifest_dirs {
+                if !dirs.contains(&dir) {
+                    adapter.validate_manifest_without_lock(&dir)?;
+                }
+            }
+        }
         tracing::info!(
             tool = id.as_str(),
             projects = dirs.len(),
