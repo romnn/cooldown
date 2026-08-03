@@ -14,9 +14,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport,
+    Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -299,6 +300,10 @@ impl<L: CondaLayout> ReleaseFetcher for CondaEnvTool<L> {
 
 #[async_trait]
 impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
+    fn mutation_tool(&self) -> ToolId {
+        L::ID
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -307,12 +312,8 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
         ProjectMutationJournal::capture(&project.root, [Utf8Path::new(L::LOCKFILE)])
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             let args = L::upgrade_args(&change.package.name, change.to.as_str());

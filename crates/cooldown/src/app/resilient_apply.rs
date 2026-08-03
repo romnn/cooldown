@@ -18,8 +18,8 @@
 use std::collections::HashSet;
 
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal,
-    ProjectMutationState, Result, SkipReason, Skipped, ToolWrite,
+    ApplyObserver, ApplyReport, Change, PreparedMutation, ProjectMutationState, Result, SkipReason,
+    Skipped, ToolWrite,
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
@@ -48,17 +48,18 @@ type ApplyResult<T> = Result<T, ApplyFailure>;
 #[cfg(test)]
 async fn apply_resilient(
     writer: &dyn ToolWrite,
-    project: &Project,
-    plan: &Plan,
-    journal: &ProjectMutationJournal,
+    project: &cooldown_core::Project,
+    plan: &cooldown_core::Plan,
 ) -> Result<ApplyReport> {
-    apply_resilient_with_observer(writer, project, plan, journal, &())
+    let mutation = PreparedMutation::prepare(writer, project, plan).await?;
+    apply_resilient_with_observer(writer, &mutation, &())
         .await
         .map(|mutation| mutation.report)
         .map_err(ApplyFailure::into_core_error)
 }
 
 /// A successful apply and the project state observed immediately afterwards for later drift checks.
+#[derive(Debug)]
 pub(crate) struct AppliedMutation {
     pub(crate) report: ApplyReport,
     pub(crate) expected: ProjectMutationState,
@@ -66,16 +67,14 @@ pub(crate) struct AppliedMutation {
 
 async fn apply_checked(
     writer: &dyn ToolWrite,
-    project: &Project,
-    plan: &Plan,
-    journal: &ProjectMutationJournal,
+    mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<cooldown_core::ApplyAttempt> {
-    journal
-        .validate_project(&project.root)
+    mutation
+        .parts_for(writer)
         .map_err(ApplyFailure::RestoreConflict)?;
     writer
-        .apply_with_observer(project, plan, journal, observer)
+        .apply_with_observer(mutation, observer)
         .await
         .map_err(ApplyFailure::RestoreConflict)
 }
@@ -88,18 +87,19 @@ async fn apply_checked(
 /// candidate never blocks the rest.
 /// A local environment failure such as a missing binary, read-only tree, or full disk is not a
 /// candidate conflict and propagates unchanged.
-/// `journal` is the caller's pre-apply snapshot and is restored before each recovery trial and the
-/// final commit, so no partial widen or lock leaks.
+/// The prepared operation's journal is restored before each recovery trial and the final commit,
+/// so no partial widen or lock leaks.
 /// Its project identity and writable topology are revalidated before every adapter attempt.
 /// Native candidate work is forwarded to `observer` across the first attempt and recovery trials.
 pub(crate) async fn apply_resilient_with_observer(
     writer: &dyn ToolWrite,
-    project: &Project,
-    plan: &Plan,
-    journal: &ProjectMutationJournal,
+    mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<AppliedMutation> {
-    let first = apply_checked(writer, project, plan, journal, observer).await?;
+    let (_, plan, journal) = mutation
+        .parts_for(writer)
+        .map_err(ApplyFailure::RestoreConflict)?;
+    let first = apply_checked(writer, mutation, observer).await?;
     let (first_report, first_state) = match first {
         cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
         cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
@@ -132,7 +132,7 @@ pub(crate) async fn apply_resilient_with_observer(
     }
 
     let (accepted, trial_state) =
-        verified_satisfiable_subset(writer, project, plan, journal, first_state, observer).await?;
+        verified_satisfiable_subset(writer, mutation, first_state, observer).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
@@ -150,11 +150,10 @@ pub(crate) async fn apply_resilient_with_observer(
                 .map_err(ApplyFailure::RestoreConflict)?,
         )
     } else {
-        let committed = Plan {
-            changes: accepted,
-            ..plan.clone()
-        };
-        let result = apply_checked(writer, project, &committed, journal, observer).await?;
+        let committed = mutation
+            .subset(accepted)
+            .map_err(ApplyFailure::RestoreConflict)?;
+        let result = apply_checked(writer, &committed, observer).await?;
         let (report, expected) = match result {
             cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
             cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
@@ -199,12 +198,13 @@ pub(crate) async fn apply_resilient_with_observer(
 /// non-contiguous subset would pass.
 async fn verified_satisfiable_subset(
     writer: &dyn ToolWrite,
-    project: &Project,
-    plan: &Plan,
-    journal: &ProjectMutationJournal,
+    mutation: &PreparedMutation,
     mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<(Vec<Change>, ProjectMutationState)> {
+    let (_, plan, journal) = mutation
+        .parts_for(writer)
+        .map_err(ApplyFailure::RestoreConflict)?;
     let mut accepted: Vec<Change> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
     push_halves(&mut work, plan.changes.clone());
@@ -213,11 +213,10 @@ async fn verified_satisfiable_subset(
         journal
             .restore_if_unchanged(&current_state)
             .map_err(ApplyFailure::RestoreConflict)?;
-        let trial = Plan {
-            changes: accepted.iter().chain(group.iter()).cloned().collect(),
-            ..plan.clone()
-        };
-        let result = apply_checked(writer, project, &trial, journal, observer).await?;
+        let trial = mutation
+            .subset(accepted.iter().chain(group.iter()).cloned().collect())
+            .map_err(ApplyFailure::RestoreConflict)?;
+        let result = apply_checked(writer, &trial, observer).await?;
         let report = match result {
             cooldown_core::ApplyAttempt::Finished { report, postimage } => {
                 current_state = postimage;
@@ -284,11 +283,11 @@ fn held(change: &Change) -> Skipped {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_resilient, apply_resilient_with_observer};
+    use super::{ApplyFailure, apply_resilient, apply_resilient_with_observer};
     use async_trait::async_trait;
     use camino::Utf8Path;
     use cooldown_core::{
-        ApplyObserver, ApplyReport, Change, CoreError, PackageId, Plan, Project,
+        ApplyObserver, ApplyReport, Change, CoreError, PackageId, Plan, PreparedMutation, Project,
         ProjectMutationJournal, Result, RewriteMode, ToolId, ToolTermination, ToolWrite,
         UpdateKind, VerifyReport, Version,
     };
@@ -373,6 +372,7 @@ mod tests {
     /// `apply` reports every change applied on success; the journal is empty so restore is a no-op.
     /// `apply_calls` counts invocations so a test can assert the happy path adds no overhead.
     struct MockWriter {
+        tool: ToolId,
         resolves: ResolveOracle,
         fault: Option<Fault>,
         reject_error: RejectError,
@@ -382,6 +382,7 @@ mod tests {
     impl MockWriter {
         fn new(resolves: impl Fn(&[String]) -> bool + Send + Sync + 'static) -> Self {
             MockWriter {
+                tool: TOOL,
                 resolves: Box::new(resolves),
                 fault: None,
                 reject_error: RejectError::Tool,
@@ -396,6 +397,11 @@ mod tests {
             }
         }
 
+        fn with_tool(mut self, tool: ToolId) -> Self {
+            self.tool = tool;
+            self
+        }
+
         fn apply_calls(&self) -> usize {
             self.apply_calls.load(Ordering::SeqCst)
         }
@@ -403,20 +409,20 @@ mod tests {
 
     #[async_trait]
     impl ToolWrite for MockWriter {
+        fn mutation_tool(&self) -> ToolId {
+            self.tool
+        }
+
         async fn mutation_journal(
             &self,
             project: &Project,
             _plan: &Plan,
         ) -> Result<ProjectMutationJournal> {
-            ProjectMutationJournal::capture(&project.root, std::iter::empty::<&Utf8Path>())
+            ProjectMutationJournal::capture(&project.root, [Utf8Path::new("requirements.txt")])
         }
 
-        async fn apply(
-            &self,
-            _project: &Project,
-            plan: &Plan,
-            _journal: &ProjectMutationJournal,
-        ) -> Result<ApplyReport> {
+        async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+            let (_, plan, _) = mutation.parts_for(self)?;
             self.apply_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(fault) = &self.fault {
                 return Err(match fault {
@@ -460,15 +466,14 @@ mod tests {
 
         async fn apply_with_observer(
             &self,
-            project: &Project,
-            plan: &Plan,
-            journal: &ProjectMutationJournal,
+            mutation: &PreparedMutation,
             observer: &dyn ApplyObserver,
         ) -> Result<cooldown_core::ApplyAttempt> {
+            let (_, plan, journal) = mutation.parts_for(self)?;
             for change in &plan.changes {
                 observer.candidate_started(change);
             }
-            let report = self.apply(project, plan, journal).await;
+            let report = self.apply(mutation).await;
             let postimage = journal.capture_state()?;
             Ok(cooldown_core::ApplyAttempt::Finished { report, postimage })
         }
@@ -513,11 +518,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b", "c"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(names(&report.applied), names(&plan.changes));
         assert!(report.skipped.is_empty());
@@ -525,28 +526,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_mismatched_journal_is_rejected_before_apply() -> color_eyre::eyre::Result<()> {
+    async fn prepared_operation_rejects_another_adapter() -> color_eyre::eyre::Result<()> {
         let writer = MockWriter::new(|_| true);
+        let other = MockWriter::new(|_| true).with_tool(ToolId("other"));
         let TempProject {
-            directory: _source_directory,
+            directory: _directory,
             project,
         } = temp_project();
-        let TempProject {
-            directory: _other_directory,
-            project: other_project,
-        } = temp_project();
+        std::fs::write(project.root.join("requirements.txt"), "original")?;
         let plan = plan(&["a"]);
-        let journal = writer.mutation_journal(&other_project, &plan).await?;
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
 
-        let result = apply_resilient(&writer, &project, &plan, &journal).await;
+        let result = other.apply(&mutation).await;
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
-        assert_eq!(writer.apply_calls(), 0);
+        assert_eq!(other.apply_calls(), 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn observed_apply_forwards_every_native_candidate() {
+    #[cfg(unix)]
+    async fn retargeted_file_symlink_stops_an_in_place_adapter_before_dispatch()
+    -> color_eyre::eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        let external = tempfile::tempdir()?;
+        let external = camino::Utf8PathBuf::from_path_buf(external.path().to_owned())
+            .map_err(|path| color_eyre::eyre::eyre!("path is not UTF-8: {}", path.display()))?;
+        let relative = Utf8Path::new("requirements.txt");
+        std::fs::write(project.root.join(relative), "original")?;
+        std::fs::write(external.join(relative), "external")?;
+        let plan = plan(&["a"]);
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
+        std::fs::remove_file(project.root.join(relative))?;
+        symlink(external.join(relative), project.root.join(relative))?;
+
+        let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
+
+        std::assert_matches!(
+            result,
+            Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
+        );
+        assert_eq!(writer.apply_calls(), 0);
+        assert_eq!(
+            std::fs::read_to_string(external.join(relative))?,
+            "external"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn new_hard_link_stops_an_in_place_adapter_before_dispatch()
+    -> color_eyre::eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        let external = tempfile::tempdir()?;
+        let external = camino::Utf8PathBuf::from_path_buf(external.path().to_owned())
+            .map_err(|path| color_eyre::eyre::eyre!("path is not UTF-8: {}", path.display()))?;
+        let relative = Utf8Path::new("requirements.txt");
+        std::fs::write(project.root.join(relative), "original")?;
+        let plan = plan(&["a"]);
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
+        std::fs::hard_link(project.root.join(relative), external.join(relative))?;
+
+        let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
+
+        std::assert_matches!(
+            result,
+            Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
+        );
+        assert_eq!(writer.apply_calls(), 0);
+        assert_eq!(
+            std::fs::read_to_string(external.join(relative))?,
+            "original"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observed_apply_forwards_every_native_candidate() -> color_eyre::eyre::Result<()> {
         struct Counter(AtomicUsize);
 
         impl ApplyObserver for Counter {
@@ -562,13 +629,14 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b", "c"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
 
-        apply_resilient_with_observer(&writer, &project, &plan, &journal, &observer)
+        apply_resilient_with_observer(&writer, &mutation, &observer)
             .await
-            .unwrap();
+            .map_err(ApplyFailure::into_core_error)?;
 
         assert_eq!(observer.0.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     #[tokio::test]
@@ -581,11 +649,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b", "colors", "c", "d"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(
             names(&report.applied),
@@ -611,11 +675,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "vite", "b"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(
             names(&report.applied),
@@ -640,11 +700,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "colors", "b", "left-pad", "c"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(
             names(&report.applied),
@@ -682,11 +738,7 @@ mod tests {
             rewrite: RewriteMode::Auto,
             ..Plan::default()
         };
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(report.applied.len(), 1);
         assert_eq!(report.skipped.len(), 1);
@@ -715,11 +767,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b", "r", "bad"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert_eq!(
             names(&report.applied),
@@ -743,11 +791,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "x", "b", "y", "c"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         // a, b, c always apply; exactly one of x/y is held.
         let applied = names(&report.applied);
@@ -771,11 +815,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b", "c"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let report = apply_resilient(&writer, &project, &plan, &journal)
-            .await
-            .unwrap();
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
         assert!(report.applied.is_empty());
         assert_eq!(skipped_names(&report), names(&plan.changes));
@@ -795,9 +835,7 @@ mod tests {
             project,
         } = temp_project();
         let plan = plan(&["a", "b"]);
-        let journal = writer.mutation_journal(&project, &plan).await.unwrap();
-
-        let result = apply_resilient(&writer, &project, &plan, &journal).await;
+        let result = apply_resilient(&writer, &project, &plan).await;
 
         std::assert_matches!(&result, Err(err) if expected(err));
         assert_eq!(writer.apply_calls(), 1);

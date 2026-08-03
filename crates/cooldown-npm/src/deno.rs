@@ -15,9 +15,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::verify_current_unknown;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result,
-    SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher,
+    ReleaseOrder, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::hash_map::Entry;
@@ -483,6 +484,10 @@ impl ReleaseFetcher for DenoTool {
 
 #[async_trait]
 impl ToolWrite for DenoTool {
+    fn mutation_tool(&self) -> ToolId {
+        DENO_ID
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -512,12 +517,8 @@ impl ToolWrite for DenoTool {
     /// result, so every planned candidate is reported reached or held and every collateral move of an
     /// unplanned package surfaces as its own row — no version change is ever silent. A resolver
     /// failure marks all candidates held and lets the caller restore the journal.
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);

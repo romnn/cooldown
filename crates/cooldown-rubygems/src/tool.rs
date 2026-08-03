@@ -12,9 +12,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -176,6 +177,10 @@ impl ReleaseFetcher for BundlerTool {
 
 #[async_trait]
 impl ToolWrite for BundlerTool {
+    fn mutation_tool(&self) -> ToolId {
+        BUNDLER_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // A `gemspec` directive in the Gemfile makes bundler load the project's `*.gemspec` (Ruby),
         // which typically `require_relative`s a `lib/**/version.rb`. The throwaway probe copy must
@@ -197,12 +202,8 @@ impl ToolWrite for BundlerTool {
         )
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             // `bundle update --conservative <gem>` re-resolves just this gem (and its requirements)

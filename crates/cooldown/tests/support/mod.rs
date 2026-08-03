@@ -28,9 +28,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use color_eyre::eyre;
 use cooldown_adapter_util::{program_on_path, resolve_program};
 
 const TOOL_ATTEMPTS: usize = 3;
@@ -88,6 +89,17 @@ impl Fixture {
     /// Run a raw command in the project root, returning its captured output. Used to drive the real
     /// package manager when seeding a starting lock (e.g. `uv lock --exclude-newer …`).
     pub fn run_tool(&self, program: &str, args: &[&str], envs: &[(&str, &str)]) -> CapturedOutput {
+        self.run_tool_result(program, args, envs, None)
+            .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
+    }
+
+    fn run_tool_result(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        phase: Option<&str>,
+    ) -> eyre::Result<CapturedOutput> {
         let executable = resolve_program(program);
         let mut attempt = 1;
         loop {
@@ -96,15 +108,16 @@ impl Fixture {
             for (key, value) in envs {
                 command.env(key, value);
             }
-            let output = command
-                .output()
-                .unwrap_or_else(|err| panic!("spawn {program}: {err}"));
+            let output = match phase {
+                Some(phase) => traced_output(&mut command, phase)?,
+                None => command.output()?,
+            };
             let captured = CapturedOutput::from(program, args, output);
             if captured.status.success()
                 || !captured.is_transient_tool_failure()
                 || attempt == TOOL_ATTEMPTS
             {
-                return captured;
+                return Ok(captured);
             }
             eprintln!(
                 "retrying transient tool failure ({}/{TOOL_ATTEMPTS}): {}",
@@ -116,6 +129,24 @@ impl Fixture {
             ));
             attempt += 1;
         }
+    }
+
+    /// Runs a raw command while identifying its phase and retaining its captured diagnostics.
+    pub fn run_tool_traced(
+        &self,
+        phase: &str,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> eyre::Result<CapturedOutput> {
+        eprintln!(
+            "starting integration phase `{phase}`: {program} {}",
+            args.join(" ")
+        );
+        let started = Instant::now();
+        let captured = self.run_tool_result(program, args, envs, Some(phase))?;
+        trace_captured_phase(phase, started, &captured);
+        Ok(captured)
     }
 
     /// Run the built `cooldown` binary against the fixture with the given args, capturing output.
@@ -134,6 +165,26 @@ impl Fixture {
         CapturedOutput::from("cooldown", args, output)
     }
 
+    /// Runs cooldown while identifying its phase and retaining its captured diagnostics.
+    pub fn cooldown_traced(&self, phase: &str, args: &[&str]) -> eyre::Result<CapturedOutput> {
+        eprintln!(
+            "starting integration phase `{phase}`: cooldown {}",
+            args.join(" ")
+        );
+        let started = Instant::now();
+        let exe = env!("CARGO_BIN_EXE_cooldown");
+        let mut command = Command::new(exe);
+        command
+            .current_dir(self.dir.path())
+            .args(args)
+            .args(self.tag_independent.then_some("--no-respect-dist-tags"))
+            .arg("--dir")
+            .arg(self.dir.path());
+        let captured = CapturedOutput::from("cooldown", args, traced_output(&mut command, phase)?);
+        trace_captured_phase(phase, started, &captured);
+        Ok(captured)
+    }
+
     /// Run a `cooldown` subcommand with `--json` and parse the envelope. Panics with the captured
     /// stderr if the binary did not emit valid JSON, so a resolver/setup failure is legible.
     pub fn cooldown_json(&self, args: &[&str]) -> Envelope {
@@ -150,6 +201,79 @@ impl Fixture {
             });
         Envelope { value }
     }
+
+    /// Runs a JSON command while identifying its phase and retaining its captured diagnostics.
+    pub fn cooldown_json_traced(&self, phase: &str, args: &[&str]) -> eyre::Result<Envelope> {
+        let mut full: Vec<&str> = args.to_vec();
+        full.push("--json");
+        let captured = self.cooldown_traced(phase, &full)?;
+        let value: serde_json::Value = serde_json::from_slice(&captured.stdout).map_err(|error| {
+            eyre::eyre!(
+                "cooldown {args:?} did not emit JSON: {error}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                captured.stdout_str(),
+                captured.stderr_str(),
+            )
+        })?;
+        Ok(Envelope { value })
+    }
+}
+
+fn traced_output(command: &mut Command, phase: &str) -> eyre::Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| eyre::eyre!("traced command did not expose stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| eyre::eyre!("traced command did not expose stderr"))?;
+    let (status, stdout, stderr) = std::thread::scope(|scope| -> eyre::Result<_> {
+        let stdout = scope.spawn(|| capture_traced_stream(stdout, phase, "stdout"));
+        let stderr = scope.spawn(|| capture_traced_stream(stderr, phase, "stderr"));
+        let status = child.wait()?;
+        let stdout = stdout
+            .join()
+            .map_err(|_| eyre::eyre!("traced stdout reader panicked"))??;
+        let stderr = stderr
+            .join()
+            .map_err(|_| eyre::eyre!("traced stderr reader panicked"))??;
+        Ok((status, stdout, stderr))
+    })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn capture_traced_stream(
+    mut stream: impl std::io::Read,
+    phase: &str,
+    name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| std::io::Error::other("stream read exceeded its buffer"))?;
+        captured.extend_from_slice(chunk);
+        eprintln!("[{phase} {name}] {}", String::from_utf8_lossy(chunk));
+    }
+}
+
+fn trace_captured_phase(phase: &str, started: Instant, captured: &CapturedOutput) {
+    eprintln!(
+        "completed integration phase `{phase}` in {:?}: status={:?}",
+        started.elapsed(),
+        captured.status.code(),
+    );
 }
 
 /// Captured stdout/stderr/status of a subprocess run.
@@ -217,6 +341,20 @@ impl CapturedOutput {
             self.stderr_str(),
         );
         self
+    }
+
+    /// Returns successful output or an error containing both captured streams.
+    pub fn require_success(self) -> eyre::Result<Self> {
+        if self.status.success() {
+            return Ok(self);
+        }
+        Err(eyre::eyre!(
+            "command failed ({}): status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.label,
+            self.status.code(),
+            self.stdout_str(),
+            self.stderr_str(),
+        ))
     }
 }
 
@@ -572,7 +710,7 @@ pub fn tool_on_path(tool: &str) -> bool {
 /// failure rather than a passing skipped test.
 #[macro_export]
 macro_rules! skip_if_missing {
-    ($tool:expr) => {
+    ($tool:expr, $return:expr) => {
         let tool = $tool;
         if !$crate::support::tool_on_path(tool) {
             assert!(
@@ -583,8 +721,11 @@ macro_rules! skip_if_missing {
                 "skipping: `{}` not found on PATH (provision it via the repo `mise.toml`)",
                 tool
             );
-            return;
+            return $return;
         }
+    };
+    ($tool:expr) => {
+        $crate::skip_if_missing!($tool, ());
     };
 }
 

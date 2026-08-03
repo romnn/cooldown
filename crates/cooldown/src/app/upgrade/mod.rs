@@ -70,15 +70,15 @@ pub(super) struct UpgradeCtx<'a> {
     defer_build: bool,
 }
 
-#[derive(Clone, Copy)]
 enum ProjectExecution {
     Source,
-    Isolated,
+    Copy,
+    Isolated(cooldown_core::IsolatedMutationProject),
 }
 
 impl ProjectExecution {
-    const fn is_isolated(self) -> bool {
-        matches!(self, ProjectExecution::Isolated)
+    const fn is_isolated(&self) -> bool {
+        !matches!(self, ProjectExecution::Source)
     }
 }
 
@@ -108,7 +108,7 @@ impl<'a> UpgradeCtx<'a> {
     }
 
     fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
-        match self.access {
+        match &self.access {
             ProjectExecution::Source => super::lock::ProjectAccessWriteGuard::acquire(
                 self.repo_root,
                 &self.pctx.project.root,
@@ -116,7 +116,22 @@ impl<'a> UpgradeCtx<'a> {
                 self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
             )
             .map(Some),
-            ProjectExecution::Isolated => Ok(None),
+            ProjectExecution::Copy | ProjectExecution::Isolated(_) => Ok(None),
+        }
+    }
+
+    async fn prepare_mutation(
+        &self,
+        plan: &cooldown_core::Plan,
+    ) -> cooldown_core::Result<cooldown_core::PreparedMutation> {
+        match &self.access {
+            ProjectExecution::Isolated(project) => {
+                cooldown_core::PreparedMutation::prepare_isolated(self.writer, project, plan).await
+            }
+            ProjectExecution::Source | ProjectExecution::Copy => {
+                cooldown_core::PreparedMutation::prepare(self.writer, &self.pctx.project, plan)
+                    .await
+            }
         }
     }
 }
@@ -217,7 +232,7 @@ impl Workspace {
             };
 
             let access = if opts.dry_run {
-                ProjectExecution::Isolated
+                ProjectExecution::Copy
             } else {
                 ProjectExecution::Source
             };
@@ -312,7 +327,7 @@ impl Workspace {
                 &copied_pctx,
                 &preview_opts,
                 self.repo_root(),
-                ProjectExecution::Isolated,
+                prepared.execution(),
                 false,
             ),
             PlanMode::Upgrade,
@@ -362,6 +377,7 @@ impl Workspace {
         };
         let mut trial_opts = opts.clone();
         trial_opts.build = false;
+        let execution = ProjectExecution::Isolated(trial.mutation_project());
         let mut project_acc = UpgradeAccum::default();
         let status = ProjectUpgradeExecutor::new(
             self,
@@ -371,7 +387,7 @@ impl Workspace {
                 &copied_pctx,
                 &trial_opts,
                 self.repo_root(),
-                ProjectExecution::Isolated,
+                execution,
                 true,
             ),
             mode,
@@ -441,6 +457,13 @@ impl PreparedPreview {
         match self {
             PreparedPreview::Generic(copy) => &copy.project,
             PreparedPreview::Isolated(copy) => copy.project(),
+        }
+    }
+
+    fn execution(&self) -> ProjectExecution {
+        match self {
+            PreparedPreview::Generic(_) => ProjectExecution::Copy,
+            PreparedPreview::Isolated(copy) => ProjectExecution::Isolated(copy.mutation_project()),
         }
     }
 }

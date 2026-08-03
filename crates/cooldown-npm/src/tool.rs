@@ -31,9 +31,9 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     FetchContext, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
-    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason,
+    Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -1122,6 +1122,10 @@ fn multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
 
 #[async_trait]
 impl<L: NodeLock> ToolWrite for NpmTool<L> {
+    fn mutation_tool(&self) -> ToolId {
+        L::ID
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -1130,12 +1134,8 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         journal::<L>(project, plan)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
         // work: a cross-major target a still-present dependent's peer range excludes is held up
         // front — pnpm's resolver only *warns* on the mismatch, and npm (which rejects it by
@@ -1935,9 +1935,9 @@ packages:
             ..Plan::default()
         };
 
-        let journal =
-            ProjectMutationJournal::capture(&project.root, std::iter::empty::<&Utf8Path>())?;
-        let report = tool().apply(&project, &plan, &journal).await?;
+        let tool = tool();
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
 
         assert!(report.applied.is_empty());
         assert_eq!(report.skipped.len(), 1);

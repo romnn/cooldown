@@ -44,6 +44,7 @@
 
 mod support;
 
+use color_eyre::eyre;
 use support::{ChangeVersions, Fixture, changed_packages, pnpm_lock_pins};
 
 /// The absolute resolution cutoff. The npm registry's publish history before this instant is
@@ -374,11 +375,7 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
     );
 }
 
-/// `outdated` and `fix` recover after `sync` activates pnpm's native release-age gate.
-#[test]
-fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
-    skip_if_missing!("pnpm");
-
+fn native_minimum_age_migration_fixture() -> eyre::Result<(Fixture, Vec<u8>)> {
     // Seed without a persistent native policy so the lock can contain versions newer than FREEZE.
     // `nanoid` remains intentionally exempt after sync; the repair must preserve that native
     // exemption while adding exact allowances for the versions it is repairing. TypeScript is
@@ -389,10 +386,22 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
     fixture.write(".npmrc", NPMRC);
     add_root_dependency(&fixture, "nanoid", "^3.3.0");
     add_root_dependency(&fixture, "typescript", "^5.0.0");
-    seed_lock(&fixture, FREEZE_LATER);
     let seed_minutes = minimum_release_age_minutes(FREEZE_LATER).to_string();
     fixture
-        .run_tool(
+        .run_tool_traced(
+            "seed pre-policy lock",
+            "pnpm",
+            &[
+                "install",
+                "--lockfile-only",
+                &format!("--config.minimumReleaseAge={seed_minutes}"),
+            ],
+            &[],
+        )?
+        .require_success()?;
+    fixture
+        .run_tool_traced(
+            "pin independently adoptable TypeScript",
             "pnpm",
             &[
                 "update",
@@ -402,8 +411,8 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
                 &format!("--config.minimumReleaseAge={seed_minutes}"),
             ],
             &[],
-        )
-        .expect_success();
+        )?
+        .require_success()?;
     fixture.write("cooldown.toml", "[package.nanoid]\nlatest = true\n");
     let minimum_age_minutes = minimum_release_age_minutes(FREEZE);
     let min_age = format!("{minimum_age_minutes}m");
@@ -411,10 +420,13 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
     // Activating the native gate after resolution makes pnpm reject the existing lock. This is the
     // migration state `fix` must cross rather than misclassifying every downgrade as a conflict.
     fixture
-        .cooldown(&["sync", "--tool", "pnpm", "--min-age", &min_age])
-        .expect_success();
+        .cooldown_traced(
+            "activate native minimum age",
+            &["sync", "--tool", "pnpm", "--min-age", &min_age],
+        )?
+        .require_success()?;
     let native_before_fix = fixture.read_bytes("pnpm-workspace.yaml");
-    let native = String::from_utf8(native_before_fix.clone()).expect("native config is utf8");
+    let native = String::from_utf8(native_before_fix.clone())?;
     assert!(
         native.contains(&format!("minimumReleaseAge: {minimum_age_minutes}")),
         "sync must persist the requested native release-age gate: {native}"
@@ -423,9 +435,17 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         native.contains("minimumReleaseAgeExclude:") && native.contains("nanoid"),
         "sync must persist the package exemption the repair needs to preserve: {native}"
     );
+    Ok((fixture, native_before_fix))
+}
 
+fn assert_native_gate_rejects_starting_lock(fixture: &Fixture) -> eyre::Result<()> {
     let lock_before_rejection = fixture.read_bytes("pnpm-lock.yaml");
-    let rejected = fixture.run_tool("pnpm", &["install", "--lockfile-only"], &[]);
+    let rejected = fixture.run_tool_traced(
+        "verify the starting lock is rejected",
+        "pnpm",
+        &["install", "--lockfile-only"],
+        &[],
+    )?;
     let rejection = format!("{}\n{}", rejected.stdout_str(), rejected.stderr_str());
     assert!(
         !rejected.status.success(),
@@ -440,8 +460,21 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         fixture.read_bytes("pnpm-lock.yaml"),
         "the raw preflight probe must leave the rejected lock unchanged"
     );
+    Ok(())
+}
 
-    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+/// `outdated` and `fix` recover after `sync` activates pnpm's native release-age gate.
+#[test]
+fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+
+    let (fixture, native_before_fix) = native_minimum_age_migration_fixture()?;
+    assert_native_gate_rejects_starting_lock(&fixture)?;
+
+    let outdated = fixture.cooldown_json_traced(
+        "evaluate outdated from rejected lock",
+        &["outdated", "--freeze", FREEZE],
+    )?;
     assert!(outdated.ok(), "outdated should complete: {outdated:#?}");
     assert!(
         outdated
@@ -456,7 +489,8 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         "the valid TypeScript update must not be blocked by the starting-lock preflight"
     );
 
-    let fixed = fixture.cooldown_json(&["fix", "--freeze", FREEZE]);
+    let fixed =
+        fixture.cooldown_json_traced("repair the rejected lock", &["fix", "--freeze", FREEZE])?;
     assert!(
         fixed.ok(),
         "fix should repair the pre-policy lock: {fixed:#?}"
@@ -478,9 +512,11 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         "temporary repair overrides must not leak into native config"
     );
 
-    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    let check =
+        fixture.cooldown_json_traced("verify the repaired lock", &["check", "--freeze", FREEZE])?;
     assert!(check.ok(), "the repaired lock should satisfy the policy");
     assert_eq!(check.summary_violations(), 0);
+    Ok(())
 }
 
 /// The per-package-window fixture's manifest: a single direct `eslint` on the v9 line with a caret

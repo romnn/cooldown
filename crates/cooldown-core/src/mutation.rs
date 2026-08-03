@@ -101,8 +101,9 @@ impl ProjectMutationState {
     /// # Errors
     ///
     /// Returns a [`CoreError`] when the project identity or any file cannot be captured safely.
-    /// Writable paths with a symbolic-link ancestor are rejected because another project lease may
-    /// govern their resolved target.
+    /// Writable paths with a symbolic-link ancestor or final entry are rejected because another
+    /// project lease may govern their resolved target.
+    /// Existing multiply-linked files are rejected for the same reason.
     pub fn capture(root: &Utf8Path, write_set: &ProjectMutationJournal) -> Result<Self> {
         let project = ProjectMutationRoot::capture(root)?;
         let files = write_set
@@ -402,7 +403,9 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) when the project identity or a file cannot be
     /// captured safely.
-    /// Writable paths with a symbolic-link ancestor are rejected.
+    /// Writable paths with a symbolic-link ancestor or final entry are rejected.
+    /// Existing multiply-linked files are rejected because an in-place write could mutate an
+    /// alias outside the project lease.
     pub fn capture<I, P>(root: &Utf8Path, paths: I) -> Result<Self>
     where
         I: IntoIterator<Item = P>,
@@ -425,7 +428,8 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) when the project identity, a path, or a snapshot is
     /// invalid.
-    /// Writable paths with a symbolic-link ancestor are rejected.
+    /// Writable paths with a symbolic-link ancestor or final entry are rejected, as are existing
+    /// multiply-linked files.
     pub fn from_snapshot(root: &Utf8Path, files: Vec<ProjectMutationFile>) -> Result<Self> {
         Self::from_bound_snapshot(ProjectMutationRoot::capture(root)?, files)
     }
@@ -441,7 +445,7 @@ impl ProjectMutationJournal {
             ));
         }
         for file in &files {
-            validate_mutation_ancestors(project.path(), &file.path)?;
+            validate_mutation_target(project.path(), &file.path)?;
         }
         Ok(ProjectMutationJournal { project, files })
     }
@@ -457,7 +461,8 @@ impl ProjectMutationJournal {
     /// # Errors
     ///
     /// Returns [`CoreError::LockConflict`] when `root` names another project, its directory was
-    /// replaced after journal capture, or a writable ancestor is no longer a regular directory.
+    /// replaced after journal capture, a writable ancestor is no longer a regular directory, or a
+    /// final target became a symbolic link, special file, or multiply-linked regular file.
     pub fn validate_project(&self, root: &Utf8Path) -> Result<()> {
         let live = ProjectMutationRoot::capture(root).map_err(|error| {
             CoreError::LockConflict(format!(
@@ -466,7 +471,7 @@ impl ProjectMutationJournal {
         })?;
         self.project.ensure_same(&live)?;
         for file in &self.files {
-            validate_mutation_ancestors(self.project.path(), &file.path).map_err(|error| {
+            validate_mutation_target(self.project.path(), &file.path).map_err(|error| {
                 CoreError::LockConflict(format!(
                     "could not revalidate mutation write set for {}: {error}",
                     self.project.path()
@@ -498,8 +503,8 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the path is not a regular file, changes identity
-    /// during capture, or cannot be read.
+    /// Returns a [`CoreError`](crate::CoreError) if the path is not a singly linked regular file,
+    /// changes identity during capture, or cannot be read.
     fn capture_file(root: &Utf8Path, rel: &Utf8Path) -> Result<ProjectMutationFile> {
         ProjectMutationFile::capture(root, rel)
     }
@@ -628,6 +633,7 @@ impl ProjectMutationFile {
         }
         let mut file = std::fs::File::open(&path)?;
         let opened = file.metadata()?;
+        require_single_link(&file, &opened, &path)?;
         let identity = same_file::Handle::from_file(file.try_clone()?)?;
         let current = std::fs::symlink_metadata(&path)?;
         let current_identity = same_file::Handle::from_path(&path)?;
@@ -645,6 +651,7 @@ impl ProjectMutationFile {
                 "{path} changed identity while cooldown read its mutation journal"
             )));
         }
+        require_single_link(&file, &final_metadata, &path)?;
         ProjectMutationFile::from_snapshot(rel.to_owned(), Some(bytes), Some(opened.permissions()))
     }
 }
@@ -896,6 +903,72 @@ fn validate_mutation_ancestors(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_mutation_target(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
+    validate_mutation_ancestors(root, path)?;
+    let target = root.join(path);
+    let metadata = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(CoreError::Filesystem(format!(
+            "refusing non-regular project mutation target {target}"
+        )));
+    }
+    let file = std::fs::File::open(&target)?;
+    let opened = file.metadata()?;
+    let identity = same_file::Handle::from_file(file.try_clone()?)?;
+    let current_identity = same_file::Handle::from_path(&target)?;
+    if !opened.file_type().is_file() || identity != current_identity {
+        return Err(CoreError::LockConflict(format!(
+            "{target} changed identity while cooldown revalidated its mutation target"
+        )));
+    }
+    require_single_link(&file, &opened, &target)
+}
+
+#[cfg(unix)]
+fn require_single_link(
+    _file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+    path: &Utf8Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.nlink() == 1 {
+        return Ok(());
+    }
+    Err(CoreError::Filesystem(format!(
+        "refusing multiply linked project mutation target {path}"
+    )))
+}
+
+#[cfg(windows)]
+fn require_single_link(
+    file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+    path: &Utf8Path,
+) -> Result<()> {
+    if winapi_util::file::information(file)?.number_of_links() == 1 {
+        return Ok(());
+    }
+    Err(CoreError::Filesystem(format!(
+        "refusing multiply linked project mutation target {path}"
+    )))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn require_single_link(
+    _file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+    path: &Utf8Path,
+) -> Result<()> {
+    Err(CoreError::Filesystem(format!(
+        "cannot verify project mutation target link count for {path} on this platform"
+    )))
 }
 
 fn validate_state(root: &Utf8Path, expected: &[ProjectMutationFile], context: &str) -> Result<()> {
@@ -1160,6 +1233,49 @@ mod mutation_journal_tests {
             std::fs::read_to_string(external_root.join("Cargo.toml"))?,
             "external"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_authority_rejects_a_retargeted_file_symlink() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let project_root = root(&project)?;
+        let external_root = root(&external)?;
+        let relative = Utf8Path::new("requirements.txt");
+        let target = external_root.join(relative);
+        std::fs::write(project_root.join(relative), "original")?;
+        std::fs::write(&target, "external")?;
+        let journal = ProjectMutationJournal::capture(&project_root, [relative])?;
+        std::fs::remove_file(project_root.join(relative))?;
+        symlink(&target, project_root.join(relative))?;
+
+        let result = journal.validate_project(&project_root);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        assert_eq!(std::fs::read_to_string(target)?, "external");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn mutation_journal_rejects_a_multiply_linked_file() -> eyre::Result<()> {
+        let project = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let project_root = root(&project)?;
+        let external_root = root(&external)?;
+        let relative = Utf8Path::new("requirements.txt");
+        let external_alias = external_root.join("requirements.txt");
+        std::fs::write(project_root.join(relative), "original")?;
+        std::fs::hard_link(project_root.join(relative), &external_alias)?;
+
+        let result = ProjectMutationJournal::capture(&project_root, [relative]);
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        assert_eq!(std::fs::read_to_string(external_alias)?, "original");
         Ok(())
     }
 

@@ -13,9 +13,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -175,6 +176,10 @@ impl ReleaseFetcher for HexTool {
 
 #[async_trait]
 impl ToolWrite for HexTool {
+    fn mutation_tool(&self) -> ToolId {
+        HEX_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `mix deps.get`/`deps.update` COMPILES `mix.exs` (Elixir) to resolve, and a project's
         // `mix.exs` frequently reads sibling source (a `@version` from a module, `Code.require_file`,
@@ -193,12 +198,8 @@ impl ToolWrite for HexTool {
         ProjectMutationJournal::capture(&project.root, [Utf8Path::new("mix.lock")])
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             // `mix deps.update <dep>` re-resolves that dependency within the manifest's constraints.

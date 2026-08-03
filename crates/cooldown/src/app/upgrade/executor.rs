@@ -384,11 +384,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// Final edge-binding enforcement and run-level audit for this project.
     async fn normalize_edges(&mut self) -> MutationFlow {
+        let plan = Plan {
+            edge_policy: self.ctx.pctx.edge_policy,
+            ..Plan::default()
+        };
+        let mutation = match self.ctx.prepare_mutation(&plan).await {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return ControlFlow::Break(MutationTerminated);
+            }
+        };
         match self
             .ctx
             .writer
             .normalize_lock_edges(
-                &self.ctx.pctx.project,
+                &mutation,
                 self.ctx.pctx.edge_policy,
                 self.initial_edge_snapshot.as_deref(),
                 &self.committed_edge_rebinds,
@@ -1420,11 +1431,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .progress
             .phase(format!("applying {} planned changes", changes.len()));
         self.ctx.opts.progress.policy_pass(&changes);
-        let journal = match self
+        let prepared = match self
             .prepare_batch_journal(&plan, rollback.as_deref_mut())
             .await
         {
-            Ok(journal) => journal,
+            Ok(prepared) => prepared,
             Err(error) => {
                 outcome
                     .errors
@@ -1437,9 +1448,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
         let mutation = match super::super::resilient_apply::apply_resilient_with_observer(
             self.ctx.writer,
-            &self.ctx.pctx.project,
-            &plan,
-            &journal,
+            &prepared,
             &self.ctx.opts.progress,
         )
         .await
@@ -1455,22 +1464,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcome;
             }
         };
+        let journal = prepared.journal();
         let expected = mutation.expected;
         let report = mutation.report;
         if let Err(error) = validate_edge_rebinds(&report.edge_rebinds) {
-            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+            self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             self.add_change_errors(&mut outcome, &error, &changes);
             return outcome;
         }
         if report.applied.is_empty() {
             self.add_batch_skips(&mut outcome, report.skipped);
-            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+            self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             return outcome;
         }
         let report = match self.verify_apply_report(report, &changes).await {
             Ok(report) => report,
             Err(error) => {
-                self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+                self.restore_journal_into_outcome(journal, &expected, &mut outcome);
                 self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
@@ -1480,7 +1490,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if !report.planned_applied {
             // No requested target landed: roll any incidental resolver movement back to the captured
             // state instead of committing a collateral-only mutation.
-            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+            self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             return outcome;
         }
 
@@ -1493,7 +1503,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await
         else {
-            self.restore_journal_into_outcome(&journal, &expected, &mut outcome);
+            self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             return outcome;
         };
 
@@ -1511,17 +1521,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &self,
         plan: &Plan,
         rollback: Option<&mut TrialRollback>,
-    ) -> cooldown_core::Result<cooldown_core::ProjectMutationJournal> {
-        let journal = self
-            .ctx
-            .writer
-            .mutation_journal(&self.ctx.pctx.project, plan)
-            .await?;
-        journal.validate_project(&self.ctx.pctx.project.root)?;
+    ) -> cooldown_core::Result<cooldown_core::PreparedMutation> {
+        let prepared = self.ctx.prepare_mutation(plan).await?;
         if let Some(rollback) = rollback {
-            rollback.preserve(&journal)?;
+            rollback.preserve(prepared.journal())?;
         }
-        Ok(journal)
+        Ok(prepared)
     }
 
     fn batch_plan(&self, changes: &[Change], state: &TrialState) -> Plan {

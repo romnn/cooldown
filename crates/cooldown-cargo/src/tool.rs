@@ -34,10 +34,10 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
     Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
-    MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId,
+    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -735,6 +735,10 @@ fn reached_after(
 
 #[async_trait]
 impl ToolWrite for CargoTool {
+    fn mutation_tool(&self) -> ToolId {
+        CARGO_ID
+    }
+
     fn mutation_execution(&self) -> MutationExecution<'_> {
         MutationExecution::Isolated(self)
     }
@@ -774,22 +778,17 @@ impl ToolWrite for CargoTool {
         ProjectMutationJournal::capture(&project.root, relative)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         self.apply_plan(project, plan, journal, None).await
     }
 
     async fn apply_with_observer(
         &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
+        mutation: &PreparedMutation,
         observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         let report = self
             .apply_plan(project, plan, journal, Some(observer))
             .await;
@@ -823,11 +822,12 @@ impl ToolWrite for CargoTool {
     /// Final edge-binding enforcement and run-start-to-final audit.
     async fn normalize_lock_edges(
         &self,
-        project: &Project,
+        mutation: &PreparedMutation,
         policy: EdgePolicy,
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<EdgeNormalizationReport> {
+        let (project, _, _) = mutation.isolated_parts_for(self)?;
         let before_lock = before
             .map(|contents| {
                 std::str::from_utf8(contents)
@@ -1309,21 +1309,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_apply_rejects_a_journal_from_another_project() -> eyre::Result<()> {
-        let source = tempfile::tempdir()?;
+    async fn prepared_apply_rejects_an_unauthorized_plan_subset() -> eyre::Result<()> {
         let other = tempfile::tempdir()?;
-        let source_root = Utf8PathBuf::from_path_buf(source.path().to_owned())
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let other_root = Utf8PathBuf::from_path_buf(other.path().to_owned())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        std::fs::write(source_root.join("Cargo.toml"), "[workspace]\n")?;
         std::fs::write(other_root.join("Cargo.toml"), "[workspace]\n")?;
-        let source_project = Project {
-            root: source_root.clone(),
-            kind: CARGO_ID,
-            manifest: source_root.join("Cargo.toml"),
-            exclude_newer: None,
-        };
         let other_project = Project {
             root: other_root.clone(),
             kind: CARGO_ID,
@@ -1336,9 +1326,37 @@ mod tests {
             cooldown_registry::HttpOptions::default(),
         )?);
         let plan = Plan::default();
-        let journal = tool.mutation_journal(&other_project, &plan).await?;
+        let mutation = PreparedMutation::prepare(&tool, &other_project, &plan).await?;
 
-        let result = tool.apply(&source_project, &plan, &journal).await;
+        let result = mutation.subset(vec![change("serde", "1.0.0", "1.0.1", false)]);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_edge_normalization_requires_an_isolated_project() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        let project = Project {
+            root: root.clone(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let plan = Plan::default();
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+
+        let result = tool
+            .normalize_lock_edges(&mutation, EdgePolicy::None, None, &[])
+            .await;
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
@@ -1365,14 +1383,14 @@ mod tests {
             cooldown_registry::HttpOptions::default(),
         )?);
         let plan = Plan::default();
-        let journal = tool.mutation_journal(&project, &plan).await?;
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
 
-        tool.apply(&project, &plan, &journal).await?;
+        tool.apply(&mutation).await?;
         std::fs::rename(&root, &moved)?;
         std::fs::create_dir(&root)?;
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
 
-        let result = tool.apply(&project, &plan, &journal).await;
+        let result = tool.apply(&mutation).await;
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())

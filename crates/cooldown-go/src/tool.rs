@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal,
-    Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport,
+    LockVerifyReport, NativePolicyLayer, Plan, PreparedMutation, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -153,6 +153,10 @@ impl ReleaseFetcher for GoTool {
 
 #[async_trait]
 impl ToolWrite for GoTool {
+    fn mutation_tool(&self) -> ToolId {
+        GO_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `go get`/`go mod tidy` reads the package import graph from `.go` source to keep `go.mod`
         // requires consistent, so the throwaway copy must include source. Go source is small; the bulk
@@ -171,12 +175,8 @@ impl ToolWrite for GoTool {
         mutation::mutation_journal(&project.root, plan)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         apply::apply(&self.go, project, plan, journal).await
     }
 

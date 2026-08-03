@@ -13,9 +13,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -175,6 +176,10 @@ impl ReleaseFetcher for SwiftTool {
 
 #[async_trait]
 impl ToolWrite for SwiftTool {
+    fn mutation_tool(&self) -> ToolId {
+        SWIFT_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `swift package` COMPILES `Package.swift` (and any version-specific `Package@swift-N.swift`,
         // plus helper files it imports) to resolve, so the throwaway probe copy must carry `.swift`
@@ -193,12 +198,8 @@ impl ToolWrite for SwiftTool {
         ProjectMutationJournal::capture(&project.root, [Utf8Path::new("Package.resolved")])
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             // `swift package update <identity>` re-resolves one dependency within Package.swift's

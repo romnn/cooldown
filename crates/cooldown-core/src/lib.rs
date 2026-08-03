@@ -33,8 +33,8 @@ pub use policy::{
 };
 pub use ports::{
     AcceptedPublication, ApplyAttempt, ApplyObserver, Capabilities, Clock, IsolatedMutation,
-    IsolatedMutationStrategy, MutationExecution, MutationRecovery, NativePolicyLayer, NativeRule,
-    PackageRegistry, RawArtifact, RawRelease, RawWindow, RecoveryDisposition, ReleaseFetcher,
-    ResolveInputs, ResolvedPolicy, SyncReport, SyncScope, Tool, ToolRead, ToolWrite,
-    debug_assert_sorted, normalize_native,
+    IsolatedMutationProject, IsolatedMutationStrategy, MutationExecution, MutationRecovery,
+    NativePolicyLayer, NativeRule, PackageRegistry, PreparedMutation, RawArtifact, RawRelease,
+    RawWindow, RecoveryDisposition, ReleaseFetcher, ResolveInputs, ResolvedPolicy, SyncReport,
+    SyncScope, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
 };

@@ -214,12 +214,9 @@ fn scan_marker_groups(
         result.validation_only.dedup();
         if scan.topmost_only {
             result.primary = keep_topmost(std::mem::take(&mut result.primary));
-            result.validation_only.retain(|candidate| {
-                !result
-                    .primary
-                    .iter()
-                    .any(|accepted| candidate.starts_with(accepted))
-            });
+            result
+                .validation_only
+                .retain(|candidate| result.primary.binary_search(candidate).is_err());
         }
     }
     Ok(found)
@@ -543,6 +540,37 @@ mod tests {
 
         assert!(found.primary.is_empty());
         assert_eq!(found.validation_only, vec![root, nested]);
+        Ok(())
+    }
+
+    #[test]
+    fn primary_root_does_not_hide_a_nested_validation_marker() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let nested = root.join("tools/custom");
+        std::fs::create_dir_all(nested.join(".cargo"))?;
+        std::fs::write(root.join("Cargo.lock"), "")?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"custom\"\n")?;
+        std::fs::write(
+            nested.join(".cargo/config.toml"),
+            "[resolver]\nlockfile-path = \"Custom.lock\"\n",
+        )?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert_eq!(found.primary, vec![root]);
+        assert_eq!(found.validation_only, vec![nested]);
         Ok(())
     }
 

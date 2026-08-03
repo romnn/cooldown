@@ -16,10 +16,11 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
-    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, ResolvedPolicy, Result,
+    RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -677,6 +678,10 @@ impl UvTool {
 
 #[async_trait]
 impl ToolWrite for UvTool {
+    fn mutation_tool(&self) -> ToolId {
+        UV_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `uv lock` builds local/workspace-member metadata via the PEP 517 backend for a `dynamic`
         // version or `readme`/`license = {file = ...}`, which reads `.py` source (e.g. `_version.py`).
@@ -701,12 +706,8 @@ impl ToolWrite for UvTool {
         )
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);

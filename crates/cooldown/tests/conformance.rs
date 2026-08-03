@@ -346,6 +346,10 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
+    fn mutation_tool(&self) -> ToolId {
+        GO
+    }
+
     fn mutation_execution(&self) -> MutationExecution<'_> {
         if self.root.join("use-isolated-mutation").exists() {
             MutationExecution::Isolated(self)
@@ -391,12 +395,8 @@ impl ToolWrite for FakeEco {
         ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
 
-    async fn apply(
-        &self,
-        p: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (p, plan, _) = mutation.parts_for(self)?;
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
         if self.root.join("use-isolated-mutation").exists() {
@@ -467,12 +467,11 @@ impl ToolWrite for FakeEco {
 
     async fn apply_with_observer(
         &self,
-        p: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
+        mutation: &PreparedMutation,
         _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        let report = self.apply(p, plan, journal).await;
+        let (p, _, journal) = mutation.parts_for(self)?;
+        let report = self.apply(mutation).await;
         if p.root.join("pending-recovery-on-apply").exists() {
             return Ok(ApplyAttempt::PendingRecovery {
                 detail: "fake adapter retained authoritative recovery evidence".to_string(),
@@ -496,11 +495,12 @@ impl ToolWrite for FakeEco {
 
     async fn normalize_lock_edges(
         &self,
-        project: &Project,
+        mutation: &PreparedMutation,
         _policy: EdgePolicy,
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<cooldown_core::EdgeNormalizationReport> {
+        let (project, _, _) = mutation.parts_for(self)?;
         if project.root.join("fail-edge-normalization").exists() {
             return Err(CoreError::PendingRecovery(
                 "fake edge normalization retained recovery evidence".to_string(),
@@ -609,17 +609,16 @@ impl ReleaseFetcher for UnknownLockFake {
 
 #[async_trait]
 impl ToolWrite for UnknownLockFake {
+    fn mutation_tool(&self) -> ToolId {
+        GO
+    }
+
     async fn mutation_journal(&self, p: &Project, plan: &Plan) -> Result<ProjectMutationJournal> {
         self.0.mutation_journal(p, plan).await
     }
 
-    async fn apply(
-        &self,
-        p: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
-        self.0.apply(p, plan, journal).await
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        self.0.apply(mutation).await
     }
 
     async fn build(&self, p: &Project) -> Result<VerifyReport> {
@@ -3725,6 +3724,10 @@ impl ReleaseFetcher for RepoScopedFake {
 
 #[async_trait]
 impl ToolWrite for RepoScopedFake {
+    fn mutation_tool(&self) -> ToolId {
+        REPO_TOOL
+    }
+
     async fn recover_pending_mutation(&self, project: &Project) -> Result<MutationRecovery> {
         self.recoveries.lock().unwrap().push(project.root.clone());
         Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
@@ -3733,12 +3736,8 @@ impl ToolWrite for RepoScopedFake {
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
-    async fn apply(
-        &self,
-        _p: &Project,
-        _plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        mutation.parts_for(self)?;
         Ok(ApplyReport::default())
     }
     async fn build(&self, _p: &Project) -> Result<VerifyReport> {
@@ -3911,15 +3910,15 @@ impl ReleaseFetcher for ProjectScopedFake {
 
 #[async_trait]
 impl ToolWrite for ProjectScopedFake {
+    fn mutation_tool(&self) -> ToolId {
+        PROJECT_TOOL
+    }
+
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
-    async fn apply(
-        &self,
-        _p: &Project,
-        _plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        mutation.parts_for(self)?;
         Ok(ApplyReport::default())
     }
     async fn build(&self, _p: &Project) -> Result<VerifyReport> {
@@ -4095,15 +4094,15 @@ impl ReleaseFetcher for HeldConflictFake {
 
 #[async_trait]
 impl ToolWrite for HeldConflictFake {
+    fn mutation_tool(&self) -> ToolId {
+        HELD_TOOL
+    }
+
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         ProjectMutationJournal::capture(&p.root, std::iter::empty::<&camino::Utf8Path>())
     }
-    async fn apply(
-        &self,
-        p: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (p, plan, _) = mutation.parts_for(self)?;
         // Any apply touches the tree it is handed — a dry-run must hand us the copy, never the real
         // root, so this sentinel never appears in the real project.
         std::fs::write(p.root.join("applied.sentinel"), "applied").unwrap();

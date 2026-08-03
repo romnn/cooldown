@@ -17,12 +17,19 @@
   `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side adapter fail a shared read
   session without performing recovery. `ProjectMutationState` pairs a rollback journal with the
   post-apply state observed before any conditional restore.
-- **Breaking library API:** `ToolWrite::apply_with_observer` returns an adapter-boundary postimage,
+- **Breaking library API:** `ToolWrite::apply` and `apply_with_observer` now accept a
+  `PreparedMutation` instead of independently supplied project, plan, and journal values. Callers
+  construct it through `PreparedMutation::prepare`; resilient retries derive authorized subsets
+  through `PreparedMutation::subset`. `ToolWrite::mutation_tool` binds the capability to its
+  consuming adapter. `apply_with_observer` returns an adapter-boundary postimage,
   using the `ApplyAttempt` enum to keep adapter-owned pending recovery outside the application's
-  rollback authority. `ApplyReport` carries non-fatal committed warnings, final edge audits return
-  an `EdgeNormalizationReport`, and `CoreError`/`DiagnosticKind` include `PendingRecovery`.
-  `ProjectMutationFile` also records standard file permissions and rejects non-regular paths so a
-  rollback can restore the file contents and modes without following a symlink. Its fields and the
+  rollback authority. `ToolWrite::normalize_lock_edges` also accepts the prepared capability, and
+  Cargo requires one carrying provenance from an adapter-created isolated project. `ApplyReport`
+  carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
+  `CoreError`/`DiagnosticKind` include `PendingRecovery`.
+  `ProjectMutationFile` also records standard file permissions and rejects non-regular or
+  multiply-linked paths so a rollback can restore the file contents and modes without following a
+  symlink or mutating an external hard-link alias. Its fields and the
   journal's file list are now private; callers should use `ProjectMutationJournal::capture`, the
   recovery-only `ProjectMutationJournal::from_snapshot`, and the read-only accessors. Journals and
   observed states are bound to the canonical source-project identity, preventing malformed write

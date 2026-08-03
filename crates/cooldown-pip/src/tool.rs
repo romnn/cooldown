@@ -12,10 +12,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -261,6 +261,10 @@ impl<L: PyLayout> ReleaseFetcher for PyTool<L> {
 
 #[async_trait]
 impl<L: PyLayout> ToolWrite for PyTool<L> {
+    fn mutation_tool(&self) -> ToolId {
+        L::ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `pip-compile`/`uv pip compile` EXECUTES a project's `setup.py` (and reads any version/readme
         // file it imports) to discover its dependencies, so the throwaway probe copy must carry `.py`
@@ -283,12 +287,8 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
         ProjectMutationJournal::capture(&project.root, paths)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if L::ID == Pip::ID {
             for change in &plan.changes {
@@ -384,9 +384,8 @@ mod tests {
             ..Plan::default()
         };
 
-        let journal =
-            ProjectMutationJournal::capture(&project.root, std::iter::empty::<&Utf8Path>())?;
-        let report = tool.apply(&project, &plan, &journal).await?;
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
 
         assert_eq!(report.applied.len(), 1);
         assert!(report.skipped.is_empty());
