@@ -36,8 +36,8 @@ use cooldown_core::{
     Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
     MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
     Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId,
-    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -748,16 +748,6 @@ impl ToolWrite for CargoTool {
     async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)
-    }
-
-    fn resolve_inputs(&self) -> ResolveInputs {
-        // `cargo update`/`generate-lockfile` validates every workspace member's declared targets, so
-        // the throwaway copy must include `.rs` source — a member with an empty `src/` errors with "no
-        // targets specified". Source is small (the bulk of a repo is build `target/`, which is pruned).
-        ResolveInputs {
-            source_extensions: &["rs"],
-            ..ResolveInputs::DEFAULT
-        }
     }
 
     async fn mutation_journal(

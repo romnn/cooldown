@@ -1,7 +1,7 @@
 //! The `cooldown` binary entry point: install error reporting, parse, run on a tokio runtime, and
 //! exit with the policy taxonomy's code.
 
-use clap::{CommandFactory, FromArgMatches};
+use clap::FromArgMatches;
 use cooldown::cli::{Cli, CliOverrides, run};
 
 fn main() -> std::process::ExitCode {

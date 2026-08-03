@@ -86,6 +86,25 @@ recovery_options! {
     ],
 }
 
+pub(in crate::cli) fn configure_recovery_help(mut command: clap::Command) -> clap::Command {
+    // Global arguments reach subcommands only when Clap builds the command graph.
+    // Build first so the recovery subcommand can hide every option its minimal bootstrap rejects.
+    command.build();
+    command.mut_subcommand("recover", |subcommand| {
+        subcommand.mut_args(|argument| {
+            let rejected = RECOVERY_OPTIONS.iter().any(|option| {
+                option.id == argument.get_id().as_str()
+                    && matches!(option.class, RecoveryOptionClass::Rejected { .. })
+            });
+            if rejected {
+                argument.hide(true)
+            } else {
+                argument
+            }
+        })
+    })
+}
+
 pub(in crate::cli) struct PreparedRecovery {
     pub(in crate::cli) targets: Vec<RecoveryTarget>,
     pub(in crate::cli) json: bool,
@@ -215,7 +234,7 @@ fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
 mod tests {
     use super::*;
     use crate::cli::Cli;
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
     use color_eyre::eyre;
 
     #[test]
@@ -244,6 +263,37 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(actual, classified);
+    }
+
+    #[test]
+    fn recovery_help_lists_only_options_used_by_recovery() -> eyre::Result<()> {
+        let error = Cli::command()
+            .try_get_matches_from(["cooldown", "recover", "--help"])
+            .err()
+            .ok_or_else(|| eyre::eyre!("recovery help unexpectedly parsed as a command"))?;
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+
+        for supported in ["--tool", "--cargo", "--no-gitignore", "--json", "--color"] {
+            assert!(
+                help.contains(supported),
+                "recovery help omitted {supported}"
+            );
+        }
+        for rejected in [
+            "--min-age",
+            "--allow",
+            "--major",
+            "--sync",
+            "--dry-run",
+            "--offline",
+        ] {
+            assert!(
+                !help.contains(rejected),
+                "recovery help advertised rejected option {rejected}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

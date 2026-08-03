@@ -857,8 +857,8 @@ pub trait ToolWrite: Send + Sync {
 
     /// The files this adapter's resolver preview reads from a heuristic throwaway project copy.
     ///
-    /// The generic preview copy excludes bulk source and data that can make monorepo copies
-    /// prohibitively expensive.
+    /// Only in-place adapters use this generic preview path.
+    /// It excludes bulk source and data that can make monorepo copies prohibitively expensive.
     /// The default [`ResolveInputs::DEFAULT`] is the union of dependency metadata across supported
     /// managers, with no source files.
     /// Adapters may add source extensions needed by their preview resolver.
@@ -880,9 +880,9 @@ pub struct ResolveInputs {
     /// Project-relative path prefixes to copy, for config files whose basename is too generic or
     /// whose resolver support files live below an otherwise-pruned dot directory.
     pub path_prefixes: &'static [&'static str],
-    /// File extensions (without the leading dot) to copy as source. Cargo (`rs`) and Go (`go`)
-    /// validate their targets/import graph against the real source, so the probe must include it;
-    /// declaration-only resolvers (pnpm, uv, deno) leave this empty.
+    /// File extensions (without the leading dot) to copy as source.
+    /// Go (`go`) and adapters with executable manifests validate resolver input against source, so
+    /// their generic preview must include it; declaration-only resolvers leave this empty.
     pub source_extensions: &'static [&'static str],
 }
 

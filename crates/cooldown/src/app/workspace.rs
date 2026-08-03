@@ -396,12 +396,17 @@ pub struct Workspace {
     release_cache: Box<dyn ReleaseResolver>,
 }
 
-/// The registered tool adapters, split into read-side and mutation-side ports.
+struct RegisteredAdapter {
+    reader: Arc<dyn ToolRead>,
+    fetcher: Arc<dyn ReleaseFetcher>,
+    writer: Option<Arc<dyn ToolWrite>>,
+}
+
+/// The registered tool adapters, with one coherent port family per tool identifier.
 #[derive(Default)]
 pub struct AdapterSet {
-    readers: Vec<Arc<dyn ToolRead>>,
-    fetchers: HashMap<ToolId, Arc<dyn ReleaseFetcher>>,
-    writers: HashMap<ToolId, Arc<dyn ToolWrite>>,
+    order: Vec<ToolId>,
+    adapters: HashMap<ToolId, RegisteredAdapter>,
 }
 
 impl AdapterSet {
@@ -411,16 +416,26 @@ impl AdapterSet {
         Self::default()
     }
 
-    /// Register one concrete adapter as read-side and registry-fetch ports only.
-    pub fn register_read<T>(&mut self, adapter: Arc<T>)
+    /// Registers one concrete adapter as read-side and registry-fetch ports only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`cooldown_core::CoreError::System`] when that tool family is already registered.
+    pub fn register_read<T>(&mut self, adapter: Arc<T>) -> cooldown_core::Result<()>
     where
         T: ToolRead + ReleaseFetcher + 'static,
     {
         let id = adapter.id();
         let reader: Arc<dyn ToolRead> = adapter.clone();
         let fetcher: Arc<dyn ReleaseFetcher> = adapter;
-        self.readers.push(reader);
-        self.fetchers.insert(id, fetcher);
+        self.register(
+            id,
+            RegisteredAdapter {
+                reader,
+                fetcher,
+                writer: None,
+            },
+        )
     }
 
     /// Register one concrete adapter as read/fetch ports plus a mutator whose writes are verified
@@ -429,7 +444,7 @@ impl AdapterSet {
     /// # Errors
     ///
     /// Returns [`cooldown_core::CoreError::System`] when the adapter's read and write sides declare
-    /// different tool-family identifiers.
+    /// different tool-family identifiers or when that tool family is already registered.
     pub fn register_target_verified_mutator<T>(
         &mut self,
         adapter: Arc<T>,
@@ -446,35 +461,61 @@ impl AdapterSet {
                 write_id.as_str()
             )));
         }
-        self.register_read(adapter.clone());
+        let reader: Arc<dyn ToolRead> = adapter.clone();
+        let fetcher: Arc<dyn ReleaseFetcher> = adapter.clone();
         let writer: Arc<dyn ToolWrite> = adapter;
-        self.writers.insert(read_id, writer);
+        self.register(
+            read_id,
+            RegisteredAdapter {
+                reader,
+                fetcher,
+                writer: Some(writer),
+            },
+        )
+    }
+
+    fn register(&mut self, id: ToolId, adapter: RegisteredAdapter) -> cooldown_core::Result<()> {
+        if self.adapters.contains_key(&id) {
+            return Err(cooldown_core::CoreError::System(format!(
+                "adapter tool family {} is already registered",
+                id.as_str()
+            )));
+        }
+        self.order.push(id);
+        self.adapters.insert(id, adapter);
         Ok(())
     }
 
     /// Iterate the read-side adapters in registration order.
     pub fn readers(&self) -> impl Iterator<Item = &Arc<dyn ToolRead>> {
-        self.readers.iter()
+        self.order
+            .iter()
+            .filter_map(|id| self.adapters.get(id).map(|adapter| &adapter.reader))
     }
 
     /// Look up the read-side port for one tool.
+    #[must_use]
     pub fn reader(&self, id: ToolId) -> Option<&dyn ToolRead> {
-        self.readers
-            .iter()
-            .find(|adapter| adapter.id() == id)
-            .map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .map(|adapter| adapter.reader.as_ref())
     }
 
     /// Look up the mutation-side port for one tool.
+    #[must_use]
     pub fn writer(&self, id: ToolId) -> Option<&dyn ToolWrite> {
-        self.writers.get(&id).map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .and_then(|adapter| adapter.writer.as_deref())
     }
 
     /// The registry-fetch port for one tool. Intentionally private to this module: it is reached
     /// only by [`Workspace`]'s cache-backed fetch methods, so no caller elsewhere can fetch releases
     /// without going through the release cache — the [`ReleaseFetcher`] never leaves this module.
     fn release_fetcher(&self, id: ToolId) -> Option<&dyn ReleaseFetcher> {
-        self.fetchers.get(&id).map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .map(|adapter| adapter.fetcher.as_ref())
     }
 }
 
@@ -970,10 +1011,12 @@ mod tests {
         deps: Vec<Dependency>,
     }
 
-    struct MismatchedAdapter;
+    struct TestAdapter {
+        write_id: ToolId,
+    }
 
     #[async_trait]
-    impl ToolRead for MismatchedAdapter {
+    impl ToolRead for TestAdapter {
         fn id(&self) -> ToolId {
             CARGO
         }
@@ -1018,7 +1061,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl cooldown_core::ReleaseFetcher for MismatchedAdapter {
+    impl cooldown_core::ReleaseFetcher for TestAdapter {
         async fn releases(
             &self,
             _dep: &Dependency,
@@ -1038,9 +1081,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl ToolWrite for MismatchedAdapter {
+    impl ToolWrite for TestAdapter {
         fn mutation_tool(&self) -> ToolId {
-            PNPM
+            self.write_id
         }
 
         async fn mutation_journal(
@@ -1077,12 +1120,29 @@ mod tests {
     fn adapter_registration_rejects_mismatched_read_and_write_tool_families() {
         let mut adapters = AdapterSet::new();
 
-        let result = adapters.register_target_verified_mutator(Arc::new(MismatchedAdapter));
+        let result =
+            adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: PNPM }));
 
         assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 0);
         assert!(adapters.writer(CARGO).is_none());
         assert!(adapters.writer(PNPM).is_none());
+    }
+
+    #[test]
+    fn adapter_registration_rejects_a_duplicate_tool_family_atomically() {
+        let mut adapters = AdapterSet::new();
+        assert_matches!(
+            adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: CARGO })),
+            Ok(())
+        );
+
+        let result = adapters.register_read(Arc::new(TestAdapter { write_id: CARGO }));
+
+        assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        assert_eq!(adapters.readers().count(), 1);
+        assert_eq!(adapters.reader(CARGO).map(ToolRead::id), Some(CARGO));
+        assert!(adapters.writer(CARGO).is_some());
     }
 
     #[async_trait]

@@ -3,7 +3,7 @@ mod options;
 mod policy;
 mod recovery;
 
-pub(in crate::cli) use recovery::{PreparedRecovery, prepare_recovery};
+pub(in crate::cli) use recovery::{PreparedRecovery, configure_recovery_help, prepare_recovery};
 
 use super::{CliOverrides, GlobalArgs};
 use crate::app::{Baseline, Clock, FixedClock, SystemClock, Workspace};

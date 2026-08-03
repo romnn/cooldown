@@ -23,11 +23,12 @@
   `PreparedMutation::prepare_isolated` and reject in-place dispatch. Resilient retries derive
   authorized subsets through `PreparedMutation::subset` while sharing one immutable journal.
   `ToolWrite::mutation_tool` binds the capability to its tool family, and `AdapterSet` registration
-  now fails when an adapter's read and write identifiers differ. `apply_with_observer` returns an
-  adapter-boundary postimage, using the `ApplyAttempt` enum to keep adapter-owned pending recovery
-  outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also accepts the
-  prepared capability, and Cargo requires one carrying provenance from an adapter-created isolated
-  project. `ApplyReport`
+  now fails when an adapter's read and write identifiers differ or when that tool family is already
+  registered. `AdapterSet::register_read` consequently returns `Result`. `apply_with_observer`
+  returns an adapter-boundary postimage, using the `ApplyAttempt` enum to keep adapter-owned pending
+  recovery outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also
+  accepts the prepared capability, and Cargo requires one carrying provenance from an
+  adapter-created isolated project. `ApplyReport`
   carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
   `CoreError`/`DiagnosticKind` include `PendingRecovery`.
   `ProjectMutationFile` also records standard file permissions and rejects non-regular or

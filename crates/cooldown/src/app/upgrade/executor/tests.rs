@@ -294,9 +294,10 @@ fn verify_applied_targets_requires_the_planned_direct_member_to_land() {
 fn verify_applied_targets_rejects_a_target_reached_through_a_sibling_entry() {
     // A member that declares the crate twice ([dependencies] toml = "1" beside
     // [build-dependencies] toml = "0.5") resolves the target version before the planned 0.5.x
-    // move is even attempted. As long as the member's old direct line survives, the change has
-    // not landed — the sibling edge must not verify it as applied (it would report an upgrade
-    // the lock never took, on every run, forever).
+    // move is even attempted.
+    // As long as the member's old direct line survives, the change has not landed — the sibling
+    // edge must not verify it as applied (it would report an upgrade the lock never took, on every
+    // run, forever).
     let mut planned_change = change("toml", "0.5.11", "1.1.2");
     planned_change.members = vec![member("rawloader", "rawloader")];
     let planned = vec![planned_change.clone()];
@@ -330,8 +331,9 @@ fn verify_applied_targets_rejects_a_target_reached_through_a_sibling_entry() {
 #[test]
 fn verify_applied_targets_keeps_each_held_member_when_targets_collide() {
     // Two members bump the same crate to the same target from different current versions, so the
-    // changes share (name, registry, to) and differ only by member. Both are held; neither may
-    // be dropped by a member-blind key collapsing them into a single skip.
+    // changes share (name, registry, to) and differ only by member.
+    // Both are held; neither may be dropped by a member-blind key collapsing them into a single
+    // skip.
     let mut held_a = change("nix", "0.28.0", "0.31.3");
     held_a.members = vec![member("app-a", "crates/app-a")];
     let mut held_b = change("nix", "0.30.0", "0.31.3");
@@ -511,8 +513,8 @@ fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
 
 #[test]
 fn collapse_reclassifies_kind_against_the_net_target_when_available() {
-    // The first leg is a minor float-up, but the committed net row is only a patch move. The
-    // report kind should describe the collapsed row, not the phantom intermediate.
+    // The first leg is a minor float-up, but the committed net row is only a patch move.
+    // The report kind should describe the collapsed row, not the phantom intermediate.
     let mut items = vec![
         applied_item("quote", "1.0.0", "1.1.0", false),
         applied_item("quote", "1.1.0", "1.0.1", true),
@@ -601,8 +603,9 @@ fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
 
 #[test]
 fn collapse_does_not_merge_two_coexisting_majors_of_one_crate() {
-    // cargo keeps two majors of `serde` in the lock; both bump in one run. They share the
-    // (name, registry) key but their versions do not chain, so neither row is merged or dropped.
+    // Cargo keeps two majors of `serde` in the lock; both bump in one run.
+    // They share the (name, registry) key but their versions do not chain, so neither row is merged
+    // or dropped.
     let mut items = vec![
         applied_item("serde", "0.9.1", "0.9.3", false),
         applied_item("serde", "1.0.0", "1.0.5", false),

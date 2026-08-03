@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use clap::parser::ValueSource;
-use clap::{ArgMatches, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// Verbosity for the diagnostic log written to stderr (independent of `--json`/report output).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -91,6 +91,14 @@ pub struct Cli {
     pub(in crate::cli) command: Command,
     #[command(flatten)]
     pub(in crate::cli) global: GlobalArgs,
+}
+
+impl Cli {
+    /// Builds the parser command with help scoped to each command's supported options.
+    #[must_use]
+    pub fn command() -> clap::Command {
+        super::setup::configure_recovery_help(<Self as CommandFactory>::command())
+    }
 }
 
 /// `--transitive <mode>`: how `check`/`fix`/`upgrade` handle too-fresh *transitive* dependencies.
@@ -694,7 +702,7 @@ fn set_on_subcommand(matches: &ArgMatches, command: &str, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Cli, CliOverrides};
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
 
     fn overrides(args: &[&str]) -> CliOverrides {
         let matches = Cli::command().get_matches_from(args);

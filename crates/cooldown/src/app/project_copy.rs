@@ -362,32 +362,33 @@ mod tests {
         assert!(d.join(".swiftpm/configuration/registries.json").exists());
     }
 
-    /// `source_extensions` is opt-in per tool: Cargo/Go include their source (their resolve validates
-    /// targets/imports against it), the declaration-only default does not.
+    /// `source_extensions` is opt-in per generic preview adapter.
+    /// Go includes its source because resolution validates imports against it, while the
+    /// declaration-only default does not.
     #[test]
     fn source_extensions_are_opt_in_per_tool() {
         let src = tempfile::tempdir().expect("src");
         let s = src.path();
-        std::fs::write(s.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        std::fs::write(s.join("go.mod"), "module example.com/x\n").expect("write");
         std::fs::create_dir_all(s.join("src")).expect("mkdir");
-        std::fs::write(s.join("src/lib.rs"), "").expect("write");
+        std::fs::write(s.join("src/lib.go"), "package src\n").expect("write");
         std::fs::create_dir_all(s.join("_internal")).expect("mkdir");
-        std::fs::write(s.join("_internal/helper.rs"), "").expect("write");
+        std::fs::write(s.join("_internal/helper.go"), "package internal\n").expect("write");
 
-        // Cargo opts into `.rs`, so its source is copied.
-        let cargo_inputs = ResolveInputs {
-            source_extensions: &["rs"],
+        // Go opts into `.go`, so its source is copied.
+        let go_inputs = ResolveInputs {
+            source_extensions: &["go"],
             ..ResolveInputs::DEFAULT
         };
         let dest = tempfile::tempdir().expect("dest");
-        copy_project_tree(s, dest.path(), &cargo_inputs).expect("copy");
-        assert!(dest.path().join("Cargo.toml").exists());
+        copy_project_tree(s, dest.path(), &go_inputs).expect("copy");
+        assert!(dest.path().join("go.mod").exists());
         assert!(
-            dest.path().join("src/lib.rs").exists(),
-            "cargo copies .rs source so the resolve sees crate targets"
+            dest.path().join("src/lib.go").exists(),
+            "Go copies .go source so resolution sees package imports"
         );
         assert!(
-            dest.path().join("_internal/helper.rs").exists(),
+            dest.path().join("_internal/helper.go").exists(),
             "underscore source dirs are valid resolver input locations"
         );
 
@@ -395,11 +396,11 @@ mod tests {
         let dest_default = tempfile::tempdir().expect("dest");
         copy_project_tree(s, dest_default.path(), &ResolveInputs::DEFAULT).expect("copy");
         assert!(
-            !dest_default.path().join("src/lib.rs").exists(),
+            !dest_default.path().join("src/lib.go").exists(),
             "the declaration-only default never copies source"
         );
         assert!(
-            !dest_default.path().join("_internal/helper.rs").exists(),
+            !dest_default.path().join("_internal/helper.go").exists(),
             "underscore source still requires an opted-in source extension"
         );
     }
