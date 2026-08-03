@@ -18,37 +18,154 @@ const RECOVERY_RELEVANT_GLOBAL_ARGUMENTS: &[&str] = &[
     "color",
 ];
 
-#[cfg(test)]
-const RECOVERY_REJECTED_GLOBAL_ARGUMENTS: &[&str] = &[
-    "min_age",
-    "min_age_major",
-    "min_age_minor",
-    "min_age_patch",
-    "latest",
-    "freeze",
-    "allow",
-    "major",
-    "no_major",
-    "respect_dist_tags",
-    "no_respect_dist_tags",
-    "package",
-    "exclude_folders",
-    "exclude_packages",
-    "list_packages",
-    "paths",
-    "show_projects",
-    "no_suggestions",
-    "allow_stale_lock",
-    "sync",
-    "dry_run",
-    "offline",
-    "fresh",
-    "concurrency",
-    "no_native",
-    "no_global",
-    "config",
+struct RejectedRecoveryOption {
+    id: &'static str,
+    flag: &'static str,
+    is_set: fn(&GlobalArgs) -> bool,
+}
+
+const RECOVERY_REJECTED_OPTIONS: &[RejectedRecoveryOption] = &[
+    RejectedRecoveryOption {
+        id: "min_age",
+        flag: "--min-age",
+        is_set: |global| global.min_age.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "min_age_major",
+        flag: "--min-age-major",
+        is_set: |global| global.min_age_major.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "min_age_minor",
+        flag: "--min-age-minor",
+        is_set: |global| global.min_age_minor.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "min_age_patch",
+        flag: "--min-age-patch",
+        is_set: |global| global.min_age_patch.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "latest",
+        flag: "--latest",
+        is_set: |global| global.latest,
+    },
+    RejectedRecoveryOption {
+        id: "freeze",
+        flag: "--freeze",
+        is_set: |global| global.freeze.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "allow",
+        flag: "--allow",
+        is_set: |global| !global.allow.is_empty(),
+    },
+    RejectedRecoveryOption {
+        id: "major",
+        flag: "--major",
+        is_set: |global| global.major,
+    },
+    RejectedRecoveryOption {
+        id: "no_major",
+        flag: "--no-major",
+        is_set: |global| global.no_major,
+    },
+    RejectedRecoveryOption {
+        id: "respect_dist_tags",
+        flag: "--respect-dist-tags",
+        is_set: |global| global.respect_dist_tags,
+    },
+    RejectedRecoveryOption {
+        id: "no_respect_dist_tags",
+        flag: "--no-respect-dist-tags",
+        is_set: |global| global.no_respect_dist_tags,
+    },
+    RejectedRecoveryOption {
+        id: "package",
+        flag: "--package",
+        is_set: |global| !global.package.is_empty(),
+    },
+    RejectedRecoveryOption {
+        id: "exclude_folders",
+        flag: "--exclude-folders",
+        is_set: |global| !global.exclude_folders.is_empty(),
+    },
+    RejectedRecoveryOption {
+        id: "exclude_packages",
+        flag: "--exclude-packages",
+        is_set: |global| !global.exclude_packages.is_empty(),
+    },
+    RejectedRecoveryOption {
+        id: "list_packages",
+        flag: "--list-packages",
+        is_set: |global| global.list_packages,
+    },
+    RejectedRecoveryOption {
+        id: "paths",
+        flag: "--paths",
+        is_set: |global| global.paths,
+    },
+    RejectedRecoveryOption {
+        id: "show_projects",
+        flag: "--show-projects",
+        is_set: |global| global.show_projects,
+    },
+    RejectedRecoveryOption {
+        id: "no_suggestions",
+        flag: "--no-suggestions",
+        is_set: |global| global.no_suggestions,
+    },
+    RejectedRecoveryOption {
+        id: "allow_stale_lock",
+        flag: "--allow-stale-lock",
+        is_set: |global| global.allow_stale_lock,
+    },
+    RejectedRecoveryOption {
+        id: "sync",
+        flag: "--sync",
+        is_set: |global| global.sync,
+    },
+    RejectedRecoveryOption {
+        id: "dry_run",
+        flag: "--dry-run",
+        is_set: |global| global.dry_run,
+    },
+    RejectedRecoveryOption {
+        id: "offline",
+        flag: "--offline",
+        is_set: |global| global.offline,
+    },
+    RejectedRecoveryOption {
+        id: "fresh",
+        flag: "--fresh",
+        is_set: |global| global.fresh,
+    },
+    RejectedRecoveryOption {
+        id: "concurrency",
+        flag: "--concurrency",
+        is_set: |global| global.concurrency.is_some(),
+    },
+    RejectedRecoveryOption {
+        id: "no_native",
+        flag: "--no-native",
+        is_set: |global| global.no_native,
+    },
+    RejectedRecoveryOption {
+        id: "no_global",
+        flag: "--no-global",
+        is_set: |global| global.no_global,
+    },
+    RejectedRecoveryOption {
+        id: "config",
+        flag: "--config",
+        is_set: |global| global.config.is_some(),
+    },
     #[cfg(debug_assertions)]
-    "now",
+    RejectedRecoveryOption {
+        id: "now",
+        flag: "--now",
+        is_set: |global| global.now.is_some(),
+    },
 ];
 
 pub(in crate::cli) struct PreparedRecovery {
@@ -90,42 +207,14 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
 }
 
 fn validate_recovery_options(global: &GlobalArgs) -> Result<(), CoreError> {
-    let unsupported = [
-        (global.min_age.is_some(), "--min-age"),
-        (global.min_age_major.is_some(), "--min-age-major"),
-        (global.min_age_minor.is_some(), "--min-age-minor"),
-        (global.min_age_patch.is_some(), "--min-age-patch"),
-        (global.latest, "--latest"),
-        (global.freeze.is_some(), "--freeze"),
-        (!global.allow.is_empty(), "--allow"),
-        (global.major, "--major"),
-        (global.no_major, "--no-major"),
-        (global.respect_dist_tags, "--respect-dist-tags"),
-        (global.no_respect_dist_tags, "--no-respect-dist-tags"),
-        (!global.package.is_empty(), "--package"),
-        (!global.exclude_folders.is_empty(), "--exclude-folders"),
-        (!global.exclude_packages.is_empty(), "--exclude-packages"),
-        (global.list_packages, "--list-packages"),
-        (global.paths, "--paths"),
-        (global.show_projects, "--show-projects"),
-        (global.no_suggestions, "--no-suggestions"),
-        (global.allow_stale_lock, "--allow-stale-lock"),
-        (global.sync, "--sync"),
-        (global.dry_run, "--dry-run"),
-        (global.offline, "--offline"),
-        (global.fresh, "--fresh"),
-        (global.concurrency.is_some(), "--concurrency"),
-        (global.no_native, "--no-native"),
-        (global.no_global, "--no-global"),
-        (global.config.is_some(), "--config"),
-    ]
-    .into_iter()
-    .find_map(|(set, name)| set.then_some(name));
-    #[cfg(debug_assertions)]
-    let unsupported = unsupported.or(global.now.is_some().then_some("--now"));
-    if let Some(name) = unsupported {
+    if let Some(option) = RECOVERY_REJECTED_OPTIONS
+        .iter()
+        .find(|option| (option.is_set)(global))
+    {
+        tracing::debug!(argument = option.id, "rejecting irrelevant recovery option");
         return Err(CoreError::Config(format!(
-            "`recover` does not use `{name}`; remove it so recovery depends only on project location and recovery artifacts"
+            "`recover` does not use `{}`; remove it so recovery depends only on project location and recovery artifacts",
+            option.flag
         )));
     }
     Ok(())
@@ -231,8 +320,9 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let classified = RECOVERY_RELEVANT_GLOBAL_ARGUMENTS
             .iter()
-            .chain(RECOVERY_REJECTED_GLOBAL_ARGUMENTS)
-            .map(|argument| (*argument).to_string())
+            .copied()
+            .chain(RECOVERY_REJECTED_OPTIONS.iter().map(|option| option.id))
+            .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(actual, classified);

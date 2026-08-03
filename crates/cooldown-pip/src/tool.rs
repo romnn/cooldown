@@ -286,7 +286,7 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
                 Utf8Path::new(L::MANIFEST),
             )?);
         }
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::new(files)
     }
 
     async fn apply(

@@ -191,12 +191,10 @@ impl ToolWrite for BundlerTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile"))?,
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile.lock"))?,
-            ],
-        })
+        ProjectMutationJournal::new(vec![
+            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile"))?,
+            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile.lock"))?,
+        ])
     }
 
     async fn apply(

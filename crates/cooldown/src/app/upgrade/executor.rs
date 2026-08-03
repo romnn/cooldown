@@ -2113,18 +2113,11 @@ fn preserve_rollback_entries(
     rollback: &mut ProjectMutationJournal,
     journal: &ProjectMutationJournal,
 ) {
-    for file in &journal.files {
-        if rollback
-            .files
-            .iter()
-            .all(|captured| captured.path != file.path)
-        {
-            // By the mutation-journal contract, an earlier plan could not have changed a path it did
-            // not capture. Its first appearance therefore still contains the pre-trial bytes even
-            // when a reconciliation plan expands the write set.
-            rollback.files.push(file.clone());
-        }
-    }
+    // By the mutation-journal contract, an earlier plan could not have changed a path it did not
+    // capture.
+    // Its first appearance therefore still contains the pre-trial bytes even when a reconciliation
+    // plan expands the write set.
+    rollback.extend_missing(journal);
 }
 
 /// Restores deterministic mutation order after concurrent registry fetches return in completion
@@ -2537,10 +2530,11 @@ mod tests {
         sort_planned_changes, target_package, verify_applied_targets,
     };
     use crate::app::{TransitiveGate, UpgradeItem};
+    use color_eyre::eyre;
     use cooldown_core::{
         ApplyReport, Change, DepScope, Dependency, EdgeBindingAction, LockStatus, MajorKey,
-        MemberRef, PackageId, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseOrder,
-        ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
+        MemberRef, PackageId, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality,
+        SkipReason, ToolId, UpdateKind, Version,
     };
     use std::collections::HashSet;
 
@@ -2579,68 +2573,64 @@ mod tests {
     }
 
     #[test]
-    fn rollback_journal_keeps_the_first_snapshot_for_each_path() {
-        let mut rollback = ProjectMutationJournal {
-            files: vec![ProjectMutationFile {
-                path: "package-lock.json".into(),
-                contents: Some(b"baseline lock".to_vec()),
-                permissions: None,
-            }],
-        };
-        let later = ProjectMutationJournal {
-            files: vec![
-                ProjectMutationFile {
-                    path: "package-lock.json".into(),
-                    contents: Some(b"trial lock".to_vec()),
-                    permissions: None,
-                },
-                ProjectMutationFile {
-                    path: "package.json".into(),
-                    contents: Some(b"baseline manifest".to_vec()),
-                    permissions: None,
-                },
-            ],
-        };
+    fn rollback_journal_keeps_the_first_snapshot_for_each_path() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::write(root.join("package-lock.json"), b"baseline lock")?;
+        let mut rollback =
+            ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+                root,
+                camino::Utf8Path::new("package-lock.json"),
+            )?])?;
+        std::fs::write(root.join("package-lock.json"), b"trial lock")?;
+        std::fs::write(root.join("package.json"), b"baseline manifest")?;
+        let later = ProjectMutationJournal::new(vec![
+            ProjectMutationJournal::capture_file(root, camino::Utf8Path::new("package-lock.json"))?,
+            ProjectMutationJournal::capture_file(root, camino::Utf8Path::new("package.json"))?,
+        ])?;
 
         preserve_rollback_entries(&mut rollback, &later);
 
-        assert_eq!(rollback.files.len(), 2);
-        assert_eq!(
-            rollback.files[0].contents.as_deref(),
-            Some(b"baseline lock".as_slice())
-        );
-        assert_eq!(rollback.files[1].path, "package.json");
+        assert_eq!(rollback.files().len(), 2);
+        let mut files = rollback.files().iter();
+        let lock = files
+            .next()
+            .ok_or_else(|| eyre::eyre!("rollback journal omitted the lockfile"))?;
+        let manifest = files
+            .next()
+            .ok_or_else(|| eyre::eyre!("rollback journal omitted the manifest"))?;
+        assert_eq!(lock.contents(), Some(b"baseline lock".as_slice()));
+        assert_eq!(manifest.path(), "package.json");
+        assert!(files.next().is_none());
+        Ok(())
     }
 
     #[test]
-    fn trial_rollback_refuses_to_overwrite_external_drift() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root =
-            camino::Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 tempdir");
+    fn trial_rollback_refuses_to_overwrite_external_drift() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let path = root.join("Cargo.toml");
-        std::fs::write(&path, b"original").expect("write original");
-        let journal = ProjectMutationJournal {
-            files: vec![ProjectMutationFile {
-                path: "Cargo.toml".into(),
-                contents: Some(b"original".to_vec()),
-                permissions: None,
-            }],
-        };
+        std::fs::write(&path, b"original")?;
+        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &root,
+            camino::Utf8Path::new("Cargo.toml"),
+        )?])?;
         let mut rollback = TrialRollback::default();
-        rollback.preserve(&root, &journal).expect("preserve trial");
+        rollback.preserve(&root, &journal)?;
 
-        std::fs::write(&path, b"cooldown candidate").expect("write candidate");
-        rollback.accept(journal.capture_state(&root).expect("capture candidate"));
-        std::fs::write(&path, b"external edit").expect("write external edit");
+        std::fs::write(&path, b"cooldown candidate")?;
+        rollback.accept(journal.capture_state(&root)?);
+        std::fs::write(&path, b"external edit")?;
 
         let error = rollback
             .restore(&root)
-            .expect_err("drift must block rollback");
+            .err()
+            .ok_or_else(|| eyre::eyre!("independent drift unexpectedly allowed trial rollback"))?;
         std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
-        assert_eq!(
-            std::fs::read(path).expect("read external edit"),
-            b"external edit"
-        );
+        assert_eq!(std::fs::read(path)?, b"external edit");
+        Ok(())
     }
 
     #[test]

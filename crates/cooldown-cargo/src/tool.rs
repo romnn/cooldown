@@ -29,9 +29,9 @@ use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
     Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
     MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -567,10 +567,10 @@ impl CargoTool {
         // missing/unparsable snapshot leaves `before` empty, so a crate that moved is still reported
         // (never silent).
         let before_lock = journal
-            .files
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("Cargo.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("Cargo.lock"))
+            .and_then(ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .and_then(|content| CargoLock::parse(content).ok());
         let before = before_lock
@@ -752,7 +752,7 @@ impl ToolWrite for CargoTool {
         for rel in relative {
             files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
         }
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::new(files)
     }
 
     async fn apply(

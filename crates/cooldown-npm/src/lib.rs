@@ -6,11 +6,14 @@
 //!
 //! [`ToolId`]: cooldown_core::ToolId
 
+mod apply;
 pub mod deno;
 pub mod jsr;
 pub mod lock;
 mod manifest;
+mod native;
 pub mod nodecmd;
+mod peers;
 pub mod registry;
 pub mod tool;
 pub mod version;

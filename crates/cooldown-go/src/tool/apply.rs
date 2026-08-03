@@ -32,10 +32,10 @@ pub(super) async fn apply(
     // tidy` introduced. A missing/unparsable snapshot leaves `before` empty, so a module that moved
     // is still reported (never silent).
     let before = journal
-        .files
+        .files()
         .iter()
-        .find(|file| file.path == Utf8Path::new("go.mod"))
-        .and_then(|file| file.contents.as_deref())
+        .find(|file| file.path() == Utf8Path::new("go.mod"))
+        .and_then(cooldown_core::ProjectMutationFile::contents)
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(parse_requires)
         .unwrap_or_default();

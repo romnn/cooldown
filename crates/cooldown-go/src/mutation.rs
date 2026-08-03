@@ -20,7 +20,7 @@ pub(crate) fn mutation_journal(root: &Utf8Path, plan: &Plan) -> Result<ProjectMu
         }
         capture_import_targets(root, root, &old_path, &mut seen, &mut files)?;
     }
-    Ok(ProjectMutationJournal { files })
+    ProjectMutationJournal::new(files)
 }
 
 pub(crate) fn rewrite_imports(
@@ -30,11 +30,11 @@ pub(crate) fn rewrite_imports(
     journal: &ProjectMutationJournal,
 ) -> Result<usize> {
     let mut count = 0;
-    for file in &journal.files {
-        if file.path.extension() != Some("go") {
+    for file in journal.files() {
+        if file.path().extension() != Some("go") {
             continue;
         }
-        let path = root.join(&file.path);
+        let path = root.join(file.path());
         let src = std::fs::read_to_string(&path)?;
         let replaced = rewrite_import_path(&src, old, new);
         if replaced != src {
@@ -195,7 +195,7 @@ mod tests {
         capture_import_targets(root, root, "example.com/foo/v2", &mut seen, &mut out)
             .expect("scan succeeds");
 
-        let captured: Vec<&str> = out.iter().map(|file| file.path.as_str()).collect();
+        let captured: Vec<&str> = out.iter().map(|file| file.path().as_str()).collect();
         assert_eq!(
             captured,
             vec!["main.go"],

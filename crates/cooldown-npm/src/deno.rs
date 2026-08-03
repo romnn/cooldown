@@ -16,8 +16,8 @@ use cooldown_adapter_util::verify_current_unknown;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result, SkipReason, Skipped,
-    ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result,
+    SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::hash_map::Entry;
@@ -500,7 +500,7 @@ impl ToolWrite for DenoTool {
             &project.root,
             Utf8Path::new("deno.lock"),
         )?);
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::new(files)
     }
 
     /// Re-resolve the **whole** dependency graph once under cooldown's window, pinning every planned
@@ -530,10 +530,10 @@ impl ToolWrite for DenoTool {
         }
 
         let before = journal
-            .files
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("deno.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("deno.lock"))
+            .and_then(ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .map(locked_versions)
             .unwrap_or_default();

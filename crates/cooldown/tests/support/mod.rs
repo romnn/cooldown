@@ -48,6 +48,8 @@ impl Fixture {
             .prefix("cooldown-it-")
             .tempdir()
             .expect("create temp dir");
+        // Anchor discovery when an ambient ancestor belongs to another Git repository.
+        std::fs::create_dir(dir.path().join(".git")).expect("create fixture Git anchor");
         Self {
             dir,
             tag_independent: false,

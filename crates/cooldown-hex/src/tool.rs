@@ -190,12 +190,10 @@ impl ToolWrite for HexTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new("mix.lock"),
-            )?],
-        })
+        ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &project.root,
+            Utf8Path::new("mix.lock"),
+        )?])
     }
 
     async fn apply(

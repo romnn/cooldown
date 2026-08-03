@@ -695,15 +695,10 @@ impl ToolWrite for UvTool {
         // Capture the lock and the manifest: `apply` re-locks (uv.lock) and, when the target falls
         // outside the declared requirement, rewrites the constraint (pyproject.toml). Capturing the
         // manifest unconditionally is harmless — restore runs only on rollback.
-        Ok(ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("uv.lock"))?,
-                ProjectMutationJournal::capture_file(
-                    &project.root,
-                    Utf8Path::new("pyproject.toml"),
-                )?,
-            ],
-        })
+        ProjectMutationJournal::new(vec![
+            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("uv.lock"))?,
+            ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("pyproject.toml"))?,
+        ])
     }
 
     async fn apply(
@@ -773,10 +768,10 @@ impl ToolWrite for UvTool {
         // snapshot against the result, so *every* net version change is surfaced. A missing/unparsable
         // snapshot leaves `before` empty, so a package that moved is still reported (never silent).
         let before = journal
-            .files
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("uv.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("uv.lock"))
+            .and_then(cooldown_core::ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .and_then(|content| UvLock::parse(content).ok())
             .map(|lock| locked_versions(&lock))

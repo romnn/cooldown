@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Breaking library API:** `ToolRead::project_detection` replaces `project_marker` and
+  `probe_manifest_without_lock`. Ordinary adapters should wrap their marker in
+  `ProjectDetection::Primary`; adapters that must inspect manifest-only roots should use
+  `PrimaryWithValidation` and implement `validate_manifest_without_lock`.
 - **Breaking library API:** adapter parsing and lookup helpers now return named records instead of
   positional tuples. This affects Go path-version splitting; npm lock parsing and install-tree
   resolution; and the public Hex, Maven, pip, and RubyGems resolved-pin parsers. Callers should use
@@ -18,9 +22,11 @@
   rollback authority. `ApplyReport` carries non-fatal committed warnings, final edge audits return
   an `EdgeNormalizationReport`, and `CoreError`/`DiagnosticKind` include `PendingRecovery`.
   `ProjectMutationFile` also records standard file permissions and rejects non-regular paths so a
-  rollback can restore the file contents and modes without following a symlink. Callers can
-  therefore distinguish rollback conflicts from visible corrections whose directory durability is
-  uncertain.
+  rollback can restore the file contents and modes without following a symlink. Its fields and the
+  journal's file list are now private; callers should use `ProjectMutationFile::from_snapshot`,
+  `ProjectMutationJournal::new`, and the read-only accessors so invalid write sets cannot be
+  constructed. Callers can therefore distinguish rollback conflicts from visible corrections
+  whose directory durability is uncertain.
 - **Breaking library API:** `ToolWrite::mutation_execution` can provide an
   `IsolatedMutationStrategy` that stages and publishes its own faithful resolver trial. Cargo uses
   this boundary so resolver and edge-normalization trials touch only a disposable project copy;

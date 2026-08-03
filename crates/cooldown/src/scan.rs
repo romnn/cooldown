@@ -138,7 +138,11 @@ fn scan_marker_dirs(
     validation_only.dedup();
     if topmost_only {
         primary = keep_topmost(primary);
-        validation_only = keep_topmost(validation_only);
+        validation_only.retain(|candidate| {
+            !primary
+                .iter()
+                .any(|accepted| candidate.starts_with(accepted))
+        });
     }
     Ok(ProjectMarkerDirs {
         primary,
@@ -374,10 +378,37 @@ mod tests {
         let found = find_project_marker_dirs(&root, detection, false, &[])?;
 
         assert_eq!(found.primary, vec![root.join("with-lock")]);
-        assert_eq!(
-            found.validation_only,
-            vec![root.join("custom-lock"), root.join("with-lock")]
-        );
+        assert_eq!(found.validation_only, vec![root.join("custom-lock")]);
+        Ok(())
+    }
+
+    #[test]
+    fn outer_validation_marker_does_not_hide_a_nested_validation_marker() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let nested = root.join("tools/custom");
+        std::fs::create_dir_all(nested.join(".cargo"))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"custom\"\n")?;
+        std::fs::write(
+            nested.join(".cargo/config.toml"),
+            "[resolver]\nlockfile-path = \"Custom.lock\"\n",
+        )?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert!(found.primary.is_empty());
+        assert_eq!(found.validation_only, vec![root, nested]);
         Ok(())
     }
 

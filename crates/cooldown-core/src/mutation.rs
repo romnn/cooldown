@@ -7,8 +7,7 @@ use sha2::{Digest as _, Sha256};
 /// The pre-change file state a planned mutation may rewrite.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectMutationJournal {
-    /// The captured file entries the application layer can restore on rollback.
-    pub files: Vec<ProjectMutationFile>,
+    files: Vec<ProjectMutationFile>,
 }
 
 /// The post-apply state observed at a rollback boundary.
@@ -269,7 +268,7 @@ impl AcceptedProjectState {
         inputs: ProjectInputSnapshot,
     ) -> Result<Self> {
         if !matching_write_sets(&original.files, &candidate.files)
-            || !valid_mutation_paths(&original.files)
+            || !valid_mutation_files(&original.files)
         {
             return Err(CoreError::LockConflict(
                 "accepted project state has an invalid or mismatched source write set".to_string(),
@@ -342,18 +341,43 @@ impl AcceptedProjectState {
 /// One file entry recorded in a [`ProjectMutationJournal`].
 #[derive(Debug, Clone)]
 pub struct ProjectMutationFile {
-    /// The path relative to the project root.
-    pub path: Utf8PathBuf,
-    /// The captured bytes when the file existed, or `None` when it was absent and must be removed
-    /// on restore.
-    pub contents: Option<Vec<u8>>,
-    /// The captured standard permissions when the file existed.
-    ///
-    /// ACLs and extended attributes are outside the journal's portable rollback contract.
-    pub permissions: Option<std::fs::Permissions>,
+    path: Utf8PathBuf,
+    contents: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
 }
 
 impl ProjectMutationJournal {
+    /// Builds a journal from validated captured file entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) when a path is unsafe or duplicated, or when a
+    /// snapshot is inconsistent.
+    pub fn new(files: Vec<ProjectMutationFile>) -> Result<Self> {
+        if !valid_mutation_files(&files) {
+            return Err(CoreError::Filesystem(
+                "mutation journal contains an unsafe, duplicate, or inconsistent project file"
+                    .to_string(),
+            ));
+        }
+        Ok(ProjectMutationJournal { files })
+    }
+
+    /// The ordered captured entries in this journal's write set.
+    #[must_use]
+    pub fn files(&self) -> &[ProjectMutationFile] {
+        &self.files
+    }
+
+    /// Adds paths absent from this journal while preserving its earlier snapshots.
+    pub fn extend_missing(&mut self, other: &ProjectMutationJournal) {
+        for file in &other.files {
+            if self.files.iter().all(|existing| existing.path != file.path) {
+                self.files.push(file.clone());
+            }
+        }
+    }
+
     /// Capture the current contents of one project-relative file.
     ///
     /// Missing files are recorded as `None`, which tells [`restore`](Self::restore) to remove them
@@ -375,11 +399,7 @@ impl ProjectMutationJournal {
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ProjectMutationFile {
-                    path: rel.to_owned(),
-                    contents: None,
-                    permissions: None,
-                });
+                return ProjectMutationFile::from_snapshot(rel.to_owned(), None, None);
             }
             Err(error) => return Err(error.into()),
         };
@@ -407,11 +427,7 @@ impl ProjectMutationJournal {
                 "{path} changed identity while cooldown read its mutation journal"
             )));
         }
-        Ok(ProjectMutationFile {
-            path: rel.to_owned(),
-            contents: Some(bytes),
-            permissions: Some(opened.permissions()),
-        })
+        ProjectMutationFile::from_snapshot(rel.to_owned(), Some(bytes), Some(opened.permissions()))
     }
 
     /// Captures the current state of every file in this journal's write set.
@@ -420,7 +436,7 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if a file exists but cannot be read.
     pub fn capture_state(&self, root: &Utf8Path) -> Result<ProjectMutationState> {
-        if !valid_mutation_paths(&self.files) {
+        if !valid_mutation_files(&self.files) {
             return Err(CoreError::Filesystem(
                 "mutation journal contains an unsafe or duplicate project path".to_string(),
             ));
@@ -464,7 +480,7 @@ impl ProjectMutationJournal {
         root: &Utf8Path,
         expected: &ProjectMutationState,
     ) -> Result<()> {
-        if !matching_write_sets(&self.files, &expected.files) || !valid_mutation_paths(&self.files)
+        if !matching_write_sets(&self.files, &expected.files) || !valid_mutation_files(&self.files)
         {
             return Err(CoreError::LockConflict(
                 "rollback state does not match the mutation journal write set; left project files untouched"
@@ -503,7 +519,7 @@ impl ProjectMutationJournal {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if a file cannot be written back or removed.
     pub fn restore(&self, root: &Utf8Path) -> Result<()> {
-        if !valid_mutation_paths(&self.files) {
+        if !valid_mutation_files(&self.files) {
             return Err(CoreError::Filesystem(
                 "mutation journal contains an unsafe or duplicate project path".to_string(),
             ));
@@ -519,7 +535,7 @@ fn projected_files(
     source: &[ProjectMutationFile],
     write_set: &[ProjectMutationFile],
 ) -> Result<Vec<ProjectMutationFile>> {
-    if !valid_mutation_paths(source) || !valid_mutation_paths(write_set) {
+    if !valid_mutation_files(source) || !valid_mutation_files(write_set) {
         return Err(CoreError::LockConflict(
             "cannot project an invalid mutation write set".to_string(),
         ));
@@ -542,6 +558,50 @@ fn projected_files(
 }
 
 impl ProjectMutationFile {
+    /// Reconstructs one captured file entry from a validated portable snapshot.
+    ///
+    /// `contents` and `permissions` must either both be present or both be absent.
+    /// ACLs and extended attributes remain outside the portable rollback contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) when the path is unsafe or the snapshot fields are
+    /// inconsistent.
+    pub fn from_snapshot(
+        path: Utf8PathBuf,
+        contents: Option<Vec<u8>>,
+        permissions: Option<std::fs::Permissions>,
+    ) -> Result<Self> {
+        if !safe_mutation_path(&path) || contents.is_some() != permissions.is_some() {
+            return Err(CoreError::Filesystem(format!(
+                "refusing invalid project mutation snapshot for `{path}`"
+            )));
+        }
+        Ok(ProjectMutationFile {
+            path,
+            contents,
+            permissions,
+        })
+    }
+
+    /// The project-relative path captured by this entry.
+    #[must_use]
+    pub fn path(&self) -> &Utf8Path {
+        &self.path
+    }
+
+    /// The captured contents, or `None` when the file was absent.
+    #[must_use]
+    pub fn contents(&self) -> Option<&[u8]> {
+        self.contents.as_deref()
+    }
+
+    /// The captured standard permissions, or `None` when the file was absent.
+    #[must_use]
+    pub fn permissions(&self) -> Option<&std::fs::Permissions> {
+        self.permissions.as_ref()
+    }
+
     fn matches(&self, other: &ProjectMutationFile) -> bool {
         self.path == other.path
             && self.contents == other.contents
@@ -617,11 +677,13 @@ fn matching_write_sets(left: &[ProjectMutationFile], right: &[ProjectMutationFil
             .all(|(left, right)| left.path == right.path)
 }
 
-fn valid_mutation_paths(files: &[ProjectMutationFile]) -> bool {
+fn valid_mutation_files(files: &[ProjectMutationFile]) -> bool {
     let mut paths = std::collections::BTreeSet::new();
-    files
-        .iter()
-        .all(|file| safe_mutation_path(&file.path) && paths.insert(file.path.as_str()))
+    files.iter().all(|file| {
+        safe_mutation_path(&file.path)
+            && file.contents.is_some() == file.permissions.is_some()
+            && paths.insert(file.path.as_str())
+    })
 }
 
 fn safe_mutation_path(path: &Utf8Path) -> bool {
@@ -678,9 +740,9 @@ mod mutation_journal_tests {
         let root = root(&directory)?;
         let relative = Utf8Path::new("Cargo.toml");
         std::fs::write(root.join(relative), "original")?;
-        let journal = ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(&root, relative)?],
-        };
+        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &root, relative,
+        )?])?;
         std::fs::write(root.join(relative), "candidate")?;
         let expected = journal.capture_state(&root)?;
         std::fs::write(root.join(relative), "external")?;
@@ -698,16 +760,38 @@ mod mutation_journal_tests {
     fn mutation_journal_rejects_paths_outside_the_project() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = root(&directory)?;
-        let journal = ProjectMutationJournal {
-            files: vec![ProjectMutationFile {
-                path: Utf8PathBuf::from("../outside"),
-                contents: Some(b"replacement".to_vec()),
-                permissions: None,
-            }],
-        };
+        let result = ProjectMutationFile::from_snapshot(
+            Utf8PathBuf::from("../outside"),
+            Some(b"replacement".to_vec()),
+            Some(std::fs::metadata(&root)?.permissions()),
+        );
 
-        std::assert_matches!(journal.capture_state(&root), Err(CoreError::Filesystem(_)));
-        std::assert_matches!(journal.restore(&root), Err(CoreError::Filesystem(_)));
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_file_rejects_inconsistent_snapshot_fields() {
+        let result = ProjectMutationFile::from_snapshot(
+            Utf8PathBuf::from("Cargo.lock"),
+            Some(b"lock".to_vec()),
+            None,
+        );
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+    }
+
+    #[test]
+    fn mutation_journal_rejects_duplicate_paths() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let relative = Utf8Path::new("Cargo.lock");
+        std::fs::write(root.join(relative), "lock")?;
+        let file = ProjectMutationJournal::capture_file(&root, relative)?;
+
+        let result = ProjectMutationJournal::new(vec![file.clone(), file]);
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
         Ok(())
     }
 
@@ -735,12 +819,10 @@ mod mutation_journal_tests {
         let existing = Utf8Path::new("Cargo.toml");
         let created = Utf8Path::new("Cargo.lock");
         std::fs::write(root.join(existing), "original")?;
-        let journal = ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&root, existing)?,
-                ProjectMutationJournal::capture_file(&root, created)?,
-            ],
-        };
+        let journal = ProjectMutationJournal::new(vec![
+            ProjectMutationJournal::capture_file(&root, existing)?,
+            ProjectMutationJournal::capture_file(&root, created)?,
+        ])?;
         std::fs::write(root.join(existing), "candidate")?;
         std::fs::write(root.join(created), "candidate")?;
         let expected = journal.capture_state(&root)?;
@@ -763,9 +845,9 @@ mod mutation_journal_tests {
         let path = root.join(relative);
         std::fs::write(&path, "original")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
-        let journal = ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(&root, relative)?],
-        };
+        let journal = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &root, relative,
+        )?])?;
 
         std::fs::write(&path, "candidate")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;

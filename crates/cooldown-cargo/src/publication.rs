@@ -189,7 +189,7 @@ impl ProjectRecoveryRecord {
             .iter()
             .map(|file| file.original_file(root))
             .collect::<Result<Vec<_>>>()?;
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::new(files)
     }
 }
 
@@ -198,11 +198,11 @@ impl ProjectRecoveryFile {
         let original_contents = utf8_contents(original)?;
         let candidate_contents = utf8_contents(candidate)?;
         Ok(ProjectRecoveryFile {
-            path: original.path.to_string(),
+            path: original.path().to_string(),
             original: original_contents,
             candidate: candidate_contents,
-            original_permissions: RecoveryPermissions::new(original.permissions.as_ref()),
-            candidate_permissions: RecoveryPermissions::new(candidate.permissions.as_ref()),
+            original_permissions: RecoveryPermissions::new(original.permissions()),
+            candidate_permissions: RecoveryPermissions::new(candidate.permissions()),
         })
     }
 
@@ -229,14 +229,13 @@ impl ProjectRecoveryFile {
     }
 
     fn original_file(&self, root: &Utf8Path) -> Result<ProjectMutationFile> {
-        Ok(ProjectMutationFile {
-            path: Utf8PathBuf::from(&self.path),
-            contents: self
-                .original
+        ProjectMutationFile::from_snapshot(
+            Utf8PathBuf::from(&self.path),
+            self.original
                 .as_ref()
                 .map(|value| value.as_bytes().to_vec()),
-            permissions: self.original_permissions.to_permissions(root)?,
-        })
+            self.original_permissions.to_permissions(root)?,
+        )
     }
 
     fn matches_original(&self, live: &ProjectMutationFile) -> bool {
@@ -257,9 +256,9 @@ impl ProjectRecoveryFile {
         contents: Option<&str>,
         permissions: RecoveryPermissions,
     ) -> bool {
-        live.path == Utf8Path::new(&self.path)
-            && live.contents.as_deref() == contents.map(str::as_bytes)
-            && permissions.matches(live.permissions.as_ref())
+        live.path() == Utf8Path::new(&self.path)
+            && live.contents() == contents.map(str::as_bytes)
+            && permissions.matches(live.permissions())
     }
 }
 
@@ -328,13 +327,12 @@ impl RecoveryPermissions {
 }
 
 fn utf8_contents(file: &ProjectMutationFile) -> Result<Option<String>> {
-    file.contents
-        .as_ref()
+    file.contents()
         .map(|contents| {
-            String::from_utf8(contents.clone()).map_err(|error| {
+            String::from_utf8(contents.to_vec()).map_err(|error| {
                 CoreError::Serialization(format!(
                     "Cargo mutation output {} is not UTF-8: {error}",
-                    file.path
+                    file.path()
                 ))
             })
         })
@@ -523,7 +521,7 @@ fn recover_project_publication(
             if !recorded.matches_original(live) {
                 return Err(CoreError::LockUnreadable(format!(
                     "{} changed after the accepted project trial at {recovery_path}; left all files untouched",
-                    project.root.join(&live.path)
+                    project.root.join(live.path())
                 )));
             }
             continue;
@@ -535,7 +533,7 @@ fn recover_project_publication(
         } else {
             return Err(CoreError::LockUnreadable(format!(
                 "{} no longer matches either side of the interrupted project publication at {recovery_path}; left all files untouched",
-                project.root.join(&live.path)
+                project.root.join(live.path())
             )));
         }
     }
@@ -971,7 +969,7 @@ mod tests {
             }
             std::fs::write(target, contents)?;
         }
-        let original = ProjectMutationJournal { files };
+        let original = ProjectMutationJournal::new(files)?;
         let candidate = original.capture_state(&candidate_root)?;
         Ok(AcceptedProjectState::new(
             original,

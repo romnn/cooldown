@@ -304,12 +304,10 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new(L::LOCKFILE),
-            )?],
-        })
+        ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &project.root,
+            Utf8Path::new(L::LOCKFILE),
+        )?])
     }
 
     async fn apply(

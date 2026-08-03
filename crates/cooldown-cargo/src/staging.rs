@@ -608,6 +608,8 @@ fn reject_unsupported_config_environment(
 
 fn cargo_registry_index_variable(key: &OsStr) -> bool {
     key.to_str().is_some_and(|key| {
+        #[cfg(windows)]
+        let key = key.to_ascii_uppercase();
         key.starts_with("CARGO_REGISTRIES_")
             && key.ends_with("_INDEX")
             && key.len() > "CARGO_REGISTRIES__INDEX".len()
@@ -753,7 +755,7 @@ fn capture_outputs(root: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<ProjectMuta
         .iter()
         .map(|path| ProjectMutationJournal::capture_file(root, path))
         .collect::<Result<Vec<_>>>()?;
-    Ok(ProjectMutationJournal { files })
+    ProjectMutationJournal::new(files)
 }
 
 fn common_ancestor(paths: &[Utf8PathBuf]) -> Result<Utf8PathBuf> {
@@ -947,6 +949,20 @@ mod tests {
         .ok_or_else(|| eyre::eyre!("file-backed registry environment was accepted"))?;
 
         assert!(error.to_string().contains("CARGO_REGISTRIES_PRIVATE_INDEX"));
+        assert!(error.to_string().contains("file-backed URL"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_case_file_registry_environment_is_rejected_on_windows() -> eyre::Result<()> {
+        let error = reject_unsupported_config_environment([(
+            OsString::from("cargo_registries_private_index"),
+            OsString::from("file:///private/index"),
+        )])
+        .err()
+        .ok_or_else(|| eyre::eyre!("mixed-case file-backed registry environment was accepted"))?;
+
         assert!(error.to_string().contains("file-backed URL"));
         Ok(())
     }

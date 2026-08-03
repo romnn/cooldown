@@ -141,12 +141,10 @@ impl IsolatedMutationStrategy for FakeEco {
             CoreError::PathEncoding(format!("non-UTF-8 test path: {}", path.display()))
         })?;
         std::fs::copy(source.root.join("Cargo.lock"), root.join("Cargo.lock"))?;
-        let preimage = ProjectMutationJournal {
-            files: vec![ProjectMutationJournal::capture_file(
-                &source.root,
-                camino::Utf8Path::new("Cargo.lock"),
-            )?],
-        };
+        let preimage = ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+            &source.root,
+            camino::Utf8Path::new("Cargo.lock"),
+        )?])?;
         let staged = Project {
             root: root.clone(),
             manifest: root.join("go.mod"),
@@ -389,12 +387,10 @@ impl ToolWrite for FakeEco {
 
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
         if self.state.lock().unwrap().write_lock_on_apply {
-            return Ok(ProjectMutationJournal {
-                files: vec![ProjectMutationJournal::capture_file(
-                    &p.root,
-                    camino::Utf8Path::new("fake.lock"),
-                )?],
-            });
+            return ProjectMutationJournal::new(vec![ProjectMutationJournal::capture_file(
+                &p.root,
+                camino::Utf8Path::new("fake.lock"),
+            )?]);
         }
         Ok(ProjectMutationJournal::default())
     }
