@@ -36,6 +36,11 @@ Cargo configuration `include`, legacy `paths`, path-backed config patches, local
 file-backed registry indices are also rejected until cooldown can snapshot their complete local
 input closure. This includes `CARGO_REGISTRIES_<NAME>_INDEX` overrides.
 
+A symlink used to locate the Cargo project root is supported because cooldown canonicalizes that
+root before coordinating access. A symlink inside a writable project path, such as a symlinked
+workspace member whose manifest may be rewritten, is rejected because the project lease cannot
+govern the resolved target safely.
+
 ## How each is driven
 
 `cooldown` never treats a native package manager as the source of policy — the cooldown verdict is computed in one core evaluator. The native tool is used only to **resolve** a lockfile graph and to **apply** changes back to it. That is what keeps "adoptable" identical across ecosystems.

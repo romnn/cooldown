@@ -2,15 +2,21 @@
 //! releases from the crates.io sparse index, and `cargo`-driven apply/build.
 //!
 //! Cargo has no publish-date cutoff flag (no `--exclude-newer` equivalent), so the cooldown window
-//! is realized entirely in [`cooldown_core`]: the crates.io sparse index supplies publish times, the
-//! core computes each crate's newest-within-window target, and this adapter applies those as concrete
-//! `cargo update --precise <version>` pins. Apply re-resolves the **whole** graph by issuing all of
-//! a project's planned pins (one `cargo update -p <spec> --precise V` per pin — cargo silently drops
-//! all but the first spec when several share one `--precise`) as one logical unit, then builds the
-//! report from the FULL before/after `Cargo.lock` diff — not from per-change outcomes. So every net
-//! version change is surfaced (the planned moves, the collateral moves the re-resolve forces on
-//! non-candidate crates, and the candidates a mutually-exclusive `=`-pin or single-major shared
-//! transitive leaves held), and a converged graph re-applies to a byte-stable fixed point.
+//! is realized entirely in [`cooldown_core`].
+//! The crates.io sparse index supplies publish times, the core computes each crate's
+//! newest-within-window target, and this adapter applies those targets as concrete
+//! `cargo update --precise <version>` pins.
+//!
+//! Apply re-resolves the **whole** graph by issuing all planned pins as one logical unit.
+//! Each target gets its own command because Cargo silently applies only the first package spec when
+//! several share one `--precise` argument.
+//! Version reporting compares before/after `Cargo.lock` slots, while edge reporting audits moves
+//! paired across stable dependent identities whose endpoints coexist in both snapshots.
+//! The slot comparison reports planned and collateral version changes, while a planned candidate
+//! that does not reach its target receives a held row.
+//! Changed dependent identities and unpaired entries remain package-set changes rather than
+//! attributable binding rows.
+//! A converged graph re-applies to a byte-stable fixed point.
 
 use crate::CARGO_ID;
 use crate::cargocmd::{Cargo, ResolvedGraph};
@@ -319,8 +325,8 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     None
 }
 
-/// The net version changes of the before/after lock diff that `applied` does not already report,
-/// as sorted collateral rows.
+/// The paired version-slot changes that `applied` does not already report, as sorted collateral
+/// rows.
 ///
 /// Exclusion is by exact `(name, from, to)` move, not by planned package name: a planned candidate
 /// the resolve *held* can still have been floated off its baseline by a sibling pin, and that real
@@ -353,10 +359,10 @@ fn collateral_changes(
     changes
 }
 
-/// A net version change `apply` derived from the before/after lock diff that no planned row
-/// reports — collateral movement the whole-graph re-resolve forced. Reported so no crate's
-/// version change is ever silent: a transitive pushed backward to keep the lock consistent, or
-/// matured down by `fix`, surfaces as its own report row.
+/// A paired version-slot change that no planned row reports.
+///
+/// The whole-graph re-resolve can force collateral movement, such as pushing a transitive backward
+/// for consistency or maturing a crate down during `fix`.
 fn collateral_change(name: &str, from: &str, to: &str) -> Change {
     let downgrade = version::compare(to, from).is_lt();
     Change {
@@ -400,14 +406,17 @@ fn blocking_requirer(
 }
 
 impl CargoTool {
-    /// Re-resolve the **whole** graph once under cooldown's window, then build the report from the
-    /// full before/after `Cargo.lock` diff. `upgrade` is informational for the rewrite policy; cargo
-    /// has no date cutoff, so every move is expressed as a concrete `--precise` pin computed by the
-    /// core. Widening for `Always`/`Auto` happens before pinning so a cross-major target is admitted.
+    /// Re-resolves the **whole** graph under cooldown's window.
+    ///
+    /// `upgrade` is informational for the rewrite policy.
+    /// Cargo has no date cutoff, so each planned target is expressed as a concrete `--precise` pin
+    /// computed by the core.
+    /// Widening for `Always` and `Auto` happens before pinning so a cross-major target is admitted.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
+        journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<()> {
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
@@ -415,6 +424,7 @@ impl CargoTool {
         // target (a cross-major bump). The pin itself follows.
         if matches!(plan.rewrite, RewriteMode::Always) {
             for change in &plan.changes {
+                journal.validate_project(&project.root)?;
                 manifest::widen_constraint(
                     &project.root,
                     &change.members,
@@ -423,7 +433,8 @@ impl CargoTool {
                 )?;
             }
         }
-        self.pin_batch(project, &plan.changes, observer).await?;
+        self.pin_batch(project, &plan.changes, journal, observer)
+            .await?;
 
         if matches!(plan.rewrite, RewriteMode::Auto) {
             // Widen only the candidates the pin batch could not place at their target because their
@@ -438,6 +449,7 @@ impl CargoTool {
             for _ in 0..plan.changes.len() {
                 let after = read_lock(project)?.crates_io_locked_versions();
                 let graph = if needs_graph {
+                    journal.validate_project(&project.root)?;
                     Some(self.cargo.metadata(&project.root).await?)
                 } else {
                     None
@@ -449,6 +461,7 @@ impl CargoTool {
                         continue;
                     }
                     short.push(change.clone());
+                    journal.validate_project(&project.root)?;
                     if !manifest::widen_constraint(
                         &project.root,
                         &change.members,
@@ -464,7 +477,7 @@ impl CargoTool {
                 if !widened_any {
                     break;
                 }
-                self.pin_batch(project, &short, observer).await?;
+                self.pin_batch(project, &short, journal, observer).await?;
             }
         }
         Ok(())
@@ -484,6 +497,7 @@ impl CargoTool {
         &self,
         project: &Project,
         changes: &[Change],
+        journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<()> {
         // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
@@ -515,6 +529,7 @@ impl CargoTool {
                 if let Some(observer) = observer {
                     observer.candidate_started(change);
                 }
+                journal.validate_project(&project.root)?;
                 self.update_precise(project, &change.package.name, &current, change.to.as_str())
                     .await?;
             }
@@ -556,6 +571,7 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<ApplyReport> {
+        journal.validate_project(&project.root)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);
@@ -563,9 +579,10 @@ impl CargoTool {
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
         // the re-resolve), parsed once: its slot map feeds the version diff below and its edge view
         // feeds the edge policy. The batched precise pins emit one consistent lock; the report is the
-        // diff of this snapshot against the result, so *every* net version change is surfaced. A
-        // missing/unparsable snapshot leaves `before` empty, so a crate that moved is still reported
-        // (never silent).
+        // paired version-slot diff of this snapshot against the result.
+        // A missing or unparsable snapshot leaves `before` empty.
+        // Planned target reporting still uses the resolved result, but collateral comparison then
+        // has no baseline.
         let before_lock = journal
             .files()
             .iter()
@@ -580,8 +597,12 @@ impl CargoTool {
 
         // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
         // invocation, repeated to a bounded fixed point because one invocation may move a package
-        // another planned pin still needs to address. The diff below surfaces every net move.
-        match self.whole_graph_resolve(project, plan, observer).await {
+        // another planned pin still needs to address.
+        // The diff below surfaces every paired version-slot move.
+        match self
+            .whole_graph_resolve(project, plan, journal, observer)
+            .await
+        {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
@@ -609,6 +630,7 @@ impl CargoTool {
         let corrective_edges =
             matches!(plan.edge_policy, EdgePolicy::Canonicalize) || preserve_needs_graph;
         let graph = if needs_graph || corrective_edges {
+            journal.validate_project(&project.root)?;
             Some(self.cargo.metadata(&project.root).await?)
         } else {
             None
@@ -616,6 +638,7 @@ impl CargoTool {
 
         // Enforce the plan's edge policy over the re-resolved lock and collect the moves observation
         // can pair across stable dependent identities and coexisting endpoints.
+        journal.validate_project(&project.root)?;
         let enforced = edges::enforce::enforce(
             &self.cargo,
             project,
@@ -656,8 +679,8 @@ impl CargoTool {
             }
         }
 
-        // The hard requirement: no net version change to *any* crate may be omitted. Every moved
-        // slot the applied rows above do not already report is surfaced as its own collateral
+        // No paired version-slot change may be omitted.
+        // Every moved slot the applied rows above do not already report is surfaced as a collateral
         // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
         // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
         // would hide that real move).
@@ -1283,6 +1306,76 @@ mod tests {
 
         let result = skipped_on_apply_error(&change, err);
         std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
+    }
+
+    #[tokio::test]
+    async fn direct_apply_rejects_a_journal_from_another_project() -> eyre::Result<()> {
+        let source = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        let source_root = Utf8PathBuf::from_path_buf(source.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let other_root = Utf8PathBuf::from_path_buf(other.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(source_root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(other_root.join("Cargo.toml"), "[workspace]\n")?;
+        let source_project = Project {
+            root: source_root.clone(),
+            kind: CARGO_ID,
+            manifest: source_root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let other_project = Project {
+            root: other_root.clone(),
+            kind: CARGO_ID,
+            manifest: other_root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let plan = Plan::default();
+        let journal = tool.mutation_journal(&other_project, &plan).await?;
+
+        let result = tool.apply(&source_project, &plan, &journal).await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_apply_revalidates_a_recreated_root_on_every_attempt() -> eyre::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(parent.path().join("project"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let moved = Utf8PathBuf::from_path_buf(parent.path().join("moved"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        let project = Project {
+            root: root.clone(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let plan = Plan::default();
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.apply(&project, &plan, &journal).await?;
+        std::fs::rename(&root, &moved)?;
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+
+        let result = tool.apply(&project, &plan, &journal).await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
     }
 
     #[tokio::test]

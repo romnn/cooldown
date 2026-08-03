@@ -64,6 +64,22 @@ pub(crate) struct AppliedMutation {
     pub(crate) expected: ProjectMutationState,
 }
 
+async fn apply_checked(
+    writer: &dyn ToolWrite,
+    project: &Project,
+    plan: &Plan,
+    journal: &ProjectMutationJournal,
+    observer: &dyn ApplyObserver,
+) -> ApplyResult<cooldown_core::ApplyAttempt> {
+    journal
+        .validate_project(&project.root)
+        .map_err(ApplyFailure::RestoreConflict)?;
+    writer
+        .apply_with_observer(project, plan, journal, observer)
+        .await
+        .map_err(ApplyFailure::RestoreConflict)
+}
+
 /// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the
 /// candidates that actually make the set unsatisfiable.
 ///
@@ -74,6 +90,7 @@ pub(crate) struct AppliedMutation {
 /// candidate conflict and propagates unchanged.
 /// `journal` is the caller's pre-apply snapshot and is restored before each recovery trial and the
 /// final commit, so no partial widen or lock leaks.
+/// Its project identity and writable topology are revalidated before every adapter attempt.
 /// Native candidate work is forwarded to `observer` across the first attempt and recovery trials.
 pub(crate) async fn apply_resilient_with_observer(
     writer: &dyn ToolWrite,
@@ -82,13 +99,7 @@ pub(crate) async fn apply_resilient_with_observer(
     journal: &ProjectMutationJournal,
     observer: &dyn ApplyObserver,
 ) -> ApplyResult<AppliedMutation> {
-    journal
-        .validate_project(&project.root)
-        .map_err(ApplyFailure::RestoreConflict)?;
-    let first = writer
-        .apply_with_observer(project, plan, journal, observer)
-        .await
-        .map_err(ApplyFailure::RestoreConflict)?;
+    let first = apply_checked(writer, project, plan, journal, observer).await?;
     let (first_report, first_state) = match first {
         cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
         cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
@@ -143,10 +154,7 @@ pub(crate) async fn apply_resilient_with_observer(
             changes: accepted,
             ..plan.clone()
         };
-        let result = writer
-            .apply_with_observer(project, &committed, journal, observer)
-            .await
-            .map_err(ApplyFailure::RestoreConflict)?;
+        let result = apply_checked(writer, project, &committed, journal, observer).await?;
         let (report, expected) = match result {
             cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
             cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
@@ -209,10 +217,7 @@ async fn verified_satisfiable_subset(
             changes: accepted.iter().chain(group.iter()).cloned().collect(),
             ..plan.clone()
         };
-        let result = writer
-            .apply_with_observer(project, &trial, journal, observer)
-            .await
-            .map_err(ApplyFailure::RestoreConflict)?;
+        let result = apply_checked(writer, project, &trial, journal, observer).await?;
         let report = match result {
             cooldown_core::ApplyAttempt::Finished { report, postimage } => {
                 current_state = postimage;

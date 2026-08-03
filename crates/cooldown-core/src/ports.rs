@@ -417,6 +417,9 @@ pub trait ToolWrite: Send + Sync {
 
     /// Applies `plan` to `project` and reports what was applied or skipped.
     ///
+    /// Implementations must reject a journal that does not belong to `project` before mutating any
+    /// project file.
+    ///
     /// Mechanics only (manifest rewrites, MVS, resolver runs).
     /// **Whole-plan** rollback belongs to
     /// the application layer: it captures a [`ProjectMutationJournal`] before calling `apply`,
@@ -432,8 +435,10 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the manifest cannot be rewritten or re-locking
-    /// fails.
+    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when `journal` does not
+    /// belong to `project`.
+    /// Returns another [`CoreError`](crate::CoreError) if the manifest cannot be rewritten or
+    /// re-locking fails.
     async fn apply(
         &self,
         project: &Project,

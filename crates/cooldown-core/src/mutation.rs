@@ -452,15 +452,28 @@ impl ProjectMutationJournal {
         &self.files
     }
 
-    /// Checks that this journal belongs to `root`'s current project identity.
+    /// Checks that this journal still belongs to `root` and has a safe writable topology.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`] when `root` names another project or its directory was
-    /// replaced after journal capture.
+    /// Returns [`CoreError::LockConflict`] when `root` names another project, its directory was
+    /// replaced after journal capture, or a writable ancestor is no longer a regular directory.
     pub fn validate_project(&self, root: &Utf8Path) -> Result<()> {
-        self.project
-            .ensure_same(&ProjectMutationRoot::capture(root)?)
+        let live = ProjectMutationRoot::capture(root).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate mutation project {root}: {error}"
+            ))
+        })?;
+        self.project.ensure_same(&live)?;
+        for file in &self.files {
+            validate_mutation_ancestors(self.project.path(), &file.path).map_err(|error| {
+                CoreError::LockConflict(format!(
+                    "could not revalidate mutation write set for {}: {error}",
+                    self.project.path()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Adds paths absent from this journal while preserving its earlier snapshots.
@@ -970,6 +983,39 @@ mod mutation_journal_tests {
     }
 
     #[test]
+    fn mutation_authority_reports_a_removed_root_as_a_conflict() -> eyre::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(parent.path().join("project"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(&root)?;
+        let journal = ProjectMutationJournal::capture(&root, std::iter::empty::<&Utf8Path>())?;
+        std::fs::remove_dir(&root)?;
+
+        let result = journal.validate_project(&root);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_authority_reports_a_recreated_root_as_a_conflict() -> eyre::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(parent.path().join("project"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let moved = Utf8PathBuf::from_path_buf(parent.path().join("moved"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(&root)?;
+        let journal = ProjectMutationJournal::capture(&root, std::iter::empty::<&Utf8Path>())?;
+        std::fs::rename(&root, &moved)?;
+        std::fs::create_dir(&root)?;
+
+        let result = journal.validate_project(&root);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[test]
     fn mutation_journal_rejects_paths_outside_the_project() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = root(&directory)?;
@@ -1147,7 +1193,7 @@ mod mutation_journal_tests {
 
         let result = accepted.install(&source_root);
 
-        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(
             std::fs::read_to_string(external_root.join("Cargo.toml"))?,
             "external"
