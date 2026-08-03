@@ -285,25 +285,19 @@ pub fn find_recovery_marker_dirs(
 }
 
 fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<&'a str> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::debug!(%error, %dir, "skipping unreadable directory markers");
-            return BTreeSet::new();
-        }
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            let marker = markers.get(name).copied()?;
-            entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
-                .then_some(marker)
-        })
+    // Probe the small deduplicated marker set instead of enumerating each walked directory again.
+    markers
+        .iter()
+        .copied()
+        .filter(|marker| marker_entry_exists(&dir.join(marker)))
         .collect()
+}
+
+fn marker_entry_exists(path: &Utf8Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
 }
 
 /// Whether `path` (a directory) is excluded, matching its path relative to `root` against the
