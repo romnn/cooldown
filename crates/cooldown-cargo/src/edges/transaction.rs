@@ -1,7 +1,7 @@
 //! Owns reversible edge-correction probes inside a disposable Cargo project.
 
 use camino::Utf8Path;
-use cooldown_core::{CoreError, Project, Result};
+use cooldown_core::{CoreError, Result};
 
 /// A reversible lock correction whose entire lifetime stays inside a disposable project copy.
 pub(super) struct SpeculativeLockTransaction {
@@ -14,7 +14,6 @@ pub(super) struct SpeculativeLockTransaction {
 impl SpeculativeLockTransaction {
     /// Starts with `candidate_lock` installed as the pending decision.
     pub(super) fn begin(
-        _project: &Project,
         lock_path: &Utf8Path,
         original_lock: &str,
         candidate_lock: &str,

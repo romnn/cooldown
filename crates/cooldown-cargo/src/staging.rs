@@ -17,6 +17,8 @@ struct CargoMutationStage {
     staged: Project,
     preimage: ProjectMutationJournal,
     inputs: ProjectInputSnapshot,
+    cargo: Cargo,
+    source_topology: StagingMetadata,
     layout: StagingLayout,
     source_files: BTreeSet<Utf8PathBuf>,
 }
@@ -51,13 +53,12 @@ impl IsolatedMutation for CargoMutationStage {
     }
 
     fn accepted_state(&self) -> Result<AcceptedProjectState> {
-        self.validate_source_shape()?;
-        self.inputs.validate()?;
         let candidate = self.preimage.capture_state(&self.staged.root)?;
         AcceptedProjectState::new(self.preimage.clone(), candidate, self.inputs.clone())
     }
 
     async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication> {
+        self.validate_source_topology().await?;
         self.validate_source_shape()?;
         accepted.validate_source(&self.source.root)?;
         crate::publication::publish_accepted(&self.source, accepted)
@@ -74,27 +75,24 @@ impl CargoMutationStage {
                     "Cargo could not describe the locked source topology: {error}"
                 ))
             })?;
-        let layout = StagingLayout::new(source, metadata)?;
+        let layout = StagingLayout::new(source, metadata.clone())?;
         let source_files = layout.source_files()?;
         let preimage = capture_outputs(&source.root, &layout.output_paths)?;
-        let scratch = tempfile::tempdir()?;
-        let topology = utf8_path(scratch.path().join("tree"))?;
-        std::fs::create_dir_all(&topology)?;
-        layout.copy_to(&topology, &source_files)?;
-
-        let current_files = layout.source_files()?;
-        if source_files != current_files {
-            return Err(isolation_error(
-                "Cargo's resolution inputs changed while cooldown staged them",
-            ));
-        }
         let input_paths = source_files
             .iter()
             .filter(|path| !layout.is_output(path))
             .cloned()
             .collect::<Vec<_>>();
         let inputs = ProjectInputSnapshot::capture(&input_paths)?;
-        layout.validate_copy(&topology, &source_files)?;
+        let scratch = tempfile::tempdir()?;
+        let topology = utf8_path(scratch.path().join("tree"))?;
+        std::fs::create_dir_all(&topology)?;
+        layout.copy_to(&topology, &source_files)?;
+        inputs.validate().map_err(|error| {
+            isolation_error(format!(
+                "Cargo's resolution inputs changed while cooldown staged them: {error}"
+            ))
+        })?;
 
         let staged_root = layout.staged_path(&topology, &source.root)?;
         let staged_manifest = layout.staged_path(&topology, &source.manifest)?;
@@ -119,9 +117,30 @@ impl CargoMutationStage {
             staged,
             preimage,
             inputs,
+            cargo: cargo.clone(),
+            source_topology: metadata,
             layout,
             source_files,
         })
+    }
+
+    async fn validate_source_topology(&self) -> Result<()> {
+        let current = self
+            .cargo
+            .staging_metadata(&self.source.root)
+            .await
+            .map_err(|error| {
+                CoreError::LockConflict(format!(
+                    "could not revalidate Cargo's workspace topology: {error}; left source project files untouched"
+                ))
+            })?;
+        if current != self.source_topology {
+            return Err(CoreError::LockConflict(
+                "Cargo's workspace members, package identities, manifests, or targets changed during the isolated trial; left source project files untouched"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_source_shape(&self) -> Result<()> {
@@ -283,21 +302,6 @@ impl StagingLayout {
         Ok(())
     }
 
-    fn validate_copy(&self, topology: &Utf8Path, files: &BTreeSet<Utf8PathBuf>) -> Result<()> {
-        for source in files {
-            if self.is_ambient(source) {
-                continue;
-            }
-            let staged = self.staged_path(topology, source)?;
-            if std::fs::read(source)? != std::fs::read(&staged)? {
-                return Err(isolation_error(format!(
-                    "Cargo input changed while cooldown copied it: {source}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn staged_path(&self, topology: &Utf8Path, source: &Utf8Path) -> Result<Utf8PathBuf> {
         let relative = source.strip_prefix(&self.common_root).map_err(|_| {
             isolation_error(format!(
@@ -430,6 +434,7 @@ fn discover_vendor_roots(configs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf
                     "cannot parse Cargo configuration {config}: {error}"
                 ))
             })?;
+        reject_unsupported_config_inputs(config, &value)?;
         let Some(sources) = value.get("source").and_then(toml::Value::as_table) else {
             continue;
         };
@@ -445,6 +450,36 @@ fn discover_vendor_roots(configs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf
         }
     }
     Ok(roots)
+}
+
+fn reject_unsupported_config_inputs(config: &Utf8Path, value: &toml::Value) -> Result<()> {
+    if value.get("include").is_some() {
+        return Err(isolation_error(format!(
+            "Cargo configuration {config} uses `include`, whose recursive input closure is not yet supported"
+        )));
+    }
+    if value.get("paths").is_some() {
+        return Err(isolation_error(format!(
+            "Cargo configuration {config} uses local `paths` overrides, which are not yet supported"
+        )));
+    }
+    let has_local_registry = value
+        .get("source")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|sources| {
+            sources.values().any(|source| {
+                source
+                    .get("local-registry")
+                    .and_then(toml::Value::as_str)
+                    .is_some()
+            })
+        });
+    if has_local_registry {
+        return Err(isolation_error(format!(
+            "Cargo configuration {config} uses a `local-registry` source, which is not yet supported"
+        )));
+    }
+    Ok(())
 }
 
 fn path_dependency_roots(initial: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf8PathBuf>> {
@@ -655,6 +690,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unsupported_cargo_configuration_inputs_fail_explicitly() -> eyre::Result<()> {
+        let config = Utf8Path::new("/project/.cargo/config.toml");
+        for (contents, expected) in [
+            ("include = [\"shared.toml\"]", "uses `include`"),
+            ("paths = [\"../override\"]", "uses local `paths`"),
+            (
+                "[source.local]\nlocal-registry = \"registry\"",
+                "uses a `local-registry`",
+            ),
+        ] {
+            let value: toml::Value = toml::from_str(contents)?;
+            let error = reject_unsupported_config_inputs(config, &value)
+                .err()
+                .ok_or_else(|| eyre::eyre!("unsupported Cargo configuration was accepted"))?;
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected diagnostic for {contents:?}: {error}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sibling_path_dependency_keeps_its_relative_topology() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -806,6 +864,37 @@ mod tests {
         let accepted = stage.accepted_state()?;
 
         write(&root.join(".cargo/config.toml"), "[net]\noffline = true\n")?;
+
+        std::assert_matches!(
+            stage.publish(&accepted).await,
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            source_lock
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newly_globbed_workspace_member_invalidates_publication() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("workspace"))?;
+        write(
+            &root.join("Cargo.toml"),
+            indoc! {r#"
+            [workspace]
+            members = ["crates/*"]
+            resolver = "3"
+        "#},
+        )?;
+        package(&root.join("crates/first"), "first")?;
+        generate_lock(&root)?;
+        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
+        let accepted = stage.accepted_state()?;
+
+        package(&root.join("crates/new"), "new")?;
 
         std::assert_matches!(
             stage.publish(&accepted).await,

@@ -149,7 +149,7 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), DurableWrit
 
 #[cfg_attr(
     not(unix),
-    allow(
+    expect(
         clippy::unnecessary_wraps,
         reason = "the shared cross-platform signature remains fallible on Unix"
     )

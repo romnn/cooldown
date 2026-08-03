@@ -347,13 +347,18 @@ struct RawMeta {
 }
 
 /// Cargo's authoritative package and target topology for one locked resolve.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StagingMetadata {
     pub(crate) workspace_root: camino::Utf8PathBuf,
     pub(crate) packages: Vec<StagingPackage>,
 }
 
 /// One package whose manifest and target paths Cargo may read during a resolve.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StagingPackage {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) version: String,
     pub(crate) manifest_path: camino::Utf8PathBuf,
     pub(crate) target_paths: Vec<camino::Utf8PathBuf>,
     pub(crate) source: Option<String>,
@@ -853,6 +858,44 @@ impl Cargo {
         Self::parse_graph(&stdout)
     }
 
+    /// Reads the lock-generation graph without allowing Cargo to update `Cargo.lock`.
+    ///
+    /// Unlike [`Self::verify_locked`], this command may access the registry and therefore does not
+    /// require every resolved package to be available offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the corresponding Cargo
+    /// tool error for any other failure.
+    pub async fn metadata_locked(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
+        let out = self
+            .output(
+                dir,
+                &[
+                    "metadata",
+                    "--all-features",
+                    "--locked",
+                    "--format-version",
+                    "1",
+                ],
+            )
+            .await?;
+        if out.status.success() {
+            return Self::parse_graph(&String::from_utf8_lossy(&out.stdout));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stale_lock_diagnostic(&stderr) {
+            return Err(CoreError::StaleLock(format!(
+                "Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`"
+            )));
+        }
+        Err(CoreError::Tool {
+            tool: self.bin.clone(),
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(&out),
+        })
+    }
+
     /// Reads the locked package and target topology without allowing Cargo to rewrite the source.
     ///
     /// # Errors
@@ -892,7 +935,7 @@ impl Cargo {
                     "cargo metadata returned a relative or empty package manifest path".to_string(),
                 ));
             }
-            let target_paths = package
+            let mut target_paths = package
                 .targets
                 .into_iter()
                 .map(|target| camino::Utf8PathBuf::from(target.src_path))
@@ -902,13 +945,19 @@ impl Cargo {
                     "cargo metadata returned a relative target path for {manifest_path}"
                 )));
             }
+            target_paths.sort();
+            let workspace_member = members.contains(&package.id);
             packages.push(StagingPackage {
+                id: package.id,
+                name: package.name,
+                version: package.version,
                 manifest_path,
                 target_paths,
                 source: package.source,
-                workspace_member: members.contains(&package.id),
+                workspace_member,
             });
         }
+        packages.sort();
         Ok(StagingMetadata {
             workspace_root,
             packages,
@@ -1144,7 +1193,41 @@ fn stale_lock_diagnostic(stderr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
     use indoc::indoc;
+
+    #[tokio::test]
+    async fn locked_metadata_rejects_a_stale_lock_without_rewriting_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        std::fs::write(root.join("src/lib.rs"), "pub fn app() {}\n")?;
+        let generated = std::process::Command::new(Cargo::new().bin)
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .output()?;
+        if !generated.status.success() {
+            return Err(eyre::eyre!(
+                "cargo generate-lockfile failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            ));
+        }
+        let before = std::fs::read(root.join("Cargo.lock"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+        )?;
+
+        let error = Cargo::new().metadata_locked(root).await.err();
+        std::assert_matches!(error, Some(CoreError::StaleLock(_)));
+        assert_eq!(std::fs::read(root.join("Cargo.lock"))?, before);
+        Ok(())
+    }
 
     #[test]
     fn stale_lock_classification_matches_only_cargos_update_diagnostic() {

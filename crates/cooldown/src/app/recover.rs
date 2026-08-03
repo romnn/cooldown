@@ -1,16 +1,20 @@
-//! `recover` — restore adapter-owned project state left by an interrupted mutation, then stop.
+//! `recover` — settle adapter-owned project state left by an interrupted mutation, then stop.
 
 use super::lock::ProjectWriteGuard;
 use super::progress::Progress;
 use super::{Exit, diag_from_error};
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::{Diagnostic, ToolId};
+use cooldown_core::{Diagnostic, MutationRecovery, RecoveryDisposition, ToolId};
 
 /// What happened while recovering one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStatus {
-    /// Interrupted state was validated and restored.
-    Recovered,
+    /// A completely published accepted candidate was retained.
+    Accepted,
+    /// A partial or speculative mutation was restored to its preimage.
+    Restored,
+    /// Only recovery artifacts remained and were consumed.
+    CleanupOnly,
     /// No interrupted state was present.
     Unchanged,
     /// Recovery could not safely complete.
@@ -22,7 +26,9 @@ impl RecoveryStatus {
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
-            RecoveryStatus::Recovered => "recovered",
+            RecoveryStatus::Accepted => "accepted",
+            RecoveryStatus::Restored => "restored",
+            RecoveryStatus::CleanupOnly => "cleanup-only",
             RecoveryStatus::Unchanged => "unchanged",
             RecoveryStatus::Error => "error",
         }
@@ -40,12 +46,14 @@ pub struct RecoveryItem {
     pub status: RecoveryStatus,
     /// The diagnostic when recovery failed.
     pub error: Option<Diagnostic>,
+    /// Non-fatal durability or cleanup diagnostics.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Per-status recovery counts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecoverySummary {
-    /// Projects whose interrupted state was restored.
+    /// Projects whose interrupted state was settled as accepted, restored, or cleanup-only.
     pub recovered: usize,
     /// Projects without interrupted state.
     pub unchanged: usize,
@@ -63,7 +71,7 @@ pub struct RecoveryOutcome {
     pub exit: Exit,
 }
 
-type RecoverProject = fn(&Utf8Path) -> cooldown_core::Result<bool>;
+type RecoverProject = fn(&Utf8Path) -> cooldown_core::Result<MutationRecovery>;
 
 /// A project found from adapter-owned recovery artifacts without normal policy bootstrap.
 pub(crate) struct RecoveryTarget {
@@ -103,20 +111,43 @@ pub(crate) fn recover_targets(
             Ok(_guard) => (target.recover)(&target.root),
             Err(error) => Err(error),
         };
-        let (status, error) = match result {
-            Ok(true) => {
-                summary.recovered += 1;
-                (RecoveryStatus::Recovered, None)
-            }
-            Ok(false) => {
-                summary.unchanged += 1;
-                (RecoveryStatus::Unchanged, None)
+        let (status, error, warnings) = match result {
+            Ok(recovery) => {
+                let status = match recovery.disposition {
+                    RecoveryDisposition::Unchanged => {
+                        summary.unchanged += 1;
+                        RecoveryStatus::Unchanged
+                    }
+                    RecoveryDisposition::Accepted => {
+                        summary.recovered += 1;
+                        RecoveryStatus::Accepted
+                    }
+                    RecoveryDisposition::Restored => {
+                        summary.recovered += 1;
+                        RecoveryStatus::Restored
+                    }
+                    RecoveryDisposition::CleanupOnly => {
+                        summary.recovered += 1;
+                        RecoveryStatus::CleanupOnly
+                    }
+                };
+                let warnings = recovery
+                    .warnings
+                    .into_iter()
+                    .map(|warning| {
+                        warning
+                            .with_tool(target.tool.as_str())
+                            .with_project(&target.project)
+                    })
+                    .collect();
+                (status, None, warnings)
             }
             Err(error) => {
                 summary.errors += 1;
                 (
                     RecoveryStatus::Error,
                     Some(diag_from_error(&error, target.tool, &target.project, None)),
+                    Vec::new(),
                 )
             }
         };
@@ -125,6 +156,7 @@ pub(crate) fn recover_targets(
             project: target.project,
             status,
             error,
+            warnings,
         });
     }
     items.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.tool.cmp(&b.tool)));

@@ -70,8 +70,10 @@ struct CheckAccum {
 
 /// The outcome of the fail-closed lock-currency probe: continue evaluating, or skip this project.
 enum LockProbe {
-    /// The lock is current (or a stale lock was downgraded to a warning); continue.
+    /// The lock is current; continue dependency evaluation.
     Continue,
+    /// The stale lock was accepted as a warning; do not inspect a graph Cargo would have to update.
+    StaleAllowed,
     /// The lock could not be soundly evaluated; this project is skipped.
     Skip,
 }
@@ -199,7 +201,7 @@ impl<'a> CheckRunner<'a> {
                     .await
             }
         };
-        if matches!(lock_probe, LockProbe::Skip) {
+        if matches!(lock_probe, LockProbe::Skip | LockProbe::StaleAllowed) {
             return;
         }
 
@@ -277,6 +279,7 @@ impl<'a> CheckRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
     ) -> LockProbe {
+        let stale = report.status == cooldown_core::LockStatus::Stale;
         let outcome = lock_report_outcome(
             report,
             pctx.tool,
@@ -289,7 +292,11 @@ impl<'a> CheckRunner<'a> {
                 if let Some(diagnostic) = outcome.diagnostic {
                     self.acc.warnings.push(diagnostic);
                 }
-                LockProbe::Continue
+                if stale {
+                    LockProbe::StaleAllowed
+                } else {
+                    LockProbe::Continue
+                }
             }
             LockReportAction::Skip => {
                 if let Some(diagnostic) = outcome.diagnostic {
@@ -314,7 +321,7 @@ impl<'a> CheckRunner<'a> {
         );
         if self.opts.allow_stale_lock && downgradable {
             self.acc.warnings.push(diag);
-            LockProbe::Continue
+            LockProbe::StaleAllowed
         } else {
             self.acc.errors.push(diag);
             LockProbe::Skip

@@ -507,6 +507,7 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "crates/app/Cargo.toml",
         &format!("{APP_MANIFEST}regex = \"1\"\n"),
     );
+    let stale_lock = fixture.read_bytes("Cargo.lock");
 
     let stale = fixture.cooldown_json(&["check", "--latest", "--package", "log"]);
     assert!(!stale.ok(), "stale lock must fail closed by default");
@@ -543,6 +544,22 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "stale-lock warning should name the manifest path, got {:?}",
         allowed.warning_paths()
     );
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--allow-stale-lock"]);
+    assert!(
+        outdated.ok(),
+        "outdated remains informational on a stale lock"
+    );
+    assert!(outdated.warning_kinds().contains("stale_lock"));
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+
+    let explain = fixture.cooldown(&["explain", "log"]);
+    assert!(
+        !explain.status.success(),
+        "explain must fail closed on a stale lock"
+    );
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
 }
 
 #[test]

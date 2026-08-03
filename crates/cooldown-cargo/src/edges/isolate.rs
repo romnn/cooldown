@@ -57,8 +57,7 @@ pub(super) async fn apply_rewrites(
             committed: CommittedRewrites::Unchanged,
         });
     };
-    let mut transaction =
-        SpeculativeLockTransaction::begin(project, lock_path, resolver_text, &rewritten)?;
+    let mut transaction = SpeculativeLockTransaction::begin(lock_path, resolver_text, &rewritten)?;
     let result = apply_transaction(
         cargo,
         project,
@@ -446,8 +445,7 @@ mod tests {
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
         };
-        let transaction =
-            SpeculativeLockTransaction::begin(&project, &lock_path, "resolver", "candidate")?;
+        let transaction = SpeculativeLockTransaction::begin(&lock_path, "resolver", "candidate")?;
         Ok((directory, project, lock_path, transaction))
     }
 

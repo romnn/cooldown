@@ -17,6 +17,11 @@ pub(super) fn run(prepared: setup::PreparedRecovery) -> Result<Exit, CoreError> 
         .iter()
         .filter_map(|item| item.error.clone())
         .collect();
+    let warnings = outcome
+        .items
+        .iter()
+        .flat_map(|item| item.warnings.clone())
+        .collect();
     let envelope = with_diags(
         render::Envelope::new(
             "recover",
@@ -26,7 +31,7 @@ pub(super) fn run(prepared: setup::PreparedRecovery) -> Result<Exit, CoreError> 
             summary,
             items,
         ),
-        Vec::new(),
+        warnings,
         errors,
     );
     emit_envelope(prepared.json, &envelope, || {

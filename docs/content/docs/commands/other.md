@@ -79,7 +79,7 @@ The same behavior is available as a global `--sync` flag on any command, which s
 
 ## `recover`
 
-Restore package-manager state left by an interrupted cooldown mutation, then stop without
+Settle package-manager state left by an interrupted cooldown mutation, then stop without
 resolving dependencies or applying another change:
 
 ```bash

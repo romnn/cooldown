@@ -922,7 +922,7 @@ mod tests {
         RecoveryItem {
             tool: "cargo".to_string(),
             project: ".".to_string(),
-            status: RecoveryStatus::Recovered,
+            status: RecoveryStatus::Restored,
         }
     }
 

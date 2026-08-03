@@ -2,10 +2,12 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    AcceptedProjectState, AcceptedPublication, CoreError, Diagnostic, DiagnosticKind, Project,
-    ProjectMutationFile, ProjectMutationJournal, Result,
+    AcceptedProjectState, AcceptedPublication, CoreError, Diagnostic, DiagnosticKind,
+    MutationRecovery, Project, ProjectMutationFile, ProjectMutationJournal, RecoveryDisposition,
+    Result,
 };
 use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 
 const RECOVERY_FORMAT: &str = "cooldown-cargo-lock-recovery-v2";
@@ -301,7 +303,7 @@ impl RecoveryPermissions {
 
     #[cfg_attr(
         unix,
-        allow(
+        expect(
             clippy::unnecessary_wraps,
             reason = "the shared cross-platform signature remains fallible on non-Unix targets"
         )
@@ -432,13 +434,13 @@ fn retry_private_cleanup<F>(
     }
 }
 
-/// Restores a validated interrupted transaction while the caller holds exclusive project access.
-pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
+/// Settles a validated interrupted transaction while the caller holds exclusive project access.
+pub(crate) fn recover_pending(project: &Project) -> Result<MutationRecovery> {
     let lock_path = project.root.join("Cargo.lock");
     let recovery_path = recovery_path(&lock_path);
     if !path_exists(&recovery_path)? {
         ensure_no_orphan_artifacts(&lock_path)?;
-        return Ok(false);
+        return Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged));
     }
     let format = recovery_record_format(&recovery_path)?;
     if format == PROJECT_RECOVERY_FORMAT {
@@ -463,7 +465,8 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
             "Cargo.lock no longer matches the interrupted transaction recorded at {recovery_path}; left all files untouched"
         )));
     }
-    if current != record.original_lock {
+    let restored = current != record.original_lock;
+    if restored {
         durable_write(lock_path.as_std_path(), record.original_lock.as_bytes())?;
     }
     ensure_lock_equals(
@@ -474,15 +477,26 @@ pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
     )?;
     cleanup_linked_publication_files(&recovery_path)?;
     cleanup_linked_publication_files(&state_path)?;
-    remove_file(&recovery_path)?;
-    if let Err(error) = remove_file(&state_path) {
-        tracing::warn!(
-            path = %state_path,
-            error = %error,
-            "could not remove recovered Cargo.lock state"
-        );
+    let mut recovery = MutationRecovery::settled(if restored {
+        RecoveryDisposition::Restored
+    } else {
+        RecoveryDisposition::CleanupOnly
+    });
+    if let CommitOutcome::DurabilityUncertain(error) = remove_transaction_marker(&recovery_path)? {
+        recovery.warnings.push(Diagnostic::new(
+            DiagnosticKind::Filesystem,
+            format!(
+                "recovery settled Cargo.lock, but marker-removal durability is uncertain at {recovery_path}: {error}"
+            ),
+        ));
     }
-    Ok(true)
+    if let Err(error) = remove_file(&state_path) {
+        recovery.warnings.push(Diagnostic::new(
+            DiagnosticKind::Filesystem,
+            format!("recovery settled Cargo.lock, but could not remove state artifact {state_path}: {error}"),
+        ));
+    }
+    Ok(recovery)
 }
 
 fn recovery_record_format(path: &Utf8Path) -> Result<String> {
@@ -494,7 +508,10 @@ fn recovery_record_format(path: &Utf8Path) -> Result<String> {
         .ok_or_else(|| untrusted_record(path))
 }
 
-fn recover_project_publication(project: &Project, recovery_path: &Utf8Path) -> Result<bool> {
+fn recover_project_publication(
+    project: &Project,
+    recovery_path: &Utf8Path,
+) -> Result<MutationRecovery> {
     let record: ProjectRecoveryRecord = read_json(recovery_path)?;
     record.validate(project, recovery_path)?;
     let original = record.original_journal(&project.root)?;
@@ -522,21 +539,28 @@ fn recover_project_publication(project: &Project, recovery_path: &Utf8Path) -> R
             )));
         }
     }
-    if saw_original && saw_candidate {
+    let disposition = if saw_original && saw_candidate {
         original.restore_if_unchanged(&project.root, &live)?;
-    }
+        RecoveryDisposition::Restored
+    } else if saw_candidate {
+        RecoveryDisposition::Accepted
+    } else {
+        RecoveryDisposition::CleanupOnly
+    };
     cleanup_linked_publication_files(recovery_path)?;
+    let mut recovery = MutationRecovery::settled(disposition);
     match remove_transaction_marker(recovery_path)? {
         CommitOutcome::Committed => {}
         CommitOutcome::DurabilityUncertain(error) => {
-            tracing::warn!(
-                path = %recovery_path,
-                error = %error,
-                "project recovery completed, but marker-removal durability is uncertain"
-            );
+            recovery.warnings.push(Diagnostic::new(
+                DiagnosticKind::Filesystem,
+                format!(
+                    "project recovery settled the visible files, but marker-removal durability is uncertain at {recovery_path}: {error}"
+                ),
+            ));
         }
     }
-    Ok(true)
+    Ok(recovery)
 }
 
 /// Refuses a read while an interrupted mutation still owns recovery state.
@@ -629,11 +653,48 @@ fn lock_equals(lock_path: &Utf8Path, expected: &str) -> Result<bool> {
 }
 
 fn path_exists(path: &Utf8Path) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+    Ok(open_recovery_artifact(path)?.is_some())
+}
+
+fn open_recovery_artifact(path: &Utf8Path) -> Result<Option<File>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(untrusted_record(path));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        CoreError::LockUnreadable(format!(
+            "cannot safely open Cargo.lock recovery artifact at {path}: {error}; left all files untouched"
+        ))
+    })?;
+    let metadata = file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    let path_identity = same_file::Handle::from_path(path)?;
+    let final_metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || !path_metadata.file_type().is_file()
+        || !final_metadata.file_type().is_file()
+        || same_file::Handle::from_file(file.try_clone()?)? != path_identity
+    {
+        return Err(untrusted_record(path));
+    }
+    Ok(Some(file))
 }
 
 fn publish_exclusive_json<T: serde::Serialize>(
@@ -795,8 +856,12 @@ fn cleanup_linked_publication_files(public_path: &Utf8Path) -> Result<()> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Utf8Path) -> Result<T> {
-    let contents = std::fs::read(path)?;
-    serde_json::from_slice(&contents).map_err(|error| {
+    let file = open_recovery_artifact(path)?.ok_or_else(|| {
+        CoreError::LockUnreadable(format!(
+            "Cargo.lock recovery artifact disappeared at {path}; left all files untouched"
+        ))
+    })?;
+    serde_json::from_reader(file).map_err(|error| {
         CoreError::LockUnreadable(format!(
             "invalid Cargo.lock recovery record at {path}: {error}; left all files untouched"
         ))
@@ -991,7 +1056,10 @@ mod tests {
             .map_err(|error| eyre::eyre!("publish marker: {error:?}"))?;
         std::fs::write(&lock_path, "accepted lock")?;
 
-        assert!(recover_pending(&project)?);
+        std::assert_matches!(
+            recover_pending(&project)?.disposition,
+            RecoveryDisposition::Restored
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         assert_eq!(
             std::fs::read_to_string(&manifest_path)?,
@@ -1025,7 +1093,10 @@ mod tests {
 
         std::assert_matches!(error, CoreError::PendingRecovery(_));
         assert!(recovery_path(&lock_path).exists());
-        assert!(recover_pending(&project)?);
+        std::assert_matches!(
+            recover_pending(&project)?.disposition,
+            RecoveryDisposition::Restored
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         assert_eq!(
             std::fs::read_to_string(&manifest_path)?,
@@ -1061,7 +1132,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
         assert!(recovery_path(&lock_path).exists());
-        assert!(recover_pending(&project)?);
+        std::assert_matches!(
+            recover_pending(&project)?.disposition,
+            RecoveryDisposition::Accepted
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
         Ok(())
     }
@@ -1076,7 +1150,10 @@ mod tests {
             .map_err(|error| eyre::eyre!("publish marker: {error:?}"))?;
         accepted.install(&project.root)?;
 
-        assert!(recover_pending(&project)?);
+        std::assert_matches!(
+            recover_pending(&project)?.disposition,
+            RecoveryDisposition::Accepted
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
         assert!(!marker.exists());
         Ok(())
@@ -1134,7 +1211,10 @@ mod tests {
         let (_dir, project, lock_path) = setup();
         let (marker, state_path) = publish_legacy_recovery(&project, &lock_path, "candidate")?;
 
-        assert!(recover_pending(&project)?);
+        std::assert_matches!(
+            recover_pending(&project)?.disposition,
+            RecoveryDisposition::Restored
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         assert!(!marker.exists());
         assert!(!state_path.exists());
@@ -1451,6 +1531,25 @@ mod tests {
         std::assert_matches!(error, CoreError::StaleLock(_));
         assert_eq!(std::fs::read_to_string(&lock_path)?, "candidate");
         assert!(marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_marker_symlinks_fail_closed() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (_dir, project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        symlink("missing-recovery-record", &marker)?;
+
+        std::assert_matches!(
+            ensure_no_pending(&project),
+            Err(CoreError::LockUnreadable(_))
+        );
+        std::assert_matches!(recover_pending(&project), Err(CoreError::LockUnreadable(_)));
+        assert_eq!(std::fs::read_to_string(lock_path)?, "original");
+        assert!(std::fs::symlink_metadata(marker)?.file_type().is_symlink());
         Ok(())
     }
 }

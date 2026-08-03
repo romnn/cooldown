@@ -22,7 +22,7 @@ pub const CARGO_ID: ToolId = ToolId("cargo");
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
-/// Restores an interrupted Cargo mutation transaction rooted at `project_root`.
+/// Settles an interrupted Cargo mutation transaction rooted at `project_root`.
 ///
 /// This recovery-only entry point performs no manifest parsing, registry setup, or Cargo command.
 /// The caller must hold exclusive access for the project root.
@@ -30,10 +30,10 @@ pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 /// # Errors
 ///
 /// Returns a [`cooldown_core::CoreError`] when recovery state is malformed, belongs to another
-/// project, no longer matches the tracked manifests and lock, or cannot be read or restored safely.
+/// project, no longer matches the tracked manifests and lock, or cannot be read or settled safely.
 pub fn recover_interrupted_mutation(
     project_root: &camino::Utf8Path,
-) -> cooldown_core::Result<bool> {
+) -> cooldown_core::Result<cooldown_core::MutationRecovery> {
     let project = cooldown_core::Project {
         root: project_root.to_owned(),
         manifest: project_root.join("Cargo.toml"),

@@ -110,9 +110,11 @@ impl ProjectReadGuard {
     fn acquire_file(path: &Path, file: File) -> Result<Self, CoreError> {
         match file.try_lock_shared() {
             Ok(()) => Ok(ProjectReadGuard { file }),
-            Err(TryLockError::WouldBlock) => {
-                Err(lock_conflict(path, "a mutating cooldown run", true))
-            }
+            Err(TryLockError::WouldBlock) => Err(lock_conflict(
+                path,
+                "an isolated mutation trial or source write",
+                true,
+            )),
             Err(TryLockError::Error(error)) => Err(lock_error(path, &error)),
         }
     }
@@ -359,7 +361,11 @@ fn open_coordinated_lock_file(path: &Path) -> Result<(File, File), CoreError> {
 fn acquire_shared_file(path: &Path, file: File) -> Result<File, CoreError> {
     match file.try_lock_shared() {
         Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(lock_conflict(path, "a mutating cooldown run", true)),
+        Err(TryLockError::WouldBlock) => Err(lock_conflict(
+            path,
+            "an isolated mutation trial or source write",
+            true,
+        )),
         Err(TryLockError::Error(error)) => Err(lock_error(path, &error)),
     }
 }

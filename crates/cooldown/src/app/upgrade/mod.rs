@@ -337,7 +337,7 @@ impl Workspace {
         let Some(writer) = self.mutator(pctx.tool) else {
             return;
         };
-        let (_guard, trial) = match self
+        let (_guard, trial, recovery_warnings) = match self
             .prepare_isolated_trial(writer, pctx, opts, strategy)
             .await
         {
@@ -352,6 +352,12 @@ impl Workspace {
                 return;
             }
         };
+        acc.warnings
+            .extend(recovery_warnings.into_iter().map(|warning| {
+                warning
+                    .with_tool(pctx.tool.as_str())
+                    .with_project(pctx.rel_path.as_str())
+            }));
         let copied_pctx = super::ProjectCtx {
             tool: pctx.tool,
             project: trial.project().clone(),
@@ -391,9 +397,16 @@ impl Workspace {
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         strategy: &dyn IsolatedMutationStrategy,
-    ) -> cooldown_core::Result<(IsolatedAccessGuard, Box<dyn IsolatedMutation>)> {
-        let guard = if opts.dry_run {
-            IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?)
+    ) -> cooldown_core::Result<(
+        IsolatedAccessGuard,
+        Box<dyn IsolatedMutation>,
+        Vec<Diagnostic>,
+    )> {
+        let (guard, recovery_warnings) = if opts.dry_run {
+            (
+                IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?),
+                Vec::new(),
+            )
         } else {
             let guard = super::lock::ProjectAccessWriteGuard::acquire(
                 self.repo_root(),
@@ -401,12 +414,12 @@ impl Workspace {
                 pctx.tool,
                 writer.sync_scope() == cooldown_core::SyncScope::Repo,
             )?;
-            writer.recover_pending_mutation(&pctx.project).await?;
-            IsolatedAccessGuard::Write(guard)
+            let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+            (IsolatedAccessGuard::Write(guard), recovery.warnings)
         };
         opts.progress.phase("preparing isolated mutation project");
         let trial = strategy.prepare(&pctx.project).await?;
-        Ok((guard, trial))
+        Ok((guard, trial, recovery_warnings))
     }
 }
 

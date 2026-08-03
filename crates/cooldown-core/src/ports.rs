@@ -292,21 +292,53 @@ pub enum AcceptedPublication {
     },
 }
 
+/// How adapter-owned interrupted mutation state was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryDisposition {
+    /// No interrupted mutation state was present.
+    Unchanged,
+    /// A completely published accepted candidate was retained.
+    Accepted,
+    /// A partial or speculative mutation was restored to its preimage.
+    Restored,
+    /// Only recovery artifacts remained and were consumed.
+    CleanupOnly,
+}
+
+/// The settled recovery state and any non-fatal durability or cleanup diagnostics.
+#[derive(Debug, Clone)]
+pub struct MutationRecovery {
+    /// The state selected by recovery.
+    pub disposition: RecoveryDisposition,
+    /// Non-fatal diagnostics produced after the visible state was settled.
+    pub warnings: Vec<crate::Diagnostic>,
+}
+
+impl MutationRecovery {
+    /// Constructs a recovery result without warnings.
+    #[must_use]
+    pub const fn settled(disposition: RecoveryDisposition) -> Self {
+        MutationRecovery {
+            disposition,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// A prepared isolated resolver trial tied to its accepted-state publisher.
 #[async_trait]
 pub trait IsolatedMutation: Send {
     /// The staged project that receives resolver mutations.
     fn project(&self) -> &Project;
 
-    /// Captures the accepted outputs and revalidates every source input used by the trial.
+    /// Captures the accepted outputs together with the source-input snapshot that authorized them.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`] if an output is outside the publication set or a source input
-    /// changed independently.
+    /// Returns a [`CoreError`] if an output is outside the publication set or cannot be captured.
     fn accepted_state(&self) -> Result<AcceptedProjectState>;
 
-    /// Publishes a verified accepted state to the source project.
+    /// Revalidates the trial's topology and source inputs, then publishes its accepted state.
     ///
     /// # Errors
     ///
@@ -478,9 +510,8 @@ pub trait ToolWrite: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if pending state cannot be validated or recovered.
-    /// Returns `true` when recovery changed project state.
-    async fn recover_pending_mutation(&self, _project: &Project) -> Result<bool> {
-        Ok(false)
+    async fn recover_pending_mutation(&self, _project: &Project) -> Result<MutationRecovery> {
+        Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
     }
 
     /// Captures the adapter-owned lock state needed to report edge bindings across a whole run.

@@ -698,7 +698,7 @@ pub struct RecoveryMeta {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoverySummary {
-    /// Projects whose interrupted state was restored.
+    /// Projects whose interrupted state was settled as accepted, restored, or cleanup-only.
     pub recovered: usize,
     /// Projects without interrupted state.
     pub unchanged: usize,
@@ -742,8 +742,12 @@ macro_rules! recovery_statuses {
 }
 
 recovery_statuses! {
-    /// Interrupted state was validated and restored.
-    Recovered = "recovered",
+    /// A completely published accepted candidate was retained.
+    Accepted = "accepted",
+    /// A partial or speculative mutation was restored to its preimage.
+    Restored = "restored",
+    /// Only recovery artifacts remained and were consumed.
+    CleanupOnly = "cleanup_only",
     /// No interrupted state was present.
     Unchanged = "unchanged",
     /// Recovery could not safely complete.

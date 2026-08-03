@@ -26,7 +26,9 @@ The strict, whole-graph default stays **opt-out, never opt-in**.
 
 ## Mutations never leave a rejectable lock
 
-`upgrade` and `fix` apply **one change at a time**. If a re-lock leaves a new too-fresh, non-acknowledged dependency in the graph, the tool **restores the lock snapshot and skips that change**. A mutation that reports success therefore never leaves a lock that a subsequent `check` would reject — the graph you end up on is gate-clean by construction.
+`upgrade` and `fix` evaluate resolver changes in an isolated project. If a re-lock leaves a new too-fresh, non-acknowledged dependency in the graph, the trial rejects that change before anything becomes visible in the source. The complete accepted manifest-and-lock state is published under one recovery record. A mutation that reports success therefore never leaves a lock that a subsequent `check` would reject — the graph you end up on is gate-clean by construction.
+
+Cooldown coordinates access through target-derived lock files. Git repositories use Git's common directory. A non-Git project uses `.cooldown/locks`, including for read commands, so add `.cooldown/` to that project's ignore rules if it is not already ignored.
 
 ## Cache hardening
 

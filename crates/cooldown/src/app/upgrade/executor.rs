@@ -283,15 +283,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return ProjectRunStatus::Terminated;
             }
         };
-        if let Err(error) = self
+        let recovery = match self
             .ctx
             .writer
             .recover_pending_mutation(&self.ctx.pctx.project)
             .await
         {
-            self.record_project_error(&error, None);
-            return ProjectRunStatus::Terminated;
-        }
+            Ok(recovery) => recovery,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return ProjectRunStatus::Terminated;
+            }
+        };
+        self.acc
+            .warnings
+            .extend(recovery.warnings.into_iter().map(|warning| {
+                warning
+                    .with_tool(self.ctx.pctx.tool.as_str())
+                    .with_project(self.ctx.pctx.rel_path.as_str())
+            }));
         self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
             return ProjectRunStatus::Terminated;
@@ -406,15 +416,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
-        if let Err(error) = self
+        let recovery = match self
             .ctx
             .writer
             .recover_pending_mutation(&self.ctx.pctx.project)
             .await
         {
-            self.record_project_error(&error, None);
-            return;
-        }
+            Ok(recovery) => recovery,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return;
+            }
+        };
+        self.acc
+            .warnings
+            .extend(recovery.warnings.into_iter().map(|warning| {
+                warning
+                    .with_tool(self.ctx.pctx.tool.as_str())
+                    .with_project(self.ctx.pctx.rel_path.as_str())
+            }));
         self.manifest_only = manifest_only;
         sort_planned_changes(&mut changes);
         let Some(mut state) = self.initial_trial_state().await else {

@@ -52,7 +52,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
 fn direct_cargo_recovery_roots(workdir: &Utf8Path, repo_root: &Utf8Path) -> Vec<Utf8PathBuf> {
     let mut roots = Vec::new();
     for ancestor in workdir.ancestors() {
-        if ancestor.join(RECOVERY_MARKER).is_file() {
+        if std::fs::symlink_metadata(ancestor.join(RECOVERY_MARKER)).is_ok() {
             roots.push(ancestor.to_owned());
         }
         if ancestor == repo_root {
@@ -140,6 +140,24 @@ mod tests {
             cargo_recovery_roots(root, false).expect("discover roots"),
             vec![root.to_owned()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_marker_symlink_is_discovered_for_fail_closed_validation() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        symlink("missing-record", root.join(RECOVERY_MARKER))?;
+
+        assert_eq!(
+            direct_cargo_recovery_roots(root, root),
+            vec![root.to_owned()]
+        );
+        assert_eq!(cargo_recovery_roots(root, false)?, vec![root.to_owned()]);
+        Ok(())
     }
 
     #[test]

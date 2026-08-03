@@ -367,9 +367,9 @@ impl ToolWrite for FakeEco {
         Ok(())
     }
 
-    async fn recover_pending_mutation(&self, _p: &Project) -> Result<bool> {
+    async fn recover_pending_mutation(&self, _p: &Project) -> Result<MutationRecovery> {
         self.state.lock().unwrap().recovery_completed = true;
-        Ok(true)
+        Ok(MutationRecovery::settled(RecoveryDisposition::Restored))
     }
 
     async fn lock_edge_snapshot(&self, p: &Project) -> Result<Option<Vec<u8>>> {
@@ -3715,9 +3715,9 @@ impl ReleaseFetcher for RepoScopedFake {
 
 #[async_trait]
 impl ToolWrite for RepoScopedFake {
-    async fn recover_pending_mutation(&self, project: &Project) -> Result<bool> {
+    async fn recover_pending_mutation(&self, project: &Project) -> Result<MutationRecovery> {
         self.recoveries.lock().unwrap().push(project.root.clone());
-        Ok(false)
+        Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
     }
 
     async fn mutation_journal(&self, _p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {

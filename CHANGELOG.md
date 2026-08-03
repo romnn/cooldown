@@ -7,10 +7,12 @@
   resolution; and the public Hex, Maven, pip, and RubyGems resolved-pin parsers. Callers should use
   the documented fields on `PathVersionSplit`, `NameVersion`, `ResolvedInstance`, `ResolvedDep`,
   and `ResolvedPin`.
-- **Breaking library API:** `ToolWrite::recover_pending_mutation` now returns whether recovery
-  changed project state, and `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side
-  adapter fail a shared read session without performing recovery. `ProjectMutationState` pairs a
-  rollback journal with the post-apply state observed before any conditional restore.
+- **Breaking library API:** `ToolWrite::recover_pending_mutation` now returns a typed
+  `MutationRecovery` that distinguishes an accepted publication, a restored preimage, artifact-only
+  cleanup, and unchanged state while retaining non-fatal cleanup or durability diagnostics.
+  `ToolWrite::ensure_no_pending_mutation` lets the same mutation-side adapter fail a shared read
+  session without performing recovery. `ProjectMutationState` pairs a rollback journal with the
+  post-apply state observed before any conditional restore.
 - **Breaking library API:** `ToolWrite::apply_with_observer` returns an adapter-boundary postimage,
   using the `ApplyAttempt` enum to keep adapter-owned pending recovery outside the application's
   rollback authority. `ApplyReport` carries non-fatal committed warnings, final edge audits return

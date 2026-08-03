@@ -153,7 +153,7 @@ impl ToolRead for CargoTool {
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         edges::enforce::ensure_no_pending(project)?;
-        let graph = self.cargo.metadata(&project.root).await?;
+        let graph = self.cargo.metadata_locked(&project.root).await?;
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
             if graph.roots.contains(id) || !info.is_crates_io() {
@@ -778,7 +778,10 @@ impl ToolWrite for CargoTool {
         self.cargo.build(&project.root).await
     }
 
-    async fn recover_pending_mutation(&self, project: &Project) -> Result<bool> {
+    async fn recover_pending_mutation(
+        &self,
+        project: &Project,
+    ) -> Result<cooldown_core::MutationRecovery> {
         edges::enforce::recover_pending(project)
     }
 

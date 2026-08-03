@@ -434,6 +434,7 @@ dependencies = [
  "cooldown-toml-util",
  "indoc",
  "jiff",
+ "libc",
  "same-file",
  "semver",
  "serde",

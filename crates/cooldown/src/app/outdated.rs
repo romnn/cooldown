@@ -131,12 +131,15 @@ impl<'a> OutdatedRunner<'a> {
                     error = %error,
                     "could not enumerate dependencies"
                 );
-                self.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    &read.project_label,
-                    None,
-                ));
+                let diagnostic = diag_from_error(&error, pctx.tool, &read.project_label, None)
+                    .with_path(pctx.project.manifest.as_str());
+                if self.opts.allow_stale_lock
+                    && matches!(error, cooldown_core::CoreError::StaleLock(_))
+                {
+                    self.warnings.push(diagnostic);
+                } else {
+                    self.errors.push(diagnostic);
+                }
                 return;
             }
         };

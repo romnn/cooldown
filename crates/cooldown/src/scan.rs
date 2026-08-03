@@ -82,7 +82,7 @@ pub fn find_marker_dirs(
         // common for libraries that don't commit `Cargo.lock` — is still detected.
         if entry.file_type().is_some_and(|t| t.is_dir())
             && let Some(dir) = Utf8Path::from_path(entry.path())
-            && dir.join(marker).is_file()
+            && marker_entry_exists(&dir.join(marker))
         {
             dirs.push(dir.to_owned());
         }
@@ -94,6 +94,13 @@ pub fn find_marker_dirs(
         dirs = keep_topmost(dirs);
     }
     Ok(dirs)
+}
+
+fn marker_entry_exists(path: &Utf8Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
 }
 
 /// Whether `path` (a directory) is excluded, matching its path relative to `root` against the
