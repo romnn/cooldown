@@ -253,6 +253,7 @@ pub trait NodeLock: Send + Sync + 'static {
 ///   silently does nothing.
 ///
 /// So the operation is modeled by what the manager can actually do, not by one argv.
+#[derive(Debug)]
 pub enum PreservingPin {
     /// One command pins the exact version and writes no manifest (pnpm's `update --no-save`).
     Direct(Vec<String>),

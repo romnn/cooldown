@@ -1,7 +1,6 @@
 //! Proposes, guards, verifies, commits, and reports edge-policy outcomes.
 
 use super::isolate::{CommittedRewrites, apply_rewrites};
-use super::recovery;
 use super::{
     BindingChange, EdgeRewrite, LockEdgeView, RequirementIndex, binding_changes, guard_rewrites,
 };
@@ -10,7 +9,7 @@ use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
 use crate::index::CRATES_IO;
 use crate::lockfile::CargoLock;
 use cooldown_core::{
-    Diagnostic, EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
+    EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,9 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct EnforcementResult {
     pub(crate) rebinds: Vec<EdgeRebind>,
     pub(crate) graph: Option<ResolvedGraph>,
-    pub(crate) warnings: Vec<Diagnostic>,
 }
 
+#[derive(Debug)]
 enum BindingOutcome {
     Corrected {
         rewrite: EdgeRewrite,
@@ -124,7 +123,6 @@ pub(crate) async fn enforce(
     Ok(EnforcementResult {
         rebinds: outcomes.into_iter().map(outcome_row).collect(),
         graph,
-        warnings: application.warnings,
     })
 }
 
@@ -132,12 +130,12 @@ pub(crate) async fn enforce(
 ///
 /// The mutation lifecycle calls this only while holding the project's exclusive lock.
 pub(crate) fn recover_pending(project: &Project) -> Result<bool> {
-    recovery::recover_pending(project)
+    crate::publication::recover_pending(project)
 }
 
 /// Refuses a read while an interrupted mutation still owns recovery state.
 pub(crate) fn ensure_no_pending(project: &Project) -> Result<()> {
-    recovery::ensure_no_pending(project)
+    crate::publication::ensure_no_pending(project)
 }
 
 /// Reconciles committed batch corrections with the final saved binding state.
@@ -445,13 +443,11 @@ mod tests {
             None,
         );
 
-        assert!(matches!(
-            outcomes.as_slice(),
+        std::assert_matches!(outcomes.as_slice(),
             [BindingOutcome::Unaddressable { change, reason }]
                 if change.before.version == "2.0.0"
                     && change.after.version == "1.0.0"
-                    && reason.contains("several version-qualified entries")
-        ));
+            && reason.contains("several version-qualified entries"));
     }
 
     #[test]
@@ -468,11 +464,9 @@ mod tests {
             None,
         );
 
-        assert!(matches!(
-            outcomes.as_slice(),
+        std::assert_matches!(outcomes.as_slice(),
             [BindingOutcome::ObservedAllowed(change)]
-                if change.before.version == "2.0.0" && change.after.version == "1.0.0"
-        ));
+        if change.before.version == "2.0.0" && change.after.version == "1.0.0");
     }
 
     #[test]
@@ -511,11 +505,9 @@ mod tests {
             Some(&requirements),
         );
 
-        assert!(matches!(
-            outcomes.as_slice(),
+        std::assert_matches!(outcomes.as_slice(),
             [BindingOutcome::Unaddressable { reason, .. }]
-                if reason.contains("did not identify")
-        ));
+        if reason.contains("did not identify"));
     }
 
     #[test]
@@ -544,11 +536,9 @@ mod tests {
         );
 
         assert!(outcome_edge_key(&withheld).is_none());
-        assert!(matches!(
-            observed.as_slice(),
+        std::assert_matches!(observed.as_slice(),
             [BindingOutcome::ObservedAllowed(change)]
-                if change.before.version == "1.0.0" && change.after.version == "2.0.0"
-        ));
+        if change.before.version == "1.0.0" && change.after.version == "2.0.0");
     }
 
     #[test]

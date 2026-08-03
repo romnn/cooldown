@@ -234,9 +234,9 @@ mod reaching_tests {
             stderr: "pnpm: unable to open database file".into(),
         };
 
-        assert!(matches!(
+        std::assert_matches!(
             skipped_on_apply_error(&change(), err),
             Err(CoreError::Tool { .. })
-        ));
+        );
     }
 }

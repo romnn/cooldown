@@ -338,6 +338,6 @@ mod tests {
         let root = utf8(tmp.path());
         let err = find_marker_dirs(&root, "Cargo.lock", false, &["a/**/[".to_string()], false)
             .expect_err("bad glob");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
     }
 }

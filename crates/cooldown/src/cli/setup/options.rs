@@ -361,7 +361,7 @@ mod tests {
         for command in ["upgrade", "fix"] {
             let err = reject_offline_dry_run(command, true, true)
                 .expect_err("offline dry-run must be a usage error");
-            assert!(matches!(err, CoreError::Config(_)), "command `{command}`");
+            std::assert_matches!(err, CoreError::Config(_), "command `{command}`");
         }
         // Non-mutating commands and non-conflicting flag combinations pass through.
         assert!(reject_offline_dry_run("outdated", true, true).is_ok());

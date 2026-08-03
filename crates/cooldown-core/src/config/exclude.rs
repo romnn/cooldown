@@ -148,13 +148,13 @@ mod tests {
 
     #[test]
     fn invalid_glob_is_a_config_error() {
-        assert!(matches!(
+        std::assert_matches!(
             compile_folder_globset(&["a/**/[".to_string()]),
             Err(CoreError::Config(_))
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             compile_package_globset(&["[".to_string()]),
             Err(CoreError::Config(_))
-        ));
+        );
     }
 }

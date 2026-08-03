@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
+use color_eyre::eyre;
 use cooldown::app::{
     AdapterSet, Baseline, CheckStatus, Exit, OutdatedStatus, ProjectCtx, RunOpts, Workspace,
 };
@@ -121,6 +122,75 @@ impl FakeEco {
             manifest: self.root.join("go.mod"),
             exclude_newer: None,
         }
+    }
+}
+
+struct FakeMutationStage {
+    _scratch: tempfile::TempDir,
+    source: Project,
+    staged: Project,
+    preimage: ProjectMutationJournal,
+    publish_pending_recovery: bool,
+}
+
+#[async_trait]
+impl IsolatedMutationStrategy for FakeEco {
+    async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>> {
+        let scratch = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(scratch.path().to_owned()).map_err(|path| {
+            CoreError::PathEncoding(format!("non-UTF-8 test path: {}", path.display()))
+        })?;
+        std::fs::copy(source.root.join("Cargo.lock"), root.join("Cargo.lock"))?;
+        let preimage = ProjectMutationJournal {
+            files: vec![ProjectMutationJournal::capture_file(
+                &source.root,
+                camino::Utf8Path::new("Cargo.lock"),
+            )?],
+        };
+        let staged = Project {
+            root: root.clone(),
+            manifest: root.join("go.mod"),
+            kind: source.kind,
+            exclude_newer: source.exclude_newer.clone(),
+        };
+        Ok(Box::new(FakeMutationStage {
+            _scratch: scratch,
+            source: source.clone(),
+            staged,
+            preimage,
+            publish_pending_recovery: source.root.join("publish-pending-recovery").exists(),
+        }))
+    }
+}
+
+#[async_trait]
+impl IsolatedMutation for FakeMutationStage {
+    fn project(&self) -> &Project {
+        &self.staged
+    }
+
+    fn accepted_state(&self) -> Result<AcceptedProjectState> {
+        let candidate = self.preimage.capture_state(&self.staged.root)?;
+        AcceptedProjectState::new(
+            self.preimage.clone(),
+            candidate,
+            ProjectInputSnapshot::default(),
+        )
+    }
+
+    async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication> {
+        accepted.install(&self.source.root)?;
+        if self.publish_pending_recovery {
+            return Ok(AcceptedPublication::PublishedPendingRecovery {
+                warnings: Vec::new(),
+                error: CoreError::PendingRecovery(
+                    "fake accepted publication retained recovery evidence".to_string(),
+                ),
+            });
+        }
+        Ok(AcceptedPublication::Published {
+            warnings: Vec::new(),
+        })
     }
 }
 
@@ -279,23 +349,12 @@ impl ReleaseFetcher for FakeEco {
 
 #[async_trait]
 impl ToolWrite for FakeEco {
-    fn mutation_execution(&self) -> MutationExecution {
+    fn mutation_execution(&self) -> MutationExecution<'_> {
         if self.root.join("use-isolated-mutation").exists() {
-            MutationExecution::Isolated {
-                output_filenames: &["Cargo.lock"],
-            }
+            MutationExecution::Isolated(self)
         } else {
             MutationExecution::InPlace
         }
-    }
-
-    async fn publish_accepted_state(
-        &self,
-        project: &Project,
-        accepted: &AcceptedProjectState,
-    ) -> Result<Vec<Diagnostic>> {
-        accepted.install(&project.root)?;
-        Ok(Vec::new())
     }
 
     async fn ensure_no_pending_mutation(&self, _p: &Project) -> Result<()> {
@@ -681,7 +740,7 @@ async fn dry_run_refuses_pending_source_state_without_recovering_it() {
 }
 
 #[tokio::test]
-async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Result<()> {
+async fn restore_conflict_stops_before_a_later_lock_batch() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("fake.lock"), b"original lock")?;
     std::fs::write(root.join("record-apply-batches"), b"")?;
@@ -734,7 +793,7 @@ async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Resul
     let state = adapter
         .state
         .get_mut()
-        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?;
+        .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?;
     state.manifest_constraints = vec![build_tool];
     state.drift_lock_before_graph_failure = true;
     state.write_lock_on_apply = true;
@@ -754,7 +813,7 @@ async fn restore_conflict_stops_before_a_later_lock_batch() -> color_eyre::Resul
 }
 
 #[tokio::test]
-async fn isolated_mutation_publishes_once_then_builds_the_source() -> color_eyre::Result<()> {
+async fn isolated_mutation_publishes_once_then_builds_the_source() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("Cargo.lock"), "source lock")?;
     std::fs::write(root.join("use-isolated-mutation"), "")?;
@@ -797,7 +856,56 @@ async fn isolated_mutation_publishes_once_then_builds_the_source() -> color_eyre
 }
 
 #[tokio::test]
-async fn pending_adapter_recovery_prevents_outer_rollback_and_build() -> color_eyre::Result<()> {
+async fn published_pending_recovery_keeps_applied_rows_and_suppresses_build() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("Cargo.lock"), "source lock")?;
+    std::fs::write(root.join("use-isolated-mutation"), "")?;
+    std::fs::write(root.join("publish-pending-recovery"), "")?;
+    let adapter = fake(
+        root.clone(),
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        HashMap::from([(
+            "a".to_string(),
+            vec![
+                rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    2,
+                    Some("2025-02-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        )]),
+        HashMap::from([(
+            "a".to_string(),
+            rel("v1.0.0", 1, Some("2025-01-01T00:00:00Z"), None),
+        )]),
+    );
+    let mut options = opts();
+    options.build = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&options)
+        .await;
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("Cargo.lock"))?,
+        "accepted lock"
+    );
+    assert!(!root.join("build-invoked").exists());
+    assert_eq!(outcome.summary.applied, 1);
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.kind == DiagnosticKind::PendingRecovery)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_adapter_recovery_prevents_outer_rollback_and_build() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("fake.lock"), b"original lock")?;
     std::fs::write(root.join("pending-recovery-on-apply"), b"")?;
@@ -825,7 +933,7 @@ async fn pending_adapter_recovery_prevents_outer_rollback_and_build() -> color_e
     adapter
         .state
         .get_mut()
-        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?
+        .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?
         .write_lock_on_apply = true;
     let mut options = opts();
     options.build = true;
@@ -848,7 +956,7 @@ async fn pending_adapter_recovery_prevents_outer_rollback_and_build() -> color_e
 }
 
 #[tokio::test]
-async fn edge_normalization_failure_stops_before_final_build() -> color_eyre::Result<()> {
+async fn edge_normalization_failure_stops_before_final_build() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("edge.snapshot"), b"run-start edge state")?;
     std::fs::write(root.join("fail-edge-normalization"), b"")?;
@@ -1596,7 +1704,7 @@ async fn check_fails_closed_on_stale_lock() {
 }
 
 #[tokio::test]
-async fn upgrade_applies_clean_change() -> color_eyre::Result<()> {
+async fn upgrade_applies_clean_change() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("warn-on-apply"), b"")?;
     let mut releases = HashMap::new();
@@ -2016,7 +2124,7 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
 }
 
 #[tokio::test]
-async fn edge_report_redacts_source_secrets_at_the_app_boundary() -> color_eyre::Result<()> {
+async fn edge_report_redacts_source_secrets_at_the_app_boundary() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut rebind = diesel_rebind(
         Some(
@@ -2038,11 +2146,11 @@ async fn edge_report_redacts_source_secrets_at_the_app_boundary() -> color_eyre:
         .items
         .iter()
         .find(|item| item.name == "uuid")
-        .ok_or_else(|| color_eyre::eyre::eyre!("missing edge report row"))?;
+        .ok_or_else(|| eyre::eyre!("missing edge report row"))?;
     let edge = row
         .edge
         .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("missing edge report detail"))?;
+        .ok_or_else(|| eyre::eyre!("missing edge report detail"))?;
 
     assert_eq!(
         edge.dependent_source.as_deref(),
@@ -2156,10 +2264,8 @@ async fn final_edge_audit_replaces_superseded_batch_history() {
         .iter()
         .filter_map(|item| item.edge.as_ref())
         .collect();
-    assert!(matches!(
-        edges.as_slice(),
-        [edge] if edge.action == EdgeBindingAction::Canonicalized
-    ));
+    std::assert_matches!(edges.as_slice(),
+    [edge] if edge.action == EdgeBindingAction::Canonicalized);
 }
 
 /// Releases for package "a": the current v1.0.0 plus a long-matured cross-major v2.0.0. `kind =
@@ -2840,7 +2946,7 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
 }
 
 #[tokio::test]
-async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> color_eyre::Result<()> {
+async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("warn-on-apply"), b"")?;
     let mut releases = HashMap::new();
@@ -2897,7 +3003,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> color_e
         .items
         .first()
         .and_then(|item| item.skipped.as_ref())
-        .ok_or_else(|| color_eyre::eyre::eyre!("expected a skipped upgrade row"))?;
+        .ok_or_else(|| eyre::eyre!("expected a skipped upgrade row"))?;
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
     assert_eq!(sk.offending.as_deref(), Some("t"));
     assert!(
@@ -3409,7 +3515,7 @@ async fn upgrade_reports_final_lock_and_build_failures() {
 }
 
 #[tokio::test]
-async fn explain_traces_the_default_window() -> color_eyre::Result<()> {
+async fn explain_traces_the_default_window() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
@@ -3438,7 +3544,7 @@ async fn explain_traces_the_default_window() -> color_eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn explain_refuses_pending_mutation_state() -> color_eyre::Result<()> {
+async fn explain_refuses_pending_mutation_state() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut adapter = fake(
         root,
@@ -3450,21 +3556,21 @@ async fn explain_refuses_pending_mutation_state() -> color_eyre::Result<()> {
     adapter
         .state
         .get_mut()
-        .map_err(|_| color_eyre::eyre::eyre!("fake state mutex poisoned"))?
+        .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?
         .require_recovery_before_read = true;
 
     let result = workspace(adapter, Baseline::default())
         .explain("a", &opts())
         .await;
 
-    assert!(matches!(result, Err(CoreError::StaleLock(_))));
+    std::assert_matches!(result, Err(CoreError::StaleLock(_)));
     Ok(())
 }
 
 /// `explain` resolves the package's registry from the dependency graph, so a `[registry."…"]`
 /// rule is applied (it would be silently skipped if explain resolved with no registry).
 #[tokio::test]
-async fn explain_applies_registry_scoped_rule() -> color_eyre::Result<()> {
+async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)], // dep `a` is published from registry "proxy.example"
@@ -3653,8 +3759,7 @@ impl ToolWrite for RepoScopedFake {
 }
 
 #[tokio::test]
-async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> color_eyre::Result<()>
-{
+async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> eyre::Result<()> {
     let TmpRoot { guard: _dir, root } = tmp_root();
     std::fs::create_dir_all(root.join("a"))?;
     std::fs::create_dir_all(root.join("b"))?;
@@ -3829,7 +3934,7 @@ impl ToolWrite for ProjectScopedFake {
 }
 
 #[tokio::test]
-async fn sync_project_scope_writes_native_per_project() -> color_eyre::Result<()> {
+async fn sync_project_scope_writes_native_per_project() -> eyre::Result<()> {
     let TmpRoot { guard: _dir, root } = tmp_root();
     std::fs::create_dir_all(root.join("a"))?;
     std::fs::create_dir_all(root.join("b"))?;

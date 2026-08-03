@@ -19,11 +19,11 @@
   rollback can restore the file contents and modes without following a symlink. Callers can
   therefore distinguish rollback conflicts from visible corrections whose directory durability is
   uncertain.
-- **Breaking library API:** `ToolWrite::mutation_execution` lets an adapter require isolated
-  resolver trials, and `ToolWrite::publish_accepted_state` publishes the resulting
-  `AcceptedProjectState`. Cargo uses this boundary so resolver and edge-normalization trials touch
-  only a disposable project copy; the source project receives the accepted manifests and lock
-  through one adapter-owned recovery protocol after its complete preimage is revalidated.
+- **Breaking library API:** `ToolWrite::mutation_execution` can provide an
+  `IsolatedMutationStrategy` that stages and publishes its own faithful resolver trial. Cargo uses
+  this boundary so resolver and edge-normalization trials touch only a disposable project copy;
+  the source project receives the accepted manifests and lock through one adapter-owned recovery
+  protocol after its complete input and output preimage is revalidated.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.
@@ -47,7 +47,8 @@
   `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
   fails `--strict`. Cargo resolver and correction trials run in an isolated project copy. Once the
   complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
-  record guards checked, directory-durable publication of the accepted manifests and lock.
+  record guards checked publication of the accepted manifests and lock. Publication includes
+  parent-directory durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new `recover`
   command discovers exact ignored or hidden targets without loading policy, manifests, baselines,
   or registries, then completes or restores a validated interrupted publication without continuing

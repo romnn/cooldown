@@ -586,6 +586,7 @@ mod tests {
         OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus, RecoverySummary, SkippedInfo,
         UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
+    use color_eyre::eyre;
     use cooldown_core::{
         Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
     };
@@ -607,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_discriminator_conditions_enforce_row_invariants() -> color_eyre::Result<()> {
+    fn edge_discriminator_conditions_enforce_row_invariants() -> eyre::Result<()> {
         let schema = json_schema();
         assert_eq!(
             schema["$defs"]["upgradeEdgeInfo"]["properties"]["detail"]["minLength"],
@@ -615,11 +616,11 @@ mod tests {
         );
         let conditions = schema["$defs"]["upgradeItem"]["allOf"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing edge action conditions"))?;
+            .ok_or_else(|| eyre::eyre!("missing edge action conditions"))?;
 
         let unapplied = conditions[0]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing unapplied edge actions"))?;
+            .ok_or_else(|| eyre::eyre!("missing unapplied edge actions"))?;
         for action in cooldown_core::EdgeBindingAction::ALL {
             let listed = unapplied.contains(&Value::String(action.wire_value().to_string()));
             assert_eq!(listed, !action.is_applied());
@@ -630,7 +631,7 @@ mod tests {
         );
         let applied = conditions[1]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing applied edge actions"))?;
+            .ok_or_else(|| eyre::eyre!("missing applied edge actions"))?;
         for action in cooldown_core::EdgeBindingAction::ALL {
             let listed = applied.contains(&Value::String(action.wire_value().to_string()));
             assert_eq!(listed, action.is_applied());
@@ -653,12 +654,12 @@ mod tests {
         );
         let prohibited = conditions[2]["then"]["not"]["anyOf"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing edge-only prohibited properties"))?;
+            .ok_or_else(|| eyre::eyre!("missing edge-only prohibited properties"))?;
         assert_eq!(prohibited[0]["required"][0], "skipped");
         assert_eq!(prohibited[1]["required"][0], "error");
         let reasoned = conditions[3]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing reasoned edge actions"))?;
+            .ok_or_else(|| eyre::eyre!("missing reasoned edge actions"))?;
         assert_eq!(
             conditions[3]["then"]["properties"]["edge"]["required"][0],
             "detail"
@@ -711,11 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_status_schema_accepts_every_typed_variant() -> color_eyre::Result<()> {
+    fn recovery_status_schema_accepts_every_typed_variant() -> eyre::Result<()> {
         let schema = json_schema();
         let allowed = schema["$defs"]["recoveryItem"]["properties"]["status"]["enum"]
             .as_array()
-            .ok_or_else(|| color_eyre::eyre::eyre!("recovery status enum is not an array"))?;
+            .ok_or_else(|| eyre::eyre!("recovery status enum is not an array"))?;
         for status in RecoveryStatus::ALL {
             assert!(allowed.contains(&Value::String(status.wire_value().to_string())));
         }

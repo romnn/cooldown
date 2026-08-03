@@ -26,12 +26,12 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    AcceptedProjectState, ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change,
-    CoreError, DepScope, Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext,
-    LockVerifyReport, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
-    Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
+    Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
+    MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
+    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +65,10 @@ impl CargoTool {
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         CargoTool::new(CratesIoIndex::new(http))
+    }
+
+    pub(crate) const fn cargo(&self) -> &Cargo {
+        &self.cargo
     }
 }
 
@@ -613,7 +617,6 @@ impl CargoTool {
         .await?;
         let graph = enforced.graph;
         let edge_rebinds = enforced.rebinds;
-        report.warnings.extend(enforced.warnings);
 
         let after_lock = read_lock(project)?;
         let after = after_lock.locked_versions();
@@ -700,18 +703,8 @@ fn reached_after(
 
 #[async_trait]
 impl ToolWrite for CargoTool {
-    fn mutation_execution(&self) -> MutationExecution {
-        MutationExecution::Isolated {
-            output_filenames: &["Cargo.toml", "Cargo.lock"],
-        }
-    }
-
-    async fn publish_accepted_state(
-        &self,
-        project: &Project,
-        accepted: &AcceptedProjectState,
-    ) -> Result<Vec<cooldown_core::Diagnostic>> {
-        edges::recovery::publish_accepted(project, accepted)
+    fn mutation_execution(&self) -> MutationExecution<'_> {
+        MutationExecution::Isolated(self)
     }
 
     async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
@@ -839,7 +832,7 @@ impl ToolWrite for CargoTool {
         edges::enforce::reconcile_committed_outcomes(&final_view, &mut result.rebinds, committed);
         Ok(EdgeNormalizationReport {
             rebinds: result.rebinds,
-            warnings: result.warnings,
+            warnings: Vec::new(),
         })
     }
 }
@@ -1279,7 +1272,7 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
+        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
     #[tokio::test]

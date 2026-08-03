@@ -22,6 +22,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 camino.workspace = true
 same-file.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 color-eyre.workspace = true

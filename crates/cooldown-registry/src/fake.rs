@@ -102,10 +102,8 @@ fn parse(s: &str) -> Option<Timestamp> {
 fn newest_or_none(times: impl Iterator<Item = Option<Timestamp>>) -> Option<Timestamp> {
     let mut newest: Option<Timestamp> = None;
     for t in times {
-        match t {
-            None => return None,
-            Some(t) => newest = Some(newest.map_or(t, |n| n.max(t))),
-        }
+        let t = t?;
+        newest = Some(newest.map_or(t, |n| n.max(t)));
     }
     newest
 }

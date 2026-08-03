@@ -1142,7 +1142,7 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
+        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
     #[test]
@@ -1350,7 +1350,7 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(first, SyncReport::Written { .. }));
+        std::assert_matches!(first, SyncReport::Written { .. });
         // The flat top-level key is written into the repo-root uv.toml, not the [tool.uv] nested form.
         let written = std::fs::read_to_string(&uv_toml).expect("read uv.toml");
         assert!(
@@ -1364,7 +1364,7 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(second, SyncReport::Unchanged { .. }));
+        std::assert_matches!(second, SyncReport::Unchanged { .. });
     }
 
     #[tokio::test]
@@ -1381,7 +1381,7 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(report, SyncReport::Unchanged { .. }));
+        std::assert_matches!(report, SyncReport::Unchanged { .. });
         // A `Latest` window excludes nothing, so no uv.toml is created.
         assert!(!root.join("uv.toml").exists());
     }

@@ -1,13 +1,9 @@
-//! Throwaway recursive copies of a project tree, used by the non-mutating resolve probes.
+//! Heuristic throwaway copies used for previews by adapters without tool-specific staging.
 //!
-//! Both `outdated`'s policy-complete upgrade preview and the dependency-mutating `--dry-run` need to
-//! run the real resolver against a project without touching its real lockfiles or manifests.
-//! They copy the project into a temp directory, run the mutating policy flow there, and discard the
-//! copy — so a single implementation of the copy lives here and is shared by both paths.
+//! `outdated` and `--dry-run` run real resolvers without touching source lockfiles or manifests.
+//! Adapters that publish isolated mutations provide their own faithful staging strategy instead.
 
-use cooldown_core::{
-    AcceptedProjectState, CoreError, Project, ProjectMutationJournal, ResolveInputs,
-};
+use cooldown_core::{CoreError, Project, ResolveInputs};
 
 const SKIP_DIRS: &[&str] = &[
     ".venv",
@@ -23,9 +19,10 @@ const SKIP_DIRS: &[&str] = &[
     "testdata",
 ];
 
-/// A project copied into a throwaway temp directory. The copy is deleted when this value drops, so
-/// the real project tree is never read for mutation or written. Hold it for as long as the copied
-/// [`Project`] is in use.
+/// A project copied into a throwaway temp directory.
+///
+/// The copy is deleted when this value drops, so resolver mutations never reach the source tree.
+/// Hold it for as long as the copied [`Project`] is in use.
 pub(crate) struct ProjectCopy {
     /// Kept so the temp directory lives as long as the copy; dropping it removes the tree.
     _scratch: tempfile::TempDir,
@@ -33,80 +30,15 @@ pub(crate) struct ProjectCopy {
     pub(crate) project: Project,
 }
 
-/// An isolated mutation workspace paired with the exact source preimage it may replace.
-pub(crate) struct MutationProjectCopy {
-    copy: ProjectCopy,
-    preimage: ProjectMutationJournal,
-    output_filenames: &'static [&'static str],
-}
-
-impl MutationProjectCopy {
-    /// Copies the resolver inputs and proves that every mutable output matches the source preimage.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`] if the project cannot be copied, an output path is unsafe, or the
-    /// source changes while the copy is assembled.
-    pub(crate) fn create(
-        project: &Project,
-        inputs: &ResolveInputs,
-        output_filenames: &'static [&'static str],
-    ) -> cooldown_core::Result<Self> {
-        let copy = ProjectCopy::create(project, inputs)?;
-        let paths = mutation_output_paths(project, &copy.project, output_filenames)?;
-        let preimage = capture_journal(&project.root, &paths)?;
-        let copied = preimage.capture_state(&copy.project.root)?;
-        let initial = AcceptedProjectState::new(preimage.clone(), copied)?;
-        if initial.changed_files().next().is_some() {
-            return Err(CoreError::LockConflict(
-                "project mutation inputs changed while cooldown prepared the isolated copy"
-                    .to_string(),
-            ));
-        }
-        Ok(MutationProjectCopy {
-            copy,
-            preimage,
-            output_filenames,
-        })
-    }
-
-    /// The copied project that receives every speculative resolver operation.
-    pub(crate) fn project(&self) -> &Project {
-        &self.copy.project
-    }
-
-    /// Captures the accepted copy state for one checked publication to the source project.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`] if the resolver created an untracked output or the candidate cannot
-    /// be captured.
-    pub(crate) fn accepted_state(&self) -> cooldown_core::Result<AcceptedProjectState> {
-        let final_paths = discover_output_paths(&self.copy.project.root, self.output_filenames)?;
-        if final_paths
-            .iter()
-            .any(|path| self.preimage.files.iter().all(|file| file.path != *path))
-        {
-            return Err(CoreError::LockConflict(
-                "isolated resolver created an output outside its accepted publication set"
-                    .to_string(),
-            ));
-        }
-        let candidate = self.preimage.capture_state(&self.copy.project.root)?;
-        AcceptedProjectState::new(self.preimage.clone(), candidate)
-    }
-}
-
 impl ProjectCopy {
     /// Copy only the files the resolver reads (`inputs`) from `project`'s tree into a fresh temp
     /// directory and return a [`Project`] with a canonical root and its manifest rebased onto the
     /// copy.
     ///
-    /// Crucially this copies ONLY manifests, lockfiles, workspace/registry config, and (for Cargo/Go)
-    /// source — never the full source/data tree. A blind recursive copy is catastrophic in a large
-    /// monorepo: it would duplicate gigabytes of assets, model weights, and build data into the
-    /// tempdir (often tmpfs/RAM), which the resolver never reads. The real tree is only read (never
-    /// written), and the copy is discarded when the returned value drops.
+    /// This copies only the manifests, lockfiles, configuration, and source extensions declared by
+    /// `inputs`.
+    /// A blind recursive copy could duplicate gigabytes of unrelated monorepo data into a tempdir.
+    /// The source tree is read but never written, and the heuristic copy is discarded on drop.
     pub(crate) fn create(project: &Project, inputs: &ResolveInputs) -> cooldown_core::Result<Self> {
         let manifest_rel = project.manifest.strip_prefix(&project.root).map_err(|_| {
             CoreError::System(format!(
@@ -142,95 +74,13 @@ impl ProjectCopy {
     }
 }
 
-fn mutation_output_paths(
-    source: &Project,
-    copy: &Project,
-    output_filenames: &[&str],
-) -> cooldown_core::Result<Vec<camino::Utf8PathBuf>> {
-    let mut paths = discover_output_paths(&source.root, output_filenames)?;
-    paths.extend(discover_output_paths(&copy.root, output_filenames)?);
-    paths.extend(output_filenames.iter().map(camino::Utf8PathBuf::from));
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-fn capture_journal(
-    root: &camino::Utf8Path,
-    paths: &[camino::Utf8PathBuf],
-) -> cooldown_core::Result<ProjectMutationJournal> {
-    let files = paths
-        .iter()
-        .map(|path| ProjectMutationJournal::capture_file(root, path))
-        .collect::<cooldown_core::Result<Vec<_>>>()?;
-    Ok(ProjectMutationJournal { files })
-}
-
-fn discover_output_paths(
-    root: &camino::Utf8Path,
-    output_filenames: &[&str],
-) -> cooldown_core::Result<Vec<camino::Utf8PathBuf>> {
-    let mut paths = Vec::new();
-    discover_output_paths_inner(
-        root.as_std_path(),
-        std::path::Path::new(""),
-        output_filenames,
-        &mut paths,
-    )?;
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-fn discover_output_paths_inner(
-    root: &std::path::Path,
-    relative: &std::path::Path,
-    output_filenames: &[&str],
-    paths: &mut Vec<camino::Utf8PathBuf>,
-) -> cooldown_core::Result<()> {
-    let directory = root.join(relative);
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let child = relative.join(&name);
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if !should_prune_dir(&name, &child, &ResolveInputs::DEFAULT) {
-                discover_output_paths_inner(root, &child, output_filenames, paths)?;
-            }
-            continue;
-        }
-        if name
-            .to_str()
-            .is_some_and(|name| output_filenames.contains(&name))
-        {
-            let path = camino::Utf8PathBuf::from_path_buf(child).map_err(|path| {
-                CoreError::PathEncoding(format!("non-UTF-8 mutation output: {}", path.display()))
-            })?;
-            paths.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// Recursively reproduce a project's directory *skeleton* into `dest`, copying ONLY the files the
-/// resolver reads (`inputs`): manifests, lockfiles, workspace/registry config, and — for Cargo/Go —
-/// source. Every other file (application source, assets, model weights, build data) is skipped, so the
-/// throwaway copy is a few megabytes of metadata even for a multi-gigabyte monorepo. The directory
-/// structure itself IS preserved (workspace members are located by path), but the bulk content is not.
+/// Recursively copies the inputs selected by a generic preview adapter into `dest`.
 ///
-/// Directories that the resolver never needs and that would make even a skeleton walk expensive or
-/// self-referential are pruned outright: virtualenvs, VCS metadata, bytecode caches, `node_modules`,
-/// build `target`, and vendored/testdata trees. Dot-prefixed config directories are traversed only
-/// when they are ancestors of explicit [`ResolveInputs::path_prefixes`] entries such as
-/// `.cargo/config.toml`; underscore-prefixed source directories are not pruned generically because
-/// they are legitimate module/package locations in several ecosystems. Any entry that is unreadable
-/// (`PermissionDenied`) is skipped quietly instead of failing the whole probe.
+/// Only the directory structure needed to place selected files is recreated.
+/// Virtual environments, VCS metadata, dependency stores, build output, and vendored/testdata trees
+/// are pruned.
+/// Dot-prefixed directories are traversed only for explicit [`ResolveInputs::path_prefixes`].
+/// An unreadable entry is skipped because this copy supports best-effort previews, not publication.
 fn copy_project_tree(
     src: &std::path::Path,
     dest: &std::path::Path,
@@ -375,7 +225,7 @@ fn rel_slash(rel: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MutationProjectCopy, ProjectCopy, copy_project_tree};
+    use super::{ProjectCopy, copy_project_tree};
     use cooldown_core::{Project, ResolveInputs, ToolId};
 
     #[test]
@@ -422,48 +272,7 @@ mod tests {
             .err()
             .expect("an outside-root manifest must be rejected");
 
-        assert!(
-            matches!(error, cooldown_core::CoreError::System(detail) if detail.contains("outside project root"))
-        );
-    }
-
-    #[test]
-    fn isolated_mutation_never_changes_source_and_rejects_later_drift() -> color_eyre::Result<()> {
-        let source = tempfile::tempdir()?;
-        let root = camino::Utf8PathBuf::from_path_buf(source.path().to_owned())
-            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 source path: {path:?}"))?;
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n")?;
-        std::fs::write(root.join("Cargo.lock"), "original lock")?;
-        let project = Project {
-            root: root.clone(),
-            kind: ToolId("cargo"),
-            manifest: root.join("Cargo.toml"),
-            exclude_newer: None,
-        };
-        let trial = MutationProjectCopy::create(
-            &project,
-            &ResolveInputs::DEFAULT,
-            &["Cargo.toml", "Cargo.lock"],
-        )?;
-
-        std::fs::write(trial.project().root.join("Cargo.lock"), "accepted lock")?;
-        let accepted = trial.accepted_state()?;
-
-        assert_eq!(
-            std::fs::read_to_string(root.join("Cargo.lock"))?,
-            "original lock"
-        );
-        accepted.validate_source(&root)?;
-        std::fs::write(root.join("Cargo.lock"), "external lock")?;
-        assert!(matches!(
-            accepted.validate_source(&root),
-            Err(cooldown_core::CoreError::LockConflict(_))
-        ));
-        assert_eq!(
-            std::fs::read_to_string(root.join("Cargo.lock"))?,
-            "external lock"
-        );
-        Ok(())
+        std::assert_matches!(error, cooldown_core::CoreError::System(detail) if detail.contains("outside project root"));
     }
 
     /// The skeleton copy reproduces the directory structure and the resolver inputs (manifests, locks,

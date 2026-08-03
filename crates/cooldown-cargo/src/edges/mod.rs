@@ -15,7 +15,7 @@
 //! structure, the policy modules ([`preserve`], [`canonicalize`]) compute corrective rewrites over
 //! them, [`rewrite`] filters those rewrites through the safety guards and applies them as targeted
 //! textual surgery that leaves the rest of the lock byte-identical, [`isolate`] finds a verified
-//! safe subset, [`recovery`] owns speculative state transitions, and [`observe`] diffs the final
+//! safe subset, [`transaction`] owns in-copy speculative state, and [`observe`] diffs the final
 //! bindings per `[[package]]` block so a rebind that no policy corrected is still reported.
 
 pub(crate) mod canonicalize;
@@ -24,8 +24,8 @@ mod isolate;
 mod lock_view;
 mod observe;
 pub(crate) mod preserve;
-pub(crate) mod recovery;
 mod rewrite;
+mod transaction;
 
 pub(crate) use lock_view::LockEdgeView;
 pub(crate) use observe::binding_changes;

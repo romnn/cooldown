@@ -9,6 +9,7 @@ use super::{
 use cooldown_core::{DepScope, ResolveKind, ResolveQuery, resolve};
 
 /// The result of `explain <pkg>`: the package's effective window plus the ordered derivation steps.
+#[derive(Debug)]
 pub struct ExplainOutcome {
     /// The resolved window and the project/registry it was derived for.
     pub meta: ExplainMeta,

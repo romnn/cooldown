@@ -331,7 +331,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).unwrap();
         let err = ConfigSources::load(root, Some(&root.join("missing.toml")), true)
             .expect_err("missing config");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
     }
 
     #[test]

@@ -128,6 +128,7 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use clap::Parser;
+    use color_eyre::eyre;
 
     #[test]
     fn recovery_marker_finds_project_without_cargo_lock() {
@@ -175,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ignored_project_is_still_a_recovery_target() -> color_eyre::Result<()> {
+    fn explicit_ignored_project_is_still_a_recovery_target() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         let project = root.join("ignored/project");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(&project)?;
@@ -194,10 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hidden_project_is_still_a_recovery_target() -> color_eyre::Result<()> {
+    fn explicit_hidden_project_is_still_a_recovery_target() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| color_eyre::eyre::eyre!("temporary path is not UTF-8"))?;
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         let project = root.join(".hidden/project");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(&project)?;

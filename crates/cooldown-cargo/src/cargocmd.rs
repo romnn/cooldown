@@ -346,6 +346,20 @@ struct RawMeta {
     resolve: Option<RawResolve>,
 }
 
+/// Cargo's authoritative package and target topology for one locked resolve.
+pub(crate) struct StagingMetadata {
+    pub(crate) workspace_root: camino::Utf8PathBuf,
+    pub(crate) packages: Vec<StagingPackage>,
+}
+
+/// One package whose manifest and target paths Cargo may read during a resolve.
+pub(crate) struct StagingPackage {
+    pub(crate) manifest_path: camino::Utf8PathBuf,
+    pub(crate) target_paths: Vec<camino::Utf8PathBuf>,
+    pub(crate) source: Option<String>,
+    pub(crate) workspace_member: bool,
+}
+
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
 /// default bare `"1.2.3"` is `^1.2.3`, a range, not a pin.
 fn exact_req_version(req: &str) -> Option<String> {
@@ -715,6 +729,13 @@ struct RawPkg {
     /// The crate's declared `rust-version` (MSRV), absent when it declares none.
     #[serde(default)]
     rust_version: Option<String>,
+    #[serde(default)]
+    targets: Vec<RawTarget>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawTarget {
+    src_path: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -830,6 +851,68 @@ impl Cargo {
             )
             .await?;
         Self::parse_graph(&stdout)
+    }
+
+    /// Reads the locked package and target topology without allowing Cargo to rewrite the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool error when the source lock is stale and a lock-read error when Cargo emits
+    /// malformed or non-UTF-8 filesystem paths.
+    pub(crate) async fn staging_metadata(
+        &self,
+        dir: &Utf8Path,
+    ) -> Result<StagingMetadata, CoreError> {
+        let stdout = self
+            .run(
+                dir,
+                &[
+                    "metadata",
+                    "--all-features",
+                    "--locked",
+                    "--format-version",
+                    "1",
+                ],
+            )
+            .await?;
+        let raw: RawMeta = serde_json::from_str(&stdout)
+            .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
+        let workspace_root = camino::Utf8PathBuf::from(raw.workspace_root);
+        if !workspace_root.is_absolute() {
+            return Err(CoreError::LockUnreadable(
+                "cargo metadata returned a relative or empty workspace root".to_string(),
+            ));
+        }
+        let members: HashSet<_> = raw.workspace_members.into_iter().collect();
+        let mut packages = Vec::with_capacity(raw.packages.len());
+        for package in raw.packages {
+            let manifest_path = camino::Utf8PathBuf::from(package.manifest_path);
+            if !manifest_path.is_absolute() {
+                return Err(CoreError::LockUnreadable(
+                    "cargo metadata returned a relative or empty package manifest path".to_string(),
+                ));
+            }
+            let target_paths = package
+                .targets
+                .into_iter()
+                .map(|target| camino::Utf8PathBuf::from(target.src_path))
+                .collect::<Vec<_>>();
+            if target_paths.iter().any(|path| !path.is_absolute()) {
+                return Err(CoreError::LockUnreadable(format!(
+                    "cargo metadata returned a relative target path for {manifest_path}"
+                )));
+            }
+            packages.push(StagingPackage {
+                manifest_path,
+                target_paths,
+                source: package.source,
+                workspace_member: members.contains(&package.id),
+            });
+        }
+        Ok(StagingMetadata {
+            workspace_root,
+            packages,
+        })
     }
 
     /// Builds a [`ResolvedGraph`] from raw `cargo metadata` JSON, for tests that exercise the graph

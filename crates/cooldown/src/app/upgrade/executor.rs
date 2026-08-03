@@ -2619,7 +2619,7 @@ mod tests {
         let error = rollback
             .restore(&root)
             .expect_err("drift must block rollback");
-        assert!(matches!(error, cooldown_core::CoreError::LockConflict(_)));
+        std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
         assert_eq!(
             std::fs::read(path).expect("read external edit"),
             b"external edit"

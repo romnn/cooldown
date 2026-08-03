@@ -17,6 +17,7 @@ use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use jiff::{SignedDuration, Timestamp};
+use sha2::{Digest as _, Sha256};
 
 /// What an adapter can express, so the conformance suite can capability-gate the right invariants.
 ///
@@ -254,15 +255,63 @@ pub trait ApplyObserver: Send + Sync {
 impl ApplyObserver for () {}
 
 /// How the application executes an adapter's resolver mutations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationExecution {
+#[derive(Clone, Copy)]
+pub enum MutationExecution<'a> {
     /// Resolver trials run against the source project under the cooperative project lease.
     InPlace,
-    /// Resolver trials run in a project copy and publish only these output basenames.
-    Isolated {
-        /// File basenames the resolver may create or rewrite.
-        output_filenames: &'static [&'static str],
+    /// The adapter prepares and publishes a faithful isolated project trial.
+    Isolated(&'a dyn IsolatedMutationStrategy),
+}
+
+/// Prepares a tool-specific isolated project with a matching publication capability.
+#[async_trait]
+pub trait IsolatedMutationStrategy: Send + Sync {
+    /// Stages every resolver input and output needed to run a faithful isolated trial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the source cannot be represented faithfully or changes while
+    /// staging.
+    async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>>;
+}
+
+/// The source-visible state after publishing an accepted isolated trial.
+#[derive(Debug)]
+pub enum AcceptedPublication {
+    /// Every accepted file is visible and no restart recovery remains pending.
+    Published {
+        /// Non-fatal durability or cleanup diagnostics.
+        warnings: Vec<crate::Diagnostic>,
     },
+    /// Every accepted file is visible, but a recovery marker still requires explicit cleanup.
+    PublishedPendingRecovery {
+        /// Non-fatal diagnostics recorded before marker cleanup became terminal.
+        warnings: Vec<crate::Diagnostic>,
+        /// The terminal recovery error that must be reported to the user.
+        error: CoreError,
+    },
+}
+
+/// A prepared isolated resolver trial tied to its accepted-state publisher.
+#[async_trait]
+pub trait IsolatedMutation: Send {
+    /// The staged project that receives resolver mutations.
+    fn project(&self) -> &Project;
+
+    /// Captures the accepted outputs and revalidates every source input used by the trial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] if an output is outside the publication set or a source input
+    /// changed independently.
+    fn accepted_state(&self) -> Result<AcceptedProjectState>;
+
+    /// Publishes a verified accepted state to the source project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] if the source changed or publication cannot complete safely.
+    async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication>;
 }
 
 /// The ownership state produced by one adapter apply attempt.
@@ -295,27 +344,8 @@ pub enum ApplyAttempt {
 #[async_trait]
 pub trait ToolWrite: Send + Sync {
     /// Selects whether resolver trials mutate the source project or a disposable copy.
-    fn mutation_execution(&self) -> MutationExecution {
+    fn mutation_execution(&self) -> MutationExecution<'_> {
         MutationExecution::InPlace
-    }
-
-    /// Publishes a verified project-copy result to the source project.
-    ///
-    /// The default rejects the call because in-place adapters never produce an
-    /// [`AcceptedProjectState`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) if publication is unsupported or cannot complete
-    /// safely.
-    async fn publish_accepted_state(
-        &self,
-        _project: &Project,
-        _accepted: &AcceptedProjectState,
-    ) -> Result<Vec<crate::Diagnostic>> {
-        Err(CoreError::System(
-            "this adapter does not publish isolated project mutations".to_string(),
-        ))
     }
 
     /// Captures the current contents of only the files `plan` may mutate.
@@ -545,27 +575,24 @@ pub trait ToolWrite: Send + Sync {
         Ok(SyncReport::Unsupported)
     }
 
-    /// The files this adapter's mutating resolve reads, so the throwaway [`ProjectCopy`] probe (used by
-    /// `outdated`'s blocked-verification and `--dry-run`) copies ONLY these — never the full source/data
-    /// tree.
+    /// The files this adapter's resolver preview reads from a heuristic throwaway project copy.
     ///
-    /// The probe copies a project into a tempdir to run the real resolver without touching the real
-    /// lock. Copying everything is catastrophic in a large monorepo (gigabytes of assets, model
-    /// weights, and build data into a tempdir that is often tmpfs/RAM), and the resolver needs none of
-    /// it — only the dependency metadata in manifests, lockfiles, and workspace/registry config. The
-    /// default [`ResolveInputs::DEFAULT`] is the union of those across every supported manager (a
-    /// basename a tool never produces simply never matches), with no source files. Cargo and Go
-    /// override it to add their source extension, because those resolvers validate crate/module targets
-    /// and the import graph against the actual source — an empty `src/` would make the resolve error.
+    /// The generic preview copy excludes bulk source and data that can make monorepo copies
+    /// prohibitively expensive.
+    /// The default [`ResolveInputs::DEFAULT`] is the union of dependency metadata across supported
+    /// managers, with no source files.
+    /// Adapters may add source extensions needed by their preview resolver.
+    /// An adapter that publishes isolated mutations instead supplies an
+    /// [`IsolatedMutationStrategy`] with its own authoritative read set and topology.
     fn resolve_inputs(&self) -> ResolveInputs {
         ResolveInputs::DEFAULT
     }
 }
 
-/// The files a tool's mutating resolve actually reads — manifests, lockfiles, workspace/registry
-/// config, and selected source — so the application can stage a throwaway project copy without
-/// cloning the whole tree. Inputs are matched by exact basename, explicit project-relative path
-/// prefix, or opted-in source extension.
+/// Files copied into a generic resolver preview without cloning the whole project tree.
+///
+/// Inputs are matched by exact basename, explicit project-relative path prefix, or opted-in source
+/// extension.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveInputs {
     /// Exact file basenames to copy wherever they appear in the tree.
@@ -728,11 +755,162 @@ impl ProjectMutationState {
     }
 }
 
-/// A verified project-copy result paired with the exact source state it may replace.
+/// Resolution inputs whose identity and contents must still match before publication.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectInputSnapshot {
+    files: Vec<ProjectInputFile>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectInputFile {
+    path: Utf8PathBuf,
+    file_identity: ProjectInputIdentity,
+    symlink_target: Option<std::path::PathBuf>,
+    digest: [u8; 32],
+    permissions: std::fs::Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectInputIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows(std::sync::Arc<same_file::Handle>),
+}
+
+impl ProjectInputSnapshot {
+    /// Captures file inputs by absolute path, including links to regular files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when a path is relative, does not resolve to a regular file, changes
+    /// while being read, or cannot be read.
+    pub fn capture(paths: &[Utf8PathBuf]) -> Result<Self> {
+        let mut unique = std::collections::BTreeSet::new();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !path.is_absolute() || !unique.insert(path.as_str()) {
+                return Err(CoreError::Filesystem(format!(
+                    "isolated project input path is relative or duplicated: {path}"
+                )));
+            }
+            files.push(ProjectInputFile::capture(path)?);
+        }
+        Ok(ProjectInputSnapshot { files })
+    }
+
+    /// Checks that every source input still has the captured identity, bytes, and permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when any input changed independently.
+    pub fn validate(&self) -> Result<()> {
+        for expected in &self.files {
+            if !expected.matches_live()? {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently after cooldown staged the isolated resolver trial; left project files untouched",
+                    expected.path
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProjectInputFile {
+    fn capture(path: &Utf8Path) -> Result<Self> {
+        use std::io::Read as _;
+
+        let path_metadata = std::fs::symlink_metadata(path)?;
+        let symlink_target = if path_metadata.file_type().is_symlink() {
+            Some(std::fs::read_link(path)?)
+        } else if path_metadata.file_type().is_file() {
+            None
+        } else {
+            return Err(CoreError::Filesystem(format!(
+                "isolated project input does not resolve to a regular file: {path}"
+            )));
+        };
+        let mut file = std::fs::File::open(path)?;
+        let file_metadata = file.metadata()?;
+        if !file_metadata.file_type().is_file() {
+            return Err(CoreError::Filesystem(format!(
+                "isolated project input does not resolve to a regular file: {path}"
+            )));
+        }
+        let file_identity = project_input_identity(&file)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let final_path_metadata = std::fs::symlink_metadata(path)?;
+        let final_symlink_target = if final_path_metadata.file_type().is_symlink() {
+            Some(std::fs::read_link(path)?)
+        } else if final_path_metadata.file_type().is_file() {
+            None
+        } else {
+            return Err(CoreError::LockConflict(format!(
+                "{path} changed kind while cooldown captured an isolated resolver input"
+            )));
+        };
+        let final_file_metadata = std::fs::metadata(path)?;
+        let final_file = std::fs::File::open(path)?;
+        let final_file_identity = project_input_identity(&final_file)?;
+        if file_identity != final_file_identity || symlink_target != final_symlink_target {
+            return Err(CoreError::LockConflict(format!(
+                "{path} changed identity while cooldown captured an isolated resolver input"
+            )));
+        }
+        Ok(ProjectInputFile {
+            path: path.to_owned(),
+            file_identity,
+            symlink_target,
+            digest: Sha256::digest(bytes).into(),
+            permissions: final_file_metadata.permissions(),
+        })
+    }
+
+    fn matches_live(&self) -> Result<bool> {
+        let current = Self::capture(&self.path).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate isolated resolver input {}: {error}",
+                self.path
+            ))
+        })?;
+        Ok(self.file_identity == current.file_identity
+            && self.symlink_target == current.symlink_target
+            && self.digest == current.digest
+            && permissions_equal(Some(&self.permissions), Some(&current.permissions)))
+    }
+}
+
+#[cfg(unix)]
+fn project_input_identity(file: &std::fs::File) -> Result<ProjectInputIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok(ProjectInputIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn project_input_identity(file: &std::fs::File) -> Result<ProjectInputIdentity> {
+    let handle = same_file::Handle::from_file(file.try_clone()?)?;
+    Ok(ProjectInputIdentity::Windows(std::sync::Arc::new(handle)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn project_input_identity(_file: &std::fs::File) -> Result<ProjectInputIdentity> {
+    Err(CoreError::Filesystem(
+        "cannot obtain stable resolver-input identity on this platform".to_string(),
+    ))
+}
+
+/// A verified project-copy result paired with every source state that authorized it.
 #[derive(Debug, Clone)]
 pub struct AcceptedProjectState {
     original: ProjectMutationJournal,
     candidate: ProjectMutationState,
+    inputs: ProjectInputSnapshot,
 }
 
 impl AcceptedProjectState {
@@ -742,7 +920,11 @@ impl AcceptedProjectState {
     ///
     /// Returns [`CoreError::LockConflict`] when the two states do not describe the same ordered
     /// write set.
-    pub fn new(original: ProjectMutationJournal, candidate: ProjectMutationState) -> Result<Self> {
+    pub fn new(
+        original: ProjectMutationJournal,
+        candidate: ProjectMutationState,
+        inputs: ProjectInputSnapshot,
+    ) -> Result<Self> {
         if !matching_write_sets(&original.files, &candidate.files)
             || !valid_mutation_paths(&original.files)
         {
@@ -753,6 +935,7 @@ impl AcceptedProjectState {
         Ok(AcceptedProjectState {
             original,
             candidate,
+            inputs,
         })
     }
 
@@ -775,6 +958,7 @@ impl AcceptedProjectState {
     ///
     /// Returns [`CoreError::LockConflict`] when any source file changed independently.
     pub fn validate_source(&self, root: &Utf8Path) -> Result<()> {
+        self.inputs.validate()?;
         validate_state(
             root,
             &self.original.files,
@@ -1097,14 +1281,15 @@ fn permissions_equal(
 #[cfg(test)]
 mod mutation_journal_tests {
     use super::*;
+    use color_eyre::eyre;
 
-    fn root(directory: &tempfile::TempDir) -> color_eyre::Result<Utf8PathBuf> {
+    fn root(directory: &tempfile::TempDir) -> eyre::Result<Utf8PathBuf> {
         Utf8PathBuf::from_path_buf(directory.path().to_owned())
-            .map_err(|_| color_eyre::eyre::eyre!("temporary path is not UTF-8"))
+            .map_err(|_| eyre::eyre!("temporary path is not UTF-8"))
     }
 
     #[test]
-    fn checked_restore_refuses_independent_drift() -> color_eyre::Result<()> {
+    fn checked_restore_refuses_independent_drift() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = root(&directory)?;
         let relative = Utf8Path::new("Cargo.toml");
@@ -1120,13 +1305,13 @@ mod mutation_journal_tests {
             color_eyre::eyre::bail!("drift unexpectedly allowed rollback");
         };
 
-        assert!(matches!(error, CoreError::LockConflict(_)));
+        std::assert_matches!(error, CoreError::LockConflict(_));
         assert_eq!(std::fs::read_to_string(root.join(relative))?, "external");
         Ok(())
     }
 
     #[test]
-    fn mutation_journal_rejects_paths_outside_the_project() -> color_eyre::Result<()> {
+    fn mutation_journal_rejects_paths_outside_the_project() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = root(&directory)?;
         let journal = ProjectMutationJournal {
@@ -1137,20 +1322,14 @@ mod mutation_journal_tests {
             }],
         };
 
-        assert!(matches!(
-            journal.capture_state(&root),
-            Err(CoreError::Filesystem(_))
-        ));
-        assert!(matches!(
-            journal.restore(&root),
-            Err(CoreError::Filesystem(_))
-        ));
+        std::assert_matches!(journal.capture_state(&root), Err(CoreError::Filesystem(_)));
+        std::assert_matches!(journal.restore(&root), Err(CoreError::Filesystem(_)));
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_file_identity_distinguishes_same_length_replacement() -> color_eyre::Result<()> {
+    fn windows_file_identity_distinguishes_same_length_replacement() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("Cargo.lock");
         let replacement = directory.path().join("replacement.lock");
@@ -1166,7 +1345,7 @@ mod mutation_journal_tests {
     }
 
     #[test]
-    fn checked_restore_replaces_and_removes_only_expected_files() -> color_eyre::Result<()> {
+    fn checked_restore_replaces_and_removes_only_expected_files() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = root(&directory)?;
         let existing = Utf8Path::new("Cargo.toml");
@@ -1191,7 +1370,7 @@ mod mutation_journal_tests {
 
     #[cfg(unix)]
     #[test]
-    fn checked_restore_restores_unix_permissions() -> color_eyre::Result<()> {
+    fn checked_restore_restores_unix_permissions() -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir()?;
@@ -1216,7 +1395,7 @@ mod mutation_journal_tests {
 
     #[cfg(unix)]
     #[test]
-    fn mutation_journal_rejects_regular_and_dangling_symlinks() -> color_eyre::Result<()> {
+    fn mutation_journal_rejects_regular_and_dangling_symlinks() -> eyre::Result<()> {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir()?;
@@ -1227,7 +1406,7 @@ mod mutation_journal_tests {
 
         for relative in [Utf8Path::new("Cargo.toml"), Utf8Path::new("Cargo.lock")] {
             let result = ProjectMutationJournal::capture_file(&root, relative);
-            assert!(matches!(result, Err(CoreError::Filesystem(_))));
+            std::assert_matches!(result, Err(CoreError::Filesystem(_)));
         }
         assert!(root.join("Cargo.toml").is_symlink());
         assert!(root.join("Cargo.lock").is_symlink());

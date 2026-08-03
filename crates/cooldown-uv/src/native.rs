@@ -250,7 +250,7 @@ mod tests {
         "#});
 
         let err = parse_native(&manifest).expect_err("invalid native config must fail");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
             .expect("valid native config")
             .expect("native layer");
         assert_eq!(layer.rules.len(), 2);
-        assert!(matches!(layer.rules[0].window, RawWindow::AbsoluteDate(_)));
-        assert!(matches!(layer.rules[1].window, RawWindow::OptOut));
+        std::assert_matches!(layer.rules[0].window, RawWindow::AbsoluteDate(_));
+        std::assert_matches!(layer.rules[1].window, RawWindow::OptOut);
     }
 }

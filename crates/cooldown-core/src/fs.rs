@@ -7,7 +7,7 @@ use crate::error::CoreError;
 use std::io::Write;
 use std::path::Path;
 
-/// The commit state of a directory-durable atomic replacement that failed.
+/// The commit state of an atomic replacement with parent-directory durability on Unix.
 #[derive(Debug, thiserror::Error)]
 pub enum DurableWriteError {
     /// The public path was not replaced.
@@ -282,9 +282,10 @@ mod tests {
     #[cfg(unix)]
     use super::DurableWriteError;
     use super::{atomic_write, atomic_write_with_permissions_checked};
+    use color_eyre::eyre;
 
     #[test]
-    fn atomic_write_writes_exact_bytes_and_leaves_no_temp_file() -> color_eyre::Result<()> {
+    fn atomic_write_writes_exact_bytes_and_leaves_no_temp_file() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
 
@@ -305,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_atomic_write_validates_after_preparing_the_replacement() -> color_eyre::Result<()> {
+    fn checked_atomic_write_validates_after_preparing_the_replacement() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
         atomic_write(&path, b"external")?;
@@ -314,15 +315,14 @@ mod tests {
             Err(CoreError::LockConflict("external edit".to_string()))
         });
 
-        assert!(matches!(result, Err(CoreError::LockConflict(_))));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(std::fs::read(path)?, b"external");
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn durable_write_reports_a_visible_replacement_when_directory_sync_fails()
-    -> color_eyre::Result<()> {
+    fn durable_write_reports_a_visible_replacement_when_directory_sync_fails() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.json");
         atomic_write(&path, b"first")?;
@@ -333,10 +333,7 @@ mod tests {
             ))
         });
 
-        assert!(matches!(
-            result,
-            Err(DurableWriteError::DurabilityUncertain(_))
-        ));
+        std::assert_matches!(result, Err(DurableWriteError::DurabilityUncertain(_)));
         assert_eq!(std::fs::read(path)?, b"second");
         Ok(())
     }

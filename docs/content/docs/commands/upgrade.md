@@ -51,7 +51,9 @@ The lock-only default is honored where the tool can pin an exact in-range versio
 
 Cargo resolver and edge-normalization trials run in an isolated project copy. Cooldown compares the
 source manifests and lock with the preimage used for that trial, then publishes the accepted files
-under one durable recovery record. An interrupted publication can therefore recover the complete
+under one owner-only recovery record. On Unix its directory transitions are durable; other
+platforms use their best available atomic replacement without promising parent-directory
+durability. An interrupted publication can therefore recover the complete
 old or accepted state without treating a rejected resolver trial as source-project state.
 
 ## Transitive dependencies

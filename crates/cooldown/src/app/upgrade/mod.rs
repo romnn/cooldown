@@ -17,8 +17,8 @@ use super::{
     BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    Change, Diagnostic, DiagnosticKind, EdgeBindingAction, LockStatus, MutationExecution,
-    PackageId, ToolRead, ToolWrite,
+    AcceptedPublication, Change, Diagnostic, DiagnosticKind, EdgeBindingAction, IsolatedMutation,
+    IsolatedMutationStrategy, LockStatus, MutationExecution, PackageId, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
 
@@ -169,22 +169,16 @@ impl Workspace {
                 acc.errors.push(read_only_mutator_diag(pctx));
                 continue;
             };
-            if !opts.dry_run
-                && let MutationExecution::Isolated { output_filenames } =
-                    writer.mutation_execution()
-            {
-                self.run_isolated_source_project(pctx, opts, mode, output_filenames, &mut acc)
+            if let MutationExecution::Isolated(strategy) = writer.mutation_execution() {
+                self.run_isolated_source_project(pctx, opts, mode, strategy, &mut acc)
                     .await;
                 continue;
             }
 
-            // Under `--dry-run`, preview the TRUE outcome of the real run: run the identical
-            // whole-graph mutation flow against a throwaway recursive copy of the project, then discard
-            // the copy. Because the copy drives the same `apply`/re-lock/reconcile path, the reported
-            // lock diff (held candidates shown skipped with their blocker, landed candidates shown
-            // applied) equals what the real run produces — the real `uv.lock`/`pyproject.toml` are
-            // never written. `dry_copy` owns the temp tree (removed when it drops at the end of the
-            // iteration); `dry_pctx` owns the copied context the executor borrows.
+            // Under `--dry-run`, run the same mutation and verification flow against a throwaway
+            // copy assembled from the adapter's declared preview inputs.
+            // The source lock and manifest are never written.
+            // `dry_copy` keeps the temp tree alive while the executor borrows `dry_pctx`.
             let _dry_copy;
             let dry_pctx;
             let effective_pctx = if opts.dry_run {
@@ -264,14 +258,30 @@ impl Workspace {
             acc.errors.push(read_only_mutator_diag(pctx));
             return acc;
         };
-        let copy = match self.project_read_guard(pctx).await {
-            Ok(_guard) => {
-                super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
+        let _guard = match self.project_read_guard(pctx).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return acc;
             }
-            Err(error) => Err(error),
         };
-        let copy = match copy {
-            Ok(copy) => copy,
+        let prepared = match writer.mutation_execution() {
+            MutationExecution::InPlace => {
+                super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
+                    .map(PreparedPreview::Generic)
+            }
+            MutationExecution::Isolated(strategy) => strategy
+                .prepare(&pctx.project)
+                .await
+                .map(PreparedPreview::Isolated),
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 acc.errors.push(diag_from_error(
                     &error,
@@ -284,7 +294,7 @@ impl Workspace {
         };
         let copied_pctx = super::ProjectCtx {
             tool: pctx.tool,
-            project: copy.project.clone(),
+            project: prepared.project().clone(),
             rel_path: pctx.rel_path.clone(),
             policy: pctx.policy.clone(),
             edge_policy: pctx.edge_policy,
@@ -318,7 +328,7 @@ impl Workspace {
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         mode: PlanMode,
-        output_filenames: &'static [&'static str],
+        strategy: &dyn IsolatedMutationStrategy,
         acc: &mut UpgradeAccum,
     ) {
         let Some(reader) = self.adapter(pctx.tool) else {
@@ -328,7 +338,7 @@ impl Workspace {
             return;
         };
         let (_guard, trial) = match self
-            .prepare_isolated_trial(writer, pctx, opts, output_filenames)
+            .prepare_isolated_trial(writer, pctx, opts, strategy)
             .await
         {
             Ok(prepared) => prepared,
@@ -372,47 +382,7 @@ impl Workspace {
             merge_discarded_trial(acc, project_acc);
             return;
         }
-        let accepted = match trial.accepted_state() {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                merge_discarded_trial(acc, project_acc);
-                acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    pctx.rel_path.as_str(),
-                    None,
-                ));
-                return;
-            }
-        };
-        opts.progress.phase("publishing accepted project state");
-        let warnings = match writer
-            .publish_accepted_state(&pctx.project, &accepted)
-            .await
-        {
-            Ok(warnings) => warnings,
-            Err(error) => {
-                merge_discarded_trial(acc, project_acc);
-                acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    pctx.rel_path.as_str(),
-                    None,
-                ));
-                return;
-            }
-        };
-        project_acc
-            .warnings
-            .extend(warnings.into_iter().map(|warning| {
-                warning
-                    .with_tool(pctx.tool.as_str())
-                    .with_project(pctx.rel_path.as_str())
-            }));
-        merge_upgrade_accum(acc, project_acc);
-        if opts.build {
-            build_published_project(writer, pctx, opts, acc).await;
-        }
+        publish_isolated_trial(trial.as_ref(), writer, pctx, opts, project_acc, acc).await;
     }
 
     async fn prepare_isolated_trial(
@@ -420,25 +390,48 @@ impl Workspace {
         writer: &dyn ToolWrite,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
-        output_filenames: &'static [&'static str],
-    ) -> cooldown_core::Result<(
-        super::lock::ProjectAccessWriteGuard,
-        super::project_copy::MutationProjectCopy,
-    )> {
-        let guard = super::lock::ProjectAccessWriteGuard::acquire(
-            self.repo_root(),
-            &pctx.project.root,
-            pctx.tool,
-            writer.sync_scope() == cooldown_core::SyncScope::Repo,
-        )?;
-        writer.recover_pending_mutation(&pctx.project).await?;
+        strategy: &dyn IsolatedMutationStrategy,
+    ) -> cooldown_core::Result<(IsolatedAccessGuard, Box<dyn IsolatedMutation>)> {
+        let guard = if opts.dry_run {
+            IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?)
+        } else {
+            let guard = super::lock::ProjectAccessWriteGuard::acquire(
+                self.repo_root(),
+                &pctx.project.root,
+                pctx.tool,
+                writer.sync_scope() == cooldown_core::SyncScope::Repo,
+            )?;
+            writer.recover_pending_mutation(&pctx.project).await?;
+            IsolatedAccessGuard::Write(guard)
+        };
         opts.progress.phase("preparing isolated mutation project");
-        let trial = super::project_copy::MutationProjectCopy::create(
-            &pctx.project,
-            &writer.resolve_inputs(),
-            output_filenames,
-        )?;
+        let trial = strategy.prepare(&pctx.project).await?;
         Ok((guard, trial))
+    }
+}
+
+enum IsolatedAccessGuard {
+    Read(
+        #[expect(dead_code, reason = "the field keeps source read access alive")]
+        super::lock::ProjectAccessReadGuard,
+    ),
+    Write(
+        #[expect(dead_code, reason = "the field keeps source write access alive")]
+        super::lock::ProjectAccessWriteGuard,
+    ),
+}
+
+enum PreparedPreview {
+    Generic(super::project_copy::ProjectCopy),
+    Isolated(Box<dyn IsolatedMutation>),
+}
+
+impl PreparedPreview {
+    fn project(&self) -> &cooldown_core::Project {
+        match self {
+            PreparedPreview::Generic(copy) => &copy.project,
+            PreparedPreview::Isolated(copy) => copy.project(),
+        }
     }
 }
 
@@ -456,6 +449,73 @@ fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
     target
         .errors
         .extend(source.items.into_iter().filter_map(|item| item.error));
+}
+
+async fn publish_isolated_trial(
+    trial: &dyn IsolatedMutation,
+    writer: &dyn ToolWrite,
+    pctx: &super::ProjectCtx,
+    opts: &RunOpts,
+    mut project_acc: UpgradeAccum,
+    acc: &mut UpgradeAccum,
+) {
+    let accepted = match trial.accepted_state() {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            merge_discarded_trial(acc, project_acc);
+            acc.errors.push(diag_from_error(
+                &error,
+                pctx.tool,
+                pctx.rel_path.as_str(),
+                None,
+            ));
+            return;
+        }
+    };
+    if opts.dry_run {
+        merge_upgrade_accum(acc, project_acc);
+        return;
+    }
+    opts.progress.phase("publishing accepted project state");
+    let publication = match trial.publish(&accepted).await {
+        Ok(publication) => publication,
+        Err(error) => {
+            merge_discarded_trial(acc, project_acc);
+            acc.errors.push(diag_from_error(
+                &error,
+                pctx.tool,
+                pctx.rel_path.as_str(),
+                None,
+            ));
+            return;
+        }
+    };
+    let (warnings, pending_recovery) = match publication {
+        AcceptedPublication::Published { warnings } => (warnings, None),
+        AcceptedPublication::PublishedPendingRecovery { warnings, error } => {
+            (warnings, Some(error))
+        }
+    };
+    project_acc
+        .warnings
+        .extend(warnings.into_iter().map(|warning| {
+            warning
+                .with_tool(pctx.tool.as_str())
+                .with_project(pctx.rel_path.as_str())
+        }));
+    merge_upgrade_accum(acc, project_acc);
+    if let Some(error) = pending_recovery {
+        acc.errors.push(diag_from_error(
+            &error,
+            pctx.tool,
+            pctx.rel_path.as_str(),
+            None,
+        ));
+        return;
+    }
+    if opts.build {
+        build_published_project(writer, pctx, opts, acc).await;
+    }
 }
 
 const fn combine_lock_status(

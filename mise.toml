@@ -5,7 +5,7 @@
 # generate fixtures on the fly and run the actual resolver, so the toolchain must be pinned
 # to keep runs reproducible across machines and over time.
 #
-# The Rust toolchain is NOT managed here: it comes from `rust-toolchain.toml` (pinned `1.96.0`)
+# The Rust toolchain is NOT managed here: it comes from `rust-toolchain.toml` (pinned `1.97.1`)
 # installed via `dtolnay/rust-toolchain` in CI, so mise's shims never shadow the build compiler
 # (and a bare `cargo +nightly` works for `task unused`/udeps without a MISE_RUST_VERSION hack).
 # The integration-test versions below are each an exact `mise ls-remote <tool>` hit (verified),

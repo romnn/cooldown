@@ -79,7 +79,7 @@ impl ColorMode {
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
 /// Construct it with clap's [`Parser`] (`Cli::parse()`) and hand it to [`run`](crate::cli::run).
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "cooldown",
     version,
@@ -162,7 +162,7 @@ impl Countdown {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub(in crate::cli) enum Command {
     /// What could update — split into "adoptable now" vs "in cooldown".
     Outdated {
@@ -291,7 +291,7 @@ pub(in crate::cli) enum Command {
 
 /// Flags shared by the mutating commands (`upgrade`, `fix`). Flattened into each so the flag is
 /// scoped to where it applies (not silently accepted on every command).
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub(in crate::cli) struct MutationArgs {
     /// Fail (exit 1) if the mutation cannot complete cleanly.
     #[arg(long)]
@@ -300,7 +300,7 @@ pub(in crate::cli) struct MutationArgs {
 
 /// Flags shared by the policy-introspection commands (`check`, `config`). Flattened into each so
 /// the strict-native controls are scoped to where they apply.
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub(in crate::cli) struct StrictNativeArgs {
     /// Fail when repo policy overrides a stricter native value.
     #[arg(long = "fail-on-stricter-native")]
@@ -310,7 +310,7 @@ pub(in crate::cli) struct StrictNativeArgs {
     pub(in crate::cli) no_fail_on_stricter_native: bool,
 }
 
-#[derive(Args)]
+#[derive(Debug, Args)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent CLI flags; clap maps each bool to a --flag"
@@ -991,14 +991,14 @@ mod tests {
     #[test]
     fn parser_accepts_full_command_shape() {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
-        assert!(matches!(cli.command, super::Command::Check { .. }));
+        std::assert_matches!(cli.command, super::Command::Check { .. });
         assert!(cli.global.json);
     }
 
     #[test]
     fn parser_accepts_recovery_only_command() {
         let cli = Cli::parse_from(["cooldown", "recover"]);
-        assert!(matches!(cli.command, super::Command::Recover));
+        std::assert_matches!(cli.command, super::Command::Recover);
     }
 
     #[test]

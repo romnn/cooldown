@@ -467,7 +467,7 @@ mod tests {
         .expect("shared http");
 
         let result = http.get(url, Duration::ZERO).await;
-        assert!(matches!(result, Err(CoreError::Transient(_))));
+        std::assert_matches!(result, Err(CoreError::Transient(_)));
     }
 
     #[tokio::test]

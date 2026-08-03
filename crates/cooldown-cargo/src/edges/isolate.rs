@@ -2,14 +2,14 @@
 //! budget.
 //! Partition and singleton probes improve coverage without claiming optimality.
 
-use super::recovery::{CommitOutcome, SpeculativeLockTransaction};
+use super::transaction::SpeculativeLockTransaction;
 use super::{
     EdgeRewrite, GuardedRewrites, LockEdgeView, RejectedRewrite, guard_rewrites, rewrite_lock_text,
 };
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::lockfile::CargoLock;
 use camino::Utf8Path;
-use cooldown_core::{Diagnostic, Project, Result};
+use cooldown_core::{Project, Result};
 use std::collections::{BTreeSet, VecDeque};
 
 /// Bounds every Cargo validation spawned after the initial all-rewrites candidate fails.
@@ -28,7 +28,6 @@ pub(super) enum CommittedRewrites {
 
 pub(super) struct RewriteApplication {
     pub(super) committed: CommittedRewrites,
-    pub(super) warnings: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +46,6 @@ pub(super) async fn apply_rewrites(
     if guarded.accepted.is_empty() {
         return Ok(RewriteApplication {
             committed: CommittedRewrites::Unchanged,
-            warnings: Vec::new(),
         });
     }
     let Some(rewritten) = rewrite_lock_text(resolver_text, &guarded.accepted) else {
@@ -57,7 +55,6 @@ pub(super) async fn apply_rewrites(
         );
         return Ok(RewriteApplication {
             committed: CommittedRewrites::Unchanged,
-            warnings: Vec::new(),
         });
     };
     let mut transaction =
@@ -73,7 +70,7 @@ pub(super) async fn apply_rewrites(
     .await;
     match result {
         Ok(application) => Ok(application),
-        Err(error) => rollback_after_error(project, &mut transaction, error),
+        Err(error) => rollback_after_error(&mut transaction, error),
     }
 }
 
@@ -88,57 +85,35 @@ async fn apply_transaction(
     match cargo.verify_locked(&project.root).await {
         Ok(Some(graph)) => {
             transaction.accept()?;
-            let warnings = commit_warnings(transaction.commit()?);
+            transaction.commit()?;
             Ok(RewriteApplication {
                 committed: CommittedRewrites::Changed {
                     corrected: std::mem::take(&mut guarded.accepted),
                     lock_text: rewritten,
                     graph: Box::new(graph),
                 },
-                warnings,
             })
         }
         Ok(None) => {
             transaction.reject()?;
             let committed =
                 isolate_rewrites(cargo, project, resolver_text, guarded, transaction).await?;
-            let warnings = commit_warnings(transaction.commit()?);
-            Ok(RewriteApplication {
-                committed,
-                warnings,
-            })
+            transaction.commit()?;
+            Ok(RewriteApplication { committed })
         }
         Err(error) => Err(error),
     }
 }
 
 fn rollback_after_error<T>(
-    project: &Project,
     transaction: &mut SpeculativeLockTransaction,
     error: cooldown_core::CoreError,
 ) -> Result<T> {
     match transaction.rollback() {
-        Ok(outcome) => release_after_rollback(project, error, outcome),
-        Err(rollback) => Err(cooldown_core::CoreError::PendingRecovery(format!(
-            "edge correction failed: {error}; adapter rollback also failed: {rollback}; run `cooldown recover` for {}",
-            project.root.join(super::recovery::RECOVERY_MARKER)
+        Ok(()) => Err(released_failure(error)),
+        Err(rollback) => Err(cooldown_core::CoreError::Filesystem(format!(
+            "edge correction failed: {error}; restoring the disposable trial also failed: {rollback}; the source project was not modified"
         ))),
-    }
-}
-
-fn release_after_rollback<T>(
-    project: &Project,
-    error: cooldown_core::CoreError,
-    outcome: CommitOutcome,
-) -> Result<T> {
-    match outcome {
-        CommitOutcome::Committed => Err(released_failure(error)),
-        CommitOutcome::DurabilityUncertain(durability) => {
-            Err(cooldown_core::CoreError::PendingRecovery(format!(
-                "edge correction failed: {error}; its rollback is visible, but recovery-marker durability is uncertain: {durability}; outer rollback was refused; run `cooldown recover` for {}",
-                project.root.join(super::recovery::RECOVERY_MARKER)
-            )))
-        }
     }
 }
 
@@ -150,15 +125,6 @@ fn released_failure(error: cooldown_core::CoreError) -> cooldown_core::CoreError
             format!("edge correction failed after its transaction rolled back cleanly: {error}"),
         ),
         error => error,
-    }
-}
-
-fn commit_warnings(outcome: CommitOutcome) -> Vec<Diagnostic> {
-    match outcome {
-        CommitOutcome::Committed => Vec::new(),
-        CommitOutcome::DurabilityUncertain(error) => {
-            vec![Diagnostic::new(error.diagnostic_kind(), error.to_string())]
-        }
     }
 }
 
@@ -405,7 +371,7 @@ async fn try_candidate(
     transaction: &mut SpeculativeLockTransaction,
     current_text: &str,
     rewrites: &[EdgeRewrite],
-) -> Result<std::result::Result<(String, ResolvedGraph), CandidateFailure>> {
+) -> Result<Result<(String, ResolvedGraph), CandidateFailure>> {
     let Some(candidate_text) = rewrite_lock_text(current_text, rewrites) else {
         return Ok(Err(CandidateFailure::TextMismatch));
     };
@@ -459,10 +425,11 @@ mod tests {
     use super::*;
     use crate::lockfile::LockPackageId;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use cooldown_core::{CoreError, ToolId};
     use indoc::indoc;
 
-    fn transaction_fixture() -> color_eyre::Result<(
+    fn transaction_fixture() -> eyre::Result<(
         tempfile::TempDir,
         Project,
         Utf8PathBuf,
@@ -470,7 +437,7 @@ mod tests {
     )> {
         let directory = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
-            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temporary path: {path:?}"))?;
+            .map_err(|path| eyre::eyre!("non-UTF-8 temporary path: {path:?}"))?;
         let lock_path = root.join("Cargo.lock");
         std::fs::write(&lock_path, b"resolver")?;
         let project = Project {
@@ -485,89 +452,64 @@ mod tests {
     }
 
     #[test]
-    fn inner_failure_rolls_back_before_releasing_ownership() -> color_eyre::Result<()> {
+    fn inner_failure_rolls_back_before_releasing_ownership() -> eyre::Result<()> {
         let (_directory, project, lock_path, mut transaction) = transaction_fixture()?;
 
         let result: cooldown_core::Result<()> = rollback_after_error(
-            &project,
             &mut transaction,
             CoreError::Filesystem("injected inner failure".to_string()),
         );
         let error = result
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("inner failure unexpectedly succeeded"))?;
+            .ok_or_else(|| eyre::eyre!("inner failure unexpectedly succeeded"))?;
 
-        assert!(matches!(error, CoreError::Filesystem(_)));
+        std::assert_matches!(error, CoreError::Filesystem(_));
         assert_eq!(std::fs::read_to_string(&lock_path)?, "resolver");
         assert!(
             !project
                 .root
-                .join(super::super::recovery::RECOVERY_MARKER)
+                .join(crate::publication::RECOVERY_MARKER)
                 .exists()
         );
         Ok(())
     }
 
     #[test]
-    fn failed_inner_rollback_retains_authoritative_recovery() -> color_eyre::Result<()> {
+    fn failed_inner_rollback_discards_the_disposable_trial() -> eyre::Result<()> {
         let (_directory, project, lock_path, mut transaction) = transaction_fixture()?;
         std::fs::write(&lock_path, b"external")?;
 
         let result: cooldown_core::Result<()> = rollback_after_error(
-            &project,
             &mut transaction,
             CoreError::Filesystem("injected inner failure".to_string()),
         );
         let error = result
             .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("inner failure unexpectedly succeeded"))?;
+            .ok_or_else(|| eyre::eyre!("inner failure unexpectedly succeeded"))?;
 
-        assert!(matches!(error, CoreError::PendingRecovery(_)));
+        std::assert_matches!(error, CoreError::Filesystem(_));
+        assert!(
+            error
+                .to_string()
+                .contains("source project was not modified")
+        );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "external");
         assert!(
-            project
+            !project
                 .root
-                .join(super::super::recovery::RECOVERY_MARKER)
+                .join(crate::publication::RECOVERY_MARKER)
                 .exists()
         );
         Ok(())
     }
 
     #[test]
-    fn uncertain_rollback_durability_does_not_release_outer_rollback() -> color_eyre::Result<()> {
-        let (_directory, project, _lock_path, _transaction) = transaction_fixture()?;
+    fn clean_inner_rollback_reclassifies_lock_errors() {
+        let error = released_failure(CoreError::LockConflict(
+            "injected inner state conflict".to_string(),
+        ));
 
-        let result: cooldown_core::Result<()> = release_after_rollback(
-            &project,
-            CoreError::Filesystem("injected inner failure".to_string()),
-            CommitOutcome::DurabilityUncertain(CoreError::Filesystem(
-                "injected directory sync failure".to_string(),
-            )),
-        );
-        let error = result
-            .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("uncertain rollback released ownership"))?;
-
-        assert!(matches!(error, CoreError::PendingRecovery(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn clean_inner_rollback_releases_outer_restore_even_after_lock_error() -> color_eyre::Result<()>
-    {
-        let (_directory, project, _lock_path, _transaction) = transaction_fixture()?;
-
-        let result: cooldown_core::Result<()> = release_after_rollback(
-            &project,
-            CoreError::LockConflict("injected inner state conflict".to_string()),
-            CommitOutcome::Committed,
-        );
-        let error = result
-            .err()
-            .ok_or_else(|| color_eyre::eyre::eyre!("clean failure unexpectedly succeeded"))?;
-
-        assert!(matches!(error, CoreError::Filesystem(_)));
-        Ok(())
+        std::assert_matches!(error, CoreError::Filesystem(_));
     }
 
     #[test]

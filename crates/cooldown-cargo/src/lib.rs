@@ -9,6 +9,8 @@ pub mod index;
 mod lockfile;
 mod manifest;
 mod native;
+mod publication;
+mod staging;
 pub mod tool;
 pub mod version;
 
@@ -18,7 +20,7 @@ use cooldown_core::ToolId;
 pub const CARGO_ID: ToolId = ToolId("cargo");
 
 /// The project-relative marker for an interrupted Cargo mutation transaction.
-pub const RECOVERY_MARKER: &str = edges::recovery::RECOVERY_MARKER;
+pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
 /// Restores an interrupted Cargo mutation transaction rooted at `project_root`.
 ///
@@ -38,7 +40,7 @@ pub fn recover_interrupted_mutation(
         kind: CARGO_ID,
         exclude_newer: None,
     };
-    edges::enforce::recover_pending(&project)
+    publication::recover_pending(&project)
 }
 
 pub use index::CratesIoIndex;

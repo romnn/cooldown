@@ -3582,7 +3582,7 @@ packages:
         let report = ToolWrite::write_native(&tool, &project, &policy, false)
             .await
             .expect("sync");
-        assert!(matches!(report, cooldown_core::SyncReport::Written { .. }));
+        std::assert_matches!(report, cooldown_core::SyncReport::Written { .. });
         let written = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).expect("read");
         assert!(
             written.contains("minimumReleaseAge: 20160"),
@@ -6196,12 +6196,9 @@ packages:
         }
 
         // pnpm needs no bracketing: its exact pin already skips the manifest.
-        assert!(
-            matches!(
-                preserving_pin::<crate::lock::Pnpm>(&project, &change, &[]),
-                Some(crate::lock::PreservingPin::Direct(_))
-            ),
-            "pnpm pins exactly without touching a manifest"
+        std::assert_matches!(
+            preserving_pin::<crate::lock::Pnpm>(&project, &change, &[]),
+            Some(crate::lock::PreservingPin::Direct(_))
         );
     }
 

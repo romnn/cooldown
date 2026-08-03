@@ -24,10 +24,8 @@ pub(crate) fn artifact_id_from_url(url: &str) -> Option<ArtifactId> {
 pub(crate) fn newest_or_none(times: impl Iterator<Item = Option<Timestamp>>) -> Option<Timestamp> {
     let mut newest: Option<Timestamp> = None;
     for time in times {
-        match time {
-            None => return None,
-            Some(time) => newest = Some(newest.map_or(time, |current| current.max(time))),
-        }
+        let time = time?;
+        newest = Some(newest.map_or(time, |current| current.max(time)));
     }
     newest
 }

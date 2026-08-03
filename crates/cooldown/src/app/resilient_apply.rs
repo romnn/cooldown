@@ -17,11 +17,9 @@
 
 use std::collections::HashSet;
 
-#[cfg(test)]
-use cooldown_core::Result;
 use cooldown_core::{
     ApplyObserver, ApplyReport, Change, Plan, Project, ProjectMutationJournal,
-    ProjectMutationState, SkipReason, Skipped, ToolWrite,
+    ProjectMutationState, Result, SkipReason, Skipped, ToolWrite,
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
@@ -45,7 +43,7 @@ impl ApplyFailure {
     }
 }
 
-type ApplyResult<T> = std::result::Result<T, ApplyFailure>;
+type ApplyResult<T> = Result<T, ApplyFailure>;
 
 #[cfg(test)]
 async fn apply_resilient(
@@ -754,9 +752,10 @@ mod tests {
     }
 
     /// Drive `writer` (pre-configured with one injected fault) through `apply_resilient` and assert
-    /// the error propagates verbatim in exactly one apply — no bisection. `apply` returns the injected
-    /// fault before it consults the resolve oracle, so `apply_calls() == 1` is what proves recovery
-    /// never ran.
+    /// the error propagates verbatim in exactly one apply — no bisection.
+    ///
+    /// `apply` returns the injected fault before it consults the resolve oracle, so
+    /// `apply_calls() == 1` proves recovery never ran.
     async fn assert_propagates_without_bisecting(
         writer: MockWriter,
         expected: impl Fn(&CoreError) -> bool,
@@ -770,10 +769,7 @@ mod tests {
 
         let result = apply_resilient(&writer, &project, &plan, &journal).await;
 
-        assert!(
-            matches!(&result, Err(err) if expected(err)),
-            "a local failure must propagate, not mark candidates held: {result:?}"
-        );
+        std::assert_matches!(&result, Err(err) if expected(err));
         assert_eq!(writer.apply_calls(), 1);
     }
 
