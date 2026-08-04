@@ -1,19 +1,11 @@
 //! The `cooldown` binary entry point: install error reporting, parse, run on a tokio runtime, and
 //! exit with the policy taxonomy's code.
 
-use clap::FromArgMatches;
-use cooldown::cli::{Cli, CliOverrides, run};
+use cooldown::cli::{Cli, run};
 
 fn main() -> std::process::ExitCode {
     let _ = color_eyre::install();
-    // Parse into `ArgMatches` first so we can tell which flags were set explicitly (for config
-    // precedence), then reconstruct the typed `Cli` from the same matches.
-    let matches = Cli::command().get_matches();
-    let cli = match Cli::from_arg_matches(&matches) {
-        Ok(cli) => cli,
-        Err(e) => e.exit(),
-    };
-    let overrides = CliOverrides::from_matches(&matches);
+    let (cli, overrides) = Cli::parse_with_overrides();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

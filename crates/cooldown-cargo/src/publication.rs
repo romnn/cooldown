@@ -798,7 +798,9 @@ fn ensure_no_orphan_artifacts(lock_path: &Utf8Path) -> Result<()> {
             continue;
         };
         let orphan_state = validated_state_path(lock_path, &name).is_ok();
-        let orphan_publication = publication_target(&name).is_some();
+        let orphan_publication = publication_target(&name).is_some_and(|target| {
+            target == RECOVERY_MARKER || validated_state_path(lock_path, target).is_ok()
+        });
         if orphan_state || orphan_publication {
             return Err(CoreError::LockUnreadable(format!(
                 "unreferenced Cargo.lock recovery artifact at {}; left it untouched; inspect and remove it explicitly",
@@ -1418,6 +1420,19 @@ mod tests {
             Err(CoreError::LockUnreadable(_))
         );
         assert_eq!(publication_temps(&lock_path)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_publication_file_does_not_block_cargo_operations() -> eyre::Result<()> {
+        let (_dir, project, lock_path) = setup();
+        let unrelated = project.root.join(".myapp.123.0.publish");
+        std::fs::write(&unrelated, "unrelated")?;
+
+        ensure_no_pending(&project)?;
+
+        assert!(unrelated.exists());
+        assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         Ok(())
     }
 

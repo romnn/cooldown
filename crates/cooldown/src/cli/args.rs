@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use clap::parser::ValueSource;
-use clap::{ArgMatches, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 /// Verbosity for the diagnostic log written to stderr (independent of `--json`/report output).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -78,7 +78,7 @@ impl ColorMode {
 
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
-/// Construct it with clap's [`Parser`] (`Cli::parse()`) and hand it to [`run`](crate::cli::run).
+/// Use [`Cli::parse_with_overrides`] and pass both returned values to [`run`](crate::cli::run).
 #[derive(Debug, Parser)]
 #[command(
     name = "cooldown",
@@ -94,6 +94,21 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Parses the process arguments with command-specific help and captures explicit overrides.
+    ///
+    /// The typed CLI and override set come from the same [`ArgMatches`], so configuration
+    /// precedence can distinguish user-supplied flags from Clap defaults.
+    #[must_use]
+    pub fn parse_with_overrides() -> (Self, CliOverrides) {
+        let matches = Self::command().get_matches();
+        let cli = match <Self as FromArgMatches>::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(error) => error.exit(),
+        };
+        let overrides = CliOverrides::from_matches(&matches);
+        (cli, overrides)
+    }
+
     /// Builds the parser command with help scoped to each command's supported options.
     #[must_use]
     pub fn command() -> clap::Command {

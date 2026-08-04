@@ -352,11 +352,14 @@ impl Workspace {
         let Some(writer) = self.mutator(pctx.tool) else {
             return;
         };
-        let (_guard, trial, recovery_warnings) = match self
-            .prepare_isolated_trial(writer, pctx, opts, strategy)
+        let _guard = match self
+            .acquire_isolated_source_access(writer, pctx, opts)
             .await
         {
-            Ok(prepared) => prepared,
+            Ok((guard, recovery_warnings)) => {
+                acc.warnings.extend(recovery_warnings);
+                guard
+            }
             Err(error) => {
                 acc.errors.push(diag_from_error(
                     &error,
@@ -367,7 +370,19 @@ impl Workspace {
                 return;
             }
         };
-        acc.warnings.extend(recovery_warnings);
+        opts.progress.phase("preparing isolated mutation project");
+        let trial = match strategy.prepare(&pctx.project).await {
+            Ok(trial) => trial,
+            Err(error) => {
+                acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    None,
+                ));
+                return;
+            }
+        };
         let copied_pctx = super::ProjectCtx {
             tool: pctx.tool,
             project: trial.project().clone(),
@@ -402,17 +417,12 @@ impl Workspace {
         publish_isolated_trial(trial.as_ref(), writer, pctx, opts, project_acc, acc).await;
     }
 
-    async fn prepare_isolated_trial(
+    async fn acquire_isolated_source_access(
         &self,
         writer: &dyn ToolWrite,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
-        strategy: &dyn IsolatedMutationStrategy,
-    ) -> cooldown_core::Result<(
-        IsolatedAccessGuard,
-        Box<dyn IsolatedMutation>,
-        Vec<Diagnostic>,
-    )> {
+    ) -> cooldown_core::Result<(IsolatedAccessGuard, Vec<Diagnostic>)> {
         let (guard, recovery_warnings) = if opts.dry_run {
             (
                 IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?),
@@ -430,9 +440,7 @@ impl Workspace {
                 super::recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
             (IsolatedAccessGuard::Write(guard), diagnostics)
         };
-        opts.progress.phase("preparing isolated mutation project");
-        let trial = strategy.prepare(&pctx.project).await?;
-        Ok((guard, trial, recovery_warnings))
+        Ok((guard, recovery_warnings))
     }
 }
 

@@ -50,7 +50,6 @@ struct RepoSyncAccess {
         reason = "the field keeps every consumer project lease alive"
     )]
     projects: Vec<SyncAccessGuard>,
-    recovery: Vec<Diagnostic>,
 }
 
 /// What happened when syncing one project's native config.
@@ -365,18 +364,23 @@ impl Workspace {
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
         };
-        let result =
-            match acquire_repo_sync_access(writer, self.repo_root(), tool, projects, opts.dry_run)
-                .await
-            {
-                Ok(access) => {
-                    warnings.extend(access.recovery);
-                    writer
-                        .write_repo_native(self.repo_root(), &policy, opts.dry_run)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
+        let result = match acquire_repo_sync_access(
+            writer,
+            self.repo_root(),
+            tool,
+            projects,
+            opts.dry_run,
+            warnings,
+        )
+        .await
+        {
+            Ok(_access) => {
+                writer
+                    .write_repo_native(self.repo_root(), &policy, opts.dry_run)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
@@ -434,6 +438,7 @@ async fn acquire_repo_sync_access(
     tool: ToolId,
     projects: &[&super::ProjectCtx],
     dry_run: bool,
+    recovery: &mut Vec<Diagnostic>,
 ) -> cooldown_core::Result<RepoSyncAccess> {
     let resource = if dry_run {
         RepoSyncResourceGuard::Read {
@@ -448,7 +453,6 @@ async fn acquire_repo_sync_access(
     projects.sort_by(|left, right| left.project.root.cmp(&right.project.root));
     projects.dedup_by(|left, right| left.project.root == right.project.root);
     let mut guards = Vec::with_capacity(projects.len());
-    let mut recovery = Vec::new();
     for project in projects {
         let access = acquire_sync_access(writer, project, dry_run).await?;
         guards.push(access.guard);
@@ -457,7 +461,6 @@ async fn acquire_repo_sync_access(
     Ok(RepoSyncAccess {
         resource,
         projects: guards,
-        recovery,
     })
 }
 

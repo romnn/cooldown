@@ -148,6 +148,11 @@ struct FakeMutationStage {
 #[async_trait]
 impl IsolatedMutationStrategy for FakeEco {
     async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>> {
+        if source.root.join("fail-isolated-staging").exists() {
+            return Err(CoreError::Filesystem(
+                "injected isolated staging failure".to_string(),
+            ));
+        }
         let scratch = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(scratch.path().to_owned()).map_err(|path| {
             CoreError::PathEncoding(format!("non-UTF-8 test path: {}", path.display()))
@@ -752,6 +757,38 @@ async fn dry_run_refuses_pending_source_state_without_recovering_it() {
 
     assert_eq!(outcome.errors.len(), 1);
     assert!(outcome.items.is_empty());
+}
+
+#[tokio::test]
+async fn isolated_staging_failure_preserves_completed_recovery_notice() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("Cargo.lock"), "source lock")?;
+    std::fs::write(root.join("use-isolated-mutation"), "")?;
+    std::fs::write(root.join("fail-isolated-staging"), "")?;
+    let mut adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+    adapter
+        .state
+        .get_mut()
+        .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?
+        .require_recovery_before_read = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&opts())
+        .await;
+
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == DiagnosticKind::Recovery)
+    );
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.message.contains("injected isolated staging failure"))
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -3751,7 +3788,15 @@ impl ToolWrite for RepoScopedFake {
 
     async fn recover_pending_mutation(&self, project: &Project) -> Result<MutationRecovery> {
         self.recoveries.lock().unwrap().push(project.root.clone());
-        Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
+        let marker = project.root.join("restore-on-recovery");
+        let disposition = match std::fs::remove_file(marker) {
+            Ok(()) => RecoveryDisposition::Restored,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                RecoveryDisposition::Unchanged
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(MutationRecovery::settled(disposition))
     }
 
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
@@ -3854,6 +3899,60 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
     assert_eq!(again.items.len(), 1);
     assert_eq!(again.items[0].status, cooldown::app::SyncStatus::Unchanged);
     assert_eq!(again.summary.unchanged, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repo_sync_preserves_earlier_recovery_notice_when_later_access_fails() -> eyre::Result<()> {
+    let TmpRoot { guard: _dir, root } = tmp_root();
+    std::fs::create_dir_all(root.join("a"))?;
+    std::fs::write(root.join("a/restore-on-recovery"), "")?;
+    let repo_writes = Arc::new(Mutex::new(0usize));
+    let recoveries = Arc::new(Mutex::new(Vec::new()));
+    let fake = RepoScopedFake {
+        root: root.clone(),
+        repo_writes: Arc::clone(&repo_writes),
+        recoveries: Arc::clone(&recoveries),
+        already_written: Mutex::new(false),
+    };
+    let contexts = ["a", "b"]
+        .into_iter()
+        .map(|rel| ProjectCtx {
+            tool: REPO_TOOL,
+            project: fake.project(rel),
+            rel_path: Utf8PathBuf::from(rel),
+            policy: PolicyStack {
+                layers: vec![builtin_default_layer()],
+                strict_native: false,
+            },
+            edge_policy: EdgePolicy::default(),
+        })
+        .collect::<Vec<_>>();
+    let mut adapters = AdapterSet::new();
+    assert_matches!(
+        adapters.register_target_verified_mutator(Arc::new(fake)),
+        Ok(())
+    );
+    let workspace = Workspace::new(
+        adapters,
+        contexts,
+        now(),
+        Baseline::default(),
+        root.clone(),
+        vec![builtin_default_layer()],
+    );
+
+    let outcome = workspace.sync(&opts()).await;
+
+    assert_eq!(*repo_writes.lock().unwrap(), 0);
+    assert_eq!(*recoveries.lock().unwrap(), vec![root.join("a")]);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == DiagnosticKind::Recovery)
+    );
+    assert_eq!(outcome.summary.errors, 1);
     Ok(())
 }
 
