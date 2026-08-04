@@ -3,7 +3,9 @@ use crate::app::{Progress, RecoveryTarget};
 use crate::cli::GlobalArgs;
 use crate::{discovery, scan};
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_cargo::{CARGO_ID, is_recovery_artifact_name, recover_interrupted_mutation};
+use cooldown_cargo::{
+    CARGO_ID, is_recovery_artifact_name, recover_interrupted_mutation, recovery_authority_projects,
+};
 use cooldown_core::{
     CoreError, ProjectDetection, ProjectMarker, ToolId, recognized_tool_names, tool_id,
 };
@@ -257,6 +259,7 @@ fn cargo_recovery_roots(
     respect_gitignore: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
     let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name)?;
+    authoritative.extend(recovery_authority_projects(root)?);
     let detected = scan::find_project_marker_dirs_batch(
         root,
         &[ProjectDetection::PrimaryWithValidation {
@@ -516,6 +519,46 @@ mod tests {
             .map(|target| target.root)
             .collect::<Vec<_>>();
         assert_eq!(roots, vec![hidden, ignored]);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_recovery_finds_anchor_only_project_in_a_pruned_directory() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("target/.hidden/project");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        std::fs::create_dir_all(&project)?;
+        let project = Utf8PathBuf::from_path_buf(std::fs::canonicalize(&project)?)
+            .map_err(|path| eyre::eyre!("non-UTF-8 project path: {path:?}"))?;
+        let coordination = cooldown_core::fs::ProjectCoordination::resolve(&project)?;
+        let authority = coordination
+            .recovery_authority()
+            .ok_or_else(|| eyre::eyre!("test project has no recovery authority"))?;
+        let anchor = authority.directory().join(format!(
+            "{:016x}.cargo-recovery.anchor",
+            cooldown_core::fs::fnv1a_64(project.as_str())
+        ));
+        std::fs::write(
+            &anchor,
+            serde_json::to_vec(&serde_json::json!({
+                "format": "cooldown-cargo-recovery-anchor-v1",
+                "project_root": project.as_str(),
+                "record_digest": "0".repeat(64),
+            }))?,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", root.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        assert!(prepared.targets.iter().any(|target| target.root == project));
         Ok(())
     }
 

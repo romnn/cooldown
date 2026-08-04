@@ -12,6 +12,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct ProjectCoordination {
     directory: PathBuf,
+    directory_identity: std::sync::Arc<same_file::Handle>,
+    project: Utf8PathBuf,
+    recovery_authority: Option<RecoveryAuthority>,
+}
+
+/// Trusted out-of-project authority for one project's recoverable mutations.
+#[derive(Debug, Clone)]
+pub struct RecoveryAuthority {
+    directory: PathBuf,
+    directory_identity: std::sync::Arc<same_file::Handle>,
     project: Utf8PathBuf,
 }
 
@@ -29,12 +39,27 @@ impl ProjectCoordination {
     pub fn resolve(target: &Utf8Path) -> Result<Self, CoreError> {
         let project = canonical_project_root(target)?;
         let marker = git_marker(project.as_std_path())?;
-        let (base, components): (PathBuf, &[&str]) = match marker {
-            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"]),
-            None => (project.as_std_path().to_owned(), &[".cooldown", "locks"]),
+        let (base, components, trusted): (PathBuf, &[&str], bool) = match marker {
+            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"], true),
+            None => (
+                project.as_std_path().to_owned(),
+                &[".cooldown", "locks"],
+                false,
+            ),
         };
         let directory = secure_create_coordination_directory(&base, components)?;
-        Ok(ProjectCoordination { directory, project })
+        let directory_identity = std::sync::Arc::new(same_file::Handle::from_path(&directory)?);
+        let recovery_authority = trusted.then(|| RecoveryAuthority {
+            directory: directory.clone(),
+            directory_identity: directory_identity.clone(),
+            project: project.clone(),
+        });
+        Ok(ProjectCoordination {
+            directory,
+            directory_identity,
+            project,
+            recovery_authority,
+        })
     }
 
     /// Returns the owner-private coordination directory.
@@ -47,6 +72,81 @@ impl ProjectCoordination {
     #[must_use]
     pub fn project(&self) -> &Utf8Path {
         &self.project
+    }
+
+    /// Returns trusted recovery authority when coordination is outside project-controlled state.
+    #[must_use]
+    pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
+        self.recovery_authority.as_ref()
+    }
+
+    /// Revalidates the project identity and its current coordination namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the project or coordination namespace changed
+    /// after this capability was captured.
+    pub fn validate_current(&self) -> Result<(), CoreError> {
+        let current = Self::resolve(&self.project).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate project coordination for {}: {error}",
+                self.project
+            ))
+        })?;
+        if self.project != current.project
+            || self.directory != current.directory
+            || self.directory_identity != current.directory_identity
+        {
+            return Err(CoreError::LockConflict(format!(
+                "project coordination changed after access was acquired for {}",
+                self.project
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RecoveryAuthority {
+    /// Returns the trusted directory containing recovery authority records.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Returns the canonical project identity governed by this authority.
+    #[must_use]
+    pub fn project(&self) -> &Utf8Path {
+        &self.project
+    }
+
+    /// Revalidates that this project still resolves to the captured trusted namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the project no longer resolves to the same Git
+    /// coordination directory.
+    pub fn validate_current(&self) -> Result<(), CoreError> {
+        let current = ProjectCoordination::resolve(&self.project).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate recovery authority for {}: {error}",
+                self.project
+            ))
+        })?;
+        let Some(authority) = current.recovery_authority else {
+            return Err(CoreError::LockConflict(format!(
+                "trusted recovery authority disappeared for {}",
+                self.project
+            )));
+        };
+        if self.directory != authority.directory
+            || self.directory_identity != authority.directory_identity
+        {
+            return Err(CoreError::LockConflict(format!(
+                "recovery authority changed after project access was acquired for {}",
+                self.project
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -509,7 +609,8 @@ mod tests {
     use super::CoreError;
     #[cfg(unix)]
     use super::DurableWriteError;
-    use super::{atomic_write, atomic_write_with_permissions_checked};
+    use super::{ProjectCoordination, atomic_write, atomic_write_with_permissions_checked};
+    use camino::Utf8Path;
     use color_eyre::eyre;
 
     #[test]
@@ -545,6 +646,38 @@ mod tests {
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(std::fs::read(path)?, b"external");
+        Ok(())
+    }
+
+    #[test]
+    fn non_git_coordination_does_not_grant_recovery_authority() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+
+        let coordination = ProjectCoordination::resolve(root)?;
+
+        assert!(coordination.recovery_authority().is_none());
+        assert!(coordination.directory().starts_with(root.join(".cooldown")));
+        Ok(())
+    }
+
+    #[test]
+    fn replaced_git_namespace_invalidates_captured_coordination() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        let coordination = ProjectCoordination::resolve(root)?;
+        std::fs::rename(root.join(".git"), root.join(".git.previous"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+
+        std::assert_matches!(
+            coordination.validate_current(),
+            Err(CoreError::LockConflict(_))
+        );
         Ok(())
     }
 

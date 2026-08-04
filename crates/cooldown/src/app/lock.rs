@@ -31,6 +31,7 @@ impl CoordinationRoot {
         ))
     }
 
+    #[cfg(test)]
     fn project_lock(&self, project: &camino::Utf8Path) -> PathBuf {
         self.0.join(format!(
             "{:016x}.lock",
@@ -51,12 +52,14 @@ impl CoordinationRoot {
 #[derive(Debug)]
 pub(crate) struct ProjectReadGuard {
     file: File,
+    coordination: ProjectCoordination,
 }
 
 /// Holds an OS-backed exclusive lock for project mutations.
 #[derive(Debug)]
 pub(crate) struct ProjectWriteGuard {
     file: File,
+    coordination: ProjectCoordination,
 }
 
 /// Holds an OS-backed shared lock for one repository-wide tool resource.
@@ -76,7 +79,6 @@ pub(crate) struct RepoToolWriteGuard {
 pub(crate) struct ProjectAccessReadGuard {
     #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
     repo: Option<RepoToolReadGuard>,
-    #[expect(dead_code, reason = "the field keeps the project read lease alive")]
     project: ProjectReadGuard,
 }
 
@@ -85,22 +87,25 @@ pub(crate) struct ProjectAccessReadGuard {
 pub(crate) struct ProjectAccessWriteGuard {
     #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
     repo: Option<RepoToolReadGuard>,
-    #[expect(dead_code, reason = "the field keeps the project write lease alive")]
     project: ProjectWriteGuard,
 }
 
 impl ProjectReadGuard {
     /// Acquires shared access, failing immediately while a writer owns the project.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
-        let (path, file, coordination) = open_project_lock(root)?;
-        let guard = Self::acquire_file(&path, file)?;
-        drop(coordination);
+        let (path, file, maintenance, coordination) = open_project_lock(root)?;
+        let guard = Self::acquire_file(&path, file, coordination)?;
+        drop(maintenance);
         Ok(guard)
     }
 
-    fn acquire_file(path: &Path, file: File) -> Result<Self, CoreError> {
+    fn acquire_file(
+        path: &Path,
+        file: File,
+        coordination: ProjectCoordination,
+    ) -> Result<Self, CoreError> {
         match file.try_lock_shared() {
-            Ok(()) => Ok(ProjectReadGuard { file }),
+            Ok(()) => Ok(ProjectReadGuard { file, coordination }),
             Err(TryLockError::WouldBlock) => Err(lock_conflict(
                 path,
                 "an isolated mutation trial or source write",
@@ -114,17 +119,22 @@ impl ProjectReadGuard {
     fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
         let path = directory.join(lock_file_name(root)?);
         let file = open_lock_file(&path)?;
-        Self::acquire_file(&path, file)
+        Self::acquire_file(&path, file, ProjectCoordination::resolve(root)?)
+    }
+
+    /// Returns the coordination identity captured by this shared lease.
+    pub(crate) fn coordination(&self) -> &ProjectCoordination {
+        &self.coordination
     }
 }
 
 impl ProjectWriteGuard {
     /// Acquires exclusive access, failing immediately while another reader or writer is active.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
-        let (path, mut file, coordination) = open_project_lock(root)?;
+        let (path, mut file, maintenance, coordination) = open_project_lock(root)?;
         Self::acquire_file(root, &path, &mut file)?;
-        drop(coordination);
-        Ok(ProjectWriteGuard { file })
+        drop(maintenance);
+        Ok(ProjectWriteGuard { file, coordination })
     }
 
     fn acquire_file(
@@ -151,7 +161,15 @@ impl ProjectWriteGuard {
         let path = directory.join(lock_file_name(root)?);
         let mut file = open_lock_file(&path)?;
         Self::acquire_file(root, &path, &mut file)?;
-        Ok(ProjectWriteGuard { file })
+        Ok(ProjectWriteGuard {
+            file,
+            coordination: ProjectCoordination::resolve(root)?,
+        })
+    }
+
+    /// Returns the coordination identity captured by this exclusive lease.
+    pub(crate) fn coordination(&self) -> &ProjectCoordination {
+        &self.coordination
     }
 }
 
@@ -213,6 +231,11 @@ impl ProjectAccessReadGuard {
         let project = ProjectReadGuard::acquire(project_root)?;
         Ok(ProjectAccessReadGuard { repo, project })
     }
+
+    /// Returns the coordination identity captured by the project read lease.
+    pub(crate) fn coordination(&self) -> &ProjectCoordination {
+        self.project.coordination()
+    }
 }
 
 impl ProjectAccessWriteGuard {
@@ -229,17 +252,28 @@ impl ProjectAccessWriteGuard {
         let project = ProjectWriteGuard::acquire(project_root)?;
         Ok(ProjectAccessWriteGuard { repo, project })
     }
+
+    /// Returns the coordination identity captured by the project write lease.
+    pub(crate) fn coordination(&self) -> &ProjectCoordination {
+        self.project.coordination()
+    }
 }
 
-fn open_project_lock(root: &camino::Utf8Path) -> Result<(PathBuf, File, File), CoreError> {
-    let path = lock_path(root)?;
-    let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
+fn open_project_lock(
+    root: &camino::Utf8Path,
+) -> Result<(PathBuf, File, File, ProjectCoordination), CoreError> {
+    let coordination = ProjectCoordination::resolve(root)?;
+    let path = coordination.directory().join(format!(
+        "{:016x}.lock",
+        cooldown_core::fs::fnv1a_64(coordination.project().as_str())
+    ));
+    let (file, maintenance) = open_coordinated_lock_file(&path).map_err(|error| {
         CoreError::Filesystem(format!(
             "cannot open the project coordination lock at {}: {error}",
             path.display()
         ))
     })?;
-    Ok((path, file, coordination))
+    Ok((path, file, maintenance, coordination))
 }
 
 fn open_repo_tool_lock(
@@ -503,11 +537,6 @@ fn record_lock_owner(file: &mut File, path: &Path, identity: &str) -> Result<(),
     );
     let _ = file.sync_data();
     Ok(())
-}
-
-fn lock_path(root: &camino::Utf8Path) -> Result<PathBuf, CoreError> {
-    let (coordination, canonical) = CoordinationRoot::resolve(root)?;
-    Ok(coordination.project_lock(&canonical))
 }
 
 #[cfg(unix)]

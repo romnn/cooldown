@@ -22,6 +22,18 @@ pub const CARGO_ID: ToolId = ToolId("cargo");
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
+/// Finds project roots named by trusted Cargo recovery authority in `root`'s Git repository.
+///
+/// # Errors
+///
+/// Returns a [`cooldown_core::CoreError`] when trusted authority is malformed, names an invalid
+/// project, or cannot be inspected safely.
+pub fn recovery_authority_projects(
+    root: &camino::Utf8Path,
+) -> cooldown_core::Result<Vec<camino::Utf8PathBuf>> {
+    publication::recovery_authority_projects(root)
+}
+
 /// Returns whether a file name uses Cargo mutation recovery's reserved artifact shape.
 ///
 /// This recognizes the public transaction marker, private transaction state, and private
@@ -34,7 +46,9 @@ pub fn is_recovery_artifact_name(name: &str) -> bool {
 /// Settles an interrupted Cargo mutation transaction rooted at `project_root`.
 ///
 /// This recovery-only entry point performs no manifest parsing, registry setup, or Cargo command.
-/// The caller must hold exclusive access for the project root.
+/// The caller must hold exclusive access for the project root and pass the coordination capability
+/// captured by that lease.
+/// Recovery fails closed when the project is outside a Git worktree.
 ///
 /// # Errors
 ///
@@ -42,6 +56,7 @@ pub fn is_recovery_artifact_name(name: &str) -> bool {
 /// project, no longer matches the tracked manifests and lock, or cannot be read or settled safely.
 pub fn recover_interrupted_mutation(
     project_root: &camino::Utf8Path,
+    coordination: &cooldown_core::fs::ProjectCoordination,
 ) -> cooldown_core::Result<cooldown_core::MutationRecovery> {
     let project = cooldown_core::Project {
         root: project_root.to_owned(),
@@ -49,7 +64,8 @@ pub fn recover_interrupted_mutation(
         kind: CARGO_ID,
         exclude_newer: None,
     };
-    publication::recover_pending(&project)
+    let authority = publication::require_recovery_authority(&project, coordination)?;
+    publication::recover_pending(&project, authority)
 }
 
 pub use index::CratesIoIndex;

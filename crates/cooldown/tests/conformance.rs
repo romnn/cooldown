@@ -147,7 +147,11 @@ struct FakeMutationStage {
 
 #[async_trait]
 impl IsolatedMutationStrategy for FakeEco {
-    async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>> {
+    async fn prepare(
+        &self,
+        source: &Project,
+        _coordination: &cooldown_core::fs::ProjectCoordination,
+    ) -> Result<Box<dyn IsolatedMutation>> {
         if source.root.join("fail-isolated-staging").exists() {
             return Err(CoreError::Filesystem(
                 "injected isolated staging failure".to_string(),
@@ -385,7 +389,11 @@ impl ToolWrite for FakeEco {
         Ok(())
     }
 
-    async fn recover_pending_mutation(&self, _p: &Project) -> Result<MutationRecovery> {
+    async fn recover_pending_mutation(
+        &self,
+        _p: &Project,
+        _coordination: &cooldown_core::fs::ProjectCoordination,
+    ) -> Result<MutationRecovery> {
         let mut state = self.state.lock().unwrap();
         let disposition = if state.require_recovery_before_read && !state.recovery_completed {
             RecoveryDisposition::Restored
@@ -3786,7 +3794,11 @@ impl ToolWrite for RepoScopedFake {
         REPO_TOOL
     }
 
-    async fn recover_pending_mutation(&self, project: &Project) -> Result<MutationRecovery> {
+    async fn recover_pending_mutation(
+        &self,
+        project: &Project,
+        _coordination: &cooldown_core::fs::ProjectCoordination,
+    ) -> Result<MutationRecovery> {
         self.recoveries.lock().unwrap().push(project.root.clone());
         let marker = project.root.join("restore-on-recovery");
         let disposition = match std::fs::remove_file(marker) {

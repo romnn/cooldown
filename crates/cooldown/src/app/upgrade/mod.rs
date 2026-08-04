@@ -273,7 +273,7 @@ impl Workspace {
             acc.errors.push(read_only_mutator_diag(pctx));
             return acc;
         };
-        let _guard = match self.project_read_guard(pctx).await {
+        let guard = match self.project_read_guard(pctx).await {
             Ok(guard) => guard,
             Err(error) => {
                 acc.errors.push(diag_from_error(
@@ -291,7 +291,7 @@ impl Workspace {
                     .map(PreparedPreview::Generic)
             }
             MutationExecution::Isolated(strategy) => strategy
-                .prepare(&pctx.project)
+                .prepare(&pctx.project, guard.coordination())
                 .await
                 .map(PreparedPreview::Isolated),
         };
@@ -352,7 +352,7 @@ impl Workspace {
         let Some(writer) = self.mutator(pctx.tool) else {
             return;
         };
-        let _guard = match self
+        let guard = match self
             .acquire_isolated_source_access(writer, pctx, opts)
             .await
         {
@@ -371,7 +371,7 @@ impl Workspace {
             }
         };
         opts.progress.phase("preparing isolated mutation project");
-        let trial = match strategy.prepare(&pctx.project).await {
+        let trial = match strategy.prepare(&pctx.project, guard.coordination()).await {
             Ok(trial) => trial,
             Err(error) => {
                 acc.errors.push(diag_from_error(
@@ -435,7 +435,9 @@ impl Workspace {
                 pctx.tool,
                 writer.sync_scope() == cooldown_core::SyncScope::Repo,
             )?;
-            let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+            let recovery = writer
+                .recover_pending_mutation(&pctx.project, guard.coordination())
+                .await?;
             let diagnostics =
                 super::recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
             (IsolatedAccessGuard::Write(guard), diagnostics)
@@ -445,14 +447,17 @@ impl Workspace {
 }
 
 enum IsolatedAccessGuard {
-    Read(
-        #[expect(dead_code, reason = "the field keeps source read access alive")]
-        super::lock::ProjectAccessReadGuard,
-    ),
-    Write(
-        #[expect(dead_code, reason = "the field keeps source write access alive")]
-        super::lock::ProjectAccessWriteGuard,
-    ),
+    Read(super::lock::ProjectAccessReadGuard),
+    Write(super::lock::ProjectAccessWriteGuard),
+}
+
+impl IsolatedAccessGuard {
+    fn coordination(&self) -> &cooldown_core::fs::ProjectCoordination {
+        match self {
+            IsolatedAccessGuard::Read(guard) => guard.coordination(),
+            IsolatedAccessGuard::Write(guard) => guard.coordination(),
+        }
+    }
 }
 
 enum PreparedPreview {

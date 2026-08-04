@@ -606,13 +606,15 @@ impl Workspace {
             });
         }
         opts.progress.phase("refreshing lock state");
-        let _guard = ProjectAccessWriteGuard::acquire(
+        let guard = ProjectAccessWriteGuard::acquire(
             self.repo_root(),
             &pctx.project.root,
             pctx.tool,
             writer.sync_scope() == cooldown_core::SyncScope::Repo,
         )?;
-        let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+        let recovery = writer
+            .recover_pending_mutation(&pctx.project, guard.coordination())
+            .await?;
         let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
         let report = writer.refresh_lock(&pctx.project).await;
         Ok(LockRefresh { report, recovery })

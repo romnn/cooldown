@@ -424,7 +424,9 @@ async fn acquire_sync_access(
         })
     } else {
         let guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
-        let recovery = writer.recover_pending_mutation(&pctx.project).await?;
+        let recovery = writer
+            .recover_pending_mutation(&pctx.project, guard.coordination())
+            .await?;
         Ok(SyncAccess {
             guard: SyncAccessGuard::Write { guard },
             recovery: recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str()),

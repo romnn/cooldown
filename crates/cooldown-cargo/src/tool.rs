@@ -801,8 +801,10 @@ impl ToolWrite for CargoTool {
     async fn recover_pending_mutation(
         &self,
         project: &Project,
+        coordination: &cooldown_core::fs::ProjectCoordination,
     ) -> Result<cooldown_core::MutationRecovery> {
-        edges::enforce::recover_pending(project)
+        let authority = crate::publication::require_recovery_authority(project, coordination)?;
+        edges::enforce::recover_pending(project, authority)
     }
 
     async fn lock_edge_snapshot(&self, project: &Project) -> Result<Option<Vec<u8>>> {

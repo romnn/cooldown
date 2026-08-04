@@ -287,13 +287,17 @@ pub enum MutationExecution<'a> {
 /// Prepares a tool-specific isolated project with a matching publication capability.
 #[async_trait]
 pub trait IsolatedMutationStrategy: Send + Sync {
-    /// Stages every resolver input and output needed to run a faithful isolated trial.
+    /// Stages every resolver input and output under the source project's captured coordination.
     ///
     /// # Errors
     ///
     /// Returns a [`CoreError`] when the source cannot be represented faithfully or changes while
     /// staging.
-    async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>>;
+    async fn prepare(
+        &self,
+        source: &Project,
+        coordination: &crate::fs::ProjectCoordination,
+    ) -> Result<Box<dyn IsolatedMutation>>;
 }
 
 /// The source-visible state after publishing an accepted isolated trial.
@@ -744,14 +748,18 @@ pub trait ToolWrite: Send + Sync {
     /// Recovers adapter-owned state left by an interrupted mutation.
     ///
     /// The application invokes this at the start of a mutation lifecycle while holding the
-    /// project's exclusive mutation lock.
+    /// project's exclusive mutation lock represented by `coordination`.
     /// Read-side adapter methods must never perform recovery; they should instead report pending
     /// state without modifying the project.
     ///
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if pending state cannot be validated or recovered.
-    async fn recover_pending_mutation(&self, _project: &Project) -> Result<MutationRecovery> {
+    async fn recover_pending_mutation(
+        &self,
+        _project: &Project,
+        _coordination: &crate::fs::ProjectCoordination,
+    ) -> Result<MutationRecovery> {
         Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged))
     }
 

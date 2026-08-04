@@ -51,6 +51,9 @@ impl Fixture {
             .expect("create temp dir");
         // Anchor discovery when an ambient ancestor belongs to another Git repository.
         std::fs::create_dir(dir.path().join(".git")).expect("create fixture Git anchor");
+        // The valid Git metadata gives mutation fixtures an external recovery trust domain.
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n")
+            .expect("write fixture Git HEAD");
         Self {
             dir,
             tag_independent: false,

@@ -129,8 +129,11 @@ pub(crate) async fn enforce(
 /// Restores the pre-candidate lock when a prior enforcement terminated during verification.
 ///
 /// The mutation lifecycle calls this only while holding the project's exclusive lock.
-pub(crate) fn recover_pending(project: &Project) -> Result<cooldown_core::MutationRecovery> {
-    crate::publication::recover_pending(project)
+pub(crate) fn recover_pending(
+    project: &Project,
+    authority: &cooldown_core::fs::RecoveryAuthority,
+) -> Result<cooldown_core::MutationRecovery> {
+    crate::publication::recover_pending(project, authority)
 }
 
 /// Refuses a read while an interrupted mutation still owns recovery state.

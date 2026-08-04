@@ -30,13 +30,16 @@ For Cargo, `upgrade` and `fix` evaluate resolver changes in an isolated project.
 a new too-fresh, non-acknowledged dependency in the graph, the trial rejects that change before
 anything becomes visible in the source. The complete accepted manifest-and-lock state is published
 under one project-visible recovery record whose exact digest is anchored in cooldown's
-owner-private, target-derived coordination namespace.
+owner-private coordination namespace beneath Git's common directory. Recovery revalidates the
+complete expected project state and the exact marker and authority identities immediately before
+consuming that evidence. Cargo source mutations outside a Git worktree fail closed because
+project-local bytes are not trusted as restoration authority.
 
 Other ecosystems currently run resolver trials in place under the project lease. Cooldown records the files each trial may change, rolls a rejected trial back only when those files still match the observed resolver output, and stops if independent drift makes restoration unsafe. These ecosystems do not yet use Cargo's persistent whole-project recovery record.
 
 Every mutation that reports success has passed the package manager's verification and the selected cooldown transitive policy. The default whole-graph policy leaves the graph gate-clean by construction. `--transitive allow` deliberately retains visible fresh transitives, while `--transitive hide` excludes transitives from the gate.
 
-Cooldown coordinates access through target-derived lock files. Git repositories use Git's common directory. A non-Git project uses `.cooldown/locks`, including for read commands, so add `.cooldown/` to that project's ignore rules if it is not already ignored.
+Cooldown coordinates access through target-derived lock files. Git repositories use Git's common directory. A non-Git project uses `.cooldown/locks`, including for read commands, so add `.cooldown/` to that project's ignore rules if it is not already ignored. These non-Git lock files coordinate cooperating cooldown processes but do not authorize recovery.
 
 ## Cache hardening
 

@@ -288,19 +288,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     pub(super) async fn run(&mut self) -> ProjectRunStatus {
-        let _guard = match self.ctx.write_guard() {
+        let guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
                 return ProjectRunStatus::Terminated;
             }
         };
-        let recovery = match self
-            .ctx
-            .writer
-            .recover_pending_mutation(&self.ctx.pctx.project)
-            .await
-        {
+        let recovery_result = match guard.as_ref() {
+            Some(guard) => {
+                self.ctx
+                    .writer
+                    .recover_pending_mutation(&self.ctx.pctx.project, guard.coordination())
+                    .await
+            }
+            None => Ok(cooldown_core::MutationRecovery::settled(
+                cooldown_core::RecoveryDisposition::Unchanged,
+            )),
+        };
+        let recovery = match recovery_result {
             Ok(recovery) => recovery,
             Err(error) => {
                 self.record_project_error(&error, None);
@@ -430,19 +436,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
     ) {
-        let _guard = match self.ctx.write_guard() {
+        let guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
             Err(error) => {
                 self.record_project_error(&error, None);
                 return;
             }
         };
-        let recovery = match self
-            .ctx
-            .writer
-            .recover_pending_mutation(&self.ctx.pctx.project)
-            .await
-        {
+        let recovery_result = match guard.as_ref() {
+            Some(guard) => {
+                self.ctx
+                    .writer
+                    .recover_pending_mutation(&self.ctx.pctx.project, guard.coordination())
+                    .await
+            }
+            None => Ok(cooldown_core::MutationRecovery::settled(
+                cooldown_core::RecoveryDisposition::Unchanged,
+            )),
+        };
+        let recovery = match recovery_result {
             Ok(recovery) => recovery,
             Err(error) => {
                 self.record_project_error(&error, None);

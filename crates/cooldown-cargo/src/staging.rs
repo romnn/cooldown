@@ -7,7 +7,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     AcceptedProjectState, AcceptedPublication, CoreError, IsolatedMutation,
     IsolatedMutationStrategy, Project, ProjectInputSnapshot, ProjectMutationJournal,
-    ProjectMutationState, Result,
+    ProjectMutationState, Result, fs::ProjectCoordination, fs::RecoveryAuthority,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -23,6 +23,7 @@ struct CargoMutationStage {
     source_topology: StagingMetadata,
     layout: StagingLayout,
     source_files: BTreeSet<Utf8PathBuf>,
+    recovery_authority: Option<RecoveryAuthority>,
 }
 
 #[derive(Clone)]
@@ -41,9 +42,15 @@ struct StagingLayout {
 
 #[async_trait]
 impl IsolatedMutationStrategy for CargoTool {
-    async fn prepare(&self, source: &Project) -> Result<Box<dyn IsolatedMutation>> {
+    async fn prepare(
+        &self,
+        source: &Project,
+        coordination: &ProjectCoordination,
+    ) -> Result<Box<dyn IsolatedMutation>> {
+        coordination.validate_current()?;
+        let recovery_authority = coordination.recovery_authority().cloned();
         Ok(Box::new(
-            CargoMutationStage::prepare(self.cargo(), source).await?,
+            CargoMutationStage::prepare(self.cargo(), source, recovery_authority).await?,
         ))
     }
 }
@@ -60,15 +67,26 @@ impl IsolatedMutation for CargoMutationStage {
     }
 
     async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication> {
+        let recovery_authority = self.recovery_authority.as_ref().ok_or_else(|| {
+            CoreError::LockUnreadable(format!(
+                "recoverable Cargo publication is unavailable for non-Git project {}; move the project into a Git worktree before running a mutation",
+                self.source.root
+            ))
+        })?;
+        recovery_authority.validate_current()?;
         self.validate_source_topology().await?;
         self.validate_source_shape()?;
         accepted.validate_source(&self.source.root)?;
-        crate::publication::publish_accepted(&self.source, accepted)
+        crate::publication::publish_accepted(&self.source, accepted, recovery_authority)
     }
 }
 
 impl CargoMutationStage {
-    async fn prepare(cargo: &Cargo, source: &Project) -> Result<Self> {
+    async fn prepare(
+        cargo: &Cargo,
+        source: &Project,
+        recovery_authority: Option<RecoveryAuthority>,
+    ) -> Result<Self> {
         reject_custom_lockfile(&source.root)?;
         reject_unsupported_config_environment(std::env::vars_os())?;
         let metadata = cargo
@@ -144,6 +162,7 @@ impl CargoMutationStage {
             source_topology: metadata,
             layout,
             source_files,
+            recovery_authority,
         })
     }
 
@@ -876,6 +895,16 @@ mod tests {
         }
     }
 
+    fn recovery_authority(root: &Utf8Path) -> Result<RecoveryAuthority> {
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        let coordination = ProjectCoordination::resolve(root)?;
+        coordination
+            .recovery_authority()
+            .cloned()
+            .ok_or_else(|| CoreError::System("test project has no recovery authority".to_string()))
+    }
+
     #[test]
     fn dependency_path_parser_ignores_unrelated_path_keys() -> eyre::Result<()> {
         let manifest: toml::Value = toml::from_str(indoc! {r#"
@@ -1065,7 +1094,12 @@ mod tests {
         write(&root.join("src/lib.rs"), "pub fn app() {}\n")?;
         generate_lock(&root)?;
 
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
 
         assert!(stage.staged.root.join("../shared/Cargo.toml").exists());
         Cargo::new().staging_metadata(&stage.staged.root).await?;
@@ -1116,7 +1150,12 @@ mod tests {
         )?;
         generate_lock(&root)?;
 
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
 
         assert!(
             stage
@@ -1149,7 +1188,12 @@ mod tests {
         symlink("../member", root.join("linked"))?;
         generate_lock(&root)?;
 
-        let result = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await;
+        let result = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await;
 
         let Err(error) = result else {
             eyre::bail!("symlinked writable workspace member unexpectedly entered a trial");
@@ -1170,7 +1214,12 @@ mod tests {
         package(&root, "app")?;
         write(&root.join(".cargo/config.toml"), "[net]\noffline = true\n")?;
         generate_lock(&root)?;
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
         let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
         std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
         let accepted = stage.accepted_state()?;
@@ -1194,7 +1243,12 @@ mod tests {
         let root = utf8_path(directory.path().join("app"))?;
         package(&root, "app")?;
         generate_lock(&root)?;
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
         let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
         std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
         let accepted = stage.accepted_state()?;
@@ -1205,6 +1259,61 @@ mod tests {
             stage.publish(&accepted).await,
             Err(CoreError::LockConflict(_))
         );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            source_lock
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_git_namespace_invalidates_publication() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("app"))?;
+        package(&root, "app")?;
+        generate_lock(&root)?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
+        let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
+        std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
+        let accepted = stage.accepted_state()?;
+        std::fs::rename(root.join(".git"), root.join(".git.previous"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+
+        std::assert_matches!(
+            stage.publish(&accepted).await,
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            source_lock
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_git_project_cannot_publish_recoverable_state() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().join("app"))?;
+        package(&root, "app")?;
+        generate_lock(&root)?;
+        let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
+        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root), None).await?;
+        std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
+        let accepted = stage.accepted_state()?;
+
+        let error = stage
+            .publish(&accepted)
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("non-Git publication unexpectedly succeeded"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
         assert_eq!(
             std::fs::read_to_string(root.join("Cargo.lock"))?,
             source_lock
@@ -1226,7 +1335,12 @@ mod tests {
         )?;
         package(&root.join("crates/first"), "first")?;
         generate_lock(&root)?;
-        let stage = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await?;
+        let stage = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await?;
         let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
         let accepted = stage.accepted_state()?;
 
@@ -1256,7 +1370,12 @@ mod tests {
         generate_lock(&root)?;
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))?;
 
-        let result = CargoMutationStage::prepare(&Cargo::new(), &project(&root)).await;
+        let result = CargoMutationStage::prepare(
+            &Cargo::new(),
+            &project(&root),
+            Some(recovery_authority(&root)?),
+        )
+        .await;
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))?;
         let error = result
             .err()

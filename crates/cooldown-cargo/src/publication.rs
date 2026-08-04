@@ -4,7 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
     AcceptedProjectState, AcceptedPublication, CoreError, Diagnostic, DiagnosticKind,
     MutationRecovery, Project, ProjectMutationFile, ProjectMutationJournal, RecoveryDisposition,
-    Result,
+    Result, fs::RecoveryAuthority,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -14,6 +14,8 @@ const RECOVERY_FORMAT: &str = "cooldown-cargo-lock-recovery-v2";
 const RECOVERY_STATE_FORMAT: &str = "cooldown-cargo-lock-recovery-state-v1";
 const PROJECT_RECOVERY_FORMAT: &str = "cooldown-cargo-project-recovery-v1";
 const RECOVERY_ANCHOR_FORMAT: &str = "cooldown-cargo-recovery-anchor-v1";
+const MAX_RECOVERY_ANCHOR_BYTES: u64 = 16 * 1024;
+const MAX_RECOVERY_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const RECOVERY_MARKER: &str = "Cargo.lock.cooldown-recovery";
 
 // Retained so newer versions can recover transactions written before isolated staging.
@@ -48,8 +50,92 @@ struct RecoveryAnchor {
 }
 
 struct TrustedRecoveryRecord {
+    record: TrustedArtifact,
+    anchor: TrustedArtifact,
+    authority: RecoveryAuthority,
+}
+
+struct TrustedArtifact {
+    path: Utf8PathBuf,
     contents: Vec<u8>,
-    anchor_path: Utf8PathBuf,
+    identity: same_file::Handle,
+    owner_private: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedProjectState {
+    Original,
+    Candidate,
+}
+
+pub(crate) fn require_recovery_authority<'a>(
+    project: &Project,
+    coordination: &'a cooldown_core::fs::ProjectCoordination,
+) -> Result<&'a RecoveryAuthority> {
+    coordination.validate_current()?;
+    if coordination.project() != project.root {
+        return Err(CoreError::LockConflict(format!(
+            "project coordination belongs to {}, not {}",
+            coordination.project(),
+            project.root
+        )));
+    }
+    coordination.recovery_authority().ok_or_else(|| {
+        CoreError::LockUnreadable(format!(
+            "recoverable Cargo publication is unavailable for non-Git project {}; move the project into a Git worktree before running a mutation",
+            project.root
+        ))
+    })
+}
+
+pub(crate) fn recovery_authority_projects(root: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    let coordination = cooldown_core::fs::ProjectCoordination::resolve(root)?;
+    let Some(scan_authority) = coordination.recovery_authority() else {
+        return Ok(Vec::new());
+    };
+    let entries = std::fs::read_dir(scan_authority.directory())?;
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let target = publication_target(&name).unwrap_or(&name);
+        if !target.ends_with(".cargo-recovery.anchor") {
+            continue;
+        }
+        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "non-UTF-8 recovery authority path: {}",
+                path.display()
+            ))
+        })?;
+        let artifact = TrustedArtifact::open(&path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
+        let anchor: RecoveryAnchor = artifact.decode("recovery authority")?;
+        if anchor.format != RECOVERY_ANCHOR_FORMAT || !is_sha256_digest(&anchor.record_digest) {
+            return Err(untrusted_record(&path));
+        }
+        let project_root = Utf8PathBuf::from(anchor.project_root.clone());
+        let project = Project {
+            root: project_root.clone(),
+            manifest: project_root.join("Cargo.toml"),
+            kind: crate::CARGO_ID,
+            exclude_newer: None,
+        };
+        let project_coordination = cooldown_core::fs::ProjectCoordination::resolve(&project_root)?;
+        let project_authority = require_recovery_authority(&project, &project_coordination)?;
+        let expected = recovery_anchor_path(project_authority)?;
+        if expected.file_name() != Some(target)
+            || project_authority.directory() != scan_authority.directory()
+        {
+            return Err(untrusted_record(&path));
+        }
+        anchor.validate_without_record(&project, &path)?;
+        projects.push(project_root);
+    }
+    projects.sort();
+    projects.dedup();
+    Ok(projects)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -204,6 +290,66 @@ impl ProjectRecoveryRecord {
             .collect::<Result<Vec<_>>>()?;
         ProjectMutationJournal::from_snapshot(root, files)
     }
+
+    fn classify_state(
+        &self,
+        project: &Project,
+        live: &cooldown_core::ProjectMutationState,
+        recovery_path: &Utf8Path,
+    ) -> Result<(bool, bool)> {
+        let mut saw_original = false;
+        let mut saw_candidate = false;
+        for (recorded, live) in self.files.iter().zip(live.files()) {
+            if !recorded.is_changed() {
+                if !recorded.matches_original(live) {
+                    return Err(CoreError::LockUnreadable(format!(
+                        "{} changed after the accepted project trial at {recovery_path}; left all files untouched",
+                        project.root.join(live.path())
+                    )));
+                }
+                continue;
+            }
+            if recorded.matches_original(live) {
+                saw_original = true;
+            } else if recorded.matches_candidate(live) {
+                saw_candidate = true;
+            } else {
+                return Err(CoreError::LockUnreadable(format!(
+                    "{} no longer matches either side of the interrupted project publication at {recovery_path}; left all files untouched",
+                    project.root.join(live.path())
+                )));
+            }
+        }
+        Ok((saw_original, saw_candidate))
+    }
+
+    fn validate_expected_state(
+        &self,
+        project: &Project,
+        live: &cooldown_core::ProjectMutationState,
+        expected: ExpectedProjectState,
+        recovery_path: &Utf8Path,
+    ) -> Result<()> {
+        for (recorded, live) in self.files.iter().zip(live.files()) {
+            let matches = match expected {
+                ExpectedProjectState::Original => recorded.matches_original(live),
+                ExpectedProjectState::Candidate => {
+                    if recorded.is_changed() {
+                        recorded.matches_candidate(live)
+                    } else {
+                        recorded.matches_original(live)
+                    }
+                }
+            };
+            if !matches {
+                return Err(CoreError::LockUnreadable(format!(
+                    "{} changed before recovery evidence could be consumed at {recovery_path}; retained the recovery record",
+                    project.root.join(live.path())
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RecoveryAnchor {
@@ -240,14 +386,22 @@ impl RecoveryAnchor {
 }
 
 impl TrustedRecoveryRecord {
-    fn open(project: &Project, record_path: &Utf8Path) -> Result<Self> {
-        let contents = read_artifact(record_path)?;
-        let anchor_path = recovery_anchor_path(project)?;
-        let anchor = read_recovery_anchor(&anchor_path)?;
-        anchor.validate(project, &contents, &anchor_path)?;
+    fn open(
+        project: &Project,
+        record_path: &Utf8Path,
+        authority: &RecoveryAuthority,
+    ) -> Result<Self> {
+        authority.validate_current()?;
+        let anchor_path = recovery_anchor_path(authority)?;
+        let anchor = TrustedArtifact::open(&anchor_path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
+        let anchor_record: RecoveryAnchor = anchor.decode("recovery authority")?;
+        anchor_record.validate_without_record(project, &anchor_path)?;
+        let record = TrustedArtifact::open(record_path, MAX_RECOVERY_RECORD_BYTES, false)?;
+        anchor_record.validate(project, &record.contents, &anchor_path)?;
         Ok(TrustedRecoveryRecord {
-            contents,
-            anchor_path,
+            record,
+            anchor,
+            authority: authority.clone(),
         })
     }
 
@@ -261,11 +415,71 @@ impl TrustedRecoveryRecord {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(&self, record_path: &Utf8Path) -> Result<T> {
-        serde_json::from_slice(&self.contents).map_err(|error| {
+        serde_json::from_slice(&self.record.contents).map_err(|error| {
             CoreError::LockUnreadable(format!(
                 "invalid Cargo.lock recovery record at {record_path}: {error}; left all files untouched"
             ))
         })
+    }
+
+    fn validate_evidence(&self) -> Result<()> {
+        self.authority.validate_current()?;
+        self.anchor.validate_current()?;
+        self.record.validate_current()
+    }
+}
+
+impl TrustedArtifact {
+    fn open(path: &Utf8Path, limit: u64, owner_private: bool) -> Result<Self> {
+        let (mut file, identity) = open_recovery_artifact(path)?.ok_or_else(|| {
+            CoreError::LockUnreadable(format!(
+                "Cargo.lock recovery artifact disappeared at {path}; left all files untouched"
+            ))
+        })?;
+        if owner_private {
+            cooldown_core::fs::validate_owner_private_file(&file, path.as_std_path()).map_err(
+                |error| {
+                    CoreError::LockUnreadable(format!(
+                        "untrusted Cargo.lock recovery authority at {path}: {error}; left all files untouched"
+                    ))
+                },
+            )?;
+        }
+        let contents = read_bounded(&mut file, path, limit)?;
+        if identity != same_file::Handle::from_path(path)? {
+            return Err(untrusted_record(path));
+        }
+        Ok(TrustedArtifact {
+            path: path.to_owned(),
+            contents,
+            identity,
+            owner_private,
+        })
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(&self, label: &str) -> Result<T> {
+        serde_json::from_slice(&self.contents).map_err(|error| {
+            CoreError::LockUnreadable(format!(
+                "invalid Cargo.lock {label} at {}: {error}; left all files untouched",
+                self.path
+            ))
+        })
+    }
+
+    fn validate_current(&self) -> Result<()> {
+        let limit = u64::try_from(self.contents.len()).map_err(|error| {
+            CoreError::System(format!(
+                "recovery evidence size cannot be represented: {error}"
+            ))
+        })?;
+        let current = Self::open(&self.path, limit, self.owner_private)?;
+        if self.identity != current.identity || self.contents != current.contents {
+            return Err(CoreError::LockUnreadable(format!(
+                "Cargo.lock recovery evidence changed at {}; left it untouched",
+                self.path
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -419,24 +633,33 @@ fn utf8_contents(file: &ProjectMutationFile) -> Result<Option<String>> {
 pub(crate) fn publish_accepted(
     project: &Project,
     accepted: &AcceptedProjectState,
+    authority: &RecoveryAuthority,
 ) -> Result<AcceptedPublication> {
-    publish_accepted_with(project, accepted, AcceptedProjectState::install)
+    publish_accepted_with(project, accepted, authority, AcceptedProjectState::install)
 }
 
 fn publish_accepted_with<F>(
     project: &Project,
     accepted: &AcceptedProjectState,
+    authority: &RecoveryAuthority,
     install: F,
 ) -> Result<AcceptedPublication>
 where
     F: FnOnce(&AcceptedProjectState, &Utf8Path) -> Result<()>,
 {
-    publish_accepted_with_marker(project, accepted, install, remove_transaction_marker)
+    publish_accepted_with_marker(
+        project,
+        accepted,
+        authority,
+        install,
+        remove_transaction_marker,
+    )
 }
 
 fn publish_accepted_with_marker<F, R>(
     project: &Project,
     accepted: &AcceptedProjectState,
+    authority: &RecoveryAuthority,
     install: F,
     remove_marker: R,
 ) -> Result<AcceptedPublication>
@@ -449,14 +672,23 @@ where
             warnings: Vec::new(),
         });
     }
+    authority.validate_current()?;
+    if authority.project() != project.root {
+        return Err(CoreError::LockConflict(format!(
+            "Cargo recovery authority belongs to {}, not {}",
+            authority.project(),
+            project.root
+        )));
+    }
     accepted.validate_source(&project.root)?;
     let lock_path = project.root.join("Cargo.lock");
     let recovery_path = recovery_path(&lock_path);
-    let anchor_path = recovery_anchor_path(project)?;
+    let anchor_path = recovery_anchor_path(authority)?;
     ensure_no_orphan_artifacts(&lock_path)?;
-    if path_exists(&anchor_path)? {
+    if path_exists(&anchor_path)? || !private_publication_paths(&anchor_path)?.is_empty() {
         return Err(CoreError::LockUnreadable(format!(
-            "unsettled Cargo recovery authority at {anchor_path}; run `cooldown recover` before publishing another project state"
+            "unsettled Cargo recovery authority at {anchor_path}; run `cooldown recover -C {} --cargo` before publishing another project state",
+            project.root
         )));
     }
     let record = ProjectRecoveryRecord::new(project, accepted)?;
@@ -474,12 +706,12 @@ where
     };
     let publication = match publish_exclusive_bytes(&recovery_path, &record_contents) {
         Ok(outcome) => outcome,
-        Err(PublicationError::NotPublished(error)) => {
-            if let Err(cleanup_error) = remove_recovery_anchor(&anchor_path) {
+        Err(PublicationError::NotPublished(error)) => match remove_recovery_anchor(&anchor_path) {
+            Ok(CommitOutcome::Committed) => return Err(error),
+            Ok(CommitOutcome::DurabilityUncertain(cleanup_error)) | Err(cleanup_error) => {
                 return Err(pending_recovery(&anchor_path, &cleanup_error));
             }
-            return Err(error);
-        }
+        },
         Err(error @ PublicationError::DurabilityUncertain(_)) => {
             let error = error.into_core_error(&recovery_path);
             return Err(pending_recovery(&recovery_path, &error));
@@ -488,6 +720,14 @@ where
     if let Err(error) = install(accepted, &project.root) {
         return Err(pending_recovery(&recovery_path, &error));
     }
+    let trusted = TrustedRecoveryRecord::open(project, &recovery_path, authority)
+        .map_err(|error| pending_recovery(&recovery_path, &error))?;
+    accepted
+        .validate_candidate(&project.root)
+        .map_err(|error| pending_recovery(&recovery_path, &error))?;
+    trusted
+        .validate_evidence()
+        .map_err(|error| pending_recovery(&recovery_path, &error))?;
     let marker = match remove_marker(&recovery_path) {
         Ok(marker) => marker,
         Err(error) => {
@@ -499,7 +739,11 @@ where
     };
     let mut warnings = Vec::new();
     match marker {
-        CommitOutcome::Committed => match remove_recovery_anchor(&anchor_path) {
+        CommitOutcome::Committed => match trusted
+            .anchor
+            .validate_current()
+            .and_then(|()| remove_recovery_anchor(&anchor_path))
+        {
             Ok(CommitOutcome::Committed) => {}
             Ok(CommitOutcome::DurabilityUncertain(error)) | Err(error) => {
                 warnings.push(Diagnostic::new(
@@ -548,15 +792,26 @@ fn retry_private_cleanup<F>(
 }
 
 /// Settles a validated interrupted transaction while the caller holds exclusive project access.
-pub(crate) fn recover_pending(project: &Project) -> Result<MutationRecovery> {
+pub(crate) fn recover_pending(
+    project: &Project,
+    authority: &RecoveryAuthority,
+) -> Result<MutationRecovery> {
+    authority.validate_current()?;
+    if authority.project() != project.root {
+        return Err(CoreError::LockConflict(format!(
+            "Cargo recovery authority belongs to {}, not {}",
+            authority.project(),
+            project.root
+        )));
+    }
     let lock_path = project.root.join("Cargo.lock");
     let recovery_path = recovery_path(&lock_path);
-    let anchor_path = recovery_anchor_path(project)?;
+    let anchor_path = recovery_anchor_path(authority)?;
     if !path_exists(&recovery_path)? {
         ensure_no_orphan_artifacts(&lock_path)?;
         return recover_orphan_anchor(project, &anchor_path);
     }
-    let trusted = TrustedRecoveryRecord::open(project, &recovery_path)?;
+    let trusted = TrustedRecoveryRecord::open(project, &recovery_path, authority)?;
     let format = trusted.format(&recovery_path)?;
     if format == PROJECT_RECOVERY_FORMAT {
         return recover_project_publication(project, &recovery_path, &trusted);
@@ -592,12 +847,18 @@ pub(crate) fn recover_pending(project: &Project) -> Result<MutationRecovery> {
     )?;
     cleanup_linked_publication_files(&recovery_path)?;
     cleanup_linked_publication_files(&state_path)?;
+    ensure_lock_equals(
+        &lock_path,
+        &record.original_lock,
+        "consuming interrupted-correction recovery evidence",
+        Some(&recovery_path),
+    )?;
     let recovery = MutationRecovery::settled(if restored {
         RecoveryDisposition::Restored
     } else {
         RecoveryDisposition::CleanupOnly
     });
-    let mut recovery = finish_recovery_authority(recovery, &recovery_path, &anchor_path)?;
+    let mut recovery = finish_recovery_authority(recovery, &trusted)?;
     if let Err(error) = remove_file(&state_path) {
         recovery.warnings.push(Diagnostic::new(
             DiagnosticKind::Filesystem,
@@ -609,10 +870,13 @@ pub(crate) fn recover_pending(project: &Project) -> Result<MutationRecovery> {
 
 fn recover_orphan_anchor(project: &Project, anchor_path: &Utf8Path) -> Result<MutationRecovery> {
     if !path_exists(anchor_path)? {
-        return Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged));
+        return recover_private_anchor_publications(project, anchor_path);
     }
-    let anchor = read_recovery_anchor(anchor_path)?;
+    let artifact = TrustedArtifact::open(anchor_path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
+    let anchor: RecoveryAnchor = artifact.decode("recovery authority")?;
     anchor.validate_without_record(project, anchor_path)?;
+    cleanup_linked_publication_files(anchor_path)?;
+    artifact.validate_current()?;
     let mut recovery = MutationRecovery::settled(RecoveryDisposition::CleanupOnly);
     match remove_recovery_anchor(anchor_path)? {
         CommitOutcome::Committed => {}
@@ -626,61 +890,122 @@ fn recover_orphan_anchor(project: &Project, anchor_path: &Utf8Path) -> Result<Mu
     Ok(recovery)
 }
 
+fn recover_private_anchor_publications(
+    project: &Project,
+    anchor_path: &Utf8Path,
+) -> Result<MutationRecovery> {
+    let mut artifacts = Vec::new();
+    for path in private_publication_paths(anchor_path)? {
+        let artifact = TrustedArtifact::open(&path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
+        let anchor: RecoveryAnchor = artifact.decode("recovery authority")?;
+        anchor.validate_without_record(project, &path)?;
+        artifacts.push(artifact);
+    }
+    if artifacts.is_empty() {
+        return Ok(MutationRecovery::settled(RecoveryDisposition::Unchanged));
+    }
+    let mut recovery = MutationRecovery::settled(RecoveryDisposition::CleanupOnly);
+    for artifact in artifacts {
+        artifact.validate_current()?;
+        if let CommitOutcome::DurabilityUncertain(error) =
+            remove_transaction_marker(&artifact.path)?
+        {
+            recovery.warnings.push(Diagnostic::new(
+                DiagnosticKind::Filesystem,
+                format!(
+                    "removed stale private Cargo recovery authority at {}, but directory durability is uncertain: {error}",
+                    artifact.path
+                ),
+            ));
+        }
+    }
+    Ok(recovery)
+}
+
+fn private_publication_paths(public_path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    let parent = public_path.parent().ok_or_else(|| {
+        CoreError::PathEncoding(format!("recovery path has no parent: {public_path}"))
+    })?;
+    let public_name = public_path.file_name().ok_or_else(|| {
+        CoreError::PathEncoding(format!("recovery path has no file name: {public_path}"))
+    })?;
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if publication_target(&name) != Some(public_name) {
+            continue;
+        }
+        paths.push(Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "non-UTF-8 recovery publication path: {}",
+                path.display()
+            ))
+        })?);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 fn recover_project_publication(
     project: &Project,
     recovery_path: &Utf8Path,
     trusted: &TrustedRecoveryRecord,
 ) -> Result<MutationRecovery> {
+    recover_project_publication_with(project, recovery_path, trusted, || Ok(()))
+}
+
+fn recover_project_publication_with<F>(
+    project: &Project,
+    recovery_path: &Utf8Path,
+    trusted: &TrustedRecoveryRecord,
+    before_final_validation: F,
+) -> Result<MutationRecovery>
+where
+    F: FnOnce() -> Result<()>,
+{
     let record: ProjectRecoveryRecord = trusted.decode(recovery_path)?;
     record.validate(project, recovery_path)?;
     let original = record.original_journal(&project.root)?;
     let live = original.capture_state()?;
-    let mut saw_original = false;
-    let mut saw_candidate = false;
-    for (recorded, live) in record.files.iter().zip(live.files()) {
-        if !recorded.is_changed() {
-            if !recorded.matches_original(live) {
-                return Err(CoreError::LockUnreadable(format!(
-                    "{} changed after the accepted project trial at {recovery_path}; left all files untouched",
-                    project.root.join(live.path())
-                )));
-            }
-            continue;
-        }
-        if recorded.matches_original(live) {
-            saw_original = true;
-        } else if recorded.matches_candidate(live) {
-            saw_candidate = true;
-        } else {
-            return Err(CoreError::LockUnreadable(format!(
-                "{} no longer matches either side of the interrupted project publication at {recovery_path}; left all files untouched",
-                project.root.join(live.path())
-            )));
-        }
-    }
-    let disposition = if saw_original && saw_candidate {
+    let (saw_original, saw_candidate) = record.classify_state(project, &live, recovery_path)?;
+    let (disposition, expected) = if saw_original && saw_candidate {
         original.restore_if_unchanged(&live)?;
-        RecoveryDisposition::Restored
+        (
+            RecoveryDisposition::Restored,
+            ExpectedProjectState::Original,
+        )
     } else if saw_candidate {
-        RecoveryDisposition::Accepted
+        (
+            RecoveryDisposition::Accepted,
+            ExpectedProjectState::Candidate,
+        )
     } else {
-        RecoveryDisposition::CleanupOnly
+        (
+            RecoveryDisposition::CleanupOnly,
+            ExpectedProjectState::Original,
+        )
     };
     cleanup_linked_publication_files(recovery_path)?;
-    finish_recovery_authority(
-        MutationRecovery::settled(disposition),
-        recovery_path,
-        &trusted.anchor_path,
-    )
+    before_final_validation()?;
+    let final_live = original.capture_state()?;
+    record.validate_expected_state(project, &final_live, expected, recovery_path)?;
+    finish_recovery_authority(MutationRecovery::settled(disposition), trusted)
 }
 
 fn finish_recovery_authority(
     mut recovery: MutationRecovery,
-    recovery_path: &Utf8Path,
-    anchor_path: &Utf8Path,
+    trusted: &TrustedRecoveryRecord,
 ) -> Result<MutationRecovery> {
+    trusted.validate_evidence()?;
+    let recovery_path = &trusted.record.path;
+    let anchor_path = &trusted.anchor.path;
     match remove_transaction_marker(recovery_path)? {
-        CommitOutcome::Committed => match remove_recovery_anchor(anchor_path) {
+        CommitOutcome::Committed => {
+            trusted.anchor.validate_current()?;
+            match remove_recovery_anchor(anchor_path) {
             Ok(CommitOutcome::Committed) => {}
             Ok(CommitOutcome::DurabilityUncertain(error)) | Err(error) => {
                 recovery.warnings.push(Diagnostic::new(
@@ -690,7 +1015,8 @@ fn finish_recovery_authority(
                     ),
                 ));
             }
-        },
+            }
+        }
         CommitOutcome::DurabilityUncertain(error) => recovery.warnings.push(Diagnostic::new(
             DiagnosticKind::Filesystem,
             format!(
@@ -788,13 +1114,12 @@ fn path_exists(path: &Utf8Path) -> Result<bool> {
     Ok(open_recovery_artifact(path)?.is_some())
 }
 
-fn recovery_anchor_path(project: &Project) -> Result<Utf8PathBuf> {
-    let coordination = cooldown_core::fs::ProjectCoordination::resolve(&project.root)?;
+fn recovery_anchor_path(authority: &RecoveryAuthority) -> Result<Utf8PathBuf> {
     let name = format!(
         "{:016x}.cargo-recovery.anchor",
-        cooldown_core::fs::fnv1a_64(coordination.project().as_str())
+        cooldown_core::fs::fnv1a_64(authority.project().as_str())
     );
-    Utf8PathBuf::from_path_buf(coordination.directory().join(name)).map_err(|path| {
+    Utf8PathBuf::from_path_buf(authority.directory().join(name)).map_err(|path| {
         CoreError::PathEncoding(format!(
             "non-UTF-8 Cargo recovery authority path: {}",
             path.display()
@@ -802,7 +1127,7 @@ fn recovery_anchor_path(project: &Project) -> Result<Utf8PathBuf> {
     })
 }
 
-fn open_recovery_artifact(path: &Utf8Path) -> Result<Option<File>> {
+fn open_recovery_artifact(path: &Utf8Path) -> Result<Option<(File, same_file::Handle)>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(untrusted_record(path));
@@ -840,7 +1165,7 @@ fn open_recovery_artifact(path: &Utf8Path) -> Result<Option<File>> {
     {
         return Err(untrusted_record(path));
     }
-    Ok(Some(file))
+    Ok(Some((file, path_identity)))
 }
 
 fn publish_exclusive_json<T: serde::Serialize>(
@@ -1040,40 +1365,28 @@ fn cleanup_linked_publication_files(public_path: &Utf8Path) -> Result<()> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Utf8Path) -> Result<T> {
-    let contents = read_artifact(path)?;
-    serde_json::from_slice(&contents).map_err(|error| {
-        CoreError::LockUnreadable(format!(
-            "invalid Cargo.lock recovery record at {path}: {error}; left all files untouched"
-        ))
-    })
+    TrustedArtifact::open(path, MAX_RECOVERY_RECORD_BYTES, false)?.decode("recovery record")
 }
 
-fn read_recovery_anchor(path: &Utf8Path) -> Result<RecoveryAnchor> {
-    let file = open_recovery_artifact(path)?.ok_or_else(|| {
+fn read_bounded(file: &mut File, path: &Utf8Path, limit: u64) -> Result<Vec<u8>> {
+    if file.metadata()?.len() > limit {
+        return Err(CoreError::LockUnreadable(format!(
+            "Cargo.lock recovery artifact at {path} exceeds the {limit}-byte safety limit; left it untouched"
+        )));
+    }
+    let capacity = usize::try_from(file.metadata()?.len()).map_err(|error| {
         CoreError::LockUnreadable(format!(
-            "Cargo.lock recovery authority disappeared at {path}; left all files untouched"
+            "Cargo.lock recovery artifact size at {path} cannot be represented: {error}; left it untouched"
         ))
     })?;
-    cooldown_core::fs::validate_owner_private_file(&file, path.as_std_path()).map_err(|error| {
-        CoreError::LockUnreadable(format!(
-            "untrusted Cargo.lock recovery authority at {path}: {error}; left all files untouched"
-        ))
-    })?;
-    serde_json::from_reader(file).map_err(|error| {
-        CoreError::LockUnreadable(format!(
-            "invalid Cargo.lock recovery authority at {path}: {error}; left all files untouched"
-        ))
-    })
-}
-
-fn read_artifact(path: &Utf8Path) -> Result<Vec<u8>> {
-    let mut file = open_recovery_artifact(path)?.ok_or_else(|| {
-        CoreError::LockUnreadable(format!(
-            "Cargo.lock recovery artifact disappeared at {path}; left all files untouched"
-        ))
-    })?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)?;
+    let mut contents = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).map_or(true, |size| size > limit) {
+        return Err(CoreError::LockUnreadable(format!(
+            "Cargo.lock recovery artifact at {path} exceeds the {limit}-byte safety limit; left it untouched"
+        )));
+    }
     Ok(contents)
 }
 
@@ -1154,10 +1467,31 @@ mod tests {
     fn setup() -> (tempfile::TempDir, Project, Utf8PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8 temp path");
+        std::fs::create_dir_all(root.join(".git")).expect("create Git directory");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write Git HEAD");
         let project = project(&root);
         let lock_path = root.join("Cargo.lock");
         cooldown_core::fs::atomic_write(lock_path.as_std_path(), b"original").expect("write lock");
         (dir, project, lock_path)
+    }
+
+    fn recovery_authority(project: &Project) -> Result<RecoveryAuthority> {
+        let coordination = cooldown_core::fs::ProjectCoordination::resolve(&project.root)?;
+        coordination
+            .recovery_authority()
+            .cloned()
+            .ok_or_else(|| CoreError::System("test project has no recovery authority".to_string()))
+    }
+
+    fn test_publish(
+        project: &Project,
+        accepted: &AcceptedProjectState,
+    ) -> Result<AcceptedPublication> {
+        publish_accepted(project, accepted, &recovery_authority(project)?)
+    }
+
+    fn test_recover(project: &Project) -> Result<MutationRecovery> {
+        recover_pending(project, &recovery_authority(project)?)
     }
 
     fn accepted_project_state(
@@ -1192,7 +1526,7 @@ mod tests {
         record: &T,
     ) -> eyre::Result<()> {
         let contents = serde_json::to_vec(record)?;
-        let anchor_path = recovery_anchor_path(project)?;
+        let anchor_path = recovery_anchor_path(&recovery_authority(project)?)?;
         let anchor = RecoveryAnchor::new(project, &contents)?;
         publish_exclusive_json(&anchor_path, &anchor)
             .map_err(|error| eyre::eyre!("publish recovery anchor: {error:?}"))?;
@@ -1231,7 +1565,7 @@ mod tests {
         let (_directory, project, lock_path) = setup();
         let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
 
-        let publication = publish_accepted(&project, &accepted)?;
+        let publication = test_publish(&project, &accepted)?;
 
         std::assert_matches!(
             publication,
@@ -1248,7 +1582,7 @@ mod tests {
         let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
         std::fs::write(&lock_path, "external")?;
 
-        let error = publish_accepted(&project, &accepted)
+        let error = test_publish(&project, &accepted)
             .err()
             .ok_or_else(|| eyre::eyre!("drifted publication succeeded"))?;
 
@@ -1276,7 +1610,7 @@ mod tests {
         std::fs::write(&lock_path, "accepted lock")?;
 
         std::assert_matches!(
-            recover_pending(&project)?.disposition,
+            test_recover(&project)?.disposition,
             RecoveryDisposition::Restored
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
@@ -1305,7 +1639,7 @@ mod tests {
         std::fs::write(&marker, serde_json::to_vec(&record)?)?;
         std::fs::write(&lock_path, "forged lock")?;
 
-        let error = recover_pending(&project)
+        let error = test_recover(&project)
             .err()
             .ok_or_else(|| eyre::eyre!("unanchored recovery record was accepted"))?;
 
@@ -1320,6 +1654,79 @@ mod tests {
     }
 
     #[test]
+    fn matching_project_local_anchor_cannot_authorize_recovery() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("non-UTF-8 project path: {path:?}"))?;
+        let project = project(&root);
+        let lock_path = root.join("Cargo.lock");
+        std::fs::write(&lock_path, "original")?;
+        let accepted = accepted_project_state(&project, &[("Cargo.lock", "forged")])?;
+        let record = ProjectRecoveryRecord::new(&project, &accepted)?;
+        let record_contents = serde_json::to_vec(&record)?;
+        let marker = recovery_path(&lock_path);
+        std::fs::write(&marker, &record_contents)?;
+        let coordination = cooldown_core::fs::ProjectCoordination::resolve(&root)?;
+        let anchor_path = Utf8PathBuf::from_path_buf(coordination.directory().join(format!(
+            "{:016x}.cargo-recovery.anchor",
+            cooldown_core::fs::fnv1a_64(root.as_str())
+        )))
+        .map_err(|path| eyre::eyre!("non-UTF-8 anchor path: {path:?}"))?;
+        let anchor = RecoveryAnchor::new(&project, &record_contents)?;
+        std::fs::write(&anchor_path, serde_json::to_vec(&anchor)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&anchor_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        let error = require_recovery_authority(&project, &coordination)
+            .err()
+            .ok_or_else(|| eyre::eyre!("project-local authority was trusted"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        assert_eq!(std::fs::read_to_string(lock_path)?, "original");
+        assert!(marker.exists());
+        assert!(anchor_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_authority_rejects_an_oversized_marker_before_reading_it() -> eyre::Result<()> {
+        let (_directory, project, lock_path) = setup();
+        let marker = recovery_path(&lock_path);
+        let file = File::create(&marker)?;
+        file.set_len(MAX_RECOVERY_RECORD_BYTES + 1)?;
+
+        let error = test_recover(&project)
+            .err()
+            .ok_or_else(|| eyre::eyre!("oversized untrusted marker was accepted"))?;
+
+        std::assert_matches!(&error, CoreError::LockUnreadable(_));
+        assert!(!error.to_string().contains("safety limit"));
+        assert_eq!(
+            std::fs::metadata(marker)?.len(),
+            MAX_RECOVERY_RECORD_BYTES + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_recovery_reader_rejects_oversized_evidence() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("record"))
+            .map_err(|path| eyre::eyre!("non-UTF-8 record path: {path:?}"))?;
+        std::fs::write(&path, b"12345")?;
+
+        let error = TrustedArtifact::open(&path, 4, false)
+            .err()
+            .ok_or_else(|| eyre::eyre!("oversized recovery evidence was accepted"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        Ok(())
+    }
+
+    #[test]
     fn recovery_anchor_rejects_marker_content_drift() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
         let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
@@ -1330,14 +1737,152 @@ mod tests {
         changed_record.push(b' ');
         cooldown_core::fs::atomic_write(marker.as_std_path(), &changed_record)?;
 
-        let error = recover_pending(&project)
+        let error = test_recover(&project)
             .err()
             .ok_or_else(|| eyre::eyre!("marker drift was accepted by its recovery anchor"))?;
 
         std::assert_matches!(error, CoreError::LockUnreadable(_));
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         assert!(marker.exists());
-        assert!(recovery_anchor_path(&project)?.exists());
+        assert!(recovery_anchor_path(&recovery_authority(&project)?)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_retains_evidence_when_project_drifts_before_cleanup() -> eyre::Result<()> {
+        let (_directory, project, lock_path) = setup();
+        let manifest_path = project.root.join("Cargo.toml");
+        std::fs::write(&manifest_path, "original manifest")?;
+        let accepted = accepted_project_state(
+            &project,
+            &[
+                ("Cargo.lock", "accepted lock"),
+                ("Cargo.toml", "accepted manifest"),
+            ],
+        )?;
+        let marker = recovery_path(&lock_path);
+        let record = ProjectRecoveryRecord::new(&project, &accepted)?;
+        publish_trusted_record(&project, &marker, &record)?;
+        accepted.install(&project.root)?;
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let trusted = TrustedRecoveryRecord::open(&project, &marker, &authority)?;
+
+        let error = recover_project_publication_with(&project, &marker, &trusted, || {
+            std::fs::write(&manifest_path, "external manifest")?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| eyre::eyre!("recovery consumed evidence after project drift"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path)?,
+            "external manifest"
+        );
+        assert!(marker.exists());
+        assert!(anchor_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_revalidates_the_restored_preimage_before_cleanup() -> eyre::Result<()> {
+        let (_directory, project, lock_path) = setup();
+        let manifest_path = project.root.join("Cargo.toml");
+        std::fs::write(&manifest_path, "original manifest")?;
+        let accepted = accepted_project_state(
+            &project,
+            &[
+                ("Cargo.lock", "accepted lock"),
+                ("Cargo.toml", "accepted manifest"),
+            ],
+        )?;
+        let marker = recovery_path(&lock_path);
+        let record = ProjectRecoveryRecord::new(&project, &accepted)?;
+        publish_trusted_record(&project, &marker, &record)?;
+        std::fs::write(&lock_path, "accepted lock")?;
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let trusted = TrustedRecoveryRecord::open(&project, &marker, &authority)?;
+
+        let error = recover_project_publication_with(&project, &marker, &trusted, || {
+            std::fs::write(&manifest_path, "external manifest")?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| eyre::eyre!("recovery consumed evidence after restored-state drift"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path)?,
+            "external manifest"
+        );
+        assert!(marker.exists());
+        assert!(anchor_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_retains_authority_when_marker_identity_changes_before_cleanup() -> eyre::Result<()>
+    {
+        let (_directory, project, lock_path) = setup();
+        let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
+        let marker = recovery_path(&lock_path);
+        let record = ProjectRecoveryRecord::new(&project, &accepted)?;
+        publish_trusted_record(&project, &marker, &record)?;
+        accepted.install(&project.root)?;
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let trusted = TrustedRecoveryRecord::open(&project, &marker, &authority)?;
+        let replacement_contents = serde_json::to_vec(&record)?;
+
+        let error = recover_project_publication_with(&project, &marker, &trusted, || {
+            let replacement = marker.with_extension("replacement");
+            std::fs::write(&replacement, &replacement_contents)?;
+            std::fs::rename(replacement, &marker)?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| eyre::eyre!("recovery consumed replaced evidence"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        assert!(marker.exists());
+        assert!(anchor_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_retains_evidence_when_authority_identity_changes_before_cleanup() -> eyre::Result<()>
+    {
+        let (_directory, project, lock_path) = setup();
+        let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
+        let marker = recovery_path(&lock_path);
+        let record = ProjectRecoveryRecord::new(&project, &accepted)?;
+        publish_trusted_record(&project, &marker, &record)?;
+        accepted.install(&project.root)?;
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let trusted = TrustedRecoveryRecord::open(&project, &marker, &authority)?;
+        let replacement_contents = std::fs::read(&anchor_path)?;
+
+        let error = recover_project_publication_with(&project, &marker, &trusted, || {
+            let replacement = anchor_path.with_extension("replacement");
+            std::fs::write(&replacement, &replacement_contents)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(replacement, &anchor_path)?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| eyre::eyre!("recovery consumed replaced authority"))?;
+
+        std::assert_matches!(error, CoreError::LockUnreadable(_));
+        assert!(marker.exists());
+        assert!(anchor_path.exists());
         Ok(())
     }
 
@@ -1348,7 +1893,8 @@ mod tests {
         std::fs::write(project.root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
         let accepted = accepted_project_state(&project, &[("Cargo.lock", "accepted")])?;
 
-        let error = publish_accepted_with(&project, &accepted, |_accepted, _root| {
+        let authority = recovery_authority(&project)?;
+        let error = publish_accepted_with(&project, &accepted, &authority, |_accepted, _root| {
             Err(CoreError::Filesystem(
                 "injected publication failure".to_string(),
             ))
@@ -1357,9 +1903,41 @@ mod tests {
         .ok_or_else(|| eyre::eyre!("injected publication unexpectedly succeeded"))?;
 
         std::assert_matches!(error, CoreError::PendingRecovery(_));
-        let anchor = recovery_anchor_path(&project)?;
+        let anchor = recovery_anchor_path(&authority)?;
         assert!(anchor.starts_with(project.root.join(".git/cooldown/locks")));
         assert!(anchor.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn authority_discovery_finds_anchor_only_projects() -> eyre::Result<()> {
+        let (_directory, project, _lock_path) = setup();
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let anchor = RecoveryAnchor::new(&project, b"record")?;
+        publish_exclusive_json(&anchor_path, &anchor)
+            .map_err(|error| eyre::eyre!("publish anchor: {error:?}"))?;
+
+        assert_eq!(recovery_authority_projects(&project.root)?, [project.root]);
+        Ok(())
+    }
+
+    #[test]
+    fn authority_discovery_and_recovery_find_private_anchor_publications() -> eyre::Result<()> {
+        let (_directory, project, _lock_path) = setup();
+        let authority = recovery_authority(&project)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let anchor = RecoveryAnchor::new(&project, b"record")?;
+        let contents = serde_json::to_vec(&anchor)?;
+        let private = create_synced_private_file(&anchor_path, &contents)?;
+
+        let projects = recovery_authority_projects(&project.root)?;
+        assert_eq!(projects.as_slice(), std::slice::from_ref(&project.root));
+        std::assert_matches!(
+            test_recover(&project)?.disposition,
+            RecoveryDisposition::CleanupOnly
+        );
+        assert!(!private.exists());
         Ok(())
     }
 
@@ -1376,7 +1954,8 @@ mod tests {
             ],
         )?;
 
-        let error = publish_accepted_with(&project, &accepted, |_accepted, root| {
+        let authority = recovery_authority(&project)?;
+        let error = publish_accepted_with(&project, &accepted, &authority, |_accepted, root| {
             std::fs::write(root.join("Cargo.lock"), "accepted lock")?;
             Err(CoreError::Filesystem(
                 "injected publication failure".to_string(),
@@ -1388,7 +1967,7 @@ mod tests {
         std::assert_matches!(error, CoreError::PendingRecovery(_));
         assert!(recovery_path(&lock_path).exists());
         std::assert_matches!(
-            recover_pending(&project)?.disposition,
+            test_recover(&project)?.disposition,
             RecoveryDisposition::Restored
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
@@ -1409,6 +1988,7 @@ mod tests {
         let publication = publish_accepted_with_marker(
             &project,
             &accepted,
+            &recovery_authority(&project)?,
             AcceptedProjectState::install,
             |_path| {
                 Err(CoreError::Filesystem(
@@ -1427,7 +2007,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
         assert!(recovery_path(&lock_path).exists());
         std::assert_matches!(
-            recover_pending(&project)?.disposition,
+            test_recover(&project)?.disposition,
             RecoveryDisposition::Accepted
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
@@ -1444,7 +2024,7 @@ mod tests {
         accepted.install(&project.root)?;
 
         std::assert_matches!(
-            recover_pending(&project)?.disposition,
+            test_recover(&project)?.disposition,
             RecoveryDisposition::Accepted
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
@@ -1470,7 +2050,7 @@ mod tests {
         accepted.install(&project.root)?;
         std::fs::write(&manifest_path, "external manifest")?;
 
-        std::assert_matches!(recover_pending(&project), Err(CoreError::LockUnreadable(_)));
+        std::assert_matches!(test_recover(&project), Err(CoreError::LockUnreadable(_)));
         assert_eq!(std::fs::read_to_string(&lock_path)?, "accepted");
         assert_eq!(
             std::fs::read_to_string(&manifest_path)?,
@@ -1504,7 +2084,7 @@ mod tests {
         let (marker, state_path) = publish_legacy_recovery(&project, &lock_path, "candidate")?;
 
         std::assert_matches!(
-            recover_pending(&project)?.disposition,
+            test_recover(&project)?.disposition,
             RecoveryDisposition::Restored
         );
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
@@ -1521,7 +2101,7 @@ mod tests {
         publish_exclusive_json(&state_path, &state)
             .map_err(|error| eyre::eyre!("publish orphan state: {error:?}"))?;
 
-        let error = recover_pending(&project)
+        let error = test_recover(&project)
             .err()
             .ok_or_else(|| eyre::eyre!("orphan state was not reported"))?;
 
@@ -1669,7 +2249,7 @@ mod tests {
         let PublicationOutcome::CleanupPending { path, .. } = outcome else {
             return Err(eyre::eyre!("publication did not retain its private name"));
         };
-        let anchor_path = recovery_anchor_path(&project)?;
+        let anchor_path = recovery_anchor_path(&recovery_authority(&project)?)?;
         let anchor = RecoveryAnchor::new(&project, b"record")?;
         publish_exclusive_json(&anchor_path, &anchor)
             .map_err(|error| eyre::eyre!("publish anchor: {error:?}"))?;
@@ -1812,7 +2392,7 @@ mod tests {
         let marker = recovery_path(&lock_path);
         cooldown_core::fs::atomic_write(marker.as_std_path(), b"user data").expect("write marker");
 
-        let error = recover_pending(&project).expect_err("reject marker");
+        let error = test_recover(&project).expect_err("reject marker");
 
         std::assert_matches!(error, CoreError::LockUnreadable(_));
         assert_eq!(
@@ -1836,7 +2416,7 @@ mod tests {
         };
         cooldown_core::fs::atomic_write(state_path.as_std_path(), &serde_json::to_vec(&state)?)?;
 
-        let error = recover_pending(&project)
+        let error = test_recover(&project)
             .err()
             .ok_or_else(|| eyre::eyre!("malformed state was accepted"))?;
 
@@ -1875,7 +2455,7 @@ mod tests {
             ensure_no_pending(&project),
             Err(CoreError::LockUnreadable(_))
         );
-        std::assert_matches!(recover_pending(&project), Err(CoreError::LockUnreadable(_)));
+        std::assert_matches!(test_recover(&project), Err(CoreError::LockUnreadable(_)));
         assert_eq!(std::fs::read_to_string(lock_path)?, "original");
         assert!(std::fs::symlink_metadata(marker)?.file_type().is_symlink());
         Ok(())

@@ -94,10 +94,17 @@ side effect. Recovery validates every recorded manifest and lock state before ch
 It accepts an already complete publication or restores a mixed interrupted publication to its
 complete preimage, and leaves the project and recovery evidence untouched on unknown drift.
 The project-visible record is trusted only when its exact digest matches an owner-private authority
-in cooldown's target-derived coordination namespace.
+under the repository's Git common directory. Non-Git projects do not grant recovery authority from
+their project-local coordination files, so recoverable Cargo source mutations currently require a
+Git worktree.
 It discovers Cargo's public marker and orphaned private state/publication artifacts without loading
 policy, manifests, baselines, or registries, so malformed normal-run inputs cannot prevent
 recovery. Setup failures also use the schema-v4 recovery envelope under `--json`.
+
+Repository recovery also inspects trusted authority records and their interrupted private
+publication names. This finds transactions that stopped after authority became durable but before
+the project-visible marker was published, including projects hidden from the ordinary repository
+walk.
 
 A repository-root recovery scan includes hidden and gitignored projects but deliberately skips
 bulk dependency, build, and cache directories: `.cache`, `.venv`, `node_modules`, `target`, and
