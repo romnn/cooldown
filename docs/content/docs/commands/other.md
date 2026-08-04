@@ -79,16 +79,25 @@ The same behavior is available as a global `--sync` flag on any command, which s
 
 ## `recover`
 
-Settle package-manager state left by an interrupted cooldown mutation, then stop without
-resolving dependencies or applying another change:
+Settle Cargo project state left by an interrupted cooldown mutation, then stop without resolving
+dependencies or applying another change:
 
 ```bash
 cooldown recover
 ```
 
+Recovery currently supports Cargo only. Selecting another ecosystem with `--tool` is rejected
+instead of reporting an empty successful run.
+
 Read-only commands fail closed when they find a pending transaction; they never repair it as a
 side effect. Recovery validates every recorded manifest and lock state before changing anything.
 It accepts an already complete publication or restores a mixed interrupted publication to its
 complete preimage, and leaves the project and recovery evidence untouched on unknown drift.
-It discovers adapter-owned recovery artifacts directly, so malformed policy, manifest, baseline,
-or cache state cannot prevent the command from reporting and recovering an interrupted mutation.
+It discovers Cargo recovery artifacts without loading policy, manifests, baselines, or registries,
+so malformed normal-run inputs cannot prevent recovery.
+
+A repository-root recovery scan includes hidden and gitignored projects but deliberately skips
+bulk dependency, build, and cache directories: `.cache`, `.venv`, `node_modules`, `target`, and
+`vendor`. To recover an explicitly targeted Cargo project inside one of those directories, run
+`cooldown recover -C path/to/project --cargo`; the direct project check does not use the bounded
+repository scan.

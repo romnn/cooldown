@@ -311,9 +311,10 @@ pub(in crate::cli) enum Command {
     Init,
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
-    /// Recover interrupted package-manager state without performing any other mutation.
+    /// Recover interrupted Cargo project state without performing any other mutation.
     ///
-    /// Recovery uses only project location, tool selection, and reporting options.
+    /// Recovery currently supports Cargo only.
+    /// It uses only project location, tool selection, and reporting options.
     /// Normal policy, registry, sync, stale-lock, and dry-run options are rejected.
     Recover,
     /// Write the resolved policy down into native configs.

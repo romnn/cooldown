@@ -92,14 +92,21 @@ pub(in crate::cli) fn configure_recovery_help(mut command: clap::Command) -> cla
     command.build();
     command.mut_subcommand("recover", |subcommand| {
         subcommand.mut_args(|argument| {
+            let id = argument.get_id().as_str();
             let rejected = RECOVERY_OPTIONS.iter().any(|option| {
-                option.id == argument.get_id().as_str()
-                    && matches!(option.class, RecoveryOptionClass::Rejected { .. })
+                option.id == id && matches!(option.class, RecoveryOptionClass::Rejected { .. })
             });
             if rejected {
                 argument.hide(true)
             } else {
-                argument
+                match id {
+                    "tool" => argument.help(
+                        "Select Cargo recovery (`cargo` or `rust`); other tools are rejected",
+                    ),
+                    "cargo" => argument
+                        .help("Recover Cargo state explicitly (shorthand for `--tool cargo`)"),
+                    _ => argument,
+                }
             }
         })
     })
@@ -114,7 +121,7 @@ pub(in crate::cli) struct PreparedRecovery {
 /// Discovers recovery artifacts without loading normal run configuration or package state.
 pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRecovery, CoreError> {
     validate_recovery_options(global)?;
-    let tools = selected_tools(global)?;
+    let tools = selected_recovery_tools(global)?;
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
     let scan_root = scan_root_for(&workdir, &repo_root);
@@ -171,13 +178,13 @@ fn direct_cargo_recovery_roots(workdir: &Utf8Path, repo_root: &Utf8Path) -> Vec<
     roots
 }
 
-fn selected_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError> {
+fn selected_recovery_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError> {
     let names = if global.cargo {
         vec![CARGO_ID.as_str().to_string()]
     } else {
         global.tool.clone()
     };
-    names
+    let tools = names
         .iter()
         .map(|name| {
             tool_id(name).ok_or_else(|| {
@@ -187,7 +194,14 @@ fn selected_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError> {
                 ))
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(tool) = tools.iter().find(|tool| **tool != CARGO_ID) {
+        return Err(CoreError::Config(format!(
+            "`recover --tool {}` is unsupported; recovery currently supports Cargo only; use `--tool cargo` or `--cargo`",
+            tool.as_str()
+        )));
+    }
+    Ok(tools)
 }
 
 fn cargo_recovery_roots(
@@ -250,6 +264,23 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rejects_a_selected_unsupported_ecosystem() -> eyre::Result<()> {
+        let cli = Cli::parse_from(["cooldown", "recover", "--tool", "npm"]);
+
+        let error = prepare_recovery(&cli.global)
+            .err()
+            .ok_or_else(|| eyre::eyre!("recovery accepted an unsupported ecosystem"))?;
+
+        std::assert_matches!(
+            error,
+            CoreError::Config(message)
+                if message.contains("recover --tool npm")
+                    && message.contains("currently supports Cargo only")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_global_argument_has_an_explicit_recovery_classification() {
         let actual = Cli::command()
             .get_arguments()
@@ -280,6 +311,8 @@ mod tests {
                 "recovery help omitted {supported}"
             );
         }
+        assert!(help.contains("Select Cargo recovery"));
+        assert!(help.contains("other tools are rejected"));
         for rejected in [
             "--min-age",
             "--allow",

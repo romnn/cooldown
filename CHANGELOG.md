@@ -73,10 +73,11 @@
   complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
   record guards checked publication of the accepted manifests and lock. Publication includes
   parent-directory durability on Unix and best-effort directory persistence elsewhere.
-  Unknown or unreferenced recovery artifacts are reported and left untouched. The new `recover`
-  command discovers exact ignored or hidden targets without loading policy, manifests, baselines,
-  or registries, then completes or restores a validated interrupted publication without continuing
-  into another mutation. Project reads and
+  Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
+  `recover` command discovers ignored or hidden targets in a bounded repository scan without
+  loading policy, manifests, baselines, or registries; an explicit `-C <project>` also finds targets
+  inside pruned bulk directories. It then completes or restores a validated interrupted publication
+  without continuing into another mutation. Project reads and
   native-policy sync share target-derived project leases under the Git common directory (or a
   project-local non-Git state directory), while repository-scoped native state has its own
   tool-qualified lease independent of project discovery. User-visible source identities redact
