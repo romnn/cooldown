@@ -1002,8 +1002,6 @@ mod tests {
         Capabilities, DepScope, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
         PackageId, ProjectMarker, ReleaseQuality, Version,
     };
-    use std::assert_matches;
-
     const CARGO: ToolId = ToolId("cargo");
     const PNPM: ToolId = ToolId("pnpm");
     const UV: ToolId = ToolId("uv");
@@ -1125,7 +1123,7 @@ mod tests {
         let result =
             adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: PNPM }));
 
-        assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 0);
         assert!(adapters.writer(CARGO).is_none());
         assert!(adapters.writer(PNPM).is_none());
@@ -1134,14 +1132,14 @@ mod tests {
     #[test]
     fn adapter_registration_rejects_a_duplicate_tool_family_atomically() {
         let mut adapters = AdapterSet::new();
-        assert_matches!(
+        std::assert_matches!(
             adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: CARGO })),
             Ok(())
         );
 
         let result = adapters.register_read(Arc::new(TestAdapter { write_id: CARGO }));
 
-        assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 1);
         assert_eq!(adapters.reader(CARGO).map(ToolRead::id), Some(CARGO));
         assert!(adapters.writer(CARGO).is_some());

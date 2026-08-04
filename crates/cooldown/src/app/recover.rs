@@ -1,6 +1,5 @@
 //! `recover` — settle adapter-owned project state left by an interrupted mutation, then stop.
 
-use super::lock::ProjectWriteGuard;
 use super::progress::Progress;
 use super::{Exit, diag_from_error};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -71,10 +70,7 @@ pub struct RecoveryOutcome {
     pub exit: Exit,
 }
 
-type RecoverProject = fn(
-    &Utf8Path,
-    &cooldown_core::fs::ProjectCoordination,
-) -> cooldown_core::Result<MutationRecovery>;
+type RecoverProject = fn(&Utf8Path) -> cooldown_core::Result<MutationRecovery>;
 
 /// A project found from adapter-owned recovery artifacts without normal policy bootstrap.
 pub(crate) struct RecoveryTarget {
@@ -110,10 +106,7 @@ pub(crate) fn recover_targets(
     for target in targets {
         let _progress = progress.project(target.tool, &target.project);
         progress.phase("checking interrupted project state");
-        let result = match ProjectWriteGuard::acquire(&target.root) {
-            Ok(guard) => (target.recover)(&target.root, guard.coordination()),
-            Err(error) => Err(error),
-        };
+        let result = (target.recover)(&target.root);
         let (status, error, warnings) = match result {
             Ok(recovery) => {
                 let status = match recovery.disposition {

@@ -41,11 +41,11 @@ root before coordinating access. A symlink inside a writable project path, such 
 workspace member whose manifest may be rewritten, is rejected because the project lease cannot
 govern the resolved target safely.
 
-Cargo mutations that publish manifests or a lockfile currently require a Git worktree. Cooldown
-stores recovery authority beneath Git's common directory so ordinary project content cannot claim
-permission to restore source files. Read-only commands and isolated previews remain available for
-non-Git Cargo projects, but a source mutation fails closed until a trusted external recovery
-namespace is available.
+Cargo mutations that publish manifests or a lockfile currently require a Git worktree on Unix.
+Cooldown stores recovery authority beneath Git's common directory and verifies its Unix ownership
+and permissions so ordinary project content cannot claim permission to restore source files.
+Read-only commands and isolated previews remain available elsewhere, but a source mutation fails
+closed until cooldown can prove a trusted external recovery namespace on that platform.
 
 ## How each is driven
 

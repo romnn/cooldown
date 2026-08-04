@@ -37,7 +37,7 @@ pub(crate) struct LockEdgeView {
     /// are excluded; the policies never rewrite those (the observation diff still sees them via
     /// [`qualified`](Self::qualified)).
     pub(super) bindings: BTreeMap<(LockPackageId, String), String>,
-    /// EVERY qualified entry per `(block, dependency name)`, keyed by the dependent's full block
+    /// Every qualified entry per `(block, dependency name)`, keyed by the dependent's full block
     /// identity and holding the entry remainder verbatim (`"0.8.2"`, or `"0.8.2 (registry+…)"`
     /// when the entry needs a source suffix to disambiguate), each list sorted by bound version.
     /// The observation diff ([`binding_changes`](super::binding_changes)) reads this, so a rebind

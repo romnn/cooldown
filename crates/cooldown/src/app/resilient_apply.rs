@@ -287,7 +287,6 @@ mod tests {
         ProjectMutationJournal, Result, RewriteMode, ToolId, ToolTermination, ToolWrite,
         UpdateKind, VerifyReport, Version,
     };
-    use std::assert_matches;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -536,7 +535,7 @@ mod tests {
 
         let result = other.apply(&mutation).await;
 
-        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(other.apply_calls(), 0);
         Ok(())
     }
@@ -553,7 +552,7 @@ mod tests {
 
         let result = mutation.subset(vec![change("b")]);
 
-        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 
@@ -581,7 +580,7 @@ mod tests {
 
         let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
 
-        assert_matches!(
+        std::assert_matches!(
             result,
             Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
         );
@@ -612,7 +611,7 @@ mod tests {
 
         let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
 
-        assert_matches!(
+        std::assert_matches!(
             result,
             Err(ApplyFailure::RestoreConflict(CoreError::LockConflict(_)))
         );
@@ -849,7 +848,7 @@ mod tests {
         let plan = plan(&["a", "b"]);
         let result = apply_resilient(&writer, &project, &plan).await;
 
-        assert_matches!(&result, Err(err) if expected(err));
+        std::assert_matches!(&result, Err(err) if expected(err));
         assert_eq!(writer.apply_calls(), 1);
     }
 

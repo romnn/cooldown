@@ -49,8 +49,12 @@
   the source project receives the accepted manifests and lock through one adapter-owned recovery
   protocol after its complete input and output preimage is revalidated. Strategy preparation and
   mutation recovery now receive the captured `ProjectCoordination` identity. Git-backed
-  coordination exposes a `RecoveryAuthority` tied to the captured common-directory identity;
-  project-local non-Git coordination deliberately cannot authorize restoration.
+  coordination exposes a `RecoveryAuthority` on Unix tied to the captured common-directory
+  identity; project-local non-Git coordination and platforms without verified owner-private
+  authority deliberately cannot authorize restoration. Standalone
+  `recover_interrupted_mutation` now acquires its own `ProjectWriteLease` instead of accepting a
+  freely supplied coordination value, and `recovery_authority_projects` accepts an explicit
+  `RecoveryScope` so callers cannot conflate repository-wide and targeted recovery.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.
@@ -75,10 +79,11 @@
   fails `--strict`. Cargo resolver and correction trials run in an isolated project copy. Once the
   complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
   record guards checked publication of the accepted manifests and lock. Its exact digest is
-  anchored beneath Git's owner-private common-directory coordination namespace before source
-  publication, so project content alone cannot claim restoration authority. Cargo source mutations
-  outside a Git worktree fail closed until a trusted external authority is available. Publication
-  includes parent-directory durability on Unix and best-effort directory persistence elsewhere.
+  anchored beneath Git's owner-private common-directory coordination namespace on Unix before
+  source publication, so project content alone cannot claim restoration authority. Cargo source
+  mutations outside a Git worktree, or on platforms without verified owner-private authority, fail
+  closed until a trusted external authority is available. Publication includes parent-directory
+  durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
   `recover` command discovers public markers, orphaned private artifacts, and trusted authority
   records whose project marker was never published without loading policy, manifests, baselines,

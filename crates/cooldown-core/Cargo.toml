@@ -25,6 +25,7 @@ same-file.workspace = true
 sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+libc.workspace = true
 rustix.workspace = true
 
 [target.'cfg(windows)'.dependencies]

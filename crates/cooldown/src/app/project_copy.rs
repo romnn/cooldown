@@ -25,7 +25,8 @@ const SKIP_DIRS: &[&str] = &[
 /// Hold it for as long as the copied [`Project`] is in use.
 pub(crate) struct ProjectCopy {
     /// Kept so the temp directory lives as long as the copy; dropping it removes the tree.
-    _scratch: tempfile::TempDir,
+    #[expect(dead_code, reason = "the field keeps the copied project tree alive")]
+    scratch: tempfile::TempDir,
     /// The copied project, rooted inside the temp directory.
     pub(crate) project: Project,
 }
@@ -68,7 +69,7 @@ impl ProjectCopy {
             exclude_newer: project.exclude_newer.clone(),
         };
         Ok(ProjectCopy {
-            _scratch: scratch,
+            scratch,
             project: copied,
         })
     }

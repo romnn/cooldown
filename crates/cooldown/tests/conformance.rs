@@ -15,7 +15,6 @@ use cooldown::app::{
 };
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
-use std::assert_matches;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -138,7 +137,8 @@ impl FakeEco {
 }
 
 struct FakeMutationStage {
-    _scratch: tempfile::TempDir,
+    #[expect(dead_code, reason = "the field keeps the staged test project alive")]
+    scratch: tempfile::TempDir,
     source: Project,
     staged: Project,
     preimage: ProjectMutationJournal,
@@ -171,7 +171,7 @@ impl IsolatedMutationStrategy for FakeEco {
             exclude_newer: source.exclude_newer.clone(),
         };
         Ok(Box::new(FakeMutationStage {
-            _scratch: scratch,
+            scratch,
             source: source.clone(),
             staged,
             preimage,
@@ -567,7 +567,7 @@ fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLa
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -668,7 +668,7 @@ fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -2336,7 +2336,7 @@ async fn final_edge_audit_replaces_superseded_batch_history() {
         .iter()
         .filter_map(|item| item.edge.as_ref())
         .collect();
-    assert_matches!(edges.as_slice(),
+    std::assert_matches!(edges.as_slice(),
     [edge] if edge.action == EdgeBindingAction::Canonicalized);
 }
 
@@ -3635,7 +3635,7 @@ async fn explain_refuses_pending_mutation_state() -> eyre::Result<()> {
         .explain("a", &opts())
         .await;
 
-    assert_matches!(result, Err(CoreError::StaleLock(_)));
+    std::assert_matches!(result, Err(CoreError::StaleLock(_)));
     Ok(())
 }
 
@@ -3682,7 +3682,7 @@ async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -3873,7 +3873,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -3941,7 +3941,7 @@ async fn repo_sync_preserves_earlier_recovery_notice_when_later_access_fails() -
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -4103,7 +4103,7 @@ async fn sync_project_scope_writes_native_per_project() -> eyre::Result<()> {
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );
@@ -4286,7 +4286,7 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
         edge_policy: EdgePolicy::default(),
     };
     let mut adapters = AdapterSet::new();
-    assert_matches!(
+    std::assert_matches!(
         adapters.register_target_verified_mutator(Arc::new(fake)),
         Ok(())
     );

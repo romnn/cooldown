@@ -872,8 +872,6 @@ mod tests {
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
-    use std::assert_matches;
-
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
         use std::fmt::Write as _;
         let mut content = String::from("version = 4\n");
@@ -1334,7 +1332,7 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
+        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
     #[tokio::test]
@@ -1356,7 +1354,7 @@ mod tests {
         )?);
         let result = PreparedMutation::prepare(&tool, &other_project, &Plan::default()).await;
 
-        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 
@@ -1385,7 +1383,7 @@ mod tests {
             .normalize_lock_edges(&mutation, EdgePolicy::None, None, &[])
             .await;
 
-        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 
@@ -1418,7 +1416,7 @@ mod tests {
 
         let result = tool.apply(&mutation).await;
 
-        assert_matches!(result, Err(CoreError::LockConflict(_)));
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())
     }
 

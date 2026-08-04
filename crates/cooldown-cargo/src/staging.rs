@@ -14,7 +14,11 @@ use std::ffi::{OsStr, OsString};
 
 /// A Cargo trial paired with every source input and output that authorized it.
 struct CargoMutationStage {
-    _scratch: tempfile::TempDir,
+    #[expect(
+        dead_code,
+        reason = "the field keeps the staged project directory alive"
+    )]
+    scratch: tempfile::TempDir,
     source: Project,
     staged: Project,
     preimage: ProjectMutationJournal,
@@ -69,7 +73,7 @@ impl IsolatedMutation for CargoMutationStage {
     async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication> {
         let recovery_authority = self.recovery_authority.as_ref().ok_or_else(|| {
             CoreError::LockUnreadable(format!(
-                "recoverable Cargo publication is unavailable for non-Git project {}; move the project into a Git worktree before running a mutation",
+                "recoverable Cargo publication is unavailable for {}; recovery requires a Git worktree on a platform where cooldown can verify owner-private authority",
                 self.source.root
             ))
         })?;
@@ -153,7 +157,7 @@ impl CargoMutationStage {
         }
 
         Ok(CargoMutationStage {
-            _scratch: scratch,
+            scratch,
             source: source.clone(),
             staged,
             preimage,

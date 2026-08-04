@@ -473,6 +473,7 @@ dependencies = [
  "globset",
  "indoc",
  "jiff",
+ "libc",
  "rustix",
  "same-file",
  "serde",

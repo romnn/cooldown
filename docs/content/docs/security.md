@@ -30,10 +30,11 @@ For Cargo, `upgrade` and `fix` evaluate resolver changes in an isolated project.
 a new too-fresh, non-acknowledged dependency in the graph, the trial rejects that change before
 anything becomes visible in the source. The complete accepted manifest-and-lock state is published
 under one project-visible recovery record whose exact digest is anchored in cooldown's
-owner-private coordination namespace beneath Git's common directory. Recovery revalidates the
-complete expected project state and the exact marker and authority identities immediately before
-consuming that evidence. Cargo source mutations outside a Git worktree fail closed because
-project-local bytes are not trusted as restoration authority.
+owner-private coordination namespace beneath Git's common directory on Unix. Recovery revalidates
+the complete expected project state and the exact marker and authority identities immediately
+before consuming that evidence. Cargo source mutations outside a Git worktree, and on platforms
+where cooldown cannot prove the authority is private to the current user, fail closed because
+untrusted bytes cannot authorize restoration.
 
 Other ecosystems currently run resolver trials in place under the project lease. Cooldown records the files each trial may change, rolls a rejected trial back only when those files still match the observed resolver output, and stops if independent drift makes restoration unsafe. These ecosystems do not yet use Cargo's persistent whole-project recovery record.
 

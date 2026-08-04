@@ -17,12 +17,25 @@ pub struct ProjectCoordination {
     recovery_authority: Option<RecoveryAuthority>,
 }
 
-/// Trusted out-of-project authority for one project's recoverable mutations.
+/// Trusted Unix authority for one project's recoverable mutations outside project content.
 #[derive(Debug, Clone)]
 pub struct RecoveryAuthority {
     directory: PathBuf,
     directory_identity: std::sync::Arc<same_file::Handle>,
     project: Utf8PathBuf,
+}
+
+/// An exclusive OS-backed lease for one project's mutation state.
+#[derive(Debug)]
+pub struct ProjectWriteLease {
+    #[expect(dead_code, reason = "the field keeps the project write lease alive")]
+    project_lock: std::fs::File,
+    #[expect(
+        dead_code,
+        reason = "the field keeps stale-lock maintenance from removing the lease"
+    )]
+    maintenance_lock: std::fs::File,
+    coordination: ProjectCoordination,
 }
 
 impl ProjectCoordination {
@@ -37,17 +50,29 @@ impl ProjectCoordination {
     /// Returns a filesystem or path-encoding error when the target cannot be canonicalized or the
     /// coordination namespace is not an owner-private regular directory tree.
     pub fn resolve(target: &Utf8Path) -> Result<Self, CoreError> {
+        Self::resolve_with(target, true)
+    }
+
+    fn resolve_existing(target: &Utf8Path) -> Result<Self, CoreError> {
+        Self::resolve_with(target, false)
+    }
+
+    fn resolve_with(target: &Utf8Path, create: bool) -> Result<Self, CoreError> {
         let project = canonical_project_root(target)?;
         let marker = git_marker(project.as_std_path())?;
         let (base, components, trusted): (PathBuf, &[&str], bool) = match marker {
-            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"], true),
+            Some(marker) => (
+                git_common_directory(&marker)?,
+                &["cooldown", "locks"],
+                cfg!(unix),
+            ),
             None => (
                 project.as_std_path().to_owned(),
                 &[".cooldown", "locks"],
                 false,
             ),
         };
-        let directory = secure_create_coordination_directory(&base, components)?;
+        let directory = secure_coordination_directory(&base, components, create)?;
         let directory_identity = std::sync::Arc::new(same_file::Handle::from_path(&directory)?);
         let recovery_authority = trusted.then(|| RecoveryAuthority {
             directory: directory.clone(),
@@ -74,7 +99,8 @@ impl ProjectCoordination {
         &self.project
     }
 
-    /// Returns trusted recovery authority when coordination is outside project-controlled state.
+    /// Returns trusted recovery authority when its Unix ownership can be proven outside project
+    /// content.
     #[must_use]
     pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
         self.recovery_authority.as_ref()
@@ -87,7 +113,7 @@ impl ProjectCoordination {
     /// Returns [`CoreError::LockConflict`] when the project or coordination namespace changed
     /// after this capability was captured.
     pub fn validate_current(&self) -> Result<(), CoreError> {
-        let current = Self::resolve(&self.project).map_err(|error| {
+        let current = Self::resolve_existing(&self.project).map_err(|error| {
             CoreError::LockConflict(format!(
                 "could not revalidate project coordination for {}: {error}",
                 self.project
@@ -126,7 +152,7 @@ impl RecoveryAuthority {
     /// Returns [`CoreError::LockConflict`] when the project no longer resolves to the same Git
     /// coordination directory.
     pub fn validate_current(&self) -> Result<(), CoreError> {
-        let current = ProjectCoordination::resolve(&self.project).map_err(|error| {
+        let current = ProjectCoordination::resolve_existing(&self.project).map_err(|error| {
             CoreError::LockConflict(format!(
                 "could not revalidate recovery authority for {}: {error}",
                 self.project
@@ -147,6 +173,51 @@ impl RecoveryAuthority {
             )));
         }
         Ok(())
+    }
+}
+
+impl ProjectWriteLease {
+    /// Acquires exclusive access to a project's mutation state.
+    ///
+    /// The lease uses the same target-derived lock as cooldown's application layer and fails
+    /// immediately while another reader or writer owns that project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds project access.
+    /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
+    pub fn acquire(target: &Utf8Path) -> Result<Self, CoreError> {
+        let coordination = ProjectCoordination::resolve(target)?;
+        let maintenance_path = coordination.directory().join(".maintenance.lock");
+        let maintenance = open_coordination_lock(&maintenance_path)?;
+        maintenance.lock_shared()?;
+        let path = coordination.directory().join(format!(
+            "{:016x}.lock",
+            fnv1a_64(coordination.project().as_str())
+        ));
+        let file = open_coordination_lock(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(CoreError::LockConflict(format!(
+                    "{} is locked by another cooldown run",
+                    path.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        coordination.validate_current()?;
+        Ok(ProjectWriteLease {
+            project_lock: file,
+            maintenance_lock: maintenance,
+            coordination,
+        })
+    }
+
+    /// Returns the coordination identity captured by this lease.
+    #[must_use]
+    pub fn coordination(&self) -> &ProjectCoordination {
+        &self.coordination
     }
 }
 
@@ -253,9 +324,10 @@ fn resolve_relative(base: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn secure_create_coordination_directory(
+fn secure_coordination_directory(
     base: &Path,
     components: &[&str],
+    create: bool,
 ) -> Result<PathBuf, CoreError> {
     let mut current = base.to_owned();
     let base_metadata = std::fs::symlink_metadata(&current)?;
@@ -275,7 +347,7 @@ fn secure_create_coordination_directory(
                     current.display()
                 )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
                 match create_coordination_directory(&current) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -302,6 +374,71 @@ fn secure_create_coordination_directory(
         )));
     }
     Ok(current)
+}
+
+fn open_coordination_lock(path: &Path) -> Result<std::fs::File, CoreError> {
+    let parent = path.parent().ok_or_else(|| {
+        CoreError::Filesystem(format!(
+            "coordination lock has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir() {
+        return Err(CoreError::Filesystem(format!(
+            "coordination lock parent is not a regular directory: {}",
+            parent.display()
+        )));
+    }
+    let parent_identity = same_file::Handle::from_path(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CoreError::Filesystem(format!(
+                "coordination lock is not a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || !std::fs::symlink_metadata(path)?.file_type().is_file()
+        || same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_path(path)?
+        || parent_identity != same_file::Handle::from_path(parent)?
+    {
+        return Err(CoreError::Filesystem(format!(
+            "coordination lock changed identity while opening: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(CoreError::Filesystem(format!(
+                "coordination lock has multiple hard links: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -678,6 +815,22 @@ mod tests {
             coordination.validate_current(),
             Err(CoreError::LockConflict(_))
         );
+        assert!(!root.join(".git/cooldown").exists());
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn platforms_without_owner_validation_do_not_grant_recovery_authority() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+
+        let coordination = ProjectCoordination::resolve(root)?;
+
+        assert!(coordination.recovery_authority().is_none());
         Ok(())
     }
 

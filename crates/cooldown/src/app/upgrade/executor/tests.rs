@@ -12,7 +12,7 @@ use cooldown_core::{
     PackageId, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId,
     UpdateKind, Version,
 };
-use std::{assert_matches, collections::HashSet};
+use std::collections::HashSet;
 
 #[test]
 fn upgrade_scopes_candidates_to_direct_requires() {
@@ -101,7 +101,7 @@ fn trial_rollback_refuses_to_overwrite_external_drift() -> eyre::Result<()> {
         .restore()
         .err()
         .ok_or_else(|| eyre::eyre!("independent drift unexpectedly allowed trial rollback"))?;
-    assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
+    std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
     assert_eq!(std::fs::read(path)?, b"external edit");
     Ok(())
 }
