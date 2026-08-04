@@ -40,6 +40,7 @@ use std::collections::BTreeSet;
 /// # Errors
 ///
 /// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+#[cfg(test)]
 pub fn find_marker_dirs(
     root: &Utf8Path,
     marker: &str,
@@ -115,6 +116,7 @@ struct MarkerScan<'a> {
     topmost_only: bool,
 }
 
+#[cfg(test)]
 fn scan_marker_dirs(
     root: &Utf8Path,
     primary_marker: &str,
@@ -222,15 +224,15 @@ fn scan_marker_groups(
     Ok(found)
 }
 
-/// Finds exact recovery artifacts without applying normal project-discovery ignore policy.
+/// Finds reserved recovery artifact names without applying normal project-discovery ignore policy.
 ///
 /// Hidden and gitignored projects remain visible because recovery must follow durable ownership
 /// evidence rather than the current discovery configuration.
 /// Known metadata, dependency, build, and cache trees are pruned to keep a repository-root safety
 /// scan bounded.
-pub fn find_recovery_marker_dirs(
+pub(crate) fn find_recovery_artifact_dirs(
     root: &Utf8Path,
-    marker: &str,
+    is_artifact: impl Fn(&str) -> bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
     let mut builder = WalkBuilder::new(root);
     builder
@@ -269,11 +271,13 @@ pub fn find_recovery_marker_dirs(
                 )));
             }
         };
-        if entry.file_type().is_some_and(|kind| kind.is_dir())
-            && let Some(dir) = Utf8Path::from_path(entry.path())
-            && std::fs::symlink_metadata(dir.join(marker)).is_ok()
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if is_artifact(name)
+            && let Some(parent) = entry.path().parent().and_then(Utf8Path::from_path)
         {
-            dirs.push(dir.to_owned());
+            dirs.push(parent.to_owned());
         }
     }
     dirs.sort();
@@ -691,9 +695,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::write(root.join(".gitignore"), "ignored/\n")?;
         for marker in [
-            "ignored/project/recovery",
+            "ignored/project/.recovery.123.0.publish",
             ".hidden/project/recovery",
-            "target/fixture/recovery",
+            "target/fixture/.recovery.123.0.publish",
         ] {
             let marker = root.join(marker);
             std::fs::create_dir_all(
@@ -704,7 +708,9 @@ mod tests {
             std::fs::write(marker, "")?;
         }
 
-        let found = find_recovery_marker_dirs(root, "recovery")?;
+        let found = find_recovery_artifact_dirs(root, |name| {
+            matches!(name, "recovery" | ".recovery.123.0.publish")
+        })?;
         assert_eq!(
             found,
             vec![root.join(".hidden/project"), root.join("ignored/project")]

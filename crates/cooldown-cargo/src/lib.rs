@@ -22,6 +22,15 @@ pub const CARGO_ID: ToolId = ToolId("cargo");
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
+/// Whether a file name uses Cargo mutation recovery's reserved artifact shape.
+///
+/// This recognizes the public transaction marker, private transaction state, and private
+/// publication names that may remain after an interrupted publication.
+#[must_use]
+pub fn is_recovery_artifact_name(name: &str) -> bool {
+    publication::is_recovery_artifact_name(name)
+}
+
 /// Settles an interrupted Cargo mutation transaction rooted at `project_root`.
 ///
 /// This recovery-only entry point performs no manifest parsing, registry setup, or Cargo command.

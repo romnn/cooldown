@@ -589,17 +589,7 @@ fn unique_state_path(lock_path: &Utf8Path) -> Utf8PathBuf {
 }
 
 fn validated_state_path(lock_path: &Utf8Path, state_file: &str) -> Result<Utf8PathBuf> {
-    let state_component = Utf8Path::new(state_file);
-    let lock_file = lock_path
-        .file_name()
-        .ok_or_else(|| CoreError::PathEncoding(format!("path has no file name: {lock_path}")))?;
-    let prefix = format!("{lock_file}.cooldown-recovery-");
-    let valid_name = state_component
-        .parent()
-        .is_some_and(|parent| parent.as_str().is_empty())
-        && state_file.starts_with(&prefix)
-        && state_component.extension() == Some("state");
-    if !valid_name {
+    if !is_recovery_state_name(state_file) {
         return Err(CoreError::LockUnreadable(format!(
             "untrusted Cargo.lock recovery state path `{state_file}`; left all files untouched"
         )));
@@ -797,11 +787,7 @@ fn ensure_no_orphan_artifacts(lock_path: &Utf8Path) -> Result<()> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let orphan_state = validated_state_path(lock_path, &name).is_ok();
-        let orphan_publication = publication_target(&name).is_some_and(|target| {
-            target == RECOVERY_MARKER || validated_state_path(lock_path, target).is_ok()
-        });
-        if orphan_state || orphan_publication {
+        if is_recovery_artifact_name(&name) {
             return Err(CoreError::LockUnreadable(format!(
                 "unreferenced Cargo.lock recovery artifact at {}; left it untouched; inspect and remove it explicitly",
                 parent.join(name)
@@ -809,6 +795,22 @@ fn ensure_no_orphan_artifacts(lock_path: &Utf8Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_recovery_artifact_name(name: &str) -> bool {
+    name == RECOVERY_MARKER
+        || is_recovery_state_name(name)
+        || publication_target(name)
+            .is_some_and(|target| target == RECOVERY_MARKER || is_recovery_state_name(target))
+}
+
+fn is_recovery_state_name(name: &str) -> bool {
+    let component = Utf8Path::new(name);
+    component
+        .parent()
+        .is_some_and(|parent| parent.as_str().is_empty())
+        && name.starts_with("Cargo.lock.cooldown-recovery-")
+        && component.extension() == Some("state")
 }
 
 fn publication_target(name: &str) -> Option<&str> {
@@ -1434,6 +1436,25 @@ mod tests {
         assert!(unrelated.exists());
         assert_eq!(std::fs::read_to_string(&lock_path)?, "original");
         Ok(())
+    }
+
+    #[test]
+    fn recovery_artifact_names_cover_public_private_and_staged_state() {
+        for name in [
+            RECOVERY_MARKER,
+            "Cargo.lock.cooldown-recovery-123-456.state",
+            ".Cargo.lock.cooldown-recovery.123.0.publish",
+            ".Cargo.lock.cooldown-recovery-123-456.state.123.0.publish",
+        ] {
+            assert!(is_recovery_artifact_name(name), "missed {name}");
+        }
+        for name in [
+            "Cargo.lock",
+            ".myapp.123.0.publish",
+            ".Cargo.lock.cooldown-recovery.bad.0.publish",
+        ] {
+            assert!(!is_recovery_artifact_name(name), "accepted {name}");
+        }
     }
 
     #[test]

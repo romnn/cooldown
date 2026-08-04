@@ -57,7 +57,15 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     }
 
     if matches!(cli.command, Command::Recover) {
-        return commands::run_recover(setup::prepare_recovery(global)?);
+        let prepared = match setup::prepare_recovery(global) {
+            Ok(prepared) => prepared,
+            Err(error) if global.json => {
+                let exit = exit_for_error(&error);
+                return commands::run_recover_error(&error, exit);
+            }
+            Err(error) => return Err(error),
+        };
+        return commands::run_recover(prepared);
     }
 
     // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The

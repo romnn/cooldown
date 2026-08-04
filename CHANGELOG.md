@@ -74,10 +74,11 @@
   record guards checked publication of the accepted manifests and lock. Publication includes
   parent-directory durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
-  `recover` command discovers ignored or hidden targets in a bounded repository scan without
-  loading policy, manifests, baselines, or registries; an explicit `-C <project>` also finds targets
-  inside pruned bulk directories. It then completes or restores a validated interrupted publication
-  without continuing into another mutation. Project reads and
+  `recover` command discovers public markers and orphaned private artifacts in ignored or hidden
+  targets through a bounded repository scan without loading policy, manifests, baselines, or
+  registries; an explicit `-C <project>` also finds targets inside pruned bulk directories. Recovery
+  setup failures honor `--json` with the schema-v4 envelope. The command then completes or restores
+  a validated interrupted publication without continuing into another mutation. Project reads and
   native-policy sync share target-derived project leases under the Git common directory (or a
   project-local non-Git state directory), while repository-scoped native state has its own
   tool-qualified lease independent of project discovery. User-visible source identities redact

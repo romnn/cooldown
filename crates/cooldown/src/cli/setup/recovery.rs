@@ -3,8 +3,10 @@ use crate::app::{Progress, RecoveryTarget};
 use crate::cli::GlobalArgs;
 use crate::{discovery, scan};
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_cargo::{CARGO_ID, RECOVERY_MARKER, recover_interrupted_mutation};
-use cooldown_core::{CoreError, ToolId, recognized_tool_names, tool_id};
+use cooldown_cargo::{CARGO_ID, is_recovery_artifact_name, recover_interrupted_mutation};
+use cooldown_core::{
+    CoreError, ProjectDetection, ProjectMarker, ToolId, recognized_tool_names, tool_id,
+};
 
 struct RecoveryOption {
     id: &'static str,
@@ -127,7 +129,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let scan_root = scan_root_for(&workdir, &repo_root);
     let mut targets = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
-        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root);
+        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root)?;
         roots.extend(cargo_recovery_roots(&scan_root, !global.no_gitignore)?);
         roots.sort();
         roots.dedup();
@@ -165,17 +167,34 @@ fn validate_recovery_options(global: &GlobalArgs) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn direct_cargo_recovery_roots(workdir: &Utf8Path, repo_root: &Utf8Path) -> Vec<Utf8PathBuf> {
+fn direct_cargo_recovery_roots(
+    workdir: &Utf8Path,
+    repo_root: &Utf8Path,
+) -> Result<Vec<Utf8PathBuf>, CoreError> {
     let mut roots = Vec::new();
     for ancestor in workdir.ancestors() {
-        if std::fs::symlink_metadata(ancestor.join(RECOVERY_MARKER)).is_ok() {
+        if contains_cargo_recovery_artifact(ancestor)? {
             roots.push(ancestor.to_owned());
         }
         if ancestor == repo_root {
             break;
         }
     }
-    roots
+    Ok(roots)
+}
+
+fn contains_cargo_recovery_artifact(root: &Utf8Path) -> Result<bool, CoreError> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_recovery_artifact_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn selected_recovery_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError> {
@@ -208,20 +227,30 @@ fn cargo_recovery_roots(
     root: &Utf8Path,
     respect_gitignore: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
-    let mut authoritative = scan::find_recovery_marker_dirs(root, RECOVERY_MARKER)?;
-    authoritative.extend(scan::find_marker_dirs(
+    let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name)?;
+    let detected = scan::find_project_marker_dirs_batch(
         root,
-        "Cargo.lock",
+        &[ProjectDetection::PrimaryWithValidation {
+            primary: ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        }],
         respect_gitignore,
         &[],
-        true,
-    )?);
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| CoreError::System("Cargo recovery scan produced no result".to_string()))?;
+    authoritative.extend(detected.primary);
     authoritative.sort();
     authoritative.dedup();
 
-    let manifests = scan::find_marker_dirs(root, "Cargo.toml", respect_gitignore, &[], false)?;
     let mut roots = authoritative.clone();
-    roots.extend(manifests.into_iter().filter(|manifest| {
+    roots.extend(detected.validation_only.into_iter().filter(|manifest| {
         !authoritative
             .iter()
             .any(|known| manifest.starts_with(known) || known.starts_with(manifest))
@@ -250,6 +279,7 @@ mod tests {
     use crate::cli::Cli;
     use clap::Parser;
     use color_eyre::eyre;
+    use cooldown_cargo::RECOVERY_MARKER;
 
     #[test]
     fn recovery_rejects_normal_run_options_it_does_not_use() -> eyre::Result<()> {
@@ -352,7 +382,7 @@ mod tests {
         symlink("missing-record", root.join(RECOVERY_MARKER))?;
 
         assert_eq!(
-            direct_cargo_recovery_roots(root, root),
+            direct_cargo_recovery_roots(root, root)?,
             vec![root.to_owned()]
         );
         assert_eq!(cargo_recovery_roots(root, false)?, vec![root.to_owned()]);
@@ -430,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_recovery_finds_hidden_and_ignored_descendants() -> eyre::Result<()> {
+    fn repository_recovery_finds_hidden_and_ignored_orphan_artifacts() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
@@ -440,8 +470,14 @@ mod tests {
         std::fs::create_dir_all(&hidden)?;
         std::fs::create_dir_all(&ignored)?;
         std::fs::write(root.join(".gitignore"), "ignored/\n")?;
-        std::fs::write(hidden.join(RECOVERY_MARKER), "{}")?;
-        std::fs::write(ignored.join(RECOVERY_MARKER), "{}")?;
+        std::fs::write(
+            hidden.join("Cargo.lock.cooldown-recovery-123-456.state"),
+            "{}",
+        )?;
+        std::fs::write(
+            ignored.join(".Cargo.lock.cooldown-recovery.123.0.publish"),
+            "{}",
+        )?;
         let cli = Cli::parse_from(["cooldown", "recover", "-C", root.as_str(), "--cargo"]);
 
         let prepared = prepare_recovery(&cli.global)?;
@@ -451,6 +487,27 @@ mod tests {
             .map(|target| target.root)
             .collect::<Vec<_>>();
         assert_eq!(roots, vec![hidden, ignored]);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_pruned_project_finds_an_orphan_publication() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("target/fixture");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join(".Cargo.lock.cooldown-recovery.123.0.publish"),
+            "{}",
+        )?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", project.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        assert_eq!(prepared.targets.len(), 1);
+        assert_eq!(prepared.targets[0].root, project);
         Ok(())
     }
 }

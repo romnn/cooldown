@@ -93,8 +93,9 @@ Read-only commands fail closed when they find a pending transaction; they never 
 side effect. Recovery validates every recorded manifest and lock state before changing anything.
 It accepts an already complete publication or restores a mixed interrupted publication to its
 complete preimage, and leaves the project and recovery evidence untouched on unknown drift.
-It discovers Cargo recovery artifacts without loading policy, manifests, baselines, or registries,
-so malformed normal-run inputs cannot prevent recovery.
+It discovers Cargo's public marker and orphaned private state/publication artifacts without loading
+policy, manifests, baselines, or registries, so malformed normal-run inputs cannot prevent
+recovery. Setup failures also use the schema-v4 recovery envelope under `--json`.
 
 A repository-root recovery scan includes hidden and gitignored projects but deliberately skips
 bulk dependency, build, and cache directories: `.cache`, `.venv`, `node_modules`, `target`, and

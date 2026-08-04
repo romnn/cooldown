@@ -43,6 +43,10 @@ pub(crate) fn run_recover(
     recover::run(prepared)
 }
 
+pub(crate) fn run_recover_error(error: &CoreError, exit: Exit) -> Result<Exit, CoreError> {
+    recover::run_preparation_error(error, exit)
+}
+
 pub(crate) fn no_tool_json(command: &'static str) -> Result<String, CoreError> {
     present::no_tool_json(command)
 }
