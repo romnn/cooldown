@@ -73,10 +73,9 @@ pub(super) fn collapse_applied_legs(
                 continue;
             }
             let downgrade = head.downgrade
-                || prior_violations.contains(&ViolationKey {
-                    package: head.name.clone(),
-                    version: head.from.clone(),
-                });
+                || prior_violations
+                    .iter()
+                    .any(|violation| violation.matches_report_row(tool, head));
             let kind = classify_update_kind(&head.from, &net_to).unwrap_or(head.kind);
             retarget.push((first, net_to, downgrade, kind));
             remove.extend(chain.iter().skip(1).copied());

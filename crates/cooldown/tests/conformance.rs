@@ -286,7 +286,12 @@ impl ToolRead for FakeEco {
     async fn native_policy(&self, _p: &Project) -> Result<Option<NativePolicyLayer>> {
         Ok(None)
     }
-    async fn verify_lock_current(&self, _p: &Project) -> Result<LockVerifyReport> {
+    async fn verify_lock_current(&self, p: &Project) -> Result<LockVerifyReport> {
+        if p.root.join("fail-final-lock-verification").exists() {
+            return Err(CoreError::Transient(
+                "injected final lock verification failure".into(),
+            ));
+        }
         let stale = self.stale_lock
             || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
         Ok(LockVerifyReport {
@@ -1916,7 +1921,7 @@ async fn upgrade_honors_allow_stale_lock_after_apply() {
         stale_lock_after_apply: true,
         build_fails_after_apply: false,
         state: Mutex::new(State::default()),
-        root,
+        root: root.clone(),
     };
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
@@ -3529,7 +3534,7 @@ async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
 }
 
 #[tokio::test]
-async fn upgrade_reports_final_lock_and_build_failures() {
+async fn upgrade_stops_before_build_when_the_final_lock_is_stale() {
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
@@ -3562,9 +3567,9 @@ async fn upgrade_reports_final_lock_and_build_failures() {
         fail_graph_after_apply: false,
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: true,
-        build_fails_after_apply: true,
+        build_fails_after_apply: false,
         state: Mutex::new(State::default()),
-        root,
+        root: root.clone(),
     };
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
@@ -3573,17 +3578,37 @@ async fn upgrade_reports_final_lock_and_build_failures() {
 
     assert_eq!(out.exit, Exit::Environment);
     assert_eq!(out.summary.applied, 1);
-    assert_eq!(out.summary.errors, 2);
+    assert_eq!(out.summary.errors, 1);
     assert!(
         out.errors
             .iter()
             .any(|d| d.kind == DiagnosticKind::StaleLock)
     );
-    assert!(
-        out.errors
-            .iter()
-            .any(|d| d.kind == DiagnosticKind::ToolFailed)
+    assert!(!root.join("build-invoked").exists());
+}
+
+#[tokio::test]
+async fn upgrade_stops_before_build_when_final_lock_verification_errors() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("fail-final-lock-verification"), "")?;
+    let adapter = fake(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
     );
+    let mut options = opts();
+    options.build = true;
+
+    let outcome = workspace(adapter, Baseline::default())
+        .upgrade(&options)
+        .await;
+
+    assert_eq!(outcome.exit, Exit::Environment);
+    assert_eq!(outcome.summary.errors, 1);
+    assert!(!root.join("build-invoked").exists());
+    Ok(())
 }
 
 #[tokio::test]

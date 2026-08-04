@@ -769,8 +769,8 @@ impl EdgeRebind {
 /// A resolved package version already rejected by the active policy before an apply trial begins.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BaselineViolation {
-    /// The package name in its tool's native spelling.
-    pub package: String,
+    /// The complete package identity, including its registry or source.
+    pub package: PackageId,
     /// The exact version present in the starting graph.
     pub version: Version,
 }

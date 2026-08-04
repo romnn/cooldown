@@ -1091,10 +1091,10 @@ fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>
     for violation in plan
         .baseline_violations
         .iter()
-        .filter(|violation| !targeted.contains(violation.package.as_str()))
+        .filter(|violation| !targeted.contains(violation.package.name.as_str()))
     {
         exact_versions
-            .entry(violation.package.clone())
+            .entry(violation.package.name.clone())
             .or_default()
             .insert(violation.version.to_string());
     }
@@ -1440,15 +1440,15 @@ mod tests {
             changes: vec![change("eslint", "10.7.0", "10.6.0")],
             baseline_violations: vec![
                 cooldown_core::BaselineViolation {
-                    package: "eslint".to_string(),
+                    package: PackageId::new(ToolId(NPM), "eslint", None),
                     version: Version::new("10.7.0"),
                 },
                 cooldown_core::BaselineViolation {
-                    package: "flatted".to_string(),
+                    package: PackageId::new(ToolId(NPM), "flatted", None),
                     version: Version::new("3.4.3"),
                 },
                 cooldown_core::BaselineViolation {
-                    package: "flatted".to_string(),
+                    package: PackageId::new(ToolId(NPM), "flatted", None),
                     version: Version::new("3.4.2"),
                 },
             ],

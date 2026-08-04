@@ -62,7 +62,7 @@ struct FixPlan {
 
 /// The report and state delta produced by one native resolver batch.
 #[derive(Default)]
-struct BatchOutcome {
+struct BatchReport {
     items: Vec<UpgradeItem>,
     edge_items: Vec<UpgradeItem>,
     /// Per-batch edge evidence retained only until the final adapter audit.
@@ -71,21 +71,27 @@ struct BatchOutcome {
     errors: Vec<Diagnostic>,
     strict_incomplete: bool,
     lock_refreshed: bool,
-    mutation: BatchMutation,
 }
 
 /// The physical project state left by one resolver batch.
-#[derive(Default)]
-enum BatchMutation {
+enum BatchOutcome {
     /// No mutation was attempted or retained.
-    #[default]
-    Unchanged,
+    Unchanged(BatchReport),
     /// The journal was restored to its pre-batch state.
-    Restored,
+    Restored(BatchReport),
     /// The post-apply graph was verified and retained.
-    Committed(CommittedBatch),
+    Committed {
+        report: BatchReport,
+        state: CommittedBatch,
+    },
     /// Independent drift prevented restoration, so no later mutation may run.
-    RestoreConflict,
+    RestoreConflict(BatchReport),
+}
+
+impl Default for BatchOutcome {
+    fn default() -> Self {
+        BatchOutcome::Unchanged(BatchReport::default())
+    }
 }
 
 struct MutationTerminated;
@@ -98,12 +104,23 @@ pub(super) enum ProjectRunStatus {
     Terminated,
 }
 
-/// One policy-violating resolved pin — the package and the exact too-fresh version the graph holds.
-/// The key the trial state machine tracks baseline and residual violations by.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// One policy-violating resolved pin with its complete package identity.
+///
+/// The trial state machine tracks baseline and residual violations by this key so a violation from
+/// one registry cannot acknowledge or replace a source-distinct package.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ViolationKey {
-    package: String,
+    package: PackageId,
     version: String,
+}
+
+impl ViolationKey {
+    fn matches_report_row(&self, tool: &str, item: &UpgradeItem) -> bool {
+        self.package.tool.as_str() == tool
+            && self.package.name == item.name
+            && self.package.registry == item.registry
+            && self.version == item.from
+    }
 }
 
 /// What a kept batch changes about the trial state.
@@ -174,15 +191,86 @@ impl BatchOutcome {
     }
 
     fn has_restore_conflict(&self) -> bool {
-        matches!(&self.mutation, BatchMutation::RestoreConflict)
+        matches!(self, BatchOutcome::RestoreConflict(_))
+    }
+
+    fn is_committed(&self) -> bool {
+        matches!(self, BatchOutcome::Committed { .. })
+    }
+
+    fn committed_state(&self) -> Option<&CommittedBatch> {
+        match self {
+            BatchOutcome::Committed { state, .. } => Some(state),
+            BatchOutcome::Unchanged(_)
+            | BatchOutcome::Restored(_)
+            | BatchOutcome::RestoreConflict(_) => None,
+        }
+    }
+
+    fn mark_restored(&mut self) {
+        let report = self.take_report();
+        *self = BatchOutcome::Restored(report);
+    }
+
+    fn mark_committed(&mut self, state: CommittedBatch) {
+        let report = self.take_report();
+        *self = BatchOutcome::Committed { report, state };
+    }
+
+    fn mark_restore_conflict(&mut self) {
+        let report = self.take_report();
+        *self = BatchOutcome::RestoreConflict(report);
+    }
+
+    fn take_report(&mut self) -> BatchReport {
+        match std::mem::take(self) {
+            BatchOutcome::Unchanged(report)
+            | BatchOutcome::Restored(report)
+            | BatchOutcome::RestoreConflict(report)
+            | BatchOutcome::Committed { report, .. } => report,
+        }
     }
 
     fn merge_into(self, acc: &mut UpgradeAccum) {
-        acc.items.extend(self.items);
-        acc.edge_items.extend(self.edge_items);
-        acc.warnings.extend(self.warnings);
-        acc.errors.extend(self.errors);
-        acc.strict_incomplete |= self.strict_incomplete;
+        let report = self.into_report();
+        acc.items.extend(report.items);
+        acc.edge_items.extend(report.edge_items);
+        acc.warnings.extend(report.warnings);
+        acc.errors.extend(report.errors);
+        acc.strict_incomplete |= report.strict_incomplete;
+    }
+
+    fn into_report(self) -> BatchReport {
+        match self {
+            BatchOutcome::Unchanged(report)
+            | BatchOutcome::Restored(report)
+            | BatchOutcome::RestoreConflict(report)
+            | BatchOutcome::Committed { report, .. } => report,
+        }
+    }
+}
+
+impl std::ops::Deref for BatchOutcome {
+    type Target = BatchReport;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            BatchOutcome::Unchanged(report)
+            | BatchOutcome::Restored(report)
+            | BatchOutcome::RestoreConflict(report)
+            | BatchOutcome::Committed { report, .. } => report,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BatchOutcome {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            BatchOutcome::Unchanged(report)
+            | BatchOutcome::Restored(report)
+            | BatchOutcome::RestoreConflict(report)
+            | BatchOutcome::Committed { report, .. } => report,
+        }
     }
 }
 
@@ -776,7 +864,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let upgraded_cleanly =
             lock_outcome.applied_count() > 0 && lock_outcome.errored_count() == 0;
         Self::advance_trial_state(&lock_outcome, state);
-        let lock_committed = matches!(&lock_outcome.mutation, BatchMutation::Committed(_));
+        let lock_committed = lock_outcome.is_committed();
         pending.push(lock_outcome);
         if pending.iter().any(|outcome| outcome.errored_count() > 0) {
             return UpgradeTrialResult::Aborted(trial_errors(pending));
@@ -828,7 +916,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.lock_refreshed_by_apply |= outcome.lock_refreshed;
         // Only kept batches reach the merge as committed, so this records exactly "the current lock
         // was produced by a committed apply" — which enforced the edge policy on its way out.
-        self.lock_edges_enforced |= matches!(&outcome.mutation, BatchMutation::Committed(_));
+        self.lock_edges_enforced |= outcome.is_committed();
         self.committed_edge_rebinds
             .extend(outcome.edge_rebinds.iter().cloned());
         outcome.merge_into(self.acc);
@@ -855,7 +943,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// outcome, immediately after [`apply_batch`](Self::apply_batch) returns; a rolled-back run
     /// resets the state explicitly instead of un-applying outcomes.
     fn advance_trial_state(outcome: &BatchOutcome, state: &mut TrialState) {
-        if let BatchMutation::Committed(committed) = &outcome.mutation {
+        if let Some(committed) = outcome.committed_state() {
             state
                 .baseline_violations
                 .clone_from(&committed.violations_after);
@@ -870,7 +958,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // Name one stuck transitive as the offender (sorted for a stable report).
         let offender = residual
             .iter()
-            .map(|violation| violation.package.clone())
+            .map(|violation| violation.package.name.clone())
             .min();
         for change in changes {
             self.record_change_skip(
@@ -915,7 +1003,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
             Err(error) => {
                 outcome.errors.push(self.project_diag(&error, None));
-                outcome.mutation = BatchMutation::RestoreConflict;
+                outcome.mark_restore_conflict();
                 false
             }
         }
@@ -1352,11 +1440,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
                 .await;
             if !errors.is_empty() {
-                outcomes.push(BatchOutcome {
-                    errors,
-                    strict_incomplete: true,
-                    ..BatchOutcome::default()
-                });
+                let mut outcome = BatchOutcome::default();
+                outcome.errors = errors;
+                outcome.strict_incomplete = true;
+                outcomes.push(outcome);
                 return outcomes;
             }
             if changes.is_empty() {
@@ -1460,7 +1547,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcome;
             }
             Err(super::super::resilient_apply::ApplyFailure::RestoreConflict(error)) => {
-                outcome.mutation = BatchMutation::RestoreConflict;
+                outcome.mark_restore_conflict();
                 self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
@@ -1513,7 +1600,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             && let Err(error) = rollback.accept(expected)
         {
             outcome.errors.push(self.project_diag(&error, None));
-            outcome.mutation = BatchMutation::RestoreConflict;
+            outcome.mark_restore_conflict();
         }
         outcome
     }
@@ -1620,7 +1707,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             planned_applied: _,
         } = report;
         outcome.lock_refreshed = self.ctx.writer.successful_apply_proves_lock_current();
-        outcome.mutation = BatchMutation::Committed(committed);
+        outcome.mark_committed(committed);
         outcome.warnings.extend(warnings.into_iter().map(|warning| {
             warning
                 .with_tool(self.ctx.tool_name())
@@ -1730,7 +1817,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             TransitiveGate::Hide => keep(false),
             TransitiveGate::Allow => {
                 for violation in &new_violations {
-                    let package = violation.package.as_str();
+                    let package = violation.package.name.as_str();
                     let version = violation.version.as_str();
                     self.add_fix_warning_to_outcome(
                         outcome,
@@ -1771,10 +1858,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                                 reason: SkipReason::TransitiveInCooldown,
                                 message: conflict_skip_message(
                                     SkipReason::TransitiveInCooldown,
-                                    Some(&forced.package),
+                                    Some(&forced.package.name),
                                     &change.package.name,
                                 ),
-                                offending: Some(forced.package.clone()),
+                                offending: Some(forced.package.name.clone()),
                             }),
                         ));
                     }
@@ -1812,10 +1899,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         outcome: &mut BatchOutcome,
     ) {
         match journal.restore_if_unchanged(expected) {
-            Ok(()) => outcome.mutation = BatchMutation::Restored,
+            Ok(()) => outcome.mark_restored(),
             Err(error) => {
                 outcome.errors.push(self.project_diag(&error, None));
-                outcome.mutation = BatchMutation::RestoreConflict;
+                outcome.mark_restore_conflict();
             }
         }
     }
@@ -1867,6 +1954,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         }
 
+        if terminal {
+            return ControlFlow::Break(MutationTerminated);
+        }
+
         if self.ctx.opts.build && !self.ctx.defer_build {
             self.acc.build_requested = true;
             self.ctx.opts.progress.phase("building updated project");
@@ -1887,11 +1978,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
             }
         }
-        if terminal {
-            ControlFlow::Break(MutationTerminated)
-        } else {
-            ControlFlow::Continue(())
-        }
+        ControlFlow::Continue(())
     }
 
     fn record_lock_status(&mut self, status: LockStatus) {
@@ -1949,17 +2036,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     self.ws.now(),
                 );
                 if !acknowledged {
-                    let reconcilable = dep
-                        .graph_floor
-                        .as_ref()
-                        .is_some_and(|floor| *floor != dep.current);
-                    violations.insert(
-                        ViolationKey {
-                            package: dep.package.name.clone(),
-                            version: dep.current.to_string(),
-                        },
-                        reconcilable,
-                    );
+                    insert_graph_violation(&mut violations, &dep);
                 }
             }
         }
@@ -2107,16 +2184,15 @@ fn push_upgrade_halves(work: &mut Vec<Vec<Change>>, mut changes: Vec<Change>) {
 fn trial_errors(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
     let mut errors = BatchOutcome::default();
     for outcome in outcomes {
-        if outcome.has_restore_conflict() {
-            errors.mutation = BatchMutation::RestoreConflict;
+        let restore_conflict = outcome.has_restore_conflict();
+        let report = outcome.into_report();
+        if restore_conflict {
+            errors.mark_restore_conflict();
         }
-        errors.errors.extend(outcome.errors);
-        errors.items.extend(
-            outcome
-                .items
-                .into_iter()
-                .filter(|item| item.error.is_some()),
-        );
+        errors.errors.extend(report.errors);
+        errors
+            .items
+            .extend(report.items.into_iter().filter(|item| item.error.is_some()));
     }
     errors.strict_incomplete = errors.errored_count() > 0;
     errors
@@ -2241,32 +2317,59 @@ fn newly_introduced_violations(
     before: &HashSet<ViolationKey>,
     after: &HashSet<ViolationKey>,
 ) -> Vec<ViolationKey> {
-    let before_counts = violation_counts_by_name(before);
-    let after_counts = violation_counts_by_name(after);
+    let before_counts = violation_counts_by_package(before);
+    let after_counts = violation_counts_by_package(after);
     let mut residual: Vec<ViolationKey> = after
         .difference(before)
         .filter(|violation| {
-            after_counts
-                .get(violation.package.as_str())
-                .copied()
-                .unwrap_or(0)
-                > before_counts
-                    .get(violation.package.as_str())
-                    .copied()
-                    .unwrap_or(0)
+            let package = (
+                violation.package.name.as_str(),
+                violation.package.registry.as_deref(),
+            );
+            after_counts.get(&package).copied().unwrap_or(0)
+                > before_counts.get(&package).copied().unwrap_or(0)
         })
         .cloned()
         .collect();
-    residual.sort();
+    residual.sort_by(|left, right| {
+        left.package
+            .tool
+            .as_str()
+            .cmp(right.package.tool.as_str())
+            .then_with(|| left.package.name.cmp(&right.package.name))
+            .then_with(|| left.package.registry.cmp(&right.package.registry))
+            .then_with(|| left.version.cmp(&right.version))
+    });
     residual
 }
 
-fn violation_counts_by_name(violations: &HashSet<ViolationKey>) -> HashMap<&str, usize> {
+fn violation_counts_by_package(
+    violations: &HashSet<ViolationKey>,
+) -> HashMap<(&str, Option<&str>), usize> {
     let mut counts = HashMap::new();
     for violation in violations {
-        *counts.entry(violation.package.as_str()).or_default() += 1;
+        *counts
+            .entry((
+                violation.package.name.as_str(),
+                violation.package.registry.as_deref(),
+            ))
+            .or_default() += 1;
     }
     counts
+}
+
+fn insert_graph_violation(violations: &mut HashMap<ViolationKey, bool>, dep: &Dependency) {
+    let reconcilable = dep
+        .graph_floor
+        .as_ref()
+        .is_some_and(|floor| *floor != dep.current);
+    violations.insert(
+        ViolationKey {
+            package: dep.package.clone(),
+            version: dep.current.to_string(),
+        },
+        reconcilable,
+    );
 }
 
 #[cfg(test)]

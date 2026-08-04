@@ -1,9 +1,9 @@
-use super::planning::target_package;
+use super::planning::{plan_baseline_violations, target_package};
 use super::{
     PlanMode, TrialRollback, ViolationKey, candidate_scope, collapse_applied_legs, collateral_rows,
-    combine_lock_status, conflict_skip_message, is_downgrade, newly_introduced_violations,
-    planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
-    verify_applied_targets,
+    combine_lock_status, conflict_skip_message, insert_graph_violation, is_downgrade,
+    newly_introduced_violations, planned_changes_landed, preserve_rollback_entries,
+    sort_planned_changes, verify_applied_targets,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
@@ -444,11 +444,19 @@ fn no_prior() -> HashSet<ViolationKey> {
 fn violations(items: &[(&str, &str)]) -> HashSet<ViolationKey> {
     items
         .iter()
-        .map(|(name, version)| ViolationKey {
-            package: (*name).to_string(),
-            version: (*version).to_string(),
-        })
+        .map(|(name, version)| violation(name, version, Some("crates.io")))
         .collect()
+}
+
+fn violation(name: &str, version: &str, registry: Option<&str>) -> ViolationKey {
+    violation_for(ToolId("cargo"), name, version, registry)
+}
+
+fn violation_for(tool: ToolId, name: &str, version: &str, registry: Option<&str>) -> ViolationKey {
+    ViolationKey {
+        package: PackageId::new(tool, name, registry.map(ToString::to_string)),
+        version: version.to_string(),
+    }
 }
 
 fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
@@ -473,10 +481,7 @@ fn residual_gate_flags_an_added_version_line_for_a_dirty_package() {
 
     assert_eq!(
         newly_introduced_violations(&before, &after),
-        vec![ViolationKey {
-            package: "t".to_string(),
-            version: "1.0.0".to_string(),
-        }]
+        vec![violation("t", "1.0.0", Some("crates.io"))]
     );
 }
 
@@ -487,11 +492,79 @@ fn residual_gate_flags_a_new_dirty_package() {
 
     assert_eq!(
         newly_introduced_violations(&before, &after),
-        vec![ViolationKey {
-            package: "other".to_string(),
-            version: "2.0.0".to_string(),
-        }]
+        vec![violation("other", "2.0.0", Some("crates.io"))]
     );
+}
+
+#[test]
+fn residual_gate_distinguishes_same_version_from_two_sources() {
+    let from_registry_a = violation("foo", "1.0.0", Some("registry-a"));
+    let from_registry_b = violation("foo", "1.0.0", Some("registry-b"));
+    let before = HashSet::from([from_registry_a.clone()]);
+    let after = HashSet::from([from_registry_a, from_registry_b.clone()]);
+
+    assert_eq!(
+        newly_introduced_violations(&before, &after),
+        vec![from_registry_b]
+    );
+}
+
+#[test]
+fn graph_violation_state_remains_distinct_for_source_twins() {
+    let mut registry_a = dep("foo", "1.0.0");
+    registry_a.package.registry = Some("registry-a".to_string());
+    registry_a.graph_floor = Some(Version::new("0.9.0"));
+    let mut registry_b = dep("foo", "1.0.0");
+    registry_b.package.registry = Some("registry-b".to_string());
+    registry_b.graph_floor = Some(Version::new("1.0.0"));
+    let mut violations = std::collections::HashMap::new();
+
+    insert_graph_violation(&mut violations, &registry_a);
+    insert_graph_violation(&mut violations, &registry_b);
+
+    assert_eq!(violations.len(), 2);
+    assert_eq!(
+        violations.get(&violation_for(
+            ToolId("mock"),
+            "foo",
+            "1.0.0",
+            Some("registry-a")
+        )),
+        Some(&true)
+    );
+    assert_eq!(
+        violations.get(&violation_for(
+            ToolId("mock"),
+            "foo",
+            "1.0.0",
+            Some("registry-b")
+        )),
+        Some(&false)
+    );
+}
+
+#[test]
+fn residual_gate_flags_replacement_by_a_source_distinct_package() {
+    let before = HashSet::from([violation("foo", "1.0.0", Some("registry-a"))]);
+    let replacement = violation("foo", "1.0.0", Some("registry-b"));
+    let after = HashSet::from([replacement.clone()]);
+
+    assert_eq!(
+        newly_introduced_violations(&before, &after),
+        vec![replacement]
+    );
+}
+
+#[test]
+fn planned_baseline_violations_preserve_source_identity() {
+    let registry_a = violation("foo", "1.0.0", Some("registry-a"));
+    let registry_b = violation("foo", "1.0.0", Some("registry-b"));
+
+    let planned = plan_baseline_violations(&HashSet::from([registry_b, registry_a]));
+
+    assert_eq!(planned.len(), 2);
+    assert_eq!(planned[0].package.registry.as_deref(), Some("registry-a"));
+    assert_eq!(planned[1].package.registry.as_deref(), Some("registry-b"));
 }
 
 #[test]
@@ -586,7 +659,7 @@ fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
         applied_item("quote", "1.0.7", "1.0.4", true),
     ];
     let prior: HashSet<ViolationKey> = HashSet::from([ViolationKey {
-        package: "quote".to_string(),
+        package: PackageId::new(ToolId("cargo"), "quote", Some("crates.io".to_string())),
         version: "1.0.5".to_string(),
     }]);
     collapse_applied_legs(&mut items, ".", "cargo", &prior, no_kind);

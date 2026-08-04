@@ -69,7 +69,11 @@ pub(super) fn plan_baseline_violations(
         .collect::<Vec<_>>();
     baseline.sort_by(|a, b| {
         a.package
-            .cmp(&b.package)
+            .tool
+            .as_str()
+            .cmp(b.package.tool.as_str())
+            .then_with(|| a.package.name.cmp(&b.package.name))
+            .then_with(|| a.package.registry.cmp(&b.package.registry))
             .then_with(|| a.version.as_str().cmp(b.version.as_str()))
     });
     baseline
