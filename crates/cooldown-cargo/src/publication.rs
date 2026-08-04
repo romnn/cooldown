@@ -491,8 +491,10 @@ mod tests {
         publish_exclusive_json(&anchor_path, &anchor)
             .map_err(|error| eyre::eyre!("publish anchor: {error:?}"))?;
 
-        let scope = crate::RecoveryScope::Explicit(project.root.clone());
-        assert_eq!(recovery_authority_projects(&scope)?, [project.root]);
+        let scope = crate::RecoveryScope::explicit(&project.root)?;
+        let discovery = recovery_authority_projects(&scope)?;
+        assert_eq!(discovery.projects, [project.root]);
+        assert!(discovery.warnings.is_empty());
         Ok(())
     }
 
@@ -505,9 +507,13 @@ mod tests {
         let contents = serde_json::to_vec(&anchor)?;
         let private = create_synced_private_file(&anchor_path, &contents)?;
 
-        let scope = crate::RecoveryScope::Explicit(project.root.clone());
-        let projects = recovery_authority_projects(&scope)?;
-        assert_eq!(projects.as_slice(), std::slice::from_ref(&project.root));
+        let scope = crate::RecoveryScope::explicit(&project.root)?;
+        let discovery = recovery_authority_projects(&scope)?;
+        assert_eq!(
+            discovery.projects.as_slice(),
+            std::slice::from_ref(&project.root)
+        );
+        assert!(discovery.warnings.is_empty());
         std::assert_matches!(
             test_recover(&project)?.disposition,
             RecoveryDisposition::CleanupOnly
@@ -518,8 +524,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn explicit_authority_discovery_ignores_a_malformed_other_linked_worktree() -> eyre::Result<()>
-    {
+    fn explicit_authority_discovery_warns_about_a_malformed_other_linked_worktree()
+    -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
@@ -554,8 +560,11 @@ mod tests {
         std::fs::write(&second_anchor_path, "not valid recovery authority")?;
         std::fs::set_permissions(&second_anchor_path, std::fs::Permissions::from_mode(0o600))?;
 
-        let scope = crate::RecoveryScope::Explicit(first.root.clone());
-        assert_eq!(recovery_authority_projects(&scope)?, [first.root]);
+        let scope = crate::RecoveryScope::explicit(&first.root)?;
+        let discovery = recovery_authority_projects(&scope)?;
+        assert_eq!(discovery.projects, [first.root]);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.warnings[0].path, second_anchor_path);
         Ok(())
     }
 
@@ -569,6 +578,26 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("recovery ignored the held project lease"))?;
 
         std::assert_matches!(error, CoreError::LockConflict(_));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_recovery_canonicalizes_relative_components_and_symlink_spelling() -> eyre::Result<()>
+    {
+        use std::os::unix::fs::symlink;
+
+        let (directory, project, _lock_path) = setup();
+        let relative_spelling = project.root.join(".");
+        let symlink_spelling = project.root.join("linked-project");
+        symlink(&project.root, &symlink_spelling)?;
+
+        let relative = crate::recover_interrupted_mutation(&relative_spelling)?;
+        let linked = crate::recover_interrupted_mutation(&symlink_spelling)?;
+
+        std::assert_matches!(relative.disposition, RecoveryDisposition::Unchanged);
+        std::assert_matches!(linked.disposition, RecoveryDisposition::Unchanged);
+        drop(directory);
         Ok(())
     }
 

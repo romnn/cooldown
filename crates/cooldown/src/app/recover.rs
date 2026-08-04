@@ -66,6 +66,8 @@ pub struct RecoveryOutcome {
     pub summary: RecoverySummary,
     /// Per-project recovery results.
     pub items: Vec<RecoveryItem>,
+    /// Discovery warnings that could not be attributed to one project.
+    pub warnings: Vec<Diagnostic>,
     /// The process exit: non-zero if any project failed recovery.
     pub exit: Exit,
 }
@@ -99,6 +101,7 @@ impl RecoveryTarget {
 /// Recovers pre-discovered targets without loading policy, manifests, baselines, or registries.
 pub(crate) fn recover_targets(
     targets: Vec<RecoveryTarget>,
+    warnings: Vec<Diagnostic>,
     progress: &Progress,
 ) -> RecoveryOutcome {
     let mut summary = RecoverySummary::default();
@@ -159,6 +162,7 @@ pub(crate) fn recover_targets(
     RecoveryOutcome {
         summary,
         items,
+        warnings,
         exit: if summary.errors == 0 {
             Exit::Ok
         } else {

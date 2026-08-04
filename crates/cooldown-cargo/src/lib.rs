@@ -22,31 +22,80 @@ pub const CARGO_ID: ToolId = ToolId("cargo");
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
-/// The project roots an explicit or repository-wide Cargo recovery may settle.
+/// A canonical project scope for explicit or repository-wide Cargo recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoveryScope {
-    /// Every Cargo project beneath the repository root.
-    Repository(camino::Utf8PathBuf),
-    /// The selected project subtree and relevant ancestor projects.
-    Explicit(camino::Utf8PathBuf),
+pub struct RecoveryScope {
+    root: camino::Utf8PathBuf,
+    kind: RecoveryScopeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryScopeKind {
+    Repository,
+    Explicit,
+}
+
+/// Trusted authority projects and non-fatal artifacts that could not be attributed to a project.
+#[derive(Debug)]
+pub struct RecoveryAuthorityDiscovery {
+    /// Canonical project roots whose authority belongs to the requested scope.
+    pub projects: Vec<camino::Utf8PathBuf>,
+    /// Malformed authority artifacts in the shared coordination namespace.
+    pub warnings: Vec<RecoveryDiscoveryWarning>,
+}
+
+/// A recovery authority artifact that could not be decoded enough to determine its project.
+#[derive(Debug)]
+pub struct RecoveryDiscoveryWarning {
+    /// The untrusted artifact path.
+    pub path: camino::Utf8PathBuf,
+    /// The validation failure that prevented attribution.
+    pub error: cooldown_core::CoreError,
 }
 
 impl RecoveryScope {
+    /// Canonicalizes a repository root whose descendant Cargo projects may be recovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem or path-encoding error when `root` cannot be canonicalized.
+    pub fn repository(root: &camino::Utf8Path) -> cooldown_core::Result<Self> {
+        Self::canonical(root, RecoveryScopeKind::Repository)
+    }
+
+    /// Canonicalizes an explicit project subtree and its relevant ancestor projects.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem or path-encoding error when `root` cannot be canonicalized.
+    pub fn explicit(root: &camino::Utf8Path) -> cooldown_core::Result<Self> {
+        Self::canonical(root, RecoveryScopeKind::Explicit)
+    }
+
+    fn canonical(root: &camino::Utf8Path, kind: RecoveryScopeKind) -> cooldown_core::Result<Self> {
+        let canonical = std::fs::canonicalize(root)?;
+        let root = camino::Utf8PathBuf::from_path_buf(canonical).map_err(|path| {
+            cooldown_core::CoreError::PathEncoding(format!(
+                "non-UTF-8 recovery scope: {}",
+                path.display()
+            ))
+        })?;
+        Ok(RecoveryScope { root, kind })
+    }
+
     /// Returns the root used for artifact and project discovery.
     #[must_use]
     pub fn root(&self) -> &camino::Utf8Path {
-        match self {
-            RecoveryScope::Repository(root) | RecoveryScope::Explicit(root) => root,
-        }
+        &self.root
     }
 
     /// Returns whether `project` belongs to this recovery request.
     #[must_use]
     pub fn includes(&self, project: &camino::Utf8Path) -> bool {
-        match self {
-            RecoveryScope::Repository(root) => project.starts_with(root),
-            RecoveryScope::Explicit(target) => {
-                project.starts_with(target) || target.starts_with(project)
+        match self.kind {
+            RecoveryScopeKind::Repository => project.starts_with(&self.root),
+            RecoveryScopeKind::Explicit => {
+                project.starts_with(&self.root) || self.root.starts_with(project)
             }
         }
     }
@@ -54,14 +103,14 @@ impl RecoveryScope {
     /// Returns whether malformed authority without a project identity must fail discovery.
     #[must_use]
     pub(crate) const fn requires_complete_authority_scan(&self) -> bool {
-        matches!(self, RecoveryScope::Repository(_))
+        matches!(self.kind, RecoveryScopeKind::Repository)
     }
 
     pub(crate) fn includes_unknown_authority(&self, authority_name: &str) -> bool {
-        let RecoveryScope::Explicit(target) = self else {
+        if !matches!(self.kind, RecoveryScopeKind::Explicit) {
             return true;
-        };
-        target.ancestors().any(|ancestor| {
+        }
+        self.root.ancestors().any(|ancestor| {
             authority_name
                 == format!(
                     "{:016x}.cargo-recovery.anchor",
@@ -71,7 +120,7 @@ impl RecoveryScope {
     }
 }
 
-/// Finds trusted authority projects included by `scope` in its Git repository.
+/// Discovers trusted authority projects and unattributable artifacts in `scope`'s Git repository.
 ///
 /// # Errors
 ///
@@ -79,7 +128,7 @@ impl RecoveryScope {
 /// project, or cannot be inspected safely.
 pub fn recovery_authority_projects(
     scope: &RecoveryScope,
-) -> cooldown_core::Result<Vec<camino::Utf8PathBuf>> {
+) -> cooldown_core::Result<RecoveryAuthorityDiscovery> {
     publication::recovery_authority_projects(scope)
 }
 
@@ -107,8 +156,9 @@ pub fn recover_interrupted_mutation(
     project_root: &camino::Utf8Path,
 ) -> cooldown_core::Result<cooldown_core::MutationRecovery> {
     let lease = cooldown_core::fs::ProjectWriteLease::acquire(project_root)?;
+    let project_root = lease.coordination().project().to_owned();
     let project = cooldown_core::Project {
-        root: project_root.to_owned(),
+        root: project_root.clone(),
         manifest: project_root.join("Cargo.toml"),
         kind: CARGO_ID,
         exclude_newer: None,
@@ -123,18 +173,24 @@ pub use tool::CargoTool;
 #[cfg(test)]
 mod tests {
     use super::RecoveryScope;
-    use camino::Utf8PathBuf;
+    use color_eyre::eyre;
 
     #[test]
-    fn recovery_scope_distinguishes_repository_and_explicit_roots() {
-        let repository = RecoveryScope::Repository(Utf8PathBuf::from("/repo"));
-        assert!(repository.includes(camino::Utf8Path::new("/repo/project")));
-        assert!(repository.includes(camino::Utf8Path::new("/repo/sibling")));
-        assert!(!repository.includes(camino::Utf8Path::new("/sibling")));
+    fn recovery_scope_canonicalizes_repository_and_explicit_roots() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        std::fs::create_dir_all(root.join("project/member"))?;
+        std::fs::create_dir_all(root.join("sibling"))?;
 
-        let explicit = RecoveryScope::Explicit(Utf8PathBuf::from("/repo/project"));
-        assert!(explicit.includes(camino::Utf8Path::new("/repo")));
-        assert!(explicit.includes(camino::Utf8Path::new("/repo/project/member")));
-        assert!(!explicit.includes(camino::Utf8Path::new("/repo/sibling")));
+        let repository = RecoveryScope::repository(&root.join("project/.."))?;
+        assert!(repository.includes(&root.join("project")));
+        assert!(repository.includes(&root.join("sibling")));
+
+        let explicit = RecoveryScope::explicit(&root.join("project/member/.."))?;
+        assert!(explicit.includes(root));
+        assert!(explicit.includes(&root.join("project/member")));
+        assert!(!explicit.includes(&root.join("sibling")));
+        Ok(())
     }
 }

@@ -43,6 +43,8 @@
   `capture_state`, `restore_if_unchanged`, and `restore` now use that bound identity instead of
   accepting a project root at each call. Callers can therefore distinguish rollback conflicts from
   visible corrections whose directory durability is uncertain.
+  `BaselineViolation` now carries a complete `PackageId`, so source-distinct packages cannot share
+  transitive-policy authority.
 - **Breaking library API:** `ToolWrite::mutation_execution` can provide an
   `IsolatedMutationStrategy` that stages and publishes its own faithful resolver trial. Cargo uses
   this boundary so resolver and edge-normalization trials touch only a disposable project copy;
@@ -54,7 +56,12 @@
   authority deliberately cannot authorize restoration. Standalone
   `recover_interrupted_mutation` now acquires its own `ProjectWriteLease` instead of accepting a
   freely supplied coordination value, and `recovery_authority_projects` accepts an explicit
-  `RecoveryScope` so callers cannot conflate repository-wide and targeted recovery.
+  `RecoveryScope` so callers cannot conflate repository-wide and targeted recovery. Recovery scopes
+  are now created through the fallible `RecoveryScope::repository` and `RecoveryScope::explicit`
+  constructors, which bind lexical spellings to one canonical project identity.
+  `recovery_authority_projects` returns both attributed projects and warnings for malformed
+  authority that could not be attributed safely. Shared `ProjectReadLease` and `ProjectWriteLease`
+  types now own the project-lock protocol used by both the application and standalone recovery.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.

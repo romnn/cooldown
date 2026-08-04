@@ -8,7 +8,7 @@ use cooldown_cargo::{
     recovery_authority_projects,
 };
 use cooldown_core::{
-    CoreError, ProjectDetection, ProjectMarker, ToolId, recognized_tool_names, tool_id,
+    CoreError, Diagnostic, ProjectDetection, ProjectMarker, ToolId, recognized_tool_names, tool_id,
 };
 
 struct RecoveryOption {
@@ -119,6 +119,7 @@ pub(in crate::cli) fn configure_recovery_help(mut command: clap::Command) -> cla
 
 pub(in crate::cli) struct PreparedRecovery {
     pub(in crate::cli) targets: Vec<RecoveryTarget>,
+    pub(in crate::cli) warnings: Vec<Diagnostic>,
     pub(in crate::cli) json: bool,
     pub(in crate::cli) progress: Progress,
 }
@@ -130,14 +131,17 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
     let scope = if global.dir.is_some() {
-        RecoveryScope::Explicit(workdir.clone())
+        RecoveryScope::explicit(&workdir)?
     } else {
-        RecoveryScope::Repository(scan_root_for(&workdir, &repo_root))
+        RecoveryScope::repository(&scan_root_for(&workdir, &repo_root))?
     };
     let mut targets = Vec::new();
+    let mut warnings = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
         let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root)?;
-        roots.extend(cargo_recovery_roots(&scope, !global.no_gitignore)?);
+        let discovery = cargo_recovery_discovery(&scope, !global.no_gitignore)?;
+        roots.extend(discovery.roots);
+        warnings.extend(discovery.warnings);
         roots.sort();
         roots.dedup();
         for root in roots.into_iter().filter(|root| scope.includes(root)) {
@@ -152,6 +156,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     }
     Ok(PreparedRecovery {
         targets,
+        warnings,
         json: global.json,
         progress: super::options::progress_mode(global),
     })
@@ -228,13 +233,42 @@ fn selected_recovery_tools(global: &GlobalArgs) -> Result<Vec<ToolId>, CoreError
     Ok(tools)
 }
 
+#[cfg(test)]
 fn cargo_recovery_roots(
     scope: &RecoveryScope,
     respect_gitignore: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
+    Ok(cargo_recovery_discovery(scope, respect_gitignore)?.roots)
+}
+
+struct CargoRecoveryDiscovery {
+    roots: Vec<Utf8PathBuf>,
+    warnings: Vec<Diagnostic>,
+}
+
+fn cargo_recovery_discovery(
+    scope: &RecoveryScope,
+    respect_gitignore: bool,
+) -> Result<CargoRecoveryDiscovery, CoreError> {
     let root = scope.root();
     let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name)?;
-    authoritative.extend(recovery_authority_projects(scope)?);
+    let authority = recovery_authority_projects(scope)?;
+    authoritative.extend(authority.projects);
+    let warnings = authority
+        .warnings
+        .into_iter()
+        .map(|warning| {
+            Diagnostic::new(
+                warning.error.diagnostic_kind(),
+                format!(
+                    "could not attribute Cargo recovery authority at {}: {}",
+                    warning.path, warning.error
+                ),
+            )
+            .with_tool(CARGO_ID.as_str())
+            .with_path(warning.path.as_str())
+        })
+        .collect();
     let detected = scan::find_project_marker_dirs_batch(
         root,
         &[ProjectDetection::PrimaryWithValidation {
@@ -264,7 +298,7 @@ fn cargo_recovery_roots(
     }));
     roots.sort();
     roots.dedup();
-    Ok(roots)
+    Ok(CargoRecoveryDiscovery { roots, warnings })
 }
 
 fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
@@ -288,8 +322,8 @@ mod tests {
     use color_eyre::eyre;
     use cooldown_cargo::RECOVERY_MARKER;
 
-    fn explicit_scope(root: &Utf8Path) -> RecoveryScope {
-        RecoveryScope::Explicit(root.to_owned())
+    fn explicit_scope(root: &Utf8Path) -> cooldown_core::Result<RecoveryScope> {
+        RecoveryScope::explicit(root)
     }
 
     #[test]
@@ -371,15 +405,17 @@ mod tests {
     }
 
     #[test]
-    fn recovery_marker_finds_project_without_cargo_lock() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = Utf8Path::from_path(directory.path()).expect("UTF-8 tempdir");
-        std::fs::write(root.join(RECOVERY_MARKER), "{}").expect("write marker");
+    fn recovery_marker_finds_project_without_cargo_lock() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        std::fs::write(root.join(RECOVERY_MARKER), "{}")?;
 
         assert_eq!(
-            cargo_recovery_roots(&explicit_scope(root), false).expect("discover roots"),
+            cargo_recovery_roots(&explicit_scope(root)?, false)?,
             vec![root.to_owned()]
         );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -397,25 +433,27 @@ mod tests {
             vec![root.to_owned()]
         );
         assert_eq!(
-            cargo_recovery_roots(&explicit_scope(root), false)?,
+            cargo_recovery_roots(&explicit_scope(root)?, false)?,
             vec![root.to_owned()]
         );
         Ok(())
     }
 
     #[test]
-    fn nested_recovery_marker_is_not_hidden_by_an_outer_lock() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = Utf8Path::from_path(directory.path()).expect("UTF-8 tempdir");
+    fn nested_recovery_marker_is_not_hidden_by_an_outer_lock() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
         let nested = root.join("tools/independent");
-        std::fs::create_dir_all(&nested).expect("create nested project");
-        std::fs::write(root.join("Cargo.lock"), "").expect("write outer lock");
-        std::fs::write(nested.join(RECOVERY_MARKER), "{}").expect("write nested marker");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(root.join("Cargo.lock"), "")?;
+        std::fs::write(nested.join(RECOVERY_MARKER), "{}")?;
 
         assert_eq!(
-            cargo_recovery_roots(&explicit_scope(root), false).expect("discover roots"),
+            cargo_recovery_roots(&explicit_scope(root)?, false)?,
             vec![root.to_owned(), nested]
         );
+        Ok(())
     }
 
     #[test]
@@ -513,6 +551,44 @@ mod tests {
 
         assert_eq!(prepared.targets.len(), 1);
         assert_eq!(prepared.targets[0].root, first);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_recovery_warns_about_an_unattributable_descendant_authority() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let parent = root.join("projects");
+        let descendant = parent.join(".hidden/interrupted");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        std::fs::create_dir_all(&descendant)?;
+        let descendant = Utf8PathBuf::from_path_buf(std::fs::canonicalize(descendant)?)
+            .map_err(|path| eyre::eyre!("non-UTF-8 project path: {path:?}"))?;
+        let coordination = cooldown_core::fs::ProjectCoordination::resolve(&descendant)?;
+        let authority = coordination
+            .recovery_authority()
+            .ok_or_else(|| eyre::eyre!("test project has no recovery authority"))?;
+        let anchor = authority.directory().join(format!(
+            "{:016x}.cargo-recovery.anchor",
+            cooldown_core::fs::fnv1a_64(descendant.as_str())
+        ));
+        std::fs::write(&anchor, "not valid recovery authority")?;
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o600))?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", parent.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        assert_eq!(prepared.warnings.len(), 1);
+        assert!(
+            prepared.warnings[0]
+                .message
+                .contains(anchor.to_string_lossy().as_ref())
+        );
         Ok(())
     }
 
@@ -642,7 +718,7 @@ mod tests {
         std::fs::create_dir_all(&workdir)?;
         std::fs::create_dir_all(&sibling)?;
         std::fs::write(sibling.join(RECOVERY_MARKER), "{}")?;
-        let scope = RecoveryScope::Repository(scan_root_for(&workdir, root));
+        let scope = RecoveryScope::repository(&scan_root_for(&workdir, root))?;
 
         let roots = cargo_recovery_roots(&scope, false)?;
 

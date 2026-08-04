@@ -38,6 +38,19 @@ pub struct ProjectWriteLease {
     coordination: ProjectCoordination,
 }
 
+/// A shared OS-backed lease for one project's package-manager state.
+#[derive(Debug)]
+pub struct ProjectReadLease {
+    #[expect(dead_code, reason = "the field keeps the project read lease alive")]
+    project_lock: std::fs::File,
+    #[expect(
+        dead_code,
+        reason = "the field keeps stale-lock maintenance from removing the lease"
+    )]
+    maintenance_lock: std::fs::File,
+    coordination: ProjectCoordination,
+}
+
 impl ProjectCoordination {
     /// Resolves and securely creates the coordination namespace for `target`.
     ///
@@ -188,24 +201,26 @@ impl ProjectWriteLease {
     /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
     pub fn acquire(target: &Utf8Path) -> Result<Self, CoreError> {
         let coordination = ProjectCoordination::resolve(target)?;
-        let maintenance_path = coordination.directory().join(".maintenance.lock");
-        let maintenance = open_coordination_lock(&maintenance_path)?;
-        maintenance.lock_shared()?;
-        let path = coordination.directory().join(format!(
-            "{:016x}.lock",
-            fnv1a_64(coordination.project().as_str())
-        ));
-        let file = open_coordination_lock(&path)?;
+        Self::acquire_coordination(coordination)
+    }
+
+    /// Acquires exclusive access through an already resolved coordination identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds project access.
+    /// Returns a filesystem error when the coordination lock cannot be opened safely.
+    pub fn acquire_coordination(coordination: ProjectCoordination) -> Result<Self, CoreError> {
+        let (path, file, maintenance) = open_project_lease_files(&coordination)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(CoreError::LockConflict(format!(
-                    "{} is locked by another cooldown run",
-                    path.display()
-                )));
+                return Err(project_lock_conflict(&path, "another cooldown run", false));
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        #[cfg(unix)]
+        record_project_lock_owner(&file, &path, coordination.project())?;
         coordination.validate_current()?;
         Ok(ProjectWriteLease {
             project_lock: file,
@@ -219,6 +234,97 @@ impl ProjectWriteLease {
     pub fn coordination(&self) -> &ProjectCoordination {
         &self.coordination
     }
+}
+
+impl ProjectReadLease {
+    /// Acquires shared access to a project's package-manager state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds exclusive access.
+    /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
+    pub fn acquire(target: &Utf8Path) -> Result<Self, CoreError> {
+        let coordination = ProjectCoordination::resolve(target)?;
+        Self::acquire_coordination(coordination)
+    }
+
+    /// Acquires shared access through an already resolved coordination identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds exclusive access.
+    /// Returns a filesystem error when the coordination lock cannot be opened safely.
+    pub fn acquire_coordination(coordination: ProjectCoordination) -> Result<Self, CoreError> {
+        let (path, file, maintenance) = open_project_lease_files(&coordination)?;
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(project_lock_conflict(
+                    &path,
+                    "an isolated mutation trial or source write",
+                    true,
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        coordination.validate_current()?;
+        Ok(ProjectReadLease {
+            project_lock: file,
+            maintenance_lock: maintenance,
+            coordination,
+        })
+    }
+
+    /// Returns the coordination identity captured by this lease.
+    #[must_use]
+    pub fn coordination(&self) -> &ProjectCoordination {
+        &self.coordination
+    }
+}
+
+fn open_project_lease_files(
+    coordination: &ProjectCoordination,
+) -> Result<(PathBuf, std::fs::File, std::fs::File), CoreError> {
+    let maintenance_path = coordination.directory().join(".maintenance.lock");
+    let maintenance = open_coordination_lock(&maintenance_path)?;
+    maintenance.lock_shared()?;
+    let path = coordination.directory().join(format!(
+        "{:016x}.lock",
+        fnv1a_64(coordination.project().as_str())
+    ));
+    let file = open_coordination_lock(&path)?;
+    Ok((path, file, maintenance))
+}
+
+fn project_lock_conflict(path: &Path, owner: &str, include_holder: bool) -> CoreError {
+    let holder = include_holder
+        .then(|| std::fs::read_to_string(path).ok())
+        .flatten()
+        .and_then(|contents| contents.lines().next().map(str::to_string))
+        .filter(|line| !line.is_empty())
+        .map(|line| format!(" ({line})"))
+        .unwrap_or_default();
+    CoreError::LockConflict(format!("{} is locked by {owner}{holder}", path.display()))
+}
+
+#[cfg(unix)]
+fn record_project_lock_owner(
+    file: &std::fs::File,
+    path: &Path,
+    project: &Utf8Path,
+) -> Result<(), CoreError> {
+    use std::io::{Seek as _, SeekFrom};
+    require_single_link(&file.metadata()?, path)?;
+    file.set_len(0)?;
+    let mut writer = file;
+    writer.seek(SeekFrom::Start(0))?;
+    writeln!(
+        writer,
+        "locked by cooldown pid {} for {project}",
+        std::process::id()
+    )?;
+    file.sync_data()?;
+    Ok(())
 }
 
 /// Verifies that an opened authority file is private to the current user where supported.
@@ -439,6 +545,18 @@ fn open_coordination_lock(path: &Path) -> Result<std::fs::File, CoreError> {
         }
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if metadata.nlink() == 1 {
+        return Ok(());
+    }
+    Err(CoreError::Filesystem(format!(
+        "coordination lock has multiple hard links: {}",
+        path.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -746,7 +864,10 @@ mod tests {
     use super::CoreError;
     #[cfg(unix)]
     use super::DurableWriteError;
-    use super::{ProjectCoordination, atomic_write, atomic_write_with_permissions_checked};
+    use super::{
+        ProjectCoordination, ProjectReadLease, ProjectWriteLease, atomic_write,
+        atomic_write_with_permissions_checked,
+    };
     use camino::Utf8Path;
     use color_eyre::eyre;
 
@@ -796,6 +917,32 @@ mod tests {
 
         assert!(coordination.recovery_authority().is_none());
         assert!(coordination.directory().starts_with(root.join(".cooldown")));
+        Ok(())
+    }
+
+    #[test]
+    fn project_read_and_write_leases_share_one_lock_protocol() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let first_reader = ProjectReadLease::acquire(root)?;
+        let second_reader = ProjectReadLease::acquire(root)?;
+
+        std::assert_matches!(
+            ProjectWriteLease::acquire(root),
+            Err(CoreError::LockConflict(_))
+        );
+        drop(first_reader);
+        drop(second_reader);
+
+        let writer = ProjectWriteLease::acquire(root)?;
+        let conflict = ProjectReadLease::acquire(root)
+            .err()
+            .ok_or_else(|| eyre::eyre!("reader acquired a write-locked project"))?;
+        #[cfg(unix)]
+        assert!(conflict.to_string().contains("locked by cooldown pid"));
+        std::assert_matches!(conflict, CoreError::LockConflict(_));
+        drop(writer);
         Ok(())
     }
 

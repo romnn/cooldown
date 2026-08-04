@@ -30,13 +30,17 @@ pub(crate) fn require_recovery_authority<'a>(
 
 pub(crate) fn recovery_authority_projects(
     scope: &crate::RecoveryScope,
-) -> Result<Vec<Utf8PathBuf>> {
+) -> Result<crate::RecoveryAuthorityDiscovery> {
     let coordination = cooldown_core::fs::ProjectCoordination::resolve(scope.root())?;
     let Some(scan_authority) = coordination.recovery_authority() else {
-        return Ok(Vec::new());
+        return Ok(crate::RecoveryAuthorityDiscovery {
+            projects: Vec::new(),
+            warnings: Vec::new(),
+        });
     };
     let entries = std::fs::read_dir(scan_authority.directory())?;
     let mut projects = Vec::new();
+    let mut warnings = Vec::new();
     for entry in entries {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -55,12 +59,18 @@ pub(crate) fn recovery_authority_projects(
         let untrusted = match TrustedArtifact::open(&path, MAX_RECOVERY_ANCHOR_BYTES, false) {
             Ok(artifact) => artifact,
             Err(error) if scope.includes_unknown_authority(target) => return Err(error),
-            Err(_) => continue,
+            Err(error) => {
+                warnings.push(crate::RecoveryDiscoveryWarning { path, error });
+                continue;
+            }
         };
         let anchor: RecoveryAnchor = match untrusted.decode("recovery authority") {
             Ok(anchor) => anchor,
             Err(error) if scope.requires_complete_authority_scan() => return Err(error),
-            Err(_) => continue,
+            Err(error) => {
+                warnings.push(crate::RecoveryDiscoveryWarning { path, error });
+                continue;
+            }
         };
         let project_root = Utf8PathBuf::from(anchor.project_root.clone());
         if !scope.includes(&project_root) {
@@ -90,5 +100,5 @@ pub(crate) fn recovery_authority_projects(
     }
     projects.sort();
     projects.dedup();
-    Ok(projects)
+    Ok(crate::RecoveryAuthorityDiscovery { projects, warnings })
 }

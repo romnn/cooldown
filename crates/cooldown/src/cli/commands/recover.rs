@@ -7,7 +7,7 @@ use cooldown_render as render;
 pub(super) fn run(prepared: setup::PreparedRecovery) -> Result<Exit, CoreError> {
     let tools: Vec<_> = prepared.targets.iter().map(|target| target.tool).collect();
     prepared.progress.start_run(&tools);
-    let outcome = recover_targets(prepared.targets, &prepared.progress);
+    let outcome = recover_targets(prepared.targets, prepared.warnings, &prepared.progress);
     prepared.progress.finish_run();
 
     let summary = present::recovery_summary(&outcome.summary);
@@ -18,9 +18,10 @@ pub(super) fn run(prepared: setup::PreparedRecovery) -> Result<Exit, CoreError> 
         .filter_map(|item| item.error.clone())
         .collect();
     let warnings = outcome
-        .items
+        .warnings
         .iter()
-        .flat_map(|item| item.warnings.clone())
+        .cloned()
+        .chain(outcome.items.iter().flat_map(|item| item.warnings.clone()))
         .collect();
     let envelope = with_diags(
         render::Envelope::new(
@@ -35,7 +36,7 @@ pub(super) fn run(prepared: setup::PreparedRecovery) -> Result<Exit, CoreError> 
         errors,
     );
     emit_envelope(prepared.json, &envelope, || {
-        present::render_recovery_text(&outcome.summary, &outcome.items)
+        present::render_recovery_text(&outcome.summary, &outcome.items, &outcome.warnings)
     })?;
     Ok(outcome.exit)
 }

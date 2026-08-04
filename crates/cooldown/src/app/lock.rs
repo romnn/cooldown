@@ -1,6 +1,6 @@
 //! Shared read and exclusive write access for project and repository package-manager resources.
 
-use cooldown_core::fs::ProjectCoordination;
+use cooldown_core::fs::{ProjectCoordination, ProjectReadLease, ProjectWriteLease};
 use cooldown_core::{CoreError, ToolId};
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -51,15 +51,13 @@ impl CoordinationRoot {
 /// Holds an OS-backed shared lock for project reads.
 #[derive(Debug)]
 pub(crate) struct ProjectReadGuard {
-    file: File,
-    coordination: ProjectCoordination,
+    lease: ProjectReadLease,
 }
 
 /// Holds an OS-backed exclusive lock for project mutations.
 #[derive(Debug)]
 pub(crate) struct ProjectWriteGuard {
-    file: File,
-    coordination: ProjectCoordination,
+    lease: ProjectWriteLease,
 }
 
 /// Holds an OS-backed shared lock for one repository-wide tool resource.
@@ -93,83 +91,30 @@ pub(crate) struct ProjectAccessWriteGuard {
 impl ProjectReadGuard {
     /// Acquires shared access, failing immediately while a writer owns the project.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
-        let (path, file, maintenance, coordination) = open_project_lock(root)?;
-        let guard = Self::acquire_file(&path, file, coordination)?;
-        drop(maintenance);
-        Ok(guard)
-    }
-
-    fn acquire_file(
-        path: &Path,
-        file: File,
-        coordination: ProjectCoordination,
-    ) -> Result<Self, CoreError> {
-        match file.try_lock_shared() {
-            Ok(()) => Ok(ProjectReadGuard { file, coordination }),
-            Err(TryLockError::WouldBlock) => Err(lock_conflict(
-                path,
-                "an isolated mutation trial or source write",
-                true,
-            )),
-            Err(TryLockError::Error(error)) => Err(lock_error(path, &error)),
-        }
-    }
-
-    #[cfg(test)]
-    fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
-        let path = directory.join(lock_file_name(root)?);
-        let file = open_lock_file(&path)?;
-        Self::acquire_file(&path, file, ProjectCoordination::resolve(root)?)
+        let coordination = project_coordination(root)?;
+        Ok(ProjectReadGuard {
+            lease: ProjectReadLease::acquire_coordination(coordination)?,
+        })
     }
 
     /// Returns the coordination identity captured by this shared lease.
     pub(crate) fn coordination(&self) -> &ProjectCoordination {
-        &self.coordination
+        self.lease.coordination()
     }
 }
 
 impl ProjectWriteGuard {
     /// Acquires exclusive access, failing immediately while another reader or writer is active.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
-        let (path, mut file, maintenance, coordination) = open_project_lock(root)?;
-        Self::acquire_file(root, &path, &mut file)?;
-        drop(maintenance);
-        Ok(ProjectWriteGuard { file, coordination })
-    }
-
-    fn acquire_file(
-        root: &camino::Utf8Path,
-        path: &Path,
-        file: &mut File,
-    ) -> Result<(), CoreError> {
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(lock_conflict(path, "another cooldown run", false));
-            }
-            Err(TryLockError::Error(error)) => return Err(lock_error(path, &error)),
-        }
-
-        #[cfg(unix)]
-        record_lock_owner(file, path, root.as_str())?;
-        tracing::trace!(path = %path.display(), project = %root, "acquired exclusive project access");
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn acquire_in(root: &camino::Utf8Path, directory: &Path) -> Result<Self, CoreError> {
-        let path = directory.join(lock_file_name(root)?);
-        let mut file = open_lock_file(&path)?;
-        Self::acquire_file(root, &path, &mut file)?;
+        let coordination = project_coordination(root)?;
         Ok(ProjectWriteGuard {
-            file,
-            coordination: ProjectCoordination::resolve(root)?,
+            lease: ProjectWriteLease::acquire_coordination(coordination)?,
         })
     }
 
     /// Returns the coordination identity captured by this exclusive lease.
     pub(crate) fn coordination(&self) -> &ProjectCoordination {
-        &self.coordination
+        self.lease.coordination()
     }
 }
 
@@ -259,21 +204,10 @@ impl ProjectAccessWriteGuard {
     }
 }
 
-fn open_project_lock(
-    root: &camino::Utf8Path,
-) -> Result<(PathBuf, File, File, ProjectCoordination), CoreError> {
+fn project_coordination(root: &camino::Utf8Path) -> Result<ProjectCoordination, CoreError> {
     let coordination = ProjectCoordination::resolve(root)?;
-    let path = coordination.directory().join(format!(
-        "{:016x}.lock",
-        cooldown_core::fs::fnv1a_64(coordination.project().as_str())
-    ));
-    let (file, maintenance) = open_coordinated_lock_file(&path).map_err(|error| {
-        CoreError::Filesystem(format!(
-            "cannot open the project coordination lock at {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok((path, file, maintenance, coordination))
+    collect_stale_locks_once(coordination.directory());
+    Ok(coordination)
 }
 
 fn open_repo_tool_lock(
@@ -552,15 +486,6 @@ fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), 
 }
 
 #[cfg(test)]
-fn lock_file_name(root: &camino::Utf8Path) -> Result<String, CoreError> {
-    let root = canonical_lock_root(root)?;
-    Ok(format!(
-        "{:016x}.lock",
-        cooldown_core::fs::fnv1a_64(root.as_str())
-    ))
-}
-
-#[cfg(test)]
 fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> Result<String, CoreError> {
     let root = canonical_lock_root(root)?;
     let identity = format!("{}\0{}", root.as_str(), tool.as_str());
@@ -573,18 +498,6 @@ fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> Result<Str
 #[cfg(test)]
 fn canonical_lock_root(root: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, CoreError> {
     Ok(ProjectCoordination::resolve(root)?.project().to_owned())
-}
-
-impl Drop for ProjectReadGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-impl Drop for ProjectWriteGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
 }
 
 impl Drop for RepoToolReadGuard {
@@ -714,55 +627,60 @@ mod tests {
     }
 
     #[test]
-    fn readers_can_share_project_access() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let locks = tempfile::tempdir().expect("lock dir");
-        let _first = ProjectReadGuard::acquire_in(root, locks.path()).expect("first reader");
+    fn readers_can_share_project_access() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(dir.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let _first = ProjectReadGuard::acquire(root)?;
 
-        ProjectReadGuard::acquire_in(root, locks.path()).expect("second reader");
+        ProjectReadGuard::acquire(root)?;
+        Ok(())
     }
 
     #[test]
-    fn reader_and_writer_exclude_each_other() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let locks = tempfile::tempdir().expect("lock dir");
-        let _reader = ProjectReadGuard::acquire_in(root, locks.path()).expect("reader");
-
-        let error =
-            ProjectWriteGuard::acquire_in(root, locks.path()).expect_err("writer must fail");
-        std::assert_matches!(error, CoreError::LockConflict(_));
-    }
-
-    #[test]
-    fn writer_excludes_readers_and_writers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let locks = tempfile::tempdir().expect("lock dir");
-        let _writer = ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer");
+    fn reader_and_writer_exclude_each_other() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(dir.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let _reader = ProjectReadGuard::acquire(root)?;
 
         std::assert_matches!(
-            ProjectReadGuard::acquire_in(root, locks.path()).expect_err("reader must fail"),
-            CoreError::LockConflict(_)
+            ProjectWriteGuard::acquire(root),
+            Err(CoreError::LockConflict(_))
         );
-        std::assert_matches!(
-            ProjectWriteGuard::acquire_in(root, locks.path()).expect_err("second writer must fail"),
-            CoreError::LockConflict(_)
-        );
+        Ok(())
     }
 
     #[test]
-    fn write_access_can_be_reacquired_after_drop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8 path");
-        let locks = tempfile::tempdir().expect("lock dir");
+    fn writer_excludes_readers_and_writers() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(dir.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let _writer = ProjectWriteGuard::acquire(root)?;
+
+        std::assert_matches!(
+            ProjectReadGuard::acquire(root),
+            Err(CoreError::LockConflict(_))
+        );
+        std::assert_matches!(
+            ProjectWriteGuard::acquire(root),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_access_can_be_reacquired_after_drop() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(dir.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
 
         {
-            let _guard = ProjectWriteGuard::acquire_in(root, locks.path()).expect("first writer");
+            let _guard = ProjectWriteGuard::acquire(root)?;
         }
 
-        ProjectWriteGuard::acquire_in(root, locks.path()).expect("writer reacquired");
+        ProjectWriteGuard::acquire(root)?;
+        Ok(())
     }
 
     #[test]

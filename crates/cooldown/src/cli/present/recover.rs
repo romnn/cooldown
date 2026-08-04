@@ -34,6 +34,7 @@ pub(in crate::cli) fn recovery_items(items: &[RecoveryItem]) -> Vec<RecoveryItem
 pub(in crate::cli) fn render_recovery_text(
     summary: &RecoverySummary,
     items: &[RecoveryItem],
+    warnings: &[cooldown_core::Diagnostic],
 ) -> String {
     let mut out = String::new();
     for item in items {
@@ -51,7 +52,10 @@ pub(in crate::cli) fn render_recovery_text(
             let _ = writeln!(out, "    warning [{}]: {}", warning.kind, warning.message);
         }
     }
-    if !items.is_empty() {
+    for warning in warnings {
+        let _ = writeln!(out, "  warning [{}]: {}", warning.kind, warning.message);
+    }
+    if !items.is_empty() || !warnings.is_empty() {
         out.push('\n');
     }
     let _ = writeln!(
@@ -83,6 +87,10 @@ mod tests {
                 "visible state was settled, but marker-removal durability is uncertain",
             )],
         };
+        let discovery_warning = Diagnostic::new(
+            DiagnosticKind::LockfileUnreadable,
+            "could not attribute one recovery authority",
+        );
 
         let rendered = render_recovery_text(
             &RecoverySummary {
@@ -91,6 +99,7 @@ mod tests {
                 errors: 1,
             },
             &[item],
+            &[discovery_warning],
         );
 
         assert!(rendered.contains(". (cargo): error"));
@@ -100,5 +109,10 @@ mod tests {
         assert!(rendered.contains(
             "warning [filesystem]: visible state was settled, but marker-removal durability is uncertain"
         ));
+        assert!(
+            rendered.contains(
+                "warning [lockfile_unreadable]: could not attribute one recovery authority"
+            )
+        );
     }
 }
