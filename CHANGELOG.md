@@ -44,7 +44,8 @@
   are rejected because they cannot be governed by the selected project's mutation lease.
   `capture_state`, `restore_if_unchanged`, and `restore` now use that bound identity instead of
   accepting a project root at each call. Callers can therefore distinguish rollback conflicts from
-  visible corrections whose directory durability is uncertain.
+  visible corrections whose directory durability is uncertain. A multi-file rollback conflict
+  emits an indeterminate-state error and never counts previously verified rows as applied.
   `BaselineViolation` now carries a complete `PackageId`, so source-distinct packages cannot share
   transitive-policy authority.
 - **Breaking library API:** `ToolWrite::mutation_execution` can provide an

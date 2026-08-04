@@ -5,7 +5,7 @@ mod report;
 mod transitive_gate;
 
 use self::batch::{
-    BatchOutcome, CommittedBatch, VerifiedBatchReport, retained_trial_outcomes, trial_errors,
+    BatchOutcome, CommittedBatch, VerifiedBatchReport, indeterminate_trial, trial_errors,
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
@@ -831,15 +831,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 true
             }
             Err(error) => {
-                outcome.errors.push(self.project_diag(&error, None));
+                outcome.errors.push(self.restore_conflict_diag(&error));
                 outcome.mark_restore_conflict();
                 false
             }
         }
     }
 
-    /// Resolves an aborted trial without hiding a verified mutation that survives a restore
-    /// conflict.
+    /// Resolves an aborted trial without claiming which mutations survived a restore conflict.
     fn settle_aborted_trial(
         &self,
         snapshot: &TrialRollback,
@@ -853,8 +852,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 trial_errors(outcomes)
             }
             Err(error) => {
-                let mut outcome = retained_trial_outcomes(outcomes);
-                outcome.errors.push(self.project_diag(&error, None));
+                let mut outcome = indeterminate_trial(outcomes);
+                outcome.errors.push(self.restore_conflict_diag(&error));
                 outcome
             }
         }
@@ -1920,6 +1919,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return diagnostic;
         }
         diag_from_error(error, self.ctx.pctx.tool, self.project_label(), package)
+    }
+
+    fn restore_conflict_diag(&self, error: &cooldown_core::CoreError) -> Diagnostic {
+        let mut diagnostic = self.project_diag(error, None);
+        diagnostic.message = format!(
+            "rollback could not restore a known project state; the final mutation state is indeterminate: {}",
+            diagnostic.message
+        );
+        diagnostic
     }
 
     fn record_project_error(&mut self, error: &cooldown_core::CoreError, package: Option<&str>) {

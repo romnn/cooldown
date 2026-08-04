@@ -1,9 +1,9 @@
 use super::planning::{plan_baseline_violations, target_package};
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
-    collateral_rows, combine_lock_status, conflict_skip_message, insert_graph_violation,
-    is_downgrade, newly_introduced_violations, package_label, planned_changes_landed,
-    preserve_rollback_entries, retained_trial_outcomes, sort_planned_changes,
+    collateral_rows, combine_lock_status, conflict_skip_message, indeterminate_trial,
+    insert_graph_violation, is_downgrade, newly_introduced_violations, package_label,
+    planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
     verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
@@ -470,11 +470,14 @@ fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
 }
 
 #[test]
-fn restore_conflict_retains_rows_from_an_earlier_committed_batch() {
+fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
     let mut committed = BatchOutcome::default();
     committed
         .items
         .push(applied_item("kept", "1.0.0", "1.1.0", false));
+    committed
+        .edge_items
+        .push(edge_item("consumer", "1.0.0", "1.1.0"));
     committed.mark_committed(CommittedBatch {
         violations_after: HashSet::new(),
         reconcile_needed: false,
@@ -485,13 +488,12 @@ fn restore_conflict_retains_rows_from_an_earlier_committed_batch() {
         "later batch could not restore",
     ));
 
-    let retained = retained_trial_outcomes(vec![committed, failed]);
+    let conflict = indeterminate_trial(vec![committed, failed]);
 
-    assert!(retained.has_restore_conflict());
-    assert_eq!(retained.items.len(), 1);
-    assert_eq!(retained.items[0].name, "kept");
-    assert!(retained.items[0].applied);
-    assert_eq!(retained.errors.len(), 1);
+    assert!(conflict.has_restore_conflict());
+    assert!(conflict.items.is_empty());
+    assert!(conflict.edge_items.is_empty());
+    assert_eq!(conflict.errors.len(), 1);
 }
 
 #[test]

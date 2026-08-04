@@ -164,37 +164,11 @@ pub(super) fn trial_errors(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
     errors
 }
 
-/// Retains verified committed rows when an outer restore conflict leaves them in the project.
-pub(super) fn retained_trial_outcomes(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
-    let mut retained = BatchOutcome::default();
-    for outcome in outcomes {
-        match outcome {
-            BatchOutcome::Committed { report, .. } => merge_batch_report(&mut retained, report),
-            BatchOutcome::Unchanged(report)
-            | BatchOutcome::Restored(report)
-            | BatchOutcome::RestoreConflict(report) => merge_batch_errors(&mut retained, report),
-        }
-    }
-    retained.strict_incomplete |= retained.errored_count() > 0;
-    retained.mark_restore_conflict();
-    retained
-}
-
-fn merge_batch_report(outcome: &mut BatchOutcome, report: BatchReport) {
-    outcome.items.extend(report.items);
-    outcome.edge_items.extend(report.edge_items);
-    outcome.edge_rebinds.extend(report.edge_rebinds);
-    outcome.warnings.extend(report.warnings);
-    outcome.errors.extend(report.errors);
-    outcome.strict_incomplete |= report.strict_incomplete;
-    outcome.lock_refreshed |= report.lock_refreshed;
-}
-
-fn merge_batch_errors(outcome: &mut BatchOutcome, report: BatchReport) {
-    outcome.errors.extend(report.errors);
-    outcome
-        .items
-        .extend(report.items.into_iter().filter(|item| item.error.is_some()));
+/// Retains only error provenance when rollback leaves the final project state indeterminate.
+pub(super) fn indeterminate_trial(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
+    let mut conflict = trial_errors(outcomes);
+    conflict.mark_restore_conflict();
+    conflict
 }
 
 /// The adapter evidence retained after graph verification accepts one batch.

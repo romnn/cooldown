@@ -83,6 +83,9 @@ struct State {
     recovery_completed: bool,
     /// Simulate an independent lock edit immediately before a graph-probe failure.
     drift_lock_before_graph_failure: bool,
+    /// Make an outer two-file rollback restore its first file, then fail on its second file.
+    #[cfg(unix)]
+    force_partial_restore_failure: bool,
 }
 
 #[allow(
@@ -322,6 +325,15 @@ impl ReleaseFetcher for FakeEco {
                     .is_some_and(|name| name == dep.package.name)
         };
         if fail_after_apply {
+            #[cfg(unix)]
+            if self.state.lock().unwrap().force_partial_restore_failure {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                std::fs::set_permissions(
+                    self.root.join("blocked"),
+                    std::fs::Permissions::from_mode(0o500),
+                )?;
+            }
             return Err(CoreError::Transient(
                 format!("reconcile release probe failed for {}", dep.package.name).into(),
             ));
@@ -419,6 +431,16 @@ impl ToolWrite for FakeEco {
     }
 
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        #[cfg(unix)]
+        if self.state.lock().unwrap().force_partial_restore_failure {
+            return ProjectMutationJournal::capture(
+                &p.root,
+                [
+                    camino::Utf8Path::new("restored/state"),
+                    camino::Utf8Path::new("blocked/state"),
+                ],
+            );
+        }
         if self.state.lock().unwrap().write_lock_on_apply {
             return ProjectMutationJournal::capture(&p.root, [camino::Utf8Path::new("fake.lock")]);
         }
@@ -457,6 +479,11 @@ impl ToolWrite for FakeEco {
         }
         if state.write_lock_on_apply {
             std::fs::write(p.root.join("fake.lock"), b"mutated lock")?;
+        }
+        #[cfg(unix)]
+        if state.force_partial_restore_failure {
+            std::fs::write(p.root.join("restored/state"), b"candidate")?;
+            std::fs::write(p.root.join("blocked/state"), b"candidate")?;
         }
         if self.inject_fresh_on_apply {
             state.fresh_transitive_present = true;
@@ -3169,6 +3196,88 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
         std::fs::read(root.join("fake.lock")).expect("read restored fake lock"),
         b"baseline lock"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_outer_restore_reports_no_applied_rows() -> eyre::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::create_dir_all(root.join("restored"))?;
+    std::fs::create_dir_all(root.join("blocked"))?;
+    std::fs::write(root.join("restored/state"), b"original first")?;
+    std::fs::write(root.join("blocked/state"), b"original second")?;
+
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_releases = too_fresh_fix_releases();
+    releases.insert("t".to_string(), t_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&t_releases, "v1.0.2"));
+    locked.insert(
+        "x".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let mut floated = dep("t", "v1.0.2", false);
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![dep("x", "v1.0.0", false)],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State {
+            fail_releases_after_apply_for: Some("x".to_string()),
+            force_partial_restore_failure: true,
+            ..State::default()
+        }),
+        root: root.clone(),
+    };
+
+    let outcome = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+    std::fs::set_permissions(root.join("blocked"), std::fs::Permissions::from_mode(0o700))?;
+
+    // The rollback restored only its first file, so neither previously verified row is authoritative.
+    assert_eq!(
+        std::fs::read(root.join("restored/state"))?,
+        b"original first"
+    );
+    assert_eq!(std::fs::read(root.join("blocked/state"))?, b"candidate");
+    assert_eq!(outcome.exit, Exit::Environment);
+    assert_eq!(outcome.summary.applied, 0);
+    assert!(!outcome.meta.applied);
+    assert!(outcome.items.iter().all(|item| !item.applied));
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.message.contains("mutation state is indeterminate"))
+    );
+    Ok(())
 }
 
 #[tokio::test]
