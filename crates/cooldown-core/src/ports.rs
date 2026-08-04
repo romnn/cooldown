@@ -399,14 +399,23 @@ impl dyn IsolatedMutation + '_ {
     }
 }
 
-/// The ownership state produced by one adapter apply attempt.
+/// An adapter apply attempt bound to its prepared mutation.
+///
+/// Adapters construct this value through [`PreparedMutation`] so an observed postimage cannot be
+/// paired with another project or write set.
+#[derive(Debug)]
+pub struct ApplyAttempt {
+    outcome: ApplyAttemptOutcome,
+}
+
+/// The ownership state produced by one validated adapter apply attempt.
 ///
 /// A finished resolver failure may still have rewritten files, so it carries the postimage an
 /// outer journal may conditionally restore.
 /// A pending-recovery outcome deliberately carries no postimage because adapter-owned recovery
 /// evidence is the only authority allowed to restore that state.
 #[derive(Debug)]
-pub enum ApplyAttempt {
+pub enum ApplyAttemptOutcome {
     /// The adapter released mutation ownership to the application.
     Finished {
         /// The adapter's apply result.
@@ -559,6 +568,31 @@ impl PreparedMutation {
         self.journal.as_ref()
     }
 
+    /// Binds a finished adapter report and postimage to this operation's mutation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when `postimage` belongs to another project or does not
+    /// contain this operation's complete write set.
+    pub fn finished_attempt(
+        &self,
+        report: Result<ApplyReport>,
+        postimage: &ProjectMutationState,
+    ) -> Result<ApplyAttempt> {
+        let postimage = postimage.state_for(self.journal())?;
+        Ok(ApplyAttempt {
+            outcome: ApplyAttemptOutcome::Finished { report, postimage },
+        })
+    }
+
+    /// Retains adapter-owned recovery authority instead of releasing state to the application.
+    #[must_use]
+    pub fn pending_recovery_attempt(&self, detail: String) -> ApplyAttempt {
+        ApplyAttempt {
+            outcome: ApplyAttemptOutcome::PendingRecovery { detail },
+        }
+    }
+
     /// Revalidates and exposes an operation whose adapter requires isolated mutation execution.
     ///
     /// # Errors
@@ -607,6 +641,26 @@ impl PreparedMutation {
             tool: self.tool,
             execution: self.execution,
         })
+    }
+}
+
+impl ApplyAttempt {
+    /// Revalidates this attempt against the operation receiving its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when a finished postimage came from another project or
+    /// write set.
+    pub fn into_outcome_for(self, mutation: &PreparedMutation) -> Result<ApplyAttemptOutcome> {
+        match self.outcome {
+            ApplyAttemptOutcome::Finished { report, postimage } => {
+                let postimage = postimage.state_for(mutation.journal())?;
+                Ok(ApplyAttemptOutcome::Finished { report, postimage })
+            }
+            ApplyAttemptOutcome::PendingRecovery { detail } => {
+                Ok(ApplyAttemptOutcome::PendingRecovery { detail })
+            }
+        }
     }
 }
 
@@ -677,7 +731,7 @@ pub trait ToolWrite: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured.
-    /// The adapter's own apply error remains inside [`ApplyAttempt::Finished`] so the caller
+    /// The adapter's own apply error remains inside [`ApplyAttemptOutcome::Finished`] so the caller
     /// receives the postimage even after a failed resolver mutates files.
     async fn apply_with_observer(
         &self,
@@ -686,7 +740,7 @@ pub trait ToolWrite: Send + Sync {
     ) -> Result<ApplyAttempt> {
         let report = self.apply(mutation).await;
         let postimage = mutation.journal().capture_state()?;
-        Ok(ApplyAttempt::Finished { report, postimage })
+        mutation.finished_attempt(report, &postimage)
     }
 
     /// Opt-in compile/sync after re-locking (the `--build` step).

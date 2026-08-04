@@ -1,4 +1,4 @@
-use super::{PlanMode, ViolationKey};
+use super::PlanMode;
 use crate::app::TransitiveGate;
 use cooldown_core::{
     BaselineViolation, Change, DepScope, Dependency, MajorKey, PackageId, Release, ResolveContext,
@@ -58,15 +58,9 @@ pub(super) fn sort_planned_changes(changes: &mut [Change]) {
 }
 
 pub(super) fn plan_baseline_violations(
-    violations: &HashSet<ViolationKey>,
+    violations: &HashSet<BaselineViolation>,
 ) -> Vec<BaselineViolation> {
-    let mut baseline = violations
-        .iter()
-        .map(|violation| BaselineViolation {
-            package: violation.package.clone(),
-            version: Version::new(&violation.version),
-        })
-        .collect::<Vec<_>>();
+    let mut baseline = violations.iter().cloned().collect::<Vec<_>>();
     baseline.sort_by(|a, b| {
         a.package
             .tool

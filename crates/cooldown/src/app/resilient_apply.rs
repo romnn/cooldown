@@ -69,10 +69,13 @@ async fn apply_checked(
     writer: &dyn ToolWrite,
     mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
-) -> ApplyResult<cooldown_core::ApplyAttempt> {
-    writer
+) -> ApplyResult<cooldown_core::ApplyAttemptOutcome> {
+    let attempt = writer
         .apply_with_observer(mutation, observer)
         .await
+        .map_err(ApplyFailure::RestoreConflict)?;
+    attempt
+        .into_outcome_for(mutation)
         .map_err(ApplyFailure::RestoreConflict)
 }
 
@@ -97,8 +100,8 @@ pub(crate) async fn apply_resilient_with_observer(
     let journal = mutation.journal();
     let first = apply_checked(writer, mutation, observer).await?;
     let (first_report, first_state) = match first {
-        cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
-        cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+        cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => (report, postimage),
+        cooldown_core::ApplyAttemptOutcome::PendingRecovery { detail } => {
             return Err(ApplyFailure::RestoreConflict(
                 cooldown_core::CoreError::PendingRecovery(detail),
             ));
@@ -151,8 +154,10 @@ pub(crate) async fn apply_resilient_with_observer(
             .map_err(ApplyFailure::RestoreConflict)?;
         let result = apply_checked(writer, &committed, observer).await?;
         let (report, expected) = match result {
-            cooldown_core::ApplyAttempt::Finished { report, postimage } => (report, postimage),
-            cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+            cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => {
+                (report, postimage)
+            }
+            cooldown_core::ApplyAttemptOutcome::PendingRecovery { detail } => {
                 return Err(ApplyFailure::RestoreConflict(
                     cooldown_core::CoreError::PendingRecovery(detail),
                 ));
@@ -213,11 +218,11 @@ async fn verified_satisfiable_subset(
             .map_err(ApplyFailure::RestoreConflict)?;
         let result = apply_checked(writer, &trial, observer).await?;
         let report = match result {
-            cooldown_core::ApplyAttempt::Finished { report, postimage } => {
+            cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => {
                 current_state = postimage;
                 report
             }
-            cooldown_core::ApplyAttempt::PendingRecovery { detail } => {
+            cooldown_core::ApplyAttemptOutcome::PendingRecovery { detail } => {
                 return Err(ApplyFailure::RestoreConflict(
                     cooldown_core::CoreError::PendingRecovery(detail),
                 ));
@@ -471,7 +476,7 @@ mod tests {
             }
             let report = self.apply(mutation).await;
             let postimage = journal.capture_state()?;
-            Ok(cooldown_core::ApplyAttempt::Finished { report, postimage })
+            mutation.finished_attempt(report, &postimage)
         }
 
         async fn build(&self, _project: &Project) -> Result<VerifyReport> {
@@ -551,6 +556,31 @@ mod tests {
         let mutation = PreparedMutation::prepare(&writer, &project, &plan(&["a"])).await?;
 
         let result = mutation.subset(vec![change("b")]);
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_operation_rejects_another_projects_postimage() -> eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _first_directory,
+            project: first,
+        } = temp_project();
+        let TempProject {
+            directory: _second_directory,
+            project: second,
+        } = temp_project();
+        std::fs::write(first.root.join("requirements.txt"), "first")?;
+        std::fs::write(second.root.join("requirements.txt"), "second")?;
+        let plan = plan(&["a"]);
+        let first_mutation = PreparedMutation::prepare(&writer, &first, &plan).await?;
+        let second_mutation = PreparedMutation::prepare(&writer, &second, &plan).await?;
+        let postimage = first_mutation.journal().capture_state()?;
+        let attempt = first_mutation.finished_attempt(Ok(ApplyReport::default()), &postimage)?;
+
+        let result = attempt.into_outcome_for(&second_mutation);
 
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         Ok(())

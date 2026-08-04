@@ -1,16 +1,17 @@
 use super::planning::{plan_baseline_violations, target_package};
 use super::{
-    PlanMode, TrialRollback, ViolationKey, candidate_scope, collapse_applied_legs, collateral_rows,
-    combine_lock_status, conflict_skip_message, insert_graph_violation, is_downgrade,
-    newly_introduced_violations, planned_changes_landed, preserve_rollback_entries,
-    sort_planned_changes, verify_applied_targets,
+    BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
+    collateral_rows, combine_lock_status, conflict_skip_message, insert_graph_violation,
+    is_downgrade, newly_introduced_violations, package_label, planned_changes_landed,
+    preserve_rollback_entries, retained_trial_outcomes, sort_planned_changes,
+    verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
 use cooldown_core::{
-    ApplyReport, Change, DepScope, Dependency, EdgeBindingAction, LockStatus, MajorKey, MemberRef,
-    PackageId, ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId,
-    UpdateKind, Version,
+    ApplyReport, BaselineViolation, Change, DepScope, Dependency, Diagnostic, DiagnosticKind,
+    EdgeBindingAction, LockStatus, MajorKey, MemberRef, PackageId, ProjectMutationJournal, Release,
+    ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
 };
 use std::collections::HashSet;
 
@@ -437,30 +438,60 @@ fn edge_item(dependent: &str, from: &str, to: &str) -> UpgradeItem {
     item
 }
 
-fn no_prior() -> HashSet<ViolationKey> {
+fn no_prior() -> HashSet<BaselineViolation> {
     HashSet::new()
 }
 
-fn violations(items: &[(&str, &str)]) -> HashSet<ViolationKey> {
+fn violations(items: &[(&str, &str)]) -> HashSet<BaselineViolation> {
     items
         .iter()
         .map(|(name, version)| violation(name, version, Some("crates.io")))
         .collect()
 }
 
-fn violation(name: &str, version: &str, registry: Option<&str>) -> ViolationKey {
+fn violation(name: &str, version: &str, registry: Option<&str>) -> BaselineViolation {
     violation_for(ToolId("cargo"), name, version, registry)
 }
 
-fn violation_for(tool: ToolId, name: &str, version: &str, registry: Option<&str>) -> ViolationKey {
-    ViolationKey {
+fn violation_for(
+    tool: ToolId,
+    name: &str,
+    version: &str,
+    registry: Option<&str>,
+) -> BaselineViolation {
+    BaselineViolation {
         package: PackageId::new(tool, name, registry.map(ToString::to_string)),
-        version: version.to_string(),
+        version: Version::new(version),
     }
 }
 
 fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
     None
+}
+
+#[test]
+fn restore_conflict_retains_rows_from_an_earlier_committed_batch() {
+    let mut committed = BatchOutcome::default();
+    committed
+        .items
+        .push(applied_item("kept", "1.0.0", "1.1.0", false));
+    committed.mark_committed(CommittedBatch {
+        violations_after: HashSet::new(),
+        reconcile_needed: false,
+    });
+    let mut failed = BatchOutcome::default();
+    failed.errors.push(Diagnostic::new(
+        DiagnosticKind::LockConflict,
+        "later batch could not restore",
+    ));
+
+    let retained = retained_trial_outcomes(vec![committed, failed]);
+
+    assert!(retained.has_restore_conflict());
+    assert_eq!(retained.items.len(), 1);
+    assert_eq!(retained.items[0].name, "kept");
+    assert!(retained.items[0].applied);
+    assert_eq!(retained.errors.len(), 1);
 }
 
 #[test]
@@ -568,6 +599,24 @@ fn planned_baseline_violations_preserve_source_identity() {
 }
 
 #[test]
+fn policy_violation_labels_include_a_redacted_source() {
+    let violation = violation(
+        "foo",
+        "1.0.0",
+        Some("git+https://token@example.com/private/repo.git?access_token=secret"),
+    );
+
+    assert_eq!(
+        package_label(&violation.package),
+        "foo from git:example.com/private/repo"
+    );
+    assert_eq!(
+        violation_identity(&violation),
+        "foo@1.0.0 from git:example.com/private/repo"
+    );
+}
+
+#[test]
 fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
     // The forward batch floats `quote` up (collateral); the reconcile pass matures it back down.
     let mut items = vec![
@@ -658,9 +707,9 @@ fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
         applied_item("quote", "1.0.5", "1.0.7", false),
         applied_item("quote", "1.0.7", "1.0.4", true),
     ];
-    let prior: HashSet<ViolationKey> = HashSet::from([ViolationKey {
+    let prior: HashSet<BaselineViolation> = HashSet::from([BaselineViolation {
         package: PackageId::new(ToolId("cargo"), "quote", Some("crates.io".to_string())),
-        version: "1.0.5".to_string(),
+        version: Version::new("1.0.5"),
     }]);
     collapse_applied_legs(&mut items, ".", "cargo", &prior, no_kind);
     assert_eq!(items.len(), 1);

@@ -684,33 +684,7 @@ fn mutation_status(it: &UpgradeItem) -> MutationStatus {
 }
 
 fn abbreviated_source(source: &str) -> String {
-    let source = cooldown_core::redact::url_secrets(source);
-    let source = source.as_str();
-    if source == "registry+https://github.com/rust-lang/crates.io-index" {
-        return "crates.io".to_string();
-    }
-    let Some((kind, address)) = source.split_once('+') else {
-        return "source".to_string();
-    };
-    if address.starts_with("file:") {
-        return format!("{kind}:local");
-    }
-    let without_scheme = address
-        .split_once("://")
-        .map_or(address, |(_, location)| location);
-    let without_credentials = without_scheme
-        .rsplit_once('@')
-        .map_or(without_scheme, |(_, location)| location);
-    let location = without_credentials
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(".git");
-    if location.is_empty() {
-        kind.to_string()
-    } else {
-        format!("{kind}:{location}")
-    }
+    cooldown_core::redact::source_label(source)
 }
 
 fn edge_summary_note(summary: &UpgradeSummary) -> String {

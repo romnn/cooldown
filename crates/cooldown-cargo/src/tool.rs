@@ -786,12 +786,12 @@ impl ToolWrite for CargoTool {
             .await;
         let report = match report {
             Err(CoreError::PendingRecovery(detail)) => {
-                return Ok(ApplyAttempt::PendingRecovery { detail });
+                return Ok(mutation.pending_recovery_attempt(detail));
             }
             report => report,
         };
         let postimage = journal.capture_state()?;
-        Ok(ApplyAttempt::Finished { report, postimage })
+        mutation.finished_attempt(report, &postimage)
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {

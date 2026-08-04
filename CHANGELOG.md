@@ -25,8 +25,10 @@
   `ToolWrite::mutation_tool` binds the capability to its tool family, and `AdapterSet` registration
   now fails when an adapter's read and write identifiers differ or when that tool family is already
   registered. `AdapterSet::register_read` consequently returns `Result`. `apply_with_observer`
-  returns an adapter-boundary postimage, using the `ApplyAttempt` enum to keep adapter-owned pending
-  recovery outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also
+  returns an adapter-boundary postimage. `ApplyAttempt` is now an opaque value constructed through
+  `PreparedMutation`; callers inspect its validated `ApplyAttemptOutcome`, preventing a custom
+  adapter from pairing another project or write set with a finished result. Adapter-owned pending
+  recovery remains outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also
   accepts the prepared capability, and Cargo requires one carrying provenance from an
   adapter-created isolated project. `ApplyReport`
   carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
@@ -60,8 +62,9 @@
   are now created through the fallible `RecoveryScope::repository` and `RecoveryScope::explicit`
   constructors, which bind lexical spellings to one canonical project identity.
   `recovery_authority_projects` returns both attributed projects and warnings for malformed
-  authority that could not be attributed safely. Shared `ProjectReadLease` and `ProjectWriteLease`
-  types now own the project-lock protocol used by both the application and standalone recovery.
+  authority that could not be attributed safely. Shared `ProjectReadLease`, `ProjectWriteLease`,
+  `RepositoryResourceReadLease`, and `RepositoryResourceWriteLease` types now own the coordinated
+  lock protocols used by the application and standalone recovery.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.

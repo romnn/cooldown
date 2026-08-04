@@ -100,5 +100,6 @@ pub(crate) fn recovery_authority_projects(
     }
     projects.sort();
     projects.dedup();
+    warnings.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(crate::RecoveryAuthorityDiscovery { projects, warnings })
 }

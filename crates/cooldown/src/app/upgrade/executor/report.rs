@@ -1,6 +1,5 @@
-use super::ViolationKey;
 use crate::app::{SkippedInfo, UpgradeItem};
-use cooldown_core::{Change, LockStatus, SkipReason, UpdateKind};
+use cooldown_core::{BaselineViolation, Change, LockStatus, SkipReason, UpdateKind};
 use std::collections::{HashMap, HashSet};
 
 /// Collapses chronological version legs into the net rows present in the committed lock.
@@ -18,7 +17,7 @@ pub(super) fn collapse_applied_legs(
     items: &mut Vec<UpgradeItem>,
     project: &str,
     tool: &str,
-    prior_violations: &HashSet<ViolationKey>,
+    prior_violations: &HashSet<BaselineViolation>,
     classify_update_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
 ) {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
@@ -75,7 +74,7 @@ pub(super) fn collapse_applied_legs(
             let downgrade = head.downgrade
                 || prior_violations
                     .iter()
-                    .any(|violation| violation.matches_report_row(tool, head));
+                    .any(|violation| violation_matches_report_row(violation, tool, head));
             let kind = classify_update_kind(&head.from, &net_to).unwrap_or(head.kind);
             retarget.push((first, net_to, downgrade, kind));
             remove.extend(chain.iter().skip(1).copied());
@@ -97,6 +96,17 @@ pub(super) fn collapse_applied_legs(
         .filter(|(idx, _)| !remove.contains(idx))
         .map(|(_, item)| item)
         .collect();
+}
+
+fn violation_matches_report_row(
+    violation: &BaselineViolation,
+    tool: &str,
+    item: &UpgradeItem,
+) -> bool {
+    violation.package.tool.as_str() == tool
+        && violation.package.name == item.name
+        && violation.package.registry == item.registry
+        && violation.version.as_str() == item.from
 }
 
 pub(super) const fn combine_lock_status(

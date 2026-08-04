@@ -4,6 +4,7 @@
 //! crates.
 
 use crate::error::CoreError;
+use crate::model::ToolId;
 use camino::{Utf8Path, Utf8PathBuf};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,40 @@ pub struct ProjectReadLease {
         reason = "the field keeps stale-lock maintenance from removing the lease"
     )]
     maintenance_lock: std::fs::File,
+    coordination: ProjectCoordination,
+}
+
+/// An exclusive OS-backed lease for one repository-wide package-manager resource.
+#[derive(Debug)]
+pub struct RepositoryResourceWriteLease {
+    #[expect(
+        dead_code,
+        reason = "the field keeps the repository resource lease alive"
+    )]
+    resource_lock: std::fs::File,
+    #[expect(
+        dead_code,
+        reason = "the field keeps stale-lock maintenance from removing the lease"
+    )]
+    maintenance_lock: std::fs::File,
+    #[expect(dead_code, reason = "the field retains the lease namespace identity")]
+    coordination: ProjectCoordination,
+}
+
+/// A shared OS-backed lease for one repository-wide package-manager resource.
+#[derive(Debug)]
+pub struct RepositoryResourceReadLease {
+    #[expect(
+        dead_code,
+        reason = "the field keeps the repository resource lease alive"
+    )]
+    resource_lock: std::fs::File,
+    #[expect(
+        dead_code,
+        reason = "the field keeps stale-lock maintenance from removing the lease"
+    )]
+    maintenance_lock: std::fs::File,
+    #[expect(dead_code, reason = "the field retains the lease namespace identity")]
     coordination: ProjectCoordination,
 }
 
@@ -220,7 +255,7 @@ impl ProjectWriteLease {
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         #[cfg(unix)]
-        record_project_lock_owner(&file, &path, coordination.project())?;
+        record_lock_owner(&file, &path, &format!("project {}", coordination.project()))?;
         coordination.validate_current()?;
         Ok(ProjectWriteLease {
             project_lock: file,
@@ -233,6 +268,98 @@ impl ProjectWriteLease {
     #[must_use]
     pub fn coordination(&self) -> &ProjectCoordination {
         &self.coordination
+    }
+}
+
+impl RepositoryResourceWriteLease {
+    /// Acquires exclusive access to one tool's repository-wide native state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds the resource.
+    /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
+    pub fn acquire(target: &Utf8Path, tool: ToolId) -> Result<Self, CoreError> {
+        let coordination = ProjectCoordination::resolve(target)?;
+        Self::acquire_coordination(coordination, tool)
+    }
+
+    /// Acquires exclusive access through an already resolved coordination identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds the resource.
+    /// Returns a filesystem error when the coordination lock cannot be opened safely.
+    pub fn acquire_coordination(
+        coordination: ProjectCoordination,
+        tool: ToolId,
+    ) -> Result<Self, CoreError> {
+        let (path, file, maintenance) = open_repository_lease_files(&coordination, tool)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(project_lock_conflict(&path, "another cooldown run", false));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        record_lock_owner(
+            &file,
+            &path,
+            &format!(
+                "{} repository resource at {}",
+                tool.as_str(),
+                coordination.project()
+            ),
+        )?;
+        coordination.validate_current()?;
+        Ok(RepositoryResourceWriteLease {
+            resource_lock: file,
+            maintenance_lock: maintenance,
+            coordination,
+        })
+    }
+}
+
+impl RepositoryResourceReadLease {
+    /// Acquires shared access to one tool's repository-wide native state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds exclusive access.
+    /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
+    pub fn acquire(target: &Utf8Path, tool: ToolId) -> Result<Self, CoreError> {
+        let coordination = ProjectCoordination::resolve(target)?;
+        Self::acquire_coordination(coordination, tool)
+    }
+
+    /// Acquires shared access through an already resolved coordination identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] while another cooldown operation holds exclusive access.
+    /// Returns a filesystem error when the coordination lock cannot be opened safely.
+    pub fn acquire_coordination(
+        coordination: ProjectCoordination,
+        tool: ToolId,
+    ) -> Result<Self, CoreError> {
+        let (path, file, maintenance) = open_repository_lease_files(&coordination, tool)?;
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(project_lock_conflict(
+                    &path,
+                    "an isolated mutation trial or source write",
+                    true,
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        coordination.validate_current()?;
+        Ok(RepositoryResourceReadLease {
+            resource_lock: file,
+            maintenance_lock: maintenance,
+            coordination,
+        })
     }
 }
 
@@ -296,6 +423,21 @@ fn open_project_lease_files(
     Ok((path, file, maintenance))
 }
 
+fn open_repository_lease_files(
+    coordination: &ProjectCoordination,
+    tool: ToolId,
+) -> Result<(PathBuf, std::fs::File, std::fs::File), CoreError> {
+    let maintenance_path = coordination.directory().join(".maintenance.lock");
+    let maintenance = open_coordination_lock(&maintenance_path)?;
+    maintenance.lock_shared()?;
+    let identity = format!("{}\0{}", coordination.project(), tool.as_str());
+    let path = coordination
+        .directory()
+        .join(format!("repo-{:016x}.lock", fnv1a_64(&identity)));
+    let file = open_coordination_lock(&path)?;
+    Ok((path, file, maintenance))
+}
+
 fn project_lock_conflict(path: &Path, owner: &str, include_holder: bool) -> CoreError {
     let holder = include_holder
         .then(|| std::fs::read_to_string(path).ok())
@@ -308,11 +450,7 @@ fn project_lock_conflict(path: &Path, owner: &str, include_holder: bool) -> Core
 }
 
 #[cfg(unix)]
-fn record_project_lock_owner(
-    file: &std::fs::File,
-    path: &Path,
-    project: &Utf8Path,
-) -> Result<(), CoreError> {
+fn record_lock_owner(file: &std::fs::File, path: &Path, identity: &str) -> Result<(), CoreError> {
     use std::io::{Seek as _, SeekFrom};
     require_single_link(&file.metadata()?, path)?;
     file.set_len(0)?;
@@ -320,7 +458,7 @@ fn record_project_lock_owner(
     writer.seek(SeekFrom::Start(0))?;
     writeln!(
         writer,
-        "locked by cooldown pid {} for {project}",
+        "locked by cooldown pid {} for {identity}",
         std::process::id()
     )?;
     file.sync_data()?;

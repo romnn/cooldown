@@ -503,12 +503,12 @@ impl ToolWrite for FakeEco {
         let (p, _, journal) = self.mutation_parts(mutation)?;
         let report = self.apply(mutation).await;
         if p.root.join("pending-recovery-on-apply").exists() {
-            return Ok(ApplyAttempt::PendingRecovery {
-                detail: "fake adapter retained authoritative recovery evidence".to_string(),
-            });
+            return Ok(mutation.pending_recovery_attempt(
+                "fake adapter retained authoritative recovery evidence".to_string(),
+            ));
         }
         let postimage = journal.capture_state()?;
-        Ok(ApplyAttempt::Finished { report, postimage })
+        mutation.finished_attempt(report, &postimage)
     }
 
     async fn build(&self, p: &Project) -> Result<VerifyReport> {
@@ -3082,7 +3082,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> eyre::R
         .and_then(|item| item.skipped.as_ref())
         .ok_or_else(|| eyre::eyre!("expected a skipped upgrade row"))?;
     assert_eq!(sk.reason, SkipReason::TransitiveInCooldown);
-    assert_eq!(sk.offending.as_deref(), Some("t"));
+    assert_eq!(sk.offending.as_deref(), Some("t from proxy.example"));
     assert!(
         out.warnings
             .iter()
@@ -3345,7 +3345,7 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
     assert_eq!(out.summary.skipped, 1);
     let skipped = out.items[0].skipped.as_ref().expect("skip recorded");
     assert_eq!(skipped.reason, SkipReason::TransitiveInCooldown);
-    assert_eq!(skipped.offending.as_deref(), Some("t"));
+    assert_eq!(skipped.offending.as_deref(), Some("t from proxy.example"));
 }
 
 #[tokio::test]
@@ -4385,7 +4385,10 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
         .as_ref()
         .expect("typer must be held (skipped), not planned");
     assert_eq!(skipped.reason, SkipReason::ResolverConflict);
-    assert_eq!(skipped.offending.as_deref(), Some("huggingface-hub"));
+    assert_eq!(
+        skipped.offending.as_deref(),
+        Some("huggingface-hub from proxy.example")
+    );
     assert_eq!(dry.summary.applied, 0);
     assert_eq!(dry.summary.skipped, 1);
     // A dry-run never persists: the apply ran against the copy, so the real root has no sentinel and
@@ -4413,7 +4416,7 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
         held_set(&real.items),
         vec![HeldCandidate {
             package: "typer".to_string(),
-            offending: Some("huggingface-hub".to_string()),
+            offending: Some("huggingface-hub from proxy.example".to_string()),
         }],
     );
     // The real run did mutate its own (separate) root — proving the sentinel mechanism actually fires

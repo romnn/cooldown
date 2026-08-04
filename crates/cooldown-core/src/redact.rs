@@ -45,6 +45,43 @@ pub fn url_secrets(value: &str) -> String {
     redacted
 }
 
+/// Returns a compact, credential-free label for a package-manager source identity.
+#[must_use]
+pub fn source_label(source: &str) -> String {
+    let source = url_secrets(source);
+    let source = source.as_str();
+    if source == "registry+https://github.com/rust-lang/crates.io-index" {
+        return "crates.io".to_string();
+    }
+    let Some((kind, address)) = source.split_once('+') else {
+        if source.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        }) {
+            return source.to_string();
+        }
+        return format!("source:{:016x}", crate::fs::fnv1a_64(source));
+    };
+    if address.starts_with("file:") {
+        return format!("{kind}:local");
+    }
+    let without_scheme = address
+        .split_once("://")
+        .map_or(address, |(_, location)| location);
+    let without_credentials = without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, location)| location);
+    let location = without_credentials
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git");
+    if location.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}:{location}")
+    }
+}
+
 fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://").and_then(|index| index.checked_add(3)) else {
         return url.to_string();
@@ -152,7 +189,7 @@ const fn is_url_terminator(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::url_secrets;
+    use super::{source_label, url_secrets};
 
     #[test]
     fn redacts_credentials_queries_and_fragments_without_losing_git_provenance() {
@@ -199,5 +236,22 @@ mod tests {
                 "git+https://example.com/repo?branch=next#{commit} https://example.com/#REDACTED"
             )
         );
+    }
+
+    #[test]
+    fn abbreviates_sources_without_disclosing_credentials() {
+        assert_eq!(
+            source_label("registry+https://github.com/rust-lang/crates.io-index"),
+            "crates.io"
+        );
+        assert_eq!(
+            source_label("git+https://token@example.com/private/repo.git?branch=release#abcdef"),
+            "git:example.com/private/repo"
+        );
+        assert_eq!(
+            source_label("git+file:///home/user/private/repo#abcdef"),
+            "git:local"
+        );
+        assert_eq!(source_label("proxy.example"), "proxy.example");
     }
 }

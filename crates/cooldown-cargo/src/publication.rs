@@ -524,7 +524,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn explicit_authority_discovery_warns_about_a_malformed_other_linked_worktree()
+    fn explicit_authority_discovery_sorts_warnings_for_malformed_linked_worktrees()
     -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -534,7 +534,12 @@ mod tests {
         let common = base.join("common.git");
         let first_root = base.join("first");
         let second_root = base.join("second");
-        for (root, name) in [(&first_root, "first"), (&second_root, "second")] {
+        let third_root = base.join("third");
+        for (root, name) in [
+            (&first_root, "first"),
+            (&second_root, "second"),
+            (&third_root, "third"),
+        ] {
             std::fs::create_dir_all(common.join(format!("worktrees/{name}")))?;
             std::fs::write(
                 common.join(format!("worktrees/{name}/commondir")),
@@ -549,22 +554,34 @@ mod tests {
         }
         let first = project(&first_root);
         let second = project(&second_root);
+        let third = project(&third_root);
         let first_authority = recovery_authority(&first)?;
         let second_authority = recovery_authority(&second)?;
+        let third_authority = recovery_authority(&third)?;
         assert_eq!(first_authority.directory(), second_authority.directory());
+        assert_eq!(first_authority.directory(), third_authority.directory());
         let first_anchor_path = recovery_anchor_path(&first_authority)?;
         let first_anchor = RecoveryAnchor::new(&first, b"record")?;
         publish_exclusive_json(&first_anchor_path, &first_anchor)
             .map_err(|error| eyre::eyre!("publish first anchor: {error:?}"))?;
         let second_anchor_path = recovery_anchor_path(&second_authority)?;
-        std::fs::write(&second_anchor_path, "not valid recovery authority")?;
-        std::fs::set_permissions(&second_anchor_path, std::fs::Permissions::from_mode(0o600))?;
+        let third_anchor_path = recovery_anchor_path(&third_authority)?;
+        for path in [&third_anchor_path, &second_anchor_path] {
+            std::fs::write(path, "not valid recovery authority")?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
 
         let scope = crate::RecoveryScope::explicit(&first.root)?;
         let discovery = recovery_authority_projects(&scope)?;
         assert_eq!(discovery.projects, [first.root]);
-        assert_eq!(discovery.warnings.len(), 1);
-        assert_eq!(discovery.warnings[0].path, second_anchor_path);
+        let mut expected = vec![second_anchor_path, third_anchor_path];
+        expected.sort();
+        let warnings = discovery
+            .warnings
+            .into_iter()
+            .map(|warning| warning.path)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings, expected);
         Ok(())
     }
 

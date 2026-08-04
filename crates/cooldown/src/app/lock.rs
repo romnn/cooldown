@@ -1,12 +1,19 @@
 //! Shared read and exclusive write access for project and repository package-manager resources.
 
-use cooldown_core::fs::{ProjectCoordination, ProjectReadLease, ProjectWriteLease};
+use cooldown_core::fs::{
+    ProjectCoordination, ProjectReadLease, ProjectWriteLease, RepositoryResourceReadLease,
+    RepositoryResourceWriteLease,
+};
 use cooldown_core::{CoreError, ToolId};
 #[cfg(unix)]
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions, TryLockError};
+#[cfg(unix)]
+use std::fs::TryLockError;
+#[cfg(any(unix, test))]
+use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(any(unix, test))]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
@@ -19,9 +26,11 @@ const STALE_LOCK_AGE: Duration = Duration::from_hours(720);
 const STALE_COLLECTION_INTERVAL: Duration = Duration::from_hours(24);
 
 /// The target-derived directory where every process rendezvouses for project access.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CoordinationRoot(PathBuf);
 
+#[cfg(test)]
 impl CoordinationRoot {
     fn resolve(target: &camino::Utf8Path) -> Result<(Self, camino::Utf8PathBuf), CoreError> {
         let coordination = ProjectCoordination::resolve(target)?;
@@ -36,14 +45,6 @@ impl CoordinationRoot {
         self.0.join(format!(
             "{:016x}.lock",
             cooldown_core::fs::fnv1a_64(project.as_str())
-        ))
-    }
-
-    fn repo_tool_lock(&self, repo: &camino::Utf8Path, tool: ToolId) -> PathBuf {
-        let identity = format!("{}\0{}", repo.as_str(), tool.as_str());
-        self.0.join(format!(
-            "repo-{:016x}.lock",
-            cooldown_core::fs::fnv1a_64(&identity)
         ))
     }
 }
@@ -63,13 +64,15 @@ pub(crate) struct ProjectWriteGuard {
 /// Holds an OS-backed shared lock for one repository-wide tool resource.
 #[derive(Debug)]
 pub(crate) struct RepoToolReadGuard {
-    file: File,
+    #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
+    lease: RepositoryResourceReadLease,
 }
 
 /// Holds an OS-backed exclusive lock for one repository-wide tool resource.
 #[derive(Debug)]
 pub(crate) struct RepoToolWriteGuard {
-    file: File,
+    #[expect(dead_code, reason = "the field keeps the repository write lease alive")]
+    lease: RepositoryResourceWriteLease,
 }
 
 /// Holds every shared lease needed to read one project's package-manager state.
@@ -121,44 +124,20 @@ impl ProjectWriteGuard {
 impl RepoToolReadGuard {
     /// Acquires shared access to one tool's repository-wide native state.
     pub(crate) fn acquire(root: &camino::Utf8Path, tool: ToolId) -> Result<Self, CoreError> {
-        let (path, file, coordination) = open_repo_tool_lock(root, tool)?;
-        let file = acquire_shared_file(&path, file)?;
-        drop(coordination);
-        Ok(RepoToolReadGuard { file })
-    }
-
-    #[cfg(test)]
-    fn acquire_in(
-        root: &camino::Utf8Path,
-        tool: ToolId,
-        directory: &Path,
-    ) -> Result<Self, CoreError> {
-        let path = directory.join(repo_tool_lock_file_name(root, tool)?);
-        let file = acquire_shared_file(&path, open_lock_file(&path)?)?;
-        Ok(RepoToolReadGuard { file })
+        let coordination = project_coordination(root)?;
+        Ok(RepoToolReadGuard {
+            lease: RepositoryResourceReadLease::acquire_coordination(coordination, tool)?,
+        })
     }
 }
 
 impl RepoToolWriteGuard {
     /// Acquires exclusive access to one tool's repository-wide native state.
     pub(crate) fn acquire(root: &camino::Utf8Path, tool: ToolId) -> Result<Self, CoreError> {
-        let (path, file, coordination) = open_repo_tool_lock(root, tool)?;
-        let identity = format!("{} repository resource at {root}", tool.as_str());
-        let file = acquire_exclusive_file(&identity, &path, file)?;
-        drop(coordination);
-        Ok(RepoToolWriteGuard { file })
-    }
-
-    #[cfg(test)]
-    fn acquire_in(
-        root: &camino::Utf8Path,
-        tool: ToolId,
-        directory: &Path,
-    ) -> Result<Self, CoreError> {
-        let path = directory.join(repo_tool_lock_file_name(root, tool)?);
-        let identity = format!("{} repository resource at {root}", tool.as_str());
-        let file = acquire_exclusive_file(&identity, &path, open_lock_file(&path)?)?;
-        Ok(RepoToolWriteGuard { file })
+        let coordination = project_coordination(root)?;
+        Ok(RepoToolWriteGuard {
+            lease: RepositoryResourceWriteLease::acquire_coordination(coordination, tool)?,
+        })
     }
 }
 
@@ -210,36 +189,12 @@ fn project_coordination(root: &camino::Utf8Path) -> Result<ProjectCoordination, 
     Ok(coordination)
 }
 
-fn open_repo_tool_lock(
-    root: &camino::Utf8Path,
-    tool: ToolId,
-) -> Result<(PathBuf, File, File), CoreError> {
-    let (coordination, canonical) = CoordinationRoot::resolve(root)?;
-    let path = coordination.repo_tool_lock(&canonical, tool);
-    let (file, coordination) = open_coordinated_lock_file(&path).map_err(|error| {
-        CoreError::Filesystem(format!(
-            "cannot open the repository resource coordination lock at {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok((path, file, coordination))
-}
-
-fn lock_conflict(path: &Path, owner: &str, include_holder: bool) -> CoreError {
-    let holder = include_holder
-        .then(|| std::fs::read_to_string(path).ok())
-        .flatten()
-        .and_then(|contents| contents.lines().next().map(str::to_string))
-        .filter(|line| !line.is_empty())
-        .map(|line| format!(" ({line})"))
-        .unwrap_or_default();
-    CoreError::LockConflict(format!("{} is locked by {owner}{holder}", path.display()))
-}
-
+#[cfg(unix)]
 fn lock_error(path: &Path, error: &std::io::Error) -> CoreError {
     CoreError::Filesystem(format!("{}: {error}", path.display()))
 }
 
+#[cfg(any(unix, test))]
 fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     let parent = path.parent().ok_or_else(|| {
         CoreError::Filesystem(format!(
@@ -302,6 +257,7 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     Ok(file)
 }
 
+#[cfg(test)]
 fn open_coordinated_lock_file(path: &Path) -> Result<(File, File), CoreError> {
     let Some(directory) = path.parent() else {
         return Err(CoreError::Filesystem(format!(
@@ -315,35 +271,6 @@ fn open_coordinated_lock_file(path: &Path) -> Result<(File, File), CoreError> {
     coordination.lock_shared().map_err(CoreError::from)?;
     let file = open_lock_file(path)?;
     Ok((file, coordination))
-}
-
-fn acquire_shared_file(path: &Path, file: File) -> Result<File, CoreError> {
-    match file.try_lock_shared() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(lock_conflict(
-            path,
-            "an isolated mutation trial or source write",
-            true,
-        )),
-        Err(TryLockError::Error(error)) => Err(lock_error(path, &error)),
-    }
-}
-
-fn acquire_exclusive_file(identity: &str, path: &Path, file: File) -> Result<File, CoreError> {
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(lock_conflict(path, "another cooldown run", false));
-        }
-        Err(TryLockError::Error(error)) => return Err(lock_error(path, &error)),
-    }
-
-    #[cfg(unix)]
-    let mut file = file;
-    #[cfg(unix)]
-    record_lock_owner(&mut file, path, identity)?;
-    tracing::trace!(path = %path.display(), %identity, "acquired exclusive resource access");
-    Ok(file)
 }
 
 #[cfg(unix)]
@@ -425,7 +352,7 @@ fn collect_stale_lock_files(directory: &Path, minimum_age: Duration) -> Result<b
 }
 
 #[cfg(not(unix))]
-fn collect_stale_locks_once(_directory: &Path) {}
+fn collect_stale_locks_once(_directory: &std::path::Path) {}
 
 #[cfg(unix)]
 fn maintenance_is_recent(
@@ -460,20 +387,6 @@ fn record_maintenance(file: &mut File, now: SystemTime) -> Result<(), CoreError>
 }
 
 #[cfg(unix)]
-fn record_lock_owner(file: &mut File, path: &Path, identity: &str) -> Result<(), CoreError> {
-    require_single_link(&file.metadata()?, path)?;
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    let _ = writeln!(
-        file,
-        "locked by cooldown pid {} for {identity}",
-        std::process::id()
-    );
-    let _ = file.sync_data();
-    Ok(())
-}
-
-#[cfg(unix)]
 fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), CoreError> {
     use std::os::unix::fs::MetadataExt as _;
     if metadata.nlink() == 1 {
@@ -483,33 +396,6 @@ fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), 
         "coordination lock has multiple hard links: {}",
         path.display()
     )))
-}
-
-#[cfg(test)]
-fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> Result<String, CoreError> {
-    let root = canonical_lock_root(root)?;
-    let identity = format!("{}\0{}", root.as_str(), tool.as_str());
-    Ok(format!(
-        "repo-{:016x}.lock",
-        cooldown_core::fs::fnv1a_64(&identity)
-    ))
-}
-
-#[cfg(test)]
-fn canonical_lock_root(root: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, CoreError> {
-    Ok(ProjectCoordination::resolve(root)?.project().to_owned())
-}
-
-impl Drop for RepoToolReadGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-impl Drop for RepoToolWriteGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
 }
 
 #[cfg(test)]
@@ -734,17 +620,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = camino::Utf8Path::from_path(dir.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let locks = tempfile::tempdir()?;
-        let _reader = RepoToolReadGuard::acquire_in(root, ToolId("uv"), locks.path())?;
+        let _reader = RepoToolReadGuard::acquire(root, ToolId("uv"))?;
 
         // Readers share one tool resource, its writer conflicts, and another tool stays
         // independent.
-        RepoToolReadGuard::acquire_in(root, ToolId("uv"), locks.path())?;
+        RepoToolReadGuard::acquire(root, ToolId("uv"))?;
         std::assert_matches!(
-            RepoToolWriteGuard::acquire_in(root, ToolId("uv"), locks.path()),
+            RepoToolWriteGuard::acquire(root, ToolId("uv")),
             Err(CoreError::LockConflict(_))
         );
-        RepoToolWriteGuard::acquire_in(root, ToolId("cargo"), locks.path())?;
+        RepoToolWriteGuard::acquire(root, ToolId("cargo"))?;
         Ok(())
     }
 
