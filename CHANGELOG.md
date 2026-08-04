@@ -71,16 +71,19 @@
   `applied` says whether the binding outcome is committed, and a `held` or `unaddressable` row
   fails `--strict`. Cargo resolver and correction trials run in an isolated project copy. Once the
   complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
-  record guards checked publication of the accepted manifests and lock. Publication includes
-  parent-directory durability on Unix and best-effort directory persistence elsewhere.
+  record guards checked publication of the accepted manifests and lock. Its exact digest is
+  anchored in the owner-private target coordination namespace before source publication, so
+  project content alone cannot claim restoration authority. Publication includes parent-directory
+  durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
   `recover` command discovers public markers and orphaned private artifacts in ignored or hidden
   targets through a bounded repository scan without loading policy, manifests, baselines, or
-  registries; an explicit `-C <project>` also finds targets inside pruned bulk directories. Recovery
-  setup failures honor `--json` with the schema-v4 envelope. The command then completes or restores
-  a validated interrupted publication without continuing into another mutation. Project reads and
-  native-policy sync share target-derived project leases under the Git common directory (or a
-  project-local non-Git state directory), while repository-scoped native state has its own
+  registries; an explicit `-C <project>` scans only that subtree and relevant ancestors, including
+  targets inside pruned bulk directories without traversing unrelated repository siblings.
+  Recovery setup failures honor `--json` with the schema-v4 envelope. The command then completes or
+  restores a validated interrupted publication without continuing into another mutation. Project
+  reads and native-policy sync share target-derived project leases under the Git common directory
+  (or a project-local non-Git state directory), while repository-scoped native state has its own
   tool-qualified lease independent of project discovery. User-visible source identities redact
   credentials, non-provenance query values, and non-commit fragments. Config follows the
   per-project repository cascade, and the closed JSON contract is schema v4.

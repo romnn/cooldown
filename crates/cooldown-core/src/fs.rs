@@ -4,8 +4,235 @@
 //! crates.
 
 use crate::error::CoreError;
+use camino::{Utf8Path, Utf8PathBuf};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// A private target-derived namespace shared by every process coordinating one project.
+#[derive(Debug, Clone)]
+pub struct ProjectCoordination {
+    directory: PathBuf,
+    project: Utf8PathBuf,
+}
+
+impl ProjectCoordination {
+    /// Resolves and securely creates the coordination namespace for `target`.
+    ///
+    /// Git projects rendezvous beneath the Git common directory.
+    /// Non-Git projects use an owner-private `.cooldown/locks` directory beneath the canonical
+    /// project root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem or path-encoding error when the target cannot be canonicalized or the
+    /// coordination namespace is not an owner-private regular directory tree.
+    pub fn resolve(target: &Utf8Path) -> Result<Self, CoreError> {
+        let project = canonical_project_root(target)?;
+        let marker = git_marker(project.as_std_path())?;
+        let (base, components): (PathBuf, &[&str]) = match marker {
+            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"]),
+            None => (project.as_std_path().to_owned(), &[".cooldown", "locks"]),
+        };
+        let directory = secure_create_coordination_directory(&base, components)?;
+        Ok(ProjectCoordination { directory, project })
+    }
+
+    /// Returns the owner-private coordination directory.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Returns the canonical project identity used to derive the namespace.
+    #[must_use]
+    pub fn project(&self) -> &Utf8Path {
+        &self.project
+    }
+}
+
+/// Verifies that an opened authority file is private to the current user where supported.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`] on Unix when the file belongs to another user or grants any
+/// group or other permission.
+pub fn validate_owner_private_file(file: &std::fs::File, path: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        let current_user = rustix::process::geteuid().as_raw();
+        if metadata.uid() != current_user || metadata.mode() & 0o077 != 0 {
+            return Err(CoreError::Filesystem(format!(
+                "authority file is not private to the current user: {}",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+    }
+    Ok(())
+}
+
+fn canonical_project_root(root: &Utf8Path) -> Result<Utf8PathBuf, CoreError> {
+    let path = std::fs::canonicalize(root)?;
+    Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| CoreError::PathEncoding(format!("non-UTF-8 path: {}", path.display())))
+}
+
+fn git_marker(root: &Path) -> Result<Option<PathBuf>, CoreError> {
+    for ancestor in root.ancestors() {
+        let marker = ancestor.join(".git");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    || (metadata.file_type().is_dir() && marker.join("HEAD").is_file()) =>
+            {
+                return Ok(Some(marker));
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(CoreError::Filesystem(format!(
+                    "Git coordination marker is not a regular file or directory: {}",
+                    marker.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CoreError::Filesystem(format!(
+                    "cannot inspect the Git coordination marker at {}: {error}",
+                    marker.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
+    if marker.is_dir() {
+        return std::fs::canonicalize(marker).map_err(Into::into);
+    }
+    let contents = std::fs::read_to_string(marker)?;
+    let git_dir = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CoreError::Filesystem(format!(
+                "invalid Git directory pointer at {}",
+                marker.display()
+            ))
+        })?;
+    let git_dir = resolve_relative(marker.parent().unwrap_or_else(|| Path::new("")), git_dir);
+    let git_dir = std::fs::canonicalize(git_dir)?;
+    let common_marker = git_dir.join("commondir");
+    if !common_marker.is_file() {
+        return Ok(git_dir);
+    }
+    let common = std::fs::read_to_string(&common_marker)?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(CoreError::Filesystem(format!(
+            "empty Git common-directory pointer at {}",
+            common_marker.display()
+        )));
+    }
+    std::fs::canonicalize(resolve_relative(&git_dir, common)).map_err(Into::into)
+}
+
+fn resolve_relative(base: &Path, value: &str) -> PathBuf {
+    let value = Path::new(value);
+    if value.is_absolute() {
+        value.to_owned()
+    } else {
+        base.join(value)
+    }
+}
+
+fn secure_create_coordination_directory(
+    base: &Path,
+    components: &[&str],
+) -> Result<PathBuf, CoreError> {
+    let mut current = base.to_owned();
+    let base_metadata = std::fs::symlink_metadata(&current)?;
+    if !base_metadata.file_type().is_dir() {
+        return Err(CoreError::Filesystem(format!(
+            "coordination root is not a regular directory: {}",
+            current.display()
+        )));
+    }
+    for component in components {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(CoreError::Filesystem(format!(
+                    "coordination path is not a regular directory: {}",
+                    current.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match create_coordination_directory(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if !metadata.file_type().is_dir() {
+                    return Err(CoreError::Filesystem(format!(
+                        "coordination path changed while it was created: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        validate_coordination_directory(&std::fs::symlink_metadata(&current)?, &current)?;
+    }
+    let canonical = std::fs::canonicalize(&current)?;
+    if canonical != current {
+        return Err(CoreError::Filesystem(format!(
+            "coordination directory traverses a symbolic link: {}",
+            current.display()
+        )));
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn validate_coordination_directory(
+    metadata: &std::fs::Metadata,
+    path: &Path,
+) -> Result<(), CoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let current_user = rustix::process::geteuid().as_raw();
+    if metadata.uid() != current_user || metadata.mode() & 0o022 != 0 {
+        return Err(CoreError::Filesystem(format!(
+            "coordination directory is not private to the current user: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn create_coordination_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(path)
+    }
+}
 
 /// The commit state of an atomic replacement with parent-directory durability on Unix.
 #[derive(Debug, thiserror::Error)]

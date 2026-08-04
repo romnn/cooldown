@@ -1,5 +1,6 @@
 //! Shared read and exclusive write access for project and repository package-manager resources.
 
+use cooldown_core::fs::ProjectCoordination;
 use cooldown_core::{CoreError, ToolId};
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -23,21 +24,11 @@ struct CoordinationRoot(PathBuf);
 
 impl CoordinationRoot {
     fn resolve(target: &camino::Utf8Path) -> Result<(Self, camino::Utf8PathBuf), CoreError> {
-        let canonical = canonical_lock_root(target)?;
-        let root = Self::from_canonical(&canonical, git_marker(canonical.as_std_path())?)?;
-        Ok((root, canonical))
-    }
-
-    fn from_canonical(
-        canonical: &camino::Utf8Path,
-        marker: Option<PathBuf>,
-    ) -> Result<Self, CoreError> {
-        let (base, components): (PathBuf, &[&str]) = match marker {
-            Some(marker) => (git_common_directory(&marker)?, &["cooldown", "locks"]),
-            None => (canonical.as_std_path().to_owned(), &[".cooldown", "locks"]),
-        };
-        let directory = secure_create_coordination_directory(&base, components)?;
-        Ok(CoordinationRoot(directory))
+        let coordination = ProjectCoordination::resolve(target)?;
+        Ok((
+            CoordinationRoot(coordination.directory().to_owned()),
+            coordination.project().to_owned(),
+        ))
     }
 
     fn project_lock(&self, project: &camino::Utf8Path) -> PathBuf {
@@ -519,128 +510,6 @@ fn lock_path(root: &camino::Utf8Path) -> Result<PathBuf, CoreError> {
     Ok(coordination.project_lock(&canonical))
 }
 
-fn git_marker(root: &Path) -> Result<Option<PathBuf>, CoreError> {
-    for ancestor in root.ancestors() {
-        let marker = ancestor.join(".git");
-        match std::fs::symlink_metadata(&marker) {
-            Ok(metadata)
-                if metadata.file_type().is_file()
-                    || (metadata.file_type().is_dir() && marker.join("HEAD").is_file()) =>
-            {
-                return Ok(Some(marker));
-            }
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(CoreError::Filesystem(format!(
-                    "Git coordination marker is not a regular file or directory: {}",
-                    marker.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CoreError::Filesystem(format!(
-                    "cannot inspect the Git coordination marker at {}: {error}",
-                    marker.display()
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
-    if marker.is_dir() {
-        return std::fs::canonicalize(marker).map_err(Into::into);
-    }
-    let contents = std::fs::read_to_string(marker)?;
-    let git_dir = contents
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| {
-            CoreError::Filesystem(format!(
-                "invalid Git directory pointer at {}",
-                marker.display()
-            ))
-        })?;
-    let git_dir = resolve_relative(marker.parent().unwrap_or_else(|| Path::new("")), git_dir);
-    let git_dir = std::fs::canonicalize(git_dir)?;
-    let common_marker = git_dir.join("commondir");
-    if !common_marker.is_file() {
-        return Ok(git_dir);
-    }
-    let common = std::fs::read_to_string(&common_marker)?;
-    let common = common.trim();
-    if common.is_empty() {
-        return Err(CoreError::Filesystem(format!(
-            "empty Git common-directory pointer at {}",
-            common_marker.display()
-        )));
-    }
-    std::fs::canonicalize(resolve_relative(&git_dir, common)).map_err(Into::into)
-}
-
-fn resolve_relative(base: &Path, value: &str) -> PathBuf {
-    let value = Path::new(value);
-    if value.is_absolute() {
-        value.to_owned()
-    } else {
-        base.join(value)
-    }
-}
-
-fn secure_create_coordination_directory(
-    base: &Path,
-    components: &[&str],
-) -> Result<PathBuf, CoreError> {
-    let mut current = base.to_owned();
-    let base_metadata = std::fs::symlink_metadata(&current)?;
-    if !base_metadata.file_type().is_dir() {
-        return Err(CoreError::Filesystem(format!(
-            "coordination root is not a regular directory: {}",
-            current.display()
-        )));
-    }
-    for component in components {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(CoreError::Filesystem(format!(
-                    "coordination path is not a regular directory: {}",
-                    current.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match create_coordination_directory(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let metadata = std::fs::symlink_metadata(&current)?;
-                if !metadata.file_type().is_dir() {
-                    return Err(CoreError::Filesystem(format!(
-                        "coordination path changed while it was created: {}",
-                        current.display()
-                    )));
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-        #[cfg(unix)]
-        validate_coordination_directory(&std::fs::symlink_metadata(&current)?, &current)?;
-    }
-    let canonical = std::fs::canonicalize(&current)?;
-    if canonical != current {
-        return Err(CoreError::Filesystem(format!(
-            "coordination directory traverses a symbolic link: {}",
-            current.display()
-        )));
-    }
-    Ok(current)
-}
-
 #[cfg(unix)]
 fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), CoreError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -651,36 +520,6 @@ fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), 
         "coordination lock has multiple hard links: {}",
         path.display()
     )))
-}
-
-#[cfg(unix)]
-fn validate_coordination_directory(
-    metadata: &std::fs::Metadata,
-    path: &Path,
-) -> Result<(), CoreError> {
-    use std::os::unix::fs::MetadataExt as _;
-    let current_user = rustix::process::geteuid().as_raw();
-    if metadata.uid() != current_user || metadata.mode() & 0o022 != 0 {
-        return Err(CoreError::Filesystem(format!(
-            "coordination directory is not private to the current user: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn create_coordination_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::DirBuilder::new().create(path)
-    }
 }
 
 #[cfg(test)]
@@ -702,10 +541,9 @@ fn repo_tool_lock_file_name(root: &camino::Utf8Path, tool: ToolId) -> Result<Str
     ))
 }
 
+#[cfg(test)]
 fn canonical_lock_root(root: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, CoreError> {
-    let path = std::fs::canonicalize(root)?;
-    camino::Utf8PathBuf::from_path_buf(path)
-        .map_err(|path| CoreError::PathEncoding(format!("non-UTF-8 path: {}", path.display())))
+    Ok(ProjectCoordination::resolve(root)?.project().to_owned())
 }
 
 impl Drop for ProjectReadGuard {
@@ -747,8 +585,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         let manifest = root.join("Cargo.toml");
         std::fs::write(&manifest, "[package]\nname = \"safe\"\n")?;
-        let canonical = canonical_lock_root(root)?;
-        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        let (coordination, canonical) = CoordinationRoot::resolve(root)?;
         symlink("../../Cargo.toml", coordination.0.join(".maintenance.lock"))?;
 
         let result = open_coordinated_lock_file(&coordination.project_lock(&canonical));
@@ -771,8 +608,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         let manifest = root.join("Cargo.toml");
         std::fs::write(&manifest, "[package]\nname = \"safe\"\n")?;
-        let canonical = canonical_lock_root(root)?;
-        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        let (coordination, canonical) = CoordinationRoot::resolve(root)?;
         symlink("../../Cargo.toml", coordination.project_lock(&canonical))?;
 
         let error = open_coordinated_lock_file(&coordination.project_lock(&canonical))
@@ -798,9 +634,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         std::fs::create_dir_all(outside.path().join("locks"))?;
         symlink(outside.path(), root.join(".cooldown"))?;
-        let canonical = canonical_lock_root(root)?;
-
-        let error = CoordinationRoot::from_canonical(&canonical, None)
+        let error = CoordinationRoot::resolve(root)
             .err()
             .ok_or_else(|| eyre::eyre!("coordination symlink was accepted"))?;
         std::assert_matches!(error, CoreError::Filesystem(_), "{error:?}");
@@ -814,8 +648,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
         let manifest = root.join("Cargo.toml");
         std::fs::write(&manifest, "[package]\nname = \"safe\"\n")?;
-        let canonical = canonical_lock_root(root)?;
-        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        let (coordination, canonical) = CoordinationRoot::resolve(root)?;
         std::fs::hard_link(&manifest, coordination.0.join(".maintenance.lock"))?;
 
         let result = open_coordinated_lock_file(&coordination.project_lock(&canonical));
@@ -843,9 +676,7 @@ mod tests {
             root.join(".cooldown"),
             std::fs::Permissions::from_mode(0o777),
         )?;
-        let canonical = canonical_lock_root(root)?;
-
-        let error = CoordinationRoot::from_canonical(&canonical, None)
+        let error = CoordinationRoot::resolve(root)
             .err()
             .ok_or_else(|| eyre::eyre!("shared coordination directory was accepted"))?;
 
@@ -945,9 +776,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = camino::Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let canonical = canonical_lock_root(root)?;
-
-        let coordination = CoordinationRoot::from_canonical(&canonical, None)?;
+        let (coordination, canonical) = CoordinationRoot::resolve(root)?;
 
         assert_eq!(coordination.0, canonical.join(".cooldown/locks"));
         Ok(())

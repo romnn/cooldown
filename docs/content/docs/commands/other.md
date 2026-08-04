@@ -93,6 +93,8 @@ Read-only commands fail closed when they find a pending transaction; they never 
 side effect. Recovery validates every recorded manifest and lock state before changing anything.
 It accepts an already complete publication or restores a mixed interrupted publication to its
 complete preimage, and leaves the project and recovery evidence untouched on unknown drift.
+The project-visible record is trusted only when its exact digest matches an owner-private authority
+in cooldown's target-derived coordination namespace.
 It discovers Cargo's public marker and orphaned private state/publication artifacts without loading
 policy, manifests, baselines, or registries, so malformed normal-run inputs cannot prevent
 recovery. Setup failures also use the schema-v4 recovery envelope under `--json`.
@@ -100,5 +102,6 @@ recovery. Setup failures also use the schema-v4 recovery envelope under `--json`
 A repository-root recovery scan includes hidden and gitignored projects but deliberately skips
 bulk dependency, build, and cache directories: `.cache`, `.venv`, `node_modules`, `target`, and
 `vendor`. To recover an explicitly targeted Cargo project inside one of those directories, run
-`cooldown recover -C path/to/project --cargo`; the direct project check does not use the bounded
-repository scan.
+`cooldown recover -C path/to/project --cargo`. An explicit scope scans only that directory's
+subtree and relevant ancestors, so unreadable or malformed repository siblings cannot block the
+selected project.

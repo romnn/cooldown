@@ -26,7 +26,11 @@ The strict, whole-graph default stays **opt-out, never opt-in**.
 
 ## Mutations honor the selected graph gate
 
-For Cargo, `upgrade` and `fix` evaluate resolver changes in an isolated project. If a re-lock leaves a new too-fresh, non-acknowledged dependency in the graph, the trial rejects that change before anything becomes visible in the source. The complete accepted manifest-and-lock state is published under one recovery record.
+For Cargo, `upgrade` and `fix` evaluate resolver changes in an isolated project. If a re-lock leaves
+a new too-fresh, non-acknowledged dependency in the graph, the trial rejects that change before
+anything becomes visible in the source. The complete accepted manifest-and-lock state is published
+under one project-visible recovery record whose exact digest is anchored in cooldown's
+owner-private, target-derived coordination namespace.
 
 Other ecosystems currently run resolver trials in place under the project lease. Cooldown records the files each trial may change, rolls a rejected trial back only when those files still match the observed resolver output, and stops if independent drift makes restoration unsafe. These ecosystems do not yet use Cargo's persistent whole-project recovery record.
 

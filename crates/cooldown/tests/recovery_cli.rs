@@ -1,4 +1,4 @@
-//! Process-level recovery CLI contract tests.
+//! Exercises the process-level recovery CLI contract.
 
 use color_eyre::eyre;
 use std::process::Command;

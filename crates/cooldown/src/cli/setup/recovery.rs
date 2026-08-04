@@ -120,22 +120,51 @@ pub(in crate::cli) struct PreparedRecovery {
     pub(in crate::cli) progress: Progress,
 }
 
+enum RecoveryScope {
+    Repository(Utf8PathBuf),
+    Explicit(Utf8PathBuf),
+}
+
+impl RecoveryScope {
+    fn new(global: &GlobalArgs, workdir: &Utf8Path, repo_root: &Utf8Path) -> Self {
+        if global.dir.is_some() {
+            RecoveryScope::Explicit(workdir.to_owned())
+        } else {
+            RecoveryScope::Repository(scan_root_for(workdir, repo_root))
+        }
+    }
+
+    fn scan_root(&self) -> &Utf8Path {
+        match self {
+            RecoveryScope::Repository(root) | RecoveryScope::Explicit(root) => root,
+        }
+    }
+
+    fn includes(&self, workdir: &Utf8Path, root: &Utf8Path) -> bool {
+        workdir == self.scan_root() || workdir.starts_with(root) || root.starts_with(workdir)
+    }
+}
+
 /// Discovers recovery artifacts without loading normal run configuration or package state.
 pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRecovery, CoreError> {
     validate_recovery_options(global)?;
     let tools = selected_recovery_tools(global)?;
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
-    let scan_root = scan_root_for(&workdir, &repo_root);
+    let scope = RecoveryScope::new(global, &workdir, &repo_root);
     let mut targets = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
         let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root)?;
-        roots.extend(cargo_recovery_roots(&scan_root, !global.no_gitignore)?);
+        roots.extend(cargo_recovery_roots(
+            scope.scan_root(),
+            !global.no_gitignore,
+        )?);
         roots.sort();
         roots.dedup();
-        for root in roots.into_iter().filter(|root| {
-            workdir == scan_root || workdir.starts_with(root) || root.starts_with(&workdir)
-        }) {
+        for root in roots
+            .into_iter()
+            .filter(|root| scope.includes(&workdir, root))
+        {
             let project = relative_project(&repo_root, &root);
             targets.push(RecoveryTarget::new(
                 CARGO_ID,
@@ -505,6 +534,32 @@ mod tests {
         let cli = Cli::parse_from(["cooldown", "recover", "-C", project.as_str(), "--cargo"]);
 
         let prepared = prepare_recovery(&cli.global)?;
+
+        assert_eq!(prepared.targets.len(), 1);
+        assert_eq!(prepared.targets[0].root, project);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_recovery_does_not_traverse_unrelated_repository_siblings() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("crates/target-project");
+        let inaccessible = root.join("crates/unrelated");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&inaccessible)?;
+        std::fs::write(project.join(RECOVERY_MARKER), "{}")?;
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000))?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", project.as_str(), "--cargo"]);
+
+        let result = prepare_recovery(&cli.global);
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700))?;
+        let prepared = result?;
 
         assert_eq!(prepared.targets.len(), 1);
         assert_eq!(prepared.targets[0].root, project);
