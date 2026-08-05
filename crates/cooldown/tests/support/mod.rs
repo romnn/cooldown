@@ -400,6 +400,23 @@ pub struct EdgeRow {
     pub to: String,
 }
 
+#[derive(serde::Deserialize)]
+struct RawEdgeRow {
+    name: String,
+    applied: bool,
+    from: String,
+    to: String,
+    edge: RawEdgeInfo,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEdgeInfo {
+    dependent: String,
+    dependent_source: Option<String>,
+    action: String,
+}
+
 /// A parsed `cooldown --json` envelope with typed accessors for the fields the invariants check.
 #[derive(Debug)]
 pub struct Envelope {
@@ -636,20 +653,19 @@ impl Envelope {
     pub fn edge_rows(&self) -> Vec<EdgeRow> {
         self.items()
             .iter()
-            .filter_map(|item| {
-                let edge = item.get("edge")?;
-                Some(EdgeRow {
-                    dependency: item.get("name")?.as_str()?.to_owned(),
-                    dependent: edge.get("dependent")?.as_str()?.to_owned(),
-                    dependent_source: edge
-                        .get("dependentSource")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    action: edge.get("action")?.as_str()?.to_owned(),
-                    applied: item.get("applied")?.as_bool()?,
-                    from: item.get("from")?.as_str()?.to_owned(),
-                    to: item.get("to")?.as_str()?.to_owned(),
-                })
+            .filter(|item| item.get("edge").is_some())
+            .map(|item| {
+                let raw: RawEdgeRow = serde_json::from_value(item.clone())
+                    .expect("edge-bearing upgrade row matches the JSON schema");
+                EdgeRow {
+                    dependency: raw.name,
+                    dependent: raw.edge.dependent,
+                    dependent_source: raw.edge.dependent_source,
+                    action: raw.edge.action,
+                    applied: raw.applied,
+                    from: raw.from,
+                    to: raw.to,
+                }
             })
             .collect()
     }

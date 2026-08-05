@@ -2,6 +2,7 @@
 //! attributable to a dependency you couldn't evaluate forces a non-zero exit. Evaluates the
 //! resolved graph (direct + transitive) by default.
 
+use super::lock::ProjectAccessWriteGuard;
 use super::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
     RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
@@ -180,20 +181,24 @@ impl<'a> CheckRunner<'a> {
             return;
         };
 
-        let refreshed = self.refresh_lock(pctx, &read.project_label).await;
+        let (refreshed, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
         if matches!(&refreshed, Some(LockProbe::Skip)) {
             return;
         }
-        let read_guard = match self.ws.project_read_guard(pctx).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    &read.project_label,
-                    None,
-                ));
-                return;
+        let read_guard = if refresh_guard.is_some() {
+            None
+        } else {
+            match self.ws.project_read_guard(pctx).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.acc.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        &read.project_label,
+                        None,
+                    ));
+                    return;
+                }
             }
         };
         let lock_probe = match refreshed {
@@ -228,6 +233,7 @@ impl<'a> CheckRunner<'a> {
             }
         };
         drop(read_guard);
+        drop(refresh_guard);
 
         self.opts
             .progress
@@ -271,18 +277,22 @@ impl<'a> CheckRunner<'a> {
         &mut self,
         pctx: &super::ProjectCtx,
         project_label: &str,
-    ) -> Option<LockProbe> {
+    ) -> (Option<LockProbe>, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(refresh) => {
                 self.acc.warnings.extend(refresh.recovery);
-                match refresh.report {
+                let probe = match refresh.report {
                     Ok(report) => {
                         report.map(|report| self.handle_lock_report(report, pctx, project_label))
                     }
                     Err(error) => Some(self.handle_lock_error(&error, pctx, project_label)),
-                }
+                };
+                (probe, refresh.guard)
             }
-            Err(err) => Some(self.handle_lock_error(&err, pctx, project_label)),
+            Err(err) => (
+                Some(self.handle_lock_error(&err, pctx, project_label)),
+                None,
+            ),
         }
     }
 

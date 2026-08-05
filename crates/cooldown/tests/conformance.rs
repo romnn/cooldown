@@ -69,6 +69,8 @@ struct State {
     fresh_transitive_present: bool,
     /// Whether `apply` has already mutated the project once.
     apply_attempted: bool,
+    /// Number of resolver apply attempts made during this run.
+    apply_attempts: usize,
     /// Direct manifest constraints that have no resolved graph entry.
     manifest_constraints: Vec<Dependency>,
     /// Package versions pinned by a successful fake apply, surfaced by the next graph probe.
@@ -83,6 +85,8 @@ struct State {
     recovery_completed: bool,
     /// Simulate an independent lock edit immediately before a graph-probe failure.
     drift_lock_before_graph_failure: bool,
+    /// Delay an armed graph-probe failure until this apply attempt, when configured.
+    fail_graph_after_attempt: Option<usize>,
     /// Make an outer two-file rollback restore its first file, then fail on its second file.
     #[cfg(unix)]
     force_partial_restore_failure: bool,
@@ -254,7 +258,13 @@ impl ToolRead for FakeEco {
                 "dependency discovery ran before mutation recovery".to_string(),
             ));
         }
-        if scope == DepScope::Graph && self.fail_graph_after_apply && state.apply_attempted {
+        if scope == DepScope::Graph
+            && self.fail_graph_after_apply
+            && state.apply_attempted
+            && state
+                .fail_graph_after_attempt
+                .is_none_or(|attempt| state.apply_attempts >= attempt)
+        {
             if state.drift_lock_before_graph_failure {
                 std::fs::write(p.root.join("fake.lock"), b"external edit")?;
             }
@@ -451,6 +461,7 @@ impl ToolWrite for FakeEco {
         let (p, plan, _) = self.mutation_parts(mutation)?;
         let mut state = self.state.lock().unwrap();
         state.apply_attempted = true;
+        state.apply_attempts += 1;
         if self.root.join("use-isolated-mutation").exists() {
             if p.root == self.root {
                 return Err(CoreError::System(
@@ -3114,6 +3125,75 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> eyre::R
         out.warnings
             .iter()
             .all(|warning| warning.message != "committed correction durability is uncertain")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upgrade_keeps_earlier_singleton_holds_when_later_selection_aborts() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    for name in ["a", "b"] {
+        releases.insert(
+            name.to_string(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-06-01T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+    }
+    let mut locked = HashMap::new();
+    for name in ["a", "b"] {
+        locked.insert(
+            name.to_string(),
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        );
+    }
+    locked.insert(
+        "t".to_string(),
+        rel("v0.5.0", 0, Some("2026-06-16T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true), dep("b", "v1.0.0", true)],
+        transitive: Vec::new(),
+        fresh_transitive: Some(dep("t", "v0.5.0", false)),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: true,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State {
+            fail_graph_after_attempt: Some(3),
+            ..State::default()
+        }),
+        root,
+    };
+
+    let outcome = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    assert_eq!(outcome.exit, Exit::Environment);
+    assert_eq!(outcome.summary.applied, 0);
+    assert_eq!(outcome.summary.skipped, 1);
+    assert_eq!(outcome.summary.errors, 1);
+    let held = outcome
+        .items
+        .iter()
+        .find(|item| item.skipped.is_some())
+        .ok_or_else(|| eyre::eyre!("earlier rejected singleton was not reported"))?;
+    assert_eq!(held.name, "a");
+    assert_eq!(
+        held.skipped.as_ref().map(|skipped| skipped.reason),
+        Some(SkipReason::TransitiveInCooldown)
     );
     Ok(())
 }

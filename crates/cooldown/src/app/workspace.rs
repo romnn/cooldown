@@ -34,6 +34,7 @@ pub struct ProjectCtx {
 pub(crate) struct LockRefresh {
     pub(crate) report: cooldown_core::Result<Option<LockVerifyReport>>,
     pub(crate) recovery: Vec<Diagnostic>,
+    pub(crate) guard: Option<ProjectAccessWriteGuard>,
 }
 
 pub(crate) fn recovery_diagnostics(
@@ -591,18 +592,21 @@ impl Workspace {
             return Ok(LockRefresh {
                 report: Ok(None),
                 recovery: Vec::new(),
+                guard: None,
             });
         }
         let Some(writer) = self.mutator(pctx.tool) else {
             return Ok(LockRefresh {
                 report: Ok(None),
                 recovery: Vec::new(),
+                guard: None,
             });
         };
         if !writer.supports_lock_refresh() {
             return Ok(LockRefresh {
                 report: Ok(None),
                 recovery: Vec::new(),
+                guard: None,
             });
         }
         opts.progress.phase("refreshing lock state");
@@ -617,7 +621,11 @@ impl Workspace {
             .await?;
         let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
         let report = writer.refresh_lock(&pctx.project).await;
-        Ok(LockRefresh { report, recovery })
+        Ok(LockRefresh {
+            report,
+            recovery,
+            guard: Some(guard),
+        })
     }
 
     /// Starts a read session and checks adapter-owned pending state without mutating it.
@@ -997,6 +1005,7 @@ pub(crate) fn lock_report_outcome(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use color_eyre::eyre;
     use cooldown_core::config::builtin_default_layer;
     use cooldown_core::{
         Capabilities, DepScope, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
@@ -1013,6 +1022,7 @@ mod tests {
 
     struct TestAdapter {
         write_id: ToolId,
+        refresh: bool,
     }
 
     #[async_trait]
@@ -1114,14 +1124,30 @@ mod tests {
                 detail: String::new(),
             })
         }
+
+        async fn refresh_lock(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+            Ok(Some(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "refreshed".to_string(),
+            }))
+        }
+
+        fn supports_lock_refresh(&self) -> bool {
+            self.refresh
+        }
     }
 
     #[test]
     fn adapter_registration_rejects_mismatched_read_and_write_tool_families() {
         let mut adapters = AdapterSet::new();
 
-        let result =
-            adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: PNPM }));
+        let result = adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: PNPM,
+            refresh: false,
+        }));
 
         std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 0);
@@ -1133,16 +1159,58 @@ mod tests {
     fn adapter_registration_rejects_a_duplicate_tool_family_atomically() {
         let mut adapters = AdapterSet::new();
         std::assert_matches!(
-            adapters.register_target_verified_mutator(Arc::new(TestAdapter { write_id: CARGO })),
+            adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+                write_id: CARGO,
+                refresh: false,
+            })),
             Ok(())
         );
 
-        let result = adapters.register_read(Arc::new(TestAdapter { write_id: CARGO }));
+        let result = adapters.register_read(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: false,
+        }));
 
         std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 1);
         assert_eq!(adapters.reader(CARGO).map(ToolRead::id), Some(CARGO));
         assert!(adapters.writer(CARGO).is_some());
+    }
+
+    #[tokio::test]
+    async fn lock_refresh_retains_exclusive_access_for_the_following_read() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let pctx = project_ctx(CARGO, root.as_str());
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: true,
+        }))?;
+        let ws = Workspace::new(
+            adapters,
+            vec![pctx],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+        let opts = RunOpts {
+            lock: true,
+            ..RunOpts::default()
+        };
+
+        let refresh = ws.refresh_project_lock(&ws.projects()[0], &opts).await?;
+
+        assert!(refresh.guard.is_some());
+        std::assert_matches!(
+            ProjectAccessReadGuard::acquire(&root, &root, CARGO, false),
+            Err(cooldown_core::CoreError::LockConflict(_))
+        );
+        drop(refresh);
+        ProjectAccessReadGuard::acquire(&root, &root, CARGO, false)?;
+        Ok(())
     }
 
     #[async_trait]

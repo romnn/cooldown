@@ -99,7 +99,10 @@ enum UpgradeSelectionResult {
         accepted: Vec<Change>,
         rejected: Vec<RejectedUpgrade>,
     },
-    Aborted(BatchOutcome),
+    Aborted {
+        outcome: BatchOutcome,
+        rejected: Vec<RejectedUpgrade>,
+    },
 }
 
 /// The evolving per-project state during upgrade trials.
@@ -533,8 +536,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Isolates a policy-blocked multi-candidate batch, then commits its safe subset via one joint
-    /// replay. With no safe candidate every rejection is reported held; a selection abort merges
-    /// only the failing trial's errors.
+    /// replay. With no safe candidate every rejection is reported held; a selection abort retains
+    /// earlier settled rejections beside the failing trial's errors unless rollback leaves the
+    /// project state indeterminate.
     async fn recover_policy_blocked_upgrade(
         &mut self,
         lock_changes: Vec<Change>,
@@ -554,7 +558,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.replay_selected_upgrade_changes(accepted, rejected, baseline, state, rollback)
                     .await
             }
-            UpgradeSelectionResult::Aborted(outcome) => self.merge_batch_outcome(outcome),
+            UpgradeSelectionResult::Aborted { outcome, rejected } => {
+                if !outcome.has_restore_conflict() {
+                    self.record_rejected_upgrade_changes(rejected);
+                }
+                self.merge_batch_outcome(outcome)
+            }
         }
     }
 
@@ -591,14 +600,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 UpgradeTrialResult::Settled(_) => {
                     let mut outcome = BatchOutcome::default();
                     if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
-                        return UpgradeSelectionResult::Aborted(outcome);
+                        return UpgradeSelectionResult::Aborted { outcome, rejected };
                     }
                     accepted.extend(group);
                 }
                 UpgradeTrialResult::PolicyBlocked(violations) => {
                     let mut outcome = BatchOutcome::default();
                     if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
-                        return UpgradeSelectionResult::Aborted(outcome);
+                        return UpgradeSelectionResult::Aborted { outcome, rejected };
                     }
                     if group.len() > 1 {
                         push_upgrade_halves(&mut work, group);
@@ -612,7 +621,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 UpgradeTrialResult::Aborted(outcomes) => {
                     let outcome = self.settle_aborted_trial(rollback, baseline, state, outcomes);
-                    return UpgradeSelectionResult::Aborted(outcome);
+                    return UpgradeSelectionResult::Aborted { outcome, rejected };
                 }
             }
         }

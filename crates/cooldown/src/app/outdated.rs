@@ -2,6 +2,7 @@
 //! candidate set; informational, so per-dep failures never change the exit code.
 
 use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
+use super::lock::ProjectAccessWriteGuard;
 use super::{
     Exit, FetchedRelease, LockReportAction, RunOpts, Workspace, age_days, diag_from_error,
     lock_report_outcome, render_window,
@@ -103,20 +104,25 @@ impl<'a> OutdatedRunner<'a> {
             return;
         };
 
-        if !self.refresh_lock(pctx, &read.project_label).await {
+        let (continue_run, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
+        if !continue_run {
             return;
         }
 
-        let read_guard = match self.ws.project_read_guard(pctx).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    &read.project_label,
-                    None,
-                ));
-                return;
+        let read_guard = if refresh_guard.is_some() {
+            None
+        } else {
+            match self.ws.project_read_guard(pctx).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        &read.project_label,
+                        None,
+                    ));
+                    return;
+                }
             }
         };
 
@@ -177,6 +183,7 @@ impl<'a> OutdatedRunner<'a> {
             }
         }
         drop(read_guard);
+        drop(refresh_guard);
         let fetched = self
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
@@ -307,11 +314,15 @@ impl<'a> OutdatedRunner<'a> {
         apply_held(items, &candidates, &held);
     }
 
-    async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
+    async fn refresh_lock(
+        &mut self,
+        pctx: &'a super::ProjectCtx,
+        project_label: &str,
+    ) -> (bool, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(refresh) => {
                 self.warnings.extend(refresh.recovery);
-                match refresh.report {
+                let continue_run = match refresh.report {
                     Ok(report) => report
                         .is_none_or(|report| self.handle_lock_report(report, pctx, project_label)),
                     Err(error) => {
@@ -321,14 +332,15 @@ impl<'a> OutdatedRunner<'a> {
                         );
                         false
                     }
-                }
+                };
+                (continue_run, refresh.guard)
             }
             Err(error) => {
                 self.errors.push(
                     diag_from_error(&error, pctx.tool, project_label, None)
                         .with_path(pctx.project.manifest.as_str()),
                 );
-                false
+                (false, None)
             }
         }
     }
