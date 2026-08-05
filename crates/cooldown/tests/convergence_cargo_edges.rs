@@ -323,7 +323,7 @@ fn edge_policy_none_reports_without_correcting() {
     let fixture = edge_fixture();
     let binding_before = edge_binding(&fixture.read_bytes("Cargo.lock"), "diesel", "uuid");
 
-    let upgrade = fixture.cooldown_json(&[
+    let args = [
         "upgrade",
         "--freeze",
         FREEZE,
@@ -331,13 +331,12 @@ fn edge_policy_none_reports_without_correcting() {
         "uuid",
         "--cargo-edge-policy",
         "none",
-    ]);
+    ];
+    let upgrade = fixture.cooldown_json(&args);
     assert!(
         upgrade.ok(),
         "upgrade should succeed: {}",
-        fixture
-            .cooldown(&["upgrade", "--freeze", FREEZE, "--package", "uuid"])
-            .stderr_str()
+        fixture.cooldown(&args).stderr_str()
     );
     assert!(upgrade.applied_names().contains("uuid"));
 

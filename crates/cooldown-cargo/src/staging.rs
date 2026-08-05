@@ -492,15 +492,27 @@ fn rust_toolchain_paths(directories: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<
 }
 
 fn reject_staging_ancestor_overrides(scratch: &Utf8Path) -> Result<()> {
+    reject_staging_ancestor_overrides_with_environment(scratch, &cargo_config_environment()?)
+}
+
+fn reject_staging_ancestor_overrides_with_environment(
+    scratch: &Utf8Path,
+    environment: &CargoConfigEnvironment,
+) -> Result<()> {
     let ancestors = scratch
         .ancestors()
         .skip(1)
         .map(Utf8Path::to_owned)
         .collect::<BTreeSet<_>>();
-    let config_dirs = ancestors
+    let mut config_dirs = ancestors
         .iter()
         .map(|ancestor| ancestor.join(".cargo"))
         .collect::<BTreeSet<_>>();
+    if let Some((cargo_home, configured)) = &environment.cargo_home
+        && (!configured || cargo_home.is_absolute())
+    {
+        config_dirs.remove(cargo_home);
+    }
     let unexpected = cargo_config_paths(&config_dirs)?
         .into_iter()
         .chain(rust_toolchain_paths(&ancestors)?)
@@ -971,6 +983,29 @@ mod tests {
             .err()
             .ok_or_else(|| eyre::eyre!("temporary Rust toolchain override was accepted"))?;
         assert!(toolchain_error.to_string().contains(toolchain.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn ambient_cargo_home_is_not_a_staging_divergence() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().to_owned())?;
+        let scratch = root.join("scratch/trial");
+        std::fs::create_dir_all(&scratch)?;
+        let cargo_home = root.join(".cargo");
+        write(
+            &cargo_home.join("config.toml"),
+            indoc! {"
+                [net]
+                offline = true
+            "},
+        )?;
+        for configured in [false, true] {
+            let environment = CargoConfigEnvironment {
+                cargo_home: Some((cargo_home.clone(), configured)),
+            };
+            reject_staging_ancestor_overrides_with_environment(&scratch, &environment)?;
+        }
         Ok(())
     }
 

@@ -35,9 +35,9 @@ recovering that alternate file requires it to become part of the adapter's typed
 Cargo configuration `include`, legacy `paths`, path-backed config patches, local registries, and
 file-backed registry indices are also rejected until cooldown can snapshot their complete local
 input closure. This includes `CARGO_REGISTRIES_<NAME>_INDEX` overrides.
-Cooldown also rejects a temporary staging location whose ancestors contain Cargo configuration or
-a Rust toolchain file, because those files would affect only the isolated trial and not the source
-project Cargo first described.
+Cooldown also rejects a temporary staging location whose ancestors contain Cargo configuration
+outside the active Cargo home, or a Rust toolchain file, because those files could affect only the
+isolated trial and not the source project Cargo first described.
 
 A symlink used to locate the Cargo project root is supported because cooldown canonicalizes that
 root before coordinating access. A symlink inside a writable project path, such as a symlinked
