@@ -22,7 +22,7 @@ use crate::CARGO_ID;
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
-use crate::lockfile::{CargoLock, SlotKey};
+use crate::lockfile::{CargoLock, SlotKey, SourcedSlotKey};
 use crate::manifest;
 use crate::native::parse_native;
 use crate::version;
@@ -34,10 +34,10 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
     Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
-    MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
-    Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    MemberRef, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId,
+    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -328,45 +328,117 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
 /// The paired version-slot changes that `applied` does not already report, as sorted collateral
 /// rows.
 ///
-/// Exclusion is by exact `(name, from, to)` move, not by planned package name: a planned candidate
-/// the resolve *held* can still have been floated off its baseline by a sibling pin, and that real
-/// movement must surface beside its held skip row instead of being silently dropped.
+/// Exclusion is by exact registry plus `(name, from, to)` move, not by planned package name: a
+/// planned candidate the resolve *held* can still have been floated off its baseline by a sibling
+/// pin, and that real movement must surface beside its held skip row instead of being silently
+/// dropped. Slots are compared per registry source, so a crates.io crate and an
+/// alternate-registry crate sharing a name and major can neither pair with each other nor borrow
+/// each other's registry label.
 fn collateral_changes(
-    before: &BTreeMap<SlotKey, String>,
-    after: &BTreeMap<SlotKey, String>,
+    before: &BTreeMap<SourcedSlotKey, String>,
+    after: &BTreeMap<SourcedSlotKey, String>,
     applied: &[Change],
 ) -> Vec<Change> {
-    let reported: BTreeSet<(&str, &str, &str)> = applied
+    let reported: BTreeSet<(&str, &str, &str, &str)> = applied
         .iter()
         .map(|change| {
             (
+                change.package.registry.as_deref().unwrap_or(CRATES_IO),
                 change.package.name.as_str(),
                 change.from.as_str(),
                 change.to.as_str(),
             )
         })
         .collect();
-    let mut changes: Vec<Change> = before
-        .iter()
-        .filter_map(|((name, _), from)| {
-            let to = after.get(&(name.clone(), version::major_key(from).0))?;
-            (version::compare(from, to).is_ne()
-                && !reported.contains(&(name.as_str(), from.as_str(), to.as_str())))
-            .then(|| collateral_change(name, from, to))
-        })
-        .collect();
-    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    // Group each side's version lines per source and name. Pairing only within a slot line would
+    // lose every cross-line float — a companion crate dragged to its dependent's next major
+    // (cranelift 0.133 → 0.134 beside wasmtime 46 → 47) is exactly the collateral this report
+    // exists to surface, and 0.x lines make even minor companions cross-line.
+    let mut before_by_name: BTreeMap<(&String, &String), Vec<&String>> = BTreeMap::new();
+    for ((source, name, _), version) in before {
+        before_by_name
+            .entry((source, name))
+            .or_default()
+            .push(version);
+    }
+    let mut after_by_name: BTreeMap<(&String, &String), Vec<&String>> = BTreeMap::new();
+    for ((source, name, _), version) in after {
+        after_by_name
+            .entry((source, name))
+            .or_default()
+            .push(version);
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    for ((source, name), befores) in &before_by_name {
+        let empty = Vec::new();
+        let afters = after_by_name.get(&(*source, *name)).unwrap_or(&empty);
+        // Identical versions on both sides are unmoved lines; only the residuals moved.
+        let mut from_residual: Vec<&String> = befores
+            .iter()
+            .filter(|version| !afters.contains(version))
+            .copied()
+            .collect();
+        let mut to_residual: Vec<&String> = afters
+            .iter()
+            .filter(|version| !befores.contains(version))
+            .copied()
+            .collect();
+        from_residual.sort_by(|a, b| version::compare(a, b));
+        to_residual.sort_by(|a, b| version::compare(a, b));
+        let pairs: Vec<(&String, &String)> = if from_residual.len() == to_residual.len() {
+            // Equal residual counts: each line moved somewhere; rank order pairs each old line
+            // with its successor (coexisting lines keep their relative order across a re-lock).
+            from_residual.into_iter().zip(to_residual).collect()
+        } else {
+            // A line appeared or vanished (a fork or a dropped duplicate): rank pairing would
+            // misattribute, so fall back to same-line pairing and leave the structural change to
+            // the lock diff.
+            from_residual
+                .into_iter()
+                .filter_map(|from| {
+                    let line = version::major_key(from).0;
+                    to_residual
+                        .iter()
+                        .find(|to| version::major_key(to).0 == line)
+                        .map(|to| (from, *to))
+                })
+                .collect()
+        };
+        // The compact label the slot's lock source resolves to (`crates.io` for the default
+        // registry), computed once per group and matched against the applied rows' registry.
+        let registry = cooldown_core::redact::source_label(source);
+        for (from, to) in pairs {
+            if version::compare(from, to).is_ne()
+                && !reported.contains(&(
+                    registry.as_str(),
+                    name.as_str(),
+                    from.as_str(),
+                    to.as_str(),
+                ))
+            {
+                changes.push(collateral_change(&registry, name, from, to));
+            }
+        }
+    }
+    changes.sort_by(|a, b| {
+        a.package
+            .name
+            .cmp(&b.package.name)
+            .then_with(|| a.package.registry.cmp(&b.package.registry))
+            .then_with(|| a.from.as_str().cmp(b.from.as_str()))
+    });
     changes
 }
 
-/// A paired version-slot change that no planned row reports.
+/// A paired version-slot change that no planned row reports, labeled with the registry its lock
+/// source resolves to.
 ///
 /// The whole-graph re-resolve can force collateral movement, such as pushing a transitive backward
 /// for consistency or maturing a crate down during `fix`.
-fn collateral_change(name: &str, from: &str, to: &str) -> Change {
+fn collateral_change(registry: &str, name: &str, from: &str, to: &str) -> Change {
     let downgrade = version::compare(to, from).is_lt();
     Change {
-        package: PackageId::new(CARGO_ID, name.to_string(), Some(CRATES_IO.to_string())),
+        package: PackageId::new(CARGO_ID, name.to_string(), Some(registry.to_string())),
         from: Version::new(from.to_string()),
         to: Version::new(to.to_string()),
         // A collateral move is transitive consistency churn, not a directly-declared bump; its kind
@@ -376,6 +448,132 @@ fn collateral_change(name: &str, from: &str, to: &str) -> Change {
         direct: false,
         members: Vec::new(),
     }
+}
+
+/// Pin-rejection diagnostics keyed by planned-change identity. Keying by name alone would let
+/// coexisting-major plans for one crate (cargo forks distinct majors side by side) overwrite each
+/// other's diagnostics and attach one target's rejection to the other's held row.
+type PinRejections = BTreeMap<(String, String, String), String>;
+
+/// The [`PinRejections`] key of one planned change: its `(name, from, to)` line.
+fn rejection_key(change: &Change) -> (String, String, String) {
+    (
+        change.package.name.clone(),
+        change.from.as_str().to_string(),
+        change.to.as_str().to_string(),
+    )
+}
+
+/// Each planned candidate either reached cooldown's target (its newest-within-window) — reported
+/// applied — or fell short because a mutually-exclusive `=`-pin or single-major shared transitive
+/// won — reported held, naming the blocker.
+fn classify_planned_changes(
+    plan: &Plan,
+    crates_io_after: &BTreeMap<SlotKey, String>,
+    graph: Option<&crate::cargocmd::ResolvedGraph>,
+    pin_rejections: &PinRejections,
+    report: &mut ApplyReport,
+) {
+    for change in &plan.changes {
+        if reached_after(crates_io_after, graph, change) {
+            report.applied.push(change.clone());
+        } else {
+            let offender = graph
+                .and_then(|graph| {
+                    blocking_requirer(graph, &change.package.name, change.to.as_str())
+                })
+                .unwrap_or_else(|| change.package.name.clone());
+            report.skipped.push(Skipped {
+                change: change.clone(),
+                reason: SkipReason::ResolverConflict,
+                offending: Some(PackageId::new(
+                    CARGO_ID,
+                    offender,
+                    Some(CRATES_IO.to_string()),
+                )),
+                // Cargo's own rejection sentence (which requirement, declared by whom) beats
+                // both the generic reason and the `=`-pin-only graph offender.
+                detail: pin_rejections.get(&rejection_key(change)).cloned(),
+            });
+        }
+    }
+}
+
+/// The manifests a candidate's widen may touch — its members' plus the workspace root (the
+/// inherited-requirement fallback) — with their pre-widen contents, so a widen whose pin cannot
+/// land is restored byte-identically instead of leaving a requirement the lock does not honor.
+fn manifest_snapshot(
+    root: &Utf8Path,
+    members: &[MemberRef],
+) -> Result<Vec<(Utf8PathBuf, Option<String>)>> {
+    let mut paths: Vec<Utf8PathBuf> = members
+        .iter()
+        .map(|member| manifest::member_manifest_rel(&member.path))
+        .collect();
+    paths.push(Utf8PathBuf::from("Cargo.toml"));
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|rel| {
+            let contents = match std::fs::read_to_string(root.join(&rel)) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(CoreError::from(error)),
+            };
+            Ok((rel, contents))
+        })
+        .collect()
+}
+
+/// Writes a [`manifest_snapshot`] back verbatim. A path captured as absent is left alone — the
+/// widen machinery never creates manifests.
+fn restore_manifests(root: &Utf8Path, snapshot: &[(Utf8PathBuf, Option<String>)]) -> Result<()> {
+    for (rel, contents) in snapshot {
+        if let Some(contents) = contents {
+            std::fs::write(root.join(rel), contents)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compresses a rejected `cargo update --precise` stderr into one report-friendly line: cargo's
+/// `error:` sentence plus the first `required by package` attribution — the two facts that say
+/// which requirement blocked the pin and whose manifest declares it. `None` when the error carries
+/// no stderr (nothing better than the generic reason exists). The summary reaches the TTY and
+/// JSON reports verbatim, so embedded URLs are stripped of credentials here, at construction.
+fn summarize_pin_rejection(error: &CoreError) -> Option<String> {
+    use std::fmt::Write as _;
+    let CoreError::Tool { stderr, .. } = error else {
+        return None;
+    };
+    let sentence = stderr.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix("error: ")
+            .or_else(|| line.strip_prefix("error["))
+            .map(|rest| rest.trim_end_matches('.'))
+    })?;
+    let mut summary = sentence.to_string();
+    // Cargo prints the first attribution either bare (`required by package …`) or as a chain
+    // continuation (`... required by package …`); accept both.
+    if let Some(requirer) = stderr.lines().map(str::trim).find_map(|line| {
+        line.trim_start_matches('.')
+            .trim_start()
+            .strip_prefix("required by package `")
+            .and_then(|rest| rest.split('`').next())
+    }) {
+        // The path/hash suffix cargo prints for workspace members is noise at report width.
+        let requirer = requirer.split(" (").next().unwrap_or(requirer);
+        let _ = write!(summary, " (required by {requirer})");
+    }
+    // Cargo quotes registry URLs inside requirement errors; a private-registry URL can embed
+    // credentials, so redact before the cap bounds the (possibly lengthened) line.
+    let mut summary = cooldown_core::redact::url_secrets(&summary);
+    // Char-boundary-safe cap: the requirement sentence quotes tool-controlled strings.
+    if let Some((cut, _)) = summary.char_indices().nth(220) {
+        summary.truncate(cut);
+        summary.push('…');
+    }
+    Some(summary)
 }
 
 /// The crate whose `=x.y.z` requirement structurally holds `held` out of the graph at `target` —
@@ -411,14 +609,17 @@ impl CargoTool {
     /// `upgrade` is informational for the rewrite policy.
     /// Cargo has no date cutoff, so each planned target is expressed as a concrete `--precise` pin
     /// computed by the core.
-    /// Widening for `Always` and `Auto` happens before pinning so a cross-major target is admitted.
+    /// Under `Always`, every owning constraint is widened up front, before the pin batch. Under
+    /// `Auto`, the pin batch runs first and only the candidates it left short of a cross-major
+    /// target get a *tentative* post-pin widen — kept when the re-pin lands, restored when it
+    /// does not (see the loop below).
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
-    ) -> Result<()> {
+    ) -> Result<PinRejections> {
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
@@ -433,14 +634,19 @@ impl CargoTool {
                 )?;
             }
         }
-        self.pin_batch(project, &plan.changes, journal, observer)
+        let mut rejections = BTreeMap::new();
+        self.pin_batch(project, &plan.changes, journal, observer, &mut rejections)
             .await?;
 
         if matches!(plan.rewrite, RewriteMode::Auto) {
             // Widen only the candidates the pin batch could not place at their target because their
-            // own declared requirement caps them, then re-pin. A candidate still short after a no-op
-            // widen round is blocked by another crate (a real conflict the diff reports), so the loop
-            // stops widening.
+            // own declared requirement caps them, then re-pin. Each widen is *tentative*: a widened
+            // requirement whose pin still cannot land (a third-party crate holds the old major)
+            // would leave the manifest demanding a version the lock does not carry, and that poisons
+            // the whole batch at lock verification (`--locked`) — so a widen whose candidate stays
+            // short is restored, and the candidate remains a held skip carrying its recorded
+            // rejection. A candidate still short after a no-op widen round is blocked by another
+            // crate (a real conflict the diff reports), so the loop stops widening.
             // The member-aware reach check is the only thing in this loop that needs the resolved
             // graph, so skip the `cargo metadata` spawn entirely when no candidate is a direct
             // member dep. When it is needed, fail closed: falling back to the lock-slot check is the
@@ -454,15 +660,14 @@ impl CargoTool {
                 } else {
                     None
                 };
-                let mut widened_any = false;
-                let mut short = Vec::new();
+                let mut progressed = false;
                 for change in &plan.changes {
                     if reached_after(&after, graph.as_ref(), change) {
                         continue;
                     }
-                    short.push(change.clone());
+                    let snapshot = manifest_snapshot(&project.root, &change.members)?;
                     journal.validate_project(&project.root)?;
-                    if !manifest::widen_constraint(
+                    if manifest::widen_constraint(
                         &project.root,
                         &change.members,
                         &change.package.name,
@@ -471,16 +676,56 @@ impl CargoTool {
                     .modified
                     .is_empty()
                     {
-                        widened_any = true;
+                        continue;
+                    }
+                    self.pin_batch(
+                        project,
+                        std::slice::from_ref(change),
+                        journal,
+                        observer,
+                        &mut rejections,
+                    )
+                    .await?;
+                    // The unlocked metadata resolve runs *before* the lock re-read: it may itself
+                    // re-lock the widened requirement — including forking a new major alongside a
+                    // third-party-held old one, which `update --precise` cannot express — and the
+                    // reach check must see that result. A resolve the widened requirement makes
+                    // unsatisfiable is this candidate's rejection, not a batch failure: record
+                    // cargo's explanation, restore the widen, and move on.
+                    let landed_graph = if needs_member_graph(change) {
+                        journal.validate_project(&project.root)?;
+                        match self.cargo.metadata(&project.root).await {
+                            Ok(graph) => Some(graph),
+                            Err(err)
+                                if err.is_tool_spawn_failure()
+                                    || err.is_local_environment_failure() =>
+                            {
+                                return Err(err);
+                            }
+                            Err(err) => {
+                                if let Some(summary) = summarize_pin_rejection(&err) {
+                                    rejections.entry(rejection_key(change)).or_insert(summary);
+                                }
+                                restore_manifests(&project.root, &snapshot)?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let landed = read_lock(project)?.crates_io_locked_versions();
+                    if reached_after(&landed, landed_graph.as_ref(), change) {
+                        progressed = true;
+                    } else {
+                        restore_manifests(&project.root, &snapshot)?;
                     }
                 }
-                if !widened_any {
+                if !progressed {
                     break;
                 }
-                self.pin_batch(project, &short, journal, observer).await?;
             }
         }
-        Ok(())
+        Ok(rejections)
     }
 
     /// Applies all `changes` as one logical unit, driving each to its exact target.
@@ -499,6 +744,7 @@ impl CargoTool {
         changes: &[Change],
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
     ) -> Result<()> {
         // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
         // are one lock move, so issue each distinct spec once, in a deterministic order.
@@ -530,8 +776,14 @@ impl CargoTool {
                     observer.candidate_started(change);
                 }
                 journal.validate_project(&project.root)?;
-                self.update_precise(project, &change.package.name, &current, change.to.as_str())
-                    .await?;
+                if let Some(rejection) = self
+                    .update_precise(project, &change.package.name, &current, change.to.as_str())
+                    .await?
+                {
+                    // Last rejection wins; a candidate a later pass still lands never reads its
+                    // stale entry (details are consulted only for unreached candidates).
+                    rejections.insert(rejection_key(change), rejection);
+                }
             }
             let after = read_lock(project)?.locked_slots();
             if !attempted || after == before {
@@ -543,25 +795,27 @@ impl CargoTool {
 
     /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
     ///
-    /// A rejected precise pin is a resolver outcome, so the final lock diff reports the candidate
-    /// held. Broken local state must propagate; otherwise disk-full or spawn failures would
-    /// masquerade as a conflict in the candidate set.
+    /// A rejected precise pin is a resolver outcome the final lock diff reports as held; the
+    /// returned summary of cargo's own explanation lets the skip row name the blocking requirement
+    /// instead of the generic "the resolver rejected this change". Broken local state must
+    /// propagate; otherwise disk-full or spawn failures would masquerade as a conflict in the
+    /// candidate set.
     async fn update_precise(
         &self,
         project: &Project,
         name: &str,
         from: &str,
         to: &str,
-    ) -> Result<()> {
-        if let Err(err) = self
+    ) -> Result<Option<String>> {
+        match self
             .cargo
             .update_precise_crates_io(&project.root, name, from, to)
             .await
-            && err.is_local_environment_failure()
         {
-            return Err(err);
+            Ok(()) => Ok(None),
+            Err(err) if err.is_local_environment_failure() => Err(err),
+            Err(err) => Ok(summarize_pin_rejection(&err)),
         }
-        Ok(())
     }
 
     async fn apply_plan(
@@ -593,18 +847,19 @@ impl CargoTool {
             .and_then(|content| CargoLock::parse(content).ok());
         let before = before_lock
             .as_ref()
-            .map(CargoLock::locked_versions)
+            .map(CargoLock::locked_versions_by_source)
             .unwrap_or_default();
 
         // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
         // invocation, repeated to a bounded fixed point because one invocation may move a package
         // another planned pin still needs to address.
         // The diff below surfaces every paired version-slot move.
-        match self
+        let pin_phase = std::time::Instant::now();
+        let pin_rejections = match self
             .whole_graph_resolve(project, plan, journal, observer)
             .await
         {
-            Ok(()) => {}
+            Ok(rejections) => rejections,
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
             // version). Propagate so the caller's `apply_resilient` can isolate the offending
@@ -612,8 +867,13 @@ impl CargoTool {
             // Local environment failures propagate through `apply_resilient` without bisection.
             // The caller restores the journal, so no partial lock is kept.
             Err(err) => return Err(err),
-        }
+        };
 
+        tracing::debug!(
+            candidates = plan.changes.len(),
+            elapsed_ms = pin_phase.elapsed().as_millis(),
+            "cargo pin phase finished"
+        );
         let resolver_lock = read_lock(project)?;
 
         // The resolved graph supplies declared requirements to edge enforcement, proves which
@@ -643,6 +903,7 @@ impl CargoTool {
         // Enforce the plan's edge policy over the re-resolved lock and collect the moves observation
         // can pair across stable dependent identities and coexisting endpoints.
         journal.validate_project(&project.root)?;
+        let edge_phase = std::time::Instant::now();
         let enforced = edges::enforce::enforce(
             &self.cargo,
             project,
@@ -651,37 +912,23 @@ impl CargoTool {
             graph,
         )
         .await?;
+        tracing::debug!(
+            elapsed_ms = edge_phase.elapsed().as_millis(),
+            "cargo edge phase finished"
+        );
         let graph = enforced.graph;
         let edge_rebinds = enforced.rebinds;
 
         let after_lock = read_lock(project)?;
-        let after = after_lock.locked_versions();
+        let after = after_lock.locked_versions_by_source();
         let crates_io_after = after_lock.crates_io_locked_versions();
-        // Each planned candidate either reached cooldown's target (its newest-within-window) —
-        // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
-        // transitive won — reported held, naming the blocker.
-        for change in &plan.changes {
-            if reached_after(&crates_io_after, graph.as_ref(), change) {
-                report.applied.push(change.clone());
-            } else {
-                let offender = graph
-                    .as_ref()
-                    .and_then(|graph| {
-                        blocking_requirer(graph, &change.package.name, change.to.as_str())
-                    })
-                    .unwrap_or_else(|| change.package.name.clone());
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: Some(PackageId::new(
-                        CARGO_ID,
-                        offender,
-                        Some(CRATES_IO.to_string()),
-                    )),
-                    detail: None,
-                });
-            }
-        }
+        classify_planned_changes(
+            plan,
+            &crates_io_after,
+            graph.as_ref(),
+            &pin_rejections,
+            &mut report,
+        );
 
         // No paired version-slot change may be omitted.
         // Every moved slot the applied rows above do not already report is surfaced as a collateral
@@ -689,6 +936,12 @@ impl CargoTool {
         // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
         // would hide that real move).
         let collateral = collateral_changes(&before, &after, &report.applied);
+        tracing::debug!(
+            before_slots = before.len(),
+            after_slots = after.len(),
+            collateral = collateral.len(),
+            "cargo apply collateral diff"
+        );
         report.applied.extend(collateral);
         report.edge_rebinds = edge_rebinds;
         Ok(report)
@@ -882,14 +1135,28 @@ mod tests {
     use indoc::{formatdoc, indoc};
 
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
+        let sourced: Vec<(&str, &str, &str)> = packages
+            .iter()
+            .map(|(name, version)| {
+                (
+                    *name,
+                    *version,
+                    "registry+https://github.com/rust-lang/crates.io-index",
+                )
+            })
+            .collect();
+        lock_with_sources(&sourced)
+    }
+
+    fn lock_with_sources(packages: &[(&str, &str, &str)]) -> CargoLock {
         let mut content = String::from("version = 4\n");
-        for (name, version) in packages {
+        for (name, version, source) in packages {
             content.push_str(&formatdoc! {r#"
 
                 [[package]]
                 name = "{name}"
                 version = "{version}"
-                source = "registry+https://github.com/rust-lang/crates.io-index"
+                source = "{source}"
             "#});
         }
         CargoLock::parse(&content).expect("lock parses")
@@ -979,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_versions_skips_non_registry_and_keys_per_major() {
+    fn locked_versions_by_source_skips_non_registry_and_keys_per_major() {
         let lock = CargoLock::parse(indoc! {r#"
             version = 4
 
@@ -1008,26 +1275,30 @@ mod tests {
             source = "git+https://example.com/x#abc"
         "#})
         .expect("lock parses");
-        let slots = lock.locked_versions();
+        let slots = lock.locked_versions_by_source();
         // The path/workspace member `demo` and the git source are excluded; the two serde majors are
         // distinct slots, and semantic ordering chooses 1.0.197 over lexically-greater 1.0.99.
+        let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
         assert_eq!(
-            slots.get(&("serde".into(), "1".into())).map(String::as_str),
+            slots
+                .get(&(crates_io.into(), "serde".into(), "1".into()))
+                .map(String::as_str),
             Some("1.0.197")
         );
         assert_eq!(
             slots
-                .get(&("serde".into(), "0.9".into()))
+                .get(&(crates_io.into(), "serde".into(), "0.9".into()))
                 .map(String::as_str),
             Some("0.9.15")
         );
-        assert!(!slots.keys().any(|(name, _)| name == "demo"));
-        assert!(!slots.keys().any(|(name, _)| name == "local-git"));
+        assert!(!slots.keys().any(|(_, name, _)| name == "demo"));
+        assert!(!slots.keys().any(|(_, name, _)| name == "local-git"));
     }
 
     #[test]
     fn reached_requires_the_exact_target_in_its_major_slot() {
-        let after = lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]).locked_versions();
+        let after =
+            lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]).crates_io_locked_versions();
         // A concrete Cargo `--precise` target must land exactly; an overshoot remains off-policy.
         assert!(reached(
             &after,
@@ -1131,7 +1402,7 @@ mod tests {
 
     #[test]
     fn target_gated_workspace_duplicate_requires_member_aware_rewrite() {
-        let after = lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]).locked_versions();
+        let after = lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]).crates_io_locked_versions();
         let graph = crate::cargocmd::Cargo::build_graph_from_json(
             r#"{
                 "packages": [
@@ -1246,7 +1517,7 @@ mod tests {
         };
         let stale = graph("dep-old");
         let verified = graph("dep-target");
-        let after = lock_with(&[("dep", "1.0.0"), ("dep", "1.1.0")]).locked_versions();
+        let after = lock_with(&[("dep", "1.0.0"), ("dep", "1.1.0")]).crates_io_locked_versions();
         let mut change = change("dep", "1.0.0", "1.1.0", false);
         change.members = vec![cooldown_core::MemberRef {
             name: "app".to_string(),
@@ -1262,8 +1533,8 @@ mod tests {
         // Raising `a` forces the shared transitive `shared` from 1.1.0 down to 1.0.0 as a consistency
         // move. No applied row reports `shared`, so the diff must surface it as its own collateral
         // row — the silent drift the earlier per-precise-pin design allowed.
-        let before = lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]).locked_versions();
-        let after = lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]).locked_versions();
+        let before = lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]).locked_versions_by_source();
+        let after = lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]).locked_versions_by_source();
         let applied = [change("a", "1.0.0", "2.0.0", false)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1278,11 +1549,62 @@ mod tests {
     }
 
     #[test]
+    fn collateral_change_pairs_a_cross_line_companion_float() {
+        // The luup5 cranelift case: pinning wasmtime 46 → 47 drags its unplanned cranelift
+        // companion from the 0.133 line onto 0.134. Same-line pairing can never see this move —
+        // 0.x minors are distinct lines — so it was silently absent from the report, and the later
+        // reconcile leg (0.134.3 → 0.134.2) had no first leg to collapse against.
+        let before = lock_with(&[("wasmtime", "46.0.1"), ("cranelift-codegen", "0.133.1")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("wasmtime", "47.0.2"), ("cranelift-codegen", "0.134.3")])
+            .locked_versions_by_source();
+        let applied = [change("wasmtime", "46.0.1", "47.0.2", false)];
+        let collateral = collateral_changes(&before, &after, &applied);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "cranelift-codegen");
+        assert_eq!(collateral[0].from.as_str(), "0.133.1");
+        assert_eq!(collateral[0].to.as_str(), "0.134.3");
+        assert!(!collateral[0].downgrade);
+    }
+
+    #[test]
+    fn collateral_change_zips_coexisting_lines_by_rank() {
+        // Two coexisting wasmparser lines each advance one step in the same re-lock; rank order
+        // pairs each old line with its successor instead of cross-wiring them.
+        let before = lock_with(&[("wasmparser", "0.251.0"), ("wasmparser", "0.253.0")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("wasmparser", "0.252.0"), ("wasmparser", "0.254.0")])
+            .locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        let moves: Vec<(&str, &str)> = collateral
+            .iter()
+            .map(|change| (change.from.as_str(), change.to.as_str()))
+            .collect();
+        assert_eq!(moves, [("0.251.0", "0.252.0"), ("0.253.0", "0.254.0")]);
+    }
+
+    #[test]
+    fn collateral_change_falls_back_to_same_line_pairing_when_a_line_appears() {
+        // `dep` forks a new major (2.0.0 appears) while its 1.x line also patches: unequal residual
+        // counts make rank pairing ambiguous, so only the same-line 1.x move is reported.
+        let before = lock_with(&[("dep", "1.0.0")]).locked_versions_by_source();
+        let after = lock_with(&[("dep", "1.0.1"), ("dep", "2.0.0")]).locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        let moves: Vec<(&str, &str)> = collateral
+            .iter()
+            .map(|change| (change.from.as_str(), change.to.as_str()))
+            .collect();
+        assert_eq!(moves, [("1.0.0", "1.0.1")]);
+    }
+
+    #[test]
     fn collateral_change_excludes_applied_and_unchanged_packages() {
         // `a`'s move is already told by its applied row (no duplicate), `b` is unchanged (no row),
         // `c` is an unplanned forward move (a real collateral change). Only `c` is surfaced.
-        let before = lock_with(&[("a", "2.0.0"), ("b", "2.0.0"), ("c", "1.0.0")]).locked_versions();
-        let after = lock_with(&[("a", "1.0.0"), ("b", "2.0.0"), ("c", "1.5.0")]).locked_versions();
+        let before = lock_with(&[("a", "2.0.0"), ("b", "2.0.0"), ("c", "1.0.0")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("a", "1.0.0"), ("b", "2.0.0"), ("c", "1.5.0")])
+            .locked_versions_by_source();
         let applied = [change("a", "2.0.0", "1.0.0", true)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1291,12 +1613,34 @@ mod tests {
     }
 
     #[test]
+    fn collateral_change_keeps_registries_apart() {
+        // A crates.io crate and an alternate-registry crate share a name and major line. Slots are
+        // compared per source, so the alternate registry's move neither pairs against the
+        // crates.io baseline (which would fabricate endpoints) nor gets labeled crates.io.
+        let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+        let alt = "registry+sparse+https://registry.example.com/index/";
+        let before = lock_with_sources(&[("dep", "1.0.0", crates_io), ("dep", "1.2.0", alt)])
+            .locked_versions_by_source();
+        let after = lock_with_sources(&[("dep", "1.0.0", crates_io), ("dep", "1.3.0", alt)])
+            .locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].from.as_str(), "1.2.0");
+        assert_eq!(collateral[0].to.as_str(), "1.3.0");
+        assert_eq!(
+            collateral[0].package.registry.as_deref(),
+            Some("registry:registry.example.com"),
+            "the row names its own registry, not crates.io"
+        );
+    }
+
+    #[test]
     fn collateral_changes_surface_a_held_candidates_real_movement() {
         // A held planned candidate has no applied row, yet a sibling pin still floated it off its
         // baseline. That net move must surface as a collateral row beside the held skip instead of
         // being silently dropped behind the planned name.
-        let before = lock_with(&[("referencing", "0.46.5")]).locked_versions();
-        let after = lock_with(&[("referencing", "0.46.10")]).locked_versions();
+        let before = lock_with(&[("referencing", "0.46.5")]).locked_versions_by_source();
+        let after = lock_with(&[("referencing", "0.46.10")]).locked_versions_by_source();
         let collateral = collateral_changes(&before, &after, &[]);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "referencing");
@@ -1305,9 +1649,87 @@ mod tests {
 
         // Once the candidate reaches its target, its applied row already tells the move: no
         // duplicate collateral row.
-        let landed = lock_with(&[("referencing", "0.46.10")]).locked_versions();
+        let landed = lock_with(&[("referencing", "0.46.10")]).locked_versions_by_source();
         let applied = [change("referencing", "0.46.5", "0.46.10", false)];
         assert!(collateral_changes(&before, &landed, &applied).is_empty());
+    }
+
+    #[test]
+    fn summarize_pin_rejection_names_the_requirement_and_requirer() {
+        // Verbatim (trimmed) stderr shape from a live `cargo update -p regex --precise 1.13.1`
+        // rejection: the blocking requirement plus the first requirer make the report row
+        // actionable where "the resolver rejected this change" was not.
+        let stderr = indoc::indoc! {r#"
+            error: failed to select a version for the requirement `regex = ">=1.0, <1.13"`
+            candidate versions found which didn't match: 1.13.1
+            location searched: crates.io index
+            required by package `serde-saphyr v0.0.16`
+                ... which satisfies dependency `serde-saphyr = "^0.0.16"` (locked to 0.0.16) of package `mistralrs-core v0.9.0 (https://github.com/EricLBuehler/mistral.rs.git?tag=v0.9.0#54957525)`
+        "#};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some(
+                "failed to select a version for the requirement `regex = \">=1.0, <1.13\"` \
+                 (required by serde-saphyr v0.0.16)"
+            ),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_drops_workspace_path_noise_from_the_requirer() {
+        // A workspace member requirer carries its path suffix; the report only needs the name.
+        let stderr = indoc::indoc! {r#"
+            error: failed to select a version for the requirement `bincode = "^2"`
+            candidate versions found which didn't match: 3.0.0
+            required by package `y-airtype-core v0.0.20 (/home/user/repo/services/collab/y-airtype-core)`
+        "#};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some(
+                "failed to select a version for the requirement `bincode = \"^2\"` \
+                 (required by y-airtype-core v0.0.20)"
+            ),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_reads_the_chain_form_attribution() {
+        // The unsatisfiable-fork shape: no `the requirement` clause, and the attribution arrives as
+        // a `... required by package` chain continuation rather than the bare form.
+        let stderr = indoc::indoc! {r"
+            Updating crates.io index
+            error: failed to select a version for `bincode`.
+                ... required by package `y-airtype-core v0.0.20 (/tmp/tree/services/collab/y-airtype-core)`
+                ... which satisfies path dependency `y-airtype-core` (locked to 0.0.20) of package `y-airtype v0.0.20 (/tmp/tree/services/collab/y-airtype)`
+            versions that meet the requirements `^3.0.0` are: 3.0.0
+        "};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some("failed to select a version for `bincode` (required by y-airtype-core v0.0.20)"),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_without_stderr_stays_generic() {
+        assert_eq!(
+            summarize_pin_rejection(&cooldown_core::CoreError::StaleLock("x".into())),
+            None,
+        );
     }
 
     #[test]
@@ -1486,6 +1908,173 @@ mod tests {
 
         journal.restore()?;
         assert!(!lock.exists());
+        Ok(())
+    }
+
+    /// The manifest the tentative-Auto fixture starts from: `dep = "1"` caps the planned
+    /// cross-major target, so the pin batch must fail first and the Auto loop must widen.
+    #[cfg(unix)]
+    const WIDEN_MANIFEST: &str = indoc! {r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2024"
+
+        [dependencies]
+        dep = "1"
+    "#};
+
+    #[cfg(unix)]
+    const WIDEN_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["dep"]
+
+        [[package]]
+        name = "dep"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+
+    /// A tentative-Auto fixture project driven by a scripted `cargo` stand-in. The script rejects
+    /// every `update --precise` while the manifest still declares `dep = "1"` (a real pin cannot
+    /// land outside the requirement); with `accept_when_widened` it models the third-party-held
+    /// old major staying put by rewriting the lock to *fork* dep 2.0.0 beside the 1.0.0 line once
+    /// the widen removed the cap — without it, the pin stays rejected even after widening.
+    #[cfg(unix)]
+    fn widen_fixture(
+        root: &camino::Utf8Path,
+        accept_when_widened: bool,
+    ) -> eyre::Result<(Project, CargoTool)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("Cargo.toml"), WIDEN_MANIFEST)?;
+        std::fs::write(root.join("Cargo.lock"), WIDEN_LOCK)?;
+        let accept = if accept_when_widened {
+            std::fs::write(
+                root.join("Cargo.lock.forked"),
+                formatdoc! {r#"
+                    {WIDEN_LOCK}
+                    [[package]]
+                    name = "dep"
+                    version = "2.0.0"
+                    source = "registry+https://github.com/rust-lang/crates.io-index"
+                "#},
+            )?;
+            indoc! {r#"
+                if ! grep -q 'dep = "1"' Cargo.toml; then
+                  cp Cargo.lock.forked Cargo.lock
+                  exit 0
+                fi
+            "#}
+        } else {
+            ""
+        };
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            formatdoc! {r#"
+                #!/bin/sh
+                {accept}
+                echo 'error: failed to select a version for the requirement `dep = "^1"`' >&2
+                echo 'required by package `app v0.1.0 (/repo/app)`' >&2
+                exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_auto_widen_is_restored_when_the_pin_still_cannot_land() -> eyre::Result<()> {
+        // The luup5 widen-poison regression: a third-party crate holds the old major, so the
+        // widened requirement can never re-lock. The widen must be rolled back byte-identically —
+        // a manifest demanding a version the lock does not carry poisons the whole batch at
+        // `--locked` verification — and the candidate must keep cargo's own rejection sentence.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = widen_fixture(root, false)?;
+        let plan = Plan {
+            changes: vec![change("dep", "1.0.0", "2.0.0", false)],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            WIDEN_LOCK,
+            "a rejected pin leaves the lock untouched"
+        );
+        let detail = rejections
+            .get(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string()))
+            .expect("the held candidate keeps its planned-change-keyed rejection");
+        assert!(
+            detail.contains("failed to select a version") && detail.contains("required by app"),
+            "cargo's own sentence and requirer survive: {detail}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_auto_widen_is_kept_when_the_pin_lands_as_a_fork() -> eyre::Result<()> {
+        // The success arm of the same state machine: once the widen lifts the declared cap, the
+        // re-pin forks the new major beside the third-party-held old line. The widened manifest
+        // must be kept — restoring it would demand the old major back and undo the landing.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = widen_fixture(root, true)?;
+        let plan = Plan {
+            changes: vec![change("dep", "1.0.0", "2.0.0", false)],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+        assert!(
+            !manifest.contains(r#"dep = "1""#),
+            "the landed widen keeps the manifest on the new requirement: {manifest}"
+        );
+        let landed = read_lock(&project)?.crates_io_locked_versions();
+        assert_eq!(
+            landed.get(&("dep".into(), "2".into())).map(String::as_str),
+            Some("2.0.0"),
+            "the pin landed in the target major slot"
+        );
+        assert_eq!(
+            landed.get(&("dep".into(), "1".into())).map(String::as_str),
+            Some("1.0.0"),
+            "the third-party-held old major coexists as its own line"
+        );
         Ok(())
     }
 }

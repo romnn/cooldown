@@ -806,6 +806,13 @@ impl Cargo {
         Self::default()
     }
 
+    /// A wrapper driving an explicit binary, so hermetic tests can substitute a scripted fake for
+    /// the real `cargo` without touching the process environment.
+    #[cfg(test)]
+    pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
+        Cargo { bin: bin.into() }
+    }
+
     async fn output(
         &self,
         dir: &Utf8Path,
@@ -826,9 +833,22 @@ impl Cargo {
             bin = self.bin,
             args = ?args,
             elapsed_ms = started.elapsed().as_millis(),
+            // `ok` covers the spawn only; a launched command that exits non-zero still logs
+            // `ok=true` here and its own `cargo command failed` line below.
             ok = result.is_ok(),
             "cargo finished"
         );
+        if let Ok(out) = &result
+            && !out.status.success()
+        {
+            tracing::debug!(
+                bin = self.bin,
+                args = ?args,
+                status = %out.status,
+                detail = %failure_detail(out),
+                "cargo command failed"
+            );
+        }
         result
     }
 

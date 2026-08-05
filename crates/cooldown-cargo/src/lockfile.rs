@@ -220,6 +220,10 @@ impl Hash for LockPackageId {
 /// A `(name, major)` compatibility slot in a Cargo lockfile.
 pub(crate) type SlotKey = (String, String);
 
+/// A `(source, name, major)` compatibility slot: [`SlotKey`] qualified by the registry source, so
+/// same-named packages from different registries never collapse into one slot.
+pub(crate) type SourcedSlotKey = (String, String, String);
+
 /// Every registry version present in each Cargo compatibility slot.
 pub(crate) type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
 
@@ -291,14 +295,37 @@ impl CargoLock {
         self.matching_slots(LockPackage::is_crates_io)
     }
 
-    /// Returns the highest registry version in each Cargo compatibility slot.
-    pub(crate) fn locked_versions(&self) -> BTreeMap<SlotKey, String> {
-        highest_versions(self.locked_slots())
-    }
-
     /// Returns the highest crates.io version in each Cargo compatibility slot.
     pub(crate) fn crates_io_locked_versions(&self) -> BTreeMap<SlotKey, String> {
         highest_versions(self.crates_io_locked_slots())
+    }
+
+    /// Returns the highest registry version in each per-source Cargo compatibility slot.
+    pub(crate) fn locked_versions_by_source(&self) -> BTreeMap<SourcedSlotKey, String> {
+        let mut slots: BTreeMap<SourcedSlotKey, String> = BTreeMap::new();
+        for package in &self.package {
+            let (Some(version), Some(source), true) = (
+                package.version.as_deref(),
+                package.source.as_deref(),
+                package.is_registry(),
+            ) else {
+                continue;
+            };
+            let key = (
+                source.to_string(),
+                package.name.clone(),
+                version::major_key(version).0,
+            );
+            slots
+                .entry(key)
+                .and_modify(|highest| {
+                    if version::compare(version, highest).is_gt() {
+                        *highest = version.to_string();
+                    }
+                })
+                .or_insert_with(|| version.to_string());
+        }
+        slots
     }
 
     fn matching_slots(&self, include: impl Fn(&LockPackage) -> bool) -> LockedSlots {
