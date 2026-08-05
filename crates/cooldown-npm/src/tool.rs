@@ -725,11 +725,30 @@ impl<L: NodeLock> NpmTool<L> {
                 // kept in range instead of pinned to the target.
                 // That is a conservative hold, not a resolver conflict, and it must not be advertised
                 // as adoptable: `outdated`'s verify reclassifies it blocked.
+                // Naming the divergent lines tells the reader *which* declarations must converge
+                // before a joint pin becomes possible. A range-only split — every copy resolved to
+                // one version but declared under disagreeing ranges — names the specifiers
+                // instead: "multiple versions" would be factually wrong there.
+                let versions = after_members.resolved_versions_of(name);
+                let specifiers = after_members.declared_specifiers_of(name);
+                let detail = if versions.len() > 1 {
+                    Some(format!(
+                        "declared at multiple versions across the workspace ({}); kept on its own line",
+                        versions.join(", ")
+                    ))
+                } else {
+                    (specifiers.len() > 1).then(|| {
+                        format!(
+                            "declared with incompatible ranges across the workspace ({}); kept on its own line",
+                            specifiers.join(", ")
+                        )
+                    })
+                };
                 report.skipped.push(Skipped {
                     change: change.clone(),
                     reason: SkipReason::MultiVersionHeld,
                     offending: None,
-                    detail: None,
+                    detail,
                 });
             } else {
                 // The joint resolve could not place this candidate at its target without breaking
@@ -830,9 +849,23 @@ impl<L: NodeLock> NpmTool<L> {
                 }
             }
 
-            let after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-            if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
-                return Err(CoreError::StaleLock(detail));
+            let mut after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+            if new_lock_inconsistency::<L>(before_content, &after_content).is_some() {
+                // pnpm's targeted `update` can float an *unrelated* importer entry out of its
+                // declared range: peer unification across linked workspace members pulls a sibling
+                // importer's version line into this one (observed on luup5 as `vite: ^6` landing
+                // at 7.3.5 while updating `@playwright/test`). The override-based repair engine
+                // resolves through a plain install, which provably respects declared ranges, so
+                // the same pins are retried through it; only a repair that still leaves a fresh
+                // inconsistency is a real stale-lock failure.
+                restore_after_owned_step(journal, &resolve.postimage)?;
+                self.repair_policy_rejected_graph(project, &active, multi_version, window_minutes)
+                    .await?;
+                resolve.postimage = journal.capture_state()?;
+                after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+                if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
+                    return Err(CoreError::StaleLock(detail));
+                }
             }
             let current = proven_peer_violations::<L>(&after_content, workspace);
             let mut rejections = plan_peer_rejections(&baseline, &current, &active, multi_version)?;

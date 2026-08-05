@@ -418,6 +418,37 @@ impl MemberIndex {
             .contains_key(&(name.to_string(), version.to_string()))
     }
 
+    /// Every distinct resolved version of `name` across the workspace's importer declarations,
+    /// ascending — the divergent lines a multi-version hold keeps apart. Empty for the name-only
+    /// (npm) index, which records no per-importer version.
+    #[must_use]
+    pub fn resolved_versions_of(&self, name: &str) -> Vec<&str> {
+        let mut versions: Vec<&str> = self
+            .by_version
+            .keys()
+            .filter(|(entry, _)| entry == name)
+            .map(|(_, version)| version.as_str())
+            .collect();
+        versions.sort_by(|a, b| crate::version::compare(a, b));
+        versions.dedup();
+        versions
+    }
+
+    /// Every distinct range specifier the workspace's importers declare for `name`, sorted — the
+    /// divergent declarations behind a range-only split, where the lock resolves every copy to one
+    /// version but the ranges themselves disagree (`~7.3.0` vs `^7.0.0`). Empty for the name-only
+    /// (npm) index, which records no per-importer specifiers.
+    #[must_use]
+    pub fn declared_specifiers_of(&self, name: &str) -> Vec<&str> {
+        let mut specifiers: Vec<&str> = self
+            .declared_specifiers
+            .get(name)
+            .map(|set| set.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        specifiers.sort_unstable();
+        specifiers
+    }
+
     /// Whether ANY member declares `name`, at whatever version — the veto-eligibility test for a
     /// violated peer package: a purely transitive peer (an auto-installed
     /// `@typescript-eslint/parser`) is the resolver's to place and re-place, so it may never veto
@@ -2163,6 +2194,19 @@ packages:
         assert!(
             !split.contains("chalk"),
             "chalk is declared with the same ^5.0.0 range at one version — not a split, stays exact-pinnable"
+        );
+        // The hold's report detail needs the disagreeing declarations themselves: with a single
+        // resolved version, "declared at multiple versions" would be factually wrong, so the
+        // specifiers are what the skip row must name.
+        assert_eq!(
+            index.resolved_versions_of("semver"),
+            ["7.3.8"],
+            "the lock resolves both declarations to one version"
+        );
+        assert_eq!(
+            index.declared_specifiers_of("semver"),
+            ["^7.0.0", "~7.3.0"],
+            "the divergent specifiers are exposed for the hold's detail line"
         );
     }
 
