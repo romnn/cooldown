@@ -126,10 +126,7 @@ pub(super) fn recovery_path(lock_path: &Utf8Path) -> Utf8PathBuf {
 }
 
 pub(super) fn recovery_anchor_path(authority: &RecoveryAuthority) -> Result<Utf8PathBuf> {
-    let name = format!(
-        "{:016x}.cargo-recovery.anchor",
-        cooldown_core::fs::fnv1a_64(authority.project().as_str())
-    );
+    let name = super::recovery_anchor_name(authority.project());
     Utf8PathBuf::from_path_buf(authority.directory().join(name)).map_err(|path| {
         CoreError::PathEncoding(format!(
             "non-UTF-8 Cargo recovery authority path: {}",

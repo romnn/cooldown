@@ -47,7 +47,7 @@ pub(crate) fn recovery_authority_projects(
             continue;
         };
         let target = publication_target(&name).unwrap_or(&name);
-        if !target.ends_with(".cargo-recovery.anchor") {
+        if !target.ends_with(super::RECOVERY_ANCHOR_SUFFIX) {
             continue;
         }
         let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {

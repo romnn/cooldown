@@ -149,6 +149,10 @@ pub enum CoreError {
     #[error("lock conflict: {0}")]
     LockConflict(String),
 
+    /// A filesystem change is visible, but syncing its containing directory failed.
+    #[error("durability uncertain: {0}")]
+    DurabilityUncertain(String),
+
     /// Adapter-owned recovery evidence remains authoritative, so no outer rollback may run.
     #[error("pending recovery: {0}")]
     PendingRecovery(String),
@@ -201,6 +205,7 @@ impl CoreError {
             | CoreError::Serialization(_)
             | CoreError::System(_)
             | CoreError::LockConflict(_)
+            | CoreError::DurabilityUncertain(_)
             | CoreError::PendingRecovery(_) => true,
             CoreError::Tool { stderr, .. } => detail_indicates_broken_environment(stderr),
             _ => false,
@@ -229,6 +234,7 @@ impl CoreError {
             CoreError::PathEncoding(_) => DiagnosticKind::PathEncoding,
             CoreError::Serialization(_) => DiagnosticKind::Serialization,
             CoreError::LockConflict(_) => DiagnosticKind::LockConflict,
+            CoreError::DurabilityUncertain(_) => DiagnosticKind::DurabilityUncertain,
             CoreError::PendingRecovery(_) => DiagnosticKind::PendingRecovery,
             CoreError::System(_) => DiagnosticKind::System,
         }
@@ -365,6 +371,8 @@ diagnostic_kinds! {
     Serialization = "serialization",
     /// Another cooldown process already holds the project mutation lock.
     LockConflict = "lock_conflict",
+    /// A filesystem change is visible, but its power-loss durability is uncertain.
+    DurabilityUncertain = "durability_uncertain",
     /// Adapter-owned recovery evidence still controls the project mutation state.
     PendingRecovery = "pending_recovery",
     /// An interrupted mutation was settled before the requested operation continued.

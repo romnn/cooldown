@@ -534,7 +534,9 @@ fn git_marker(root: &Path) -> Result<Option<PathBuf>, CoreError> {
 
 fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
     if marker.is_dir() {
-        return std::fs::canonicalize(marker).map_err(Into::into);
+        let git_dir = std::fs::canonicalize(marker)?;
+        validate_git_directory(&git_dir)?;
+        return Ok(git_dir);
     }
     let contents = std::fs::read_to_string(marker)?;
     let git_dir = contents
@@ -550,9 +552,18 @@ fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
         })?;
     let git_dir = resolve_relative(marker.parent().unwrap_or_else(|| Path::new("")), git_dir);
     let git_dir = std::fs::canonicalize(git_dir)?;
+    validate_git_directory(&git_dir)?;
     let common_marker = git_dir.join("commondir");
-    if !common_marker.is_file() {
-        return Ok(git_dir);
+    match std::fs::symlink_metadata(&common_marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(CoreError::Filesystem(format!(
+                "Git common-directory pointer is not a regular file: {}",
+                common_marker.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(git_dir),
+        Err(error) => return Err(error.into()),
     }
     let common = std::fs::read_to_string(&common_marker)?;
     let common = common.trim();
@@ -562,7 +573,37 @@ fn git_common_directory(marker: &Path) -> Result<PathBuf, CoreError> {
             common_marker.display()
         )));
     }
-    std::fs::canonicalize(resolve_relative(&git_dir, common)).map_err(Into::into)
+    let common = std::fs::canonicalize(resolve_relative(&git_dir, common))?;
+    validate_git_directory(&common)?;
+    Ok(common)
+}
+
+fn validate_git_directory(path: &Path) -> Result<(), CoreError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let head = path.join("HEAD");
+    let head_metadata = std::fs::symlink_metadata(&head).map_err(|error| {
+        CoreError::Filesystem(format!(
+            "cannot validate Git directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_dir() || !head_metadata.file_type().is_file() {
+        return Err(CoreError::Filesystem(format!(
+            "Git directory is not a regular repository metadata directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(CoreError::Filesystem(format!(
+                "Git directory is not owned by the current user: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_relative(base: &Path, value: &str) -> PathBuf {
@@ -750,10 +791,12 @@ impl DurableWriteError {
     pub fn into_core_error(self, path: &Path) -> CoreError {
         match self {
             DurableWriteError::NotCommitted(error) => error,
-            DurableWriteError::DurabilityUncertain(error) => CoreError::LockConflict(format!(
-                "{} was replaced, but syncing its parent directory failed; the replacement is visible but power-loss durability is uncertain: {error}",
-                path.display()
-            )),
+            DurableWriteError::DurabilityUncertain(error) => {
+                CoreError::DurabilityUncertain(format!(
+                    "{} was replaced, but syncing its parent directory failed; the replacement is visible but power-loss durability is uncertain: {error}",
+                    path.display()
+                ))
+            }
         }
     }
 }
@@ -1065,6 +1108,22 @@ mod tests {
     }
 
     #[test]
+    fn git_pointer_cannot_redirect_coordination_to_an_arbitrary_directory() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let arbitrary = root.join("arbitrary");
+        std::fs::create_dir(&arbitrary)?;
+        std::fs::write(root.join(".git"), format!("gitdir: {arbitrary}\n"))?;
+
+        let result = ProjectCoordination::resolve(root);
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        assert!(!arbitrary.join("cooldown").exists());
+        Ok(())
+    }
+
+    #[test]
     fn project_read_and_write_leases_share_one_lock_protocol() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
@@ -1140,6 +1199,14 @@ mod tests {
 
         std::assert_matches!(result, Err(DurableWriteError::DurabilityUncertain(_)));
         assert_eq!(std::fs::read(path)?, b"second");
+        let error = DurableWriteError::DurabilityUncertain(CoreError::Filesystem(
+            "injected directory sync failure".to_string(),
+        ))
+        .into_core_error(std::path::Path::new("state.json"));
+        assert_eq!(
+            error.diagnostic_kind(),
+            crate::error::DiagnosticKind::DurabilityUncertain
+        );
         Ok(())
     }
 }

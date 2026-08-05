@@ -110,13 +110,9 @@ impl RecoveryScope {
         if !matches!(self.kind, RecoveryScopeKind::Explicit) {
             return true;
         }
-        self.root.ancestors().any(|ancestor| {
-            authority_name
-                == format!(
-                    "{:016x}.cargo-recovery.anchor",
-                    cooldown_core::fs::fnv1a_64(ancestor.as_str())
-                )
-        })
+        self.root
+            .ancestors()
+            .any(|ancestor| authority_name == publication::recovery_anchor_name(ancestor))
     }
 }
 

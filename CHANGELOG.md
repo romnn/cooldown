@@ -32,7 +32,8 @@
   accepts the prepared capability, and Cargo requires one carrying provenance from an
   adapter-created isolated project. `ApplyReport`
   carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
-  `CoreError`/`DiagnosticKind` include `PendingRecovery`.
+  `CoreError`/`DiagnosticKind` include `PendingRecovery` and `DurabilityUncertain` so a visible
+  write whose directory sync failed is not misclassified as lock contention.
   `ProjectMutationFile` also records standard file permissions and rejects non-regular or
   multiply-linked paths so a rollback can restore the file contents and modes without following a
   symlink or mutating an external hard-link alias. Its fields and the

@@ -595,6 +595,8 @@ mod tests {
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&git_dir)?;
         std::fs::create_dir_all(&worktree)?;
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n")?;
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
         std::fs::write(git_dir.join("commondir"), "../..\n")?;
         std::fs::write(worktree.join(".git"), format!("gitdir: {git_dir}\n"))?;
 

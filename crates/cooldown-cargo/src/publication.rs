@@ -12,6 +12,15 @@ pub(crate) use model::RECOVERY_MARKER;
 pub(crate) use publish::publish_accepted;
 pub(crate) use recover::{ensure_no_pending, recover_pending};
 
+const RECOVERY_ANCHOR_SUFFIX: &str = ".cargo-recovery.anchor";
+
+pub(super) fn recovery_anchor_name(project: &camino::Utf8Path) -> String {
+    format!(
+        "{:016x}{RECOVERY_ANCHOR_SUFFIX}",
+        cooldown_core::fs::fnv1a_64(project.as_str())
+    )
+}
+
 #[cfg(test)]
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(test)]
@@ -558,16 +567,17 @@ mod tests {
         let first_root = base.join("first");
         let second_root = base.join("second");
         let third_root = base.join("third");
+        std::fs::create_dir_all(&common)?;
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n")?;
         for (root, name) in [
             (&first_root, "first"),
             (&second_root, "second"),
             (&third_root, "third"),
         ] {
-            std::fs::create_dir_all(common.join(format!("worktrees/{name}")))?;
-            std::fs::write(
-                common.join(format!("worktrees/{name}/commondir")),
-                "../..\n",
-            )?;
+            let git_dir = common.join(format!("worktrees/{name}"));
+            std::fs::create_dir_all(&git_dir)?;
+            std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
+            std::fs::write(git_dir.join("commondir"), "../..\n")?;
             std::fs::create_dir_all(root)?;
             std::fs::write(
                 root.join(".git"),

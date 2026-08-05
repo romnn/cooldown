@@ -27,7 +27,7 @@ pub struct ProjectMutationState {
     files: Vec<ProjectMutationFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ProjectMutationRoot {
     path: Utf8PathBuf,
     identity: std::sync::Arc<same_file::Handle>,
@@ -644,15 +644,23 @@ impl ProjectMutationFile {
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        let final_opened = file.metadata()?;
         let final_metadata = std::fs::symlink_metadata(&path)?;
         let final_identity = same_file::Handle::from_path(&path)?;
-        if !final_metadata.file_type().is_file() || identity != final_identity {
+        if !final_opened.file_type().is_file()
+            || !final_metadata.file_type().is_file()
+            || identity != final_identity
+        {
             return Err(CoreError::LockConflict(format!(
                 "{path} changed identity while cooldown read its mutation journal"
             )));
         }
-        require_single_link(&file, &final_metadata, &path)?;
-        ProjectMutationFile::from_snapshot(rel.to_owned(), Some(bytes), Some(opened.permissions()))
+        require_single_link(&file, &final_opened, &path)?;
+        ProjectMutationFile::from_snapshot(
+            rel.to_owned(),
+            Some(bytes),
+            Some(final_opened.permissions()),
+        )
     }
 }
 
@@ -677,7 +685,7 @@ impl ProjectMutationRoot {
     }
 
     fn ensure_same(&self, other: &ProjectMutationRoot) -> Result<()> {
-        if self == other {
+        if self.identity == other.identity {
             return Ok(());
         }
         Err(CoreError::LockConflict(format!(
@@ -921,8 +929,12 @@ fn validate_mutation_target(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
     let file = std::fs::File::open(&target)?;
     let opened = file.metadata()?;
     let identity = same_file::Handle::from_file(file.try_clone()?)?;
+    let current = std::fs::symlink_metadata(&target)?;
     let current_identity = same_file::Handle::from_path(&target)?;
-    if !opened.file_type().is_file() || identity != current_identity {
+    if !opened.file_type().is_file()
+        || !current.file_type().is_file()
+        || identity != current_identity
+    {
         return Err(CoreError::LockConflict(format!(
             "{target} changed identity while cooldown revalidated its mutation target"
         )));
@@ -1052,6 +1064,20 @@ mod mutation_journal_tests {
         std::assert_matches!(result, Err(CoreError::LockConflict(_)));
         assert_eq!(std::fs::read_to_string(root_a.join(relative))?, "project-a");
         assert_eq!(std::fs::read_to_string(root_b.join(relative))?, "project-b");
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_authority_uses_filesystem_identity_not_path_spelling() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let captured = ProjectMutationRoot::capture(&root)?;
+        let equivalent = ProjectMutationRoot {
+            path: root.join("."),
+            identity: captured.identity.clone(),
+        };
+
+        captured.ensure_same(&equivalent)?;
         Ok(())
     }
 
