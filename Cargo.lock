@@ -418,6 +418,7 @@ dependencies = [
  "cooldown-core",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
