@@ -197,7 +197,15 @@ fn canonicalize_heals_a_seeded_bad_binding_and_converges() {
         upgrade.ok(),
         "upgrade should succeed: {}",
         fixture
-            .cooldown(&["upgrade", "--freeze", FREEZE, "--package", "uuid"])
+            .cooldown(&[
+                "upgrade",
+                "--freeze",
+                FREEZE,
+                "--package",
+                "uuid",
+                "--cargo-edge-policy",
+                "canonicalize",
+            ])
             .stderr_str()
     );
     assert!(
@@ -393,7 +401,15 @@ fn canonicalize_heals_without_any_planned_change() {
         upgrade.ok(),
         "empty-plan upgrade should succeed: {}",
         fixture
-            .cooldown(&["upgrade", "--freeze", FREEZE, "--package", "uuid"])
+            .cooldown(&[
+                "upgrade",
+                "--freeze",
+                FREEZE,
+                "--package",
+                "uuid",
+                "--cargo-edge-policy",
+                "canonicalize",
+            ])
             .stderr_str()
     );
     assert_eq!(

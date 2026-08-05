@@ -75,6 +75,11 @@ pub fn source_label(source: &str) -> String {
         .next()
         .unwrap_or_default()
         .trim_end_matches(".git");
+    let location = if matches!(kind, "registry" | "sparse") {
+        location.split('/').next().unwrap_or_default()
+    } else {
+        location
+    };
     if location.is_empty() {
         kind.to_string()
     } else {
@@ -118,13 +123,18 @@ fn redact_url(url: &str) -> String {
             if index > 0 {
                 redacted.push('&');
             }
-            let (key, value) = pair
-                .split_once('=')
-                .map_or((pair, None), |(key, value)| (key, Some(value)));
+            let Some((key, value)) = pair.split_once('=') else {
+                if provenance_query_key(pair) {
+                    redacted.push_str(pair);
+                } else {
+                    redacted.push_str(REDACTED);
+                }
+                continue;
+            };
             redacted.push_str(key);
             redacted.push('=');
             if provenance_query_key(key) {
-                redacted.push_str(value.unwrap_or_default());
+                redacted.push_str(value);
             } else {
                 redacted.push_str(REDACTED);
             }
@@ -224,6 +234,14 @@ mod tests {
     }
 
     #[test]
+    fn redacts_valueless_query_tokens() {
+        assert_eq!(
+            url_secrets("https://example.com/index?bearer-secret&rev"),
+            "https://example.com/index?REDACTED&rev"
+        );
+    }
+
+    #[test]
     fn preserves_precise_git_commits_without_preserving_other_fragments() {
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let value = format!(
@@ -251,6 +269,10 @@ mod tests {
         assert_eq!(
             source_label("git+file:///home/user/private/repo#abcdef"),
             "git:local"
+        );
+        assert_eq!(
+            source_label("registry+https://packages.example.com/bearer-secret/cargo/index"),
+            "registry:packages.example.com"
         );
         assert_eq!(source_label("proxy.example"), "proxy.example");
     }

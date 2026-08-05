@@ -289,10 +289,23 @@ pub(super) fn create_synced_private_file(path: &Utf8Path, contents: &[u8]) -> Re
 }
 
 pub(super) fn ensure_no_orphan_artifacts(lock_path: &Utf8Path) -> Result<()> {
+    if let Some(path) = project_recovery_artifact(lock_path)? {
+        return Err(CoreError::LockUnreadable(format!(
+            "unreferenced Cargo.lock recovery artifact at {path}; left it untouched; inspect and remove it explicitly"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn has_project_recovery_artifacts(lock_path: &Utf8Path) -> Result<bool> {
+    Ok(project_recovery_artifact(lock_path)?.is_some())
+}
+
+fn project_recovery_artifact(lock_path: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
     let parent = lock_path.parent().unwrap_or_else(|| Utf8Path::new(""));
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     for entry in entries {
@@ -301,13 +314,10 @@ pub(super) fn ensure_no_orphan_artifacts(lock_path: &Utf8Path) -> Result<()> {
             continue;
         };
         if is_recovery_artifact_name(&name) {
-            return Err(CoreError::LockUnreadable(format!(
-                "unreferenced Cargo.lock recovery artifact at {}; left it untouched; inspect and remove it explicitly",
-                parent.join(name)
-            )));
+            return Ok(Some(parent.join(name)));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn is_recovery_artifact_name(name: &str) -> bool {

@@ -1209,7 +1209,12 @@ mod tests {
         std::fs::create_dir_all(root.join("src"))?;
         std::fs::write(
             root.join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2024"
+            "#},
         )?;
         std::fs::write(root.join("src/lib.rs"), "pub fn app() {}\n")?;
         let generated = std::process::Command::new(Cargo::new().bin)
@@ -1225,7 +1230,12 @@ mod tests {
         let before = std::fs::read(root.join("Cargo.lock"))?;
         std::fs::write(
             root.join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+            indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.2.0"
+                edition = "2024"
+            "#},
         )?;
 
         let error = Cargo::new().metadata_locked(root).await.err();

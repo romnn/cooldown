@@ -76,30 +76,42 @@ pub(crate) fn recovery_authority_projects(
         if !scope.includes(&project_root) {
             continue;
         }
-        let artifact = TrustedArtifact::open(&path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
-        let anchor: RecoveryAnchor = artifact.decode("recovery authority")?;
-        if anchor.format != RECOVERY_ANCHOR_FORMAT || !is_sha256_digest(&anchor.record_digest) {
-            return Err(untrusted_record(&path));
+        match validate_attributed_anchor(&path, target, &project_root, scan_authority) {
+            Ok(()) => projects.push(project_root),
+            Err(error) => warnings.push(crate::RecoveryDiscoveryWarning { path, error }),
         }
-        let project = Project {
-            root: project_root.clone(),
-            manifest: project_root.join("Cargo.toml"),
-            kind: crate::CARGO_ID,
-            exclude_newer: None,
-        };
-        let project_coordination = cooldown_core::fs::ProjectCoordination::resolve(&project_root)?;
-        let project_authority = require_recovery_authority(&project, &project_coordination)?;
-        let expected = recovery_anchor_path(project_authority)?;
-        if expected.file_name() != Some(target)
-            || project_authority.directory() != scan_authority.directory()
-        {
-            return Err(untrusted_record(&path));
-        }
-        anchor.validate_without_record(&project, &path)?;
-        projects.push(project_root);
     }
     projects.sort();
     projects.dedup();
     warnings.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(crate::RecoveryAuthorityDiscovery { projects, warnings })
+}
+
+fn validate_attributed_anchor(
+    path: &camino::Utf8Path,
+    target: &str,
+    project_root: &camino::Utf8Path,
+    scan_authority: &RecoveryAuthority,
+) -> Result<()> {
+    let artifact = TrustedArtifact::open(path, MAX_RECOVERY_ANCHOR_BYTES, true)?;
+    let anchor: RecoveryAnchor = artifact.decode("recovery authority")?;
+    if anchor.format != RECOVERY_ANCHOR_FORMAT || !is_sha256_digest(&anchor.record_digest) {
+        return Err(untrusted_record(path));
+    }
+    let project = Project {
+        root: project_root.to_owned(),
+        manifest: project_root.join("Cargo.toml"),
+        kind: crate::CARGO_ID,
+        exclude_newer: None,
+    };
+    let project_coordination =
+        cooldown_core::fs::ProjectCoordination::resolve_existing(project_root)?;
+    let project_authority = require_recovery_authority(&project, &project_coordination)?;
+    let expected = recovery_anchor_path(project_authority)?;
+    if expected.file_name() != Some(target)
+        || project_authority.directory() != scan_authority.directory()
+    {
+        return Err(untrusted_record(path));
+    }
+    anchor.validate_without_record(&project, path)
 }

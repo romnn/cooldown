@@ -35,21 +35,21 @@ enum RecoveryScopeKind {
     Explicit,
 }
 
-/// Trusted authority projects and non-fatal artifacts that could not be attributed to a project.
+/// Trusted authority projects and non-fatal artifacts that could not be validated safely.
 #[derive(Debug)]
 pub struct RecoveryAuthorityDiscovery {
     /// Canonical project roots whose authority belongs to the requested scope.
     pub projects: Vec<camino::Utf8PathBuf>,
-    /// Malformed authority artifacts in the shared coordination namespace.
+    /// Authority artifacts that could not be attributed or revalidated.
     pub warnings: Vec<RecoveryDiscoveryWarning>,
 }
 
-/// A recovery authority artifact that could not be decoded enough to determine its project.
+/// A recovery authority artifact that could not be attributed or revalidated safely.
 #[derive(Debug)]
 pub struct RecoveryDiscoveryWarning {
     /// The untrusted artifact path.
     pub path: camino::Utf8PathBuf,
-    /// The validation failure that prevented attribution.
+    /// The validation failure that prevented trusted discovery.
     pub error: cooldown_core::CoreError,
 }
 
@@ -120,12 +120,14 @@ impl RecoveryScope {
     }
 }
 
-/// Discovers trusted authority projects and unattributable artifacts in `scope`'s Git repository.
+/// Discovers trusted authority projects and non-fatal invalid artifacts in `scope`'s Git
+/// repository.
 ///
 /// # Errors
 ///
-/// Returns a [`cooldown_core::CoreError`] when trusted authority is malformed, names an invalid
-/// project, or cannot be inspected safely.
+/// Returns a [`cooldown_core::CoreError`] when the shared authority namespace cannot be inspected
+/// safely or repository-wide discovery encounters malformed authority that cannot be attributed to
+/// a project.
 pub fn recovery_authority_projects(
     scope: &RecoveryScope,
 ) -> cooldown_core::Result<RecoveryAuthorityDiscovery> {
@@ -145,8 +147,9 @@ pub fn is_recovery_artifact_name(name: &str) -> bool {
 ///
 /// This recovery-only entry point performs no manifest parsing, registry setup, or Cargo command.
 /// It acquires exclusive project access before inspecting or consuming recovery evidence.
-/// Recovery fails closed outside a Git worktree and on platforms where cooldown cannot prove the
-/// recovery authority is private to the current user.
+/// A project without recovery artifacts returns unchanged without requiring recovery authority.
+/// Settling present recovery state fails closed outside a Git worktree and on platforms where
+/// cooldown cannot prove the recovery authority is private to the current user.
 ///
 /// # Errors
 ///
@@ -163,6 +166,13 @@ pub fn recover_interrupted_mutation(
         kind: CARGO_ID,
         exclude_newer: None,
     };
+    if lease.coordination().recovery_authority().is_none()
+        && !publication::has_project_recovery_artifacts(&project.root.join("Cargo.lock"))?
+    {
+        return Ok(cooldown_core::MutationRecovery::settled(
+            cooldown_core::RecoveryDisposition::Unchanged,
+        ));
+    }
     let authority = publication::require_recovery_authority(&project, lease.coordination())?;
     publication::recover_pending(&project, authority)
 }
@@ -172,8 +182,9 @@ pub use tool::CargoTool;
 
 #[cfg(test)]
 mod tests {
-    use super::RecoveryScope;
+    use super::{RecoveryScope, recover_interrupted_mutation};
     use color_eyre::eyre;
+    use indoc::indoc;
 
     #[test]
     fn recovery_scope_canonicalizes_repository_and_explicit_roots() -> eyre::Result<()> {
@@ -191,6 +202,45 @@ mod tests {
         assert!(explicit.includes(root));
         assert!(explicit.includes(&root.join("project/member")));
         assert!(!explicit.includes(&root.join("sibling")));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_non_git_project_needs_no_recovery_authority() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc! {r#"
+                [workspace]
+                resolver = "3"
+            "#},
+        )?;
+
+        let recovery = recover_interrupted_mutation(root)?;
+
+        std::assert_matches!(
+            recovery.disposition,
+            cooldown_core::RecoveryDisposition::Unchanged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_git_recovery_artifact_still_requires_authority() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        let marker = root.join(super::RECOVERY_MARKER);
+        std::fs::write(&marker, "untrusted recovery state")?;
+
+        let error = recover_interrupted_mutation(root)
+            .err()
+            .ok_or_else(|| eyre::eyre!("project-local recovery state bypassed authority"))?;
+
+        std::assert_matches!(error, cooldown_core::CoreError::LockUnreadable(_));
+        assert!(marker.exists());
         Ok(())
     }
 }

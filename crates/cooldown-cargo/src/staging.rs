@@ -105,7 +105,9 @@ impl CargoMutationStage {
         let source_files = layout.source_files()?;
         let preimage = capture_outputs(&source.root, &layout.output_paths)?;
         let scratch = tempfile::tempdir()?;
-        let topology = utf8_path(scratch.path().join("tree"))?;
+        let scratch_path = utf8_path(scratch.path().to_owned())?;
+        reject_staging_ancestor_overrides(&scratch_path)?;
+        let topology = scratch_path.join("tree");
         std::fs::create_dir_all(&topology)?;
         let input_paths = source_files
             .iter()
@@ -489,6 +491,28 @@ fn rust_toolchain_paths(directories: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<
     Ok(paths)
 }
 
+fn reject_staging_ancestor_overrides(scratch: &Utf8Path) -> Result<()> {
+    let ancestors = scratch
+        .ancestors()
+        .skip(1)
+        .map(Utf8Path::to_owned)
+        .collect::<BTreeSet<_>>();
+    let config_dirs = ancestors
+        .iter()
+        .map(|ancestor| ancestor.join(".cargo"))
+        .collect::<BTreeSet<_>>();
+    let unexpected = cargo_config_paths(&config_dirs)?
+        .into_iter()
+        .chain(rust_toolchain_paths(&ancestors)?)
+        .next();
+    if let Some(path) = unexpected {
+        return Err(isolation_error(format!(
+            "Cargo's temporary staging location inherits configuration from {path}; choose a temporary directory whose ancestors do not contain Cargo or Rust toolchain configuration"
+        )));
+    }
+    Ok(())
+}
+
 fn discover_vendor_roots(configs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf8PathBuf>> {
     let mut roots = BTreeSet::new();
     for config in configs {
@@ -857,7 +881,7 @@ mod tests {
     use super::*;
     use crate::CARGO_ID;
     use color_eyre::eyre;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     fn write(path: &Utf8Path, contents: &str) -> eyre::Result<()> {
         if let Some(parent) = path.parent() {
@@ -870,7 +894,12 @@ mod tests {
     fn package(root: &Utf8Path, name: &str) -> eyre::Result<()> {
         write(
             &root.join("Cargo.toml"),
-            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            &formatdoc! {r#"
+                [package]
+                name = "{name}"
+                version = "0.1.0"
+                edition = "2024"
+            "#},
         )?;
         write(&root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")
     }
@@ -910,6 +939,42 @@ mod tests {
     }
 
     #[test]
+    fn temporary_ancestor_overrides_are_rejected() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = utf8_path(directory.path().to_owned())?;
+        let scratch = root.join("scratch/trial");
+        std::fs::create_dir_all(&scratch)?;
+        let cargo_config = root.join(".cargo/config.toml");
+        write(
+            &cargo_config,
+            indoc! {"
+                [net]
+                offline = true
+            "},
+        )?;
+
+        let cargo_error = reject_staging_ancestor_overrides(&scratch)
+            .err()
+            .ok_or_else(|| eyre::eyre!("temporary Cargo configuration was accepted"))?;
+        assert!(cargo_error.to_string().contains(cargo_config.as_str()));
+
+        std::fs::remove_file(cargo_config)?;
+        let toolchain = root.join("rust-toolchain.toml");
+        write(
+            &toolchain,
+            indoc! {r#"
+                [toolchain]
+                channel = "stable"
+            "#},
+        )?;
+        let toolchain_error = reject_staging_ancestor_overrides(&scratch)
+            .err()
+            .ok_or_else(|| eyre::eyre!("temporary Rust toolchain override was accepted"))?;
+        assert!(toolchain_error.to_string().contains(toolchain.as_str()));
+        Ok(())
+    }
+
+    #[test]
     fn dependency_path_parser_ignores_unrelated_path_keys() -> eyre::Result<()> {
         let manifest: toml::Value = toml::from_str(indoc! {r#"
         [package]
@@ -943,19 +1008,31 @@ mod tests {
             ("include = [\"shared.toml\"]", "uses `include`"),
             ("paths = [\"../override\"]", "uses local `paths`"),
             (
-                "[resolver]\nlockfile-path = \"../state/Cargo.lock\"",
+                indoc! {r#"
+                    [resolver]
+                    lockfile-path = "../state/Cargo.lock"
+                "#},
                 "sets `resolver.lockfile-path`",
             ),
             (
-                "[patch.crates-io]\nlocal = { path = \"../local\" }",
+                indoc! {r#"
+                    [patch.crates-io]
+                    local = { path = "../local" }
+                "#},
                 "uses a path-based `[patch]`",
             ),
             (
-                "[source.local]\nlocal-registry = \"registry\"",
+                indoc! {r#"
+                    [source.local]
+                    local-registry = "registry"
+                "#},
                 "uses a `local-registry`",
             ),
             (
-                "[registries.private]\nindex = \"sparse+file:///srv/index\"",
+                indoc! {r#"
+                    [registries.private]
+                    index = "sparse+file:///srv/index"
+                "#},
                 "uses a file-backed registry URL",
             ),
         ] {
@@ -975,10 +1052,19 @@ mod tests {
     fn custom_lockfile_config_is_rejected_before_project_use() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = utf8_path(directory.path().join("workspace"))?;
-        write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n")?;
+        write(
+            &root.join("Cargo.toml"),
+            indoc! {r#"
+                [workspace]
+                resolver = "3"
+            "#},
+        )?;
         write(
             &root.join(".cargo/config.toml"),
-            "[resolver]\nlockfile-path = \"../state/Cargo.lock\"\n",
+            indoc! {r#"
+                [resolver]
+                lockfile-path = "../state/Cargo.lock"
+            "#},
         )?;
 
         let error = reject_custom_lockfile(&root)
@@ -992,14 +1078,23 @@ mod tests {
     fn included_cargo_config_is_rejected_before_project_use() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = utf8_path(directory.path().join("workspace"))?;
-        write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n")?;
+        write(
+            &root.join("Cargo.toml"),
+            indoc! {r#"
+                [workspace]
+                resolver = "3"
+            "#},
+        )?;
         write(
             &root.join(".cargo/config.toml"),
             "include = [\"custom-lock.toml\"]\n",
         )?;
         write(
             &root.join(".cargo/custom-lock.toml"),
-            "[resolver]\nlockfile-path = \"../state/Cargo.lock\"\n",
+            indoc! {r#"
+                [resolver]
+                lockfile-path = "../state/Cargo.lock"
+            "#},
         )?;
 
         let error = reject_custom_lockfile(&root)
@@ -1216,7 +1311,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = utf8_path(directory.path().join("app"))?;
         package(&root, "app")?;
-        write(&root.join(".cargo/config.toml"), "[net]\noffline = true\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            indoc! {"
+                [net]
+                offline = true
+            "},
+        )?;
         generate_lock(&root)?;
         let stage = CargoMutationStage::prepare(
             &Cargo::new(),
@@ -1228,7 +1329,13 @@ mod tests {
         std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
         let accepted = stage.accepted_state()?;
 
-        write(&root.join(".cargo/config.toml"), "[net]\noffline = false\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            indoc! {"
+                [net]
+                offline = false
+            "},
+        )?;
 
         std::assert_matches!(
             stage.publish(&accepted).await,
@@ -1257,7 +1364,13 @@ mod tests {
         std::fs::write(stage.staged.root.join("Cargo.lock"), "accepted lock\n")?;
         let accepted = stage.accepted_state()?;
 
-        write(&root.join(".cargo/config.toml"), "[net]\noffline = true\n")?;
+        write(
+            &root.join(".cargo/config.toml"),
+            indoc! {"
+                [net]
+                offline = true
+            "},
+        )?;
 
         std::assert_matches!(
             stage.publish(&accepted).await,
@@ -1370,7 +1483,13 @@ mod tests {
         let root = utf8_path(directory.path().join("app"))?;
         package(&root, "app")?;
         let config = root.join(".cargo/config.toml");
-        write(&config, "[net]\noffline = true\n")?;
+        write(
+            &config,
+            indoc! {"
+                [net]
+                offline = true
+            "},
+        )?;
         generate_lock(&root)?;
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))?;
 

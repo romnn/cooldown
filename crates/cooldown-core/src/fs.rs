@@ -101,7 +101,13 @@ impl ProjectCoordination {
         Self::resolve_with(target, true)
     }
 
-    fn resolve_existing(target: &Utf8Path) -> Result<Self, CoreError> {
+    /// Resolves an existing coordination namespace without creating filesystem state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem or path-encoding error when the target cannot be canonicalized or its
+    /// established coordination namespace cannot be inspected safely.
+    pub fn resolve_existing(target: &Utf8Path) -> Result<Self, CoreError> {
         Self::resolve_with(target, false)
     }
 

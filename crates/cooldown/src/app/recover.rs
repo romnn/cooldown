@@ -170,3 +170,61 @@ pub(crate) fn recover_targets(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cooldown_core::CoreError;
+
+    fn recovery(project: &Utf8Path) -> cooldown_core::Result<MutationRecovery> {
+        let disposition = match project.as_str() {
+            "accepted" => RecoveryDisposition::Accepted,
+            "restored" => RecoveryDisposition::Restored,
+            "cleanup" => RecoveryDisposition::CleanupOnly,
+            "unchanged" => RecoveryDisposition::Unchanged,
+            _ => return Err(CoreError::Filesystem("recovery failed".to_string())),
+        };
+        Ok(MutationRecovery::settled(disposition))
+    }
+
+    #[test]
+    fn recovery_reducer_maps_every_status_and_failure_exit() {
+        let targets = ["accepted", "restored", "cleanup", "unchanged", "failed"]
+            .into_iter()
+            .map(|project| {
+                RecoveryTarget::new(
+                    ToolId("cargo"),
+                    Utf8PathBuf::from(project),
+                    project.to_string(),
+                    recovery,
+                )
+            })
+            .collect();
+
+        let outcome = recover_targets(targets, Vec::new(), &Progress::default());
+
+        assert_eq!(outcome.summary.recovered, 3);
+        assert_eq!(outcome.summary.unchanged, 1);
+        assert_eq!(outcome.summary.errors, 1);
+        assert_eq!(outcome.exit, Exit::Environment);
+        assert!(
+            outcome.items.iter().any(|item| {
+                item.project == "accepted" && item.status == RecoveryStatus::Accepted
+            })
+        );
+        assert!(
+            outcome.items.iter().any(|item| {
+                item.project == "restored" && item.status == RecoveryStatus::Restored
+            })
+        );
+        assert!(outcome.items.iter().any(|item| {
+            item.project == "cleanup" && item.status == RecoveryStatus::CleanupOnly
+        }));
+        assert!(outcome.items.iter().any(|item| {
+            item.project == "unchanged" && item.status == RecoveryStatus::Unchanged
+        }));
+        assert!(outcome.items.iter().any(|item| {
+            item.project == "failed" && item.status == RecoveryStatus::Error && item.error.is_some()
+        }));
+    }
+}

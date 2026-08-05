@@ -872,15 +872,17 @@ mod tests {
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
+
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
-        use std::fmt::Write as _;
         let mut content = String::from("version = 4\n");
         for (name, version) in packages {
-            write!(
-                content,
-                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
-            )
-            .expect("writing to a String never fails");
+            content.push_str(&formatdoc! {r#"
+
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#});
         }
         CargoLock::parse(&content).expect("lock parses")
     }
@@ -1394,7 +1396,15 @@ mod tests {
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         std::fs::write(
             root.join("Cargo.toml"),
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = \"1\"\n",
+            indoc! {r#"
+                [package]
+                name = "demo"
+                version = "0.1.0"
+                edition = "2024"
+
+                [dependencies]
+                serde = "1"
+            "#},
         )?;
         let project = Project {
             root: root.clone(),
@@ -1428,7 +1438,12 @@ mod tests {
         let manifest = root.join("Cargo.toml");
         std::fs::write(
             &manifest,
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            indoc! {r#"
+                [package]
+                name = "demo"
+                version = "0.1.0"
+                edition = "2024"
+            "#},
         )?;
         let cache_dir = tempfile::tempdir()?;
         let eco = CargoTool::from_http(cooldown_registry::SharedHttp::new(

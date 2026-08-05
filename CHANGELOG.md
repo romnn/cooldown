@@ -66,6 +66,8 @@
   authority that could not be attributed safely. Shared `ProjectReadLease`, `ProjectWriteLease`,
   `RepositoryResourceReadLease`, and `RepositoryResourceWriteLease` types now own the coordinated
   lock protocols used by the application and standalone recovery.
+  `ProjectCoordination::resolve_existing` resolves that identity without creating a coordination
+  namespace, for validation and discovery paths that must remain side-effect-free.
 - **Breaking library API:** `Workspace::explain` now returns `Result<ExplainOutcome>` so pending
   project mutation state and other access-session failures cannot be silently reduced to a missing
   registry.

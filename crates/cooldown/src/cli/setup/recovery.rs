@@ -261,7 +261,7 @@ fn cargo_recovery_discovery(
             Diagnostic::new(
                 warning.error.diagnostic_kind(),
                 format!(
-                    "could not attribute Cargo recovery authority at {}: {}",
+                    "could not validate Cargo recovery authority at {}: {}",
                     warning.path, warning.error
                 ),
             )

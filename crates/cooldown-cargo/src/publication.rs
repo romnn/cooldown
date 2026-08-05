@@ -6,7 +6,7 @@ mod model;
 mod publish;
 mod recover;
 
-pub(crate) use artifact::is_recovery_artifact_name;
+pub(crate) use artifact::{has_project_recovery_artifacts, is_recovery_artifact_name};
 pub(crate) use discovery::{recovery_authority_projects, require_recovery_authority};
 pub(crate) use model::RECOVERY_MARKER;
 pub(crate) use publish::publish_accepted;
@@ -495,6 +495,29 @@ mod tests {
         let discovery = recovery_authority_projects(&scope)?;
         assert_eq!(discovery.projects, [project.root]);
         assert!(discovery.warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn authority_discovery_warns_when_an_anchored_project_was_deleted() -> eyre::Result<()> {
+        let (_directory, repository, _lock_path) = setup();
+        let deleted_root = repository.root.join("deleted-project");
+        std::fs::create_dir_all(&deleted_root)?;
+        std::fs::write(deleted_root.join("Cargo.lock"), "original")?;
+        let deleted = project(&deleted_root);
+        let authority = recovery_authority(&deleted)?;
+        let anchor_path = recovery_anchor_path(&authority)?;
+        let anchor = RecoveryAnchor::new(&deleted, b"record")?;
+        publish_exclusive_json(&anchor_path, &anchor)
+            .map_err(|error| eyre::eyre!("publish anchor: {error:?}"))?;
+        std::fs::remove_dir_all(&deleted_root)?;
+
+        let scope = crate::RecoveryScope::repository(&repository.root)?;
+        let discovery = recovery_authority_projects(&scope)?;
+
+        assert!(discovery.projects.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.warnings[0].path, anchor_path);
         Ok(())
     }
 
