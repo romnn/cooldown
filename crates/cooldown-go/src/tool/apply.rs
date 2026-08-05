@@ -128,10 +128,17 @@ fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
 }
 
 fn resolver_conflict(change: &Change) -> Skipped {
+    // A cross-major candidate is planned under its *target* path (`…/vN` — `go get` needs it), but
+    // a skip means the tree still holds the from-major module, so the row reports the identity
+    // that actually exists; the target path stays visible in the To column's major.
+    let mut reported = change.clone();
+    if let Some(old_path) = mutation::old_import_path(change) {
+        reported.package = PackageId::new(GO_ID, old_path, change.package.registry.clone());
+    }
     Skipped {
-        change: change.clone(),
+        offending: Some(reported.package.clone()),
+        change: reported,
         reason: SkipReason::ResolverConflict,
-        offending: Some(change.package.clone()),
         detail: None,
     }
 }
@@ -271,6 +278,46 @@ mod tests {
     fn collateral_change_marks_a_forced_regression_as_a_downgrade() {
         let change = collateral_change("k8s.io/api", "v0.31.0", "v0.30.2");
         assert!(change.downgrade);
+    }
+
+    #[test]
+    fn resolver_conflict_reports_a_cross_major_skip_under_the_from_identity() {
+        // Planned under the target path (go get needs `…/v2`), but skipped — the tree still holds
+        // the v1 module, so the row must not claim a `…/v2` module exists at v1.3.0.
+        let change = Change {
+            package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+            from: Version::new("v1.3.0"),
+            to: Version::new("v2.0.0"),
+            kind: UpdateKind::Major,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let skipped = resolver_conflict(&change);
+        assert_eq!(skipped.change.package.name, "example.com/foo");
+        // Self-blame stays consistent with the rewritten identity so the renderer's self check
+        // (which falls back to the generic resolver message) still recognizes it.
+        assert_eq!(
+            skipped
+                .offending
+                .as_ref()
+                .map(|package| package.name.as_str()),
+            Some("example.com/foo"),
+        );
+        // A within-major skip keeps its identity untouched.
+        let minor = Change {
+            package: PackageId::new(GO_ID, "example.com/foo", None),
+            from: Version::new("v1.3.0"),
+            to: Version::new("v1.4.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        assert_eq!(
+            resolver_conflict(&minor).change.package.name,
+            "example.com/foo"
+        );
     }
 
     #[test]
