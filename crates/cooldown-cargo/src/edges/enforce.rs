@@ -29,6 +29,14 @@ enum BindingOutcome {
         rewrite: EdgeRewrite,
         reason: String,
     },
+    /// A withheld correction whose edge binding demonstrably moved baseline → final: one row
+    /// carrying the real bindings, with the failed attempt in the reason. Splitting it into a
+    /// `Withheld` proposal row plus an observation row reported the same decision twice, with the
+    /// proposal's To naming a version the final lock does not contain.
+    HeldObserved {
+        change: BindingChange,
+        reason: String,
+    },
     ObservedAllowed(BindingChange),
     Unaddressable {
         change: BindingChange,
@@ -94,15 +102,20 @@ pub(crate) async fn enforce(
             action: corrected_action,
         })
         .collect();
-    outcomes.extend(
+    let mut withheld_by_key: BTreeMap<(super::LockPackageId, String), (EdgeRewrite, String)> =
         guarded
             .rejected
             .iter()
-            .map(|rejected| BindingOutcome::Withheld {
-                rewrite: rejected.rewrite.clone(),
-                reason: rejected.reason.clone(),
-            }),
-    );
+            .map(|rejected| {
+                (
+                    (
+                        rejected.rewrite.dependent.clone(),
+                        rejected.rewrite.dependency.clone(),
+                    ),
+                    (rejected.rewrite.clone(), rejected.reason.clone()),
+                )
+            })
+            .collect();
 
     if let Some(before_view) = &before_view {
         let final_view = match final_text {
@@ -111,19 +124,56 @@ pub(crate) async fn enforce(
         };
         let covered: BTreeSet<_> = outcomes.iter().filter_map(outcome_edge_key).collect();
         let requirements = graph.as_ref().map(RequirementIndex::new);
-        outcomes.extend(residual_outcomes(
+        let residuals = residual_outcomes(
             policy,
             before_view,
             &final_view,
             &covered,
             requirements.as_ref(),
-        ));
+        );
+        merge_residuals_with_withheld(&mut outcomes, residuals, &mut withheld_by_key);
     }
+    // Withheld corrections whose binding shows no residual change (or with no baseline to compare
+    // against) keep the proposal presentation: attempted target in To, applied=false.
+    outcomes.extend(
+        withheld_by_key
+            .into_values()
+            .map(|(rewrite, reason)| BindingOutcome::Withheld { rewrite, reason }),
+    );
 
     Ok(EnforcementResult {
         rebinds: outcomes.into_iter().map(outcome_row).collect(),
         graph,
     })
+}
+
+/// Folds each residual binding change whose edge also carries a withheld correction into a single
+/// held row over the real baseline → final bindings: the binding moved and the policy's
+/// counter-move failed — one decision, one row. Residuals without a withheld sibling pass through;
+/// consumed withheld entries are removed from `withheld_by_key`.
+fn merge_residuals_with_withheld(
+    outcomes: &mut Vec<BindingOutcome>,
+    residuals: Vec<BindingOutcome>,
+    withheld_by_key: &mut BTreeMap<(super::LockPackageId, String), (EdgeRewrite, String)>,
+) {
+    for outcome in residuals {
+        let change = match &outcome {
+            BindingOutcome::ObservedAllowed(change)
+            | BindingOutcome::Unaddressable { change, .. } => Some(change),
+            _ => None,
+        };
+        let held = change.and_then(|change| {
+            withheld_by_key.remove(&(change.dependent.clone(), change.dependency.clone()))
+        });
+        match (held, outcome) {
+            (
+                Some((_, reason)),
+                BindingOutcome::ObservedAllowed(change)
+                | BindingOutcome::Unaddressable { change, .. },
+            ) => outcomes.push(BindingOutcome::HeldObserved { change, reason }),
+            (_, outcome) => outcomes.push(outcome),
+        }
+    }
 }
 
 /// Restores the pre-candidate lock when a prior enforcement terminated during verification.
@@ -270,6 +320,7 @@ fn outcome_edge_key(outcome: &BindingOutcome) -> Option<(super::LockPackageId, S
             Some((rewrite.dependent.clone(), rewrite.dependency.clone()))
         }
         BindingOutcome::Withheld { .. }
+        | BindingOutcome::HeldObserved { .. }
         | BindingOutcome::ObservedAllowed(_)
         | BindingOutcome::Unaddressable { .. } => None,
     }
@@ -280,6 +331,9 @@ fn outcome_row(outcome: BindingOutcome) -> EdgeRebind {
         BindingOutcome::Corrected { rewrite, action } => corrective_row(&rewrite, action, None),
         BindingOutcome::Withheld { rewrite, reason } => {
             corrective_row(&rewrite, EdgeBindingAction::Held, Some(reason))
+        }
+        BindingOutcome::HeldObserved { change, reason } => {
+            observed_row(change, EdgeBindingAction::Held, Some(reason))
         }
         BindingOutcome::ObservedAllowed(change) => {
             observed_row(change, EdgeBindingAction::Rebound, None)
