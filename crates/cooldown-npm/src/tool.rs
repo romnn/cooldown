@@ -821,11 +821,9 @@ impl<L: NodeLock> NpmTool<L> {
                     resolve.postimage = journal.capture_state()?;
                 }
                 // The joint resolve is unsatisfiable as a whole.
-                // Propagate the failure so the
-                // caller's `apply_resilient` can isolate the offending candidate(s) (an
-                // unfetchable version, one side of a conflict) and apply the rest, instead of
-                // holding every candidate.
-                // The caller restores the journal, so no partial lock is kept.
+                // Restore its partial work, then let `apply_resilient` isolate the offending
+                // candidate (an unfetchable version or one side of a conflict) instead of holding
+                // the complete batch.
                 Err(error) => {
                     restore_after_owned_step(journal, &resolve.postimage)?;
                     return Err(error);

@@ -39,8 +39,10 @@ pub(crate) fn window_minutes(spec: &WindowSpec) -> Option<i64> {
 
 /// Sets one top-level YAML scalar while preserving comments and key order.
 ///
-/// A missing file is created unless `dry_run` is enabled.
-/// The return value reports whether the file changed or would change.
+/// pnpm settings are top-level scalars, so a line-level edit avoids a full YAML round trip that
+/// would drop comments.
+/// A missing file is created unless `dry_run` is enabled, and the return value reports whether the
+/// file changed or would change.
 ///
 /// # Errors
 ///
@@ -98,8 +100,10 @@ pub(crate) fn set_yaml_scalar(
 
 /// Sets one top-level YAML block sequence while preserving the rest of the document.
 ///
-/// An empty item list removes the key and its block.
-/// Items are emitted as double-quoted scalars in caller-provided order.
+/// An empty item list removes the key and its block so native configuration never retains an empty
+/// exemption list.
+/// Items are emitted as double-quoted scalars in caller-provided order, which safely preserves
+/// scoped names such as `@scope/pkg` and glob patterns such as `@scope/*`.
 /// A missing file is created only for a non-empty list and when `dry_run` is disabled.
 ///
 /// # Errors
@@ -116,6 +120,7 @@ pub(crate) fn set_yaml_block_list(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
     };
+    // An empty desired block means the key should be absent.
     let desired: Vec<String> = if items.is_empty() {
         Vec::new()
     } else {
@@ -131,6 +136,7 @@ pub(crate) fn set_yaml_block_list(
     let mut lines = content.lines().peekable();
     while let Some(line) = lines.next() {
         if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
+            // A top-level key has no indentation; its block is the following indented lines.
             found = true;
             existing.push(line.to_string());
             while lines
@@ -139,6 +145,7 @@ pub(crate) fn set_yaml_block_list(
             {
                 existing.push(lines.next().unwrap_or_default().to_string());
             }
+            // Replace the old block in place, or remove it when the desired block is empty.
             out.extend(desired.iter().cloned());
         } else {
             out.push(line.to_string());
@@ -157,6 +164,7 @@ pub(crate) fn set_yaml_block_list(
     let mut text = if found {
         out.join("\n")
     } else {
+        // New keys follow the existing document without disturbing its text.
         let mut text = content.clone();
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
