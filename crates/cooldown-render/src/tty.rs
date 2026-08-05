@@ -279,7 +279,10 @@ fn check_notes_cell(item: &CheckItem) -> String {
         notes.push("graph-held".to_string());
     }
     if let Some(graph_floor) = &item.graph_floor {
-        notes.push(format!("floor {graph_floor}"));
+        // "graph floor", not bare "floor": beside a violation a bare "floor 0.4.4" reads as the
+        // version a fix would land on, but this is the resolved graph's lower bound — the
+        // remediation target is the newest matured release at/above it, which may differ.
+        notes.push(format!("graph floor {graph_floor}"));
     }
     if let Some(error) = &item.error {
         notes.push(error.message.clone());
@@ -576,13 +579,126 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
+/// One table row's worth of items: either a lone item or a batch of identical clean edge
+/// corrections collapsed into a single row.
+enum EdgeRenderUnit<'a> {
+    Single(&'a UpgradeItem),
+    Group(Vec<&'a UpgradeItem>),
+}
+
+/// Collapses identical clean edge corrections — same tool, project, package identity, binding
+/// move, and action, with no per-edge detail — into one render unit each, keeping first-occurrence
+/// order. A run that restores the same `windows-sys 0.52.0 → 0.59.0` binding for a dozen
+/// dependents reads as one row naming them, not a dozen rows differing only in the dependent.
+/// Tool, project, and registry are part of the identity: the same correction in two projects (or
+/// for a same-named package from another registry) is two facts, and merging them would attribute
+/// one project's edges to the other. Detail-carrying rows (held, unaddressable,
+/// rebound-with-reason) stay individual: their details are per-edge facts.
+fn group_edge_corrections(items: &[UpgradeItem]) -> Vec<EdgeRenderUnit<'_>> {
+    type GroupKey<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        &'a str,
+        &'static str,
+    );
+    let mut units: Vec<EdgeRenderUnit<'_>> = Vec::new();
+    let mut group_index: std::collections::HashMap<GroupKey<'_>, usize> =
+        std::collections::HashMap::new();
+    for item in items {
+        let groupable = item.edge.as_ref().filter(|edge| {
+            matches!(
+                edge.action,
+                cooldown_core::EdgeBindingAction::Restored
+                    | cooldown_core::EdgeBindingAction::Canonicalized
+            ) && edge.detail.is_none()
+        });
+        let Some(edge) = groupable else {
+            units.push(EdgeRenderUnit::Single(item));
+            continue;
+        };
+        let key = (
+            item.tool.as_str(),
+            item.project.as_str(),
+            item.name.as_str(),
+            item.registry.as_deref(),
+            item.from.as_str(),
+            item.to.as_str(),
+            edge.action.wire_value(),
+        );
+        if let Some(&index) = group_index.get(&key) {
+            if let Some(EdgeRenderUnit::Group(group)) = units.get_mut(index) {
+                group.push(item);
+            }
+        } else {
+            group_index.insert(key, units.len());
+            units.push(EdgeRenderUnit::Group(vec![item]));
+        }
+    }
+    units
+}
+
+/// The status cells for a collapsed correction group: the singular phrasing when the group holds
+/// one edge, the dependent roster (capped) when it holds several.
+fn edge_group_status(group: &[&UpgradeItem]) -> MutationStatus {
+    const SHOWN: usize = 3;
+    let (Some(first), Some(edge)) = (group.first(), group.first().and_then(|it| it.edge.as_ref()))
+    else {
+        return MutationStatus {
+            status: "planned",
+            reason: String::new(),
+            color: Color::Cyan,
+        };
+    };
+    if group.len() == 1 {
+        return mutation_status(first);
+    }
+    let mut labels: Vec<String> = group
+        .iter()
+        .filter_map(|it| it.edge.as_ref())
+        .map(|edge| {
+            // Same-name/version dependents from different sources are distinct facts; the
+            // abbreviated source keeps them tellable apart, matching the single-row phrasing.
+            let source = edge
+                .dependent_source
+                .as_deref()
+                .map(|source| format!(" ({})", abbreviated_source(source)))
+                .unwrap_or_default();
+            format!("{} {}{source}", edge.dependent, edge.dependent_version)
+        })
+        .collect();
+    labels.sort();
+    let mut list = labels
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if labels.len() > SHOWN {
+        let _ = write!(list, ", +{} more", labels.len() - SHOWN);
+    }
+    let subject = format!(
+        "{} dependents' {} edge bindings ({list})",
+        labels.len(),
+        first.name
+    );
+    match edge.action {
+        cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
+            status: "canonicalized",
+            reason: format!("{subject} bound to the canonical satisfying locked version"),
+            color: Color::Green,
+        },
+        _ => MutationStatus {
+            status: "restored",
+            reason: format!("the re-resolve rebound {subject}; restored"),
+            color: Color::Green,
+        },
+    }
+}
+
 /// The Status/Reason cells of one mutation row — both cells share the color.
-/// The applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is
-/// `downgraded`, not `upgraded`.
-/// A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean apply has an
-/// empty reason because Status says it.
-/// An edge row reports a lock-edge *binding* move (the From/To cells are binding versions), so its
-/// status word names the edge-policy outcome and its reason names the dependent whose edge moved.
 struct MutationStatus {
     /// The one-word status cell.
     status: &'static str,
@@ -591,6 +707,12 @@ struct MutationStatus {
     color: Color,
 }
 
+/// The status cells for one mutation row. The applied word is per-item, not per-command: a
+/// too-fresh pin an `upgrade` rolls back is `downgraded`, not `upgraded`. A held-back cross-major
+/// is a `skipped` row whose reason is `needs --major`; a clean apply has an empty reason because
+/// Status says it. An edge row reports a lock-edge *binding* move (the From/To cells are binding
+/// versions), so its status word names the edge-policy outcome and its reason names the dependent
+/// whose edge moved.
 fn mutation_status(it: &UpgradeItem) -> MutationStatus {
     if let Some(edge) = &it.edge {
         let source = edge
@@ -769,12 +891,19 @@ fn render_mutation(
         // the row's color).
         header.extend(["From", "To", "Status", "Reason"]);
         t.set_header(header);
-        for it in items {
+        for unit in group_edge_corrections(items) {
+            let (it, cells) = match &unit {
+                EdgeRenderUnit::Single(it) => (*it, mutation_status(it)),
+                EdgeRenderUnit::Group(group) => {
+                    let Some(first) = group.first() else { continue };
+                    (*first, edge_group_status(group))
+                }
+            };
             let MutationStatus {
                 status,
                 reason,
                 color,
-            } = mutation_status(it);
+            } = cells;
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -1070,6 +1199,74 @@ mod tests {
         assert!(!status.reason.contains("token"));
         assert!(!status.reason.contains("aaaa"));
         assert!(!status.reason.contains("bbbb"));
+    }
+
+    #[test]
+    fn identical_clean_edge_corrections_collapse_into_one_row_naming_dependents() {
+        use super::{EdgeRenderUnit, edge_group_status, group_edge_corrections};
+        let restored_edge = |dependent: &str| {
+            let mut item =
+                needs_major_item("windows-sys", "0.52.0", "0.59.0", UpdateKind::Minor, ".");
+            item.applied = true;
+            item.skipped = None;
+            item.edge = Some(crate::UpgradeEdgeInfo {
+                dependent: dependent.to_string(),
+                dependent_version: "1.0.0".to_string(),
+                dependent_source: None,
+                action: cooldown_core::EdgeBindingAction::Restored,
+                detail: None,
+            });
+            item
+        };
+        let items = vec![
+            restored_edge("fd-lock"),
+            restored_edge("fs-set-times"),
+            restored_edge("rustix"),
+            restored_edge("winx"),
+        ];
+        let units = group_edge_corrections(&items);
+        assert_eq!(units.len(), 1, "four identical corrections are one row");
+        let EdgeRenderUnit::Group(group) = &units[0] else {
+            panic!("expected a grouped unit");
+        };
+        let status = edge_group_status(group);
+        assert_eq!(status.status, "restored");
+        assert!(
+            status
+                .reason
+                .contains("4 dependents' windows-sys edge bindings")
+        );
+        assert!(status.reason.contains("fd-lock 1.0.0"));
+        assert!(
+            status.reason.contains("+1 more"),
+            "roster caps at three names: {}",
+            status.reason
+        );
+        // A detail-carrying held row for the same package must stay its own unit.
+        let mut held = restored_edge("held-dep");
+        if let Some(edge) = held.edge.as_mut() {
+            edge.action = cooldown_core::EdgeBindingAction::Held;
+            edge.detail = Some("verification failed".to_string());
+        }
+        let mixed = vec![restored_edge("fd-lock"), held];
+        assert_eq!(group_edge_corrections(&mixed).len(), 2);
+        // The same correction observed in a different project (or registry) is a different fact;
+        // merging would attribute one project's edges to the other.
+        let mut other_project = restored_edge("fs-set-times");
+        other_project.project = "other-project".to_string();
+        let mut other_registry = restored_edge("fd-lock");
+        other_registry.registry = Some("registry.example.com".to_string());
+        let cross = vec![
+            restored_edge("fd-lock"),
+            restored_edge("fs-set-times"),
+            other_project,
+            other_registry,
+        ];
+        assert_eq!(
+            group_edge_corrections(&cross).len(),
+            3,
+            "cross-project and cross-registry corrections stay separate"
+        );
     }
 
     /// Members whose name is the given string and whose path is `path/<name>`.
