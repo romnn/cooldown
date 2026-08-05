@@ -299,10 +299,15 @@ fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<
             let name = entry.file_name();
             let name = name.to_str()?;
             let marker = markers.get(name).copied()?;
-            entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
-                .then_some(marker)
+            let kind = entry.file_type().ok()?;
+            if kind.is_file()
+                || (kind.is_symlink()
+                    && std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
+            {
+                Some(marker)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -676,6 +681,23 @@ mod tests {
             vec![root],
             "a file-level-ignored lockfile is still a project"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_lock_symlink_does_not_mark_a_project() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        symlink("missing.lock", root.join("Cargo.lock"))?;
+
+        let found = find_marker_dirs(&root, "Cargo.lock", false, &[], true)?;
+
+        assert!(found.is_empty());
+        Ok(())
     }
 
     #[test]

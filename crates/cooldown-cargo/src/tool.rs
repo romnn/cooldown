@@ -616,12 +616,14 @@ impl CargoTool {
 
         let resolver_lock = read_lock(project)?;
 
-        // The resolved graph supplies declared requirements to edge enforcement and proves which
-        // direct member edges reached their targets.
+        // The resolved graph supplies declared requirements to edge enforcement, proves which
+        // direct member edges reached their targets, and names the requirement blocking a target
+        // absent from its lock slot.
         // Preserve needs requirements only when the before/resolver lock pair contains an
         // addressable rebind; successful lock verification returns a fresh graph after any
         // correction.
-        let needs_graph = plan.changes.iter().any(needs_member_graph);
+        let resolver_versions = resolver_lock.crates_io_locked_versions();
+        let needs_graph = needs_apply_graph(&plan.changes, &resolver_versions);
         let preserve_needs_graph = matches!(plan.edge_policy, EdgePolicy::Preserve)
             && before_lock.as_ref().is_some_and(|before_lock| {
                 edges::preserve::has_potential_restoration(
@@ -715,6 +717,12 @@ fn reached(after: &BTreeMap<SlotKey, String>, change: &Change) -> bool {
 
 fn needs_member_graph(change: &Change) -> bool {
     change.direct && !change.members.is_empty()
+}
+
+fn needs_apply_graph(changes: &[Change], after: &BTreeMap<SlotKey, String>) -> bool {
+    changes
+        .iter()
+        .any(|change| needs_member_graph(change) || !reached(after, change))
 }
 
 fn reached_after(
@@ -1056,6 +1064,21 @@ mod tests {
             ),
             "an alternate-registry target does not satisfy a crates.io plan"
         );
+    }
+
+    #[test]
+    fn apply_graph_is_loaded_to_attribute_a_held_transitive_candidate() {
+        let landed = lock_with(&[("shared", "1.1.0")]).crates_io_locked_versions();
+        let mut transitive = change("shared", "1.0.0", "1.1.0", false);
+        transitive.direct = false;
+
+        assert!(!needs_apply_graph(
+            std::slice::from_ref(&transitive),
+            &landed
+        ));
+
+        let held = lock_with(&[("shared", "1.0.0")]).crates_io_locked_versions();
+        assert!(needs_apply_graph(&[transitive], &held));
     }
 
     #[test]

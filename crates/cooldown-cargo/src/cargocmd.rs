@@ -845,6 +845,35 @@ impl Cargo {
         }
     }
 
+    async fn run_locked_metadata(&self, dir: &Utf8Path) -> Result<String, CoreError> {
+        let out = self
+            .output(
+                dir,
+                &[
+                    "metadata",
+                    "--all-features",
+                    "--locked",
+                    "--format-version",
+                    "1",
+                ],
+            )
+            .await?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stale_lock_diagnostic(&stderr) {
+            return Err(CoreError::StaleLock(format!(
+                "Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`"
+            )));
+        }
+        Err(CoreError::Tool {
+            tool: self.bin.clone(),
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(&out),
+        })
+    }
+
     /// Resolves the lock-generation graph for `dir` via `cargo metadata --all-features`.
     ///
     /// # Errors
@@ -872,56 +901,21 @@ impl Cargo {
     /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the corresponding Cargo
     /// tool error for any other failure.
     pub async fn metadata_locked(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
-        let out = self
-            .output(
-                dir,
-                &[
-                    "metadata",
-                    "--all-features",
-                    "--locked",
-                    "--format-version",
-                    "1",
-                ],
-            )
-            .await?;
-        if out.status.success() {
-            return Self::parse_graph(&String::from_utf8_lossy(&out.stdout));
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stale_lock_diagnostic(&stderr) {
-            return Err(CoreError::StaleLock(format!(
-                "Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`"
-            )));
-        }
-        Err(CoreError::Tool {
-            tool: self.bin.clone(),
-            termination: ToolTermination::from_exit_status(out.status),
-            stderr: failure_detail(&out),
-        })
+        let stdout = self.run_locked_metadata(dir).await?;
+        Self::parse_graph(&stdout)
     }
 
     /// Reads the locked package and target topology without allowing Cargo to rewrite the source.
     ///
     /// # Errors
     ///
-    /// Returns a tool error when the source lock is stale and a lock-read error when Cargo emits
-    /// malformed or non-UTF-8 filesystem paths.
+    /// Returns [`CoreError::StaleLock`] when the source lock is stale and a lock-read error when
+    /// Cargo emits malformed or non-UTF-8 filesystem paths.
     pub(crate) async fn staging_metadata(
         &self,
         dir: &Utf8Path,
     ) -> Result<StagingMetadata, CoreError> {
-        let stdout = self
-            .run(
-                dir,
-                &[
-                    "metadata",
-                    "--all-features",
-                    "--locked",
-                    "--format-version",
-                    "1",
-                ],
-            )
-            .await?;
+        let stdout = self.run_locked_metadata(dir).await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
             .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
         let workspace_root = camino::Utf8PathBuf::from(raw.workspace_root);
@@ -1238,8 +1232,11 @@ mod tests {
             "#},
         )?;
 
-        let error = Cargo::new().metadata_locked(root).await.err();
+        let cargo = Cargo::new();
+        let error = cargo.metadata_locked(root).await.err();
         std::assert_matches!(error, Some(CoreError::StaleLock(_)));
+        let staging_error = cargo.staging_metadata(root).await.err();
+        std::assert_matches!(staging_error, Some(CoreError::StaleLock(_)));
         assert_eq!(std::fs::read(root.join("Cargo.lock"))?, before);
         Ok(())
     }

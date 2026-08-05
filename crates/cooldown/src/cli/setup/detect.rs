@@ -164,11 +164,7 @@ pub(super) fn detect_projects(
                 pending.id.as_str()
             ))
         })?;
-        let validation_only = found
-            .validation_only
-            .into_iter()
-            .filter(|dir| found.primary.binary_search(dir).is_err())
-            .collect::<Vec<_>>();
+        let validation_only = validation_roots_outside_primary(&found);
         pending
             .adapter
             .validate_manifests_without_lock(&validation_only)?;
@@ -194,6 +190,20 @@ pub(super) fn detect_projects(
         }
     }
     Ok(projects)
+}
+
+fn validation_roots_outside_primary(found: &crate::scan::ProjectMarkerDirs) -> Vec<Utf8PathBuf> {
+    found
+        .validation_only
+        .iter()
+        .filter(|candidate| {
+            !found
+                .primary
+                .iter()
+                .any(|primary| candidate.starts_with(primary))
+        })
+        .cloned()
+        .collect()
 }
 
 fn marker_manifest_path(
@@ -228,5 +238,17 @@ mod tests {
         };
 
         assert_eq!(marker_manifest_path(root, &marker), root.join("deno.jsonc"));
+    }
+
+    #[test]
+    fn validation_skips_manifests_owned_by_a_detected_workspace() {
+        let root = Utf8PathBuf::from("/repo");
+        let sibling = Utf8PathBuf::from("/other");
+        let found = crate::scan::ProjectMarkerDirs {
+            primary: vec![root.clone()],
+            validation_only: vec![root.clone(), root.join("member"), sibling.clone()],
+        };
+
+        assert_eq!(validation_roots_outside_primary(&found), vec![sibling]);
     }
 }
