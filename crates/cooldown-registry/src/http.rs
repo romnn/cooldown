@@ -296,6 +296,14 @@ impl SharedHttp {
                 Err(FetchError::Backoff(delay)) if attempt <= self.inner.opts.max_retries => {
                     tokio::time::sleep(delay).await;
                 }
+                // One bounded retry for a transport failure (connection reset, DNS blip): these
+                // index GETs are idempotent, and a lone flicker otherwise fails a whole gate run
+                // with a transient-error row. The fail-closed path below still holds when the
+                // retry also fails.
+                Err(FetchError::Transient(e)) if attempt == 1 => {
+                    tracing::debug!(url, host, error = %e, "transient transport failure; retrying once");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
                 Err(FetchError::Transient(e)) => {
                     // Fall back to a stale cached copy if we have one; else propagate.
                     if !self.inner.opts.fresh
