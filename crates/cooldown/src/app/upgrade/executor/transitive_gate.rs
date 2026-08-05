@@ -93,7 +93,9 @@ pub(super) fn package_label(package: &PackageId) -> String {
 fn is_default_registry(package: &PackageId, source: &str) -> bool {
     matches!(
         (package.tool.as_str(), source),
-        ("cargo", "crates.io") | ("npm" | "pnpm" | "yarn" | "bun", "npm")
+        ("cargo", "crates.io")
+            | ("npm" | "pnpm" | "yarn" | "bun", "npm")
+            | ("go", "proxy.golang.org")
     )
 }
 

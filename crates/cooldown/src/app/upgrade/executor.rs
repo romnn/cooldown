@@ -1423,6 +1423,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let journal = prepared.journal();
         let expected = mutation.expected;
         let report = mutation.report;
+        // Candidates recovery dropped for a non-resolver failure (verification, stale lock — e.g.
+        // a peer contract the resolve broke without a culpable candidate) are per-candidate
+        // errors: rendering them as skips would hide a real defect behind "the resolver rejected
+        // this change" and a `0 errors` summary.
+        for rejection in mutation.rejected {
+            let diag = self.project_diag(&rejection.error, Some(&rejection.change.package.name));
+            outcome
+                .items
+                .push(self.change_error_item(&rejection.change, diag));
+        }
         if let Err(error) = validate_edge_rebinds(&report.edge_rebinds) {
             self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             self.add_change_errors(&mut outcome, &error, &changes);
@@ -1587,6 +1597,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         }
         for change in &collateral {
+            tracing::debug!(
+                package = %change.package.name,
+                from = %change.from,
+                to = %change.to,
+                "collateral applied row committed"
+            );
             outcome.items.push(self.change_applied_item(change));
         }
         if self.initial_edge_snapshot.is_none() {
@@ -1624,14 +1640,46 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             deps.extend(constraints);
         }
-        Ok(verify_applied_targets(report, planned, &deps))
+        let mut report = verify_applied_targets(report, planned, &deps);
+        // Adapter collateral rows (a transitive the joint resolve floated) carry no member
+        // attribution — the adapter diffs lockfiles, not the graph. The post-apply graph read
+        // above knows which members reach every landed slot, so fill the gap here; without it a
+        // transitive applied row renders an empty "Used by" while its reconcile siblings say
+        // "via …".
+        let members_by_slot: HashMap<(&str, &str), &Vec<cooldown_core::MemberRef>> = deps
+            .iter()
+            .filter(|dep| !dep.members.is_empty())
+            .map(|dep| {
+                (
+                    (dep.package.name.as_str(), dep.current.as_str()),
+                    &dep.members,
+                )
+            })
+            .collect();
+        for change in &mut report.applied {
+            if change.members.is_empty()
+                && !change.direct
+                && let Some(members) =
+                    members_by_slot.get(&(change.package.name.as_str(), change.to.as_str()))
+            {
+                change.members = (*members).clone();
+            }
+        }
+        Ok(report)
     }
 
     /// Record each held candidate (uv lowered it below its ceiling, or the resolve rejected it) as a
     /// skip, naming the package that blocks it via [`conflict_skip_message`].
     fn add_batch_skips(&self, outcome: &mut BatchOutcome, skipped: Vec<cooldown_core::Skipped>) {
         for skipped in skipped {
-            let offending = skipped.offending.map(|package| package_label(&package));
+            // Self-blame (the adapters' generic "resolver rejected" form) must be dropped on the
+            // package identity, before labeling: a registry suffix on the label ("… from
+            // proxy.golang.org") would defeat [`conflict_skip_message`]'s name-based self check and
+            // render "held: conflicts with <itself>".
+            let offending = skipped
+                .offending
+                .filter(|package| *package != skipped.change.package)
+                .map(|package| package_label(&package));
             // Deliberate policy holds are conservative-correct, not failed upgrades.
             if !matches!(
                 skipped.reason,

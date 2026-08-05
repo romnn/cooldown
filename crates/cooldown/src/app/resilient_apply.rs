@@ -51,10 +51,20 @@ async fn apply_resilient(
     project: &cooldown_core::Project,
     plan: &cooldown_core::Plan,
 ) -> Result<ApplyReport> {
+    apply_resilient_full(writer, project, plan)
+        .await
+        .map(|mutation| mutation.report)
+}
+
+#[cfg(test)]
+async fn apply_resilient_full(
+    writer: &dyn ToolWrite,
+    project: &cooldown_core::Project,
+    plan: &cooldown_core::Plan,
+) -> Result<AppliedMutation> {
     let mutation = PreparedMutation::prepare(writer, project, plan).await?;
     apply_resilient_with_observer(writer, &mutation, &())
         .await
-        .map(|mutation| mutation.report)
         .map_err(ApplyFailure::into_core_error)
 }
 
@@ -63,6 +73,19 @@ async fn apply_resilient(
 pub(crate) struct AppliedMutation {
     pub(crate) report: ApplyReport,
     pub(crate) expected: ProjectMutationState,
+    /// Candidates the recovery dropped for a failure that is *not* a resolver rejection (a
+    /// verification or stale-lock error, e.g. a peer contract the resolve broke without a
+    /// culpable candidate). These are per-candidate errors the caller must report as such —
+    /// reclassifying them as policy skips would hide a real defect behind "the resolver rejected
+    /// this change" and a `0 errors` summary.
+    pub(crate) rejected: Vec<RejectedChange>,
+}
+
+/// One candidate dropped by recovery together with the error its singleton trial produced.
+#[derive(Debug)]
+pub(crate) struct RejectedChange {
+    pub(crate) change: Change,
+    pub(crate) error: cooldown_core::CoreError,
 }
 
 async fn apply_checked(
@@ -112,6 +135,7 @@ pub(crate) async fn apply_resilient_with_observer(
             return Ok(AppliedMutation {
                 report,
                 expected: first_state,
+                rejected: Vec::new(),
             });
         }
         Err(error) if is_mutation_state_conflict(&error) => {
@@ -130,7 +154,7 @@ pub(crate) async fn apply_resilient_with_observer(
         Err(_) => {}
     }
 
-    let (accepted, trial_state) =
+    let (accepted, dropped, trial_state) =
         verified_satisfiable_subset(writer, mutation, first_state, observer).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
@@ -177,14 +201,39 @@ pub(crate) async fn apply_resilient_with_observer(
         }
     };
 
-    // Every candidate the subset excluded is held: the resolve could not place it.
+    // Every candidate the subset excluded is accounted for, split by *why* its singleton trial
+    // failed: a tool rejection (the resolver could not place it) stays a held skip carrying the
+    // tool's own first stderr line, while any other failure — verification, stale lock — is a
+    // per-candidate error the caller reports as such, never a policy skip.
+    let mut rejection_errors: std::collections::HashMap<ChangeTargetKey, cooldown_core::CoreError> =
+        dropped
+            .into_iter()
+            .map(|(change, error)| (change_target_key(&change), error))
+            .collect();
+    let mut rejected = Vec::new();
     for change in &plan.changes {
         let key = change_target_key(change);
-        if !accepted_keys.contains(&key) {
-            report.skipped.push(held(change));
+        if accepted_keys.contains(&key) {
+            continue;
+        }
+        match rejection_errors.remove(&key) {
+            Some(error @ cooldown_core::CoreError::Tool { .. }) => {
+                report.skipped.push(held(change, Some(&error)));
+            }
+            Some(error) => rejected.push(RejectedChange {
+                change: change.clone(),
+                error,
+            }),
+            // Defensive: partitioning descends every excluded change to a singleton, so an
+            // unrecorded exclusion should not happen; keep the generic held row rather than lose it.
+            None => report.skipped.push(held(change, None)),
         }
     }
-    Ok(AppliedMutation { report, expected })
+    Ok(AppliedMutation {
+        report,
+        expected,
+        rejected,
+    })
 }
 
 /// A deterministic subset of `changes` that `apply` can resolve together, found by
@@ -202,10 +251,15 @@ async fn verified_satisfiable_subset(
     mutation: &PreparedMutation,
     mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
-) -> ApplyResult<(Vec<Change>, ProjectMutationState)> {
+) -> ApplyResult<(
+    Vec<Change>,
+    Vec<(Change, cooldown_core::CoreError)>,
+    ProjectMutationState,
+)> {
     let plan = mutation.plan();
     let journal = mutation.journal();
     let mut accepted: Vec<Change> = Vec::new();
+    let mut dropped: Vec<(Change, cooldown_core::CoreError)> = Vec::new();
     let mut work: Vec<Vec<Change>> = Vec::new();
     push_halves(&mut work, plan.changes.clone());
 
@@ -241,12 +295,17 @@ async fn verified_satisfiable_subset(
                     .map_err(ApplyFailure::RestoreConflict)?;
                 return Err(ApplyFailure::Failed(error));
             }
-            // The group cannot join `accepted`: split it, or drop it if it is a single culprit.
+            // The group cannot join `accepted`: split it, or drop it if it is a single culprit —
+            // keeping the culprit's own error so the caller can report *why* it was dropped.
             Err(_) if group.len() > 1 => push_halves(&mut work, group),
-            Err(_) => {}
+            Err(error) => {
+                if let Some(change) = group.into_iter().next() {
+                    dropped.push((change, error));
+                }
+            }
         }
     }
-    Ok((accepted, current_state))
+    Ok((accepted, dropped, current_state))
 }
 
 fn is_mutation_state_conflict(error: &cooldown_core::CoreError) -> bool {
@@ -271,19 +330,50 @@ fn push_halves(work: &mut Vec<Vec<Change>>, mut group: Vec<Change>) {
 }
 
 /// A held skip for a candidate the resolve could not place. It blames itself (the generic "resolver
-/// rejected this change" form), matching what each adapter emitted when it marked the whole batch held.
-fn held(change: &Change) -> Skipped {
+/// rejected this change" form), matching what each adapter emitted when it marked the whole batch
+/// held — elaborated with the tool's own first stderr line when the singleton trial's rejection is
+/// available, since that line carries the fact the generic message lacks (which requirement, held
+/// by whom).
+fn held(change: &Change, rejection: Option<&cooldown_core::CoreError>) -> Skipped {
     Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(change.package.clone()),
-        detail: None,
+        detail: rejection.and_then(rejection_detail),
     }
+}
+
+/// The first non-empty stderr line of a tool rejection, bounded for the report table. `None` for
+/// non-tool errors and empty stderr, falling back to the generic reason message. The line reaches
+/// the TTY and JSON reports verbatim, so embedded URLs are stripped of credentials here, at
+/// construction.
+fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
+    let cooldown_core::CoreError::Tool { stderr, .. } = error else {
+        return None;
+    };
+    // Prefer the tool's own `error:` sentence: the leading lines are progress noise ("Updating
+    // crates.io index") that says nothing about the rejection.
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error"))
+        .or_else(|| stderr.lines().map(str::trim).find(|line| !line.is_empty()))?;
+    // Resolver errors quote registry URLs, which can embed credentials on private registries;
+    // redact before the cap bounds the (possibly lengthened) line.
+    let mut line = cooldown_core::redact::url_secrets(line);
+    // Char-boundary-safe cap: stderr is tool-controlled and can be arbitrarily long.
+    if let Some((cut, _)) = line.char_indices().nth(200) {
+        line.truncate(cut);
+        line.push('…');
+    }
+    Some(format!("the resolver rejected this change: {line}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyFailure, apply_resilient, apply_resilient_with_observer};
+    use super::{
+        ApplyFailure, Skipped, apply_resilient, apply_resilient_full, apply_resilient_with_observer,
+    };
     use async_trait::async_trait;
     use camino::Utf8Path;
     use color_eyre::eyre;
@@ -706,29 +796,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_lock_candidate_is_isolated_and_the_rest_apply() {
+    async fn stale_lock_candidate_is_isolated_and_reported_as_an_error_not_a_skip() {
         // A stale lock from a trial resolve is a property of that candidate set, not the local machine.
         // The recovery oracle must bisect it just like an unsatisfiable resolve, so one pnpm importer
-        // mismatch does not turn the whole workspace into held candidates.
+        // mismatch does not turn the whole workspace into held candidates — but the dropped
+        // candidate itself is a verification failure, not a resolver rejection: it must surface as
+        // a per-candidate error carrying the original message, never as a "resolver rejected this
+        // change" skip in a report claiming 0 errors.
         let writer = MockWriter::stale_lock(|names| !names.iter().any(|name| name == "vite"));
         let TempProject {
             directory: _directory,
             project,
         } = temp_project();
         let plan = plan(&["a", "vite", "b"]);
-        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
+        let mutation = apply_resilient_full(&writer, &project, &plan)
+            .await
+            .unwrap();
 
         assert_eq!(
-            names(&report.applied),
+            names(&mutation.report.applied),
             ["a", "b"].iter().map(ToString::to_string).collect()
         );
-        assert_eq!(
-            skipped_names(&report),
-            std::iter::once("vite".to_string()).collect()
+        assert!(
+            skipped_names(&mutation.report).is_empty(),
+            "a verification failure must not be reclassified as a policy skip"
+        );
+        let rejected: Vec<&str> = mutation
+            .rejected
+            .iter()
+            .map(|rejection| rejection.change.package.name.as_str())
+            .collect();
+        assert_eq!(rejected, ["vite"]);
+        assert!(
+            matches!(
+                mutation.rejected.first().map(|rejection| &rejection.error),
+                Some(cooldown_core::CoreError::StaleLock(detail))
+                    if detail.contains("does not satisfy range")
+            ),
+            "the trial's own error (and its message) must be preserved"
         );
         assert!(
             writer.apply_calls() > 1,
             "stale lock must be bisected, not propagated as a local fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_rejected_candidate_keeps_its_stderr_in_the_held_skip_detail() {
+        // A genuine resolver rejection stays a held skip — but no longer a bare one: the tool's
+        // own first stderr line (which requirement, held by whom) rides along as the detail.
+        let writer = MockWriter::new(|names| !names.iter().any(|name| name == "colors"));
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        let plan = plan(&["a", "colors", "b"]);
+        let report = apply_resilient(&writer, &project, &plan).await.unwrap();
+
+        let held: Vec<&Skipped> = report
+            .skipped
+            .iter()
+            .filter(|skipped| skipped.change.package.name == "colors")
+            .collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held.first().and_then(|skipped| skipped.detail.as_deref()),
+            Some("the resolver rejected this change: unsatisfiable"),
         );
     }
 
