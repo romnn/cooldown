@@ -37,7 +37,10 @@ file-backed registry indices are also rejected until cooldown can snapshot their
 input closure. This includes `CARGO_REGISTRIES_<NAME>_INDEX` overrides.
 Cooldown also rejects a temporary staging location whose ancestors contain Cargo configuration
 outside the active Cargo home, or a Rust toolchain file, because those files could affect only the
-isolated trial and not the source project Cargo first described.
+isolated trial and not the source project Cargo first described. This check runs when staging is
+prepared. Cargo discovers ancestor configuration again when each subprocess starts, so a file
+created in that ancestor chain after the check remains an unavoidable race; use a temporary
+directory hierarchy that other users cannot modify when this local threat matters.
 
 A symlink used to locate the Cargo project root is supported because cooldown canonicalizes that
 root before coordinating access. A symlink inside a writable project path, such as a symlinked
@@ -47,6 +50,8 @@ govern the resolved target safely.
 Cargo mutations that publish manifests or a lockfile currently require a Git worktree on Unix.
 Cooldown stores recovery authority beneath Git's common directory and verifies its Unix ownership
 and permissions so ordinary project content cannot claim permission to restore source files.
+The Git metadata directory and common directory must be owned by the current Unix user, so
+repositories exposed through another user's or root-owned bind mount fail closed.
 Read-only commands and isolated previews remain available elsewhere, but a source mutation fails
 closed until cooldown can prove a trusted external recovery namespace on that platform.
 

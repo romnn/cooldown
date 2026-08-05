@@ -655,6 +655,27 @@ fn policy_violation_labels_include_a_redacted_source() {
 }
 
 #[test]
+fn package_labels_omit_default_registry_noise() {
+    for (tool, registry) in [
+        (ToolId("cargo"), "crates.io"),
+        (ToolId("npm"), "npm"),
+        (ToolId("pnpm"), "npm"),
+        (ToolId("yarn"), "npm"),
+        (ToolId("bun"), "npm"),
+    ] {
+        let package = PackageId::new(tool, "package", Some(registry.to_string()));
+        assert_eq!(package_label(&package), "package");
+    }
+
+    let alternate = PackageId::new(
+        ToolId("npm"),
+        "package",
+        Some("registry.example".to_string()),
+    );
+    assert_eq!(package_label(&alternate), "package from registry.example");
+}
+
+#[test]
 fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
     // The forward batch floats `quote` up (collateral); the reconcile pass matures it back down.
     let mut items = vec![

@@ -74,15 +74,26 @@ pub(super) fn insert_graph_violation(
 }
 
 pub(super) fn package_label(package: &PackageId) -> String {
-    package.registry.as_deref().map_or_else(
-        || package.name.clone(),
-        |source| {
-            format!(
-                "{} from {}",
-                package.name,
-                cooldown_core::redact::source_label(source)
-            )
-        },
+    package
+        .registry
+        .as_deref()
+        .filter(|source| !is_default_registry(package, source))
+        .map_or_else(
+            || package.name.clone(),
+            |source| {
+                format!(
+                    "{} from {}",
+                    package.name,
+                    cooldown_core::redact::source_label(source)
+                )
+            },
+        )
+}
+
+fn is_default_registry(package: &PackageId, source: &str) -> bool {
+    matches!(
+        (package.tool.as_str(), source),
+        ("cargo", "crates.io") | ("npm" | "pnpm" | "yarn" | "bun", "npm")
     )
 }
 
