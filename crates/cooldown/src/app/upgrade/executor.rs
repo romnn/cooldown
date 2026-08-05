@@ -152,10 +152,15 @@ impl TrialRollback {
         expected.replace(state)
     }
 
-    fn restore(&self) -> cooldown_core::Result<()> {
+    fn restore(&mut self) -> cooldown_core::Result<()> {
         match self {
             TrialRollback::Empty => Ok(()),
-            TrialRollback::Captured { journal, expected } => journal.restore_if_unchanged(expected),
+            TrialRollback::Captured { journal, expected } => {
+                let restored = journal.state_for(journal)?;
+                journal.restore_if_unchanged(expected)?;
+                *expected = restored;
+                Ok(())
+            }
         }
     }
 }
@@ -485,8 +490,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return flow;
             }
             UpgradeTrialResult::Aborted(outcomes) => {
-                let outcome =
-                    self.settle_aborted_trial(&rollback, &baseline_before_lock, state, outcomes);
+                let outcome = self.settle_aborted_trial(
+                    &mut rollback,
+                    &baseline_before_lock,
+                    state,
+                    outcomes,
+                );
                 let flow = self.merge_batch_outcome(outcome);
                 self.collapse_collateral(&baseline_before_lock.baseline_violations);
                 return flow;
@@ -494,7 +503,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             UpgradeTrialResult::PolicyBlocked(violations) => {
                 let mut outcome = BatchOutcome::default();
                 if !self.restore_upgrade_trial(
-                    &rollback,
+                    &mut rollback,
                     &baseline_before_lock,
                     state,
                     &mut outcome,
@@ -820,7 +829,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// the caller must stop recovering instead of running further trials.
     fn restore_upgrade_trial(
         &self,
-        snapshot: &TrialRollback,
+        snapshot: &mut TrialRollback,
         baseline: &TrialState,
         state: &mut TrialState,
         outcome: &mut BatchOutcome,
@@ -841,7 +850,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Resolves an aborted trial without claiming which mutations survived a restore conflict.
     fn settle_aborted_trial(
         &self,
-        snapshot: &TrialRollback,
+        snapshot: &mut TrialRollback,
         baseline: &TrialState,
         state: &mut TrialState,
         outcomes: Vec<BatchOutcome>,

@@ -108,6 +108,42 @@ fn trial_rollback_refuses_to_overwrite_external_drift() -> eyre::Result<()> {
 }
 
 #[test]
+fn trial_rollback_refreshes_expected_state_after_restore() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_owned())
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    let manifest = root.join("package.json");
+    let lock = root.join("package-lock.json");
+    std::fs::write(&manifest, b"baseline manifest")?;
+    std::fs::write(&lock, b"baseline lock")?;
+
+    let first = ProjectMutationJournal::capture(
+        &root,
+        [
+            camino::Utf8Path::new("package.json"),
+            camino::Utf8Path::new("package-lock.json"),
+        ],
+    )?;
+    let mut rollback = TrialRollback::default();
+    rollback.preserve(&first)?;
+    std::fs::write(&manifest, b"first trial manifest")?;
+    std::fs::write(&lock, b"first trial lock")?;
+    rollback.accept(first.capture_state()?)?;
+    rollback.restore()?;
+
+    let second =
+        ProjectMutationJournal::capture(&root, [camino::Utf8Path::new("package-lock.json")])?;
+    rollback.preserve(&second)?;
+    std::fs::write(&lock, b"second trial lock")?;
+    rollback.accept(second.capture_state()?)?;
+    rollback.restore()?;
+
+    assert_eq!(std::fs::read(manifest)?, b"baseline manifest");
+    assert_eq!(std::fs::read(lock)?, b"baseline lock");
+    Ok(())
+}
+
+#[test]
 fn conflict_skip_message_names_a_different_offender() {
     // A resolver conflict blamed on another package — adopting it would have regressed that
     // package — names it, so the report explains which dependency holds the candidate back.

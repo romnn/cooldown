@@ -3697,6 +3697,61 @@ async fn upgrade_stops_before_build_when_the_final_lock_is_stale() {
 }
 
 #[tokio::test]
+async fn upgrade_reports_a_failed_requested_build() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![],
+        fresh_transitive: None,
+        releases,
+        locked,
+        inject_fresh_on_apply: false,
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: true,
+        state: Mutex::new(State::default()),
+        root: root.clone(),
+    };
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    opts.build = true;
+
+    let out = ws.upgrade(&opts).await;
+
+    assert_eq!(out.exit, Exit::Environment);
+    assert_eq!(out.summary.applied, 1);
+    assert_eq!(out.summary.errors, 1);
+    assert!(root.join("build-invoked").exists());
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| error.message == "build failed")
+    );
+}
+
+#[tokio::test]
 async fn upgrade_stops_before_build_when_final_lock_verification_errors() -> eyre::Result<()> {
     let TmpRoot { guard: _g, root } = tmp_root();
     std::fs::write(root.join("fail-final-lock-verification"), "")?;
