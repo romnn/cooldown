@@ -645,8 +645,12 @@ impl CargoTool {
             // would leave the manifest demanding a version the lock does not carry, and that poisons
             // the whole batch at lock verification (`--locked`) — so a widen whose candidate stays
             // short is restored, and the candidate remains a held skip carrying its recorded
-            // rejection. A candidate still short after a no-op widen round is blocked by another
-            // crate (a real conflict the diff reports), so the loop stops widening.
+            // rejection. A short candidate whose widen is a *no-op* (its own requirement already
+            // admits the target, or nothing declares it) may be held only by a sibling's
+            // not-yet-widened requirement, so a round in which any widen+pin progresses re-pins
+            // those candidates before it ends; a round that progresses nowhere proves the
+            // remaining short candidates conflict with another crate (a real conflict the diff
+            // reports), and only then does the loop stop widening.
             // The member-aware reach check is the only thing in this loop that needs the resolved
             // graph, so skip the `cargo metadata` spawn entirely when no candidate is a direct
             // member dep. When it is needed, fail closed: falling back to the lock-slot check is the
@@ -661,6 +665,7 @@ impl CargoTool {
                     None
                 };
                 let mut progressed = false;
+                let mut unwidened_short: Vec<Change> = Vec::new();
                 for change in &plan.changes {
                     if reached_after(&after, graph.as_ref(), change) {
                         continue;
@@ -676,6 +681,7 @@ impl CargoTool {
                     .modified
                     .is_empty()
                     {
+                        unwidened_short.push(change.clone());
                         continue;
                     }
                     self.pin_batch(
@@ -719,6 +725,20 @@ impl CargoTool {
                     } else {
                         restore_manifests(&project.root, &snapshot)?;
                     }
+                }
+                // A sibling's landed widen+pin may have removed the shared blocker behind an
+                // unwidened candidate's recorded rejection, so give those candidates their re-pin
+                // (the batch skips any node already at target) before the next round decides they
+                // are conflicted.
+                if progressed && !unwidened_short.is_empty() {
+                    self.pin_batch(
+                        project,
+                        &unwidened_short,
+                        journal,
+                        observer,
+                        &mut rejections,
+                    )
+                    .await?;
                 }
                 if !progressed {
                     break;
@@ -2080,6 +2100,114 @@ mod tests {
             landed.get(&("dep".into(), "1".into())).map(String::as_str),
             Some("1.0.0"),
             "the third-party-held old major coexists as its own line"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_widen_repins_a_noop_widen_sibling_after_another_widen_lands() -> eyre::Result<()>
+    {
+        // A lock-step pair: `lock-a` needs a cross-major widen, while `lock-b`'s target is a
+        // transitive move nothing in the manifest declares, so its widen is a no-op. The fake
+        // cargo rejects every pin while `lock-a` is unwidened (the shared blocker) and accepts
+        // both once the widen landed. `lock-b` must be re-pinned after its sibling's widen+pin
+        // progresses — not left held on the stale rejection recorded before the widen.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let manifest = indoc! {r#"
+            [package]
+            name = "app"
+            version = "0.1.0"
+            edition = "2024"
+
+            [dependencies]
+            lock-a = "1"
+        "#};
+        std::fs::write(root.join("Cargo.toml"), manifest)?;
+        let lock = |a: &str, b: &str| {
+            formatdoc! {r#"
+                version = 4
+
+                [[package]]
+                name = "app"
+                version = "0.1.0"
+                dependencies = ["lock-a", "lock-b"]
+
+                [[package]]
+                name = "lock-a"
+                version = "{a}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+
+                [[package]]
+                name = "lock-b"
+                version = "{b}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#}
+        };
+        std::fs::write(root.join("Cargo.lock"), lock("1.0.0", "1.0.0"))?;
+        std::fs::write(root.join("Cargo.lock.a-landed"), lock("2.0.0", "1.0.0"))?;
+        std::fs::write(root.join("Cargo.lock.b-landed"), lock("2.0.0", "1.2.0"))?;
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            indoc! {r##"
+                #!/bin/sh
+                if ! grep -q 'lock-a = "1"' Cargo.toml; then
+                  case "$*" in
+                    *"#lock-a@"*) cp Cargo.lock.a-landed Cargo.lock; exit 0 ;;
+                    *"#lock-b@"*) cp Cargo.lock.b-landed Cargo.lock; exit 0 ;;
+                  esac
+                fi
+                echo 'error: failed to select a version for the requirement `lock-a = "^1"`' >&2
+                echo 'required by package `app v0.1.0 (/repo/app)`' >&2
+                exit 1
+            "##},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let plan = Plan {
+            changes: vec![
+                Change {
+                    direct: false,
+                    ..change("lock-b", "1.0.0", "1.2.0", false)
+                },
+                change("lock-a", "1.0.0", "2.0.0", false),
+            ],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        let landed = read_lock(&project)?.crates_io_locked_versions();
+        assert_eq!(
+            landed
+                .get(&("lock-a".into(), "2".into()))
+                .map(String::as_str),
+            Some("2.0.0"),
+            "the widened sibling landed at its cross-major target"
+        );
+        assert_eq!(
+            landed
+                .get(&("lock-b".into(), "1".into()))
+                .map(String::as_str),
+            Some("1.2.0"),
+            "the no-op-widen candidate is re-pinned once the sibling's widen removed the blocker"
         );
         Ok(())
     }
