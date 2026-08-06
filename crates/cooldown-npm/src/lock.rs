@@ -25,6 +25,12 @@ pub trait NodeLock: Send + Sync + 'static {
     /// `sync` is then `unsupported`.
     const NATIVE_MIN_AGE_FILE: Option<&'static str> = None;
 
+    /// Whether this manager's apply engine can pin a package no importer declares — pnpm, through
+    /// its temporary qualified-override resolve. The per-package landing engines (npm/yarn/bun)
+    /// need a declared requirement, so graph-wide upgrade planning would only produce
+    /// not-eligible skips for them.
+    const SUPPORTS_TRANSITIVE_ADVANCE: bool = false;
+
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
     /// # Errors
@@ -432,6 +438,19 @@ impl MemberIndex {
         versions.sort_by(|a, b| crate::version::compare(a, b));
         versions.dedup();
         versions
+    }
+
+    /// Every name the workspace's importers declare, at any version — the set a transitive-advance
+    /// override must stay clear of: an importer-declared name belongs to the targeted-update path
+    /// and its peer unification, and a graph-wide override on it would drag the declared copy
+    /// along with the transitive one.
+    #[must_use]
+    pub fn declared_names(&self) -> HashSet<String> {
+        self.by_name
+            .keys()
+            .cloned()
+            .chain(self.by_version.keys().map(|(name, _)| name.clone()))
+            .collect()
     }
 
     /// Every distinct range specifier the workspace's importers declare for `name`, sorted — the
@@ -922,6 +941,7 @@ impl NodeLock for Pnpm {
     const LOCKFILE: &'static str = "pnpm-lock.yaml";
     const BIN: &'static str = "pnpm";
     const NATIVE_MIN_AGE_FILE: Option<&'static str> = Some("pnpm-workspace.yaml");
+    const SUPPORTS_TRANSITIVE_ADVANCE: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(parse_pnpm(content))

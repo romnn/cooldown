@@ -1,9 +1,10 @@
 //! End-to-end convergence tests that drive the REAL `pnpm` resolver against fixtures generated on
 //! the fly in temp dirs. These guard the pnpm adapter's whole-graph re-resolve: the adapter pins each
-//! eligible candidate to cooldown's exact target in one joint importer-filtered update, then builds
-//! the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can never silently
-//! move another package, mutually-exclusive peers settle at a single fixed point, and a converged
-//! graph re-applies to a byte-stable lock.
+//! eligible importer-declared candidate to cooldown's exact target in one joint importer-filtered
+//! update — a candidate no importer declares takes the temporary qualified-override leg instead —
+//! then builds the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can
+//! never silently move another package, mutually-exclusive peers settle at a single fixed point,
+//! and a converged graph re-applies to a byte-stable lock.
 //!
 //! # The old bug
 //!
@@ -271,6 +272,56 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     assert_eq!(
         reported, moved_in_lock,
         "report set must equal the lock-diff set (no silent change)\nreported={reported:?}\nlock-diff={moved_in_lock:?}"
+    );
+}
+
+#[test]
+fn upgrade_advances_a_matured_transitive_no_importer_declares() {
+    skip_if_missing!("pnpm");
+    // The dompurify/quinn-proto class: `agent-base` is exact-pinned so the direct layer is inert,
+    // and no importer declares its transitive `debug` (declared range `^4.3.4`). Seeding under
+    // FREEZE locks debug at 4.3.6 (2024-07-27, the newest release then);
+    // 4.3.7 (2024-09-06) matures under FREEZE_LATER while 4.4.0 (2024-12-06) stays outside it.
+    // `pnpm update debug@…` cannot reach an undeclared package (named selectors match direct
+    // dependencies only, `--depth` notwithstanding), so only the temporary qualified-override leg
+    // can advance it.
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        r#"{ "name": "transitive-advance", "private": true, "dependencies": { "agent-base": "7.1.1" } }"#,
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, FREEZE);
+    let seeded = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        seeded.contains("debug@4.3.6"),
+        "seed sanity: registry history as of FREEZE locks debug at 4.3.6"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report.applied_names().contains("debug"),
+        "the transitive advance must be its own applied row, applied={:?}",
+        report.applied_names()
+    );
+    let lock = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        lock.contains("debug@4.3.7"),
+        "debug advances to the newest release matured under FREEZE_LATER"
+    );
+    assert!(
+        !lock.contains("overrides:"),
+        "the temporary override must not persist in the settled lock"
+    );
+
+    // Converged: a second run under the same freeze plans nothing new.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        second.applied_names().is_empty(),
+        "a converged graph re-applies to a fixed point, applied={:?}",
+        second.applied_names()
     );
 }
 

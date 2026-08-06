@@ -284,6 +284,13 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
         for NameVersion { name, version } in resolved {
+            // A non-registry resolution — an injected workspace package (`file:`/`link:`), a git
+            // or tarball URL — has no registry release history to evaluate and, like cargo's
+            // non-registry sources, is not cooldown's to move. The `:` discriminates: registry
+            // versions are semver strings, which never contain one.
+            if version.contains(':') {
+                continue;
+            }
             let member_paths = member_index.members_for(&name, &version);
             let is_direct = match &manifest_direct {
                 Some(names) => names.contains(&name),
@@ -660,6 +667,16 @@ impl<L: NodeLock> NpmTool<L> {
         let multi_version = before_content
             .map(multi_version_names::<L>)
             .unwrap_or_default();
+        // Per-candidate transitive-advance verdicts against the pre-apply lock: which candidates
+        // ride the qualified-override leg, and why each of the rest must be held (importer-owned
+        // name, duplicated graph copies, no safe override scope).
+        let importer_declared = before_content
+            .map(|content| L::member_sources(content).declared_names())
+            .unwrap_or_default();
+        let version_lines = before_content
+            .map(resolved_version_lines::<L>)
+            .unwrap_or_default();
+        let advance = classify_transitive_advance(plan, &importer_declared, &version_lines);
 
         // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the
         // current instant.
@@ -679,6 +696,7 @@ impl<L: NodeLock> NpmTool<L> {
                     plan,
                     journal,
                     multi_version: &multi_version,
+                    advance: &advance,
                     window_minutes,
                     workspace,
                 },
@@ -713,57 +731,38 @@ impl<L: NodeLock> NpmTool<L> {
                 (None, Some(_)) | (Some(_), None) => true,
                 (None, None) => false,
             };
+            // A transitive candidate the advance pass held (importer-owned name, duplicated graph
+            // copies, no override scope) was never handed to the resolver; its truthful hold row
+            // replaces both the generic conflict verdict and — for a duplicate copy whose newest
+            // line already sits at the target — the silent no-op the newest-copy projection would
+            // otherwise produce.
+            let advance_hold = advance
+                .get(&advance_key(change))
+                .and_then(|verdict| verdict.hold_skip(change));
             if reached(&after, &after_members, change) {
                 if moved {
                     report.applied.push(change.clone());
+                } else if let Some(hold) = advance_hold {
+                    report.skipped.push(hold);
                 }
-                // Reached its target without a net lock move because a duplicate copy of the same
-                // name is at the target.
-                // This is a no-op, neither applied nor held.
+                // Otherwise: reached its target without a net lock move because a duplicate copy
+                // of the same name is at the target — a no-op, neither applied nor held.
+            } else if let Some(hold) = advance_hold {
+                report.skipped.push(hold);
             } else if multi_version.contains(name) {
-                // A dependency declared at multiple versions across the workspace is deliberately
-                // kept in range instead of pinned to the target.
-                // That is a conservative hold, not a resolver conflict, and it must not be advertised
-                // as adoptable: `outdated`'s verify reclassifies it blocked.
-                // Naming the divergent lines tells the reader *which* declarations must converge
-                // before a joint pin becomes possible. A range-only split — every copy resolved to
-                // one version but declared under disagreeing ranges — names the specifiers
-                // instead: "multiple versions" would be factually wrong there.
-                let versions = after_members.resolved_versions_of(name);
-                let specifiers = after_members.declared_specifiers_of(name);
-                let detail = if versions.len() > 1 {
-                    Some(format!(
-                        "declared at multiple versions across the workspace ({}); kept on its own line",
-                        versions.join(", ")
-                    ))
-                } else {
-                    (specifiers.len() > 1).then(|| {
-                        format!(
-                            "declared with incompatible ranges across the workspace ({}); kept on its own line",
-                            specifiers.join(", ")
-                        )
-                    })
-                };
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::MultiVersionHeld,
-                    offending: None,
-                    detail,
-                });
+                report
+                    .skipped
+                    .push(multi_version_hold(change, &after_members));
             } else {
-                // The joint resolve could not place this candidate at its target without breaking
-                // the lock because a mutually-exclusive peer won.
-                // Name the sibling whose peer choice excluded it so the report says
-                // "held: conflicts with <pkg>"; absent a unique blocker it falls back to the
-                // candidate itself.
-                let offender =
-                    peer_conflict_blocker(&after_content, name).unwrap_or_else(|| name.to_string());
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
-                    detail: None,
-                });
+                let advanced = matches!(
+                    advance.get(&advance_key(change)),
+                    Some(TransitiveAdvance::Pin(_))
+                );
+                report.skipped.push(resolver_conflict_hold::<L>(
+                    change,
+                    &after_content,
+                    advanced,
+                ));
             }
         }
 
@@ -803,6 +802,7 @@ impl<L: NodeLock> NpmTool<L> {
             plan,
             journal,
             multi_version,
+            advance,
             window_minutes,
             workspace,
         } = inputs;
@@ -811,7 +811,7 @@ impl<L: NodeLock> NpmTool<L> {
         let mut active = plan.clone();
         loop {
             let resolve_result = self
-                .whole_graph_resolve(project, &active, multi_version, window_minutes)
+                .whole_graph_resolve(project, &active, multi_version, advance, window_minutes)
                 .await;
             let mut resolve = OwnedStep::capture(resolve_result, journal)?;
             match resolve.result {
@@ -834,6 +834,7 @@ impl<L: NodeLock> NpmTool<L> {
                         project,
                         &active,
                         multi_version,
+                        advance,
                         window_minutes,
                     )
                     .await?;
@@ -859,8 +860,14 @@ impl<L: NodeLock> NpmTool<L> {
                 // the same pins are retried through it; only a repair that still leaves a fresh
                 // inconsistency is a real stale-lock failure.
                 restore_after_owned_step(journal, &resolve.postimage)?;
-                self.repair_policy_rejected_graph(project, &active, multi_version, window_minutes)
-                    .await?;
+                self.repair_policy_rejected_graph(
+                    project,
+                    &active,
+                    multi_version,
+                    advance,
+                    window_minutes,
+                )
+                .await?;
                 resolve.postimage = journal.capture_state()?;
                 after_content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
                 if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
@@ -918,29 +925,38 @@ impl<L: NodeLock> NpmTool<L> {
     /// in unrelated workspace
     /// packages, where an unmatched package selector can otherwise move unrelated direct
     /// dependencies.
+    /// Transitive candidates take a second leg: `pnpm update` selectors match direct dependencies
+    /// only (`--depth` notwithstanding), so a package no importer declares is advanced through the
+    /// temporary qualified-override engine instead — see
+    /// [`Self::resolve_with_temporary_overrides`].
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
         multi_version: &HashSet<String>,
+        advance: &HashMap<AdvanceKey, TransitiveAdvance>,
         window_minutes: Option<i64>,
     ) -> Result<()> {
         let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
-        if inputs.exact_pins.is_empty() {
-            return Ok(());
+        if !inputs.exact_pins.is_empty() {
+            self.joint_resolve(
+                project,
+                &inputs.exact_pins,
+                &inputs.importer_filters,
+                window_minutes,
+            )
+            .await?;
+            // The up-front pass already widened every out-of-range exact target, so a candidate the
+            // resolve still left short of its target is blocked by *another* package's requirement
+            // (a peer conflict), which widening its own declared range cannot resolve — the lock
+            // diff reports it held.
+            // No post-resolve re-widen loop is needed.
         }
-        self.joint_resolve(
-            project,
-            &inputs.exact_pins,
-            &inputs.importer_filters,
-            window_minutes,
-        )
-        .await?;
-        // The up-front pass already widened every out-of-range exact target, so a candidate the resolve
-        // still left short of its target is blocked by *another* package's requirement (a peer
-        // conflict), which widening its own declared range cannot resolve — the lock diff reports it
-        // held.
-        // No post-resolve re-widen loop is needed.
+        let transitive = transitive_override_pins(plan, advance);
+        if !transitive.is_empty() {
+            self.resolve_with_temporary_overrides(project, plan, transitive, window_minutes)
+                .await?;
+        }
         Ok(())
     }
 
@@ -953,6 +969,14 @@ impl<L: NodeLock> NpmTool<L> {
         let mut importer_filters = Some(BTreeSet::new());
         for change in &plan.changes {
             let name = change.package.name.clone();
+            if !change.direct {
+                // A transitive candidate has no importer declaration for `pnpm update` to match
+                // (named selectors re-pin direct dependencies only), so it takes the
+                // qualified-override leg instead of adding an unmatchable selector here — which,
+                // via its empty member set, would also force the recursive fallback for the whole
+                // batch.
+                continue;
+            }
             if multi_version.contains(&name) {
                 // Preserve every distinct line.
                 // A bare pnpm update can write an out-of-range lock entry while leaving package.json
@@ -1017,12 +1041,38 @@ impl<L: NodeLock> NpmTool<L> {
         project: &Project,
         plan: &Plan,
         multi_version: &HashSet<String>,
+        advance: &HashMap<AdvanceKey, TransitiveAdvance>,
         window_minutes: Option<i64>,
     ) -> Result<()> {
+        // The repair replays the whole plan through the override engine, so the direct exact pins
+        // and the qualified transitive pins ride one temporary config together.
         let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
-        if inputs.exact_pins.is_empty() {
+        let mut pins = inputs.exact_pins;
+        pins.extend(transitive_override_pins(plan, advance));
+        if pins.is_empty() {
             return Ok(());
         }
+        self.resolve_with_temporary_overrides(project, plan, pins, window_minutes)
+            .await
+    }
+
+    /// Resolves the graph under temporary `pnpm-workspace.yaml` overrides for `pins`, then settles
+    /// without them — the one pnpm mechanism that reaches a package no importer declares.
+    ///
+    /// The pins are merged over the configured overrides and written to the native config; one
+    /// resolution-only install lands them; the original config is restored; and a settlement
+    /// install re-validates the result override-free. The settlement is what makes the engine
+    /// self-validating: pnpm keeps a lock entry that satisfies its dependents' declared ranges and
+    /// re-resolves one that does not, so an in-range pin survives at exactly its target while an
+    /// out-of-range force (an exact-pinning parent) reverts instead of committing a break — the
+    /// caller's lock diff then reports that candidate held.
+    async fn resolve_with_temporary_overrides(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        pins: Vec<(String, String)>,
+        window_minutes: Option<i64>,
+    ) -> Result<()> {
         let native = L::NATIVE_MIN_AGE_FILE.ok_or_else(|| {
             CoreError::System("pnpm native config path is unavailable".to_string())
         })?;
@@ -1036,7 +1086,7 @@ impl<L: NodeLock> NpmTool<L> {
         let mut overrides = self
             .configured_value::<BTreeMap<String, String>>(project, "overrides")
             .await?;
-        overrides.extend(inputs.exact_pins);
+        overrides.extend(pins);
 
         let temporary_result = async {
             set_yaml_string_map(&project.root.join(&native_rel), "overrides", &overrides)?;
@@ -1082,6 +1132,212 @@ impl<L: NodeLock> NpmTool<L> {
         serde_json::from_str(value)
             .map_err(|error| CoreError::Serialization(format!("pnpm {key}: {error}")))
     }
+}
+
+/// One transitive candidate's advance verdict, decided against the pre-apply lock.
+///
+/// The engine-level capability ([`cooldown_core::ToolWrite::supports_transitive_advance`]) is
+/// unconditional, so every per-candidate limit must surface here as a truthful skip row instead of
+/// silently narrowing the attempted set: a planned candidate the resolver was never asked to move
+/// must not masquerade as a resolver conflict — or vanish behind the report's newest-copy
+/// projection, whose per-name reduction cannot attribute a multi-copy collapse.
+pub(crate) enum TransitiveAdvance {
+    /// Advance through this qualified override key (`name@^major-line`).
+    Pin(String),
+    /// An importer declares the name (at another line — the same line would be one direct dep):
+    /// the targeted update and its peer unification own the name, and a graph-wide override would
+    /// drag the declared copy along with this one.
+    DeclaredElsewhere,
+    /// The name resolves to several graph copies; one qualified override could collapse them, a
+    /// move the newest-copy report projection cannot attribute. Each copy is held on its own line,
+    /// mirroring the importer-side multi-version hold.
+    MultiLine(Vec<String>),
+    /// No safe override scope can be derived from the current version, so there is nothing to
+    /// qualify the pin with.
+    Unscopable,
+}
+
+impl TransitiveAdvance {
+    /// The truthful skip row for a non-[`Pin`](Self::Pin) verdict; `None` when the candidate was
+    /// genuinely handed to the resolver.
+    fn hold_skip(&self, change: &Change) -> Option<Skipped> {
+        let (reason, detail) = match self {
+            TransitiveAdvance::Pin(_) => return None,
+            TransitiveAdvance::DeclaredElsewhere => (
+                SkipReason::MultiVersionHeld,
+                format!(
+                    "importers declare {} at another line; this undeclared copy is kept on its own line",
+                    change.package.name
+                ),
+            ),
+            TransitiveAdvance::MultiLine(lines) => (
+                SkipReason::MultiVersionHeld,
+                format!(
+                    "resolved at multiple versions across the graph ({}); each copy is kept on its own line",
+                    lines.join(", ")
+                ),
+            ),
+            TransitiveAdvance::Unscopable => (
+                SkipReason::NotEligible,
+                format!("no safe override scope can be derived from {}", change.from),
+            ),
+        };
+        Some(Skipped {
+            change: change.clone(),
+            reason,
+            offending: None,
+            detail: Some(detail),
+        })
+    }
+}
+
+/// The per-candidate advance key: a change's `(name, from)` line. Two planned changes can share it
+/// only by sharing the whole line, so the verdict is well-defined per key.
+pub(crate) type AdvanceKey = (String, String);
+
+fn advance_key(change: &Change) -> AdvanceKey {
+    (
+        change.package.name.clone(),
+        change.from.as_str().to_string(),
+    )
+}
+
+/// Classifies every transitive (non-direct) candidate against the pre-apply lock: which are
+/// advanced through a qualified override, and why each of the rest is held. Computed once from the
+/// full plan — peer-rejection rounds shrink the plan, and a verdict depends only on the pre-apply
+/// lock, never on the surviving candidate set.
+fn classify_transitive_advance(
+    plan: &Plan,
+    importer_declared: &HashSet<String>,
+    version_lines: &HashMap<String, BTreeSet<String>>,
+) -> HashMap<AdvanceKey, TransitiveAdvance> {
+    let mut verdicts = HashMap::new();
+    for change in plan.changes.iter().filter(|change| !change.direct) {
+        let name = &change.package.name;
+        let verdict = if importer_declared.contains(name) {
+            TransitiveAdvance::DeclaredElsewhere
+        } else if let Some(lines) = version_lines.get(name).filter(|lines| lines.len() > 1) {
+            TransitiveAdvance::MultiLine(lines.iter().cloned().collect())
+        } else {
+            match major_line_qualifier(change.from.as_str()) {
+                Some(qualifier) => TransitiveAdvance::Pin(format!("{name}@{qualifier}")),
+                None => TransitiveAdvance::Unscopable,
+            }
+        };
+        verdicts.insert(advance_key(change), verdict);
+    }
+    verdicts
+}
+
+/// The temporary override entries for the plan's advanceable transitive candidates: each
+/// [`TransitiveAdvance::Pin`] verdict becomes a major-line-qualified override (`name@^3.0.0`,
+/// `name@^0.11.0`) pinned to its exact matured target, so only the candidate's own version line is
+/// addressed and a same-name copy on another major stays untouched.
+fn transitive_override_pins(
+    plan: &Plan,
+    advance: &HashMap<AdvanceKey, TransitiveAdvance>,
+) -> Vec<(String, String)> {
+    let mut pins: Vec<(String, String)> = plan
+        .changes
+        .iter()
+        .filter(|change| !change.direct)
+        .filter_map(|change| {
+            let TransitiveAdvance::Pin(key) = advance.get(&advance_key(change))? else {
+                return None;
+            };
+            Some((key.clone(), change.to.as_str().to_string()))
+        })
+        .collect();
+    pins.sort();
+    pins.dedup();
+    pins
+}
+
+/// The conservative hold for a name importers declare at multiple versions: it is deliberately
+/// kept in range instead of pinned to the target, and it must not be advertised as adoptable —
+/// `outdated`'s verify reclassifies it blocked. Naming the divergent lines tells the reader
+/// *which* declarations must converge before a joint pin becomes possible; a range-only split —
+/// every copy resolved to one version but declared under disagreeing ranges — names the
+/// specifiers instead, since "multiple versions" would be factually wrong there.
+fn multi_version_hold(change: &Change, after_members: &crate::lock::MemberIndex) -> Skipped {
+    let name = change.package.name.as_str();
+    let versions = after_members.resolved_versions_of(name);
+    let specifiers = after_members.declared_specifiers_of(name);
+    let detail = if versions.len() > 1 {
+        Some(format!(
+            "declared at multiple versions across the workspace ({}); kept on its own line",
+            versions.join(", ")
+        ))
+    } else {
+        (specifiers.len() > 1).then(|| {
+            format!(
+                "declared with incompatible ranges across the workspace ({}); kept on its own line",
+                specifiers.join(", ")
+            )
+        })
+    };
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::MultiVersionHeld,
+        offending: None,
+        detail,
+    }
+}
+
+/// The held verdict for a candidate the joint resolve left short of its target: a
+/// mutually-exclusive peer won, so the row names the sibling whose peer choice excluded it (the
+/// candidate itself absent a unique blocker). For an attempted transitive advance (`advanced`)
+/// the generic message hides the real cause — whether the qualified override never matched (an
+/// exact or sub-line dependent range) or the override-free settlement reverted the pin, the
+/// target sits outside some dependent's declared range — so the detail says that instead.
+fn resolver_conflict_hold<L: NodeLock>(
+    change: &Change,
+    after_content: &str,
+    advanced: bool,
+) -> Skipped {
+    let name = change.package.name.as_str();
+    let offender = peer_conflict_blocker(after_content, name).unwrap_or_else(|| name.to_string());
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
+        detail: advanced.then(|| {
+            format!(
+                "the transitive advance did not land: a dependent's declared range holds it at {}",
+                change.from
+            )
+        }),
+    }
+}
+
+/// Every registry-resolved version line per name in the lock — the multiset the per-candidate
+/// advance verdicts are judged against, where the report's newest-copy projection would collapse
+/// duplicate copies.
+fn resolved_version_lines<L: NodeLock>(content: &str) -> HashMap<String, BTreeSet<String>> {
+    let mut lines: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
+        if version.contains(':') {
+            continue;
+        }
+        lines.entry(name).or_default().insert(version);
+    }
+    lines
+}
+
+/// The caret range covering `version`'s own major line (`3.4.8` → `^3.0.0`, `0.11.14` → `^0.11.0`)
+/// — the qualifier that scopes a transitive override to the line being advanced. `None` when the
+/// major cannot be parsed: with nothing safe to scope the override to, the candidate is left
+/// unpinned rather than force-pinned graph-wide.
+fn major_line_qualifier(version: &str) -> Option<String> {
+    let key = version::major_key(version).0;
+    if key.is_empty() {
+        return None;
+    }
+    Some(if key.contains('.') {
+        format!("^{key}.0")
+    } else {
+        format!("^{key}.0.0")
+    })
 }
 
 fn minimum_age_lock_rejected(error: &CoreError) -> bool {
@@ -1181,6 +1437,10 @@ fn multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
 impl<L: NodeLock> ToolWrite for NpmTool<L> {
     fn mutation_tool(&self) -> ToolId {
         L::ID
+    }
+
+    fn supports_transitive_advance(&self) -> bool {
+        L::SUPPORTS_TRANSITIVE_ADVANCE
     }
 
     async fn mutation_journal(
@@ -1979,6 +2239,131 @@ packages:
             direct: true,
             members: Vec::new(),
         }
+    }
+
+    #[test]
+    fn transitive_advance_pins_the_major_line_and_holds_every_ineligible_candidate() {
+        let mut deep = change("dompurify", "3.4.8", "3.4.12");
+        deep.direct = false;
+        let mut zero_major = change("proto-lite", "0.11.14", "0.11.16");
+        zero_major.direct = false;
+        // Declared by an importer (a direct `react@19` beside this transitive copy): the
+        // targeted-update path owns the name, and a graph-wide override would drag the declared
+        // copy — held, with a row saying so.
+        let mut declared_elsewhere = change("react", "18.2.0", "18.3.1");
+        declared_elsewhere.direct = false;
+        // Two resolved copies of one undeclared name: a single qualified override could collapse
+        // them, which the newest-copy report projection cannot attribute — held on its own lines.
+        let mut duplicated = change("entities", "4.5.0", "4.5.3");
+        duplicated.direct = false;
+        // No parsable major line: nothing safe to scope an override to.
+        let mut unscopable = change("weird", "not-semver", "1.0.0");
+        unscopable.direct = false;
+        let direct = change("chalk", "5.0.0", "5.3.0");
+        let plan = Plan {
+            changes: vec![
+                deep,
+                zero_major,
+                declared_elsewhere.clone(),
+                duplicated.clone(),
+                unscopable.clone(),
+                direct,
+            ],
+            ..Plan::default()
+        };
+        let importer_declared: HashSet<String> = HashSet::from(["react".to_string()]);
+        let version_lines: HashMap<String, BTreeSet<String>> = HashMap::from([(
+            "entities".to_string(),
+            BTreeSet::from(["4.5.0".to_string(), "5.0.2".to_string()]),
+        )]);
+
+        let advance = classify_transitive_advance(&plan, &importer_declared, &version_lines);
+        let pins = transitive_override_pins(&plan, &advance);
+
+        assert_eq!(
+            pins,
+            vec![
+                ("dompurify@^3.0.0".to_string(), "3.4.12".to_string()),
+                ("proto-lite@^0.11.0".to_string(), "0.11.16".to_string()),
+            ],
+            "only eligible non-direct candidates are pinned, each on its own major line"
+        );
+        // Every ineligible candidate carries a truthful hold row — never a generic resolver
+        // conflict for a move the resolver was not asked to make.
+        let hold = |change: &Change| {
+            advance
+                .get(&advance_key(change))
+                .and_then(|verdict| verdict.hold_skip(change))
+                .expect("ineligible candidate holds")
+        };
+        let declared_hold = hold(&declared_elsewhere);
+        assert_eq!(declared_hold.reason, SkipReason::MultiVersionHeld);
+        assert!(
+            declared_hold
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("importers declare react")),
+        );
+        let duplicated_hold = hold(&duplicated);
+        assert_eq!(duplicated_hold.reason, SkipReason::MultiVersionHeld);
+        assert!(
+            duplicated_hold
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("4.5.0, 5.0.2")),
+        );
+        let unscopable_hold = hold(&unscopable);
+        assert_eq!(unscopable_hold.reason, SkipReason::NotEligible);
+        // A pinned candidate has no hold row: it was genuinely handed to the resolver.
+        let pinned_key = ("dompurify".to_string(), "3.4.8".to_string());
+        assert!(matches!(
+            advance.get(&pinned_key),
+            Some(TransitiveAdvance::Pin(_))
+        ));
+    }
+
+    #[test]
+    fn prepare_whole_graph_inputs_routes_transitives_off_the_targeted_update() -> eyre::Result<()> {
+        // A transitive candidate must neither become a `pnpm update` selector (named selectors
+        // match direct deps only — a no-op pin reported held) nor, via its empty member set,
+        // force the whole batch onto the recursive fallback that runs in unrelated importers.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "chalk": "^5.0.0" } }"#,
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut direct = change("chalk", "5.0.0", "5.3.0");
+        direct.members = vec![cooldown_core::MemberRef {
+            name: "root".to_string(),
+            path: ".".to_string(),
+        }];
+        let mut transitive = change("dompurify", "3.4.8", "3.4.12");
+        transitive.direct = false;
+        let plan = Plan {
+            changes: vec![direct, transitive],
+            ..Plan::default()
+        };
+
+        let inputs = NpmTool::<Pnpm>::prepare_whole_graph_inputs(&project, &plan, &HashSet::new())?;
+
+        assert_eq!(
+            inputs.exact_pins,
+            vec![("chalk".to_string(), "5.3.0".to_string())],
+            "only the direct candidate is a targeted-update pin"
+        );
+        assert!(
+            !inputs.importer_filters.is_empty(),
+            "the transitive's empty member set must not force the recursive fallback"
+        );
+        Ok(())
     }
 
     #[tokio::test]

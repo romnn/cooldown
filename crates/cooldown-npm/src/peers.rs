@@ -515,13 +515,15 @@ fn attribute_peer_violation(
 
 /// The immutable inputs one whole-graph apply hands its peer-verified resolve loop: the plan to
 /// land, the pre-apply journal each round restores to, the multi-version names the resolve must not
-/// pin, the transitive age floor, and the workspace-manifest peer contracts the lock is not
-/// authoritative for.
+/// pin, the per-candidate transitive-advance verdicts, the transitive age floor, and the
+/// workspace-manifest peer contracts the lock is not authoritative for.
 #[derive(Clone, Copy)]
 pub(crate) struct JointResolve<'a> {
     pub(crate) plan: &'a Plan,
     pub(crate) journal: &'a ProjectMutationJournal,
     pub(crate) multi_version: &'a HashSet<String>,
+    pub(crate) advance:
+        &'a std::collections::HashMap<crate::tool::AdvanceKey, crate::tool::TransitiveAdvance>,
     pub(crate) window_minutes: Option<i64>,
     pub(crate) workspace: &'a [WorkspacePeer],
 }
