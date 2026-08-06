@@ -7,10 +7,28 @@
   its major line, gated by the new `ToolWrite::supports_transitive_advance` capability
   (default `false`). Cargo, Go, and uv advance through their existing pin engines; pnpm advances
   packages no importer declares through temporary major-line-qualified `pnpm-workspace.yaml`
-  overrides validated by an override-free settlement install; npm, yarn, and bun keep direct-only
-  upgrade planning. A transitive whose dependents exclude its matured release, whose name importers
-  declare elsewhere, or whose name resolves to several graph copies is reported held with the
-  specific reason. `--transitive hide` restores direct-only planning.
+  overrides validated by an override-free settlement install; every other adapter (npm, yarn, bun,
+  deno, pip, …) keeps direct-only upgrade planning. A transitive whose dependents exclude its
+  matured release, whose name importers declare elsewhere, or whose name resolves to several graph
+  copies is reported held with the specific reason. `--transitive hide` restores direct-only
+  planning.
+- **`--allow-stale-lock` now skips the project's dependency evaluation** instead of evaluating the
+  stale graph: a lock the tool cannot prove current yields a counted, warned skip rather than
+  verdicts derived from entries the next resolve would rewrite.
+- **Go import rewrites are lexical.** A cross-major bump rewrites `.go` import paths with a
+  quote-aware scanner instead of plain text replacement: no more doubled `/v2` suffixes, imports in
+  strings/comments handled by quote parity, gopkg.in's `pkg.v1` low-major paths rewritten
+  correctly, and symlinked trees skipped exactly as the `go` tool skips them.
+- **pnpm lock repair and truthful holds.** A lock a resolve leaves floated (an importer copy
+  outside its declared range) is repaired through the override engine before being declared stale;
+  `catalog:`/`workspace:`/`npm:` specifiers are never rewritten by constraint widening; peer-conflict
+  blame reads the lockfileVersion 9 `snapshots:` section; and a copy that lands beneath a newer
+  same-name duplicate is reported as applied (pnpm) instead of vanishing, or rolled back as a
+  phantom conflict (npm).
+- **Failures surface instead of hiding**: a candidate dropped during mutation recovery is a
+  per-candidate error rather than a silent skip behind `0 errors`, registry fetches retry a lone
+  transient transport failure once before failing the row, and resolver-quoted URL credentials are
+  redacted even inside comma-glued URL lists.
 - **Breaking library API:** `ToolRead::project_detection` replaces `project_marker` and
   `probe_manifest_without_lock`. Ordinary adapters should wrap their marker in
   `ProjectDetection::Primary`; adapters that must inspect manifest-only roots should use
