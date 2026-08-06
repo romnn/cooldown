@@ -9,6 +9,8 @@
 //! the root manifest's declared dependency names.
 
 use cooldown_core::{CoreError, Result, ToolId};
+use serde::Deserialize;
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
@@ -528,70 +530,217 @@ pub struct PeerRequirement {
     pub range: String,
 }
 
-/// Parses the `packages:` section of `pnpm-lock.yaml` (v9) into every resolved package's peer
-/// requirements. Package entries carry `peerDependencies:` (name → range); the same line-based walk
-/// as [`parse_pnpm`], since the section's shape is fixed and shallow. A `(peer@x)` disambiguation
-/// suffix on the entry key is stripped, so one package resolved under several peer contexts reports
-/// its requirement once per resolved copy — duplicates are harmless to the gate. Optional peers are
-/// reported too (see [`PeerRequirement`]); the walk still tracks the `peerDependenciesMeta:` field
-/// only so its children are never misread as `peerDependencies:` entries.
-fn parse_pnpm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
-    /// Which nested field of the current package entry the walk is inside.
-    #[derive(PartialEq)]
-    enum Field {
-        None,
-        Peers,
-        Meta,
+/// One parsed `pnpm-lock.yaml` document, typed for exactly the fields the pnpm readers consume.
+///
+/// Every other top-level section (`overrides:`, `patchedDependencies:`, `catalogs:`, `settings:`,
+/// …) and every unmodeled entry field is deliberately ignored.
+///
+/// Each reader parses the whole document once per call instead of line-scanning just its own
+/// section.
+/// The cost is accepted: the readers run a handful of times per project per run, and the document
+/// parse buys real YAML semantics (quoting and escapes, flow/block equivalence) instead of
+/// per-reader re-implementations of them.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct PnpmLockDocument {
+    importers: YamlEntries<Tolerant<PnpmImporter>>,
+    packages: YamlEntries<Tolerant<PnpmPackage>>,
+    /// Only the keys are consumed ([`PnpmLockDocument::package_and_snapshot_keys`]).
+    snapshots: YamlEntries<IgnoredAny>,
+}
+
+impl PnpmLockDocument {
+    /// Every `packages:` key followed by every `snapshots:` key, each section in document order —
+    /// the two places a peer-suffixed package identity can appear, depending on the lock format
+    /// (see `pnpm_peer_suffixed_names` in the peers module).
+    pub(crate) fn package_and_snapshot_keys(&self) -> impl Iterator<Item = &str> {
+        self.packages.keys().chain(self.snapshots.keys())
+    }
+}
+
+/// A YAML mapping read in document order with duplicate keys tolerated: entries surface exactly
+/// as the file lists them, and each occurrence of a duplicated key (which pnpm never writes)
+/// contributes its own entry instead of erroring out or collapsing.
+struct YamlEntries<V>(Vec<(String, V)>);
+
+impl<V> Default for YamlEntries<V> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<V> YamlEntries<V> {
+    fn entries(&self) -> impl Iterator<Item = (&str, &V)> {
+        self.0.iter().map(|(key, value)| (key.as_str(), value))
     }
 
-    let mut out = Vec::new();
-    let mut in_packages = false;
-    let mut entry: Option<NameVersion> = None;
-    let mut field = Field::None;
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(key, _)| key.as_str())
+    }
+}
 
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue; // blank lines punctuate the file but never end a section
-        }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => {
-                in_packages = trimmed == "packages:";
-                entry = None;
-                field = Field::None;
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for YamlEntries<V> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct EntriesVisitor<V>(std::marker::PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for EntriesVisitor<V> {
+            type Value = YamlEntries<V>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mapping")
             }
-            2 if in_packages => {
-                let key = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
-                // Balanced trailing-group strip, not a truncate at the first `(`: an injected
-                // key's `file:` path may itself contain parenthesized directory segments.
-                let key = strip_pnpm_peer_suffixes(key);
-                entry = split_name_version(key);
-                field = Field::None;
-            }
-            4 if in_packages && entry.is_some() => {
-                field = match trimmed.trim_end_matches(':') {
-                    "peerDependencies" => Field::Peers,
-                    "peerDependenciesMeta" => Field::Meta,
-                    _ => Field::None,
-                };
-            }
-            6 if in_packages && field == Field::Peers => {
-                if let (Some(dependent), Some((name, range))) =
-                    (entry.as_ref(), trimmed.split_once(':'))
-                {
-                    let range = unquote_yaml_scalar(range);
-                    if !range.is_empty() {
-                        out.push(PeerRequirement {
-                            dependent: dependent.name.clone(),
-                            dependent_version: dependent.version.clone(),
-                            package: unquote_yaml_scalar(name).to_string(),
-                            range: range.to_string(),
-                        });
-                    }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = access.next_entry()? {
+                    entries.push(entry);
                 }
+                Ok(YamlEntries(entries))
             }
-            _ => {}
+
+            // A section header with nothing under it (`packages:` at end of file) is a null
+            // value, not a mapping, and reads as an empty section.
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(YamlEntries(Vec::new()))
+            }
+        }
+        deserializer.deserialize_map(EntriesVisitor(std::marker::PhantomData))
+    }
+}
+
+/// A lock value kept fail-open per entry: a shape the typed model does not recognize (an old lock
+/// format's scalar dependency entry, a hand-edited file) degrades to `Other` — leaving its key
+/// readable and every sibling entry intact — instead of failing the whole document.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Tolerant<T> {
+    Known(T),
+    Other(IgnoredAny),
+}
+
+impl<T> Tolerant<T> {
+    fn known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// One `importers:` member: its direct-dependency groups (see [`DIRECT_GROUPS`]).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PnpmImporter {
+    dependencies: YamlEntries<Tolerant<PnpmImporterEntry>>,
+    #[serde(rename = "devDependencies")]
+    dev_dependencies: YamlEntries<Tolerant<PnpmImporterEntry>>,
+    #[serde(rename = "optionalDependencies")]
+    optional_dependencies: YamlEntries<Tolerant<PnpmImporterEntry>>,
+    #[serde(rename = "peerDependencies")]
+    peer_dependencies: YamlEntries<Tolerant<PnpmImporterEntry>>,
+}
+
+impl PnpmImporter {
+    /// The four groups in [`DIRECT_GROUPS`] order.
+    /// Group order is observable only through [`parse_pnpm_importer_specifiers`]'s
+    /// first-group-wins deduplication, which this fixed order keeps deterministic.
+    fn groups(&self) -> [&YamlEntries<Tolerant<PnpmImporterEntry>>; 4] {
+        [
+            &self.dependencies,
+            &self.dev_dependencies,
+            &self.optional_dependencies,
+            &self.peer_dependencies,
+        ]
+    }
+}
+
+/// One importer dependency entry: the declared range and the resolved version, each `None` when
+/// the lock omits that field.
+#[derive(Deserialize)]
+struct PnpmImporterEntry {
+    specifier: Option<String>,
+    version: Option<String>,
+}
+
+/// One `packages:` entry: its resolution record and declared peer ranges.
+///
+/// `peerDependenciesMeta` needs no field of its own — the typed model scopes each mapping, so
+/// meta children can never be misread as `peerDependencies:` entries.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PnpmPackage {
+    resolution: Option<PnpmResolution>,
+    #[serde(rename = "peerDependencies")]
+    peer_dependencies: YamlEntries<Tolerant<String>>,
+}
+
+/// A package's `resolution:` record; only injected-directory resolutions
+/// (`{directory: …, type: directory}`) are consumed.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PnpmResolution {
+    directory: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+/// Parses `pnpm-lock.yaml` once into the typed document, `None` on any YAML error.
+///
+/// Every reader maps `None` to its empty result, keeping the readers fail-open: a malformed lock
+/// yields no data, never an error or a panic.
+pub(crate) fn parse_pnpm_document(content: &str) -> Option<PnpmLockDocument> {
+    let mut options = serde_saphyr::Options::default();
+    // pnpm never writes duplicate keys, but a hand-edited lock may carry them; `LastWins` passes
+    // duplicate pairs through to the map visitor, so [`YamlEntries`] keeps each of them (the
+    // default policy errors out instead).
+    options.duplicate_keys = serde_saphyr::options::DuplicateKeyPolicy::LastWins;
+    // The default budget caps events/nodes/scalar bytes at totals a large monorepo lock can
+    // legitimately exceed, and a breach would silently blank every reader.
+    // Lift the size-proportional caps — the input is a project-local file — while keeping the
+    // structural guards (nesting depth, alias amplification).
+    if let Some(budget) = options.budget.as_mut() {
+        budget.max_events = usize::MAX;
+        budget.max_nodes = usize::MAX;
+        budget.max_total_scalar_bytes = usize::MAX;
+    }
+    serde_saphyr::from_str_with_options(content, options).ok()
+}
+
+/// Parses the `packages:` section of `pnpm-lock.yaml` (v9) into every resolved package's peer
+/// requirements: each package entry's `peerDependencies:` map (name → range).
+///
+/// A `(peer@x)` disambiguation suffix on the entry key is stripped, so one package resolved under
+/// several peer contexts reports its requirement once per resolved copy — duplicates are harmless
+/// to the gate.
+/// Optional peers are reported too (see [`PeerRequirement`]).
+fn parse_pnpm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
+    let Some(doc) = parse_pnpm_document(content) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, package) in doc.packages.entries() {
+        let Some(package) = package.known() else {
+            continue;
+        };
+        // Balanced trailing-group strip, not a truncate at the first `(`: an injected
+        // key's `file:` path may itself contain parenthesized directory segments.
+        let Some(dependent) = split_name_version(strip_pnpm_peer_suffixes(key)) else {
+            continue;
+        };
+        for (name, range) in package.peer_dependencies.entries() {
+            let Some(range) = range.known() else {
+                continue;
+            };
+            if !range.is_empty() {
+                out.push(PeerRequirement {
+                    dependent: dependent.name.clone(),
+                    dependent_version: dependent.version.clone(),
+                    package: name.to_string(),
+                    range: range.clone(),
+                });
+            }
         }
     }
     out
@@ -824,6 +973,12 @@ pub(crate) fn split_name_version(spec: &str) -> Option<NameVersion> {
     })
 }
 
+/// Undoes the quoting of one YAML scalar.
+///
+/// Test-only: production code decodes scalars through the YAML parser itself, and the
+/// [`decode_pnpm_importer_path`] test keeps this helper alive to pin the quoting rules importer
+/// keys must follow.
+#[cfg(test)]
 fn unquote_yaml_scalar(value: &str) -> &str {
     let value = value.trim();
     if let Some(inner) = value
@@ -842,6 +997,10 @@ fn unquote_yaml_scalar(value: &str) -> &str {
 }
 
 /// Decodes a pnpm importer ID, whose path may contain a YAML-escaped apostrophe.
+///
+/// Test-only, like [`unquote_yaml_scalar`]: its test pins the decoding the YAML parser must apply
+/// to importer keys (`''` unescapes inside single quotes only).
+#[cfg(test)]
 fn decode_pnpm_importer_path(value: &str) -> String {
     let value = value.trim();
     let Some(path) = value
@@ -1173,33 +1332,20 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
 }
 
 /// Parses `pnpm-lock.yaml` (v9): the top-level `packages:` section keys every resolved package by
-/// its `name@version(...peers)` identity. We read those keys directly — line by line — rather than
-/// pulling in a YAML dependency, since the keys are the only field we need.
+/// its `name@version(...peers)` identity — the keys are the only field this reader needs.
 fn parse_pnpm(content: &str) -> Vec<NameVersion> {
-    let mut out = Vec::new();
-    let mut in_packages = false;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue; // blank lines punctuate the file but never end a section
-        }
-        if let Some(stripped) = line.strip_prefix("  ") {
-            if !in_packages || stripped.starts_with(' ') {
-                continue; // outside the section, or a nested field of a package entry
-            }
-            let key = unquote_yaml_scalar(stripped.trim_end().trim_end_matches(':'));
+    let Some(doc) = parse_pnpm_document(content) else {
+        return Vec::new();
+    };
+    doc.packages
+        .keys()
+        .filter_map(|key| {
             // Drop the `(peer@x)` suffixes pnpm appends to disambiguate peer resolutions — as a
             // balanced trailing-group strip, since an injected key's `file:` path may itself
             // contain parenthesized directory segments.
-            let key = strip_pnpm_peer_suffixes(key);
-            if let Some(entry) = split_name_version(key) {
-                out.push(entry);
-            }
-        } else {
-            // A non-indented line begins a new top-level section; we only want `packages:`.
-            in_packages = line.starts_with("packages:");
-        }
-    }
-    out
+            split_name_version(strip_pnpm_peer_suffixes(key))
+        })
+        .collect()
 }
 
 /// The dependency-group keys a manifest/importer uses to declare a direct dependency.
@@ -1211,85 +1357,53 @@ const DIRECT_GROUPS: [&str; 4] = [
 ];
 
 /// Walks the `importers:` section of a pnpm lockfile and calls `visit` once per direct-dependency
-/// entry with `(importer_path, dep_name, specifier, version)`, in file order. `specifier`/`version`
-/// are the entry's unquoted scalar values (`None` when the entry lacks that line). Entry-level
-/// delivery is order-agnostic within the entry, so consumers need no specifier-before-version
-/// assumption. The four importer parsers share this so the indentation state machine lives once.
+/// entry with `(importer_path, dep_name, specifier, version)` — importers and entries in file
+/// order, the groups of one importer in [`DIRECT_GROUPS`] order.
+///
+/// `specifier`/`version` are the entry's scalar values (`None` when the entry lacks that field).
+/// Entry-level delivery is order-agnostic within the entry, so consumers need no
+/// specifier-before-version assumption.
+/// The four importer parsers share this so the document traversal lives once.
 fn walk_pnpm_importer_entries(
     content: &str,
-    mut visit: impl FnMut(&str, &str, Option<&str>, Option<&str>),
+    visit: impl FnMut(&str, &str, Option<&str>, Option<&str>),
 ) {
-    let mut in_importers = false;
-    let mut member: Option<String> = None;
-    let mut in_group = false;
-    let mut dep_name: Option<&str> = None;
-    let mut specifier: Option<&str> = None;
-    let mut version: Option<&str> = None;
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => {
-                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
-                in_importers = trimmed == "importers:";
-                member = None;
-                in_group = false;
-                dep_name = None;
-                specifier = None;
-                version = None;
-            }
-            2 if in_importers => {
-                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
-                let path = decode_pnpm_importer_path(trimmed.trim_end_matches(':'));
-                // A crafted or stale importer key could name a path outside the workspace, and
-                // every consumer of these paths joins them onto the project root — reject
-                // non-workspace-relative keys once, here at the parse boundary.
-                member = is_workspace_relative(&path).then_some(path);
-                in_group = false;
-                dep_name = None;
-                specifier = None;
-                version = None;
-            }
-            4 if in_importers => {
-                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
-                in_group = DIRECT_GROUPS.contains(&trimmed.trim_end_matches(':'));
-                dep_name = None;
-                specifier = None;
-                version = None;
-            }
-            6 if in_importers && in_group => {
-                flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
-                let name = unquote_yaml_scalar(trimmed.trim_end_matches(':'));
-                dep_name = (!name.is_empty()).then_some(name);
-                specifier = None;
-                version = None;
-            }
-            8 if in_importers && in_group => {
-                if let Some(raw) = trimmed.strip_prefix("specifier:") {
-                    specifier = Some(unquote_yaml_scalar(raw));
-                } else if let Some(raw) = trimmed.strip_prefix("version:") {
-                    version = Some(unquote_yaml_scalar(raw));
-                }
-            }
-            _ => {}
-        }
+    if let Some(doc) = parse_pnpm_document(content) {
+        walk_pnpm_document_importers(&doc, visit);
     }
-    flush_pnpm_entry(member.as_deref(), dep_name, specifier, version, &mut visit);
 }
 
-fn flush_pnpm_entry(
-    member: Option<&str>,
-    dep_name: Option<&str>,
-    specifier: Option<&str>,
-    version: Option<&str>,
-    visit: &mut impl FnMut(&str, &str, Option<&str>, Option<&str>),
+/// [`walk_pnpm_importer_entries`] over an already-parsed document, for callers that read further
+/// sections out of the same parse.
+fn walk_pnpm_document_importers(
+    doc: &PnpmLockDocument,
+    mut visit: impl FnMut(&str, &str, Option<&str>, Option<&str>),
 ) {
-    if let (Some(member), Some(name)) = (member, dep_name) {
-        visit(member, name, specifier, version);
+    for (path, importer) in doc.importers.entries() {
+        let Some(importer) = importer.known() else {
+            continue;
+        };
+        // A crafted or stale importer key could name a path outside the workspace, and
+        // every consumer of these paths joins them onto the project root — reject
+        // non-workspace-relative keys once, here at the parse boundary.
+        if !is_workspace_relative(path) {
+            continue;
+        }
+        for group in importer.groups() {
+            for (name, entry) in group.entries() {
+                if name.is_empty() {
+                    continue;
+                }
+                let (specifier, version) = match entry.known() {
+                    Some(entry) => (entry.specifier.as_deref(), entry.version.as_deref()),
+                    // An entry shape the model does not recognize (a pre-v9 scalar) still names
+                    // a dependency; it is delivered without specifier/version, which every
+                    // consumer skips.
+                    None => (None, None),
+                };
+                visit(path, name, specifier, version);
+            }
+        }
     }
 }
 
@@ -1304,10 +1418,13 @@ fn flush_pnpm_entry(
 /// before keying; a target that escapes the workspace root is dropped rather than aliased onto a
 /// workspace path (see [`normalize_local_target`]).
 fn parse_pnpm_local_package_consumers(content: &str) -> HashMap<String, Vec<String>> {
-    let importers = pnpm_importer_paths(content);
-    let directories = pnpm_injected_directories(content);
+    let Some(doc) = parse_pnpm_document(content) else {
+        return HashMap::new();
+    };
+    let importers = importer_paths_of(&doc);
+    let directories = injected_directories_of(&doc);
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    walk_pnpm_importer_entries(content, |member, name, _specifier, version| {
+    walk_pnpm_document_importers(&doc, |member, name, _specifier, version| {
         let target = match version {
             Some(value) => {
                 if let Some(target) = value.strip_prefix("link:") {
@@ -1336,34 +1453,20 @@ fn parse_pnpm_local_package_consumers(content: &str) -> HashMap<String, Vec<Stri
 /// the canonical set of workspace member directories, used as the ground truth when recovering a
 /// local package path from an injected `file:` version whose peer-suffix boundary is ambiguous.
 fn pnpm_importer_paths(content: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut in_importers = false;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => in_importers = trimmed == "importers:",
-            2 if in_importers => {
-                let raw_key = if let Some(stripped) = trimmed.strip_suffix(':') {
-                    stripped
-                } else if let Some((key, _)) = trimmed.split_once(": ") {
-                    // An importer with no dependencies is a flow-style `path: {}` line.
-                    key
-                } else {
-                    continue;
-                };
-                let path = decode_pnpm_importer_path(raw_key);
-                if is_workspace_relative(&path) {
-                    out.insert(path);
-                }
-            }
-            _ => {}
-        }
-    }
-    out
+    parse_pnpm_document(content)
+        .map(|doc| importer_paths_of(&doc))
+        .unwrap_or_default()
+}
+
+/// [`pnpm_importer_paths`] over an already-parsed document.
+/// Keys count whatever their value's shape — an importer with no dependencies (`path: {}`) is a
+/// member all the same.
+fn importer_paths_of(doc: &PnpmLockDocument) -> HashSet<String> {
+    doc.importers
+        .keys()
+        .filter(|path| is_workspace_relative(path))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Recovers the workspace member path from an injected `file:` version. The scalar alone is
@@ -1468,47 +1571,30 @@ impl InjectedDirectories {
 /// associates each recorded directory with the `<name>@file:<reference>` identity of its own
 /// entry key (see [`InjectedDirectories`]). A key without the `@file:` marker, or a directory
 /// that is not workspace-relative, contributes nothing.
-fn pnpm_injected_directories(content: &str) -> InjectedDirectories {
+fn injected_directories_of(doc: &PnpmLockDocument) -> InjectedDirectories {
     let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    let mut in_packages = false;
-    let mut current: Option<(String, String)> = None;
-    for line in content.lines() {
-        if line.trim().is_empty() {
+    for (key, package) in doc.packages.entries() {
+        let Some(resolution) = package
+            .known()
+            .and_then(|package| package.resolution.as_ref())
+        else {
+            continue;
+        };
+        if resolution.kind.as_deref() != Some("directory") {
             continue;
         }
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim();
-        match indent {
-            0 => {
-                in_packages = trimmed == "packages:";
-                current = None;
-            }
-            2 if in_packages => {
-                current = trimmed
-                    .strip_suffix(':')
-                    .map(unquote_yaml_scalar)
-                    // The first `@file:` is the name/reference boundary: a scope's `@` sits at the
-                    // very start of the name, and a name can never contain `:`.
-                    .and_then(|key| key.split_once("@file:"))
-                    .filter(|(name, _)| !name.is_empty())
-                    .map(|(name, reference)| (name.to_string(), reference.to_string()));
-            }
-            _ if in_packages && indent >= 4 => {
-                if let Some((name, reference)) = &current
-                    && let Some(rest) = trimmed.strip_prefix("resolution:")
-                    && rest.contains("type: directory")
-                    && let Some(after) = rest.split("directory:").nth(1)
-                {
-                    let value =
-                        unquote_yaml_scalar(after.split([',', '}']).next().unwrap_or("").trim());
-                    if is_workspace_relative(value) {
-                        map.entry(name.clone())
-                            .or_default()
-                            .push((reference.clone(), value.to_string()));
-                    }
-                }
-            }
-            _ => {}
+        let Some(directory) = resolution.directory.as_deref() else {
+            continue;
+        };
+        // The first `@file:` is the name/reference boundary: a scope's `@` sits at the
+        // very start of the name, and a name can never contain `:`.
+        let Some((name, reference)) = key.split_once("@file:") else {
+            continue;
+        };
+        if !name.is_empty() && is_workspace_relative(directory) {
+            map.entry(name.to_string())
+                .or_default()
+                .push((reference.to_string(), directory.to_string()));
         }
     }
     InjectedDirectories(map)

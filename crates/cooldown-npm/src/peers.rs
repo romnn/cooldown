@@ -1196,31 +1196,15 @@ pub(crate) fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
 /// `snapshots:` — on a modern lock a `packages:`-only scan finds nothing and every held conflict
 /// would self-blame.
 fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_packages = false;
-    for line in lock.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(stripped) = line.strip_prefix("  ") {
-            if !in_packages || stripped.starts_with(' ') {
-                continue;
-            }
-            let key = stripped
-                .trim()
-                .trim_end_matches(':')
-                .trim_matches('\'')
-                .trim_matches('"');
-            let Some(open) = key.find('(') else { continue };
-            let base = key[..open].to_string();
-            if let Some(NameVersion { name, .. }) = crate::lock::split_name_version(&base) {
-                out.push(name);
-            }
-        } else {
-            in_packages = line.starts_with("packages:") || line.starts_with("snapshots:");
-        }
-    }
-    out
+    let Some(doc) = crate::lock::parse_pnpm_document(lock) else {
+        return Vec::new();
+    };
+    doc.package_and_snapshot_keys()
+        .filter_map(|key| {
+            let (base, _suffix) = key.split_once('(')?;
+            crate::lock::split_name_version(base).map(|NameVersion { name, .. }| name)
+        })
+        .collect()
 }
 
 #[cfg(test)]
