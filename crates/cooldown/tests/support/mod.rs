@@ -563,6 +563,19 @@ impl Envelope {
             .collect()
     }
 
+    /// The named item's skip detail line (serialized as `skipped.message`), when present.
+    pub fn skip_detail_for(&self, name: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("skipped")
+                .and_then(|skipped| skipped.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    }
+
     pub fn skipped_reasons(&self) -> BTreeSet<String> {
         self.items()
             .iter()

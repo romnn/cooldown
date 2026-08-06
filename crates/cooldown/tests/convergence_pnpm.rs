@@ -325,6 +325,65 @@ fn upgrade_advances_a_matured_transitive_no_importer_declares() {
     );
 }
 
+/// The settlement's self-validation: a transitive advance whose target a dependent's declared
+/// range excludes must NOT survive the temporary override — the override-free settlement reverts
+/// the pin instead of committing a broken constraint, and the row reports the hold truthfully.
+#[test]
+fn upgrade_reverts_a_transitive_advance_a_dependents_exact_pin_excludes() {
+    skip_if_missing!("pnpm");
+    // A first-party `file:` dependency exact-pins `debug 4.3.6`, standing in for the
+    // monaco-editor/dompurify shape: no importer declares debug, so the advance rides the
+    // qualified-override leg; 4.3.7 matures under FREEZE_LATER, the override forces it, and the
+    // settlement must take it back — 4.3.6 is the only version the pinner admits.
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        r#"{ "name": "settlement-revert", "private": true, "dependencies": { "pinner": "file:./pinner" } }"#,
+    );
+    fixture.write(
+        "pinner/package.json",
+        r#"{ "name": "pinner", "version": "1.0.0", "dependencies": { "debug": "4.3.6" } }"#,
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, FREEZE);
+    let seeded = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        seeded.contains("debug@4.3.6"),
+        "seed sanity: the exact pin locks debug at 4.3.6"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(report.ok(), "a held advance is a skip, not an error");
+    assert!(
+        report.held_conflict_names().contains("debug"),
+        "the reverted advance is a held row, held={:?}",
+        report.held_conflict_names()
+    );
+    let detail = report.skip_detail_for("debug").unwrap_or_default();
+    assert!(
+        detail.contains("holds it at 4.3.6"),
+        "the hold names where the settlement actually left the copy: {detail}"
+    );
+    let lock = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        lock.contains("debug@4.3.6") && !lock.contains("debug@4.3.7"),
+        "the settlement reverts the out-of-range advance instead of committing it"
+    );
+    assert!(
+        !lock.contains("overrides:"),
+        "the temporary override must not persist in the settled lock"
+    );
+
+    // Converged: the held advance stays held, nothing oscillates.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        second.applied_names().is_empty(),
+        "a held advance must not oscillate into an applied row, applied={:?}",
+        second.applied_names()
+    );
+}
+
 #[test]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("pnpm");
