@@ -35,8 +35,14 @@ use std::ops::ControlFlow;
 /// version (`fix`). The trial/rollback/verify machinery is shared; only planning differs.
 #[derive(Clone, Copy)]
 pub(super) enum PlanMode {
-    /// `upgrade`: move direct deps to the newest matured version.
-    Upgrade,
+    /// `upgrade`: move deps to the newest matured version — direct deps across majors when allowed,
+    /// and matured in-range transitives the resolver would otherwise leave behind (a requirement
+    /// only forces the minimum it needs, so a matured transitive can sit unadopted forever).
+    Upgrade {
+        /// How transitive deps are handled (`--transitive <mode>`): `Enforce` and `Allow` advance
+        /// them within their major line, `Hide` narrows planning to direct deps.
+        transitive: TransitiveGate,
+    },
     /// `fix`: downgrade deps whose locked version is too fresh to the newest matured older version.
     Fix {
         /// How too-fresh transitive deps are handled (`--transitive <mode>`): `Enforce` downgrades
@@ -46,6 +52,17 @@ pub(super) enum PlanMode {
         /// violation is left in place with a warning.
         downgrade_pinned: bool,
     },
+}
+
+impl PlanMode {
+    /// The `--transitive` gate this run plans and gates under — the single source both the
+    /// candidate scope and the post-apply residual gate read, so a contradictory pairing is not
+    /// constructible past the mode itself.
+    const fn transitive_mode(self) -> TransitiveGate {
+        match self {
+            PlanMode::Upgrade { transitive } | PlanMode::Fix { transitive, .. } => transitive,
+        }
+    }
 }
 
 /// Backstop on the `fix`/reconcile fixpoint loop: a downgrade can lower another dep's floor and
@@ -247,7 +264,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return ProjectRunStatus::Terminated;
         };
         let verb = match self.mode {
-            PlanMode::Upgrade => "upgrades",
+            PlanMode::Upgrade { .. } => "upgrades",
             PlanMode::Fix { .. } => "downgrades",
         };
         self.ctx
@@ -271,7 +288,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return ProjectRunStatus::Terminated;
         };
         let mutation = match self.mode {
-            PlanMode::Upgrade => self.run_upgrade(deps, &mut state).await,
+            PlanMode::Upgrade { .. } => self.run_upgrade(deps, &mut state).await,
             PlanMode::Fix {
                 transitive,
                 downgrade_pinned,
@@ -878,7 +895,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
-        let scope = candidate_scope(self.mode);
+        let mut scope = candidate_scope(self.mode);
+        // Graph-wide *upgrade* planning is additionally gated on the engine: advancing a
+        // transitive needs an apply mechanism that can pin a package no manifest declares. An
+        // engine without one (npm/yarn/bun per-package landing) would only report every such
+        // candidate not-eligible, so it keeps direct-only upgrade planning. `fix` keeps the graph
+        // scope regardless — a too-fresh transitive must at least be reported.
+        if matches!(self.mode, PlanMode::Upgrade { .. })
+            && !self.ctx.writer.supports_transitive_advance()
+        {
+            scope = DepScope::Direct;
+        }
         let mut deps = match self
             .ws
             .dependencies_in_scope(self.ctx.reader, self.ctx.pctx, scope, self.ctx.opts)
@@ -894,7 +921,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // them by raising the requirement floor like Dependabot. `fix` leaves them alone — it
         // remediates the resolved lock graph, which never contains the build backend, so there is
         // nothing to downgrade.
-        if matches!(self.mode, PlanMode::Upgrade) {
+        if matches!(self.mode, PlanMode::Upgrade { .. }) {
             match self
                 .ws
                 .manifest_constraints_in_scope(self.ctx.reader, self.ctx.pctx, self.ctx.opts)
@@ -1631,7 +1658,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // plans build changes, and the read is best-effort: an unreadable build-system table must not
         // roll back an otherwise-valid batch (`dependencies` tolerates the same parse failure), so the
         // call is gated to upgrade mode and its error swallowed.
-        if matches!(self.mode, PlanMode::Upgrade)
+        if matches!(self.mode, PlanMode::Upgrade { .. })
             && let Ok(constraints) = self
                 .ctx
                 .reader
@@ -1754,7 +1781,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 // lock back only for a violation reconcile genuinely could not clear. `fix` stays
                 // conservative: it moves *backward*, so a fresh transitive it cannot reduce here is a
                 // real, unrecoverable conflict that must roll the batch back immediately.
-                if matches!(self.mode, PlanMode::Upgrade) {
+                if matches!(self.mode, PlanMode::Upgrade { .. }) {
                     return keep(true);
                 }
                 let Some(forced) = new_violations
@@ -1789,7 +1816,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     fn transitive_mode(&self) -> TransitiveGate {
-        self.ctx.opts.transitive_mode
+        self.mode.transitive_mode()
     }
 
     async fn read_reconcile_deps(&self) -> cooldown_core::Result<Vec<Dependency>> {

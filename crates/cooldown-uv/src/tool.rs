@@ -682,6 +682,11 @@ impl ToolWrite for UvTool {
         UV_ID
     }
 
+    fn supports_transitive_advance(&self) -> bool {
+        // `uv lock --upgrade-package name==version` re-pins any locked package, declared or not.
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `uv lock` builds local/workspace-member metadata via the PEP 517 backend for a `dynamic`
         // version or `readme`/`license = {file = ...}`, which reads `.py` source (e.g. `_version.py`).

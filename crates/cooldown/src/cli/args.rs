@@ -122,10 +122,12 @@ impl Cli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub(crate) enum TransitiveMode {
-    /// Include transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
-    /// `upgrade` leave them in place (direct deps are still handled).
+    /// Relax the too-fresh handling only: `check` reports violations non-fatally, `fix` leaves
+    /// too-fresh transitives in place, and `upgrade` still advances matured ones but keeps a
+    /// floated-up too-fresh transitive instead of reconciling it.
     Allow,
-    /// Skip transitive deps entirely — a direct-only run.
+    /// Don't plan or evaluate transitive deps — a direct-only run (a re-lock can still move them;
+    /// such moves stay visible as collateral rows).
     Hide,
 }
 
@@ -226,8 +228,10 @@ pub(in crate::cli) enum Command {
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
         /// How to treat *transitive* (indirect) deps. Default: move them too — advance each to its
-        /// newest matured version, and reconcile any too-fresh one a re-lock drags in back down, so
-        /// the new lock is gate-clean. `hide` is direct-only (transitives untouched); `allow` still
+        /// newest matured version where the tool's engine can pin an undeclared package (cargo,
+        /// pnpm, go, uv; npm/yarn/bun plan direct deps only), and reconcile any too-fresh one a
+        /// re-lock drags in back down, so the new lock is gate-clean. `hide` plans direct deps
+        /// only (a re-lock can still move transitives, reported as collateral); `allow` still
         /// advances the graph but leaves a floated-up too-fresh transitive in place (reported, not
         /// rolled back).
         #[arg(long, value_enum, value_name = "MODE")]

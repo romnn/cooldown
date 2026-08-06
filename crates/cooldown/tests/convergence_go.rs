@@ -181,9 +181,9 @@ fn outdated_agrees_with_upgrade() {
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
     let held = upgrade.held_conflict_names();
 
-    // Everything `upgrade` reports held, `outdated` must mark blocked. (Go's `outdated --transitive`
-    // can additionally flag candidates `upgrade` never plans — e.g. tooling-only modules outside the
-    // compile graph — so `blocked` is a superset, not a strict equal.)
+    // Everything `upgrade` reports held, `outdated` must mark blocked. (`outdated --transitive`
+    // can additionally mark statically-blocked candidates that `upgrade` — even with graph-wide
+    // transitive advance — never plans, so `blocked` is a superset, not a strict equal.)
     assert!(
         held.is_subset(&blocked),
         "every held candidate must be blocked by outdated\nheld={held:?}\nblocked={blocked:?}"

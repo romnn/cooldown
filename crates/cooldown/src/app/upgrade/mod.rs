@@ -149,7 +149,10 @@ impl Workspace {
     /// reported as skipped, never committing a state a subsequent `check` would reject. With
     /// `--dry-run` the plan is reported without mutation.
     pub async fn upgrade(&self, opts: &RunOpts) -> UpgradeOutcome {
-        self.run_plan(opts, PlanMode::Upgrade).await
+        let mode = PlanMode::Upgrade {
+            transitive: opts.transitive_mode,
+        };
+        self.run_plan(opts, mode).await
     }
 
     /// Fix cooldown violations by downgrading every dependency whose locked version is younger than
@@ -330,7 +333,9 @@ impl Workspace {
                 prepared.execution(),
                 false,
             ),
-            PlanMode::Upgrade,
+            PlanMode::Upgrade {
+                transitive: preview_opts.transitive_mode,
+            },
             &mut acc,
         )
         .run_policy(changes, manifest_only)

@@ -137,14 +137,17 @@ impl Exit {
 /// The full graph is in scope by default; the modes relax that consistently across the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransitiveGate {
-    /// Act on too-fresh transitive deps (the default, full graph): `check` fails on them, `fix`
-    /// downgrades them, `upgrade` reconciles them to a matured version.
+    /// Act on transitive deps (the default, full graph): `check` fails on too-fresh ones, `fix`
+    /// downgrades them, `upgrade` advances matured in-range ones (where the tool's engine can pin
+    /// an undeclared package) and reconciles any too-fresh one a re-lock drags in.
     #[default]
     Enforce,
-    /// Evaluate transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
-    /// `upgrade` leave them in place while still handling direct deps.
+    /// Relax only the too-fresh handling: `check` reports violations non-fatally, `fix` leaves
+    /// too-fresh transitives in place, and `upgrade` still advances matured ones but keeps a
+    /// floated-up too-fresh transitive instead of reconciling it (reported, not rolled back).
     Allow,
-    /// Don't evaluate transitive deps at all (direct-only).
+    /// Don't plan or evaluate transitive deps (direct-only). A direct re-resolve can still move
+    /// them; such moves stay visible as collateral rows.
     Hide,
 }
 

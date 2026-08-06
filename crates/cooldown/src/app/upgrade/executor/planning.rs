@@ -8,18 +8,15 @@ use std::collections::HashSet;
 
 /// Selects the dependency scope that supplies upgrade or downgrade candidates.
 ///
-/// `upgrade` moves only direct requirements forward because indirect movement is resolver-owned
-/// collateral.
-/// `fix` walks the resolved graph unless `--transitive hide` explicitly narrows it to direct
-/// dependencies.
+/// Both directions walk the resolved graph by default. Resolvers only promote the minimum a
+/// requirement forces, so a matured in-range release of a *transitive* can sit unadopted forever
+/// (a security patch no direct pin drags); `upgrade` therefore plans transitives too, advancing
+/// each within its major line, and `fix` downgrades too-fresh ones. `--transitive hide` narrows
+/// either direction to direct dependencies.
 pub(super) const fn candidate_scope(mode: PlanMode) -> DepScope {
-    match mode {
-        PlanMode::Upgrade
-        | PlanMode::Fix {
-            transitive: TransitiveGate::Hide,
-            ..
-        } => DepScope::Direct,
-        PlanMode::Fix { .. } => DepScope::Graph,
+    match mode.transitive_mode() {
+        TransitiveGate::Hide => DepScope::Direct,
+        TransitiveGate::Enforce | TransitiveGate::Allow => DepScope::Graph,
     }
 }
 

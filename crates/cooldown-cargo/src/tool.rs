@@ -1002,6 +1002,12 @@ impl ToolWrite for CargoTool {
         CARGO_ID
     }
 
+    fn supports_transitive_advance(&self) -> bool {
+        // The per-spec `update -p name@from --precise to` pin addresses any locked crate, declared
+        // or not.
+        true
+    }
+
     fn mutation_execution(&self) -> MutationExecution<'_> {
         MutationExecution::Isolated(self)
     }

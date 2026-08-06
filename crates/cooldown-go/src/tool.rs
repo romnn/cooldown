@@ -157,6 +157,12 @@ impl ToolWrite for GoTool {
         GO_ID
     }
 
+    fn supports_transitive_advance(&self) -> bool {
+        // `go get module@version` raises any module in the graph, adding an `// indirect` require
+        // when no package imports it directly.
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `go get`/`go mod tidy` reads the package import graph from `.go` source to keep `go.mod`
         // requires consistent, so the throwaway copy must include source. Go source is small; the bulk

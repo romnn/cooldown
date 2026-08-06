@@ -679,6 +679,17 @@ pub trait ToolWrite: Send + Sync {
         MutationExecution::InPlace
     }
 
+    /// Whether this tool's apply engine can move a *transitive* planned change — pin a package no
+    /// manifest declares to an exact lock version (cargo's per-spec `--precise` pins, pnpm's
+    /// temporary qualified overrides, `go get`, uv's `--upgrade-package`). `upgrade` plans
+    /// graph-wide transitive advance only when this holds; an engine that needs a declared
+    /// requirement (npm/yarn/bun per-package landing) would report every such candidate
+    /// not-eligible, so it keeps direct-only upgrade planning. `fix` is unaffected — a too-fresh
+    /// transitive is a policy violation that must at least be reported.
+    fn supports_transitive_advance(&self) -> bool {
+        false
+    }
+
     /// Captures the current contents of only the files `plan` may mutate.
     ///
     /// The returned [`ProjectMutationJournal`] is the rollback token the application layer restores

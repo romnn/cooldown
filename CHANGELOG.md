@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`upgrade` now advances matured in-range transitives** (the Dependabot-alert class no direct
+  pin drags): planning walks the whole resolved graph by default, each transitive advancing within
+  its major line, gated by the new `ToolWrite::supports_transitive_advance` capability
+  (default `false`). Cargo, Go, and uv advance through their existing pin engines; pnpm advances
+  packages no importer declares through temporary major-line-qualified `pnpm-workspace.yaml`
+  overrides validated by an override-free settlement install; npm, yarn, and bun keep direct-only
+  upgrade planning. A transitive whose dependents exclude its matured release, whose name importers
+  declare elsewhere, or whose name resolves to several graph copies is reported held with the
+  specific reason. `--transitive hide` restores direct-only planning.
 - **Breaking library API:** `ToolRead::project_detection` replaces `project_marker` and
   `probe_manifest_without_lock`. Ordinary adapters should wrap their marker in
   `ProjectDetection::Primary`; adapters that must inspect manifest-only roots should use

@@ -398,6 +398,13 @@ impl ToolWrite for FakeEco {
         GO
     }
 
+    fn supports_transitive_advance(&self) -> bool {
+        // The fake engine applies whatever the plan names, so graph-wide upgrade planning is
+        // exercised by default; a `no-transitive-advance` marker file models an engine that
+        // cannot pin an undeclared package (the npm/yarn/bun per-package family).
+        !self.root.join("no-transitive-advance").exists()
+    }
+
     fn mutation_execution(&self) -> MutationExecution<'_> {
         if self.root.join("use-isolated-mutation").exists() {
             MutationExecution::Isolated(self)
@@ -1321,12 +1328,11 @@ async fn outdated_default_view_never_labels_even_with_an_unclassifiable_newest()
 }
 
 #[tokio::test]
-async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_leaves_it() {
-    // `upgrade` scopes its CANDIDATES to direct requires; an indirect dep is never an upgrade
-    // candidate on its own. It moves forward only as a consequence of a direct bump (MVS collateral),
-    // which the report surfaces. `fix` (downgrade-only) never advances anything. Here a direct dep
-    // `a` has a matured newer version, and bumping it drags the indirect `t` forward to its newest
-    // matured release — exactly the MVS promotion the new scope relies on.
+async fn upgrade_dedupes_a_planned_transitive_with_its_mvs_collateral_while_fix_leaves_it() {
+    // `upgrade` plans the whole resolved graph, so the indirect `t` is a first-class candidate for
+    // its newest matured release — and the same move also arrives as adapter collateral when the
+    // direct `a` bump drags it (MVS promotion). The two provenances must dedupe into one applied
+    // row, never double-report. `fix` (downgrade-only) never advances anything.
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
@@ -1393,8 +1399,8 @@ async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_
     assert_eq!(fixed.summary.applied, 0);
     assert!(fixed.items.is_empty());
 
-    // `upgrade` plans only the direct `a`; the indirect `t` rides along as MVS collateral and is
-    // surfaced as its own applied row (never silent).
+    // `upgrade` plans both; `t`'s planned advance and its MVS-collateral report collapse into one
+    // applied row (never silent, never doubled).
     let upgraded = make().upgrade(&opts()).await;
     assert_eq!(upgraded.summary.applied, 2);
     let a = upgraded
@@ -1410,6 +1416,114 @@ async fn upgrade_carries_a_matured_indirect_forward_as_mvs_collateral_while_fix_
         .expect("t carried forward as collateral");
     assert_eq!(t.to, "v1.0.1");
     assert!(!t.downgrade);
+}
+
+#[tokio::test]
+async fn upgrade_advances_a_matured_in_range_transitive_no_direct_pin_drags() {
+    // The quinn-proto/dompurify class: a transitive's newer matured release exists, but no direct
+    // candidate drags it, and a resolver promotes only the minimum a requirement forces — without
+    // graph-wide planning it sits unadopted forever.
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None)],
+    );
+    releases.insert(
+        "t".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.0.1",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+        ],
+    );
+    // A transitive capped by an exact requirer pin (graph ceiling at its current version): the
+    // resolver would reject the advance, so it must not even be planned.
+    releases.insert(
+        "capped".to_string(),
+        vec![
+            rel("v3.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v3.0.1",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v2.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert(
+        "capped".to_string(),
+        rel("v3.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let mut capped = dep("capped", "v3.0.0", false);
+    capped.graph_ceiling = Some(Version::new("v3.0.0"));
+    let make = || {
+        workspace(
+            fake(
+                root.clone(),
+                vec![dep("a", "v2.0.0", true)],
+                vec![dep("t", "v1.0.0", false), capped.clone()],
+                releases.clone(),
+                locked.clone(),
+            ),
+            Baseline::default(),
+        )
+    };
+
+    let out = make().upgrade(&opts()).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 1, "only the free transitive advances");
+    let t = out
+        .items
+        .iter()
+        .find(|item| item.name == "t")
+        .expect("the transitive is planned and applied on its own");
+    assert_eq!(t.to, "v1.0.1");
+    assert!(!t.direct);
+    assert!(
+        !out.items
+            .iter()
+            .any(|item| item.name == "capped" && item.applied),
+        "a ceiling-capped transitive is not advanced"
+    );
+
+    // `--transitive hide` narrows upgrade planning to direct deps: nothing to do here.
+    let mut hide = opts();
+    hide.transitive_mode = cooldown::app::TransitiveGate::Hide;
+    let out = make().upgrade(&hide).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+
+    // An engine that cannot pin an undeclared package (`supports_transitive_advance` false, the
+    // npm/yarn/bun family) keeps direct-only upgrade planning even under the default gate —
+    // planning the candidate would only produce a not-eligible skip per run.
+    std::fs::write(root.join("no-transitive-advance"), b"").expect("write capability marker");
+    let out = make().upgrade(&opts()).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(
+        out.items.is_empty(),
+        "a capability-less engine must not plan transitives: {:?}",
+        out.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    std::fs::remove_file(root.join("no-transitive-advance")).expect("remove capability marker");
 }
 
 #[tokio::test]
@@ -3233,7 +3347,6 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
 
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true)],
-        // `x` is absent from forward planning but included when reconciliation fetches graph metadata.
         transitive: vec![dep("x", "v1.0.0", false)],
         fresh_transitive: Some(floated),
         releases,
@@ -3247,7 +3360,10 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
         state: Mutex::new(State {
-            fail_releases_after_apply_for: Some("x".to_string()),
+            // `t` enters the graph only after apply (the injected fresh transitive), so its
+            // release probe is the one fetch reconciliation performs cold — graph-wide upgrade
+            // planning has already fetched (and the run cache retains) every pre-apply package.
+            fail_releases_after_apply_for: Some("t".to_string()),
             write_lock_on_apply: true,
             ..State::default()
         }),
@@ -3266,11 +3382,11 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
         "the provisional error must not leak twice"
     );
     assert_eq!(out.errors[0].kind, DiagnosticKind::Transient);
-    assert_eq!(out.errors[0].package.as_deref(), Some("x"));
+    assert_eq!(out.errors[0].package.as_deref(), Some("t"));
     assert!(
         out.errors[0]
             .message
-            .contains("reconcile release probe failed for x")
+            .contains("reconcile release probe failed for t")
     );
     assert_eq!(
         std::fs::read(root.join("fake.lock")).expect("read restored fake lock"),
@@ -3331,7 +3447,10 @@ async fn partial_outer_restore_reports_no_applied_rows() -> eyre::Result<()> {
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
         state: Mutex::new(State {
-            fail_releases_after_apply_for: Some("x".to_string()),
+            // Like the reconcile-fetch test above: only the injected fresh transitive `t` is
+            // fetch-cold after apply, now that graph-wide upgrade planning pre-fetches (and the
+            // run cache retains) every pre-apply package.
+            fail_releases_after_apply_for: Some("t".to_string()),
             force_partial_restore_failure: true,
             ..State::default()
         }),

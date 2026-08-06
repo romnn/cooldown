@@ -58,9 +58,9 @@ old or accepted state without treating a rejected resolver trial as source-proje
 
 ## Transitive dependencies
 
-By default `upgrade` moves the **whole graph**: it advances each dependency to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. `--transitive` relaxes this:
+By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **npm, yarn, and bun plan direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent, a name resolved at several graph copies) is reported held rather than forced. `--transitive` relaxes the default:
 
-- **`--transitive hide`** — direct-only: leave transitive dependencies untouched.
+- **`--transitive hide`** — plan direct dependencies only. A re-lock can still move transitives; such moves stay visible as collateral rows.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
 
 ## Lock edge bindings (cargo)

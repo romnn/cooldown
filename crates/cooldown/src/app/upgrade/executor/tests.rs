@@ -16,10 +16,29 @@ use cooldown_core::{
 use std::collections::HashSet;
 
 #[test]
-fn upgrade_scopes_candidates_to_direct_requires() {
-    // `upgrade` hands only direct requires to the resolver; MVS promotes indirect deps as a
-    // consequence, so indirect deps are never attempt-and-rejected as candidates.
-    assert_eq!(candidate_scope(PlanMode::Upgrade), DepScope::Direct);
+fn upgrade_walks_the_graph_unless_transitive_hidden() {
+    // Resolvers promote only the minimum a requirement forces, so a matured in-range release of a
+    // transitive can sit unadopted forever (the quinn-proto/dompurify class). `upgrade` therefore
+    // plans the whole resolved graph; `Allow` still advances (it only relaxes the post-apply
+    // residual gate), and `--transitive hide` narrows to direct deps.
+    assert_eq!(
+        candidate_scope(PlanMode::Upgrade {
+            transitive: TransitiveGate::Enforce,
+        }),
+        DepScope::Graph
+    );
+    assert_eq!(
+        candidate_scope(PlanMode::Upgrade {
+            transitive: TransitiveGate::Allow,
+        }),
+        DepScope::Graph
+    );
+    assert_eq!(
+        candidate_scope(PlanMode::Upgrade {
+            transitive: TransitiveGate::Hide,
+        }),
+        DepScope::Direct
+    );
 }
 
 #[test]
