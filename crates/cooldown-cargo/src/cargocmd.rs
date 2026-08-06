@@ -425,6 +425,9 @@ struct ExactEdge {
 struct FloorEdge {
     requirer: String,
     dependency: String,
+    /// The full declared requirement, kept beside the extracted `floor` so the resolved join can
+    /// attach the floor only to nodes the requirement admits.
+    requirement: String,
     floor: String,
 }
 
@@ -602,8 +605,9 @@ fn resolved_declared_requirements(
     resolved
 }
 
-/// Walks each active requirer edge to the depended node of the candidate's name and records the
-/// highest lower bound demanded of it, per resolved `(name, version)` node.
+/// Walks each active requirer edge to the depended node of the candidate's name that the
+/// candidate's requirement admits and records the highest lower bound demanded of it, per resolved
+/// `(name, version)` node.
 fn resolved_graph_floors(
     floor_edges: Vec<FloorEdge>,
     edges: &HashMap<String, Vec<String>>,
@@ -619,6 +623,14 @@ fn resolved_graph_floors(
                 continue;
             };
             if info.name != candidate.dependency {
+                continue;
+            }
+            // A renamed multi-major dependency resolves several same-name nodes into one
+            // requirer's dep ids (`syn 1` beside `syn 2`). Joining by name alone would let the
+            // max-wins merge below push the new major's floor onto the old major's node — a floor
+            // above that node's own version, which [`req_floor`]'s contract rules out. A floor
+            // attaches only to the node its requirement admits.
+            if !crate::version::version_in_range(&candidate.requirement, &info.version) {
                 continue;
             }
             let key = (info.name.clone(), info.version.clone());
@@ -1039,6 +1051,7 @@ impl Cargo {
                     floor_edges.push(FloorEdge {
                         requirer: p.id.clone(),
                         dependency: dep.name.clone(),
+                        requirement: dep.req.clone(),
                         floor,
                     });
                 }
@@ -1056,12 +1069,19 @@ impl Cargo {
                         upper,
                     });
                 }
-                declared_requirement_edges.push(DeclaredRequirementEdge {
-                    requirer: p.id.clone(),
-                    dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
-                    package_name: dep.name.clone(),
-                    requirement: dep.req.clone(),
-                });
+                // A non-member's dev dependency gets the same treatment as in the exact/floor
+                // edges above: it is not in the resolved build graph, yet its requirement would
+                // join by *name* onto the crate's one active normal edge and veto edge rewrites
+                // the real requirement admits. A member's dev requirement stays, mirroring the
+                // dev-pin and dev-bound reasoning above.
+                if !is_dev || roots.contains(&p.id) {
+                    declared_requirement_edges.push(DeclaredRequirementEdge {
+                        requirer: p.id.clone(),
+                        dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
+                        package_name: dep.name.clone(),
+                        requirement: dep.req.clone(),
+                    });
+                }
             }
             packages.insert(
                 p.id.clone(),
@@ -1414,6 +1434,64 @@ mod tests {
     }
 
     #[test]
+    fn edge_requirements_exclude_a_non_member_dev_dependency() {
+        // diesel (a non-member) declares normal `uuid >=0.7, <2.0` beside dev `uuid ^0.8`. The
+        // dev dep of a transitive crate is not in the resolved build graph, yet its requirement
+        // would join by name onto diesel's one active uuid edge and make
+        // `RequirementIndex::admits` veto a `0.8.2 → 1.24.0` restoration the normal range allows.
+        // A member's own dev requirement stays indexed (dev deps of members are resolved).
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [
+                        {"name": "diesel", "req": "^2"},
+                        {"name": "criterion", "req": "^0.5", "kind": "dev"}
+                     ]},
+                    {"id": "diesel", "name": "diesel", "version": "2.3.11",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                        {"name": "uuid", "req": ">=0.7.0, <2.0.0"},
+                        {"name": "uuid", "req": "^0.8", "kind": "dev"}
+                     ]},
+                    {"id": "uuid", "name": "uuid", "version": "0.8.2",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "criterion", "name": "criterion", "version": "0.5.1",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [
+                        {"name": "diesel", "pkg": "diesel"},
+                        {"name": "criterion", "pkg": "criterion"}
+                    ]},
+                    {"id": "diesel", "deps": [{"name": "uuid", "pkg": "uuid"}]},
+                    {"id": "uuid", "deps": []},
+                    {"id": "criterion", "deps": []}
+                ]}
+            }
+        "#});
+        let diesel = LockPackageId::new("diesel", "2.3.11", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&diesel];
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].requirement, ">=0.7.0, <2.0.0");
+
+        let root = LockPackageId::new("app", "0.1.0", None::<String>);
+        let member_requirements = &graph.declared_requirements[&root];
+        assert!(
+            member_requirements
+                .iter()
+                .any(|requirement| requirement.dependency == "criterion"
+                    && requirement.requirement == "^0.5"),
+            "a workspace member's dev requirement stays indexed"
+        );
+    }
+
+    #[test]
     fn exact_req_version_accepts_only_single_equals_pins() {
         assert_eq!(exact_req_version("=1.0.197").as_deref(), Some("1.0.197"));
         assert_eq!(exact_req_version(" = 1.0.197 ").as_deref(), Some("1.0.197"));
@@ -1682,6 +1760,38 @@ mod tests {
         }"#;
         let graph = Cargo::build_graph_from_json(json);
         assert_eq!(graph.graph_floor("quote", "1.0.46"), Some("1.0.40"));
+    }
+
+    #[test]
+    fn graph_floor_stays_on_the_node_each_requirement_admits() {
+        // `renamer` depends on both syn majors via rename, so its resolved dep ids carry two
+        // same-name `syn` nodes. The `^2` floor (2.0.0) must not attach to the 1.x node — that
+        // would be a floor above the node's own version and would misclassify the 1.x line as
+        // irreducible; each requirement floors only the node it admits.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "renamer", "req": "^1.0"}]},
+                {"id": "renamer", "name": "renamer", "version": "1.0.0",
+                 "dependencies": [
+                    {"name": "syn", "req": "^1"},
+                    {"name": "syn", "rename": "syn2", "req": "^2"}
+                 ]},
+                {"id": "syn-1", "name": "syn", "version": "1.0.100", "dependencies": []},
+                {"id": "syn-2", "name": "syn", "version": "2.0.50", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "renamer"}]},
+                {"id": "renamer", "deps": [{"pkg": "syn-1"}, {"pkg": "syn-2"}]},
+                {"id": "syn-1", "deps": []},
+                {"id": "syn-2", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("syn", "1.0.100"), Some("1.0.0"));
+        assert_eq!(graph.graph_floor("syn", "2.0.50"), Some("2.0.0"));
     }
 
     #[test]

@@ -293,6 +293,16 @@ fn corrective_limitation(
     if let Some(reason) = after.unaddressable_reason(&change.dependent, &change.dependency) {
         return Some(reason.to_string());
     }
+    // The corrective policies rewrite crates.io bindings only, and `RequirementIndex::identifies`
+    // maps lock edges through crates.io identities alone — so an edge resolving to a git, path, or
+    // alternate-registry target is never identified even when metadata names its requirement fine.
+    // Blaming a metadata gap there would mislead; the true limitation is policy scope.
+    if change.after.source() != Some(CRATES_IO_SOURCE) {
+        return Some(
+            "the edge resolves outside crates.io, which the edge policy does not correct"
+                .to_string(),
+        );
+    }
     match requirements {
         Some(requirements)
             if requirements.identifies(
@@ -566,6 +576,59 @@ mod tests {
         std::assert_matches!(outcomes.as_slice(),
             [BindingOutcome::Unaddressable { reason, .. }]
         if reason.contains("did not identify"));
+    }
+
+    const GIT_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = [
+         "dep 1.0.0",
+        ]
+
+        [[package]]
+        name = "dep"
+        version = "1.0.0"
+        source = "git+https://example.com/dep?rev=aaa#1111111"
+
+        [[package]]
+        name = "dep"
+        version = "2.0.0"
+        source = "git+https://example.com/dep?rev=bbb#2222222"
+    "#};
+
+    #[test]
+    fn non_crates_io_rebind_is_limited_by_policy_scope_not_a_metadata_gap() {
+        // A git→git rebind is never identified by `RequirementIndex::identifies` — it maps lock
+        // edges through crates.io identities only — even when metadata names the requirement
+        // fine. The Unaddressable row must blame policy scope, not a metadata gap, with or
+        // without a requirement index at hand.
+        let after_text = GIT_LOCK.replace("\"dep 1.0.0\",", "\"dep 2.0.0\",");
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [],
+                "workspace_members": [],
+                "workspace_root": "/app",
+                "resolve": {"nodes": []}
+            }
+        "#});
+        let requirements = RequirementIndex::new(&graph);
+
+        for requirements in [Some(&requirements), None] {
+            let outcomes = residual_outcomes(
+                EdgePolicy::Preserve,
+                &view(GIT_LOCK),
+                &view(&after_text),
+                &BTreeSet::new(),
+                requirements,
+            );
+
+            std::assert_matches!(outcomes.as_slice(),
+                [BindingOutcome::Unaddressable { reason, .. }]
+            if reason.contains("outside crates.io") && !reason.contains("identify"));
+        }
     }
 
     #[test]
