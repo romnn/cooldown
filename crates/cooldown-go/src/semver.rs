@@ -655,10 +655,12 @@ fn split_gopkg_in(path: &str, _rest: &str) -> PathVersionSplit {
     }
 }
 
-/// Builds the module path for major version `n` (≥ 2) from a base path's `prefix`.
+/// Builds the module path for major version `n` from a base path's `prefix`.
 ///
 /// Returns `prefix/vN`, or `prefix.vN` for a `gopkg.in` prefix. The inverse of the
-/// `prefix` returned by [`split_path_version`].
+/// `prefix` returned by [`split_path_version`]. For a non-`gopkg.in` prefix only `n` ≥ 2 is
+/// meaningful (v0/v1 live at the bare base path); `gopkg.in` encodes every major in the path,
+/// so `n` of 0 or 1 is valid there (`gopkg.in/yaml.v1`).
 ///
 /// # Examples
 ///
@@ -667,6 +669,7 @@ fn split_gopkg_in(path: &str, _rest: &str) -> PathVersionSplit {
 ///
 /// assert_eq!(semver::major_path("example.com/foo", 3), "example.com/foo/v3");
 /// assert_eq!(semver::major_path("gopkg.in/yaml", 2), "gopkg.in/yaml.v2");
+/// assert_eq!(semver::major_path("gopkg.in/yaml", 1), "gopkg.in/yaml.v1");
 /// ```
 #[must_use]
 pub fn major_path(prefix: &str, n: u32) -> String {

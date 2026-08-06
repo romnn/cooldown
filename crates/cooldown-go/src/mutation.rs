@@ -59,11 +59,13 @@ pub(crate) fn old_import_path(change: &Change) -> Option<String> {
         return None;
     }
     // The old import path is the one for `from`'s major (`new_path` already encodes `to`'s major); v1
-    // lives at the base path. A move that does not change the path (same major, or a base↔base patch)
-    // has nothing to rewrite.
+    // lives at the base path — except on gopkg.in, which encodes *every* major in the path (v0/v1
+    // import as `prefix.v0`/`prefix.v1`, never the bare prefix; the same carve-out
+    // `discover_lower_major_paths` makes). A move that does not change the path (same major, or a
+    // base↔base patch) has nothing to rewrite.
     let from_major = semver::major(change.from.as_str());
     let n: u32 = from_major.trim_start_matches('v').parse().ok()?;
-    let old = if n <= 1 {
+    let old = if n <= 1 && !split.prefix.starts_with("gopkg.in/") {
         split.prefix
     } else {
         semver::major_path(&split.prefix, n)
@@ -81,14 +83,21 @@ fn capture_import_targets(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        // Skip exactly what the `go` tool itself ignores: directories whose names begin with `.`
+        // or `_` (so `.git`, `_data` container volumes, `_cache`, … are never descended into),
+        // plus `vendor` and `testdata` — and symlinks, whether to a directory or a `.go` file
+        // (`entry.file_type()`, unlike `Path::is_dir`, does not follow them). Beyond matching
+        // Go's own package discovery, this keeps the scan off non-source trees that may be large
+        // or unreadable (e.g. a Docker volume owned by another user), which would otherwise fail
+        // the whole upgrade — as would a captured symlink or other non-regular file, which
+        // `ProjectMutationJournal::capture` refuses to journal.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Skip exactly what the `go` tool itself ignores: directories whose names begin with `.`
-            // or `_` (so `.git`, `_data` container volumes, `_cache`, … are never descended into),
-            // plus `vendor` and `testdata`. Beyond matching Go's own package discovery, this keeps
-            // the scan off non-source trees that may be large or unreadable (e.g. a Docker volume
-            // owned by another user), which would otherwise fail the whole upgrade.
             if name.starts_with('.')
                 || name.starts_with('_')
                 || matches!(name.as_ref(), "vendor" | "testdata")
@@ -99,7 +108,7 @@ fn capture_import_targets(
             capture_import_targets(root, &child, old, seen, out)?;
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("go") {
+        if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("go") {
             continue;
         }
         let utf8 = utf8_path(path)?;
@@ -396,6 +405,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn import_scan_skips_symlinked_dirs_and_files() {
+        use std::os::unix::fs::symlink;
+        // `go` never traverses symlinks during package discovery, and
+        // `ProjectMutationJournal::capture` refuses symlinked ancestors and non-regular final
+        // paths — a scan that followed either symlink here would hard-fail the whole upgrade.
+        let target = tempfile::tempdir().expect("target tempdir");
+        let target_root = Utf8Path::from_path(target.path()).expect("utf8 target");
+        let src = "package x\nimport \"example.com/foo\"\n";
+        std::fs::create_dir(target_root.join("pkg")).expect("mkdir pkg");
+        std::fs::write(target_root.join("pkg").join("dep.go"), src).expect("write dep.go");
+        std::fs::write(target_root.join("linked.go"), src).expect("write linked.go");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8 root");
+        std::fs::write(root.join("main.go"), src).expect("write main.go");
+        // Neither link name trips the `.`/`_` name skip, so only the symlink check excludes them.
+        symlink(target_root.join("pkg"), root.join("linkdir")).expect("symlink dir");
+        symlink(target_root.join("linked.go"), root.join("link.go")).expect("symlink file");
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        capture_import_targets(root, root, "example.com/foo", &mut seen, &mut out)
+            .expect("scan succeeds");
+
+        let captured: Vec<&str> = out.iter().map(|path| path.as_str()).collect();
+        assert_eq!(
+            captured,
+            vec!["main.go"],
+            "symlinked directory contents and symlinked files are never captured"
+        );
+    }
+
     #[test]
     fn base_to_v2_rewrite_does_not_double_the_version_suffix() {
         // The luup5 armsubscriptions failure: with `new = old + "/v2"`, sequential replaces
@@ -543,6 +586,44 @@ mod tests {
         assert_eq!(
             old_import_path(&change("example.com/foo/v2", "v1.5.0", "v2.0.0")).as_deref(),
             Some("example.com/foo"),
+        );
+    }
+
+    #[test]
+    fn gopkg_in_low_majors_keep_their_versioned_import_path() {
+        // gopkg.in has no unversioned base path: v0/v1 import as `prefix.v0`/`prefix.v1`
+        // (`gopkg.in/yaml.v1`, never `gopkg.in/yaml`). Scanning for the bare prefix would match
+        // no import, so the rewrite would silently no-op and the tidied-away require would be
+        // misreported as a resolver-conflict skip.
+        assert_eq!(
+            old_import_path(&change("gopkg.in/yaml.v3", "v1.2.7", "v3.0.1")).as_deref(),
+            Some("gopkg.in/yaml.v1"),
+        );
+        assert_eq!(
+            old_import_path(&change("gopkg.in/pkg.v2", "v0.3.0", "v2.0.0")).as_deref(),
+            Some("gopkg.in/pkg.v0"),
+        );
+        // A within-major gopkg.in bump changes no path — the bare prefix must not be synthesized
+        // as a bogus old path either.
+        assert_eq!(
+            old_import_path(&change("gopkg.in/yaml.v1", "v1.2.0", "v1.3.0")),
+            None,
+        );
+    }
+
+    #[test]
+    fn gopkg_in_cross_major_rewrites_the_dotted_old_path() {
+        // End to end for gopkg.in v1 → v3: the old path derived from the change drives the same
+        // rewrite pass as `/vN` modules, moving the dotted `.v1` import (and its subpackages) to
+        // `.v3`.
+        let change = change("gopkg.in/yaml.v3", "v1.2.7", "v3.0.1");
+        let old = old_import_path(&change).expect("cross-major move has an old path");
+        let source =
+            "import (\n\t\"gopkg.in/yaml.v1\"\n\t\"gopkg.in/yaml.v1/sub\"\n\t\"other.dev/x\"\n)\n";
+        let rewritten = rewrite_import_path(source, &old, &change.package.name);
+        assert_eq!(
+            rewritten,
+            "import (\n\t\"gopkg.in/yaml.v3\"\n\t\"gopkg.in/yaml.v3/sub\"\n\t\"other.dev/x\"\n)\n",
         );
     }
 }
