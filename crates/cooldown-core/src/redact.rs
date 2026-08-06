@@ -34,6 +34,15 @@ pub fn url_secrets(value: &str) -> String {
             .char_indices()
             .find_map(|(index, character)| is_url_terminator(character).then_some(index))
             .unwrap_or(url_tail.len());
+        // A second URL glued to the first without an intervening terminator (a comma- or
+        // semicolon-joined index list) would otherwise ride inside the first URL's *path* and be
+        // emitted verbatim, credentials included. Splitting at the embedded scheme keeps each URL
+        // independently redacted — deliberately not by making `,`/`;` terminators, which would
+        // truncate a legitimate comma-carrying query before its values were masked.
+        let url_end = match embedded_scheme_start(url_tail) {
+            Some(next) if next < url_end => next,
+            _ => url_end,
+        };
         let Some(url) = url_tail.get(..url_end) else {
             break;
         };
@@ -197,6 +206,26 @@ const fn is_url_terminator(character: char) -> bool {
     character.is_whitespace() || matches!(character, ')' | ']' | '}' | '"' | '\'' | '<' | '>')
 }
 
+/// The byte offset where a *second* URL begins inside `url` — the earliest scheme whose `://`
+/// follows the first one — or `None` when the text holds a single URL. The scheme's start is found
+/// by walking back over scheme characters from the embedded `://`; a non-scheme boundary character
+/// must precede it, or the candidate is the first URL's own scheme.
+fn embedded_scheme_start(url: &str) -> Option<usize> {
+    let first = url.find("://")?;
+    let offset = first.checked_add(3)?;
+    let rest = url.get(offset..)?;
+    let second = rest.find("://")?;
+    let absolute = offset.checked_add(second)?;
+    let prefix = url.get(..absolute)?;
+    let start = prefix
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_scheme_character(*character))
+        .last()
+        .map(|(index, _)| index)?;
+    (start > 0).then_some(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{source_label, url_secrets};
@@ -214,6 +243,23 @@ mod tests {
                 "foo (git+https://example.com/repo?",
                 "branch=next&access_token=REDACTED&%73ignature=REDACTED#REDACTED)"
             )
+        );
+    }
+
+    /// Comma-joined URLs carry no terminator between them, so the second would otherwise ride
+    /// inside the first URL's path — its authority credentials emitted verbatim. Splitting at the
+    /// embedded scheme must not sacrifice comma-carrying queries, whose values are masked only
+    /// while the URL stays whole.
+    #[test]
+    fn redacts_credentials_in_a_glued_url_list() {
+        assert_eq!(
+            url_secrets("https://a.example/idx,https://user:token@b.example/idx"),
+            "https://a.example/idx,https://b.example/idx",
+        );
+        assert_eq!(
+            url_secrets("https://a.example/x?list=a,b&token=secret,tail"),
+            "https://a.example/x?list=REDACTED&token=REDACTED",
+            "a comma inside a single URL's query still masks every value"
         );
     }
 
