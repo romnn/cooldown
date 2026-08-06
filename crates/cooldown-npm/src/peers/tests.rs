@@ -2078,6 +2078,41 @@ fn peer_conflict_blocker_names_a_unique_peer_suffixed_sibling() {
     assert_eq!(peer_conflict_blocker(self_only, "pkg-a"), None);
 }
 
+/// lockfileVersion 9 (pnpm 9-11) writes suffix-free `packages:` keys and keeps the peer-resolved
+/// identities under `snapshots:` — the section the blame scan must read on a modern lock, where a
+/// `packages:`-only scan finds nothing and every held conflict would self-blame.
+#[test]
+fn peer_conflict_blocker_reads_v9_snapshot_identities() {
+    let lock = indoc::indoc! {"
+        lockfileVersion: '9.0'
+
+        packages:
+
+          pkg-a@1.0.0:
+            resolution: {integrity: sha512-a}
+
+          pkg-b@2.0.0:
+            resolution: {integrity: sha512-b}
+
+          shared@1.4.0:
+            resolution: {integrity: sha512-c}
+
+        snapshots:
+
+          pkg-a@1.0.0: {}
+
+          pkg-b@2.0.0(shared@1.4.0):
+            dependencies:
+              shared: 1.4.0
+
+          shared@1.4.0: {}
+    "};
+    assert_eq!(
+        peer_conflict_blocker(lock, "pkg-a"),
+        Some("pkg-b".to_string())
+    );
+}
+
 #[test]
 fn peer_conflict_blocker_is_generic_when_blame_is_ambiguous() {
     // Two distinct peer-suffixed siblings make blame ambiguous, so attribution stays generic.

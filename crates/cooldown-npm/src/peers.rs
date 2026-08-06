@@ -1188,9 +1188,13 @@ pub(crate) fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     }
 }
 
-/// Every `packages:` key in a `pnpm-lock.yaml` that carries a `(…)` peer disambiguation suffix —
-/// returned as the package names used to attribute a held peer conflict to the sibling that forced
-/// the peer choice.
+/// Every `packages:` or `snapshots:` key in a `pnpm-lock.yaml` that carries a `(…)` peer
+/// disambiguation suffix — returned as the package names used to attribute a held peer conflict to
+/// the sibling that forced the peer choice. Both sections must be scanned because the suffix moved
+/// with the lock format: pnpm ≤8 wrote peer-suffixed `packages:` keys, while lockfileVersion 9
+/// (pnpm 9-11) keeps `packages:` suffix-free and records the peer-resolved identities under
+/// `snapshots:` — on a modern lock a `packages:`-only scan finds nothing and every held conflict
+/// would self-blame.
 fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_packages = false;
@@ -1213,7 +1217,7 @@ fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
                 out.push(name);
             }
         } else {
-            in_packages = line.starts_with("packages:");
+            in_packages = line.starts_with("packages:") || line.starts_with("snapshots:");
         }
     }
     out

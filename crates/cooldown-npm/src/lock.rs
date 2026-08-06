@@ -450,6 +450,19 @@ impl MemberIndex {
             .keys()
             .cloned()
             .chain(self.by_version.keys().map(|(name, _)| name.clone()))
+            // An `npm:` alias records the alias under the dependency name and the real package
+            // inside the resolved version (`"foo": "npm:bar@^1"` → `("foo", "bar@1.2.3")`). The
+            // real name is importer-declared too: a graph-wide override on it would drag the
+            // alias-declared copy exactly like a same-name declaration, so it joins the set the
+            // transitive-advance engine stays clear of. The digit check keeps git/URL resolutions
+            // (which also embed `@`) from minting phantom names.
+            .chain(self.by_version.keys().filter_map(|(_, version)| {
+                let (real, resolved) = version.rsplit_once('@')?;
+                (!real.is_empty()
+                    && !real.contains(':')
+                    && resolved.starts_with(|c: char| c.is_ascii_digit()))
+                .then(|| real.to_string())
+            }))
             .collect()
     }
 
@@ -2167,6 +2180,45 @@ packages:
         assert!(
             !split.contains("foo"),
             "foo is declared at one version by importers; its transitive 2.0.0 copy must not flag it"
+        );
+    }
+
+    /// An `npm:` alias declares the REAL package under an assumed name: the importer records the
+    /// alias with a `real@version` resolution. Both names are importer-declared for the
+    /// transitive-advance guard — an override on the real name would drag the alias-declared copy
+    /// exactly like a same-name declaration. A git/URL resolution also embeds `@` but must not
+    /// mint a phantom declared name.
+    #[test]
+    fn declared_names_include_the_real_package_behind_an_alias() {
+        let lock = indoc! {"
+            importers:
+
+              .:
+                dependencies:
+                  my-lodash:
+                    specifier: npm:lodash@^4.17.0
+                    version: lodash@4.17.21
+                  pinned-git:
+                    specifier: github:user/pinned-git
+                    version: https://codeload.github.com/user/pinned-git/tar.gz/abc123
+
+            packages:
+
+              lodash@4.17.21:
+                resolution: {integrity: sha512-a}
+        "};
+        let declared = Pnpm::member_sources(lock).declared_names();
+        assert!(
+            declared.contains("my-lodash"),
+            "the alias itself is declared"
+        );
+        assert!(
+            declared.contains("lodash"),
+            "the real package behind the alias is declared too: {declared:?}"
+        );
+        assert!(
+            !declared.iter().any(|name| name.contains("codeload")),
+            "a git resolution must not mint a phantom name: {declared:?}"
         );
     }
 

@@ -394,8 +394,36 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
     }
 }
 
+/// Whether the lock's version for `name` actually moved across a whole-graph resolve.
+///
+/// A name can resolve to several copies in a pnpm graph; the `before`/`after` maps track its
+/// *newest* copy, so a candidate planned off a stale duplicate whose newest copy already sits at
+/// the target shows no net move. Reporting only genuine moves keeps the report set equal to the
+/// lock-diff set: a converged re-run, where nothing moved, reports zero applied (no oscillation).
+/// The newest copy alone is blind in the other direction, though: an importer copy that genuinely
+/// moved beneath a newer transitive duplicate shows no net newest-copy change, and its applied row
+/// would vanish. The importer-resolved version sets restore that visibility (empty on both sides
+/// for npm's name-only index, which keeps its newest-copy judgment); a converged re-run still
+/// moves neither.
+fn candidate_moved(
+    name: &str,
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+    before_members: &crate::lock::MemberIndex,
+    after_members: &crate::lock::MemberIndex,
+) -> bool {
+    before_members.resolved_versions_of(name) != after_members.resolved_versions_of(name)
+        || match (before.get(name), after.get(name)) {
+            (Some(from), Some(to)) => version::compare(from, to).is_ne(),
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        }
+}
+
 /// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
-/// member when the lock carries member-scoped entries and by the name's newest copy otherwise.
+/// member when the lock carries member-scoped entries, per the member's physical install-tree
+/// instance when the lock records layout (npm), and by the name's newest copy only as the last
+/// resort.
 ///
 /// A successful install command is not proof: `npm install <name>@<version> --before=<cutoff>`
 /// exits 0 yet lands the newest pre-cutoff version when the requested one is newer than the
@@ -419,6 +447,25 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
         return Ok(member_versions
             .into_iter()
             .all(|version| version == Some(target)));
+    }
+    // npm's declaration attribution is name-only, but its lock records the physical install tree:
+    // judge each declaring member's own resolved instance — the nearest enclosing copy — so a
+    // newer duplicate nested under another dependent cannot mask a landed root copy. The
+    // newest-copy fallback below would read the duplicate, roll the genuine landing back as a
+    // conflict, and do so again on every future run.
+    if let Some(paths) = L::install_paths(&content) {
+        let instances: Vec<Option<&str>> = change
+            .members
+            .iter()
+            .map(|member| {
+                paths
+                    .member_resolution(&member.path, &change.package.name)
+                    .map(|instance| instance.version)
+            })
+            .collect();
+        if instances.iter().any(Option::is_some) {
+            return Ok(instances.into_iter().all(|version| version == Some(target)));
+        }
     }
     Ok(newest
         .get(&change.package.name)
@@ -708,6 +755,7 @@ impl<L: NodeLock> NpmTool<L> {
         // than the name's newest copy — the multi-version float leaves a lower line short of a
         // cross-line target the higher line already satisfies.
         let after_members = L::member_sources(&after_content);
+        let before_members = before_content.map(L::member_sources).unwrap_or_default();
 
         // A peer-rejected candidate already carries its structured skip row; the diff loop below
         // must not add a second (resolver-conflict) verdict for it.
@@ -720,17 +768,7 @@ impl<L: NodeLock> NpmTool<L> {
             if peer_rejected.contains(&(name, change.to.as_str())) {
                 continue;
             }
-            // Whether the lock's version for this name actually moved.
-            // A name can resolve to several copies in a pnpm graph; `before`/`after` track its
-            // *newest* copy, so a candidate planned
-            // off a stale duplicate copy whose newest copy is already at the target shows no net move.
-            // Reporting only genuine moves keeps the report set equal to the lock-diff set: a converged
-            // re-run, where nothing moved, reports zero applied (no oscillation).
-            let moved = match (before.get(name), after.get(name)) {
-                (Some(from), Some(to)) => version::compare(from, to).is_ne(),
-                (None, Some(_)) | (Some(_), None) => true,
-                (None, None) => false,
-            };
+            let moved = candidate_moved(name, &before, &after, &before_members, &after_members);
             // A transitive candidate the advance pass held (importer-owned name, duplicated graph
             // copies, no override scope) was never handed to the resolver; its truthful hold row
             // replaces both the generic conflict verdict and — for a duplicate copy whose newest
@@ -1047,7 +1085,7 @@ impl<L: NodeLock> NpmTool<L> {
         // The repair replays the whole plan through the override engine, so the direct exact pins
         // and the qualified transitive pins ride one temporary config together.
         let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
-        let mut pins = inputs.exact_pins;
+        let mut pins = qualified_direct_override_pins(inputs.exact_pins);
         pins.extend(transitive_override_pins(plan, advance));
         if pins.is_empty() {
             return Ok(());
@@ -1100,8 +1138,17 @@ impl<L: NodeLock> NpmTool<L> {
                 .map_err(propagate_repeated_minimum_age_rejection)
         }
         .await;
-        let native_postimage = native_snapshot.capture_state()?;
-        let restore_result = restore_after_owned_step(&native_snapshot, &native_postimage);
+        let restore_result = match native_snapshot.capture_state() {
+            Ok(native_postimage) => restore_after_owned_step(&native_snapshot, &native_postimage),
+            // With no readable postimage the unchanged-check is impossible, but the temporary
+            // overrides just written must not leak into the user's config: fall back to the
+            // identity-validated unconditional restore and surface the original failure. Leaving
+            // our own write in place is strictly worse than restoring over it.
+            Err(error) => {
+                native_snapshot.restore()?;
+                Err(error)
+            }
+        };
         restore_result?;
         temporary_result?;
 
@@ -1302,9 +1349,20 @@ fn resolver_conflict_hold<L: NodeLock>(
         reason: SkipReason::ResolverConflict,
         offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
         detail: advanced.then(|| {
+            // The settlement may have re-resolved the copy to a different in-range version than
+            // the pre-apply one; the row names where the graph actually settled, since a stale
+            // `from` would contradict the collateral row that shows the real landing.
+            let settled = resolved_version_lines::<L>(after_content)
+                .remove(name)
+                .and_then(|versions| {
+                    let line = version::major_key(change.from.as_str()).0;
+                    versions
+                        .into_iter()
+                        .find(|version| version::major_key(version).0 == line)
+                })
+                .unwrap_or_else(|| change.from.as_str().to_string());
             format!(
-                "the transitive advance did not land: a dependent's declared range holds it at {}",
-                change.from
+                "the transitive advance did not land: a dependent's declared range holds it at {settled}"
             )
         }),
     }
@@ -1322,6 +1380,27 @@ fn resolved_version_lines<L: NodeLock>(content: &str) -> HashMap<String, BTreeSe
         lines.entry(name).or_default().insert(version);
     }
     lines
+}
+
+/// The plan's direct exact pins re-keyed for the override engine: each name gains its target's
+/// major-line qualifier (`semver` pinned to `7.7.3` becomes `semver@^7.0.0`). An unqualified
+/// `name: target` override captures *every* same-name request in the graph, so an undeclared copy
+/// on another major would be silently collapsed onto the direct target — and the newest-copy
+/// report projection would never show it. Qualified to the target's line, the override addresses
+/// only requests the plan actually steers (after widening, the declaring importer's range lives on
+/// that line) while a foreign line keeps its own resolution. A target with no parsable major keeps
+/// the unqualified key: better a broad pin than a repair that cannot steer its own candidate.
+fn qualified_direct_override_pins(exact_pins: Vec<(String, String)>) -> Vec<(String, String)> {
+    exact_pins
+        .into_iter()
+        .map(|(name, target)| {
+            let key = match major_line_qualifier(&target) {
+                Some(qualifier) => format!("{name}@{qualifier}"),
+                None => name,
+            };
+            (key, target)
+        })
+        .collect()
 }
 
 /// The caret range covering `version`'s own major line (`3.4.8` → `^3.0.0`, `0.11.14` → `^0.11.0`)
@@ -2241,6 +2320,43 @@ packages:
         }
     }
 
+    /// The advanced-hold detail names where the settlement actually left the copy — it may have
+    /// re-resolved to a different in-range version than the pre-apply one, and a stale `from`
+    /// would contradict the collateral row that shows the real landing.
+    #[test]
+    fn advanced_hold_detail_names_the_settled_version_not_the_stale_from() {
+        let mut advance = change("debug", "3.4.8", "3.5.0");
+        advance.direct = false;
+        let after = indoc::indoc! {"
+            importers:
+
+              .:
+                dependencies:
+                  consumer:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+
+            packages:
+
+              debug@3.4.9:
+                resolution: {integrity: sha512-a}
+        "};
+
+        let hold = resolver_conflict_hold::<Pnpm>(&advance, after, true);
+        let detail = hold.detail.expect("advanced holds carry a detail");
+        assert!(
+            detail.contains("holds it at 3.4.9"),
+            "the settled copy, not the stale pre-apply version, is named: {detail}"
+        );
+
+        let unresolvable = resolver_conflict_hold::<Pnpm>(&advance, "", true);
+        let detail = unresolvable.detail.expect("advanced holds carry a detail");
+        assert!(
+            detail.contains("holds it at 3.4.8"),
+            "with no settled copy to read, the pre-apply version is the honest fallback: {detail}"
+        );
+    }
+
     #[test]
     fn transitive_advance_pins_the_major_line_and_holds_every_ineligible_candidate() {
         let mut deep = change("dompurify", "3.4.8", "3.4.12");
@@ -2364,6 +2480,116 @@ packages:
             "the transitive's empty member set must not force the recursive fallback"
         );
         Ok(())
+    }
+
+    /// An importer copy that genuinely moved beneath a newer transitive duplicate shows no net
+    /// newest-copy change; the importer-resolved version sets keep its applied row visible, while
+    /// a converged re-run (nothing moved anywhere) still reports no movement.
+    #[test]
+    fn a_move_under_a_newer_duplicate_copy_is_still_a_move() {
+        let before_lock = indoc::indoc! {"
+            importers:
+
+              .:
+                dependencies:
+                  chalk:
+                    specifier: ^4.0.0
+                    version: 4.1.1
+
+            packages:
+
+              chalk@4.1.1:
+                resolution: {integrity: sha512-a}
+              chalk@5.6.0:
+                resolution: {integrity: sha512-b}
+        "};
+        let after_lock = before_lock.replace("4.1.1", "4.1.2");
+        let before = locked_versions::<Pnpm>(before_lock);
+        let after = locked_versions::<Pnpm>(&after_lock);
+        assert_eq!(
+            before.get("chalk").map(String::as_str),
+            Some("5.6.0"),
+            "the newest-copy projection is blind to the importer copy"
+        );
+
+        let before_members = Pnpm::member_sources(before_lock);
+        let after_members = Pnpm::member_sources(&after_lock);
+        assert!(
+            candidate_moved("chalk", &before, &after, &before_members, &after_members),
+            "the importer copy moved 4.1.1 -> 4.1.2 beneath the 5.6.0 duplicate"
+        );
+        assert!(
+            !candidate_moved("chalk", &before, &before, &before_members, &before_members),
+            "a converged re-run reports no movement"
+        );
+    }
+
+    /// npm's declaration attribution is name-only, so a landed root copy must be judged by the
+    /// member's physical install-tree instance: a newer duplicate nested under another dependent
+    /// otherwise masks the landing, and the per-package apply would roll it back as a resolver
+    /// conflict on every run.
+    #[test]
+    fn npm_landing_is_judged_by_the_members_install_instance_not_the_newest_copy()
+    -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("package-lock.json"),
+            indoc::indoc! {r#"{
+                "name": "root",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/chalk": { "version": "4.1.2" },
+                    "node_modules/x": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/chalk": { "version": "5.6.0" }
+                }
+            }"#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut landed = change("chalk", "4.1.1", "4.1.2");
+        landed.members = vec![cooldown_core::MemberRef {
+            name: "root".to_string(),
+            path: ".".to_string(),
+        }];
+
+        assert!(
+            exact_target_reached::<Npm>(&project, &landed)?,
+            "the root instance sits at the target; the nested 5.6.0 duplicate must not mask it"
+        );
+        let mut short = change("chalk", "4.1.1", "4.1.3");
+        short.members.clone_from(&landed.members);
+        assert!(
+            !exact_target_reached::<Npm>(&project, &short)?,
+            "an instance short of its target is still short"
+        );
+        Ok(())
+    }
+
+    /// The repair's override keys must scope each direct pin to its target's major line so a
+    /// same-name copy on another major is never captured; only an unparsable major falls back to
+    /// the graph-wide key.
+    #[test]
+    fn repair_override_pins_are_qualified_to_the_target_major_line() {
+        let pins = vec![
+            ("semver".to_string(), "7.7.3".to_string()),
+            ("tiny".to_string(), "0.11.14".to_string()),
+            ("weird".to_string(), "not-a-version".to_string()),
+        ];
+        assert_eq!(
+            qualified_direct_override_pins(pins),
+            vec![
+                ("semver@^7.0.0".to_string(), "7.7.3".to_string()),
+                ("tiny@^0.11.0".to_string(), "0.11.14".to_string()),
+                ("weird".to_string(), "not-a-version".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

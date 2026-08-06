@@ -296,6 +296,15 @@ fn widen_manifest(
         else {
             continue;
         };
+        // A protocol-form specifier (`catalog:`, `workspace:^`, `npm:pkg@^1`, `file:…`, `git+…`)
+        // is not a semver range: rewriting it to `^target` would sever the indirection it encodes
+        // (a pnpm catalog pin, a workspace link, an alias) instead of widening a constraint —
+        // permanently, since a widen is a committed edit. This holds in every mode: even
+        // `Always` may only reshape ranges, never replace a protocol reference. The resolve and
+        // its verification still report whether the target landed.
+        if range.contains(':') {
+            continue;
+        }
         if mode == RewriteMode::Auto && crate::version::version_in_range(range, target) {
             continue;
         }
@@ -632,6 +641,45 @@ mod tests {
         assert!(
             after.contains(r#""react": "^18.0.0""#),
             "a peer-only contract is untouched even with no install declaration: {after}"
+        );
+    }
+
+    /// A protocol-form specifier is a reference, not a range: rewriting `catalog:` to `^19.2.0`
+    /// would permanently sever the workspace-catalog indirection (and likewise a `workspace:` link
+    /// or `npm:` alias) — in every mode, since a widen is a committed edit.
+    #[test]
+    fn widen_never_rewrites_protocol_specifiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let before = indoc::indoc! {r#"{
+            "dependencies": {
+                "react": "catalog:",
+                "vue": "catalog:vue3",
+                "shared": "workspace:^",
+                "renamed": "npm:actual@^1.0.0",
+                "vendored": "file:../vendor/pkg",
+                "chalk": "^4.0.0"
+            }
+        }"#};
+        std::fs::write(root.join("package.json"), before).expect("manifest");
+
+        for mode in [RewriteMode::Auto, RewriteMode::Always] {
+            for name in ["react", "vue", "shared", "renamed", "vendored"] {
+                let rewrite = widen_constraints(&root, &[], name, "99.0.0", mode).expect("widen");
+                assert!(
+                    rewrite.modified.is_empty(),
+                    "{name} under {mode:?} must stay a protocol reference"
+                );
+            }
+        }
+        let after = std::fs::read_to_string(root.join("package.json")).expect("read");
+        assert_eq!(after, before, "protocol specifiers survive byte-exactly");
+
+        let rewrite =
+            widen_constraints(&root, &[], "chalk", "5.6.2", RewriteMode::Auto).expect("widen");
+        assert!(
+            !rewrite.modified.is_empty(),
+            "a plain semver range beside them still widens"
         );
     }
 
