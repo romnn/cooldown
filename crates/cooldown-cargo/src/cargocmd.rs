@@ -807,8 +807,9 @@ impl Cargo {
     }
 
     /// A wrapper driving an explicit binary, so hermetic tests can substitute a scripted fake for
-    /// the real `cargo` without touching the process environment.
-    #[cfg(test)]
+    /// the real `cargo` without touching the process environment. Unix-gated with its only
+    /// consumers (the script-driven widen tests), which need a shell to run the fake.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
         Cargo { bin: bin.into() }
     }
