@@ -520,6 +520,12 @@ fn violation_for(
     }
 }
 
+/// One batch per row — the chronological shape (each leg from its own batch merge) the collapse
+/// exists for; tests that need same-batch siblings pass their own ordinals.
+fn per_row_batches(idx: usize) -> usize {
+    idx
+}
+
 fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
     None
 }
@@ -694,6 +700,28 @@ fn package_labels_omit_default_registry_noise() {
     assert_eq!(package_label(&alternate), "package from registry.example");
 }
 
+/// Two coexisting copies moved simultaneously in ONE batch merely happen to touch versions
+/// (`4.17.19 → 4.17.20` beside `4.17.20 → 4.17.21`); chaining them would fabricate a single net
+/// row and hide that a `4.17.20` copy still exists. One report emits one row per copy, so
+/// chronology requires distinct batches.
+#[test]
+fn collapse_keeps_same_batch_sibling_moves_apart() {
+    let mut items = vec![
+        applied_item("lodash", "4.17.19", "4.17.20", false),
+        applied_item("lodash", "4.17.20", "4.17.21", false),
+    ];
+    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), |_| 0, no_kind);
+    assert_eq!(items.len(), 2, "sibling copies keep their own rows");
+    assert_eq!(
+        (items[0].from.as_str(), items[0].to.as_str()),
+        ("4.17.19", "4.17.20")
+    );
+    assert_eq!(
+        (items[1].from.as_str(), items[1].to.as_str()),
+        ("4.17.20", "4.17.21")
+    );
+}
+
 #[test]
 fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
     // The forward batch floats `quote` up (collateral); the reconcile pass matures it back down.
@@ -701,7 +729,14 @@ fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
         applied_item("quote", "1.0.44", "1.0.46", false),
         applied_item("quote", "1.0.46", "1.0.45", true),
     ];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
     assert_eq!(items.len(), 1, "the two legs collapse to one net row");
     assert_eq!(items[0].from, "1.0.44");
     assert_eq!(items[0].to, "1.0.45");
@@ -719,13 +754,20 @@ fn collapse_reclassifies_kind_against_the_net_target_when_available() {
         applied_item("quote", "1.0.0", "1.1.0", false),
         applied_item("quote", "1.1.0", "1.0.1", true),
     ];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), |from, to| {
-        if from == "1.0.0" && to == "1.0.1" {
-            Some(UpdateKind::Patch)
-        } else {
-            None
-        }
-    });
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        |from, to| {
+            if from == "1.0.0" && to == "1.0.1" {
+                Some(UpdateKind::Patch)
+            } else {
+                None
+            }
+        },
+    );
     assert_eq!(items.len(), 1);
     assert_eq!(
         (items[0].from.as_str(), items[0].to.as_str()),
@@ -741,7 +783,14 @@ fn collapse_drops_a_package_that_floats_up_then_fully_back() {
         applied_item("quote", "1.0.44", "1.0.46", false),
         applied_item("quote", "1.0.46", "1.0.44", true),
     ];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
     assert!(
         items.is_empty(),
         "no net move: the package is dropped from the report"
@@ -755,7 +804,14 @@ fn collapse_keeps_single_leg_rows_including_a_genuine_downgrade() {
     let mut a = applied_item("a", "1.0.0", "1.1.0", false);
     a.direct = true;
     let mut items = vec![a, applied_item("referencing", "0.46.6", "0.46.5", true)];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
     assert_eq!(items.len(), 2);
     let refr = items
         .iter()
@@ -772,7 +828,14 @@ fn collapse_does_not_merge_across_projects() {
     let mut second = applied_item("quote", "1.0.46", "1.0.45", true);
     second.project = "b".to_string();
     let mut items = vec![first, second];
-    collapse_applied_legs(&mut items, "a", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        "a",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
     // Only project `a` is in scope, and it has a single leg there, so nothing merges.
     assert_eq!(items.len(), 2);
 }
@@ -789,7 +852,7 @@ fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
         package: PackageId::new(ToolId("cargo"), "quote", Some("crates.io".to_string())),
         version: Version::new("1.0.5"),
     }]);
-    collapse_applied_legs(&mut items, ".", "cargo", &prior, no_kind);
+    collapse_applied_legs(&mut items, ".", "cargo", &prior, per_row_batches, no_kind);
     assert_eq!(items.len(), 1);
     assert_eq!(
         (items[0].from.as_str(), items[0].to.as_str()),
@@ -810,7 +873,14 @@ fn collapse_does_not_merge_two_coexisting_majors_of_one_crate() {
         applied_item("serde", "0.9.1", "0.9.3", false),
         applied_item("serde", "1.0.0", "1.0.5", false),
     ];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
     assert_eq!(items.len(), 2, "independent version lines stay distinct");
     let lines: HashSet<(String, String)> = items
         .iter()
@@ -827,7 +897,14 @@ fn collapse_leaves_reciprocal_edge_rows_independent() {
         edge_item("consumer-b", "2.0.0", "1.0.0"),
     ];
 
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
 
     assert_eq!(items.len(), 2, "edge relationships are not version legs");
     assert_eq!(
@@ -846,7 +923,14 @@ fn collapse_does_not_chain_an_edge_row_with_a_version_row() {
         edge_item("consumer", "2.0.0", "3.0.0"),
     ];
 
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
 
     assert_eq!(items.len(), 2);
     assert_eq!(

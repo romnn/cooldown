@@ -10,6 +10,11 @@ use std::collections::{HashMap, HashSet};
 /// and registry.
 /// A chain that returns to its starting version is removed because it has no net movement.
 ///
+/// Legs chain only across batches (`batch_of` yields each row's batch ordinal): one batch report
+/// emits one row per copy, so two same-batch rows sharing a name and registry are *coexisting*
+/// version lines whose simultaneous moves (`4.17.19 → 4.17.20` beside `4.17.20 → 4.17.21`) merely
+/// happen to touch — chaining them would fabricate one net row and hide a copy that still exists.
+///
 /// Direction is recomputed from the first leg and the violations that existed before the batch.
 /// Classification is recomputed through the adapter when it understands the collapsed endpoints.
 /// Only applied version rows for the selected project and tool are eligible.
@@ -18,6 +23,7 @@ pub(super) fn collapse_applied_legs(
     project: &str,
     tool: &str,
     prior_violations: &HashSet<BaselineViolation>,
+    batch_of: impl Fn(usize) -> usize,
     classify_update_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
 ) {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
@@ -42,10 +48,12 @@ pub(super) fn collapse_applied_legs(
                 continue;
             };
             let slot = chains.iter_mut().find(|chain| {
-                chain
-                    .last()
-                    .and_then(|&tail| items.get(tail))
-                    .is_some_and(|tail| tail.to == from)
+                chain.last().is_some_and(|&tail| {
+                    items
+                        .get(tail)
+                        .is_some_and(|tail_item| tail_item.to == from)
+                        && batch_of(idx) > batch_of(tail)
+                })
             });
             match slot {
                 Some(chain) => chain.push(idx),

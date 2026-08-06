@@ -205,6 +205,10 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
     manifest_only: HashSet<PackageId>,
+    /// `acc.items` length at each batch merge — the batch boundaries the leg collapse needs:
+    /// chronological legs of one copy can only span batches (one report emits one row per copy),
+    /// so two same-batch rows sharing a name are coexisting version lines that must not chain.
+    batch_item_offsets: Vec<usize>,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -225,6 +229,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             initial_edge_snapshot: None,
             committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
+            batch_item_offsets: Vec::new(),
         }
     }
 
@@ -763,11 +768,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let project = self.project_label.clone();
         let tool = self.ctx.tool_name();
         let classifier = self.ctx.reader;
+        let offsets = self.batch_item_offsets.clone();
         collapse_applied_legs(
             &mut self.acc.items,
             &project,
             tool,
             prior_violations,
+            move |idx| offsets.partition_point(|&start| start <= idx),
             |from, to| classifier.classify_update_kind(from, to),
         );
     }
@@ -783,6 +790,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.lock_edges_enforced |= outcome.is_committed();
         self.committed_edge_rebinds
             .extend(outcome.edge_rebinds.iter().cloned());
+        self.batch_item_offsets.push(self.acc.items.len());
         outcome.merge_into(self.acc);
         if restore_conflict {
             ControlFlow::Break(MutationTerminated)
