@@ -10,7 +10,7 @@ use crate::pypi::{PYPI, PyPi};
 use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
@@ -685,6 +685,41 @@ impl ToolWrite for UvTool {
     fn supports_transitive_advance(&self) -> bool {
         // `uv lock --upgrade-package name==version` re-pins any locked package, declared or not.
         true
+    }
+
+    fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
+        // `uv lock` regenerates metadata for every local source in the lock — editable installs
+        // and directory dependencies — via the PEP 517 backend, reading their `pyproject.toml`
+        // and sources. A source outside the project root must therefore be staged into a preview
+        // copy at its relative position, or the copy's resolve fails with "Distribution not found"
+        // at a path that only exists in the real tree. Best-effort: an unreadable lock or a
+        // stale entry pointing at a removed directory contributes nothing.
+        let Ok(lock) = read_lock(project) else {
+            return Vec::new();
+        };
+        let Ok(project_root) = std::fs::canonicalize(project.root.as_std_path()) else {
+            return Vec::new();
+        };
+        let mut roots = std::collections::BTreeSet::new();
+        for package in &lock.packages {
+            let Some(source) = &package.source else {
+                continue;
+            };
+            for rel in [&source.editable, &source.directory, &source.r#virtual] {
+                let Some(rel) = rel.as_deref().filter(|rel| !rel.is_empty() && *rel != ".") else {
+                    continue;
+                };
+                let Ok(abs) = std::fs::canonicalize(project.root.join(rel).as_std_path()) else {
+                    continue;
+                };
+                if !abs.starts_with(&project_root)
+                    && let Ok(utf8) = Utf8PathBuf::from_path_buf(abs)
+                {
+                    roots.insert(utf8);
+                }
+            }
+        }
+        roots.into_iter().collect()
     }
 
     fn resolve_inputs(&self) -> ResolveInputs {

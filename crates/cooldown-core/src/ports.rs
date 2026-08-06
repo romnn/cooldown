@@ -690,6 +690,16 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Absolute directories *outside* the project root that this tool's resolver must read during
+    /// a trial resolve — local path/editable dependency sources whose relative references would
+    /// otherwise escape a throwaway project copy and dangle (`editable+../sibling` resolving to a
+    /// path that does not exist under the copy's temp root). The generic preview copy stages these
+    /// at their relative positions. Best-effort: an unreadable manifest yields an empty set, and
+    /// adapters with tool-specific staging (cargo) handle their own topology and keep the default.
+    fn external_resolve_roots(&self, _project: &Project) -> Vec<camino::Utf8PathBuf> {
+        Vec::new()
+    }
+
     /// Captures the current contents of only the files `plan` may mutate.
     ///
     /// The returned [`ProjectMutationJournal`] is the rollback token the application layer restores

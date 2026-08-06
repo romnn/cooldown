@@ -205,6 +205,7 @@ impl Workspace {
                     Ok(_guard) => super::project_copy::ProjectCopy::create(
                         &pctx.project,
                         &writer.resolve_inputs(),
+                        &writer.external_resolve_roots(&pctx.project),
                     ),
                     Err(error) => Err(error),
                 };
@@ -289,10 +290,12 @@ impl Workspace {
             }
         };
         let prepared = match writer.mutation_execution() {
-            MutationExecution::InPlace => {
-                super::project_copy::ProjectCopy::create(&pctx.project, &writer.resolve_inputs())
-                    .map(PreparedPreview::Generic)
-            }
+            MutationExecution::InPlace => super::project_copy::ProjectCopy::create(
+                &pctx.project,
+                &writer.resolve_inputs(),
+                &writer.external_resolve_roots(&pctx.project),
+            )
+            .map(PreparedPreview::Generic),
             MutationExecution::Isolated(strategy) => strategy
                 .prepare(&pctx.project, guard.coordination())
                 .await

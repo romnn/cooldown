@@ -40,7 +40,17 @@ impl ProjectCopy {
     /// `inputs`.
     /// A blind recursive copy could duplicate gigabytes of unrelated monorepo data into a tempdir.
     /// The source tree is read but never written, and the heuristic copy is discarded on drop.
-    pub(crate) fn create(project: &Project, inputs: &ResolveInputs) -> cooldown_core::Result<Self> {
+    ///
+    /// `external_roots` are the out-of-tree local dependency sources the resolver must read
+    /// ([`cooldown_core::ToolWrite::external_resolve_roots`]): the copy then reproduces the shared
+    /// topology — the project and each root staged at their positions relative to the deepest
+    /// common ancestor — so a relative reference (`editable+../sibling`) resolves inside the copy
+    /// instead of dangling at a path only the real tree has.
+    pub(crate) fn create(
+        project: &Project,
+        inputs: &ResolveInputs,
+        external_roots: &[camino::Utf8PathBuf],
+    ) -> cooldown_core::Result<Self> {
         let manifest_rel = project.manifest.strip_prefix(&project.root).map_err(|_| {
             CoreError::System(format!(
                 "project manifest {} is outside project root {}",
@@ -55,15 +65,37 @@ impl ProjectCopy {
                 path.display()
             ))
         })?;
+
+        // External roots arrive canonical (the adapter resolves `../` references through the real
+        // tree), so ancestor computation must compare against the equally-canonical project root
+        // or a symlinked component would push the ancestor to `/`.
+        let canonical_root = std::fs::canonicalize(project.root.as_std_path())
+            .ok()
+            .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
+            .unwrap_or_else(|| project.root.clone());
+        let project_dest = match staging_ancestor(&canonical_root, external_roots) {
+            Some(ancestor) => {
+                let rebase = |root: &camino::Utf8Path| {
+                    root.strip_prefix(&ancestor)
+                        .map(|rel| scratch_root.join(rel))
+                };
+                for root in external_roots {
+                    let Ok(dest) = rebase(root) else { continue };
+                    copy_project_tree(root.as_std_path(), dest.as_std_path(), inputs)?;
+                }
+                rebase(&canonical_root).unwrap_or_else(|_| scratch_root.clone())
+            }
+            None => scratch_root,
+        };
         copy_project_tree(
             project.root.as_std_path(),
-            scratch_root.as_std_path(),
+            project_dest.as_std_path(),
             inputs,
         )?;
 
-        let copied_manifest = scratch_root.join(manifest_rel);
+        let copied_manifest = project_dest.join(manifest_rel);
         let copied = Project {
-            root: scratch_root,
+            root: project_dest,
             kind: project.kind,
             manifest: copied_manifest,
             exclude_newer: project.exclude_newer.clone(),
@@ -73,6 +105,37 @@ impl ProjectCopy {
             project: copied,
         })
     }
+}
+
+/// The deepest common ancestor of the project root and every external dependency root — the
+/// directory whose layout the copy must reproduce for relative references between them to
+/// resolve. `None` without external roots (the copy stays rooted at the project, the common
+/// case), or when no meaningful shared ancestor exists (a root on another mount would push the
+/// ancestor to `/`; the copy then degrades to the plain project-rooted shape, which at worst
+/// reproduces the dangling-reference failure this staging exists to avoid).
+fn staging_ancestor(
+    project_root: &camino::Utf8Path,
+    external_roots: &[camino::Utf8PathBuf],
+) -> Option<camino::Utf8PathBuf> {
+    if external_roots.is_empty() {
+        return None;
+    }
+    let mut ancestor = project_root.to_owned();
+    for root in external_roots {
+        while !root.starts_with(&ancestor) {
+            if !ancestor.pop() {
+                return None;
+            }
+        }
+    }
+    if ancestor.parent().is_none() {
+        tracing::debug!(
+            project = %project_root,
+            "external dependency roots share no ancestor below the filesystem root; preview copy stays project-rooted"
+        );
+        return None;
+    }
+    Some(ancestor)
 }
 
 /// Recursively copies the inputs selected by a generic preview adapter into `dest`.
@@ -242,7 +305,8 @@ mod tests {
             exclude_newer: None,
         };
 
-        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT).expect("copy project");
+        let copy =
+            ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[]).expect("copy project");
         let canonical_root = std::fs::canonicalize(copy.project.root.as_std_path())
             .expect("canonicalize copied root");
 
@@ -252,6 +316,56 @@ mod tests {
             copy.project.root.join("package.json")
         );
         assert!(copy.project.manifest.exists());
+    }
+
+    #[test]
+    fn copy_stages_external_dependency_roots_at_their_relative_positions() {
+        // A uv project whose editable dependencies live in sibling directories: the copy must
+        // reproduce the shared topology so `editable+../../packages/python/lib` resolves inside
+        // the temp tree instead of dangling at a path only the real tree has.
+        let repo = tempfile::tempdir().expect("repo");
+        let base = repo.path();
+        std::fs::create_dir_all(base.join("services/app")).expect("mkdir");
+        std::fs::create_dir_all(base.join("packages/python/lib")).expect("mkdir");
+        std::fs::write(base.join("services/app/pyproject.toml"), "[project]").expect("write");
+        std::fs::write(base.join("services/app/uv.lock"), "version = 1").expect("write");
+        std::fs::write(base.join("packages/python/lib/pyproject.toml"), "[project]")
+            .expect("write");
+        let canonical = |path: std::path::PathBuf| {
+            camino::Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(path).expect("canonicalize fixture path"),
+            )
+            .expect("UTF-8 fixture path")
+        };
+        let root = canonical(base.join("services/app"));
+        let external = canonical(base.join("packages/python/lib"));
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[external])
+            .expect("copy project");
+
+        assert!(
+            copy.project.root.ends_with("services/app"),
+            "the project sits at its ancestor-relative position: {}",
+            copy.project.root
+        );
+        assert!(copy.project.manifest.exists());
+        let staged_external = copy
+            .project
+            .root
+            .parent()
+            .and_then(camino::Utf8Path::parent)
+            .expect("copy has ancestor levels")
+            .join("packages/python/lib/pyproject.toml");
+        assert!(
+            staged_external.exists(),
+            "the external root's manifest is staged at its relative position: {staged_external}"
+        );
     }
 
     #[test]
@@ -269,7 +383,7 @@ mod tests {
             exclude_newer: None,
         };
 
-        let error = ProjectCopy::create(&project, &ResolveInputs::DEFAULT)
+        let error = ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[])
             .err()
             .expect("an outside-root manifest must be rejected");
 
