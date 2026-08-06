@@ -351,12 +351,32 @@ fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
     let cooldown_core::CoreError::Tool { stderr, .. } = error else {
         return None;
     };
-    // Prefer the tool's own `error:` sentence: the leading lines are progress noise ("Updating
-    // crates.io index") that says nothing about the rejection.
+    // Prefer the tool's own failure sentence — cargo/uv/pnpm prefix it `error`, uv's resolver
+    // conflicts prefix it `×` ("× No solution found when resolving dependencies") — over the
+    // progress noise around it ("Updating crates.io index", "Using CPython 3.12.13"), which says
+    // nothing about the rejection. The fallback still skips the known chatter prefixes so a
+    // stderr with no marked sentence yields its first substantive line, not the banner.
+    let noise = |line: &&str| {
+        [
+            "Using CPython",
+            "Creating virtual environment",
+            "Resolved ",
+            "Audited ",
+            "Updating ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    };
     let line = stderr
         .lines()
         .map(str::trim)
-        .find(|line| line.starts_with("error"))
+        .find(|line| line.starts_with("error") || line.starts_with('×'))
+        .or_else(|| {
+            stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !noise(line))
+        })
         .or_else(|| stderr.lines().map(str::trim).find(|line| !line.is_empty()))?;
     // Resolver errors quote registry URLs, which can embed credentials on private registries;
     // redact before the cap bounds the (possibly lengthened) line.
@@ -371,6 +391,42 @@ fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejection_detail_prefers_the_failure_sentence_over_progress_chatter() {
+        // uv prints environment banners before its verdict, and its no-solution sentence carries
+        // a `×` marker with no `error:` prefix — the row detail must surface the verdict, never
+        // "Using CPython 3.12.13".
+        let conflict = CoreError::Tool {
+            tool: "uv".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "Using CPython 3.12.13\n  × No solution found when resolving dependencies:\n"
+                .into(),
+        };
+        let detail = super::rejection_detail(&conflict).expect("tool stderr yields a detail");
+        assert!(
+            detail.contains("× No solution found"),
+            "the resolver verdict is the detail: {detail}"
+        );
+        assert!(!detail.contains("Using CPython"));
+
+        // With neither an `error:` nor a `×` sentence, the first substantive line wins over the
+        // banner; a banner-only stderr still yields the banner rather than nothing.
+        let odd = CoreError::Tool {
+            tool: "uv".into(),
+            termination: ToolTermination::ExitCode(2),
+            stderr: "Using CPython 3.12.13\nfailed to fetch metadata\n".into(),
+        };
+        let detail = super::rejection_detail(&odd).expect("substantive line yields a detail");
+        assert!(detail.contains("failed to fetch metadata"), "{detail}");
+        let banner_only = CoreError::Tool {
+            tool: "uv".into(),
+            termination: ToolTermination::ExitCode(2),
+            stderr: "Using CPython 3.12.13\n".into(),
+        };
+        let detail = super::rejection_detail(&banner_only).expect("banner-only still reports");
+        assert!(detail.contains("Using CPython 3.12.13"));
+    }
+
     use super::{
         ApplyFailure, Skipped, apply_resilient, apply_resilient_full, apply_resilient_with_observer,
     };
