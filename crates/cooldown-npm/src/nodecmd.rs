@@ -27,6 +27,15 @@ impl NodeCmd {
         }
     }
 
+    /// A wrapper driving an explicit binary, so hermetic tests can substitute a scripted fake for
+    /// the real package manager without touching the process environment (the `COOLDOWN_<BIN>`
+    /// override is process-global, which parallel tests cannot share). Unix-gated with its only
+    /// consumers, which need a shell to run the fake.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
+        NodeCmd { bin: bin.into() }
+    }
+
     async fn output(&self, dir: &Utf8Path, args: &[String]) -> Result<std::process::Output> {
         Command::new(resolve_program(&self.bin))
             .args(args)

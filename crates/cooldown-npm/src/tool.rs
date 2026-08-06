@@ -2572,6 +2572,141 @@ packages:
         Ok(())
     }
 
+    /// Writes the floated-lock fixture: a manifest declaring `dep: ^1.0.0`, a consistent seed
+    /// lock, the floated and repaired lock shapes, and a scripted fake pnpm whose `update` leg
+    /// floats the importer entry out of its declared range (the shape pnpm was observed to
+    /// produce under `--no-save`) while the override-engine legs repair it. Returns the script
+    /// path to inject via [`crate::nodecmd::NodeCmd::with_bin`].
+    #[cfg(unix)]
+    fn write_floated_lock_fixture(root: &Utf8Path) -> eyre::Result<Utf8PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "app", "dependencies": { "dep": "^1.0.0" } }"#,
+        )?;
+        let lock = |version: &str| {
+            indoc::formatdoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      dep:
+                        specifier: ^1.0.0
+                        version: {version}
+
+                packages:
+
+                  dep@{version}:
+                    resolution: {{integrity: sha512-a}}
+            "}
+        };
+        std::fs::write(root.join("pnpm-lock.yaml"), lock("1.0.0"))?;
+        std::fs::write(root.join("floated.yaml"), lock("2.0.0"))?;
+        std::fs::write(root.join("repaired.yaml"), lock("1.1.0"))?;
+        let script = root.join("fake-pnpm.sh");
+        std::fs::write(
+            &script,
+            indoc::indoc! {r#"
+                #!/bin/sh
+                case "$*" in
+                  *"config get"*)
+                    echo 'null'; exit 0 ;;
+                  *" update "*)
+                    echo update >> legs.log
+                    cp floated.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"--resolution-only"*)
+                    echo repair >> legs.log
+                    cp pnpm-workspace.yaml overrides-at-repair.yaml
+                    cp repaired.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"install"*)
+                    if [ -f pnpm-workspace.yaml ]; then echo settle-with-overrides >> legs.log; else echo settle >> legs.log; fi
+                    cp repaired.yaml pnpm-lock.yaml; exit 0 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        Ok(script)
+    }
+
+    /// The floated-lock retry end to end: pnpm's targeted `update` floats an importer entry out
+    /// of its declared range, the inconsistency check restores the journal, the same pins are
+    /// retried through the override engine (major-line-qualified, written to a temporary
+    /// `pnpm-workspace.yaml` that must not persist), and the repaired lock reports the candidate
+    /// applied instead of declaring the lock stale.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn floated_lock_is_repaired_through_the_override_engine() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let script = write_floated_lock_fixture(&root)?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut planned = change("dep", "1.0.0", "1.1.0");
+        planned.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+        let plan = Plan {
+            changes: vec![planned],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let report = tool
+            .apply_whole_graph(&project, &plan, &journal, &[])
+            .await?;
+
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|change| change.package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dep"],
+            "the retried pins land through the override engine"
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "nothing is held: {:?}",
+            report.skipped
+        );
+        let legs = std::fs::read_to_string(root.join("legs.log"))?;
+        assert_eq!(
+            legs.lines().collect::<Vec<_>>(),
+            vec!["update", "repair", "settle"],
+            "float, override repair, then an override-free settlement"
+        );
+        let overrides = std::fs::read_to_string(root.join("overrides-at-repair.yaml"))?;
+        assert!(
+            overrides.contains("dep@^1.0.0") && overrides.contains("1.1.0"),
+            "the repair rides the major-line-qualified pin: {overrides}"
+        );
+        assert!(
+            !root.join("pnpm-workspace.yaml").exists(),
+            "the temporary overrides file must not persist"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("pnpm-lock.yaml"))?.contains("dep@1.1.0"),
+            "the repaired lock is the committed result"
+        );
+        Ok(())
+    }
+
     /// The repair's override keys must scope each direct pin to its target's major line so a
     /// same-name copy on another major is never captured; only an unparsable major falls back to
     /// the graph-wide key.
