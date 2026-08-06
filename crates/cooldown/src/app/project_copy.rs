@@ -81,7 +81,17 @@ impl ProjectCopy {
                 };
                 for root in external_roots {
                     let Ok(dest) = rebase(root) else { continue };
-                    copy_project_tree(root.as_std_path(), dest.as_std_path(), inputs)?;
+                    // A single-file root (a local wheel/sdist archive) is reproduced verbatim:
+                    // the selective tree copy would filter it out as neither manifest nor source,
+                    // yet the archive itself is exactly what the resolver reads.
+                    if root.is_file() {
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::copy(root.as_std_path(), dest.as_std_path())?;
+                    } else {
+                        copy_project_tree(root.as_std_path(), dest.as_std_path(), inputs)?;
+                    }
                 }
                 rebase(&canonical_root).unwrap_or_else(|_| scratch_root.clone())
             }
@@ -110,9 +120,12 @@ impl ProjectCopy {
 /// The deepest common ancestor of the project root and every external dependency root — the
 /// directory whose layout the copy must reproduce for relative references between them to
 /// resolve. `None` without external roots (the copy stays rooted at the project, the common
-/// case), or when no meaningful shared ancestor exists (a root on another mount would push the
-/// ancestor to `/`; the copy then degrades to the plain project-rooted shape, which at worst
-/// reproduces the dangling-reference failure this staging exists to avoid).
+/// case), or when the paths share no prefix at all (a Windows-style second drive; the copy then
+/// degrades to the plain project-rooted shape, which at worst reproduces the dangling-reference
+/// failure this staging exists to avoid). The filesystem root is a legitimate ancestor: a
+/// container layout (`/app` project, `/deps` editable) has no deeper one, and only the declared
+/// roots are staged at their `/`-relative positions — never the whole filesystem — so the copy
+/// stays bounded.
 fn staging_ancestor(
     project_root: &camino::Utf8Path,
     external_roots: &[camino::Utf8PathBuf],
@@ -124,16 +137,13 @@ fn staging_ancestor(
     for root in external_roots {
         while !root.starts_with(&ancestor) {
             if !ancestor.pop() {
+                tracing::debug!(
+                    project = %project_root,
+                    "external dependency roots share no path prefix with the project; preview copy stays project-rooted"
+                );
                 return None;
             }
         }
-    }
-    if ancestor.parent().is_none() {
-        tracing::debug!(
-            project = %project_root,
-            "external dependency roots share no ancestor below the filesystem root; preview copy stays project-rooted"
-        );
-        return None;
     }
     Some(ancestor)
 }
@@ -289,7 +299,7 @@ fn rel_slash(rel: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectCopy, copy_project_tree};
+    use super::{ProjectCopy, copy_project_tree, staging_ancestor};
     use cooldown_core::{Project, ResolveInputs, ToolId};
 
     #[test]
@@ -365,6 +375,64 @@ mod tests {
         assert!(
             staged_external.exists(),
             "the external root's manifest is staged at its relative position: {staged_external}"
+        );
+    }
+
+    /// A `path` source references an archive file, not a directory: the copy reproduces the file
+    /// verbatim at its relative position — the selective tree copy would filter it out as neither
+    /// manifest nor source, yet the archive is exactly what the resolver reads.
+    #[test]
+    fn copy_stages_a_single_file_external_root_verbatim() {
+        let repo = tempfile::tempdir().expect("repo");
+        let base = repo.path();
+        std::fs::create_dir_all(base.join("services/app")).expect("mkdir");
+        std::fs::create_dir_all(base.join("vendor")).expect("mkdir");
+        std::fs::write(base.join("services/app/pyproject.toml"), "[project]").expect("write");
+        std::fs::write(base.join("vendor/pkg-1.0.tar.gz"), "archive-bytes").expect("write");
+        let canonical = |path: std::path::PathBuf| {
+            camino::Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(path).expect("canonicalize fixture path"),
+            )
+            .expect("UTF-8 fixture path")
+        };
+        let root = canonical(base.join("services/app"));
+        let archive = canonical(base.join("vendor/pkg-1.0.tar.gz"));
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[archive])
+            .expect("copy project");
+
+        let staged = copy
+            .project
+            .root
+            .parent()
+            .and_then(camino::Utf8Path::parent)
+            .expect("copy has ancestor levels")
+            .join("vendor/pkg-1.0.tar.gz");
+        assert_eq!(
+            std::fs::read_to_string(&staged).expect("staged archive"),
+            "archive-bytes",
+            "the archive's bytes are staged at its relative position"
+        );
+    }
+
+    /// A container layout's only shared ancestor may be the filesystem root itself — still a
+    /// legitimate staging base, since only the declared roots are copied, never the whole
+    /// filesystem.
+    #[test]
+    fn filesystem_root_is_a_legitimate_staging_ancestor() {
+        assert_eq!(
+            staging_ancestor(
+                camino::Utf8Path::new("/app"),
+                &[camino::Utf8PathBuf::from("/deps")]
+            )
+            .as_deref(),
+            Some(camino::Utf8Path::new("/")),
         );
     }
 

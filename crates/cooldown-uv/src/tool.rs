@@ -688,12 +688,14 @@ impl ToolWrite for UvTool {
     }
 
     fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
-        // `uv lock` regenerates metadata for every local source in the lock — editable installs
-        // and directory dependencies — via the PEP 517 backend, reading their `pyproject.toml`
-        // and sources. A source outside the project root must therefore be staged into a preview
-        // copy at its relative position, or the copy's resolve fails with "Distribution not found"
-        // at a path that only exists in the real tree. Best-effort: an unreadable lock or a
-        // stale entry pointing at a removed directory contributes nothing.
+        // `uv lock` regenerates metadata for every local source in the lock — editable installs,
+        // directory dependencies, and local archives (`path` sources, a wheel/sdist file) — via
+        // the PEP 517 backend or the archive itself. A source outside the project root must
+        // therefore be staged into a preview copy at its relative position, or the copy's resolve
+        // fails with "Distribution not found" at a path that only exists in the real tree. A
+        // `path` archive contributes its file path; the copy stages single-file roots directly.
+        // Best-effort: an unreadable lock or a stale entry pointing at a removed source
+        // contributes nothing.
         let Ok(lock) = read_lock(project) else {
             return Vec::new();
         };
@@ -705,7 +707,12 @@ impl ToolWrite for UvTool {
             let Some(source) = &package.source else {
                 continue;
             };
-            for rel in [&source.editable, &source.directory, &source.r#virtual] {
+            for rel in [
+                &source.editable,
+                &source.directory,
+                &source.r#virtual,
+                &source.path,
+            ] {
                 let Some(rel) = rel.as_deref().filter(|rel| !rel.is_empty() && *rel != ".") else {
                     continue;
                 };
@@ -1416,5 +1423,82 @@ mod tests {
         std::assert_matches!(report, SyncReport::Unchanged { .. });
         // A `Latest` window excludes nothing, so no uv.toml is created.
         assert!(!root.join("uv.toml").exists());
+    }
+
+    /// Only out-of-tree local sources become external roots: editable/directory dependencies and
+    /// `path` archives outside the project must be staged into a preview copy, while the project
+    /// root itself, in-tree sources, and stale entries pointing at removed paths contribute
+    /// nothing.
+    #[test]
+    fn external_resolve_roots_read_out_of_tree_local_sources_from_the_lock() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/sub")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("pkgs/lib")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("pkgs/data")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("vendor")).expect("mkdir");
+        std::fs::write(base_path.join("vendor/pkg-1.0.tar.gz"), "archive").expect("write");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "lib"
+            version = "0.1.0"
+            source = { editable = "../pkgs/lib" }
+
+            [[package]]
+            name = "data"
+            version = "0.1.0"
+            source = { directory = "../pkgs/data" }
+
+            [[package]]
+            name = "vendored"
+            version = "1.0.0"
+            source = { path = "../vendor/pkg-1.0.tar.gz" }
+
+            [[package]]
+            name = "inner"
+            version = "0.1.0"
+            source = { editable = "sub" }
+
+            [[package]]
+            name = "stale"
+            version = "0.1.0"
+            source = { editable = "../missing" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let canonical = |rel: &str| {
+            Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(base_path.join(rel)).expect("canonicalize fixture path"),
+            )
+            .expect("utf8 path")
+        };
+        assert_eq!(
+            roots,
+            vec![
+                canonical("pkgs/data"),
+                canonical("pkgs/lib"),
+                canonical("vendor/pkg-1.0.tar.gz"),
+            ],
+            "out-of-tree editable/directory/path sources, sorted; the project itself, in-tree \
+             sources, and stale entries contribute nothing"
+        );
     }
 }
