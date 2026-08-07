@@ -676,6 +676,42 @@ impl UvTool {
     }
 }
 
+/// Directory names the generic preview copy prunes from its selective tree walk.
+///
+/// Mirrors `SKIP_DIRS` in the application's `project_copy` module: the adapter needs the list to
+/// tell which in-tree directory sources the copy would drop, but it cannot import the binary
+/// crate that owns the walk. A unit test beside `SKIP_DIRS` pins the two lists equal so they
+/// cannot drift apart silently.
+pub const PREVIEW_PRUNED_DIRS: &[&str] = &[
+    ".venv",
+    "venv",
+    ".git",
+    ".jj",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "vendor",
+    "testdata",
+];
+
+/// Whether the selective preview copy would drop an in-tree directory at `rel`
+/// (project-relative): some path component is a pruned directory name, or the path sits under a
+/// top-level dot directory (which the walk descends only for explicit config path-prefixes no
+/// Python source ever occupies). Erring toward staging is safe — a root the walk would also
+/// reproduce is merely copied twice into the same position.
+fn preview_copy_prunes(rel: &Utf8Path) -> bool {
+    let under_dot_dir = rel
+        .components()
+        .next()
+        .is_some_and(|component| component.as_str().starts_with('.'));
+    under_dot_dir
+        || rel
+            .components()
+            .any(|component| PREVIEW_PRUNED_DIRS.contains(&component.as_str()))
+}
+
 #[async_trait]
 impl ToolWrite for UvTool {
     fn mutation_tool(&self) -> ToolId {
@@ -696,10 +732,12 @@ impl ToolWrite for UvTool {
         // `path` archive contributes its file path; the copy stages single-file roots directly.
         // An *in-tree* archive file is surfaced too: the selective preview copy keeps only
         // resolver inputs, and a `.whl`/`.tar.gz` basename matches none of them, so without
-        // explicit staging the copy loses the very file the resolver reads. In-tree directory
-        // sources stay out — the selective copy already reproduces their manifests and sources
-        // in place. Best-effort: an unreadable lock or a stale entry pointing at a removed source
-        // contributes nothing.
+        // explicit staging the copy loses the very file the resolver reads. An in-tree
+        // *directory* source is surfaced only when the selective copy would drop it — when its
+        // project-relative path passes through a pruned directory (`vendor/`, `testdata/`, a
+        // top-level dot-dir); anywhere else the copy already reproduces its manifests and
+        // sources in place. Best-effort: an unreadable lock or a stale entry pointing at a
+        // removed source contributes nothing.
         let Ok(lock) = read_lock(project) else {
             return Vec::new();
         };
@@ -723,11 +761,16 @@ impl ToolWrite for UvTool {
                 let Ok(abs) = std::fs::canonicalize(project.root.join(rel).as_std_path()) else {
                     continue;
                 };
-                let in_tree = abs.starts_with(&project_root);
-                if (!in_tree || abs.is_file())
-                    && let Ok(utf8) = Utf8PathBuf::from_path_buf(abs)
-                {
-                    roots.insert(utf8);
+                let Ok(abs) = Utf8PathBuf::from_path_buf(abs) else {
+                    continue;
+                };
+                let staged = match abs.strip_prefix(&project_root) {
+                    // An out-of-tree source is always staged: the copy has no other way to see it.
+                    Err(_) => true,
+                    Ok(in_tree) => abs.is_file() || preview_copy_prunes(in_tree),
+                };
+                if staged {
+                    roots.insert(abs);
                 }
             }
         }
@@ -1432,8 +1475,8 @@ mod tests {
 
     /// Out-of-tree local sources become external roots: editable/directory dependencies and
     /// `path` archives outside the project must be staged into a preview copy, while the project
-    /// root itself, in-tree directory sources (the selective tree copy reproduces those in
-    /// place), and stale entries pointing at removed paths contribute nothing.
+    /// root itself, in-tree directory sources the selective tree copy reproduces in place, and
+    /// stale entries pointing at removed paths contribute nothing.
     #[test]
     fn external_resolve_roots_read_out_of_tree_local_sources_from_the_lock() {
         let base = tempfile::tempdir().expect("tempdir");
@@ -1502,8 +1545,70 @@ mod tests {
                 canonical("pkgs/lib"),
                 canonical("vendor/pkg-1.0.tar.gz"),
             ],
-            "out-of-tree editable/directory/path sources, sorted; the project itself, in-tree \
-             directory sources, and stale entries contribute nothing"
+            "out-of-tree editable/directory/path sources, sorted; the project itself, unpruned \
+             in-tree directory sources, and stale entries contribute nothing"
+        );
+    }
+
+    /// An in-tree directory source under a pruned location is surfaced: the selective preview
+    /// copy never descends into `vendor/` (or a top-level dot-dir), so without staging the copy
+    /// loses the member's manifest and the resolve fails with "Distribution not found". A
+    /// directory source anywhere else stays out — the copy reproduces it in place.
+    #[test]
+    fn external_resolve_roots_include_in_tree_directory_sources_the_copy_prunes() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/vendor/mylib")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("project/.deps/hidden")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("project/sub")).expect("mkdir");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "mylib"
+            version = "0.1.0"
+            source = { directory = "vendor/mylib" }
+
+            [[package]]
+            name = "hidden"
+            version = "0.1.0"
+            source = { editable = ".deps/hidden" }
+
+            [[package]]
+            name = "inner"
+            version = "0.1.0"
+            source = { editable = "sub" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let canonical = |rel: &str| {
+            Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(base_path.join("project").join(rel))
+                    .expect("canonicalize fixture path"),
+            )
+            .expect("utf8 path")
+        };
+        assert_eq!(
+            roots,
+            vec![canonical(".deps/hidden"), canonical("vendor/mylib")],
+            "directory sources the copy prunes (vendor/, a top-level dot-dir) are staged; an \
+             unpruned in-tree directory contributes nothing"
         );
     }
 
