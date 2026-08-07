@@ -384,16 +384,11 @@ struct UpperBound {
     inclusive: bool,
 }
 
-struct DeclaredBoundEdge {
-    requirer: String,
-    dependency_name: String,
-    package_name: String,
-    requirement: String,
-    upper: UpperBound,
-}
-
-/// One manifest requirement awaiting a join to Cargo's active resolve edge.
-struct DeclaredRequirementEdge {
+/// One manifest requirement awaiting a join to Cargo's active resolve edge — the
+/// requirement-candidate rows themselves, and the join half of a [`DeclaredBoundEdge`]. Both the
+/// bound and requirement joins resolve their candidates through [`joined_targets`], so the two
+/// cannot drift apart on the rename/package-identity rules.
+struct DeclaredEdge {
     requirer: String,
     /// The manifest rename (`alias = { package = "…" }`), when the declaration uses one. The
     /// resolve graph names a renamed edge by the rename, so it stays the join key — which also
@@ -404,6 +399,13 @@ struct DeclaredRequirementEdge {
     rename: Option<String>,
     package_name: String,
     requirement: String,
+}
+
+/// One workspace-member requirement carrying an explicit upper bound, joined to resolve edges the
+/// same way as the requirement candidates.
+struct DeclaredBoundEdge {
+    declaration: DeclaredEdge,
+    upper: UpperBound,
 }
 
 struct ActiveEdge {
@@ -511,43 +513,127 @@ fn upper_bound_is_stricter(candidate: &UpperBound, current: &UpperBound) -> bool
         || (candidate.version == current.version && !candidate.inclusive && current.inclusive)
 }
 
+/// The manifest renames that can own an active resolve edge, indexed per requirer package id and
+/// depended-on package name, normalized like resolve-edge names (hyphens to underscores).
+///
+/// A plain declaration joins through the edge's resolved package identity (see
+/// [`DeclaredEdge::rename`]), which alone would also attach it to a *sibling rename's* node:
+/// `foo = ">=0.5, <2"` beside `foo05 = { package = "foo", version = "0.5" }` resolves two `foo`
+/// nodes, and the plain range admits both. The index names the edges the renamed declarations
+/// own so the plain join can skip them. Keyed per depended-on package because a rename that
+/// happens to collide with another package's lib target name owns none of that package's edges.
+struct RenameIndex {
+    by_requirer: HashMap<String, HashMap<String, HashSet<String>>>,
+}
+
+impl RenameIndex {
+    /// Indexes the renamed declarations among `declarations`. Built from the
+    /// requirement-candidate list because that list is exactly the declarations whose edges can
+    /// appear in the resolve graph — every non-dev declaration plus a member's dev declarations
+    /// (a non-member's dev edge is never resolved). The bound candidates would not do: they are
+    /// the subset with explicit upper bounds and would miss a rename declared without one (a bare
+    /// `foo05 = { package = "foo", version = "0.5" }`).
+    fn from_declarations<'a>(declarations: impl IntoIterator<Item = &'a DeclaredEdge>) -> Self {
+        let mut by_requirer: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+        for declaration in declarations {
+            if let Some(rename) = &declaration.rename {
+                by_requirer
+                    .entry(declaration.requirer.clone())
+                    .or_default()
+                    .entry(declaration.package_name.clone())
+                    .or_default()
+                    .insert(rename.replace('-', "_"));
+            }
+        }
+        RenameIndex { by_requirer }
+    }
+
+    /// Whether `requirer`'s edge named `edge_name` onto `package_name` belongs to one of its
+    /// renamed declarations — the edges a plain declaration's package-identity join must skip.
+    fn owns_edge(&self, requirer: &str, package_name: &str, edge_name: &str) -> bool {
+        self.by_requirer
+            .get(requirer)
+            .and_then(|packages| packages.get(package_name))
+            .is_some_and(|renames| renames.contains(&edge_name.replace('-', "_")))
+    }
+}
+
+/// The resolved package nodes `declaration`'s active edges join to — the one join rule shared by
+/// the declared-bound and declared-requirement candidates.
+///
+/// A renamed declaration joins by its rename (hyphen/underscore-normalized, as Cargo spells
+/// resolve-edge names), which the resolve edge reliably carries. A plain declaration's edge name
+/// is the dependency's lib target name — decoupled from the package name by a custom `[lib]
+/// name` — so the package-identity and requirement-admission checks are its whole join, minus the
+/// edges a sibling renamed declaration of the same package owns (see [`RenameIndex`]). Reduced
+/// metadata fixtures that omit edge names still join their plain declarations, which never match
+/// on the edge name.
+fn joined_targets<'graph>(
+    declaration: &DeclaredEdge,
+    active_edges: &NamedPackageEdges,
+    packages: &'graph HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
+) -> Vec<&'graph PkgInfo> {
+    let Some(edges) = active_edges.get(&declaration.requirer) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for edge in edges {
+        match &declaration.rename {
+            Some(rename) => {
+                if edge.dependency_name.replace('-', "_") != rename.replace('-', "_") {
+                    continue;
+                }
+            }
+            None => {
+                if renames.owns_edge(
+                    &declaration.requirer,
+                    &declaration.package_name,
+                    &edge.dependency_name,
+                ) {
+                    continue;
+                }
+            }
+        }
+        let Some(target) = packages.get(&edge.package_id) else {
+            continue;
+        };
+        if target.name != declaration.package_name
+            || !crate::version::version_in_range(&declaration.requirement, &target.version)
+        {
+            continue;
+        }
+        targets.push(target);
+    }
+    targets
+}
+
 fn resolved_declared_bounds(
     candidates: Vec<DeclaredBoundEdge>,
-    active_edges: &HashMap<String, Vec<ActiveEdge>>,
+    active_edges: &NamedPackageEdges,
     packages: &HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
 ) -> HashMap<(String, String), String> {
     let mut picks: HashMap<(String, String), (UpperBound, String)> = HashMap::new();
     for candidate in candidates {
-        let Some(edges) = active_edges.get(&candidate.requirer) else {
-            continue;
-        };
-        for edge in edges {
-            // Cargo normalizes hyphens to underscores in dependency names used by the resolve graph.
-            // An empty name supports reduced metadata fixtures that omit this disambiguation.
-            let names_match = edge.dependency_name.is_empty()
-                || edge.dependency_name.replace('-', "_")
-                    == candidate.dependency_name.replace('-', "_");
-            if !names_match {
-                continue;
-            }
-            let Some(info) = packages.get(&edge.package_id) else {
-                continue;
-            };
-            if info.name != candidate.package_name
-                || !crate::version::version_in_range(&candidate.requirement, &info.version)
-            {
-                continue;
-            }
-            let key = (info.name.clone(), info.version.clone());
+        for target in joined_targets(&candidate.declaration, active_edges, packages, renames) {
+            let key = (target.name.clone(), target.version.clone());
             picks
                 .entry(key)
                 .and_modify(|current| {
                     if upper_bound_is_stricter(&candidate.upper, &current.0) {
-                        current
-                            .clone_from(&(candidate.upper.clone(), candidate.requirement.clone()));
+                        current.clone_from(&(
+                            candidate.upper.clone(),
+                            candidate.declaration.requirement.clone(),
+                        ));
                     }
                 })
-                .or_insert_with(|| (candidate.upper.clone(), candidate.requirement.clone()));
+                .or_insert_with(|| {
+                    (
+                        candidate.upper.clone(),
+                        candidate.declaration.requirement.clone(),
+                    )
+                });
         }
     }
     picks
@@ -557,36 +643,17 @@ fn resolved_declared_bounds(
 }
 
 fn resolved_declared_requirements(
-    candidates: Vec<DeclaredRequirementEdge>,
+    candidates: Vec<DeclaredEdge>,
     active_edges: &NamedPackageEdges,
     packages: &HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
 ) -> HashMap<LockPackageId, Vec<DeclaredRequirement>> {
     let mut resolved: HashMap<LockPackageId, Vec<DeclaredRequirement>> = HashMap::new();
     for candidate in candidates {
         let Some(dependent) = packages.get(&candidate.requirer) else {
             continue;
         };
-        let Some(edges) = active_edges.get(&candidate.requirer) else {
-            continue;
-        };
-        for edge in edges {
-            // A renamed declaration joins by its rename (hyphen/underscore-normalized), which the
-            // resolve edge reliably carries. A plain declaration's edge name is the dependency's
-            // lib target name — decoupled from the package name by a custom `[lib] name` — so the
-            // package-identity and requirement-admission checks below are its whole join.
-            if let Some(rename) = &candidate.rename
-                && edge.dependency_name.replace('-', "_") != rename.replace('-', "_")
-            {
-                continue;
-            }
-            let Some(target) = packages.get(&edge.package_id) else {
-                continue;
-            };
-            if target.name != candidate.package_name
-                || !crate::version::version_in_range(&candidate.requirement, &target.version)
-            {
-                continue;
-            }
+        for target in joined_targets(&candidate, active_edges, packages, renames) {
             let requirement = DeclaredRequirement {
                 dependency: target.name.clone(),
                 resolved: LockPackageId::from_metadata(
@@ -1032,7 +1099,7 @@ impl Cargo {
         // cooldown may rewrite, not structural third-party graph floors.
         let mut floor_edges: Vec<FloorEdge> = Vec::new();
         let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
-        let mut declared_requirement_edges: Vec<DeclaredRequirementEdge> = Vec::new();
+        let mut declared_requirement_edges: Vec<DeclaredEdge> = Vec::new();
         let mut msrv = MsrvIndex::default();
         for p in raw.packages {
             msrv.record(&p, roots.contains(&p.id));
@@ -1072,10 +1139,12 @@ impl Cargo {
                     && let Some(upper) = explicit_upper_bound(&dep.req)
                 {
                     declared_bound_edges.push(DeclaredBoundEdge {
-                        requirer: p.id.clone(),
-                        dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
-                        package_name: dep.name.clone(),
-                        requirement: dep.req.clone(),
+                        declaration: DeclaredEdge {
+                            requirer: p.id.clone(),
+                            rename: dep.rename.clone(),
+                            package_name: dep.name.clone(),
+                            requirement: dep.req.clone(),
+                        },
                         upper,
                     });
                 }
@@ -1085,7 +1154,7 @@ impl Cargo {
                 // the real requirement admits. A member's dev requirement stays, mirroring the
                 // dev-pin and dev-bound reasoning above.
                 if !is_dev || roots.contains(&p.id) {
-                    declared_requirement_edges.push(DeclaredRequirementEdge {
+                    declared_requirement_edges.push(DeclaredEdge {
                         requirer: p.id.clone(),
                         rename: dep.rename.clone(),
                         package_name: dep.name.clone(),
@@ -1119,10 +1188,17 @@ impl Cargo {
         // an inactive (optional/target-gated) edge is absent from `resolve.nodes`, so it
         // contributes no floor — mirroring the ceiling's active-edge intersection above.
         let graph_floors = resolved_graph_floors(floor_edges, &edges, &packages);
+        // Indexed from the requirement candidates rather than the bound candidates: only the
+        // former list every edge-owning declaration (see [`RenameIndex::from_declarations`]).
+        let renames = RenameIndex::from_declarations(&declared_requirement_edges);
         let declared_bounds =
-            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages);
-        let declared_requirements =
-            resolved_declared_requirements(declared_requirement_edges, &active_edges, &packages);
+            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages, &renames);
+        let declared_requirements = resolved_declared_requirements(
+            declared_requirement_edges,
+            &active_edges,
+            &packages,
+            &renames,
+        );
         ResolvedGraph {
             packages,
             roots,
@@ -1499,6 +1575,58 @@ mod tests {
     }
 
     #[test]
+    fn edge_requirements_attach_a_plain_declaration_beside_a_rename_to_its_own_node() {
+        // `foo = ">=0.5, <2"` beside `foo05 = { package = "foo", version = "0.5" }` resolves two
+        // `foo` nodes, and the plain range admits both. The package-identity join alone would
+        // attach the plain requirement to the rename's 0.5 node too; the rename's edge belongs to
+        // the renamed declaration, so each requirement stays on its own node.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "consumer", "name": "consumer", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                         {"name": "foo", "req": ">=0.5, <2"},
+                         {"name": "foo", "rename": "foo05", "req": "^0.5"}
+                     ]},
+                    {"id": "foo-v1", "name": "foo", "version": "1.9.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "foo-v05", "name": "foo", "version": "0.5.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "consumer", "deps": [
+                        {"name": "foo", "pkg": "foo-v1"},
+                        {"name": "foo05", "pkg": "foo-v05"}
+                    ]},
+                    {"id": "foo-v1", "deps": []},
+                    {"id": "foo-v05", "deps": []}
+                ]}
+            }
+        "#});
+        let consumer = LockPackageId::new("consumer", "1.0.0", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&consumer];
+
+        assert_eq!(requirements.len(), 2);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.requirement == ">=0.5, <2" && requirement.resolved.version == "1.9.0"
+            }),
+            "the plain requirement joins only its own node"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.requirement == "^0.5" && requirement.resolved.version == "0.5.3"
+            }),
+            "the rename's requirement joins only the rename's node"
+        );
+    }
+
+    #[test]
     fn edge_requirements_exclude_a_non_member_dev_dependency() {
         // diesel (a non-member) declares normal `uuid >=0.7, <2.0` beside dev `uuid ^0.8`. The
         // dev dep of a transitive crate is not in the resolved build graph, yet its requirement
@@ -1601,22 +1729,27 @@ mod tests {
                 }],
             ),
         ]);
-        let candidates = [
+        let candidates: Vec<DeclaredBoundEdge> = [
             ("root-a", "serde", ">=1, <3"),
             ("root-b", "serde", ">=1, <2"),
             ("inactive-root", "serde", "<1.5"),
         ]
         .into_iter()
         .map(|(root, name, requirement)| DeclaredBoundEdge {
-            requirer: root.to_string(),
-            dependency_name: name.to_string(),
-            package_name: name.to_string(),
-            requirement: requirement.to_string(),
+            declaration: DeclaredEdge {
+                requirer: root.to_string(),
+                rename: None,
+                package_name: name.to_string(),
+                requirement: requirement.to_string(),
+            },
             upper: explicit_upper_bound(requirement).expect("upper bound"),
         })
         .collect();
+        let renames = RenameIndex::from_declarations(
+            candidates.iter().map(|candidate| &candidate.declaration),
+        );
 
-        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages, &renames);
 
         assert_eq!(
             bounds
@@ -1661,18 +1794,23 @@ mod tests {
                 },
             ],
         )]);
-        let candidates = [("foo-v1", ">=1, <2"), ("foo-v2", ">=2, <3")]
+        let candidates: Vec<DeclaredBoundEdge> = [("foo-v1", ">=1, <2"), ("foo-v2", ">=2, <3")]
             .into_iter()
-            .map(|(dependency_name, requirement)| DeclaredBoundEdge {
-                requirer: "root".to_string(),
-                dependency_name: dependency_name.to_string(),
-                package_name: "foo".to_string(),
-                requirement: requirement.to_string(),
+            .map(|(rename, requirement)| DeclaredBoundEdge {
+                declaration: DeclaredEdge {
+                    requirer: "root".to_string(),
+                    rename: Some(rename.to_string()),
+                    package_name: "foo".to_string(),
+                    requirement: requirement.to_string(),
+                },
                 upper: explicit_upper_bound(requirement).expect("upper bound"),
             })
             .collect();
+        let renames = RenameIndex::from_declarations(
+            candidates.iter().map(|candidate| &candidate.declaration),
+        );
 
-        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages, &renames);
 
         assert_eq!(
             bounds
@@ -1685,6 +1823,78 @@ mod tests {
                 .get(&("foo".to_string(), "2.4.0".to_string()))
                 .map(String::as_str),
             Some(">=2, <3")
+        );
+    }
+
+    #[test]
+    fn declared_bounds_join_a_custom_lib_target_name_through_package_identity() {
+        // The bounds-level mirror of the requirements test above: a member's deliberate `<1.5`
+        // cap on a crate shipping `[lib] name = "weird_lib"` never matched the resolve edge's
+        // lib-target name, so `declared_bound` yielded `None`, `honor_declared_bounds` could not
+        // veto targets past the cap, and the tentative-widen loop would rewrite the member's own
+        // deliberate upper bound.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [{"name": "odd-crate", "req": ">=1, <1.5"}]},
+                    {"id": "odd", "name": "odd-crate", "version": "1.2.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"name": "weird_lib", "pkg": "odd"}]},
+                    {"id": "odd", "deps": []}
+                ]}
+            }
+        "#});
+        assert_eq!(
+            graph.declared_bound("odd-crate", "1.2.0"),
+            Some(">=1, <1.5"),
+            "a custom lib target name must not break the bound join"
+        );
+    }
+
+    #[test]
+    fn declared_bounds_exclude_edges_owned_by_a_sibling_renamed_declaration() {
+        // The bounds-level plain-beside-rename case, with the rename declared as a bare caret:
+        // `^0.5` writes no explicit upper bound, so its node must end up with *no* declared
+        // bound — the plain `<2` must not leak across the package-identity join onto the
+        // rename's node.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [
+                         {"name": "foo", "req": ">=0.5, <2"},
+                         {"name": "foo", "rename": "foo05", "req": "^0.5"}
+                     ]},
+                    {"id": "foo-v1", "name": "foo", "version": "1.9.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "foo-v05", "name": "foo", "version": "0.5.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [
+                        {"name": "foo", "pkg": "foo-v1"},
+                        {"name": "foo05", "pkg": "foo-v05"}
+                    ]},
+                    {"id": "foo-v1", "deps": []},
+                    {"id": "foo-v05", "deps": []}
+                ]}
+            }
+        "#});
+        assert_eq!(graph.declared_bound("foo", "1.9.0"), Some(">=0.5, <2"));
+        assert_eq!(
+            graph.declared_bound("foo", "0.5.3"),
+            None,
+            "the plain bound must not attach to the rename's node"
         );
     }
 
