@@ -694,7 +694,11 @@ impl ToolWrite for UvTool {
         // therefore be staged into a preview copy at its relative position, or the copy's resolve
         // fails with "Distribution not found" at a path that only exists in the real tree. A
         // `path` archive contributes its file path; the copy stages single-file roots directly.
-        // Best-effort: an unreadable lock or a stale entry pointing at a removed source
+        // An *in-tree* archive file is surfaced too: the selective preview copy keeps only
+        // resolver inputs, and a `.whl`/`.tar.gz` basename matches none of them, so without
+        // explicit staging the copy loses the very file the resolver reads. In-tree directory
+        // sources stay out — the selective copy already reproduces their manifests and sources
+        // in place. Best-effort: an unreadable lock or a stale entry pointing at a removed source
         // contributes nothing.
         let Ok(lock) = read_lock(project) else {
             return Vec::new();
@@ -719,7 +723,8 @@ impl ToolWrite for UvTool {
                 let Ok(abs) = std::fs::canonicalize(project.root.join(rel).as_std_path()) else {
                     continue;
                 };
-                if !abs.starts_with(&project_root)
+                let in_tree = abs.starts_with(&project_root);
+                if (!in_tree || abs.is_file())
                     && let Ok(utf8) = Utf8PathBuf::from_path_buf(abs)
                 {
                     roots.insert(utf8);
@@ -1425,10 +1430,10 @@ mod tests {
         assert!(!root.join("uv.toml").exists());
     }
 
-    /// Only out-of-tree local sources become external roots: editable/directory dependencies and
+    /// Out-of-tree local sources become external roots: editable/directory dependencies and
     /// `path` archives outside the project must be staged into a preview copy, while the project
-    /// root itself, in-tree sources, and stale entries pointing at removed paths contribute
-    /// nothing.
+    /// root itself, in-tree directory sources (the selective tree copy reproduces those in
+    /// place), and stale entries pointing at removed paths contribute nothing.
     #[test]
     fn external_resolve_roots_read_out_of_tree_local_sources_from_the_lock() {
         let base = tempfile::tempdir().expect("tempdir");
@@ -1498,7 +1503,101 @@ mod tests {
                 canonical("vendor/pkg-1.0.tar.gz"),
             ],
             "out-of-tree editable/directory/path sources, sorted; the project itself, in-tree \
-             sources, and stale entries contribute nothing"
+             directory sources, and stale entries contribute nothing"
+        );
+    }
+
+    /// An in-tree `path` archive is surfaced even though it lives under the project root: the
+    /// selective preview copy keeps only resolver inputs, and a `.tar.gz`/`.whl` basename matches
+    /// none of them, so the file must be staged explicitly for the copy's resolve to read it.
+    #[test]
+    fn external_resolve_roots_include_in_tree_archive_files() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/wheels")).expect("mkdir");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        std::fs::write(root.join("wheels/pkg-2.0.tar.gz"), "archive").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "vendored"
+            version = "2.0.0"
+            source = { path = "wheels/pkg-2.0.tar.gz" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let archive = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(root.join("wheels/pkg-2.0.tar.gz").as_std_path())
+                .expect("canonicalize fixture path"),
+        )
+        .expect("utf8 path");
+        assert_eq!(
+            roots,
+            vec![archive],
+            "the in-tree archive file is staged; the project root itself is not"
+        );
+    }
+
+    /// An in-tree symlink to an out-of-tree directory canonicalizes to its target: the target is
+    /// what must be staged, and the copy layer recreates the in-tree link on top of it so the
+    /// lock's relative reference still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn external_resolve_roots_canonicalize_an_in_tree_symlink_source() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/libs")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("shared/lib")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            base_path.join("shared/lib"),
+            base_path.join("project/libs/shared"),
+        )
+        .expect("symlink");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "shared"
+            version = "0.1.0"
+            source = { editable = "libs/shared" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let target = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(base_path.join("shared/lib")).expect("canonicalize fixture path"),
+        )
+        .expect("utf8 path");
+        assert_eq!(
+            roots,
+            vec![target],
+            "the canonical out-of-tree target is the staged root"
         );
     }
 }

@@ -41,11 +41,15 @@ impl ProjectCopy {
     /// A blind recursive copy could duplicate gigabytes of unrelated monorepo data into a tempdir.
     /// The source tree is read but never written, and the heuristic copy is discarded on drop.
     ///
-    /// `external_roots` are the out-of-tree local dependency sources the resolver must read
-    /// ([`cooldown_core::ToolWrite::external_resolve_roots`]): the copy then reproduces the shared
-    /// topology — the project and each root staged at their positions relative to the deepest
-    /// common ancestor — so a relative reference (`editable+../sibling`) resolves inside the copy
-    /// instead of dangling at a path only the real tree has.
+    /// `external_roots` are the local dependency sources the resolver must read beyond what the
+    /// selective copy keeps ([`cooldown_core::ToolWrite::external_resolve_roots`]): the copy then
+    /// reproduces the shared topology — the project and each root staged at their positions
+    /// relative to the deepest common ancestor — so a relative reference (`editable+../sibling`)
+    /// resolves inside the copy instead of dangling at a path only the real tree has. A root may
+    /// also live *inside* the project (an in-tree archive file whose extension matches no
+    /// resolver input); it is staged at its project-relative position the same way. In-tree
+    /// symlinks whose canonical targets land under the staged topology are recreated pointing at
+    /// the staged location, so a lock reference through the link resolves too.
     pub(crate) fn create(
         project: &Project,
         inputs: &ResolveInputs,
@@ -73,14 +77,17 @@ impl ProjectCopy {
             .ok()
             .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
             .unwrap_or_else(|| project.root.clone());
-        let project_dest = match staging_ancestor(&canonical_root, external_roots) {
-            Some(ancestor) => {
-                let rebase = |root: &camino::Utf8Path| {
-                    root.strip_prefix(&ancestor)
-                        .map(|rel| scratch_root.join(rel))
-                };
+        let rebase =
+            staging_ancestor(&canonical_root, external_roots).map(|ancestor| StagedRebase {
+                ancestor,
+                scratch_root: scratch_root.clone(),
+            });
+        let project_dest = match &rebase {
+            Some(rebase) => {
                 for root in external_roots {
-                    let Ok(dest) = rebase(root) else { continue };
+                    let Some(dest) = rebase.rebase(root) else {
+                        continue;
+                    };
                     // A single-file root (a local wheel/sdist archive) is reproduced verbatim:
                     // the selective tree copy would filter it out as neither manifest nor source,
                     // yet the archive itself is exactly what the resolver reads.
@@ -90,10 +97,17 @@ impl ProjectCopy {
                         }
                         std::fs::copy(root.as_std_path(), dest.as_std_path())?;
                     } else {
-                        copy_project_tree(root.as_std_path(), dest.as_std_path(), inputs)?;
+                        copy_project_tree(
+                            root.as_std_path(),
+                            dest.as_std_path(),
+                            inputs,
+                            Some(rebase),
+                        )?;
                     }
                 }
-                rebase(&canonical_root).unwrap_or_else(|_| scratch_root.clone())
+                rebase
+                    .rebase(&canonical_root)
+                    .unwrap_or_else(|| rebase.scratch_root.clone())
             }
             None => scratch_root,
         };
@@ -101,6 +115,7 @@ impl ProjectCopy {
             project.root.as_std_path(),
             project_dest.as_std_path(),
             inputs,
+            rebase.as_ref(),
         )?;
 
         let copied_manifest = project_dest.join(manifest_rel);
@@ -113,6 +128,27 @@ impl ProjectCopy {
         Ok(ProjectCopy {
             scratch,
             project: copied,
+        })
+    }
+}
+
+/// Maps a canonical real-tree path under the staging ancestor to its position inside the scratch
+/// copy. Shared by root staging and the tree walk so both stage — and link to — the same layout.
+struct StagedRebase {
+    ancestor: camino::Utf8PathBuf,
+    scratch_root: camino::Utf8PathBuf,
+}
+
+impl StagedRebase {
+    /// `None` when `path` is outside the ancestor: nothing of it is staged in the copy.
+    fn rebase(&self, path: &camino::Utf8Path) -> Option<camino::Utf8PathBuf> {
+        let rel = path.strip_prefix(&self.ancestor).ok()?;
+        // `join("")` would append a trailing separator; the ancestor itself (a copy whose only
+        // roots are in-tree) maps to the scratch root as-is.
+        Some(if rel.as_str().is_empty() {
+            self.scratch_root.clone()
+        } else {
+            self.scratch_root.join(rel)
         })
     }
 }
@@ -154,13 +190,16 @@ fn staging_ancestor(
 /// Virtual environments, VCS metadata, dependency stores, build output, and vendored/testdata trees
 /// are pruned.
 /// Dot-prefixed directories are traversed only for explicit [`ResolveInputs::path_prefixes`].
+/// With a `rebase` context, a symlink whose canonical target falls under the staging ancestor is
+/// recreated pointing at the staged position of that target; other symlinks are skipped.
 /// An unreadable entry is skipped because this copy supports best-effort previews, not publication.
 fn copy_project_tree(
     src: &std::path::Path,
     dest: &std::path::Path,
     inputs: &ResolveInputs,
+    rebase: Option<&StagedRebase>,
 ) -> std::io::Result<()> {
-    copy_project_tree_inner(src, dest, std::path::Path::new(""), inputs)
+    copy_project_tree_inner(src, dest, std::path::Path::new(""), inputs, rebase)
 }
 
 fn copy_project_tree_inner(
@@ -168,6 +207,7 @@ fn copy_project_tree_inner(
     dest: &std::path::Path,
     rel: &std::path::Path,
     inputs: &ResolveInputs,
+    rebase: Option<&StagedRebase>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     let entries = match std::fs::read_dir(src) {
@@ -196,7 +236,7 @@ fn copy_project_tree_inner(
             if should_prune_dir(&name, &child_rel, inputs) {
                 continue;
             }
-            copy_project_tree_inner(&from, &to, &child_rel, inputs)?;
+            copy_project_tree_inner(&from, &to, &child_rel, inputs, rebase)?;
         } else if file_type.is_file() {
             // Copy ONLY resolver inputs — never the full source/data tree.
             if !is_resolver_input(&child_rel, &name, inputs) {
@@ -214,10 +254,44 @@ fn copy_project_tree_inner(
                     ));
                 }
             }
+        } else if file_type.is_symlink() {
+            // The staged topology can be reached through an in-tree symlink (`libs/shared`
+            // linking to an out-of-tree editable). The lock records the in-tree relative path, so
+            // the copy must reproduce the link itself — the staged canonical bytes alone leave
+            // that reference dangling. The link is recreated (rather than its target
+            // materialized) so a resolver that canonicalizes still sees one identity for a target
+            // that is also referenced directly. A link whose target falls outside the staged
+            // topology — or any link when nothing is staged — stays skipped as before.
+            if let Some(rebase) = rebase
+                && let Ok(target) = std::fs::canonicalize(&from)
+                && let Ok(target) = camino::Utf8PathBuf::from_path_buf(target)
+                && let Some(staged) = rebase.rebase(&target)
+                && let Err(err) = create_symlink(staged.as_std_path(), &to)
+            {
+                // Best-effort, like unreadable entries: a preview that cannot create the link
+                // (e.g. missing symlink privilege on Windows) degrades to the dangling-reference
+                // failure it would have hit anyway.
+                tracing::debug!(path = %to.display(), error = %err, "skipping symlink while staging project copy");
+            }
         }
-        // Symlinks and other special entries are irrelevant to resolution and are skipped.
+        // Other special entries (sockets, FIFOs) are irrelevant to resolution and are skipped.
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Windows distinguishes file and directory links; pick by the staged target's kind.
+#[cfg(windows)]
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 fn should_prune_dir(name: &std::ffi::OsStr, rel: &std::path::Path, inputs: &ResolveInputs) -> bool {
@@ -421,6 +495,112 @@ mod tests {
         );
     }
 
+    /// An *in-tree* `path` archive (`vendor/pkg-1.0.tar.gz` under the project root) is staged at
+    /// its project-relative position: the selective tree copy drops it — its extension matches no
+    /// resolver input, and `vendor/` is a pruned directory besides — yet the archive is exactly
+    /// what the copy's resolve reads.
+    #[test]
+    fn copy_stages_an_in_tree_archive_root_at_its_project_relative_position() {
+        let repo = tempfile::tempdir().expect("repo");
+        let base = repo.path();
+        std::fs::create_dir_all(base.join("app/vendor")).expect("mkdir");
+        std::fs::write(base.join("app/pyproject.toml"), "[project]").expect("write");
+        std::fs::write(base.join("app/vendor/pkg-1.0.tar.gz"), "archive-bytes").expect("write");
+        let canonical = |path: std::path::PathBuf| {
+            camino::Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(path).expect("canonicalize fixture path"),
+            )
+            .expect("UTF-8 fixture path")
+        };
+        let root = canonical(base.join("app"));
+        let archive = canonical(base.join("app/vendor/pkg-1.0.tar.gz"));
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[archive])
+            .expect("copy project");
+
+        // An all-in-tree root set makes the project root itself the staging ancestor; the copy
+        // must still sit cleanly at the scratch root (no trailing-separator artifact).
+        let canonical_copy_root = std::fs::canonicalize(copy.project.root.as_std_path())
+            .expect("canonicalize copied root");
+        assert_eq!(copy.project.root.as_std_path(), canonical_copy_root);
+        assert!(copy.project.manifest.exists());
+        assert_eq!(
+            std::fs::read_to_string(copy.project.root.join("vendor/pkg-1.0.tar.gz"))
+                .expect("staged archive"),
+            "archive-bytes",
+            "the in-tree archive's bytes are staged at its project-relative position"
+        );
+    }
+
+    /// An in-tree symlink whose target lives outside the project (`libs/shared` linking to a
+    /// sibling checkout) resolves inside the copy: the canonical target is staged at its
+    /// ancestor-relative position and the link itself is recreated pointing at that staged
+    /// location, so the lock's in-tree relative reference does not dangle.
+    #[cfg(unix)]
+    #[test]
+    fn copy_recreates_an_in_tree_symlink_to_a_staged_external_root() {
+        let repo = tempfile::tempdir().expect("repo");
+        let base = repo.path();
+        std::fs::create_dir_all(base.join("services/app/libs")).expect("mkdir");
+        std::fs::create_dir_all(base.join("shared/lib")).expect("mkdir");
+        std::fs::write(base.join("services/app/pyproject.toml"), "[project]").expect("write");
+        std::fs::write(base.join("shared/lib/pyproject.toml"), "[project]").expect("write");
+        std::os::unix::fs::symlink(
+            base.join("shared/lib"),
+            base.join("services/app/libs/shared"),
+        )
+        .expect("symlink");
+        let canonical = |path: std::path::PathBuf| {
+            camino::Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(path).expect("canonicalize fixture path"),
+            )
+            .expect("UTF-8 fixture path")
+        };
+        let root = canonical(base.join("services/app"));
+        let external = canonical(base.join("shared/lib"));
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let copy = ProjectCopy::create(&project, &ResolveInputs::DEFAULT, &[external])
+            .expect("copy project");
+
+        let link = copy.project.root.join("libs/shared");
+        assert!(
+            std::fs::symlink_metadata(link.as_std_path())
+                .expect("link staged")
+                .file_type()
+                .is_symlink(),
+            "the in-tree link itself is reproduced, not materialized"
+        );
+        assert!(
+            link.join("pyproject.toml").exists(),
+            "the in-tree relative reference resolves through the link to the staged target"
+        );
+        // The link resolves to the staged canonical position, so a resolver that canonicalizes
+        // sees one identity for a target other members may also reference directly.
+        let staged_target = copy
+            .project
+            .root
+            .parent()
+            .and_then(camino::Utf8Path::parent)
+            .expect("copy has ancestor levels")
+            .join("shared/lib");
+        assert_eq!(
+            std::fs::canonicalize(link.as_std_path()).expect("resolve staged link"),
+            staged_target.as_std_path(),
+        );
+    }
+
     /// A container layout's only shared ancestor may be the filesystem root itself — still a
     /// legitimate staging base, since only the declared roots are copied, never the whole
     /// filesystem.
@@ -487,7 +667,7 @@ mod tests {
         std::fs::create_dir_all(s.join("_data/vol")).expect("mkdir");
         std::fs::write(s.join("_data/vol/blob"), vec![0u8; 4096]).expect("write");
 
-        copy_project_tree(s, dest.path(), &ResolveInputs::DEFAULT).expect("copy");
+        copy_project_tree(s, dest.path(), &ResolveInputs::DEFAULT, None).expect("copy");
         let d = dest.path();
 
         // The skeleton: structure + resolver inputs are present.
@@ -535,7 +715,7 @@ mod tests {
         )
         .expect("write");
 
-        copy_project_tree(s, dest.path(), &ResolveInputs::DEFAULT).expect("copy");
+        copy_project_tree(s, dest.path(), &ResolveInputs::DEFAULT, None).expect("copy");
         let d = dest.path();
 
         assert!(d.join(".cargo/config.toml").exists());
@@ -564,7 +744,7 @@ mod tests {
             ..ResolveInputs::DEFAULT
         };
         let dest = tempfile::tempdir().expect("dest");
-        copy_project_tree(s, dest.path(), &go_inputs).expect("copy");
+        copy_project_tree(s, dest.path(), &go_inputs, None).expect("copy");
         assert!(dest.path().join("go.mod").exists());
         assert!(
             dest.path().join("src/lib.go").exists(),
@@ -577,7 +757,7 @@ mod tests {
 
         // The default (no source extensions) skips it.
         let dest_default = tempfile::tempdir().expect("dest");
-        copy_project_tree(s, dest_default.path(), &ResolveInputs::DEFAULT).expect("copy");
+        copy_project_tree(s, dest_default.path(), &ResolveInputs::DEFAULT, None).expect("copy");
         assert!(
             !dest_default.path().join("src/lib.go").exists(),
             "the declaration-only default never copies source"

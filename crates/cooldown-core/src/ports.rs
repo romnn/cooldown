@@ -690,14 +690,16 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
-    /// Absolute paths *outside* the project root that this tool's resolver must read during
-    /// a trial resolve — local path/editable dependency sources whose relative references would
-    /// otherwise escape a throwaway project copy and dangle (`editable+../sibling` resolving to a
-    /// path that does not exist under the copy's temp root). A root is usually a directory; a
-    /// single file (a local wheel/sdist archive) is valid too and is staged verbatim. The generic
-    /// preview copy stages each root at its relative position. Best-effort: an unreadable
-    /// manifest yields an empty set, and adapters with tool-specific staging (cargo) handle their
-    /// own topology and keep the default.
+    /// Absolute paths that this tool's resolver must read during a trial resolve but that the
+    /// selective preview copy would not stage on its own — local path/editable dependency
+    /// sources whose relative references would otherwise escape a throwaway project copy and
+    /// dangle (`editable+../sibling` resolving to a path that does not exist under the copy's
+    /// temp root). Roots are usually directories *outside* the project root; a single file (a
+    /// local wheel/sdist archive) is valid too — even in-tree, where its extension matches no
+    /// resolver-input filter — and is staged verbatim. The generic preview copy stages each root
+    /// at its relative position. Best-effort: an unreadable manifest yields an empty set, and
+    /// adapters with tool-specific staging (cargo) handle their own topology and keep the
+    /// default.
     fn external_resolve_roots(&self, _project: &Project) -> Vec<camino::Utf8PathBuf> {
         Vec::new()
     }
