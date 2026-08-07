@@ -29,11 +29,33 @@
   blame reads the lockfileVersion 9 `snapshots:` section; a copy that lands beneath a newer
   same-name duplicate is reported as applied (pnpm) instead of vanishing, or rolled back as a
   phantom conflict (npm); and a `pnpm-lock.yaml` that is malformed or written by pnpm 8 or older
-  (lockfileVersion < 9) is a clear error instead of an empty, healthy-looking dependency graph.
+  (lockfileVersion < 9) is a clear error instead of an empty, healthy-looking dependency graph —
+  including the post-apply diff and transitive-advance verdict reads, which fail the batch rather
+  than reporting every candidate unreached.
 - **Failures surface instead of hiding**: a candidate dropped during mutation recovery is a
   per-candidate error rather than a silent skip behind `0 errors`, registry fetches retry a lone
   transient transport failure once before failing the row, and resolver-quoted URL credentials are
-  redacted even inside comma-glued URL lists.
+  redacted even inside comma-glued URL lists — as well as in tool stderr quoted by failure
+  diagnostics, semicolon-separated query tokens, and credentials containing unencoded reserved
+  characters.
+- **`fix` reports net rows.** A package moved across several fix rounds (a collateral float and
+  its later downgrade) collapses into one net row, matching `upgrade`'s report contract.
+- **`upgrade --strict` tolerates not-eligible holds.** A hold cooldown cannot act on (a
+  catalog-managed dependency, a pin with no rewritable requirement) keeps the dependency on its
+  already-matured version, so it no longer fails `upgrade --strict`; `fix --strict` still fails
+  it, because there the same hold leaves a live policy violation in the graph.
+- **`outdated` agrees with `upgrade` for rewritten identities**: a held cross-path Go move
+  (`+incompatible` → `/vN`) reported under its base path now reclassifies the outdated item as
+  blocked, preserving the documented blocked-equals-held contract.
+- **Declared requirements and bounds join by package identity**, so a dependency shipping a
+  custom `[lib] name` keeps its edge attribution and its member's deliberate upper bound (a
+  widen can no longer rewrite a cap it failed to see), and a plain declaration beside a rename
+  of the same package stays on its own node.
+- **Preview copies stage local-source topology faithfully**: out-of-tree editable and archive
+  sources, in-tree archive files, in-tree directory sources under pruned locations (`vendor/`,
+  `testdata/`), and in-tree symlinks are reproduced in the throwaway resolve copy, so
+  `--dry-run`/`outdated` previews no longer fail on local-source projects the real resolver
+  handles.
 - **Breaking library API:** `ToolRead::project_detection` replaces `project_marker` and
   `probe_manifest_without_lock`. Ordinary adapters should wrap their marker in
   `ProjectDetection::Primary`; adapters that must inspect manifest-only roots should use
@@ -135,7 +157,9 @@
   records whose project marker was never published without loading policy, manifests, baselines,
   or registries. Project-visible artifacts use a bounded repository scan; an explicit
   `-C <project>` scans only that subtree and relevant ancestors, including targets inside pruned
-  bulk directories without traversing unrelated repository siblings.
+  bulk directories without traversing unrelated repository siblings. An unreadable subtree or
+  ancestor is skipped with a visible warning naming the path instead of failing the whole
+  recovery run.
   Recovery setup failures honor `--json` with the schema-v4 envelope. The command then completes or
   restores a validated interrupted publication without continuing into another mutation. Project
   reads and native-policy sync share target-derived project leases under the Git common directory
