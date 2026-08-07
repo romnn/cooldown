@@ -4,8 +4,15 @@
 //! lock).
 #![allow(
     clippy::unwrap_used,
-    reason = "integration-test helpers and the in-file fake adapter; unwrap on known-good fixtures is the intended immediate test failure (clippy.toml sets allow-unwrap-in-tests)"
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration-test helpers (including the shared `support` fixtures) and the in-file fake adapter; unwrap/expect/panic on known-good fixtures is the intended immediate test failure (clippy.toml allows all three in tests)"
 )]
+
+// Reused only for its temp-dir project fixtures (`Fixture::new` / `Fixture::new_non_git`), so the
+// coordination-namespace test below can drive the fake pipeline in both a Git-anchored and a
+// genuinely non-Git project root.
+mod support;
 
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
@@ -435,6 +442,10 @@ impl ToolWrite for FakeEco {
             RecoveryDisposition::Unchanged
         };
         state.recovery_completed = true;
+        // The workspace consumes the adapter, so `recovery_completed` cannot be inspected after a
+        // run; the marker file mirrors `build-invoked` as the externally observable record that
+        // the recovery hook ran.
+        std::fs::write(self.root.join("recovery-invoked"), b"")?;
         Ok(MutationRecovery::settled(disposition))
     }
 
@@ -782,7 +793,13 @@ fn fake(
 #[tokio::test]
 async fn mutation_recovery_precedes_dependency_discovery() {
     let TmpRoot { guard: _g, root } = tmp_root();
-    let mut adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+    let mut adapter = fake(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
     adapter
         .state
         .get_mut()
@@ -794,12 +811,25 @@ async fn mutation_recovery_precedes_dependency_discovery() {
         .await;
 
     assert!(outcome.errors.is_empty());
+    // An empty error list alone would also pass if the pipeline never reached discovery at all;
+    // the marker proves the recovery hook genuinely ran (and therefore ran before the discovery
+    // that would otherwise have errored).
+    assert!(
+        root.join("recovery-invoked").exists(),
+        "the mutation recovery hook must run during a real upgrade"
+    );
 }
 
 #[tokio::test]
 async fn dry_run_refuses_pending_source_state_without_recovering_it() {
     let TmpRoot { guard: _g, root } = tmp_root();
-    let mut adapter = fake(root, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+    let mut adapter = fake(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
     adapter
         .state
         .get_mut()
@@ -814,7 +844,94 @@ async fn dry_run_refuses_pending_source_state_without_recovering_it() {
         .await;
 
     assert_eq!(outcome.errors.len(), 1);
+    // The refusal must be the adapter's own pending-mutation diagnostic — not some incidental
+    // failure that happens to leave one error behind.
+    let error = outcome.errors.first().expect("one refusal diagnostic");
+    assert_eq!(error.kind, DiagnosticKind::StaleLock);
+    assert!(
+        error.message.contains("pending fake mutation"),
+        "the refusal must surface the adapter's pending-mutation detail, got: {}",
+        error.message
+    );
     assert!(outcome.items.is_empty());
+    // Refusing means refusing: the read-side dry run must never invoke the mutating recovery hook.
+    assert!(
+        !root.join("recovery-invoked").exists(),
+        "--dry-run must not recover the pending state it refuses"
+    );
+}
+
+/// The non-Git coordination fallback (docs/content/docs/security.md): a project with no Git
+/// metadata anywhere above it must still coordinate its mutation lifecycle, rendezvousing in an
+/// owner-private `.cooldown/locks` directory under the canonical project root instead of a Git
+/// common directory. The Git-anchored default fixture is the in-test contrast: the same pipeline
+/// leaves its lease state under `.git/cooldown/locks` and never creates `.cooldown`.
+#[tokio::test]
+async fn non_git_project_coordinates_under_repo_root_cooldown_locks() {
+    let fixture = support::Fixture::new_non_git();
+    let root =
+        Utf8PathBuf::from_path_buf(fixture.root().to_path_buf()).expect("UTF-8 fixture root");
+    assert!(
+        !root.join(".git").exists(),
+        "the opt-out fixture must carry no Git anchor"
+    );
+
+    let outcome = workspace(
+        edge_reporting_fake(root.clone(), Vec::new()),
+        Baseline::default(),
+    )
+    .upgrade(&opts())
+    .await;
+
+    assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+    assert_eq!(outcome.summary.applied, 1);
+    // Coordination hashes the canonical root (a symlinked temp dir resolves), so assert there.
+    let canonical = Utf8PathBuf::from_path_buf(
+        std::fs::canonicalize(fixture.root()).expect("canonicalize fixture root"),
+    )
+    .expect("UTF-8 canonical root");
+    let locks = canonical.join(".cooldown/locks");
+    assert!(
+        locks.is_dir(),
+        "a non-Git run must coordinate under the repo-root `.cooldown/locks` fallback"
+    );
+    assert!(
+        locks.join(".maintenance.lock").is_file(),
+        "the shared maintenance lock lives in the fallback namespace"
+    );
+    let project_lease = locks.join(format!(
+        "{:016x}.lock",
+        cooldown_core::fs::fnv1a_64(canonical.as_str())
+    ));
+    assert!(
+        project_lease.is_file(),
+        "the project lease must land in the fallback namespace: {project_lease}"
+    );
+
+    // Contrast: the default Git-anchored fixture rendezvouses in the Git common directory and
+    // must not scatter a `.cooldown` directory into the working tree.
+    let git_fixture = support::Fixture::new();
+    let git_root =
+        Utf8PathBuf::from_path_buf(git_fixture.root().to_path_buf()).expect("UTF-8 fixture root");
+    let outcome = workspace(
+        edge_reporting_fake(git_root, Vec::new()),
+        Baseline::default(),
+    )
+    .upgrade(&opts())
+    .await;
+    assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+    let git_canonical = Utf8PathBuf::from_path_buf(
+        std::fs::canonicalize(git_fixture.root()).expect("canonicalize fixture root"),
+    )
+    .expect("UTF-8 canonical root");
+    assert!(
+        git_canonical.join(".git/cooldown/locks").is_dir(),
+        "a Git-anchored run coordinates in the Git common directory"
+    );
+    assert!(
+        !git_canonical.join(".cooldown").exists(),
+        "a Git-anchored run must not create the non-Git fallback directory"
+    );
 }
 
 #[tokio::test]
@@ -2347,8 +2464,18 @@ async fn upgrade_surfaces_adapter_edge_rebinds_as_rows_beside_the_version_counts
     );
 
     // Edge rows sort after the applied rows: footnotes to the version changes above them.
-    let a_position = out.items.iter().position(|item| item.name == "a");
-    let uuid_position = out.items.iter().position(|item| item.name == "uuid");
+    // Unwrap both positions first: `None < Some(_)` holds for Options, so comparing them raw
+    // would pass vacuously with the applied row missing entirely.
+    let a_position = out
+        .items
+        .iter()
+        .position(|item| item.name == "a")
+        .expect("the applied version row for `a` must be present");
+    let uuid_position = out
+        .items
+        .iter()
+        .position(|item| item.name == "uuid")
+        .expect("an edge rebind row for `uuid` must be present");
     assert!(a_position < uuid_position);
 }
 

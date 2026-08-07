@@ -158,6 +158,79 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     );
 }
 
+/// The cutoff pair for the transitive-advance fixture. Seeding at the earlier cutoff locks the
+/// undeclared transitive `certifi` at 2024.8.30 (2024-08-30, the newest release then);
+/// 2024.12.14 matures under the later cutoff while 2025.1.31 stays outside it.
+const TRANSITIVE_ADVANCE_SEED: &str = "2024-10-01T00:00:00Z";
+const TRANSITIVE_ADVANCE_FREEZE: &str = "2025-01-01T00:00:00Z";
+
+/// The transitive-advance manifest, uv's analogue of the cargo `rand_core` shape: `requests` is
+/// exact-pinned so the direct layer is inert (2.32.3, 2024-05-29, is also its own newest release
+/// under both cutoffs — 2.32.4 is 2025-06-09), and no project requirement declares its transitive
+/// `certifi` (requests admits `certifi>=2017.4.17`). Only graph-wide transitive advance can move
+/// the standalone certifi line.
+const TRANSITIVE_ADVANCE_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-transitive-advance"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "requests==2.32.3",
+    ]
+"#};
+
+#[test]
+fn upgrade_advances_a_matured_transitive_no_direct_pin_drags() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", TRANSITIVE_ADVANCE_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, TRANSITIVE_ADVANCE_SEED);
+    let pins_before = toml_lock_pins(&fixture.read_bytes("uv.lock"));
+    assert_eq!(
+        pins_before.get("certifi").map(String::as_str),
+        Some("2024.8.30"),
+        "seed sanity: PyPI history as of the seed cutoff locks certifi at 2024.8.30"
+    );
+    assert_eq!(
+        pins_before.get("requests").map(String::as_str),
+        Some("2.32.3"),
+        "seed sanity: the exact pin"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report.applied_names().contains("certifi"),
+        "the transitive advance must be its own applied row, got {:?}",
+        report.applied_names()
+    );
+    assert!(
+        !report.applied_names().contains("requests"),
+        "the exact-pinned parent must not move"
+    );
+    let pins_after = toml_lock_pins(&fixture.read_bytes("uv.lock"));
+    assert_eq!(
+        pins_after.get("certifi").map(String::as_str),
+        Some("2024.12.14"),
+        "certifi advances to the newest release matured under the freeze"
+    );
+    assert_eq!(
+        pins_after.get("requests").map(String::as_str),
+        Some("2.32.3"),
+        "the exact pin stays"
+    );
+
+    // Converged: a second run under the same freeze plans nothing new.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        second.applied_names().is_empty(),
+        "a converged graph re-applies to a fixed point, got {:?}",
+        second.applied_names()
+    );
+}
+
 #[test]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("uv");

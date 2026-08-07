@@ -45,15 +45,29 @@ pub struct Fixture {
 impl Fixture {
     /// Create an empty fixture rooted at a fresh temp dir.
     pub fn new() -> Self {
+        let fixture = Self::new_non_git();
+        // Anchor discovery when an ambient ancestor belongs to another Git repository.
+        std::fs::create_dir(fixture.dir.path().join(".git")).expect("create fixture Git anchor");
+        // The valid Git metadata gives mutation fixtures an external recovery trust domain.
+        std::fs::write(
+            fixture.dir.path().join(".git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write fixture Git HEAD");
+        fixture
+    }
+
+    /// Create an empty fixture WITHOUT the Git anchor: a plain non-Git project directory, so
+    /// cooldown's coordination namespace falls back to the repo-root `.cooldown/locks` directory
+    /// instead of a Git common directory. This relies on the ambient temp dir having no Git
+    /// ancestor of its own (true for standard system temp dirs) — with one, discovery would anchor
+    /// there, which is exactly what [`Fixture::new`]'s stamp defends against. Tests that model a
+    /// Git checkout (or run `git init` themselves) keep using [`Fixture::new`].
+    pub fn new_non_git() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("cooldown-it-")
             .tempdir()
             .expect("create temp dir");
-        // Anchor discovery when an ambient ancestor belongs to another Git repository.
-        std::fs::create_dir(dir.path().join(".git")).expect("create fixture Git anchor");
-        // The valid Git metadata gives mutation fixtures an external recovery trust domain.
-        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n")
-            .expect("write fixture Git HEAD");
         Self {
             dir,
             tag_independent: false,
