@@ -710,6 +710,23 @@ impl<L: NodeLock> NpmTool<L> {
         // Both the newest-version map and the multi-version set are derived from this one copy, so
         // both see exactly the lock the resolve starts from without another disk read.
         let before_content = journaled_lock::<L>(journal);
+        // A `catalog:`-managed candidate can never land through the joint update: its version pin
+        // lives in pnpm-workspace.yaml's catalog definition, which cooldown does not edit — the
+        // manifest widen refuses protocol specifiers, and `pnpm update <name>@<target> --no-save`
+        // re-resolves the importer back to the catalog pin. Left in the plan it would be reported
+        // as a resolver conflict on every future run, so it is held up front with a truthful
+        // not-eligible row instead. Transitive same-name candidates stay: the advance verdicts
+        // below own them.
+        let catalog_managed = before_content
+            .map(L::catalog_managed_names)
+            .unwrap_or_default();
+        let (plan, catalog_holds) = partition_catalog_managed(plan, &catalog_managed);
+        report.skipped.extend(catalog_holds);
+        if plan.changes.is_empty() {
+            // Nothing left to resolve; the catalog holds are the whole report.
+            return Ok(report);
+        }
+        let plan = &plan;
         let before = before_content.map(locked_versions::<L>).unwrap_or_default();
         let multi_version = before_content
             .map(multi_version_names::<L>)
@@ -1298,6 +1315,51 @@ fn transitive_override_pins(
     pins.sort();
     pins.dedup();
     pins
+}
+
+/// Splits the plan's `catalog:`-managed **direct** candidates into truthful up-front holds,
+/// returning the remaining plan and their skip rows.
+///
+/// Only direct candidates are held here: a transitive candidate that merely shares a
+/// catalog-managed name is importer-declared, so the transitive-advance verdicts already hold it
+/// on their own line ([`TransitiveAdvance::DeclaredElsewhere`]).
+fn partition_catalog_managed(
+    plan: &Plan,
+    catalog_managed: &HashSet<String>,
+) -> (Plan, Vec<Skipped>) {
+    let mut retained = Vec::with_capacity(plan.changes.len());
+    let mut skips = Vec::new();
+    for change in &plan.changes {
+        if change.direct && catalog_managed.contains(change.package.name.as_str()) {
+            skips.push(catalog_managed_hold(change));
+        } else {
+            retained.push(change.clone());
+        }
+    }
+    (
+        Plan {
+            changes: retained,
+            ..plan.clone()
+        },
+        skips,
+    )
+}
+
+/// The truthful hold for a candidate whose every declaring importer manages it through a pnpm
+/// catalog: there is no editable version requirement for cooldown to retarget — the pin lives in
+/// `pnpm-workspace.yaml`'s catalog definition, which cooldown does not edit — so the row says so
+/// instead of masquerading as a resolver conflict.
+fn catalog_managed_hold(change: &Change) -> Skipped {
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::NotEligible,
+        offending: Some(change.package.clone()),
+        detail: Some(format!(
+            "{} is catalog-managed (a `catalog:` specifier); cooldown does not edit catalog \
+             definitions — update the catalog entry in pnpm-workspace.yaml to move it",
+            change.package.name
+        )),
+    }
 }
 
 /// The conservative hold for a name importers declare at multiple versions: it is deliberately
@@ -2318,6 +2380,46 @@ packages:
             direct: true,
             members: Vec::new(),
         }
+    }
+
+    /// A direct catalog-managed candidate is held up front with a truthful not-eligible row
+    /// (never a resolver conflict), while a transitive same-name candidate stays in the plan for
+    /// the advance verdicts and unrelated candidates keep the resolve path.
+    #[test]
+    fn catalog_managed_candidates_are_held_not_eligible_with_catalog_detail() {
+        let mut transitive_copy = change("react", "17.0.2", "17.0.3");
+        transitive_copy.direct = false;
+        let plan = Plan {
+            changes: vec![
+                change("react", "18.3.1", "19.0.0"),
+                change("lodash", "4.17.20", "4.17.21"),
+                transitive_copy,
+            ],
+            ..Plan::default()
+        };
+        let catalog_managed = HashSet::from(["react".to_string()]);
+
+        let (retained, skips) = partition_catalog_managed(&plan, &catalog_managed);
+
+        let retained_names: Vec<(&str, bool)> = retained
+            .changes
+            .iter()
+            .map(|change| (change.package.name.as_str(), change.direct))
+            .collect();
+        assert_eq!(
+            retained_names,
+            vec![("lodash", true), ("react", false)],
+            "only the direct catalog copy is held"
+        );
+        assert_eq!(skips.len(), 1);
+        let skip = &skips[0];
+        assert_eq!(skip.reason, SkipReason::NotEligible);
+        assert_eq!(skip.change.package.name, "react");
+        assert_eq!(skip.change.to.as_str(), "19.0.0");
+        let detail = skip.detail.as_deref().expect("a non-empty detail");
+        assert!(!detail.is_empty());
+        assert!(detail.contains("catalog-managed"), "{detail}");
+        assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
     }
 
     /// The advanced-hold detail names where the settlement actually left the copy — it may have

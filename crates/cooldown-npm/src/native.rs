@@ -98,6 +98,80 @@ pub(crate) fn set_yaml_scalar(
     Ok(changed)
 }
 
+/// The exclusive end of the block belonging to a top-level key, scanning `lines` from `start`
+/// (the line after the key).
+///
+/// YAML block content may legally contain blank lines and comment lines at any indentation —
+/// including column 0 — between its entries, so stopping at the first line without a leading
+/// space would truncate the block: a comparison against the truncated prefix misses trailing
+/// entries, and a removal leaves an orphaned fragment that breaks the document. A blank/comment
+/// run counts as interior only while further indented content follows it; a trailing run before
+/// the next top-level key (or the end of the document) is left with the following section, so
+/// replacing or removing the block never swallows a comment that documents what comes next.
+fn block_end(lines: &[&str], start: usize) -> usize {
+    let mut end = start;
+    while let Some(line) = lines.get(end) {
+        if line.starts_with(char::is_whitespace) {
+            end += 1;
+            continue;
+        }
+        if !line.is_empty() && !line.starts_with('#') {
+            // The next top-level key bounds the block.
+            break;
+        }
+        let mut probe = end + 1;
+        let continues = loop {
+            match lines.get(probe) {
+                Some(next) if next.starts_with(char::is_whitespace) => break true,
+                Some(next) if next.is_empty() || next.starts_with('#') => probe += 1,
+                _ => break false,
+            }
+        };
+        if !continues {
+            break;
+        }
+        // The run is interior: consume it and continue at the indented line that follows.
+        end = probe;
+    }
+    end
+}
+
+/// Replaces the block of the first top-level `prefix` key in `lines` with `desired`, returning
+/// `(rendered document, replaced block)` — or `None` when the key is absent. Shared by the
+/// block-sequence and string-map setters, whose edits differ only in how `desired` is built.
+fn replace_top_level_block(
+    lines: &[&str],
+    prefix: &str,
+    desired: &[String],
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut out: Vec<String> = Vec::new();
+    let mut existing: Vec<String> = Vec::new();
+    let mut found = false;
+    let mut index = 0;
+    while let Some(&line) = lines.get(index) {
+        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(prefix) {
+            // A top-level key has no indentation; its block is the following indented lines,
+            // interior blank/comment lines included (see [`block_end`]).
+            found = true;
+            let end = block_end(lines, index + 1);
+            existing.extend(
+                lines
+                    .get(index..end)
+                    .into_iter()
+                    .flatten()
+                    .map(|block_line| (*block_line).to_string()),
+            );
+            // Replace the old block in place, or remove it when the desired block is empty.
+            out.extend(desired.iter().cloned());
+            index = end;
+        } else {
+            out.push(line.to_string());
+            index += 1;
+        }
+    }
+    found.then_some((out, existing))
+}
+
 /// Sets one top-level YAML block sequence while preserving the rest of the document.
 ///
 /// An empty item list removes the key and its block so native configuration never retains an empty
@@ -130,27 +204,10 @@ pub(crate) fn set_yaml_block_list(
     };
 
     let prefix = format!("{key}:");
-    let mut out: Vec<String> = Vec::new();
-    let mut existing: Vec<String> = Vec::new();
-    let mut found = false;
-    let mut lines = content.lines().peekable();
-    while let Some(line) = lines.next() {
-        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
-            // A top-level key has no indentation; its block is the following indented lines.
-            found = true;
-            existing.push(line.to_string());
-            while lines
-                .peek()
-                .is_some_and(|next| next.starts_with(char::is_whitespace))
-            {
-                existing.push(lines.next().unwrap_or_default().to_string());
-            }
-            // Replace the old block in place, or remove it when the desired block is empty.
-            out.extend(desired.iter().cloned());
-        } else {
-            out.push(line.to_string());
-        }
-    }
+    let lines: Vec<&str> = content.lines().collect();
+    let replaced = replace_top_level_block(&lines, &prefix, &desired);
+    let found = replaced.is_some();
+    let (out, existing) = replaced.unwrap_or_default();
 
     let changed = if found {
         existing != desired
@@ -211,25 +268,10 @@ pub(crate) fn set_yaml_string_map(
     }
 
     let prefix = format!("{key}:");
-    let mut out = Vec::new();
-    let mut existing = Vec::new();
-    let mut found = false;
-    let mut lines = content.lines().peekable();
-    while let Some(line) = lines.next() {
-        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
-            found = true;
-            existing.push(line.to_string());
-            while lines
-                .peek()
-                .is_some_and(|next| next.starts_with(char::is_whitespace))
-            {
-                existing.push(lines.next().unwrap_or_default().to_string());
-            }
-            out.extend(desired.iter().cloned());
-        } else {
-            out.push(line.to_string());
-        }
-    }
+    let lines: Vec<&str> = content.lines().collect();
+    let replaced = replace_top_level_block(&lines, &prefix, &desired);
+    let found = replaced.is_some();
+    let (out, existing) = replaced.unwrap_or_default();
 
     let changed = if found {
         existing != desired
@@ -263,6 +305,7 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
+    use indoc::indoc;
 
     #[test]
     fn configured_string_list_accepts_pnpm_singletons_and_arrays() -> eyre::Result<()> {
@@ -410,6 +453,163 @@ mod tests {
         Ok(())
     }
 
+    /// A blank line and an indented comment inside the block must not truncate it: syncing a
+    /// shorter list still sees the entries after the gap, reports the change, and removes them.
+    #[test]
+    fn set_yaml_block_list_sees_entries_past_interior_blank_and_comment_lines() -> eyre::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                minimumReleaseAgeExclude:
+                  - "a"
+
+                  # our own packages
+                  - "internal-tool"
+                packages:
+                  - "x"
+            "#},
+        )?;
+
+        // The truncated-prefix bug reported changed=false here, silently leaving `internal-tool`
+        // exempt.
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["a".to_string()],
+            false
+        )?);
+        let after = std::fs::read_to_string(&path)?;
+        assert!(!after.contains("internal-tool"), "stale entry removed");
+        assert!(
+            !after.contains("# our own packages"),
+            "interior comment replaced with the block"
+        );
+        assert!(after.contains("minimumReleaseAgeExclude:\n  - \"a\"\npackages:"));
+        assert!(
+            after.contains("packages:\n  - \"x\""),
+            "next section intact"
+        );
+        Ok(())
+    }
+
+    /// A column-0 `#` comment is legal inside a block sequence; it must not end the block early.
+    #[test]
+    fn set_yaml_block_list_consumes_column_zero_comments_inside_the_block() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                minimumReleaseAgeExclude:
+                  - "a"
+                # interior note
+                  - "b"
+                packages:
+                  - "x"
+            "#},
+        )?;
+
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["a".to_string()],
+            false
+        )?);
+        let after = std::fs::read_to_string(&path)?;
+        assert!(!after.contains("- \"b\""), "entry past the comment removed");
+        assert!(!after.contains("# interior note"));
+        assert!(
+            after.contains("packages:\n  - \"x\""),
+            "next section intact"
+        );
+        Ok(())
+    }
+
+    /// A trailing blank/comment run before the next top-level key belongs to the *following*
+    /// section: an idempotent sync must not count it into the block, and a rewrite must leave it
+    /// in place.
+    #[test]
+    fn set_yaml_block_list_leaves_trailing_comments_with_the_next_section() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                minimumReleaseAgeExclude:
+                  - "a"
+
+                # the workspace members
+                packages:
+                  - "x"
+            "#},
+        )?;
+
+        // Idempotent: the trailing run is not part of the block, so the same item list changes
+        // nothing.
+        assert!(!set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["a".to_string()],
+            false
+        )?);
+
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["b".to_string()],
+            false
+        )?);
+        let after = std::fs::read_to_string(&path)?;
+        assert!(
+            after.contains(
+                "minimumReleaseAgeExclude:\n  - \"b\"\n\n# the workspace members\npackages:"
+            ),
+            "trailing comment stays with the next section: {after}"
+        );
+        Ok(())
+    }
+
+    /// Removing the key must remove the *whole* block — an interior blank line or comment must not
+    /// strand a fragment that turns the document into a YAML parse error (this is the sync path;
+    /// no journal restores the file afterwards).
+    #[test]
+    fn set_yaml_block_list_empty_sync_removes_interior_fragments() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                minimumReleaseAgeExclude:
+                  - "a"
+
+                  # our own packages
+                  - "internal-tool"
+                packages:
+                  - "x"
+            "#},
+        )?;
+
+        assert!(set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &[],
+            false
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "packages:\n  - \"x\"\n",
+            "no orphaned fragment may remain"
+        );
+        Ok(())
+    }
+
     #[test]
     fn set_yaml_string_map_replaces_only_the_requested_block() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -434,6 +634,48 @@ mod tests {
         assert!(written.contains("packages:\n  - \"a\""));
         assert!(written.contains("# keep me"));
         assert!(!set_yaml_string_map(&path, "overrides", &items)?);
+        Ok(())
+    }
+
+    /// A user `overrides:` block containing blank lines must be replaced wholesale: leftover
+    /// entries merged after the desired block would be duplicate mapping keys, which pnpm rejects
+    /// — failing the apply that installed the temporary overrides.
+    #[test]
+    fn set_yaml_string_map_replaces_a_block_containing_blank_lines() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                overrides:
+                  existing: "1.0.0"
+
+                  legacy: "0.9.0"
+                packages:
+                  - "a"
+            "#},
+        )?;
+        let items = BTreeMap::from([("@scope/pkg".to_string(), "2.0.0".to_string())]);
+
+        assert!(set_yaml_string_map(&path, "overrides", &items)?);
+        let written = std::fs::read_to_string(&path)?;
+        assert!(
+            written.contains("overrides:\n  \"@scope/pkg\": \"2.0.0\"\npackages:"),
+            "the whole user block is replaced: {written}"
+        );
+        assert!(
+            !written.contains("legacy"),
+            "no leftover entry after the desired block"
+        );
+        assert!(
+            !written.contains("existing"),
+            "no duplicate overrides content"
+        );
+        assert!(
+            written.contains("packages:\n  - \"a\""),
+            "next section intact"
+        );
         Ok(())
     }
 }

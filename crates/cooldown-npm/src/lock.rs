@@ -73,6 +73,18 @@ pub trait NodeLock: Send + Sync + 'static {
         HashMap::new()
     }
 
+    /// The dependency names whose *every* declaring importer manages them through a pnpm catalog
+    /// (a `catalog:` / `catalog:<name>` specifier). Their version pins live in
+    /// `pnpm-workspace.yaml`'s catalog definitions, which cooldown does not edit: the manifest
+    /// widen refuses protocol specifiers and `pnpm update <name>@<target>` re-resolves the
+    /// importer back to the catalog pin, so the apply engine holds these candidates up front with
+    /// a truthful skip instead of letting them surface as an eternal resolver conflict. Default:
+    /// empty (only pnpm has catalogs).
+    #[must_use]
+    fn catalog_managed_names(_content: &str) -> HashSet<String> {
+        HashSet::new()
+    }
+
     /// Every workspace member directory the lock records, whatever it declares — pnpm's
     /// `importers:` keys, npm's non-`node_modules` `packages` keys (the root as `.`). A member
     /// that declares no dependencies appears nowhere in [`member_sources`](NodeLock::member_sources)
@@ -543,10 +555,75 @@ pub struct PeerRequirement {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct PnpmLockDocument {
+    /// The lock format's own version marker, kept so [`parse_pnpm_document_strict`] can reject a
+    /// pre-v9 document instead of misreading its differently-shaped `packages:` keys (a v6 key is
+    /// `/name@version(...)`, whose leading slash would flow into registry lookups as part of the
+    /// name). `None` for a hand-crafted fixture that omits the field.
+    #[serde(rename = "lockfileVersion")]
+    lockfile_version: Option<LockfileVersion>,
     importers: YamlEntries<Tolerant<PnpmImporter>>,
     packages: YamlEntries<Tolerant<PnpmPackage>>,
     /// Only the keys are consumed ([`PnpmLockDocument::package_and_snapshot_keys`]).
     snapshots: YamlEntries<IgnoredAny>,
+}
+
+/// The lock's `lockfileVersion` scalar, normalized to its textual spelling. pnpm writes it as a
+/// quoted string from v6 on (`'6.0'`, `'9.0'`) but as a bare YAML number in v5 (`5.4`), so the
+/// visitor accepts both scalar shapes rather than fixing one type.
+struct LockfileVersion(String);
+
+impl LockfileVersion {
+    /// The version's leading major (`'9.0'` → 9, `5.4` → 5), or `None` when the scalar does not
+    /// start with an integer.
+    fn major(&self) -> Option<u64> {
+        let text = self.0.trim();
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        text.get(..end)?.parse().ok()
+    }
+}
+
+impl<'de> Deserialize<'de> for LockfileVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct VersionVisitor;
+        impl Visitor<'_> for VersionVisitor {
+            type Value = LockfileVersion;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a lockfileVersion scalar")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(LockfileVersion(value.to_string()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(LockfileVersion(value.to_string()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(LockfileVersion(value.to_string()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(LockfileVersion(value.to_string()))
+            }
+        }
+        deserializer.deserialize_any(VersionVisitor)
+    }
 }
 
 impl PnpmLockDocument {
@@ -686,18 +763,32 @@ struct PnpmResolution {
     kind: Option<String>,
 }
 
-/// Parses `pnpm-lock.yaml` once into the typed document, `None` on any YAML error.
+/// Parses `pnpm-lock.yaml` once into the typed document, failing closed on a document cooldown
+/// cannot faithfully read: unparsable YAML, a structural-guard breach (nesting depth, alias
+/// amplification), or an unsupported pre-v9 `lockfileVersion` — whose `packages:` keys are shaped
+/// differently and would otherwise be misread into garbage names like `/lodash`. An empty or
+/// whitespace-only document is a legitimately empty lock and reads as the empty document, and a
+/// fixture that omits `lockfileVersion` entirely is accepted as v9.
 ///
-/// Every reader maps `None` to its empty result, keeping the readers fail-open: a malformed lock
-/// yields no data, never an error or a panic.
-pub(crate) fn parse_pnpm_document(content: &str) -> Option<PnpmLockDocument> {
+/// This is the parse behind [`Pnpm::parse`] (the resolved-package list): like npm's
+/// `package-lock.json` parse, a corrupted lock must surface an error, never report zero
+/// dependencies as if the project were healthy.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] naming the YAML failure or the unsupported
+/// `lockfileVersion` (and the supported one).
+pub(crate) fn parse_pnpm_document_strict(content: &str) -> Result<PnpmLockDocument> {
+    if content.trim().is_empty() {
+        return Ok(PnpmLockDocument::default());
+    }
     let mut options = serde_saphyr::Options::default();
     // pnpm never writes duplicate keys, but a hand-edited lock may carry them; `LastWins` passes
     // duplicate pairs through to the map visitor, so [`YamlEntries`] keeps each of them (the
     // default policy errors out instead).
     options.duplicate_keys = serde_saphyr::options::DuplicateKeyPolicy::LastWins;
     // The default budget caps events/nodes/scalar bytes at totals a large monorepo lock can
-    // legitimately exceed, and a breach would silently blank every reader.
+    // legitimately exceed, and a breach would surface as a spurious parse failure.
     // Lift the size-proportional caps — the input is a project-local file — while keeping the
     // structural guards (nesting depth, alias amplification).
     if let Some(budget) = options.budget.as_mut() {
@@ -705,11 +796,39 @@ pub(crate) fn parse_pnpm_document(content: &str) -> Option<PnpmLockDocument> {
         budget.max_nodes = usize::MAX;
         budget.max_total_scalar_bytes = usize::MAX;
     }
-    serde_saphyr::from_str_with_options(content, options).ok()
+    let doc: PnpmLockDocument = serde_saphyr::from_str_with_options(content, options)
+        .map_err(|error| CoreError::LockUnreadable(format!("pnpm-lock.yaml: {error}")))?;
+    // Only a *parsable* major below 9 is rejected: an absent field tolerates hand-crafted
+    // fixtures, an unparsable one falls through to whatever the structure yields (every real
+    // pre-9 pnpm lock carries a numeric version), and a future major is left to prove itself
+    // rather than pre-emptively rejected.
+    if let Some(version) = &doc.lockfile_version
+        && let Some(major) = version.major()
+        && major < 9
+    {
+        return Err(CoreError::LockUnreadable(format!(
+            "pnpm-lock.yaml: unsupported lockfileVersion {found}; cooldown supports the v9 lock \
+             format (lockfileVersion 9, written by pnpm 9+) — re-run `pnpm install` with a \
+             current pnpm to migrate the lock",
+            found = version.0
+        )));
+    }
+    Ok(doc)
 }
 
-/// Parses the `packages:` section of `pnpm-lock.yaml` (v9) into every resolved package's peer
-/// requirements: each package entry's `peerDependencies:` map (name → range).
+/// [`parse_pnpm_document_strict`] with the failure collapsed to `None`, for the auxiliary readers
+/// (member attribution, peer requirements, local-package consumers, exact pins).
+///
+/// Those readers stay fail-open by design: their trait signatures are infallible enrichment of a
+/// report — a lock the strict parse rejects yields no attribution rather than a second error on
+/// top of the one [`Pnpm::parse`] already surfaces for the same content.
+pub(crate) fn parse_pnpm_document(content: &str) -> Option<PnpmLockDocument> {
+    parse_pnpm_document_strict(content).ok()
+}
+
+/// Parses the `packages:` section of `pnpm-lock.yaml` (v9, enforced by
+/// [`parse_pnpm_document_strict`]) into every resolved package's peer requirements: each package
+/// entry's `peerDependencies:` map (name → range).
 ///
 /// A `(peer@x)` disambiguation suffix on the entry key is stripped, so one package resolved under
 /// several peer contexts reports its requirement once per resolved copy — duplicates are harmless
@@ -1116,7 +1235,7 @@ impl NodeLock for Pnpm {
     const SUPPORTS_TRANSITIVE_ADVANCE: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
-        Ok(parse_pnpm(content))
+        parse_pnpm(content)
     }
 
     fn member_sources(content: &str) -> MemberIndex {
@@ -1127,6 +1246,10 @@ impl NodeLock for Pnpm {
 
     fn peer_requirements(content: &str) -> Vec<PeerRequirement> {
         parse_pnpm_peer_requirements(content)
+    }
+
+    fn catalog_managed_names(content: &str) -> HashSet<String> {
+        parse_pnpm_catalog_only_names(content)
     }
 
     fn member_paths(content: &str) -> HashSet<String> {
@@ -1331,13 +1454,13 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
     Ok(out)
 }
 
-/// Parses `pnpm-lock.yaml` (v9): the top-level `packages:` section keys every resolved package by
-/// its `name@version(...peers)` identity — the keys are the only field this reader needs.
-fn parse_pnpm(content: &str) -> Vec<NameVersion> {
-    let Some(doc) = parse_pnpm_document(content) else {
-        return Vec::new();
-    };
-    doc.packages
+/// Parses `pnpm-lock.yaml` (v9, enforced by [`parse_pnpm_document_strict`]): the top-level
+/// `packages:` section keys every resolved package by its `name@version(...peers)` identity — the
+/// keys are the only field this reader needs.
+fn parse_pnpm(content: &str) -> Result<Vec<NameVersion>> {
+    let doc = parse_pnpm_document_strict(content)?;
+    Ok(doc
+        .packages
         .keys()
         .filter_map(|key| {
             // Drop the `(peer@x)` suffixes pnpm appends to disambiguate peer resolutions — as a
@@ -1345,7 +1468,7 @@ fn parse_pnpm(content: &str) -> Vec<NameVersion> {
             // contain parenthesized directory segments.
             split_name_version(strip_pnpm_peer_suffixes(key))
         })
-        .collect()
+        .collect())
 }
 
 /// The dependency-group keys a manifest/importer uses to declare a direct dependency.
@@ -1752,6 +1875,32 @@ fn parse_pnpm_importer_specifiers(content: &str) -> HashMap<String, HashSet<Stri
     map
 }
 
+/// The dependency names every declaring importer manages through a pnpm catalog (`catalog:` /
+/// `catalog:<name>` specifier), read from the lock's `importers:` section (the lock copies each
+/// manifest's verbatim specifier).
+///
+/// A name any importer also declares with a non-catalog specifier is excluded: the joint update
+/// can still land that importer's copy, so the candidate keeps the normal resolve path. Only the
+/// registry-candidate protocol needs this: a `workspace:`-declared dependency resolves to a
+/// `link:`/`file:` version, which the resolved-package readers already skip, so it never becomes
+/// an upgrade candidate in the first place.
+fn parse_pnpm_catalog_only_names(content: &str) -> HashSet<String> {
+    let mut catalog: HashSet<String> = HashSet::new();
+    let mut otherwise: HashSet<String> = HashSet::new();
+    walk_pnpm_importer_entries(content, |_member, name, specifier, _version| {
+        let Some(specifier) = specifier else {
+            return;
+        };
+        if specifier.starts_with("catalog:") {
+            catalog.insert(name.to_string());
+        } else {
+            otherwise.insert(name.to_string());
+        }
+    });
+    catalog.retain(|name| !otherwise.contains(name));
+    catalog
+}
+
 fn pnpm_lock_consistency_error(content: &str) -> Option<String> {
     let mut error = None;
     walk_pnpm_importer_entries(content, |member, name, specifier, version| {
@@ -2077,12 +2226,150 @@ mod tests {
     fn pnpm_packages_section() {
         let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      lodash:\n        specifier: 4.17.15\n        version: 4.17.15\n\npackages:\n\n  lodash@4.17.15:\n    resolution: {integrity: sha512-x}\n\n  '@babel/core@7.1.0':\n    resolution: {integrity: sha512-y}\n\n  chalk@4.0.0(supports-color@7.2.0):\n    resolution: {integrity: sha512-z}\n";
         assert_eq!(
-            sorted(parse_pnpm(lock)),
+            sorted(parse_pnpm(lock).unwrap()),
             sorted(vec![
                 NameVersion::new("lodash", "4.17.15"),
                 NameVersion::new("@babel/core", "7.1.0"),
                 NameVersion::new("chalk", "4.0.0"),
             ])
+        );
+    }
+
+    /// A v6 lock (`lockfileVersion: '6.0'`, pnpm 8) keys `packages:` as `/name@version`; parsing
+    /// it as v9 would keep the leading slash and send `/lodash` to the registry. It must be
+    /// rejected with an error naming the found version and the supported one.
+    #[test]
+    fn pnpm_v6_lock_is_rejected_with_a_clear_error() {
+        let lock = indoc! {"
+            lockfileVersion: '6.0'
+
+            dependencies:
+              lodash:
+                specifier: ^4.17.0
+                version: 4.17.21
+
+            packages:
+
+              /lodash@4.17.21:
+                resolution: {integrity: sha512-x}
+        "};
+        let error = parse_pnpm(lock).unwrap_err().to_string();
+        assert!(error.contains("6.0"), "names the found version: {error}");
+        assert!(
+            error.contains("lockfileVersion 9"),
+            "names the supported version: {error}"
+        );
+        assert!(
+            error.contains("pnpm-lock.yaml"),
+            "names the offending file: {error}"
+        );
+    }
+
+    /// A v5 lock writes `lockfileVersion` as a bare YAML number (`5.4`), not a quoted string; the
+    /// guard must reject that spelling too.
+    #[test]
+    fn pnpm_v5_lock_is_rejected_with_a_clear_error() {
+        let lock = indoc! {"
+            lockfileVersion: 5.4
+
+            dependencies:
+              lodash: 4.17.21
+
+            packages:
+
+              /lodash/4.17.21:
+                resolution: {integrity: sha512-x}
+        "};
+        let error = parse_pnpm(lock).unwrap_err().to_string();
+        assert!(error.contains("5.4"), "names the found version: {error}");
+        assert!(
+            error.contains("lockfileVersion 9"),
+            "names the supported version: {error}"
+        );
+    }
+
+    /// A malformed lock must fail closed like npm's: reporting zero dependencies for an
+    /// unparsable document would make `outdated`/`dependencies` look healthy on a corrupted
+    /// project.
+    #[test]
+    fn malformed_pnpm_lock_is_an_error_not_an_empty_graph() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+            packages:
+              lodash@4.17.21: [unclosed
+        "};
+        let error = parse_pnpm(lock).unwrap_err();
+        assert!(
+            matches!(error, CoreError::LockUnreadable(_)),
+            "typed lock error, got: {error:?}"
+        );
+    }
+
+    /// Legitimately empty locks keep working: an empty document and a v9 header with no sections
+    /// both read as zero dependencies, not as errors.
+    #[test]
+    fn empty_pnpm_locks_parse_to_no_dependencies() {
+        assert_eq!(parse_pnpm("").unwrap(), Vec::new());
+        assert_eq!(parse_pnpm("\n\n").unwrap(), Vec::new());
+        assert_eq!(parse_pnpm("lockfileVersion: '9.0'\n").unwrap(), Vec::new());
+    }
+
+    /// The fail-open auxiliary readers collapse a pre-v9 lock to their empty result instead of
+    /// misreading its `/name@version` keys — the strict parse's error already surfaces through
+    /// `Pnpm::parse` for the same content.
+    #[test]
+    fn auxiliary_readers_yield_nothing_for_a_pre_v9_lock() {
+        let lock = indoc! {"
+            lockfileVersion: '6.0'
+
+            packages:
+
+              /lodash@4.17.21:
+                resolution: {integrity: sha512-x}
+                peerDependencies:
+                  react: ^18
+        "};
+        assert!(parse_pnpm_peer_requirements(lock).is_empty());
+        assert!(parse_pnpm_importer_members(lock).is_empty());
+    }
+
+    /// Only names *every* declaring importer manages through the catalog count as
+    /// catalog-managed; a name one importer declares with a plain range keeps the normal resolve
+    /// path, since that importer's copy can still land.
+    #[test]
+    fn catalog_managed_names_require_every_declaring_importer_to_use_the_catalog() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  react:
+                    specifier: 'catalog:'
+                    version: 18.3.1
+                  chalk:
+                    specifier: 'catalog:legacy'
+                    version: 4.1.2
+
+              apps/web:
+                dependencies:
+                  chalk:
+                    specifier: ^4.0.0
+                    version: 4.1.2
+
+            packages:
+
+              react@18.3.1:
+                resolution: {integrity: sha512-x}
+              chalk@4.1.2:
+                resolution: {integrity: sha512-y}
+        "};
+        let names = parse_pnpm_catalog_only_names(lock);
+        assert!(names.contains("react"), "catalog-only name detected");
+        assert!(
+            !names.contains("chalk"),
+            "a plain-range declaration keeps the name off the catalog hold"
         );
     }
 
