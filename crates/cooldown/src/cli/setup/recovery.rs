@@ -138,7 +138,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let mut targets = Vec::new();
     let mut warnings = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
-        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root)?;
+        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root, &scope)?;
         let discovery = cargo_recovery_discovery(&scope, !global.no_gitignore)?;
         roots.extend(discovery.roots);
         warnings.extend(discovery.warnings);
@@ -180,20 +180,50 @@ fn validate_recovery_options(global: &GlobalArgs) -> Result<(), CoreError> {
 fn direct_cargo_recovery_roots(
     workdir: &Utf8Path,
     repo_root: &Utf8Path,
+    scope: &RecoveryScope,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
     let mut roots = Vec::new();
+    // `find_repo_root` can fall back to a non-ancestor (`$HOME`, when no repository marker exists
+    // anywhere above `workdir`); an `ancestor == repo_root` bound would then never fire and the
+    // walk would probe every parent up to `/`. Bound the walk at `workdir` itself in that case —
+    // parents outside the repository are not part of this recovery request.
+    let stop = if workdir.starts_with(repo_root) {
+        repo_root
+    } else {
+        workdir
+    };
     for ancestor in workdir.ancestors() {
-        if contains_cargo_recovery_artifact(ancestor)? {
-            roots.push(ancestor.to_owned());
+        // Respect the scope before touching the directory: the caller filters the collected roots
+        // by scope anyway, so probing an out-of-scope ancestor could only fail spuriously, never
+        // contribute a target.
+        if scope.includes(ancestor) {
+            match contains_cargo_recovery_artifact(ancestor) {
+                Ok(true) => roots.push(ancestor.to_owned()),
+                Ok(false) => {}
+                // A traverse-only parent (mode 711 is common for shared roots like `/srv`) holds
+                // nothing recoverable from here, so skip it; the directory the user is standing in
+                // still fails loudly when unreadable.
+                Err(error)
+                    if ancestor != workdir
+                        && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    tracing::debug!(
+                        %ancestor,
+                        %error,
+                        "skipping unreadable ancestor during direct recovery probe"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        if ancestor == repo_root {
+        if ancestor == stop {
             break;
         }
     }
     Ok(roots)
 }
 
-fn contains_cargo_recovery_artifact(root: &Utf8Path) -> Result<bool, CoreError> {
+fn contains_cargo_recovery_artifact(root: &Utf8Path) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         if entry
@@ -251,7 +281,7 @@ fn cargo_recovery_discovery(
     respect_gitignore: bool,
 ) -> Result<CargoRecoveryDiscovery, CoreError> {
     let root = scope.root();
-    let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name)?;
+    let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name);
     let authority = recovery_authority_projects(scope)?;
     authoritative.extend(authority.projects);
     let warnings = authority
@@ -429,12 +459,92 @@ mod tests {
         symlink("missing-record", root.join(RECOVERY_MARKER))?;
 
         assert_eq!(
-            direct_cargo_recovery_roots(root, root)?,
+            direct_cargo_recovery_roots(root, root, &explicit_scope(root)?)?,
             vec![root.to_owned()]
         );
         assert_eq!(
             cargo_recovery_roots(&explicit_scope(root)?, false)?,
             vec![root.to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_walk_stops_at_workdir_when_repo_root_is_not_an_ancestor() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let workdir = root.join("srv/deploy/app");
+        std::fs::create_dir_all(&workdir)?;
+        // The `$HOME` fallback shape: `find_repo_root` returned a directory that exists but is not
+        // an ancestor of the workdir.
+        let home = root.join("home/user");
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(root.join("srv/deploy").join(RECOVERY_MARKER), "{}")?;
+        std::fs::write(workdir.join(RECOVERY_MARKER), "{}")?;
+
+        // The explicit scope includes ancestors, so only the walk bound keeps the parent out.
+        let roots = direct_cargo_recovery_roots(&workdir, &home, &explicit_scope(&workdir)?)?;
+
+        assert_eq!(
+            roots,
+            vec![workdir],
+            "the walk must stop at the workdir when the repo root is not an ancestor"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_ancestor_is_skipped_during_direct_recovery_probe() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let parent = root.join("deploy");
+        let workdir = parent.join("app");
+        std::fs::create_dir_all(&workdir)?;
+        std::fs::write(workdir.join(RECOVERY_MARKER), "{}")?;
+        std::fs::write(root.join(RECOVERY_MARKER), "{}")?;
+        // Traverse-only (no read bit): the walk may pass through the parent but cannot list it.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311))?;
+
+        let result = direct_cargo_recovery_roots(&workdir, root, &explicit_scope(&workdir)?);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))?;
+
+        assert_eq!(
+            result?,
+            vec![workdir, root.to_owned()],
+            "the unreadable parent is skipped; the readable grandparent is still probed"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_workdir_still_fails_direct_recovery_loudly() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let workdir = root.join("app");
+        std::fs::create_dir_all(&workdir)?;
+        let scope = explicit_scope(&workdir)?;
+        std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o311))?;
+        if std::fs::read_dir(&workdir).is_ok() {
+            // Permission bits do not bind (running as root): the loud-failure path is untestable.
+            std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o755))?;
+            return Ok(());
+        }
+
+        let result = direct_cargo_recovery_roots(&workdir, root, &scope);
+        std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o755))?;
+
+        assert!(
+            result.is_err(),
+            "the user's own directory must fail loudly when unreadable"
         );
         Ok(())
     }

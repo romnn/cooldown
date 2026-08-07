@@ -230,10 +230,14 @@ fn scan_marker_groups(
 /// evidence rather than the current discovery configuration.
 /// Known metadata, dependency, build, and cache trees are pruned to keep a repository-root safety
 /// scan bounded.
+/// Unreadable entries are skipped rather than failing the scan, matching the marker walks the same
+/// discovery pairs this with: one unreadable subtree (a root-owned volume mount) must not block
+/// recovering every project the walk *can* see, and an interrupted project hidden behind it stays
+/// discoverable through its recovery authority anchor, which lives outside the project tree.
 pub(crate) fn find_recovery_artifact_dirs(
     root: &Utf8Path,
     is_artifact: impl Fn(&str) -> bool,
-) -> Result<Vec<Utf8PathBuf>, CoreError> {
+) -> Vec<Utf8PathBuf> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -266,9 +270,8 @@ pub(crate) fn find_recovery_artifact_dirs(
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                return Err(CoreError::Filesystem(format!(
-                    "cannot inspect recovery artifacts below {root}: {error}"
-                )));
+                tracing::debug!(%error, %root, "skipping unreadable path during recovery artifact scan");
+                continue;
             }
         };
         let Some(name) = entry.file_name().to_str() else {
@@ -282,7 +285,7 @@ pub(crate) fn find_recovery_artifact_dirs(
     }
     dirs.sort();
     dirs.dedup();
-    Ok(dirs)
+    dirs
 }
 
 fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<&'a str> {
@@ -732,10 +735,37 @@ mod tests {
 
         let found = find_recovery_artifact_dirs(root, |name| {
             matches!(name, "recovery" | ".recovery.123.0.publish")
-        })?;
+        });
         assert_eq!(
             found,
             vec![root.join(".hidden/project"), root.join("ignored/project")]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_scan_skips_an_unreadable_subtree_instead_of_failing() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("project");
+        // Not in the pruned-name list — e.g. a root-owned `data/` volume mount inside the repo.
+        let sealed = root.join("data");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&sealed)?;
+        std::fs::write(project.join("recovery"), "")?;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))?;
+
+        let result = find_recovery_artifact_dirs(root, |name| name == "recovery");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))?;
+
+        assert_eq!(
+            result,
+            vec![project],
+            "the interrupted project the walk can see is still recovered"
         );
         Ok(())
     }
