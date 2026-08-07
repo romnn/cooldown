@@ -232,10 +232,7 @@ impl<'a> OutdatedRunner<'a> {
                     if item.status == OutdatedStatus::Adoptable
                         && let Some(change) = adoptable_change(&dep, &releases, &item)
                     {
-                        candidates.push(VerificationCandidate {
-                            item_index: items.len(),
-                            change,
-                        });
+                        candidates.push(VerificationCandidate::new(items.len(), &dep, change));
                     }
                     items.push(item);
                 }
@@ -593,6 +590,35 @@ struct ClassifiedProject {
 struct VerificationCandidate {
     item_index: usize,
     change: Change,
+    /// The held-row key spelled under the dependency's *current* identity, kept only when the
+    /// planned change rewrites the package identity (a go `/vN` path-major move). A held
+    /// cross-path move leaves the tree on the source path, so the adapter's skip row truthfully
+    /// carries that source identity while `change` names the target path; the preview join must
+    /// accept either spelling or the item stays adoptable although `upgrade` would hold it.
+    source_key: Option<ChangeTargetKey>,
+}
+
+impl VerificationCandidate {
+    fn new(item_index: usize, dep: &Dependency, change: Change) -> Self {
+        // `target_package_for` rewrote the planned identity away from the dependency's own only
+        // for a cross-path move; everywhere else the two spellings coincide and no alias is kept.
+        // Only the name differs between the spellings: the rewrite preserves registry, target,
+        // directness, and members, so the alias reuses the change's own fields for those.
+        let source_key = (change.package != dep.package).then(|| {
+            change_target_key_parts(
+                &dep.package.name,
+                dep.package.registry.as_deref(),
+                change.to.as_str(),
+                change.direct,
+                &change.members,
+            )
+        });
+        VerificationCandidate {
+            item_index,
+            change,
+            source_key,
+        }
+    }
 }
 
 /// The forward [`Change`] an `adoptable` item would take — its matured target. `None` when the item
@@ -644,14 +670,19 @@ fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Opti
 
 /// Re-classify every `adoptable` item the upgrade resolve could not land (`held`) as `blocked`,
 /// carrying the blocker the resolve named. An item the resolve landed (absent from `held`) keeps its
-/// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set.
+/// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set. A held
+/// cross-path move is reported under its source identity (the require that still exists) rather
+/// than the planned target identity, so the lookup accepts either spelling of the same change.
 fn apply_held(
     items: &mut [OutdatedItem],
     candidates: &[VerificationCandidate],
     held: &HashMap<ChangeTargetKey, Option<String>>,
 ) {
     for candidate in candidates {
-        if let Some(blocker) = held.get(&change_target_key(&candidate.change))
+        let blocker = held
+            .get(&change_target_key(&candidate.change))
+            .or_else(|| candidate.source_key.as_ref().and_then(|key| held.get(key)));
+        if let Some(blocker) = blocker
             && let Some(item) = items.get_mut(candidate.item_index)
             && item.status == OutdatedStatus::Adoptable
         {
@@ -776,10 +807,25 @@ mod tests {
     }
 
     fn candidate(item_index: usize, item: &OutdatedItem) -> VerificationCandidate {
-        VerificationCandidate {
-            item_index,
-            change: adoptable_change(&dependency(item), &[], item).expect("a forward change"),
-        }
+        let dep = dependency(item);
+        let change = adoptable_change(&dep, &[], item).expect("a forward change");
+        VerificationCandidate::new(item_index, &dep, change)
+    }
+
+    fn go_adoptable(name: &str, current: &str, target: &str) -> (OutdatedItem, Dependency) {
+        let mut item = adoptable(name, current, target);
+        item.tool = "go".to_string();
+        item.registry = None;
+        let mut dep = dependency(&item);
+        dep.package = PackageId::new(GO, name, None);
+        (item, dep)
+    }
+
+    fn go_skipped(name: &str, current: &str, target: &str, blocker: &str) -> UpgradeItem {
+        let mut row = skipped(name, current, target, blocker);
+        row.tool = "go".to_string();
+        row.registry = None;
+        row
     }
 
     fn release(version: &str, order: u8, major: &str) -> Release {
@@ -820,6 +866,87 @@ mod tests {
         let change = adoptable_change(&dep, &releases, &item).expect("a cross-major change");
 
         assert_eq!(change.package.name, "example.com/foo/v2");
+    }
+
+    #[test]
+    fn cross_path_held_go_candidate_is_reclassified_blocked() {
+        // go.mod requires `github.com/foo/bar v2.9.0+incompatible`, a matured `/v3` release
+        // exists, and MVS holds the move. The candidate plans the target identity (`…/v3`) while
+        // the preview's skip row truthfully carries the base identity the tree still holds; the
+        // join must land on the source-identity spelling, or `outdated` reports adoptable an
+        // upgrade `upgrade` would hold.
+        let (item, dep) = go_adoptable("github.com/foo/bar", "v2.9.0+incompatible", "v3.0.2");
+        let releases = [
+            release("v2.9.0+incompatible", 1, ""),
+            release("v3.0.2", 2, "/v3"),
+        ];
+        let change = adoptable_change(&dep, &releases, &item).expect("a cross-path change");
+        assert_eq!(change.package.name, "github.com/foo/bar/v3");
+        let candidates = vec![VerificationCandidate::new(0, &dep, change)];
+
+        // Go's `resolver_conflict` reports the held move under the base identity, blaming itself.
+        let held = held_from_preview(vec![go_skipped(
+            "github.com/foo/bar",
+            "v2.9.0+incompatible",
+            "v3.0.2",
+            "github.com/foo/bar",
+        )]);
+
+        // The planned-identity key alone misses — the held row is spelled under the base path.
+        assert!(!held.contains_key(&change_target_key(&candidates[0].change)));
+
+        let mut items = vec![item];
+        apply_held(&mut items, &candidates, &held);
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        // Self-blame collapses to the generic "resolver rejected" form: no named blocker.
+        assert_eq!(items[0].blocked_by, None);
+    }
+
+    #[test]
+    fn same_path_held_go_candidate_still_joins_on_its_planned_identity() {
+        // A within-path go hold keeps its planned identity (no rewrite), so the join lands on the
+        // primary key and no source-identity alias is even constructed.
+        let (item, dep) = go_adoptable("golang.org/x/text", "v0.1.0", "v0.2.0");
+        let change = adoptable_change(&dep, &[], &item).expect("a forward change");
+        let candidate = VerificationCandidate::new(0, &dep, change);
+        assert!(candidate.source_key.is_none());
+
+        let held = held_from_preview(vec![go_skipped(
+            "golang.org/x/text",
+            "v0.1.0",
+            "v0.2.0",
+            "example.com/dep",
+        )]);
+
+        let mut items = vec![item];
+        apply_held(&mut items, &[candidate], &held);
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        assert_eq!(items[0].blocked_by.as_deref(), Some("example.com/dep"));
+    }
+
+    #[test]
+    fn source_identity_fallback_does_not_join_a_different_target() {
+        // The alias keys on the same target version as the planned change, so a base-named hold at
+        // some other target must not bleed onto this candidate.
+        let (item, dep) = go_adoptable("github.com/foo/bar", "v2.9.0+incompatible", "v3.0.2");
+        let releases = [
+            release("v2.9.0+incompatible", 1, ""),
+            release("v3.0.2", 2, "/v3"),
+        ];
+        let change = adoptable_change(&dep, &releases, &item).expect("a cross-path change");
+        let candidates = vec![VerificationCandidate::new(0, &dep, change)];
+
+        let held = held_from_preview(vec![go_skipped(
+            "github.com/foo/bar",
+            "v2.9.0+incompatible",
+            "v3.0.1",
+            "github.com/foo/bar",
+        )]);
+
+        let mut items = vec![item];
+        apply_held(&mut items, &candidates, &held);
+        assert_eq!(items[0].status, OutdatedStatus::Adoptable);
+        assert_eq!(items[0].blocked_by, None);
     }
 
     #[test]
