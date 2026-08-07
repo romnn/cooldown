@@ -51,12 +51,18 @@ pub(crate) fn old_import_path(change: &Change) -> Option<String> {
     if !split.well_formed {
         return None;
     }
-    // A `+incompatible` module (e.g. `github.com/docker/cli`) stays on one import path across its v2+
-    // majors, so there is nothing to rewrite — and synthesizing a `…/vN` old path would trigger a
-    // spurious import-tree scan. The current pin's `+incompatible` marker is what identifies it; the
+    // A `+incompatible` module (e.g. `github.com/docker/cli`) tags its v2+ majors on the bare base
+    // path, so a move that stays there — the common within-line bump, or a drop back to a
+    // compatible v0/v1 — has nothing to rewrite, and synthesizing a `…/vN` old path from the
+    // version's major would trigger a spurious import-tree scan. The one `+incompatible` move that
+    // does change the path is landing on a discovered `…/vN` target (the module adopted
+    // module-style versioning, so `discover_major_paths` found the suffixed path): the old import
+    // path is then the base prefix the `+incompatible` line lived on — without it no import moves,
+    // `go mod tidy` drops the unreferenced new require, and the skip is misreported under the
+    // target identity. The current pin's `+incompatible` marker is what identifies the line; the
     // new path's suffix cannot, since a legitimate downgrade *to* the v1 base path also has none.
     if semver::is_incompatible(change.from.as_str()) {
-        return None;
+        return (!split.path_major.is_empty()).then_some(split.prefix);
     }
     // The old import path is the one for `from`'s major (`new_path` already encodes `to`'s major); v1
     // lives at the base path — except on gopkg.in, which encodes *every* major in the path (v0/v1
@@ -83,15 +89,23 @@ fn capture_import_targets(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        // Skip exactly what the `go` tool itself ignores: directories whose names begin with `.`
-        // or `_` (so `.git`, `_data` container volumes, `_cache`, … are never descended into),
-        // plus `vendor` and `testdata` — and symlinks, whether to a directory or a `.go` file
-        // (`entry.file_type()`, unlike `Path::is_dir`, does not follow them). Beyond matching
-        // Go's own package discovery, this keeps the scan off non-source trees that may be large
-        // or unreadable (e.g. a Docker volume owned by another user), which would otherwise fail
-        // the whole upgrade — as would a captured symlink or other non-regular file, which
-        // `ProjectMutationJournal::capture` refuses to journal.
+        // Skip exactly what the `go` tool itself ignores in the parent module's package walk:
+        // directories whose names begin with `.` or `_` (so `.git`, `_data` container volumes,
+        // `_cache`, … are never descended into), `vendor` and `testdata`, symlinked directories,
+        // and any subdirectory carrying its own `go.mod` (a nested module, pruned below). Beyond
+        // matching Go's own package discovery, this keeps the scan off non-source trees that may
+        // be large or unreadable (e.g. a Docker volume owned by another user), which would
+        // otherwise fail the whole upgrade — as would a captured symlink or other non-regular
+        // file, which `ProjectMutationJournal::capture` refuses to journal.
         let file_type = entry.file_type()?;
+        // Signed-off trade-off: a symlinked *`.go` file* inside a package directory is NOT
+        // ignored by `go build` (it compiles like any regular source file), yet the scan skips
+        // it, so a cross-major apply can leave such a file importing the old major. Capturing it
+        // would be worse: `ProjectMutationJournal::capture` refuses non-regular files because
+        // restore would write through the alias and clobber the link target outside the journal's
+        // control — main's old write-through-symlink behavior broke both directions.
+        // (`entry.file_type()`, unlike `Path::is_dir`, does not follow links, so symlinked
+        // directories and files both land here.)
         if file_type.is_symlink() {
             continue;
         }
@@ -105,6 +119,15 @@ fn capture_import_targets(
                 continue;
             }
             let child = utf8_path(path)?;
+            // A subdirectory with its own `go.mod` is a nested module: `go` prunes it from the
+            // parent module's package walk, and cooldown plans it as its own project with its own
+            // journal. Rewriting its files from here would advance a sibling project's imports to
+            // `…/vN` while that project's `go.mod` still requires the old major — a committed
+            // build break in another project with no rollback, since this apply succeeds. Only
+            // subdirectories are pruned; the scan root holds the module's own `go.mod`.
+            if child.join("go.mod").is_file() {
+                continue;
+            }
             capture_import_targets(root, &child, old, seen, out)?;
             continue;
         }
@@ -376,6 +399,72 @@ mod tests {
                 "v29.5.2+incompatible",
             )),
             None,
+        );
+    }
+
+    #[test]
+    fn incompatible_move_onto_a_versioned_path_rewrites_from_the_base_path() {
+        // The one `+incompatible` case where the import path DOES change: the module adopted
+        // module-style versioning, so `discover_major_paths` (which probes `…/vN` regardless of
+        // the marker) found a suffixed target. The old path is the bare base the `+incompatible`
+        // line imported as; returning None here would leave every import on the base path, let
+        // `go mod tidy` drop the unreferenced `…/v3` require, and misreport the resulting skip
+        // under the target identity.
+        assert_eq!(
+            old_import_path(&change(
+                "example.com/foo/v3",
+                "v2.9.0+incompatible",
+                "v3.0.2"
+            ))
+            .as_deref(),
+            Some("example.com/foo"),
+        );
+    }
+
+    #[test]
+    fn incompatible_downgrade_to_the_base_path_stays_path_stable() {
+        // Rolling a `+incompatible` pin back to a compatible v1 keeps the bare base import path
+        // on both sides — nothing to rewrite, and no bogus `…/v29` old path may be synthesized
+        // from the from-version's major.
+        assert_eq!(
+            old_import_path(&change("example.com/foo", "v29.2.1+incompatible", "v1.5.0")),
+            None,
+        );
+    }
+
+    #[test]
+    fn import_scan_prunes_nested_module_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8 root");
+        let src = "package x\nimport \"example.com/foo/v2\"\n";
+        // The scan root carries the parent module's own `go.mod`; only *sub*directories with a
+        // `go.mod` are module boundaries to prune.
+        std::fs::write(root.join("go.mod"), "module example.com/parent\n").expect("write go.mod");
+        std::fs::write(root.join("main.go"), src).expect("write main.go");
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir pkg");
+        std::fs::write(root.join("pkg").join("dep.go"), src).expect("write pkg dep.go");
+        // `nested` is its own module: `go` prunes it from the parent's package walk and cooldown
+        // plans it as its own project. Capturing (and so rewriting) its matching import from the
+        // parent's apply would break that sibling project with no rollback.
+        std::fs::create_dir_all(root.join("nested")).expect("mkdir nested");
+        std::fs::write(
+            root.join("nested").join("go.mod"),
+            "module example.com/parent/nested\n",
+        )
+        .expect("write nested go.mod");
+        std::fs::write(root.join("nested").join("dep.go"), src).expect("write nested dep.go");
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        capture_import_targets(root, root, "example.com/foo/v2", &mut seen, &mut out)
+            .expect("scan succeeds");
+
+        let mut captured: Vec<&str> = out.iter().map(|path| path.as_str()).collect();
+        captured.sort_unstable();
+        assert_eq!(
+            captured,
+            vec!["main.go", "pkg/dep.go"],
+            "the parent module's files are captured; the nested module's are not"
         );
     }
 

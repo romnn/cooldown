@@ -321,6 +321,45 @@ mod tests {
     }
 
     #[test]
+    fn resolver_conflict_reports_an_incompatible_cross_path_skip_under_the_base_identity() {
+        // A `+incompatible` line moving onto a discovered `…/v3` path: a skip leaves the tree on
+        // the base-path `+incompatible` require, so the row must carry the base identity — not
+        // claim a `…/v3` module pinned at a `+incompatible` from-version, which cannot exist.
+        let change = Change {
+            package: PackageId::new(GO_ID, "example.com/foo/v3", None),
+            from: Version::new("v2.9.0+incompatible"),
+            to: Version::new("v3.0.2"),
+            kind: UpdateKind::Major,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let skipped = resolver_conflict(&change);
+        assert_eq!(skipped.change.package.name, "example.com/foo");
+        assert_eq!(
+            skipped
+                .offending
+                .as_ref()
+                .map(|package| package.name.as_str()),
+            Some("example.com/foo"),
+        );
+        // A path-stable `+incompatible` skip (the common within-line bump) keeps its identity.
+        let within_line = Change {
+            package: PackageId::new(GO_ID, "github.com/docker/cli", None),
+            from: Version::new("v29.2.1+incompatible"),
+            to: Version::new("v29.5.2+incompatible"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        assert_eq!(
+            resolver_conflict(&within_line).change.package.name,
+            "github.com/docker/cli"
+        );
+    }
+
+    #[test]
     fn reached_respects_move_direction() {
         let mut after = HashMap::new();
         after.insert("k8s.io/api".to_string(), "v0.30.2".to_string());
