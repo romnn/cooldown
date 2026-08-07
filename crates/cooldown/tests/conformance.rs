@@ -517,24 +517,50 @@ impl ToolWrite for FakeEco {
         if self.inject_fresh_on_apply {
             state.fresh_transitive_present = true;
         }
+        // The `hold-not-eligible` marker lists package names (one per line) the fake refuses to
+        // move, reported as `NotEligible` skips — the catalog-managed / no-editable-requirement
+        // shape the pnpm and npm adapters produce.
+        let held_not_eligible: Vec<String> =
+            std::fs::read_to_string(self.root.join("hold-not-eligible"))
+                .map(|contents| contents.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+        let mut applied = Vec::new();
+        let mut skipped = Vec::new();
         for change in &plan.changes {
+            if held_not_eligible.contains(&change.package.name) {
+                skipped.push(Skipped {
+                    change: change.clone(),
+                    reason: SkipReason::NotEligible,
+                    offending: Some(change.package.clone()),
+                    detail: Some(format!(
+                        "{} is catalog-managed; update the catalog entry to move it",
+                        change.package.name
+                    )),
+                });
+                continue;
+            }
             state
                 .applied_versions
                 .insert(change.package.name.clone(), change.to.clone());
+            applied.push(change.clone());
         }
         // A whole-graph re-resolve can force packages the plan did not name to move for consistency.
         // Reflect those collateral moves into both the applied report and the graph state, so the
         // executor sees — and must surface — them exactly as the uv adapter does from its lock diff.
-        let mut applied = plan.changes.clone();
-        for collateral in &self.collateral_on_apply {
-            state
-                .applied_versions
-                .insert(collateral.package.name.clone(), collateral.to.clone());
-            applied.push(collateral.clone());
+        // The `collateral-once` marker scopes the float to the first re-resolve only: a later fix
+        // round's narrow downgrade batch does not re-drag the collateral, so a multi-round `fix`
+        // can converge instead of ping-ponging against the float forever.
+        if !(state.apply_attempts > 1 && self.root.join("collateral-once").exists()) {
+            for collateral in &self.collateral_on_apply {
+                state
+                    .applied_versions
+                    .insert(collateral.package.name.clone(), collateral.to.clone());
+                applied.push(collateral.clone());
+            }
         }
         Ok(ApplyReport {
             applied,
-            skipped: Vec::new(),
+            skipped,
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
             warnings: p
                 .root
@@ -2910,6 +2936,101 @@ async fn upgrade_reports_a_matured_target_held_by_the_dist_tag() {
 }
 
 #[tokio::test]
+async fn upgrade_strict_passes_over_a_not_eligible_hold() {
+    // The pnpm-catalog shape: the adapter holds the candidate `NotEligible` because cooldown has no
+    // editable requirement to retarget (the pin lives in the catalog definition). The dep merely
+    // stays on its already-matured older version — a permanent, conservative-correct hold that
+    // `--strict` must not fail, or a catalog-using repo could never pass `upgrade --strict`.
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("hold-not-eligible"), "a\n").unwrap();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let ws = workspace(
+        fake(
+            root.clone(),
+            vec![dep("a", "v1.0.0", true)],
+            Vec::new(),
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+
+    let out = ws
+        .upgrade(&RunOpts {
+            strict: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(
+        out.exit,
+        Exit::Ok,
+        "a NotEligible hold is a statement that cooldown cannot act, not an incomplete upgrade"
+    );
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    assert_eq!(
+        out.items[0].skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::NotEligible)
+    );
+}
+
+#[tokio::test]
+async fn fix_strict_still_fails_on_a_not_eligible_hold() {
+    // Under `fix` the same NotEligible hold leaves a live cooldown violation in the graph — the
+    // too-fresh pin stays — so strict keeps failing, consistent with fix's other unfixable holds
+    // (graph-held, no matured older release).
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("hold-not-eligible"), "a\n").unwrap();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let ws = workspace(
+        fake(
+            root.clone(),
+            vec![dep("a", "v1.0.2", true)],
+            Vec::new(),
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+
+    let out = ws
+        .fix(&RunOpts {
+            strict: true,
+            ..opts()
+        })
+        .await;
+
+    assert_eq!(out.exit, Exit::Policy);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(
+        out.items[0].skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::NotEligible)
+    );
+}
+
+#[tokio::test]
 async fn upgrade_ignoring_dist_tags_crosses_the_tag() {
     let TmpRoot { guard: _g, root } = tmp_root();
     let fake = major_update_fake(root, true, a_v1_and_matured_v2_above_the_tag());
@@ -3298,6 +3419,93 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
             .message
             .contains("left in place by --transitive allow")),
         "the allowed transitive is reported"
+    );
+}
+
+#[tokio::test]
+async fn fix_collapses_a_round_one_float_and_its_round_two_downgrade_into_one_net_row() {
+    // Round 1 downgrades the too-fresh direct `a`; the joint re-resolve floats the transitive `t`
+    // up to a fresh v2.0.0 as collateral. Round 2's re-plan then schedules the `t` downgrade to
+    // its newest matured release. The fixpoint exit must collapse `t`'s two chronological legs
+    // (v1.0.0 → v2.0.0, then v2.0.0 → v1.0.5) into the single net row — this drives the real
+    // `fix_to_fixpoint` wiring, not the collapse helper in isolation.
+    let TmpRoot { guard: _g, root } = tmp_root();
+    // The float happens only on the first re-resolve; the round-2 downgrade must not re-drag it.
+    std::fs::write(root.join("collateral-once"), b"").unwrap();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), too_fresh_fix_releases());
+    releases.insert(
+        "t".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.0.5",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+            // Fresh: the round-1 collateral parks `t` here, making it round 2's fix candidate.
+            rel(
+                "v2.0.0",
+                2,
+                Some("2026-06-16T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        release_named(&too_fresh_fix_releases(), "v1.0.2"),
+    );
+    locked.insert(
+        "t".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let mut floated = dep("t", "v1.0.0", false);
+    // A graph floor below the floated version proves the violation reducible, so the conservative
+    // fix gate lets round 2 mature it down instead of rolling round 1 back.
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+    let mut eco = fake(
+        root.clone(),
+        vec![dep("a", "v1.0.2", true)],
+        vec![floated],
+        releases,
+        locked,
+    );
+    eco.collateral_on_apply = vec![Change {
+        package: PackageId::new(GO, "t", Some("proxy.example".into())),
+        from: Version::new("v1.0.0"),
+        to: Version::new("v2.0.0"),
+        kind: UpdateKind::Major,
+        downgrade: false,
+        direct: false,
+        members: Vec::new(),
+    }];
+
+    let out = workspace(eco, Baseline::default()).fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    let a = out
+        .items
+        .iter()
+        .find(|item| item.name == "a")
+        .expect("a downgraded");
+    assert_eq!((a.from.as_str(), a.to.as_str()), ("v1.0.2", "v1.0.1"));
+    assert!(a.downgrade);
+    let t_rows: Vec<_> = out.items.iter().filter(|item| item.name == "t").collect();
+    assert_eq!(
+        t_rows.len(),
+        1,
+        "the collateral float and its round-2 downgrade must collapse into one net row, got: {t_rows:?}"
+    );
+    assert_eq!(
+        (t_rows[0].from.as_str(), t_rows[0].to.as_str()),
+        ("v1.0.0", "v1.0.5")
+    );
+    assert!(
+        !t_rows[0].downgrade,
+        "the net move (v1.0.0 → v1.0.5) is forward"
     );
 }
 

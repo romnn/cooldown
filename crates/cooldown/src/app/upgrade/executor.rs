@@ -1737,14 +1737,24 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .filter(|package| *package != skipped.change.package)
                 .map(|package| package_label(&package));
             // Deliberate policy holds are conservative-correct, not failed upgrades.
-            if !matches!(
+            let conservative_hold = matches!(
                 skipped.reason,
                 SkipReason::NeedsMajor
                     | SkipReason::DeclaredBoundHeld
                     | SkipReason::MaxMajorHeld
                     | SkipReason::DistTagHeld
                     | SkipReason::MultiVersionHeld
-            ) {
+            )
+            // `NotEligible` says cooldown has no editable requirement to act on (a transitive-only
+            // or path/git dep, an unscopable override, a pnpm catalog-managed pin). Under forward
+            // `upgrade` the dep merely stays on its already-matured older version — conservative-
+            // correct, and permanently so: failing `--strict` would make e.g. a catalog-using repo
+            // unable to ever pass, with no cooldown-side remedy. Under `fix` the same hold leaves a
+            // live cooldown violation in the graph, so it still fails strict, consistent with fix's
+            // other unfixable-hold paths (graph-held, no matured older release).
+            || (skipped.reason == SkipReason::NotEligible
+                && matches!(self.mode, PlanMode::Upgrade { .. }));
+            if !conservative_hold {
                 outcome.strict_incomplete = true;
             }
             let change = skipped.change;
