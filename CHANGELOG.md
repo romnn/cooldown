@@ -18,13 +18,18 @@
 - **Go import rewrites are lexical.** A cross-major bump rewrites `.go` import paths with a
   quote-aware scanner instead of plain text replacement: no more doubled `/v2` suffixes, imports in
   strings/comments handled by quote parity, gopkg.in's `pkg.v1` low-major paths rewritten
-  correctly, and symlinked trees skipped exactly as the `go` tool skips them.
+  correctly, a `+incompatible` module moving onto a `/vN` path rewritten from its base path (and a
+  skipped move reported under that base identity), and symlinked trees and nested `go.mod` module
+  directories skipped exactly as the `go` tool skips them.
 - **pnpm lock repair and truthful holds.** A lock a resolve leaves floated (an importer copy
   outside its declared range) is repaired through the override engine before being declared stale;
-  `catalog:`/`workspace:`/`npm:` specifiers are never rewritten by constraint widening; peer-conflict
-  blame reads the lockfileVersion 9 `snapshots:` section; and a copy that lands beneath a newer
+  `catalog:`/`workspace:`/`npm:` specifiers are never rewritten by constraint widening, and a
+  candidate every declaring importer manages through a `catalog:` entry is held with an explicit
+  not-eligible reason instead of surfacing as a resolver conflict; peer-conflict
+  blame reads the lockfileVersion 9 `snapshots:` section; a copy that lands beneath a newer
   same-name duplicate is reported as applied (pnpm) instead of vanishing, or rolled back as a
-  phantom conflict (npm).
+  phantom conflict (npm); and a `pnpm-lock.yaml` that is malformed or written by pnpm 8 or older
+  (lockfileVersion < 9) is a clear error instead of an empty, healthy-looking dependency graph.
 - **Failures surface instead of hiding**: a candidate dropped during mutation recovery is a
   per-candidate error rather than a silent skip behind `0 errors`, registry fetches retry a lone
   transient transport failure once before failing the row, and resolver-quoted URL credentials are
