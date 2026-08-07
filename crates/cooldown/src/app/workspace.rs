@@ -963,7 +963,12 @@ pub(crate) fn diag_from_error(
     project: &str,
     package: Option<&str>,
 ) -> Diagnostic {
-    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), err.to_string())
+    // `CoreError::Tool` embeds the tool's verbatim stderr, which can quote credentialed registry
+    // URLs (`https://user:secret@host/`). Every error that becomes a report diagnostic funnels
+    // through here, so redact at this choke point — the message reaches the TTY and the JSON
+    // envelope unmodified downstream.
+    let message = cooldown_core::redact::url_secrets(&err.to_string());
+    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), message)
         .with_tool(tool.as_str())
         .with_project(project);
     if let Some(package) = package {
@@ -989,7 +994,11 @@ pub(crate) fn lock_report_outcome(
         LockStatus::Stale => DiagnosticKind::StaleLock,
         LockStatus::Unknown => DiagnosticKind::LockUnknown,
     };
-    let diagnostic = Diagnostic::new(kind, report.detail)
+    // The detail is tool output (a verifier's stderr can quote registry URLs), so it gets the same
+    // secret redaction as `diag_from_error` messages. Moving it out keeps `report` consumed for
+    // the by-value signature.
+    let detail = report.detail;
+    let diagnostic = Diagnostic::new(kind, cooldown_core::redact::url_secrets(&detail))
         .with_tool(tool.as_str())
         .with_project(project_label)
         .with_path(manifest.as_str());
@@ -1514,5 +1523,32 @@ mod tests {
             .expect("dependencies");
 
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn diag_from_error_redacts_url_secrets_in_tool_stderr() {
+        // A registry configured with inline credentials leaks them through the tool's stderr; the
+        // diagnostic message reaches the TTY and JSON envelope verbatim, so the choke point must
+        // mask the secret while keeping the host for debuggability.
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".to_string(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: "failed to fetch https://user:hunter2@registry.example/index/config.json"
+                .to_string(),
+        };
+
+        let diag = diag_from_error(&error, CARGO, ".", Some("serde"));
+
+        assert_eq!(diag.kind, cooldown_core::DiagnosticKind::ToolFailed);
+        assert!(
+            diag.message.contains("registry.example"),
+            "the host survives redaction, got: {}",
+            diag.message
+        );
+        assert!(
+            !diag.message.contains("hunter2"),
+            "the credential must be redacted, got: {}",
+            diag.message
+        );
     }
 }

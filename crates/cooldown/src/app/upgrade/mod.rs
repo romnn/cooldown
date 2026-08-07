@@ -600,10 +600,15 @@ async fn build_published_project(
         Ok(report) => {
             acc.build_ok = Some(acc.build_ok.unwrap_or(true) && report.ok);
             if !report.ok {
+                // Build failures quote the tool's stderr, which can embed credentialed registry
+                // URLs on private indexes — redact like every other diagnostic detail.
                 acc.errors.push(
-                    Diagnostic::new(DiagnosticKind::ToolFailed, report.detail)
-                        .with_tool(pctx.tool.as_str())
-                        .with_project(pctx.rel_path.as_str()),
+                    Diagnostic::new(
+                        DiagnosticKind::ToolFailed,
+                        cooldown_core::redact::url_secrets(&report.detail),
+                    )
+                    .with_tool(pctx.tool.as_str())
+                    .with_project(pctx.rel_path.as_str()),
                 );
             }
         }

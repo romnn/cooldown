@@ -1895,10 +1895,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 LockStatus::Stale => {
                     self.record_lock_status(LockStatus::Stale);
-                    let diag = Diagnostic::new(DiagnosticKind::StaleLock, report.detail)
-                        .with_tool(self.ctx.tool_name())
-                        .with_project(self.project_label())
-                        .with_path(self.ctx.pctx.project.manifest.as_str());
+                    // Lock-verify and build details below are tool output (stderr can quote
+                    // credentialed registry URLs), so each is redacted before it becomes a
+                    // diagnostic, matching `diag_from_error`.
+                    let diag = Diagnostic::new(
+                        DiagnosticKind::StaleLock,
+                        cooldown_core::redact::url_secrets(&report.detail),
+                    )
+                    .with_tool(self.ctx.tool_name())
+                    .with_project(self.project_label())
+                    .with_path(self.ctx.pctx.project.manifest.as_str());
                     if self.ctx.opts.allow_stale_lock {
                         self.acc.warnings.push(diag);
                     } else {
@@ -1912,10 +1918,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     } else {
                         self.record_lock_status(LockStatus::Unknown);
                         self.acc.warnings.push(
-                            Diagnostic::new(DiagnosticKind::LockUnknown, report.detail)
-                                .with_tool(self.ctx.tool_name())
-                                .with_project(self.project_label())
-                                .with_path(self.ctx.pctx.project.manifest.as_str()),
+                            Diagnostic::new(
+                                DiagnosticKind::LockUnknown,
+                                cooldown_core::redact::url_secrets(&report.detail),
+                            )
+                            .with_tool(self.ctx.tool_name())
+                            .with_project(self.project_label())
+                            .with_path(self.ctx.pctx.project.manifest.as_str()),
                         );
                     }
                 }
@@ -1939,9 +1948,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     self.acc.build_ok = Some(self.acc.build_ok.unwrap_or(true) && report.ok);
                     if !report.ok {
                         self.acc.errors.push(
-                            Diagnostic::new(DiagnosticKind::ToolFailed, report.detail)
-                                .with_tool(self.ctx.tool_name())
-                                .with_project(self.project_label()),
+                            Diagnostic::new(
+                                DiagnosticKind::ToolFailed,
+                                cooldown_core::redact::url_secrets(&report.detail),
+                            )
+                            .with_tool(self.ctx.tool_name())
+                            .with_project(self.project_label()),
                         );
                     }
                 }
@@ -2027,6 +2039,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let reason = detail
                 .split_once("; recovery evidence at ")
                 .map_or(detail.as_str(), |(reason, _)| reason);
+            // The reason can carry adapter/tool text; redact like `diag_from_error`, which the
+            // fallthrough below already applies to every other error.
+            let reason = cooldown_core::redact::url_secrets(reason);
             let mut diagnostic = Diagnostic::new(
                 DiagnosticKind::Filesystem,
                 format!(

@@ -56,7 +56,12 @@ pub(super) fn run_preparation_error(error: &CoreError, exit: Exit) -> Result<Exi
             Vec::<render::RecoveryItem>::new(),
         ),
         Vec::new(),
-        vec![Diagnostic::new(error.diagnostic_kind(), error.to_string())],
+        // No tool spawns on the setup path today, but error text can still quote configured
+        // registry URLs — route through the same redaction as every other diagnostic.
+        vec![Diagnostic::new(
+            error.diagnostic_kind(),
+            cooldown_core::redact::url_secrets(&error.to_string()),
+        )],
     );
     emit_envelope(true, &envelope, String::new)?;
     Ok(exit)
