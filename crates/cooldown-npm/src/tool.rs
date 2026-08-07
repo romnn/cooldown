@@ -50,9 +50,15 @@ struct WholeGraphInputs {
 /// joint resolve forced on other packages, and the candidates left held below their target). A name
 /// that resolves to several versions (a duplicated graph copy) keeps its newest, so a moved direct
 /// declaration is never masked by a stale transitive copy of the same name.
-fn locked_versions<L: NodeLock>(content: &str) -> HashMap<String, String> {
+///
+/// The strict parse failure propagates instead of defaulting to an empty map: an empty default
+/// would diff a present-but-corrupted lock as "nothing resolved", silently reporting every
+/// candidate unmoved/unreached — the healthy-looking failure the fail-closed [`NodeLock::parse`]
+/// contract exists to prevent.
+/// A caller with legitimately absent content decides fail-open at its own call site.
+fn locked_versions<L: NodeLock>(content: &str) -> Result<HashMap<String, String>> {
     let mut versions: HashMap<String, String> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version } in L::parse(content)? {
         match versions.entry(name) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 if version::compare(&version, slot.get()).is_gt() {
@@ -64,7 +70,7 @@ fn locked_versions<L: NodeLock>(content: &str) -> HashMap<String, String> {
             }
         }
     }
-    versions
+    Ok(versions)
 }
 
 /// Resolve each member path to its `package.json` "name", read once per `dependencies()` call. A
@@ -430,7 +436,7 @@ fn candidate_moved(
 /// cutoff, so the landing must be read back from the lock.
 fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Result<bool> {
     let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-    let newest = locked_versions::<L>(&content);
+    let newest = locked_versions::<L>(&content)?;
     let target = change.to.as_str();
     if change.members.is_empty() {
         return Ok(newest
@@ -585,8 +591,11 @@ impl<L: NodeLock> NpmTool<L> {
         baseline_journal: &ProjectMutationJournal,
         workspace: &[WorkspacePeer],
     ) -> Result<ApplyReport> {
+        // A project without a journaled lock diffs from an empty baseline; a present but
+        // unparsable one is a real error, never an empty graph.
         let before = journaled_lock::<L>(baseline_journal)
             .map(locked_versions::<L>)
+            .transpose()?
             .unwrap_or_default();
         let mut report = ApplyReport::default();
         let mut violation_baseline: Option<PeerViolations> = None;
@@ -648,9 +657,13 @@ impl<L: NodeLock> NpmTool<L> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
+        // This is fresh post-install content the driver just wrote, so the earlier strict reads
+        // prove nothing about it: a failed parse must fail the batch rather than diff against an
+        // empty map that hides every collateral move. Only an absent lock diffs as empty.
         let after = after_content
             .as_deref()
             .map(locked_versions::<L>)
+            .transpose()?
             .unwrap_or_default();
         let collateral = collateral_changes::<L>(&before, &after, &report.applied);
         report.applied.extend(collateral);
@@ -727,7 +740,12 @@ impl<L: NodeLock> NpmTool<L> {
             return Ok(report);
         }
         let plan = &plan;
-        let before = before_content.map(locked_versions::<L>).unwrap_or_default();
+        // An absent pre-apply lock diffs from an empty baseline; a present but unparsable one is
+        // a real error, never an empty graph.
+        let before = before_content
+            .map(locked_versions::<L>)
+            .transpose()?
+            .unwrap_or_default();
         let multi_version = before_content
             .map(multi_version_names::<L>)
             .unwrap_or_default();
@@ -739,6 +757,7 @@ impl<L: NodeLock> NpmTool<L> {
             .unwrap_or_default();
         let version_lines = before_content
             .map(resolved_version_lines::<L>)
+            .transpose()?
             .unwrap_or_default();
         let advance = classify_transitive_advance(plan, &importer_declared, &version_lines);
 
@@ -767,7 +786,9 @@ impl<L: NodeLock> NpmTool<L> {
                 &mut peer_skips,
             )
             .await?;
-        let after = locked_versions::<L>(&after_content);
+        // Post-resolve content pnpm just wrote: a strict-parse failure fails the batch — an empty
+        // default would report every candidate held and every collateral move invisible.
+        let after = locked_versions::<L>(&after_content)?;
         // Per-importer resolved versions, so a candidate's landing is judged at *its* member rather
         // than the name's newest copy — the multi-version float leaves a lower line short of a
         // cross-line target the higher line already satisfies.
@@ -817,7 +838,7 @@ impl<L: NodeLock> NpmTool<L> {
                     change,
                     &after_content,
                     advanced,
-                ));
+                )?);
             }
         }
 
@@ -1403,45 +1424,54 @@ fn resolver_conflict_hold<L: NodeLock>(
     change: &Change,
     after_content: &str,
     advanced: bool,
-) -> Skipped {
+) -> Result<Skipped> {
     let name = change.package.name.as_str();
     let offender = peer_conflict_blocker(after_content, name).unwrap_or_else(|| name.to_string());
-    Skipped {
+    let detail = if advanced {
+        // The settlement may have re-resolved the copy to a different in-range version than
+        // the pre-apply one; the row names where the graph actually settled, since a stale
+        // `from` would contradict the collateral row that shows the real landing.
+        // An unparsable settlement lock fails the verdict instead of silently naming the
+        // pre-apply version; only a name genuinely absent from a parsable lock falls back.
+        let settled = resolved_version_lines::<L>(after_content)?
+            .remove(name)
+            .and_then(|versions| {
+                let line = version::major_key(change.from.as_str()).0;
+                versions
+                    .into_iter()
+                    .find(|version| version::major_key(version).0 == line)
+            })
+            .unwrap_or_else(|| change.from.as_str().to_string());
+        Some(format!(
+            "the transitive advance did not land: a dependent's declared range holds it at {settled}"
+        ))
+    } else {
+        None
+    };
+    Ok(Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
-        detail: advanced.then(|| {
-            // The settlement may have re-resolved the copy to a different in-range version than
-            // the pre-apply one; the row names where the graph actually settled, since a stale
-            // `from` would contradict the collateral row that shows the real landing.
-            let settled = resolved_version_lines::<L>(after_content)
-                .remove(name)
-                .and_then(|versions| {
-                    let line = version::major_key(change.from.as_str()).0;
-                    versions
-                        .into_iter()
-                        .find(|version| version::major_key(version).0 == line)
-                })
-                .unwrap_or_else(|| change.from.as_str().to_string());
-            format!(
-                "the transitive advance did not land: a dependent's declared range holds it at {settled}"
-            )
-        }),
-    }
+        detail,
+    })
 }
 
 /// Every registry-resolved version line per name in the lock — the multiset the per-candidate
 /// advance verdicts are judged against, where the report's newest-copy projection would collapse
 /// duplicate copies.
-fn resolved_version_lines<L: NodeLock>(content: &str) -> HashMap<String, BTreeSet<String>> {
+///
+/// The strict parse failure propagates instead of defaulting to an empty multiset: an empty
+/// default would silently judge every name single-line, letting an advance verdict pass on a
+/// corrupted lock (see [`locked_versions`] for the same fail-closed contract).
+fn resolved_version_lines<L: NodeLock>(content: &str) -> Result<HashMap<String, BTreeSet<String>>> {
     let mut lines: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version } in L::parse(content)? {
         if version.contains(':') {
             continue;
         }
         lines.entry(name).or_default().insert(version);
     }
-    lines
+    Ok(lines)
 }
 
 /// The plan's direct exact pins re-keyed for the override engine: each name gains its target's
@@ -1942,7 +1972,7 @@ mod tests {
     #[test]
     fn locked_versions_keeps_the_newest_copy_of_a_duplicated_name() {
         let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  foo@1.0.0:\n    resolution: {integrity: sha512-a}\n\n  foo@2.0.0:\n    resolution: {integrity: sha512-b}\n\n  bar@3.1.0:\n    resolution: {integrity: sha512-c}\n";
-        let versions = locked_versions::<Pnpm>(lock);
+        let versions = locked_versions::<Pnpm>(lock).expect("a well-formed lock parses");
         assert_eq!(versions.get("foo").map(String::as_str), Some("2.0.0"));
         assert_eq!(versions.get("bar").map(String::as_str), Some("3.1.0"));
     }
@@ -2030,7 +2060,7 @@ packages:
     resolution: {integrity: sha512-b}
 ";
         let after_members = Pnpm::member_sources(lock);
-        let after_newest = locked_versions::<Pnpm>(lock);
+        let after_newest = locked_versions::<Pnpm>(lock).expect("a well-formed lock parses");
         assert_eq!(
             after_newest.get("@types/node").map(String::as_str),
             Some("25.9.2")
@@ -2444,18 +2474,43 @@ packages:
                 resolution: {integrity: sha512-a}
         "};
 
-        let hold = resolver_conflict_hold::<Pnpm>(&advance, after, true);
+        let hold = resolver_conflict_hold::<Pnpm>(&advance, after, true)
+            .expect("a parsable settlement lock yields the hold");
         let detail = hold.detail.expect("advanced holds carry a detail");
         assert!(
             detail.contains("holds it at 3.4.9"),
             "the settled copy, not the stale pre-apply version, is named: {detail}"
         );
 
-        let unresolvable = resolver_conflict_hold::<Pnpm>(&advance, "", true);
+        // An empty document is a legitimately empty lock, not a parse failure: the name is simply
+        // absent, so the pre-apply version is the honest fallback.
+        let unresolvable =
+            resolver_conflict_hold::<Pnpm>(&advance, "", true).expect("an empty lock is parsable");
         let detail = unresolvable.detail.expect("advanced holds carry a detail");
         assert!(
             detail.contains("holds it at 3.4.8"),
             "with no settled copy to read, the pre-apply version is the honest fallback: {detail}"
+        );
+    }
+
+    /// A present but unparsable settlement lock fails the advanced-hold verdict instead of
+    /// silently falling back to the single-line/pre-apply reading — the same fail-closed contract
+    /// as the resolved-package parse.
+    #[test]
+    fn advanced_hold_verdict_fails_closed_on_an_unparsable_lock() {
+        let mut advance = change("debug", "3.4.8", "3.5.0");
+        advance.direct = false;
+        let malformed = indoc! {"
+            lockfileVersion: '9.0'
+            packages:
+              debug@3.4.9: [unclosed
+        "};
+
+        let error = resolver_conflict_hold::<Pnpm>(&advance, malformed, true)
+            .expect_err("an unparsable lock is an error, not a stale-from fallback");
+        assert!(
+            matches!(error, CoreError::LockUnreadable(_)),
+            "typed lock error, got: {error:?}"
         );
     }
 
@@ -2606,8 +2661,8 @@ packages:
                 resolution: {integrity: sha512-b}
         "};
         let after_lock = before_lock.replace("4.1.1", "4.1.2");
-        let before = locked_versions::<Pnpm>(before_lock);
-        let after = locked_versions::<Pnpm>(&after_lock);
+        let before = locked_versions::<Pnpm>(before_lock).expect("a well-formed lock parses");
+        let after = locked_versions::<Pnpm>(&after_lock).expect("a well-formed lock parses");
         assert_eq!(
             before.get("chalk").map(String::as_str),
             Some("5.6.0"),
@@ -2670,6 +2725,33 @@ packages:
         assert!(
             !exact_target_reached::<Npm>(&project, &short)?,
             "an instance short of its target is still short"
+        );
+        Ok(())
+    }
+
+    /// A present but unparsable post-install lock fails the landing read-back instead of
+    /// answering "unreached" — `Ok(false)` would roll a possibly-landed candidate back as a
+    /// resolver conflict on every run.
+    #[test]
+    fn exact_target_reached_fails_closed_on_an_unparsable_lock() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        // Truncated JSON: present content the strict parse must reject.
+        std::fs::write(root.join("package-lock.json"), r#"{ "lockfileVersion": 3,"#)?;
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let landed = change("chalk", "4.1.1", "4.1.2");
+
+        let error = exact_target_reached::<Npm>(&project, &landed)
+            .expect_err("an unparsable lock is an error, not an unreached target");
+        assert!(
+            matches!(error, CoreError::Parse(_)),
+            "npm's strict lock parse error propagates, got: {error:?}"
         );
         Ok(())
     }
@@ -2809,6 +2891,100 @@ packages:
         Ok(())
     }
 
+    /// The whole-graph report diff fails the batch when the resolve exits 0 but leaves a present,
+    /// unparsable lock: the strict parse error propagates instead of diffing every candidate as
+    /// held against an empty version map — the healthy-looking failure the fail-closed parse
+    /// closes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn whole_graph_apply_fails_closed_when_the_resolve_writes_an_unparsable_lock()
+    -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "app", "dependencies": { "dep": "^1.0.0" } }"#,
+        )?;
+        // The pre-apply lock is valid, so only the post-resolve re-read can fail the parse.
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            indoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      dep:
+                        specifier: ^1.0.0
+                        version: 1.0.0
+
+                packages:
+
+                  dep@1.0.0:
+                    resolution: {integrity: sha512-a}
+            "},
+        )?;
+        std::fs::write(
+            root.join("malformed.yaml"),
+            indoc! {"
+                lockfileVersion: '9.0'
+                packages:
+                  dep@1.1.0: [unclosed
+            "},
+        )?;
+        // A scripted pnpm whose every resolve leg "succeeds" while leaving the unparsable lock.
+        let script = root.join("fake-pnpm.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                case "$*" in
+                  *"config get"*)
+                    echo 'null'; exit 0 ;;
+                  *)
+                    cp malformed.yaml pnpm-lock.yaml; exit 0 ;;
+                esac
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut planned = change("dep", "1.0.0", "1.1.0");
+        planned.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+        let plan = Plan {
+            changes: vec![planned],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let error = tool
+            .apply_whole_graph(&project, &plan, &journal, &[])
+            .await
+            .expect_err("an unparsable post-resolve lock must fail the batch, not read as held");
+        assert!(
+            matches!(error, CoreError::LockUnreadable(_)),
+            "typed lock error, got: {error:?}"
+        );
+        Ok(())
+    }
+
     /// The repair's override keys must scope each direct pin to its target's major line so a
     /// same-name copy on another major is never captured; only an unparsable major falls back to
     /// the graph-wide key.
@@ -2856,6 +3032,56 @@ packages:
         assert_eq!(report.skipped[0].reason, SkipReason::NotEligible);
         let manifest = std::fs::read_to_string(root.join("package.json"))?;
         assert_eq!(manifest, r#"{ "name": "root" }"#);
+        Ok(())
+    }
+
+    /// The per-package post-apply diff fails the batch when the on-disk lock turns unparsable
+    /// during the apply loop: the journaled BEFORE parsed fine, but the AFTER is new content whose
+    /// failed parse must surface instead of diffing as an empty graph that hides every move.
+    #[tokio::test]
+    async fn apply_fails_closed_when_the_post_apply_lock_is_unparsable() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#)?;
+        std::fs::write(
+            root.join("package-lock.json"),
+            indoc! {r#"{
+                "name": "root",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/nanoid": { "version": "3.1.0" }
+                }
+            }"#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        // No manifest declares nanoid, so the candidate is held not-eligible without invoking
+        // npm and the batch still reaches the final before/after diff.
+        let plan = Plan {
+            changes: vec![change("nanoid", "3.1.0", "3.3.0")],
+            rewrite: RewriteMode::Always,
+            ..Plan::default()
+        };
+        let tool = tool();
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        // Corrupt the on-disk lock after the journal captured the valid pre-apply copy — the
+        // shape of a driver run that exits 0 but writes a lock the strict parse rejects.
+        std::fs::write(root.join("package-lock.json"), r#"{ "lockfileVersion": 3,"#)?;
+
+        let error = tool
+            .apply(&mutation)
+            .await
+            .expect_err("an unparsable post-apply lock must fail the batch, not diff as empty");
+        assert!(
+            matches!(error, CoreError::Parse(_)),
+            "npm's strict lock parse error propagates, got: {error:?}"
+        );
         Ok(())
     }
 }
