@@ -392,10 +392,16 @@ struct DeclaredBoundEdge {
     upper: UpperBound,
 }
 
-/// One manifest requirement awaiting a join to Cargo's active named resolve edge.
+/// One manifest requirement awaiting a join to Cargo's active resolve edge.
 struct DeclaredRequirementEdge {
     requirer: String,
-    dependency_name: String,
+    /// The manifest rename (`alias = { package = "…" }`), when the declaration uses one. The
+    /// resolve graph names a renamed edge by the rename, so it stays the join key — which also
+    /// keeps an *inactive* renamed declaration off the same package's other active edges. A plain
+    /// declaration cannot join by edge name at all: the resolve graph then names the edge by the
+    /// dependency's **lib target**, which a custom `[lib] name` decouples from the package name,
+    /// so it joins through the edge's resolved package identity instead.
+    rename: Option<String>,
     package_name: String,
     requirement: String,
 }
@@ -564,9 +570,13 @@ fn resolved_declared_requirements(
             continue;
         };
         for edge in edges {
-            let names_match = edge.dependency_name.replace('-', "_")
-                == candidate.dependency_name.replace('-', "_");
-            if !names_match {
+            // A renamed declaration joins by its rename (hyphen/underscore-normalized), which the
+            // resolve edge reliably carries. A plain declaration's edge name is the dependency's
+            // lib target name — decoupled from the package name by a custom `[lib] name` — so the
+            // package-identity and requirement-admission checks below are its whole join.
+            if let Some(rename) = &candidate.rename
+                && edge.dependency_name.replace('-', "_") != rename.replace('-', "_")
+            {
                 continue;
             }
             let Some(target) = packages.get(&edge.package_id) else {
@@ -1077,7 +1087,7 @@ impl Cargo {
                 if !is_dev || roots.contains(&p.id) {
                     declared_requirement_edges.push(DeclaredRequirementEdge {
                         requirer: p.id.clone(),
-                        dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
+                        rename: dep.rename.clone(),
                         package_name: dep.name.clone(),
                         requirement: dep.req.clone(),
                     });
@@ -1431,6 +1441,61 @@ mod tests {
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].requirement, ">=1, <3");
         assert_eq!(requirements[0].resolved.version, "2.0.0");
+    }
+
+    #[test]
+    fn edge_requirements_join_a_custom_lib_target_name_through_package_identity() {
+        // `resolve.nodes[].deps[].name` is the dependency's *lib target* name: a package with
+        // `[lib] name = "weird_lib"` never matches its own package name, so a name-based join
+        // silently degraded every edge onto it to an Unaddressable "metadata did not identify"
+        // row. Plain declarations join through the edge's package id instead; the renamed
+        // declaration beside it still joins through its rename.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "consumer", "name": "consumer", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                         {"name": "odd-crate", "req": "^1"},
+                         {"name": "dep", "rename": "dep-one", "req": "^1"}
+                     ]},
+                    {"id": "odd", "name": "odd-crate", "version": "1.2.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "dep-v1", "name": "dep", "version": "1.5.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "consumer", "deps": [
+                        {"name": "weird_lib", "pkg": "odd"},
+                        {"name": "dep_one", "pkg": "dep-v1"}
+                    ]},
+                    {"id": "odd", "deps": []},
+                    {"id": "dep-v1", "deps": []}
+                ]}
+            }
+        "#});
+        let consumer = LockPackageId::new("consumer", "1.0.0", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&consumer];
+
+        assert_eq!(requirements.len(), 2);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.dependency == "odd-crate"
+                    && requirement.resolved.version == "1.2.0"
+                    && requirement.requirement == "^1"
+            }),
+            "a custom lib target name must not break the requirement join"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.dependency == "dep" && requirement.resolved.version == "1.5.0"
+            }),
+            "a manifest rename still joins through its rename"
+        );
     }
 
     #[test]
