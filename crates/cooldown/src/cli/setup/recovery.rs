@@ -8,7 +8,8 @@ use cooldown_cargo::{
     recovery_authority_projects,
 };
 use cooldown_core::{
-    CoreError, Diagnostic, ProjectDetection, ProjectMarker, ToolId, recognized_tool_names, tool_id,
+    CoreError, Diagnostic, DiagnosticKind, ProjectDetection, ProjectMarker, ToolId,
+    recognized_tool_names, tool_id,
 };
 
 struct RecoveryOption {
@@ -138,7 +139,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let mut targets = Vec::new();
     let mut warnings = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
-        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root, &scope)?;
+        let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root, &scope, &mut warnings)?;
         let discovery = cargo_recovery_discovery(&scope, !global.no_gitignore)?;
         roots.extend(discovery.roots);
         warnings.extend(discovery.warnings);
@@ -181,6 +182,7 @@ fn direct_cargo_recovery_roots(
     workdir: &Utf8Path,
     repo_root: &Utf8Path,
     scope: &RecoveryScope,
+    warnings: &mut Vec<Diagnostic>,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
     let mut roots = Vec::new();
     // `find_repo_root` can fall back to a non-ancestor (`$HOME`, when no repository marker exists
@@ -202,18 +204,32 @@ fn direct_cargo_recovery_roots(
                 Ok(false) => {}
                 // A traverse-only parent (mode 711 is common for shared roots like `/srv`) holds
                 // nothing recoverable from here, so skip it; the directory the user is standing in
-                // still fails loudly when unreadable.
+                // still fails loudly when unreadable. The skip is a report warning rather than a
+                // `tracing::warn!` because logging is off by default, and an unlistable ancestor
+                // can hide recovery artifacts this probe would otherwise have found — the caller
+                // already aggregates discovery warnings, so the user gets to see it.
                 Err(error)
                     if ancestor != workdir
                         && error.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
-                    tracing::debug!(
-                        %ancestor,
-                        %error,
-                        "skipping unreadable ancestor during direct recovery probe"
+                    warnings.push(
+                        Diagnostic::new(
+                            DiagnosticKind::Filesystem,
+                            format!(
+                                "skipped unreadable ancestor {ancestor} while probing for Cargo recovery artifacts: {error}"
+                            ),
+                        )
+                        .with_tool(CARGO_ID.as_str())
+                        .with_path(ancestor.as_str()),
                     );
                 }
-                Err(error) => return Err(error.into()),
+                // The io error alone does not say which directory failed; name the probed path so
+                // the loud failure is actionable.
+                Err(error) => {
+                    return Err(CoreError::Filesystem(format!(
+                        "cannot probe {ancestor} for Cargo recovery artifacts: {error}"
+                    )));
+                }
             }
         }
         if ancestor == stop {
@@ -281,24 +297,31 @@ fn cargo_recovery_discovery(
     respect_gitignore: bool,
 ) -> Result<CargoRecoveryDiscovery, CoreError> {
     let root = scope.root();
-    let mut authoritative = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name);
+    let artifact_scan = scan::find_recovery_artifact_dirs(root, is_recovery_artifact_name);
+    let mut authoritative = artifact_scan.dirs;
     let authority = recovery_authority_projects(scope)?;
     authoritative.extend(authority.projects);
-    let warnings = authority
-        .warnings
+    // An unreadable subtree can hide an interrupted project the authority anchors do not reach (a
+    // nested repository, or orphan artifacts with no anchor), so each skip becomes a user-visible
+    // warning beside the authority-validation warnings.
+    let mut warnings: Vec<Diagnostic> = artifact_scan
+        .skipped_unreadable
         .into_iter()
-        .map(|warning| {
-            Diagnostic::new(
-                warning.error.diagnostic_kind(),
-                format!(
-                    "could not validate Cargo recovery authority at {}: {}",
-                    warning.path, warning.error
-                ),
-            )
-            .with_tool(CARGO_ID.as_str())
-            .with_path(warning.path.as_str())
+        .map(|message| {
+            Diagnostic::new(DiagnosticKind::Filesystem, message).with_tool(CARGO_ID.as_str())
         })
         .collect();
+    warnings.extend(authority.warnings.into_iter().map(|warning| {
+        Diagnostic::new(
+            warning.error.diagnostic_kind(),
+            format!(
+                "could not validate Cargo recovery authority at {}: {}",
+                warning.path, warning.error
+            ),
+        )
+        .with_tool(CARGO_ID.as_str())
+        .with_path(warning.path.as_str())
+    }));
     let detected = scan::find_project_marker_dirs_batch(
         root,
         &[ProjectDetection::PrimaryWithValidation {
@@ -459,7 +482,7 @@ mod tests {
         symlink("missing-record", root.join(RECOVERY_MARKER))?;
 
         assert_eq!(
-            direct_cargo_recovery_roots(root, root, &explicit_scope(root)?)?,
+            direct_cargo_recovery_roots(root, root, &explicit_scope(root)?, &mut Vec::new())?,
             vec![root.to_owned()]
         );
         assert_eq!(
@@ -484,7 +507,12 @@ mod tests {
         std::fs::write(workdir.join(RECOVERY_MARKER), "{}")?;
 
         // The explicit scope includes ancestors, so only the walk bound keeps the parent out.
-        let roots = direct_cargo_recovery_roots(&workdir, &home, &explicit_scope(&workdir)?)?;
+        let roots = direct_cargo_recovery_roots(
+            &workdir,
+            &home,
+            &explicit_scope(&workdir)?,
+            &mut Vec::new(),
+        )?;
 
         assert_eq!(
             roots,
@@ -509,15 +537,31 @@ mod tests {
         std::fs::write(root.join(RECOVERY_MARKER), "{}")?;
         // Traverse-only (no read bit): the walk may pass through the parent but cannot list it.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311))?;
+        // Permission bits do not bind when running as root; the skip (and its warning) then never
+        // fires, so the warning assertion below must be skipped too.
+        let bits_bind = std::fs::read_dir(&parent).is_err();
 
-        let result = direct_cargo_recovery_roots(&workdir, root, &explicit_scope(&workdir)?);
+        let mut warnings = Vec::new();
+        let result =
+            direct_cargo_recovery_roots(&workdir, root, &explicit_scope(&workdir)?, &mut warnings);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))?;
 
         assert_eq!(
             result?,
-            vec![workdir, root.to_owned()],
+            vec![workdir.clone(), root.to_owned()],
             "the unreadable parent is skipped; the readable grandparent is still probed"
         );
+        if bits_bind {
+            // The skip must be user-visible: an unlistable ancestor can hide recovery artifacts.
+            let warning = warnings
+                .first()
+                .ok_or_else(|| eyre::eyre!("the skipped ancestor must be reported"))?;
+            assert!(
+                warning.message.contains(parent.as_str()),
+                "the warning names the skipped ancestor, got: {}",
+                warning.message
+            );
+        }
         Ok(())
     }
 
@@ -539,12 +583,15 @@ mod tests {
             return Ok(());
         }
 
-        let result = direct_cargo_recovery_roots(&workdir, root, &scope);
+        let result = direct_cargo_recovery_roots(&workdir, root, &scope, &mut Vec::new());
         std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o755))?;
 
+        let error = result.err().ok_or_else(|| {
+            eyre::eyre!("the user's own directory must fail loudly when unreadable")
+        })?;
         assert!(
-            result.is_err(),
-            "the user's own directory must fail loudly when unreadable"
+            error.to_string().contains(workdir.as_str()),
+            "the loud failure names the unreadable directory, got: {error}"
         );
         Ok(())
     }

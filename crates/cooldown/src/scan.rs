@@ -232,12 +232,17 @@ fn scan_marker_groups(
 /// scan bounded.
 /// Unreadable entries are skipped rather than failing the scan, matching the marker walks the same
 /// discovery pairs this with: one unreadable subtree (a root-owned volume mount) must not block
-/// recovering every project the walk *can* see, and an interrupted project hidden behind it stays
-/// discoverable through its recovery authority anchor, which lives outside the project tree.
+/// recovering every project the walk *can* see, and recovery inside a subtree this process cannot
+/// read could not have proceeded anyway. The skip is only partially fail-closed, though: an
+/// interrupted project behind the unreadable subtree is rediscovered through its recovery
+/// authority anchor only when it shares the scan root's git common directory — a nested git
+/// repository or submodule inside that subtree anchors under its own git directory, and orphan
+/// artifacts with no anchor at all have nothing outside the subtree pointing at them. Both shapes
+/// escape silently, so every skipped path is returned as a warning for the caller to surface.
 pub(crate) fn find_recovery_artifact_dirs(
     root: &Utf8Path,
     is_artifact: impl Fn(&str) -> bool,
-) -> Vec<Utf8PathBuf> {
+) -> RecoveryArtifactScan {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -266,11 +271,16 @@ pub(crate) fn find_recovery_artifact_dirs(
             )
         });
     let mut dirs = Vec::new();
+    let mut skipped_unreadable = Vec::new();
     for result in builder.build() {
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                tracing::debug!(%error, %root, "skipping unreadable path during recovery artifact scan");
+                // The walker's error display names the offending path when it is known; keep the
+                // scan root as the fallback context for the rare pathless failure.
+                skipped_unreadable.push(format!(
+                    "recovery artifact scan under {root} skipped an unreadable path: {error}"
+                ));
                 continue;
             }
         };
@@ -285,7 +295,20 @@ pub(crate) fn find_recovery_artifact_dirs(
     }
     dirs.sort();
     dirs.dedup();
-    dirs
+    RecoveryArtifactScan {
+        dirs,
+        skipped_unreadable,
+    }
+}
+
+/// The outcome of [`find_recovery_artifact_dirs`]: the artifact-owning directories plus the
+/// unreadable paths the walk had to skip (see the function's fail-closed caveats).
+pub(crate) struct RecoveryArtifactScan {
+    /// Directories that directly contain a reserved recovery artifact name.
+    pub(crate) dirs: Vec<Utf8PathBuf>,
+    /// One preformatted message per skipped unreadable path; the caller surfaces them (recovery
+    /// reports them as user-visible warnings) rather than losing them to a debug trace.
+    pub(crate) skipped_unreadable: Vec<String>,
 }
 
 fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<&'a str> {
@@ -737,9 +760,10 @@ mod tests {
             matches!(name, "recovery" | ".recovery.123.0.publish")
         });
         assert_eq!(
-            found,
+            found.dirs,
             vec![root.join(".hidden/project"), root.join("ignored/project")]
         );
+        assert!(found.skipped_unreadable.is_empty());
         Ok(())
     }
 
@@ -763,9 +787,19 @@ mod tests {
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))?;
 
         assert_eq!(
-            result,
+            result.dirs,
             vec![project],
             "the interrupted project the walk can see is still recovered"
+        );
+        // The skip is not fully fail-closed (a nested repository or orphan artifacts behind the
+        // unreadable subtree escape silently), so it must surface as a warning, not a debug trace.
+        let warning = result
+            .skipped_unreadable
+            .first()
+            .ok_or_else(|| eyre::eyre!("the unreadable subtree must be reported"))?;
+        assert!(
+            warning.contains(sealed.as_str()),
+            "the warning names the unreadable path, got: {warning}"
         );
         Ok(())
     }
