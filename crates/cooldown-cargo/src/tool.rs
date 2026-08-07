@@ -369,18 +369,18 @@ fn collateral_changes(
             .push(version);
     }
     let mut changes: Vec<Change> = Vec::new();
-    for ((source, name), befores) in &before_by_name {
+    for ((source, name), before_versions) in &before_by_name {
         let empty = Vec::new();
-        let afters = after_by_name.get(&(*source, *name)).unwrap_or(&empty);
+        let after_versions = after_by_name.get(&(*source, *name)).unwrap_or(&empty);
         // Identical versions on both sides are unmoved lines; only the residuals moved.
-        let mut from_residual: Vec<&String> = befores
+        let mut from_residual: Vec<&String> = before_versions
             .iter()
-            .filter(|version| !afters.contains(version))
+            .filter(|version| !after_versions.contains(version))
             .copied()
             .collect();
-        let mut to_residual: Vec<&String> = afters
+        let mut to_residual: Vec<&String> = after_versions
             .iter()
-            .filter(|version| !befores.contains(version))
+            .filter(|version| !before_versions.contains(version))
             .copied()
             .collect();
         from_residual.sort_by(|a, b| version::compare(a, b));
@@ -499,10 +499,17 @@ fn classify_planned_changes(
     }
 }
 
-/// The manifests a candidate's widen may touch — its members' plus the workspace root (the
-/// inherited-requirement fallback) — with their pre-widen contents, so a widen whose pin cannot
-/// land is restored byte-identically instead of leaving a requirement the lock does not honor.
-fn manifest_snapshot(
+/// The files a candidate's tentative widen may touch — its members' manifests plus the workspace
+/// root's (the inherited-requirement fallback), and the staged `Cargo.lock` — with their pre-widen
+/// contents, so a widen whose pin cannot land is restored byte-identically instead of leaving a
+/// requirement the lock does not honor.
+///
+/// The lock belongs in this snapshot because the rollback runs *after* the unlocked
+/// `cargo metadata` probe, which can itself re-lock the widened requirement — forking a major that
+/// no requirement admits once the manifests are restored. Restoring the manifests alone would
+/// leave that poisoned lock for `resolver_lock` and the preserve preflight to observe until a
+/// later unlocked resolve incidentally healed it.
+fn widen_snapshot(
     root: &Utf8Path,
     members: &[MemberRef],
 ) -> Result<Vec<(Utf8PathBuf, Option<String>)>> {
@@ -511,6 +518,7 @@ fn manifest_snapshot(
         .map(|member| manifest::member_manifest_rel(&member.path))
         .collect();
     paths.push(Utf8PathBuf::from("Cargo.toml"));
+    paths.push(Utf8PathBuf::from("Cargo.lock"));
     paths.sort();
     paths.dedup();
     paths
@@ -526,9 +534,12 @@ fn manifest_snapshot(
         .collect()
 }
 
-/// Writes a [`manifest_snapshot`] back verbatim. A path captured as absent is left alone — the
-/// widen machinery never creates manifests.
-fn restore_manifests(root: &Utf8Path, snapshot: &[(Utf8PathBuf, Option<String>)]) -> Result<()> {
+/// Writes a [`widen_snapshot`] back verbatim. A path captured as absent is left alone — the
+/// widen machinery never creates manifests or locks.
+fn restore_widen_snapshot(
+    root: &Utf8Path,
+    snapshot: &[(Utf8PathBuf, Option<String>)],
+) -> Result<()> {
     for (rel, contents) in snapshot {
         if let Some(contents) = contents {
             std::fs::write(root.join(rel), contents)?;
@@ -670,7 +681,10 @@ impl CargoTool {
                     if reached_after(&after, graph.as_ref(), change) {
                         continue;
                     }
-                    let snapshot = manifest_snapshot(&project.root, &change.members)?;
+                    // Captured before the widen — the first mutation the rollback must undo; the
+                    // pin and the metadata probe below both mutate the staged lock the snapshot
+                    // carries.
+                    let snapshot = widen_snapshot(&project.root, &change.members)?;
                     journal.validate_project(&project.root)?;
                     if manifest::widen_constraint(
                         &project.root,
@@ -712,7 +726,7 @@ impl CargoTool {
                                 if let Some(summary) = summarize_pin_rejection(&err) {
                                     rejections.entry(rejection_key(change)).or_insert(summary);
                                 }
-                                restore_manifests(&project.root, &snapshot)?;
+                                restore_widen_snapshot(&project.root, &snapshot)?;
                                 continue;
                             }
                         }
@@ -723,7 +737,7 @@ impl CargoTool {
                     if reached_after(&landed, landed_graph.as_ref(), change) {
                         progressed = true;
                     } else {
-                        restore_manifests(&project.root, &snapshot)?;
+                        restore_widen_snapshot(&project.root, &snapshot)?;
                     }
                 }
                 // A sibling's landed widen+pin may have removed the shared blocker behind an
@@ -2208,6 +2222,271 @@ mod tests {
                 .map(String::as_str),
             Some("1.2.0"),
             "the no-op-widen candidate is re-pinned once the sibling's widen removed the blocker"
+        );
+        Ok(())
+    }
+
+    /// The manifest the member-candidate fixture starts from: the workspace member `app` itself
+    /// declares `dep = "1"`, capping the planned cross-major target so the Auto loop must widen.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_MANIFEST: &str = indoc! {r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2024"
+
+        [dependencies]
+        dep = "1"
+        holder = "1"
+    "#};
+
+    #[cfg(unix)]
+    const MEMBER_WIDEN_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["dep", "holder"]
+
+        [[package]]
+        name = "dep"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "holder"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+
+    /// What the fixture's `metadata` probe reports while the manifest still declares `dep = "1"`:
+    /// the member `app` resolves the old major, so the reach check sends the candidate into the
+    /// widen. The member paths only need to be mutually consistent (`/repo` + `/repo/Cargo.toml`
+    /// relativize to the `.` member): `metadata` parsing never touches the real filesystem.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_METADATA_UNWIDENED: &str = indoc! {r#"
+        {
+            "packages": [
+                {"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "/repo/Cargo.toml",
+                 "dependencies": [
+                    {"name": "dep", "req": "^1"},
+                    {"name": "holder", "req": "^1"}
+                 ]},
+                {"id": "holder", "name": "holder", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": [{"name": "dep", "req": "^1"}]},
+                {"id": "dep-old", "name": "dep", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []}
+            ],
+            "workspace_members": ["app"],
+            "workspace_root": "/repo",
+            "resolve": {"nodes": [
+                {"id": "app", "deps": [
+                    {"name": "dep", "pkg": "dep-old"},
+                    {"name": "holder", "pkg": "holder"}
+                ]},
+                {"id": "holder", "deps": [{"name": "dep", "pkg": "dep-old"}]},
+                {"id": "dep-old", "deps": []}
+            ]}
+        }
+    "#};
+
+    /// What the probe reports after its own fork: `app` resolves dep 2.1.0 — past the 2.0.0
+    /// target, so the member-aware reach check must fail — while `holder` keeps the 1.0.0 line.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_METADATA_WIDENED: &str = indoc! {r#"
+        {
+            "packages": [
+                {"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "/repo/Cargo.toml",
+                 "dependencies": [
+                    {"name": "dep", "req": "^2.0.0"},
+                    {"name": "holder", "req": "^1"}
+                 ]},
+                {"id": "holder", "name": "holder", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": [{"name": "dep", "req": "^1"}]},
+                {"id": "dep-old", "name": "dep", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []},
+                {"id": "dep-new", "name": "dep", "version": "2.1.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []}
+            ],
+            "workspace_members": ["app"],
+            "workspace_root": "/repo",
+            "resolve": {"nodes": [
+                {"id": "app", "deps": [
+                    {"name": "dep", "pkg": "dep-new"},
+                    {"name": "holder", "pkg": "holder"}
+                ]},
+                {"id": "holder", "deps": [{"name": "dep", "pkg": "dep-old"}]},
+                {"id": "dep-old", "deps": []},
+                {"id": "dep-new", "deps": []}
+            ]}
+        }
+    "#};
+
+    /// A member-candidate tentative-Auto fixture (`needs_member_graph`, unlike [`widen_fixture`]'s
+    /// member-less candidates): workspace member `app` directly declares `dep = "1"` while
+    /// third-party `holder` keeps the old major locked. The scripted cargo rejects every
+    /// `update --precise`; its *unlocked* `metadata` probe, once the widen removed the manifest
+    /// cap, re-locks the widened requirement by forking dep 2.1.0 — the newest version the widened
+    /// caret admits, past the 2.0.0 cooldown target — beside the held 1.0.0 line. With
+    /// `probe_errs` the same forking probe then exits nonzero, exercising the probe-error rollback
+    /// branch instead of the reach-check one.
+    #[cfg(unix)]
+    fn member_widen_fixture(
+        root: &camino::Utf8Path,
+        probe_errs: bool,
+    ) -> eyre::Result<(Project, CargoTool)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("Cargo.toml"), MEMBER_WIDEN_MANIFEST)?;
+        std::fs::write(root.join("Cargo.lock"), MEMBER_WIDEN_LOCK)?;
+        std::fs::write(
+            root.join("Cargo.lock.forked"),
+            formatdoc! {r#"
+                {MEMBER_WIDEN_LOCK}
+                [[package]]
+                name = "dep"
+                version = "2.1.0"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#},
+        )?;
+        std::fs::write(
+            root.join("metadata.unwidened.json"),
+            MEMBER_WIDEN_METADATA_UNWIDENED,
+        )?;
+        std::fs::write(
+            root.join("metadata.widened.json"),
+            MEMBER_WIDEN_METADATA_WIDENED,
+        )?;
+        // The forking probe either reports the graph its own fork produced or, in the
+        // probe-error variant, leaves the forked lock behind and fails like a resolver conflict.
+        let widened_probe = if probe_errs {
+            ""
+        } else {
+            indoc! {"
+                cat metadata.widened.json
+                exit 0
+            "}
+        };
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            formatdoc! {r#"
+                #!/bin/sh
+                if [ "$1" = metadata ]; then
+                  if grep -q 'dep = "1"' Cargo.toml; then
+                    cat metadata.unwidened.json
+                    exit 0
+                  fi
+                  cp Cargo.lock.forked Cargo.lock
+                {widened_probe}fi
+                echo 'error: failed to select a version for the requirement `dep = "^1"`' >&2
+                echo 'required by package `holder v1.0.0`' >&2
+                exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    fn member_widen_change() -> Change {
+        let mut planned = change("dep", "1.0.0", "2.0.0", false);
+        planned.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+        planned
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_member_widen_rollback_restores_the_probe_forked_lock() -> eyre::Result<()> {
+        // The member-candidate rollback defect: the precise pin is rejected, but the *unlocked*
+        // metadata probe between pin and rollback re-locks the widened requirement, forking dep
+        // at 2.1.0 — newer than the 2.0.0 target, so the member-aware reach check fails. The
+        // rollback must restore the staged lock beside the manifests: restoring the manifests
+        // alone would keep a fork no surviving requirement admits, visible to `resolver_lock` and
+        // the preserve preflight until a later unlocked resolve incidentally healed it.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = member_widen_fixture(root, false)?;
+        let plan = Plan {
+            changes: vec![member_widen_change()],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            MEMBER_WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            MEMBER_WIDEN_LOCK,
+            "the staged lock the probe forked is restored with the manifests, \
+             not left for a later resolve to heal"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_member_widen_rollback_restores_the_lock_when_the_probe_errs()
+    -> eyre::Result<()> {
+        // The sibling rollback branch: the widened-manifest probe forks the lock *and then* fails
+        // as a resolver rejection. That branch must likewise restore the staged lock with the
+        // manifests, and the candidate keeps a rejection detail for its skip row.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = member_widen_fixture(root, true)?;
+        let plan = Plan {
+            changes: vec![member_widen_change()],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            MEMBER_WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            MEMBER_WIDEN_LOCK,
+            "the probe-error rollback restores the staged lock the probe forked"
+        );
+        assert!(
+            rejections.contains_key(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string())),
+            "the held candidate keeps its rejection detail"
         );
         Ok(())
     }
