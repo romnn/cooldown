@@ -76,9 +76,17 @@ pub fn source_label(source: &str) -> String {
     let without_scheme = address
         .split_once("://")
         .map_or(address, |(_, location)| location);
-    let without_credentials = without_scheme
-        .rsplit_once('@')
-        .map_or(without_scheme, |(_, location)| location);
+    // Strip credentials only within the authority: an `@` later in the path (an npm-style
+    // `@scope` segment on a registry index) is path data, not a userinfo separator, and must not
+    // eat the host out of the label.
+    let authority = without_scheme
+        .get(..authority_end(without_scheme))
+        .unwrap_or(without_scheme);
+    let without_credentials = authority
+        .rfind('@')
+        .and_then(|index| index.checked_add(1))
+        .and_then(|host_start| without_scheme.get(host_start..))
+        .unwrap_or(without_scheme);
     let location = without_credentials
         .split(['?', '#'])
         .next()
@@ -103,16 +111,52 @@ fn redact_url(url: &str) -> String {
     let Some(after_scheme) = url.get(scheme_end..) else {
         return url.to_string();
     };
-    let authority_end = after_scheme
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index))
-        .unwrap_or(after_scheme.len());
-    let authority = after_scheme.get(..authority_end).unwrap_or(after_scheme);
-    let host_start = authority
-        .rfind('@')
-        .and_then(|index| index.checked_add(1))
-        .unwrap_or(0);
-    let rest = after_scheme.get(authority_end..).unwrap_or_default();
+    // The authority normally ends at the first `/`, `?`, or `#`, but a credential holding an
+    // unencoded reserved character pushes its `@` past that boundary, and a naive split would
+    // emit the secret verbatim as path, query, or fragment.
+    // This module scans arbitrary embedded segments that need not parse as URLs, so it fails
+    // closed: while the text before the boundary cannot be a plain `host[:port]` (see
+    // `plausible_host_port`) and an `@` still follows anywhere in the segment, everything up to
+    // that `@` is treated as spilled userinfo and dropped.
+    // The loop repeats because the dropped credential may itself contain further reserved
+    // characters or `@`s.
+    // Deliberate limit: a digits-only run after the last `:` is presumed a port, so
+    // `host:8080/path@v2` survives intact — and a digits-only password with an unencoded `/`
+    // (`user:1234/x@host`) is indistinguishable from that shape and passes through unredacted.
+    let mut host_start = 0;
+    while let Some(tail) = after_scheme.get(host_start..) {
+        let boundary = authority_end(tail);
+        let segment = tail.get(..boundary).unwrap_or(tail);
+        if let Some(at) = segment.rfind('@') {
+            // Userinfo confined to the authority: keep only what follows its last `@`.
+            if let Some(index) = host_start
+                .checked_add(at)
+                .and_then(|index| index.checked_add(1))
+            {
+                host_start = index;
+            }
+            break;
+        }
+        if plausible_host_port(segment) {
+            break;
+        }
+        match tail.find('@') {
+            Some(at) => {
+                let Some(index) = host_start
+                    .checked_add(at)
+                    .and_then(|index| index.checked_add(1))
+                else {
+                    break;
+                };
+                host_start = index;
+            }
+            None => break,
+        }
+    }
+    let kept = after_scheme.get(host_start..).unwrap_or(after_scheme);
+    let boundary = authority_end(kept);
+    let authority = kept.get(..boundary).unwrap_or(kept);
+    let rest = kept.get(boundary..).unwrap_or_default();
     let (without_fragment, fragment) = rest
         .split_once('#')
         .map_or((rest, None), |(prefix, value)| (prefix, Some(value)));
@@ -124,28 +168,37 @@ fn redact_url(url: &str) -> String {
 
     let mut redacted = String::with_capacity(url.len());
     redacted.push_str(url.get(..scheme_end).unwrap_or_default());
-    redacted.push_str(authority.get(host_start..).unwrap_or(authority));
+    redacted.push_str(authority);
     redacted.push_str(path);
     if let Some(query) = query {
         redacted.push('?');
-        for (index, pair) in query.split('&').enumerate() {
+        // `;` is a recognized query-pair separator alongside `&`, so both split pairs here.
+        // A git refname may legally contain `;`, which means an exotic `branch=a;b` value loses
+        // its tail to masking — but without the split a `;access_token=secret` suffix would ride
+        // to safety inside the provenance value, and this module fails closed on that ambiguity.
+        for (index, chunk) in query.split('&').enumerate() {
             if index > 0 {
                 redacted.push('&');
             }
-            let Some((key, value)) = pair.split_once('=') else {
-                if provenance_query_key(pair) {
-                    redacted.push_str(pair);
+            for (sub_index, pair) in chunk.split(';').enumerate() {
+                if sub_index > 0 {
+                    redacted.push(';');
+                }
+                let Some((key, value)) = pair.split_once('=') else {
+                    if provenance_query_key(pair) {
+                        redacted.push_str(pair);
+                    } else {
+                        redacted.push_str(REDACTED);
+                    }
+                    continue;
+                };
+                redacted.push_str(key);
+                redacted.push('=');
+                if provenance_query_key(key) {
+                    redacted.push_str(value);
                 } else {
                     redacted.push_str(REDACTED);
                 }
-                continue;
-            };
-            redacted.push_str(key);
-            redacted.push('=');
-            if provenance_query_key(key) {
-                redacted.push_str(value);
-            } else {
-                redacted.push_str(REDACTED);
             }
         }
     }
@@ -195,6 +248,35 @@ const fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+/// The byte offset where the authority portion of `text` ends: the first `/`, `?`, or `#`, or the
+/// full length when none occurs.
+fn authority_end(text: &str) -> usize {
+    text.find(['/', '?', '#']).unwrap_or(text.len())
+}
+
+/// Whether `segment` — the text between a scheme's `://` and the first `/`, `?`, or `#` — can be
+/// read as a plain `host[:port]` authority.
+///
+/// Whatever follows the last `:` must be empty or digits-only (a port), except inside a bracketed
+/// IPv6 literal, whose colons belong to the host.
+/// A non-numeric run after the last colon (`user:pa`) cannot be a port, so such a segment must be
+/// userinfo whose `@` was pushed past the boundary by an unencoded reserved character.
+fn plausible_host_port(segment: &str) -> bool {
+    let port_region = if let Some(bracketed) = segment.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((_, after)) => after,
+            // An unclosed bracket is not a valid authority; fail closed.
+            None => return false,
+        }
+    } else {
+        segment
+    };
+    match port_region.rsplit_once(':') {
+        None => true,
+        Some((_, port)) => port.bytes().all(|byte| byte.is_ascii_digit()),
     }
 }
 
@@ -279,6 +361,62 @@ mod tests {
         );
     }
 
+    /// A credential holding an unencoded `/` or `#` pushes its `@` past the naive authority
+    /// boundary; the whole prefix must still be dropped as spilled userinfo rather than leak the
+    /// secret verbatim as path or fragment.
+    #[test]
+    fn redacts_credentials_containing_reserved_characters() {
+        assert_eq!(
+            url_secrets("https://user:pa/ss@h.example/x"),
+            "https://h.example/x"
+        );
+        assert_eq!(
+            url_secrets("https://user:p#ss@h.example/"),
+            "https://h.example/"
+        );
+    }
+
+    /// A digits-only run after the authority's last `:` is a port and an `@` beyond the authority
+    /// is ordinary path or query data, so neither shape triggers the spilled-userinfo strip.
+    #[test]
+    fn preserves_ports_and_at_signs_beyond_the_authority() {
+        assert_eq!(
+            url_secrets("https://host.example:8080/path@v2"),
+            "https://host.example:8080/path@v2"
+        );
+        assert_eq!(
+            url_secrets("https://host.example/path?rev=a@b"),
+            "https://host.example/path?rev=a@b"
+        );
+        assert_eq!(
+            url_secrets("https://host.example/path?x=a@b"),
+            "https://host.example/path?x=REDACTED",
+            "the host and path survive; the value falls to the standard query-masking rule, \
+             not the userinfo strip"
+        );
+    }
+
+    /// `user:1234/x@…` is structurally identical to the legitimate `host:port/path@…` shape, so a
+    /// digits-only password with an unencoded `/` passes through — the deliberate cost of keeping
+    /// real `host:port` URLs readable.
+    #[test]
+    fn passes_a_digits_only_password_indistinguishable_from_a_port() {
+        assert_eq!(
+            url_secrets("https://user:1234/x@h.example/"),
+            "https://user:1234/x@h.example/"
+        );
+    }
+
+    /// `;` separates query pairs alongside `&`, so a `;access_token=` suffix cannot ride to
+    /// safety inside a provenance value — even though a git refname may legally contain `;`.
+    #[test]
+    fn splits_query_pairs_on_semicolons() {
+        assert_eq!(
+            url_secrets("git+https://h.example/repo?branch=main;access_token=secret"),
+            "git+https://h.example/repo?branch=main;access_token=REDACTED"
+        );
+    }
+
     #[test]
     fn redacts_valueless_query_tokens() {
         assert_eq!(
@@ -321,5 +459,20 @@ mod tests {
             "registry:packages.example.com"
         );
         assert_eq!(source_label("proxy.example"), "proxy.example");
+    }
+
+    /// An npm-style `@scope` path segment is not a credential separator: the strip stays confined
+    /// to the authority so the real host names the registry, with or without actual credentials
+    /// in front of it.
+    #[test]
+    fn labels_scoped_registry_paths_by_host() {
+        assert_eq!(
+            source_label("registry+https://host.example/@scope/index"),
+            "registry:host.example"
+        );
+        assert_eq!(
+            source_label("registry+https://user:token@host.example/@scope/index"),
+            "registry:host.example"
+        );
     }
 }
