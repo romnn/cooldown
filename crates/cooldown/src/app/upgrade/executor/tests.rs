@@ -778,6 +778,32 @@ fn collapse_reclassifies_kind_against_the_net_target_when_available() {
 }
 
 #[test]
+fn collapse_merges_two_fix_rounds_into_one_net_downgrade_row() {
+    // `fix` can move one package in consecutive rounds: a round-1 collateral leg (1.5 → 1.4)
+    // followed by the round-2 downgrade the re-plan schedules (1.4 → 1.3). The fixpoint exit
+    // collapses those chronological legs into the single net row, exactly as the `upgrade` exit
+    // paths sharing this report vocabulary do.
+    let mut items = vec![
+        applied_item("b", "1.5.0", "1.4.0", true),
+        applied_item("b", "1.4.0", "1.3.0", true),
+    ];
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
+    assert_eq!(items.len(), 1, "two fix rounds report one net movement");
+    assert_eq!(
+        (items[0].from.as_str(), items[0].to.as_str()),
+        ("1.5.0", "1.3.0")
+    );
+    assert!(items[0].downgrade, "the net move stays a downgrade");
+}
+
+#[test]
 fn collapse_drops_a_package_that_floats_up_then_fully_back() {
     let mut items = vec![
         applied_item("quote", "1.0.44", "1.0.46", false),

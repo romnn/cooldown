@@ -1259,6 +1259,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// round earlier. The deferred unfixable warnings are surfaced once, from the settling round.
     async fn fix_to_fixpoint(
         &mut self,
+        deps: Vec<Dependency>,
+        transitive: TransitiveGate,
+        downgrade_pinned: bool,
+        state: &mut TrialState,
+    ) -> MutationFlow {
+        // Collapse against the violations present before any round, mirroring `upgrade`'s use of
+        // its pre-lock baseline on every exit path: a package moved by two rounds (a collateral
+        // float, then the downgrade the re-plan schedules) must report one net row, and a chain
+        // with no net movement must report none — the contract of `collapse_applied_legs`.
+        let prior_violations = state.baseline_violations.clone();
+        let flow = self
+            .run_fix_rounds(deps, transitive, downgrade_pinned, state)
+            .await;
+        self.collapse_collateral(&prior_violations);
+        flow
+    }
+
+    /// The rounds of [`fix_to_fixpoint`](Self::fix_to_fixpoint), split out so every exit —
+    /// settled, terminated, or the round backstop — flows through exactly one report collapse.
+    async fn run_fix_rounds(
+        &mut self,
         mut deps: Vec<Dependency>,
         transitive: TransitiveGate,
         downgrade_pinned: bool,
