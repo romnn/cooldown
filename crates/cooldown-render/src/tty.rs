@@ -631,6 +631,12 @@ fn group_edge_corrections(items: &[UpgradeItem]) -> Vec<EdgeRenderUnit<'_>> {
         if let Some(&index) = group_index.get(&key) {
             if let Some(EdgeRenderUnit::Group(group)) = units.get_mut(index) {
                 group.push(item);
+            } else {
+                // `group_index` only ever records indices of `Group` units pushed right below, so
+                // this arm should be unreachable.
+                // Should the invariant ever break, an extra standalone row beats silently dropping
+                // the correction from the mutation report.
+                units.push(EdgeRenderUnit::Single(item));
             }
         } else {
             group_index.insert(key, units.len());
