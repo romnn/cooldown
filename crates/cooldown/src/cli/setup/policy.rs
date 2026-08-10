@@ -1,11 +1,12 @@
 use super::options::{ResolvedInvocation, StrictNativeMode};
+use crate::app::lock::{ProjectReadGuard, RepoToolReadGuard};
 use crate::app::{AdapterSet, ProjectCtx};
 use crate::discovery::ConfigSources;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{builtin_default_layer, layer_from_fields};
 use cooldown_core::{
-    CoreError, Origin, PolicyLayer, PolicyStack, Project, ResolveKind, ResolveQuery, ToolId,
-    normalize_native, resolve, window_exclude_newer,
+    CoreError, Origin, PolicyLayer, PolicyStack, Project, ResolveKind, ResolveQuery, SyncScope,
+    ToolId, normalize_native, resolve, window_exclude_newer,
 };
 use jiff::Timestamp;
 
@@ -56,12 +57,12 @@ pub(super) fn repo_layers(
     shared: &SharedLayers,
     repo_root: &Utf8Path,
 ) -> Result<Vec<PolicyLayer>, CoreError> {
-    let cascade = configs.repo_cascade_layers(repo_root, repo_root)?;
+    let project_config = configs.project_config(repo_root, repo_root)?;
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &shared.global {
         layers.push(layer.clone());
     }
-    layers.extend(cascade);
+    layers.extend(project_config.policy_layers);
     for layer in [&shared.explicit, &shared.env, &shared.cli]
         .into_iter()
         .flatten()
@@ -87,17 +88,34 @@ async fn assemble_ctx(
     tool: ToolId,
     mut project: Project,
 ) -> Result<ProjectCtx, CoreError> {
-    let native = if assembly.no_native {
-        None
-    } else {
-        match assembly.adapters.reader(tool) {
-            Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
-            None => None,
+    let native = {
+        let _repo_guard = assembly
+            .adapters
+            .writer(tool)
+            .filter(|writer| writer.sync_scope() == SyncScope::Repo)
+            .map(|_| RepoToolReadGuard::acquire(assembly.repo_root, tool))
+            .transpose()?;
+        let _project_guard = ProjectReadGuard::acquire(&project.root)?;
+        if let Some(writer) = assembly.adapters.writer(tool) {
+            writer.ensure_no_pending_mutation(&project).await?;
+        }
+        if assembly.no_native {
+            None
+        } else {
+            match assembly.adapters.reader(tool) {
+                Some(adapter) => adapter.native_policy(&project).await?.map(normalize_native),
+                None => None,
+            }
         }
     };
-    let cascade = assembly
+    let project_config = assembly
         .configs
-        .repo_cascade_layers(assembly.repo_root, &project.root)?;
+        .project_config(assembly.repo_root, &project.root)?;
+    let edge_policy = assembly
+        .invocation
+        .edge_policy_override()
+        .or(project_config.cargo_edge_policy)
+        .unwrap_or_default();
 
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &assembly.shared.global {
@@ -106,7 +124,7 @@ async fn assemble_ctx(
     if let Some(layer) = native {
         layers.push(layer);
     }
-    layers.extend(cascade);
+    layers.extend(project_config.policy_layers);
     for layer in [
         &assembly.shared.explicit,
         &assembly.shared.env,
@@ -174,6 +192,7 @@ async fn assemble_ctx(
             layers,
             strict_native,
         },
+        edge_policy,
     })
 }
 

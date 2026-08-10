@@ -13,6 +13,7 @@ pub(super) struct ResolvedInvocation {
     env_policy: WindowFields,
     cli_policy: WindowFields,
     strict_native: StrictNativeMode,
+    edge_policy_override: Option<cooldown_core::EdgePolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,10 @@ impl ResolvedInvocation {
 
     pub(super) fn strict_native(&self) -> StrictNativeMode {
         self.strict_native
+    }
+
+    pub(super) fn edge_policy_override(&self) -> Option<cooldown_core::EdgePolicy> {
+        self.edge_policy_override
     }
 
     pub(super) fn progress(&self) -> &Progress {
@@ -169,6 +174,7 @@ pub(super) fn resolve_invocation(
         env_policy: env_window_fields(),
         cli_policy: cli_window_fields(global),
         strict_native: strict_native_mode(overrides),
+        edge_policy_override: overrides.edge_policy,
     })
 }
 
@@ -266,7 +272,7 @@ fn resolve_globs(cfg: &CommandConfig) -> Result<Vec<PatternGlob>, CoreError> {
 
 /// Select an interactive terminal display or a plain automation-friendly transcript. Diagnostic
 /// logging uses the plain form because tracing writes directly to stderr between progress events.
-fn progress_mode(global: &GlobalArgs) -> Progress {
+pub(super) fn progress_mode(global: &GlobalArgs) -> Progress {
     use std::io::IsTerminal;
 
     if global.no_progress {
@@ -355,7 +361,7 @@ mod tests {
         for command in ["upgrade", "fix"] {
             let err = reject_offline_dry_run(command, true, true)
                 .expect_err("offline dry-run must be a usage error");
-            assert!(matches!(err, CoreError::Config(_)), "command `{command}`");
+            std::assert_matches!(err, CoreError::Config(_), "command `{command}`");
         }
         // Non-mutating commands and non-conflicting flag combinations pass through.
         assert!(reject_offline_dry_run("outdated", true, true).is_ok());

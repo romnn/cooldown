@@ -164,6 +164,85 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     );
 }
 
+/// The `main.go` for the transitive-advance fixture: it imports only `k8s.io/api`, so the module
+/// graph is exactly that require's closure — the transitive under test enters the graph solely
+/// through the direct require's MVS floors, never through a declaration of its own.
+const TRANSITIVE_ADVANCE_MAIN: &str = r#"package main
+
+import corev1 "k8s.io/api/core/v1"
+
+func main() { _ = corev1.Pod{} }
+"#;
+
+/// The transitive-advance fixture, Go's analogue of the cargo `rand_core` shape: the single direct
+/// require is seeded at the newest release matured under `FREEZE` (`k8s.io/api` v0.30.3,
+/// 2024-07-17; v0.31.0 and v0.30.4 are 2024-08-13/15, past the cutoff), so the direct layer is
+/// inert. `go mod tidy` places its undeclared transitive `k8s.io/klog/v2` at the MVS floor
+/// v2.120.1 (2024-01-18, apimachinery v0.30.3's require) while klog v2.130.1 (2024-06-20) is
+/// matured under the same cutoff — the standalone shape only graph-wide transitive advance can
+/// move, since nothing direct ever plans and MVS alone never rises above a floor.
+fn transitive_advance_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        "module example.com/cooldown-go-transitive\n\ngo 1.23\n\nrequire k8s.io/api v0.30.3\n",
+    );
+    fixture.write("main.go", TRANSITIVE_ADVANCE_MAIN);
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+#[test]
+fn upgrade_advances_a_matured_transitive_no_direct_require_drags() {
+    skip_if_missing!("go");
+    let fixture = transitive_advance_fixture();
+    let pins_before = go_mod_pins(&fixture.read_bytes("go.mod"));
+    assert_eq!(
+        pins_before.get("k8s.io/api").map(String::as_str),
+        Some("v0.30.3"),
+        "seed sanity: the direct require"
+    );
+    assert_eq!(
+        pins_before.get("k8s.io/klog/v2").map(String::as_str),
+        Some("v2.120.1"),
+        "the seed must hold the undeclared transitive at its MVS floor"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(upgrade.ok(), "upgrade should succeed");
+    assert!(
+        upgrade.applied_names().contains("k8s.io/klog/v2"),
+        "the transitive advance must be its own applied row, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        !upgrade.applied_names().contains("k8s.io/api"),
+        "the already-matured direct require must not move"
+    );
+    let pins_after = go_mod_pins(&fixture.read_bytes("go.mod"));
+    assert_eq!(
+        pins_after.get("k8s.io/klog/v2").map(String::as_str),
+        Some("v2.130.1"),
+        "klog advances to the newest release matured under the freeze"
+    );
+    assert_eq!(
+        pins_after.get("k8s.io/api").map(String::as_str),
+        Some("v0.30.3"),
+        "the direct require stays"
+    );
+
+    // Converged: a second run under the same freeze plans nothing new for the line.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        !second.applied_names().contains("k8s.io/klog/v2"),
+        "a converged line re-applies to a fixed point, got {:?}",
+        second.applied_names()
+    );
+}
+
 #[test]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("go");
@@ -181,9 +260,9 @@ fn outdated_agrees_with_upgrade() {
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
     let held = upgrade.held_conflict_names();
 
-    // Everything `upgrade` reports held, `outdated` must mark blocked. (Go's `outdated --transitive`
-    // can additionally flag candidates `upgrade` never plans — e.g. tooling-only modules outside the
-    // compile graph — so `blocked` is a superset, not a strict equal.)
+    // Everything `upgrade` reports held, `outdated` must mark blocked. (`outdated --transitive`
+    // can additionally mark statically-blocked candidates that `upgrade` — even with graph-wide
+    // transitive advance — never plans, so `blocked` is a superset, not a strict equal.)
     assert!(
         held.is_subset(&blocked),
         "every held candidate must be blocked by outdated\nheld={held:?}\nblocked={blocked:?}"

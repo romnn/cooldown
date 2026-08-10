@@ -13,9 +13,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport,
+    Version,
 };
 use cooldown_registry::SharedHttp;
 use std::marker::PhantomData;
@@ -32,14 +33,24 @@ pub trait JavaLayout: Send + Sync + 'static {
     /// The driver binary, shelled out to for apply/build.
     const BIN: &'static str;
 
-    /// Parses the lock + manifest into resolved `(coordinate, version, is_direct)` triples.
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)>;
+    /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
 
     /// The driver args that re-pin `coordinate` to `version`.
     fn upgrade_args(coordinate: &str, version: &str) -> Vec<String>;
 
     /// The driver args for the opt-in `--build` step.
     fn build_args() -> Vec<String>;
+}
+
+/// One resolved dependency from a [`JavaLayout`]'s lock + manifest.
+pub struct ResolvedDep {
+    /// The `group:artifact` coordinate as recorded in the lock.
+    pub name: String,
+    /// The resolved (locked) version.
+    pub version: String,
+    /// Whether the manifest declares the dependency directly (vs. a transitive dependency).
+    pub direct: bool,
 }
 
 /// Maven: declared dependencies live in `pom.xml`, which is both the manifest and the version
@@ -56,10 +67,14 @@ impl JavaLayout for Maven {
     const MANIFEST: &'static str = "pom.xml";
     const BIN: &'static str = "mvn";
 
-    fn parse(lock: &str, _manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
         lock::parse_pom(lock)
             .into_iter()
-            .map(|(coord, ver)| (coord, ver, true))
+            .map(|pin| ResolvedDep {
+                name: pin.name,
+                version: pin.version,
+                direct: true,
+            })
             .collect()
     }
 
@@ -84,13 +99,17 @@ impl JavaLayout for Gradle {
     const MANIFEST: &'static str = "build.gradle";
     const BIN: &'static str = "gradle";
 
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
         let direct = lock::parse_gradle_direct(manifest);
         lock::parse_gradle_lock(lock)
             .into_iter()
-            .map(|(coord, ver)| {
-                let is_direct = direct.contains(&coord);
-                (coord, ver, is_direct)
+            .map(|pin| {
+                let is_direct = direct.contains(&pin.name);
+                ResolvedDep {
+                    name: pin.name,
+                    version: pin.version,
+                    direct: is_direct,
+                }
             })
             .collect()
     }
@@ -170,13 +189,13 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
-        ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: L::MANIFEST,
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -187,15 +206,15 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
         let lock = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let mut deps = Vec::new();
-        for (coord, ver, is_direct) in L::parse(&lock, &manifest) {
-            if scope == DepScope::Direct && !is_direct {
+        for resolved in L::parse(&lock, &manifest) {
+            if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(L::ID, coord, Some(MAVEN_CENTRAL.to_string())),
-                current: Version::new(ver.clone()),
-                current_quality: classify_quality(&ver),
-                direct: is_direct,
+                package: PackageId::new(L::ID, resolved.name, Some(MAVEN_CENTRAL.to_string())),
+                current: Version::new(resolved.version.clone()),
+                current_quality: classify_quality(&resolved.version),
+                direct: resolved.direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,
@@ -250,30 +269,24 @@ impl<L: JavaLayout> ReleaseFetcher for JavaTool<L> {
 
 #[async_trait]
 impl<L: JavaLayout> ToolWrite for JavaTool<L> {
+    fn mutation_tool(&self) -> ToolId {
+        L::ID
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        let mut files = vec![ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new(L::LOCKFILE),
-        )?];
+        let mut paths = vec![Utf8Path::new(L::LOCKFILE)];
         if L::MANIFEST != L::LOCKFILE {
-            files.push(ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new(L::MANIFEST),
-            )?);
+            paths.push(Utf8Path::new(L::MANIFEST));
         }
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             let args = L::upgrade_args(&change.package.name, change.to.as_str());

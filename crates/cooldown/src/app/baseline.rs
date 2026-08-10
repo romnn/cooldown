@@ -5,6 +5,7 @@
 //! young version reintroduced in another project later is not silently grandfathered. A clean
 //! ratchet: baseline once, then the set only shrinks.
 
+use super::FetchedRelease;
 use cooldown_core::CoreError;
 use cooldown_toml_util::read_toml_file;
 use jiff::Timestamp;
@@ -182,9 +183,11 @@ impl crate::app::Workspace {
             let Some(adapter) = self.adapter(pctx.tool) else {
                 continue;
             };
+            let read_guard = self.project_read_guard(pctx).await?;
             let deps = self
                 .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
                 .await?;
+            drop(read_guard);
             let fctx = Self::fetch_context(pctx, opts);
             let rctx = Self::resolve_ctx(pctx, opts);
             // Route through the cache-backed fetch — the only locked-release path — so a package
@@ -193,7 +196,11 @@ impl crate::app::Workspace {
                 .fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout())
                 .await;
 
-            for (dep, result) in fetched {
+            for FetchedRelease {
+                dependency: dep,
+                result,
+            } in fetched
+            {
                 let Ok(locked) = result else { continue };
                 let pv = check_pin(&dep, &locked, &pctx.policy.layers, &rctx, self.now());
                 if pv.status == Status::CurrentInCooldown {

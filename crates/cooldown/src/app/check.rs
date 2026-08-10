@@ -2,9 +2,10 @@
 //! attributable to a dependency you couldn't evaluate forces a non-zero exit. Evaluates the
 //! resolved graph (direct + transitive) by default.
 
+use super::lock::ProjectAccessWriteGuard;
 use super::{
-    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, LockReportAction, RunOpts,
-    TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
+    CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
+    RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
     render_window,
 };
 use cooldown_core::{
@@ -55,6 +56,7 @@ pub struct CheckOutcome {
 #[derive(Default)]
 struct CheckAccum {
     checked: usize,
+    skipped_stale_projects: usize,
     direct: usize,
     exempt: usize,
     acknowledged: usize,
@@ -70,8 +72,10 @@ struct CheckAccum {
 
 /// The outcome of the fail-closed lock-currency probe: continue evaluating, or skip this project.
 enum LockProbe {
-    /// The lock is current (or a stale lock was downgraded to a warning); continue.
+    /// The lock is current; continue dependency evaluation.
     Continue,
+    /// The stale lock was accepted as a warning; do not inspect a graph Cargo would have to update.
+    StaleAllowed,
     /// The lock could not be soundly evaluated; this project is skipped.
     Skip,
 }
@@ -139,6 +143,7 @@ impl<'a> CheckRunner<'a> {
             + self.acc.errors.len();
         let summary = CheckSummary {
             checked: self.acc.checked,
+            skipped_stale_projects: self.acc.skipped_stale_projects,
             direct: self.acc.direct,
             exempt: self.acc.exempt,
             acknowledged: self.acc.acknowledged,
@@ -176,13 +181,37 @@ impl<'a> CheckRunner<'a> {
             return;
         };
 
-        let lock_probe = match self.refresh_lock(pctx, &read.project_label).await {
+        let (refreshed, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
+        if matches!(&refreshed, Some(LockProbe::Skip)) {
+            return;
+        }
+        let read_guard = if refresh_guard.is_some() {
+            None
+        } else {
+            match self.ws.project_read_guard(pctx).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.acc.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        &read.project_label,
+                        None,
+                    ));
+                    return;
+                }
+            }
+        };
+        let lock_probe = match refreshed {
             Some(probe) => probe,
             None => {
                 self.probe_lock(read.adapter, pctx, &read.project_label)
                     .await
             }
         };
+        if matches!(lock_probe, LockProbe::StaleAllowed) {
+            self.acc.skipped_stale_projects += 1;
+            return;
+        }
         if matches!(lock_probe, LockProbe::Skip) {
             return;
         }
@@ -203,6 +232,8 @@ impl<'a> CheckRunner<'a> {
                 return;
             }
         };
+        drop(read_guard);
+        drop(refresh_guard);
 
         self.opts
             .progress
@@ -217,7 +248,11 @@ impl<'a> CheckRunner<'a> {
                 self.opts.fanout(),
             )
             .await;
-        for (dep, result) in fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
             self.gate_pin(pctx, &read.project_label, &dep, result, &read.resolve);
         }
     }
@@ -242,11 +277,22 @@ impl<'a> CheckRunner<'a> {
         &mut self,
         pctx: &super::ProjectCtx,
         project_label: &str,
-    ) -> Option<LockProbe> {
+    ) -> (Option<LockProbe>, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
-            Ok(Some(report)) => Some(self.handle_lock_report(report, pctx, project_label)),
-            Ok(None) => None,
-            Err(err) => Some(self.handle_lock_error(&err, pctx, project_label)),
+            Ok(refresh) => {
+                self.acc.warnings.extend(refresh.recovery);
+                let probe = match refresh.report {
+                    Ok(report) => {
+                        report.map(|report| self.handle_lock_report(report, pctx, project_label))
+                    }
+                    Err(error) => Some(self.handle_lock_error(&error, pctx, project_label)),
+                };
+                (probe, refresh.guard)
+            }
+            Err(err) => (
+                Some(self.handle_lock_error(&err, pctx, project_label)),
+                None,
+            ),
         }
     }
 
@@ -256,6 +302,7 @@ impl<'a> CheckRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
     ) -> LockProbe {
+        let stale = report.status == cooldown_core::LockStatus::Stale;
         let outcome = lock_report_outcome(
             report,
             pctx.tool,
@@ -266,9 +313,17 @@ impl<'a> CheckRunner<'a> {
         match outcome.action {
             LockReportAction::Continue => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.acc.warnings.push(diagnostic);
+                    self.acc.warnings.push(if stale {
+                        stale_evaluation_skipped(diagnostic)
+                    } else {
+                        diagnostic
+                    });
                 }
-                LockProbe::Continue
+                if stale {
+                    LockProbe::StaleAllowed
+                } else {
+                    LockProbe::Continue
+                }
             }
             LockReportAction::Skip => {
                 if let Some(diagnostic) = outcome.diagnostic {
@@ -292,8 +347,8 @@ impl<'a> CheckRunner<'a> {
             DiagnosticKind::StaleLock | DiagnosticKind::NotFound
         );
         if self.opts.allow_stale_lock && downgradable {
-            self.acc.warnings.push(diag);
-            LockProbe::Continue
+            self.acc.warnings.push(stale_evaluation_skipped(diag));
+            LockProbe::StaleAllowed
         } else {
             self.acc.errors.push(diag);
             LockProbe::Skip
@@ -428,6 +483,13 @@ impl<'a> CheckRunner<'a> {
             .with_package(&dep.package.name),
         )
     }
+}
+
+fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
+    diagnostic
+        .message
+        .push_str("; dependency evaluation was skipped for this project");
+    diagnostic
 }
 
 /// Map the tallies to the fail-closed exit code: errors/unknown-age first, then a tripped

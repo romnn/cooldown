@@ -18,12 +18,14 @@ cooldown-registry.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 semver.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 indoc.workspace = true

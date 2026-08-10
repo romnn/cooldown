@@ -154,9 +154,7 @@ pub fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipp
 ///
 /// Returns a [`CoreError`](cooldown_core::CoreError) if the lock file state cannot be captured.
 pub fn single_lock_journal(root: &Utf8Path, lockfile: &Utf8Path) -> Result<ProjectMutationJournal> {
-    Ok(ProjectMutationJournal {
-        files: vec![ProjectMutationJournal::capture_file(root, lockfile)?],
-    })
+    ProjectMutationJournal::capture(root, [lockfile])
 }
 
 /// Build a standard lock-currency verification report from a boolean probe.
@@ -234,9 +232,9 @@ mod reaching_tests {
             stderr: "pnpm: unable to open database file".into(),
         };
 
-        assert!(matches!(
+        std::assert_matches!(
             skipped_on_apply_error(&change(), err),
             Err(CoreError::Tool { .. })
-        ));
+        );
     }
 }

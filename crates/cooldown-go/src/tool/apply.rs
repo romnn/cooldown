@@ -32,10 +32,10 @@ pub(super) async fn apply(
     // tidy` introduced. A missing/unparsable snapshot leaves `before` empty, so a module that moved
     // is still reported (never silent).
     let before = journal
-        .files
+        .files()
         .iter()
-        .find(|file| file.path == Utf8Path::new("go.mod"))
-        .and_then(|file| file.contents.as_deref())
+        .find(|file| file.path() == Utf8Path::new("go.mod"))
+        .and_then(cooldown_core::ProjectMutationFile::contents)
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(parse_requires)
         .unwrap_or_default();
@@ -128,10 +128,17 @@ fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
 }
 
 fn resolver_conflict(change: &Change) -> Skipped {
+    // A cross-major candidate is planned under its *target* path (`…/vN` — `go get` needs it), but
+    // a skip means the tree still holds the from-major module, so the row reports the identity
+    // that actually exists; the target path stays visible in the To column's major.
+    let mut reported = change.clone();
+    if let Some(old_path) = mutation::old_import_path(change) {
+        reported.package = PackageId::new(GO_ID, old_path, change.package.registry.clone());
+    }
     Skipped {
-        change: change.clone(),
+        offending: Some(reported.package.clone()),
+        change: reported,
         reason: SkipReason::ResolverConflict,
-        offending: Some(change.package.clone()),
         detail: None,
     }
 }
@@ -171,7 +178,7 @@ fn parse_requires(go_mod: &str) -> HashMap<String, String> {
         if in_block {
             if line == ")" {
                 in_block = false;
-            } else if let Some((path, version)) = parse_require_pair(line) {
+            } else if let Some(RequirePair { path, version }) = parse_require_pair(line) {
                 requires.insert(path, version);
             }
             continue;
@@ -179,7 +186,7 @@ fn parse_requires(go_mod: &str) -> HashMap<String, String> {
         if line == "require (" {
             in_block = true;
         } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some((path, version)) = parse_require_pair(rest.trim())
+            && let Some(RequirePair { path, version }) = parse_require_pair(rest.trim())
         {
             requires.insert(path, version);
         }
@@ -195,13 +202,25 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-/// Parse a `module/path v1.2.3` pair into `(path, version)`. Returns `None` for a malformed line
-/// (no second field, or a second field that is not a valid Go version).
-fn parse_require_pair(line: &str) -> Option<(String, String)> {
+/// One `require` directive's module path and pinned version, parsed by [`parse_require_pair`].
+struct RequirePair {
+    /// The required module path (the directive's first whitespace-separated field).
+    path: String,
+    /// The pinned version, validated as a `v`-prefixed Go semver string.
+    version: String,
+}
+
+/// Parse a `module/path v1.2.3` pair into a [`RequirePair`].
+/// Returns `None` for a malformed line (no second field, or a second field that is not a valid Go
+/// version).
+fn parse_require_pair(line: &str) -> Option<RequirePair> {
     let mut fields = line.split_whitespace();
     let path = fields.next()?;
     let version = fields.next()?;
-    semver::is_valid(version).then(|| (path.to_string(), version.to_string()))
+    semver::is_valid(version).then(|| RequirePair {
+        path: path.to_string(),
+        version: version.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -259,6 +278,85 @@ mod tests {
     fn collateral_change_marks_a_forced_regression_as_a_downgrade() {
         let change = collateral_change("k8s.io/api", "v0.31.0", "v0.30.2");
         assert!(change.downgrade);
+    }
+
+    #[test]
+    fn resolver_conflict_reports_a_cross_major_skip_under_the_from_identity() {
+        // Planned under the target path (go get needs `…/v2`), but skipped — the tree still holds
+        // the v1 module, so the row must not claim a `…/v2` module exists at v1.3.0.
+        let change = Change {
+            package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+            from: Version::new("v1.3.0"),
+            to: Version::new("v2.0.0"),
+            kind: UpdateKind::Major,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let skipped = resolver_conflict(&change);
+        assert_eq!(skipped.change.package.name, "example.com/foo");
+        // Self-blame stays consistent with the rewritten identity so the renderer's self check
+        // (which falls back to the generic resolver message) still recognizes it.
+        assert_eq!(
+            skipped
+                .offending
+                .as_ref()
+                .map(|package| package.name.as_str()),
+            Some("example.com/foo"),
+        );
+        // A within-major skip keeps its identity untouched.
+        let minor = Change {
+            package: PackageId::new(GO_ID, "example.com/foo", None),
+            from: Version::new("v1.3.0"),
+            to: Version::new("v1.4.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        assert_eq!(
+            resolver_conflict(&minor).change.package.name,
+            "example.com/foo"
+        );
+    }
+
+    #[test]
+    fn resolver_conflict_reports_an_incompatible_cross_path_skip_under_the_base_identity() {
+        // A `+incompatible` line moving onto a discovered `…/v3` path: a skip leaves the tree on
+        // the base-path `+incompatible` require, so the row must carry the base identity — not
+        // claim a `…/v3` module pinned at a `+incompatible` from-version, which cannot exist.
+        let change = Change {
+            package: PackageId::new(GO_ID, "example.com/foo/v3", None),
+            from: Version::new("v2.9.0+incompatible"),
+            to: Version::new("v3.0.2"),
+            kind: UpdateKind::Major,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let skipped = resolver_conflict(&change);
+        assert_eq!(skipped.change.package.name, "example.com/foo");
+        assert_eq!(
+            skipped
+                .offending
+                .as_ref()
+                .map(|package| package.name.as_str()),
+            Some("example.com/foo"),
+        );
+        // A path-stable `+incompatible` skip (the common within-line bump) keeps its identity.
+        let within_line = Change {
+            package: PackageId::new(GO_ID, "github.com/docker/cli", None),
+            from: Version::new("v29.2.1+incompatible"),
+            to: Version::new("v29.5.2+incompatible"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        assert_eq!(
+            resolver_conflict(&within_line).change.package.name,
+            "github.com/docker/cli"
+        );
     }
 
     #[test]

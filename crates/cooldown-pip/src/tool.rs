@@ -12,10 +12,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -35,14 +35,24 @@ pub trait PyLayout: Send + Sync + 'static {
     /// The driver binary, shelled out to for apply/build.
     const BIN: &'static str;
 
-    /// Parses the lock + manifest into resolved `(name, version, is_direct)` triples.
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)>;
+    /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
 
     /// The driver args that re-pin `name` to `version`.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
 
     /// The driver args for the opt-in `--build` step.
     fn build_args() -> Vec<String>;
+}
+
+/// One resolved distribution from a [`PyLayout`]'s lock + manifest.
+pub struct ResolvedDep {
+    /// The distribution name as recorded in the lock.
+    pub name: String,
+    /// The resolved (locked) version.
+    pub version: String,
+    /// Whether the manifest declares the distribution directly (vs. a transitive dependency).
+    pub direct: bool,
 }
 
 /// pip: a pinned `requirements.txt` is both the manifest and the version source, and every pinned
@@ -57,10 +67,14 @@ impl PyLayout for Pip {
     const MANIFEST: &'static str = "requirements.txt";
     const BIN: &'static str = "pip";
 
-    fn parse(lock: &str, _manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
         lock::parse_requirements(lock)
             .into_iter()
-            .map(|(name, ver)| (name, ver, true))
+            .map(|pin| ResolvedDep {
+                name: pin.name,
+                version: pin.version,
+                direct: true,
+            })
             .collect()
     }
 
@@ -79,13 +93,17 @@ impl PyLayout for Poetry {
     const MANIFEST: &'static str = "pyproject.toml";
     const BIN: &'static str = "poetry";
 
-    fn parse(lock: &str, manifest: &str) -> Vec<(String, String, bool)> {
+    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
         let direct = lock::parse_poetry_direct(manifest);
         lock::parse_poetry_lock(lock)
             .into_iter()
-            .map(|(name, ver)| {
-                let is_direct = lock::is_direct(&direct, &name);
-                (name, ver, is_direct)
+            .map(|pin| {
+                let is_direct = lock::is_direct(&direct, &pin.name);
+                ResolvedDep {
+                    name: pin.name,
+                    version: pin.version,
+                    direct: is_direct,
+                }
             })
             .collect()
     }
@@ -163,13 +181,13 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
-        ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: L::LOCKFILE,
             manifest: L::MANIFEST,
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -180,15 +198,15 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         let lock = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let mut deps = Vec::new();
-        for (name, ver, is_direct) in L::parse(&lock, &manifest) {
-            if scope == DepScope::Direct && !is_direct {
+        for resolved in L::parse(&lock, &manifest) {
+            if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(L::ID, name, Some(PYPI.to_string())),
-                current: Version::new(ver.clone()),
-                current_quality: classify_quality(&ver),
-                direct: is_direct,
+                package: PackageId::new(L::ID, resolved.name, Some(PYPI.to_string())),
+                current: Version::new(resolved.version.clone()),
+                current_quality: classify_quality(&resolved.version),
+                direct: resolved.direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 graph_ceiling: None,
@@ -243,6 +261,10 @@ impl<L: PyLayout> ReleaseFetcher for PyTool<L> {
 
 #[async_trait]
 impl<L: PyLayout> ToolWrite for PyTool<L> {
+    fn mutation_tool(&self) -> ToolId {
+        L::ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `pip-compile`/`uv pip compile` EXECUTES a project's `setup.py` (and reads any version/readme
         // file it imports) to discover its dependencies, so the throwaway probe copy must carry `.py`
@@ -258,25 +280,15 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        let mut files = vec![ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new(L::LOCKFILE),
-        )?];
+        let mut paths = vec![Utf8Path::new(L::LOCKFILE)];
         if L::MANIFEST != L::LOCKFILE {
-            files.push(ProjectMutationJournal::capture_file(
-                &project.root,
-                Utf8Path::new(L::MANIFEST),
-            )?);
+            paths.push(Utf8Path::new(L::MANIFEST));
         }
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if L::ID == Pip::ID {
             for change in &plan.changes {
@@ -331,30 +343,32 @@ fn not_eligible(change: &Change) -> Skipped {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use indoc::indoc;
 
     #[tokio::test]
-    async fn pip_apply_rewrites_requirements_without_invoking_pip_install() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+    async fn pip_apply_rewrites_requirements_without_invoking_pip_install() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         std::fs::write(
             root.join("requirements.txt"),
             indoc! {"
                 requests==2.28.0
                 flask==2.2.0
             "},
-        )
-        .expect("requirements");
+        )?;
         let project = Project {
             root: root.clone(),
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
         };
-        let cache = tempfile::tempdir().expect("cache");
-        let tool = PyTool::<Pip>::from_http(
-            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
-        );
+        let cache = tempfile::tempdir()?;
+        let tool = PyTool::<Pip>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let change = Change {
             package: PackageId::new(Pip::ID, "requests", Some(PYPI.to_string())),
             from: Version::new("2.28.0"),
@@ -370,16 +384,14 @@ mod tests {
             ..Plan::default()
         };
 
-        let report = tool
-            .apply(&project, &plan, &ProjectMutationJournal::default())
-            .await
-            .expect("apply");
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
 
         assert_eq!(report.applied.len(), 1);
         assert!(report.skipped.is_empty());
-        let rewritten =
-            std::fs::read_to_string(root.join("requirements.txt")).expect("requirements");
+        let rewritten = std::fs::read_to_string(root.join("requirements.txt"))?;
         assert!(rewritten.contains("requests==2.31.0"));
+        Ok(())
     }
 
     #[tokio::test]

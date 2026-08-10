@@ -1,6 +1,7 @@
 //! The machine-readable JSON schema for `--json` output, printed by `cooldown schema`.
 
 use crate::model::SCHEMA_VERSION;
+use cooldown_core::DiagnosticKind;
 use serde_json::{Map, Value, json};
 
 /// A JSON Schema (draft 2020-12) describing the command-specific envelopes.
@@ -10,31 +11,16 @@ use serde_json::{Map, Value, json};
 )]
 #[must_use]
 pub fn json_schema() -> Value {
+    let diagnostic_kinds = DiagnosticKind::ALL
+        .iter()
+        .map(|kind| Value::String(kind.wire_value().to_string()))
+        .collect::<Vec<_>>();
     let diagnostic = json!({
         "type": "object",
         "required": ["kind", "message"],
         "properties": {
             "kind": {
-                "enum": [
-                    "transient",
-                    "not_found",
-                    "unknown_age",
-                    "stricter_native",
-                    "yanked",
-                    "stale_lock",
-                    "lock_unknown",
-                    "tool_failed",
-                    "tool_spawn_failed",
-                    "lockfile_unreadable",
-                    "filesystem",
-                    "path_encoding",
-                    "serialization",
-                    "lock_conflict",
-                    "system",
-                    "config",
-                    "parse",
-                    "held"
-                ]
+                "enum": diagnostic_kinds
             },
             "message": { "type": "string" },
             "tool": { "type": "string" },
@@ -91,6 +77,30 @@ pub fn json_schema() -> Value {
         .iter()
         .map(|reason| Value::String(reason.wire_value().to_string()))
         .collect();
+    // Same construction for the edge-binding action set.
+    let edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
+    let applied_edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| action.is_applied())
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
+    let unapplied_edge_actions: Vec<Value> = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| !action.is_applied())
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect();
+    let reasoned_edge_actions = cooldown_core::EdgeBindingAction::ALL
+        .iter()
+        .filter(|action| action.requires_detail())
+        .map(|action| Value::String(action.wire_value().to_string()))
+        .collect::<Vec<_>>();
+    let recovery_statuses: Vec<Value> = crate::model::RecoveryStatus::ALL
+        .iter()
+        .map(|status| Value::String(status.wire_value().to_string()))
+        .collect();
     let skipped = json!({
         "type": "object",
         "required": ["reason", "message"],
@@ -121,9 +131,10 @@ pub fn json_schema() -> Value {
         "effectiveInfo": effective,
         "outdatedSummary": {
             "type": "object",
-            "required": ["total", "adoptable", "blocked", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
+            "required": ["total", "skippedStaleProjects", "adoptable", "blocked", "inCooldown", "upToDate", "exempt", "held", "unknownAge", "errors"],
             "properties": {
                 "total": { "type": "integer", "minimum": 0 },
+                "skippedStaleProjects": { "type": "integer", "minimum": 0 },
                 "adoptable": { "type": "integer", "minimum": 0 },
                 "blocked": { "type": "integer", "minimum": 0 },
                 "inCooldown": { "type": "integer", "minimum": 0 },
@@ -172,9 +183,10 @@ pub fn json_schema() -> Value {
         },
         "checkSummary": {
             "type": "object",
-            "required": ["checked", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
+            "required": ["checked", "skippedStaleProjects", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
             "properties": {
                 "checked": { "type": "integer", "minimum": 0 },
+                "skippedStaleProjects": { "type": "integer", "minimum": 0 },
                 "direct": { "type": "integer", "minimum": 0 },
                 "exempt": { "type": "integer", "minimum": 0 },
                 "acknowledged": { "type": "integer", "minimum": 0 },
@@ -208,17 +220,85 @@ pub fn json_schema() -> Value {
         },
         "upgradeSummary": {
             "type": "object",
-            "required": ["applied", "skipped", "errors"],
+            "required": ["applied", "skipped", "errors", "edgesCorrected", "edgesRebound", "edgesHeld", "edgesUnaddressable"],
             "properties": {
                 "applied": { "type": "integer", "minimum": 0 },
                 "skipped": { "type": "integer", "minimum": 0 },
-                "errors": { "type": "integer", "minimum": 0 }
+                "errors": { "type": "integer", "minimum": 0 },
+                "edgesCorrected": { "type": "integer", "minimum": 0 },
+                "edgesRebound": { "type": "integer", "minimum": 0 },
+                "edgesHeld": { "type": "integer", "minimum": 0 },
+                "edgesUnaddressable": { "type": "integer", "minimum": 0 }
             },
             "additionalProperties": false
         },
         "upgradeItem": {
             "type": "object",
             "required": ["name", "tool", "project", "direct", "downgrade", "from", "to", "kind", "applied"],
+            "allOf": [
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": {
+                                    "action": { "enum": unapplied_edge_actions }
+                                }
+                            }
+                        }
+                    },
+                    "then": { "properties": { "applied": { "const": false } } }
+                },
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": {
+                                    "action": { "enum": applied_edge_actions }
+                                }
+                            }
+                        }
+                    },
+                    "then": { "properties": { "applied": { "const": true } } }
+                },
+                {
+                    "if": { "required": ["edge"] },
+                    "then": {
+                        "properties": {
+                            "direct": { "const": false },
+                            "downgrade": { "const": false },
+                            "members": { "maxItems": 0 }
+                        },
+                        "not": {
+                            "anyOf": [
+                                { "required": ["skipped"] },
+                                { "required": ["error"] }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "if": {
+                        "required": ["edge"],
+                        "properties": {
+                            "edge": {
+                                "required": ["action"],
+                                "properties": {
+                                    "action": { "enum": reasoned_edge_actions }
+                                }
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "edge": { "required": ["detail"] }
+                        }
+                    }
+                }
+            ],
             "properties": {
                 "name": { "type": "string" },
                 "tool": { "type": "string" },
@@ -232,7 +312,23 @@ pub fn json_schema() -> Value {
                 "kind": { "enum": ["patch", "minor", "major"] },
                 "applied": { "type": "boolean" },
                 "skipped": { "$ref": "#/$defs/skippedInfo" },
-                "error": { "$ref": "#/$defs/diagnostic" }
+                "error": { "$ref": "#/$defs/diagnostic" },
+                "edge": { "$ref": "#/$defs/upgradeEdgeInfo" }
+            },
+            "additionalProperties": false
+        },
+        // Present iff the row reports a lock-edge *binding* move between coexisting versions
+        // (cargo `--cargo-edge-policy`); `from`/`to` then carry the binding versions (for `held`,
+        // `to` is the withheld correction target and `detail` says why it was withheld).
+        "upgradeEdgeInfo": {
+            "type": "object",
+            "required": ["dependent", "dependentVersion", "action"],
+            "properties": {
+                "dependent": { "type": "string" },
+                "dependentVersion": { "type": "string" },
+                "dependentSource": { "type": "string" },
+                "action": { "enum": edge_actions },
+                "detail": { "type": "string", "minLength": 1 }
             },
             "additionalProperties": false
         },
@@ -294,6 +390,26 @@ pub fn json_schema() -> Value {
                 "package": { "type": "string" },
                 "version": { "type": "string" },
                 "registry": { "type": "string" }
+            },
+            "additionalProperties": false
+        },
+        "recoverySummary": {
+            "type": "object",
+            "required": ["recovered", "unchanged", "errors"],
+            "properties": {
+                "recovered": { "type": "integer", "minimum": 0 },
+                "unchanged": { "type": "integer", "minimum": 0 },
+                "errors": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+        },
+        "recoveryItem": {
+            "type": "object",
+            "required": ["tool", "project", "status"],
+            "properties": {
+                "tool": { "type": "string" },
+                "project": { "type": "string" },
+                "status": { "enum": recovery_statuses }
             },
             "additionalProperties": false
         }
@@ -375,7 +491,8 @@ pub fn json_schema() -> Value {
                 vec!["path", "dryRun"],
                 "#/$defs/baselineSummary",
                 "#/$defs/baselineItem"
-            )
+            ),
+            envelope("recover", Map::new(), vec![], "#/$defs/recoverySummary", "#/$defs/recoveryItem")
         ]
     })
 }
@@ -468,8 +585,10 @@ mod tests {
         BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
         CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
         ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
-        OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus, RecoverySummary, SkippedInfo,
+        UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
+    use color_eyre::eyre;
     use cooldown_core::{
         Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
     };
@@ -491,6 +610,70 @@ mod tests {
     }
 
     #[test]
+    fn edge_discriminator_conditions_enforce_row_invariants() -> eyre::Result<()> {
+        let schema = json_schema();
+        assert_eq!(
+            schema["$defs"]["upgradeEdgeInfo"]["properties"]["detail"]["minLength"],
+            1
+        );
+        let conditions = schema["$defs"]["upgradeItem"]["allOf"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("missing edge action conditions"))?;
+
+        let unapplied = conditions[0]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("missing unapplied edge actions"))?;
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = unapplied.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(listed, !action.is_applied());
+        }
+        assert_eq!(
+            conditions[0]["then"]["properties"]["applied"]["const"],
+            false
+        );
+        let applied = conditions[1]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("missing applied edge actions"))?;
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = applied.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(listed, action.is_applied());
+        }
+        assert_eq!(
+            conditions[1]["then"]["properties"]["applied"]["const"],
+            true
+        );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["direct"]["const"],
+            false
+        );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["downgrade"]["const"],
+            false
+        );
+        assert_eq!(
+            conditions[2]["then"]["properties"]["members"]["maxItems"],
+            0
+        );
+        let prohibited = conditions[2]["then"]["not"]["anyOf"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("missing edge-only prohibited properties"))?;
+        assert_eq!(prohibited[0]["required"][0], "skipped");
+        assert_eq!(prohibited[1]["required"][0], "error");
+        let reasoned = conditions[3]["if"]["properties"]["edge"]["properties"]["action"]["enum"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("missing reasoned edge actions"))?;
+        assert_eq!(
+            conditions[3]["then"]["properties"]["edge"]["required"][0],
+            "detail"
+        );
+        for action in cooldown_core::EdgeBindingAction::ALL {
+            let listed = reasoned.contains(&Value::String(action.wire_value().to_string()));
+            assert_eq!(listed, action.requires_detail());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ceiling_skips_rank_beside_needs_major() {
         for reason in [
             SkipReason::NeedsMajor,
@@ -498,7 +681,7 @@ mod tests {
             SkipReason::MaxMajorHeld,
             SkipReason::DistTagHeld,
         ] {
-            let mut item = upgrade_item();
+            let mut item = upgrade_version_item();
             item.skipped = Some(SkippedInfo {
                 reason,
                 message: reason.message().to_string(),
@@ -530,6 +713,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_status_schema_accepts_every_typed_variant() -> eyre::Result<()> {
+        let schema = json_schema();
+        let allowed = schema["$defs"]["recoveryItem"]["properties"]["status"]["enum"]
+            .as_array()
+            .ok_or_else(|| eyre::eyre!("recovery status enum is not an array"))?;
+        for status in RecoveryStatus::ALL {
+            assert!(allowed.contains(&Value::String(status.wire_value().to_string())));
+        }
+        assert_eq!(allowed.len(), RecoveryStatus::ALL.len());
+        Ok(())
+    }
+
     fn assert_definition_keys_match(schema: &Value) {
         assert_def_keys(schema, "diagnostic", diagnostic());
         assert_def_keys(schema, "window", window());
@@ -542,13 +738,24 @@ mod tests {
         assert_def_keys(schema, "checkSummary", check_summary());
         assert_def_keys(schema, "checkItem", check_item());
         assert_def_keys(schema, "upgradeSummary", upgrade_summary());
-        assert_def_keys(schema, "upgradeItem", upgrade_item());
+        let upgrade_keys: BTreeSet<String> = serialized_keys(upgrade_version_item())
+            .union(&serialized_keys(upgrade_edge_item()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            upgrade_keys,
+            schema_keys(&schema["$defs"]["upgradeItem"]),
+            "$defs.upgradeItem is out of sync"
+        );
+        assert_def_keys(schema, "upgradeEdgeInfo", upgrade_edge_info());
         assert_def_keys(schema, "explainSummary", ExplainSummary {});
         assert_def_keys(schema, "explainStep", explain_step());
         assert_def_keys(schema, "configSummary", config_summary());
         assert_def_keys(schema, "configItem", config_item());
         assert_def_keys(schema, "baselineSummary", baseline_summary());
         assert_def_keys(schema, "baselineItem", baseline_item());
+        assert_def_keys(schema, "recoverySummary", recovery_summary());
+        assert_def_keys(schema, "recoveryItem", recovery_item());
     }
 
     fn assert_envelope_keys_match(schema: &Value) {
@@ -585,7 +792,7 @@ mod tests {
                 generated_at(),
                 upgrade_meta(),
                 upgrade_summary(),
-                vec![upgrade_item()],
+                vec![upgrade_version_item()],
             ),
         );
         assert_envelope_keys(
@@ -597,7 +804,7 @@ mod tests {
                 generated_at(),
                 upgrade_meta(),
                 upgrade_summary(),
-                vec![upgrade_item()],
+                vec![upgrade_version_item()],
             ),
         );
         assert_envelope_keys(
@@ -634,6 +841,18 @@ mod tests {
                 baseline_meta(),
                 baseline_summary(),
                 vec![baseline_item()],
+            ),
+        );
+        assert_envelope_keys(
+            schema,
+            "recover",
+            Envelope::new(
+                "recover",
+                true,
+                generated_at(),
+                RecoveryMeta {},
+                recovery_summary(),
+                vec![recovery_item()],
             ),
         );
     }
@@ -693,6 +912,22 @@ mod tests {
             .with_path("Cargo.toml")
     }
 
+    fn recovery_summary() -> RecoverySummary {
+        RecoverySummary {
+            recovered: 1,
+            unchanged: 2,
+            errors: 0,
+        }
+    }
+
+    fn recovery_item() -> RecoveryItem {
+        RecoveryItem {
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            status: RecoveryStatus::Restored,
+        }
+    }
+
     fn member() -> MemberRef {
         MemberRef {
             name: "app".to_string(),
@@ -742,6 +977,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         }
     }
 
@@ -783,6 +1019,7 @@ mod tests {
             unknown_age: 0,
             errors: 0,
             violations: 1,
+            skipped_stale_projects: 0,
         }
     }
 
@@ -821,10 +1058,14 @@ mod tests {
             applied: 1,
             skipped: 1,
             errors: 0,
+            edges_corrected: 1,
+            edges_rebound: 1,
+            edges_held: 1,
+            edges_unaddressable: 1,
         }
     }
 
-    fn upgrade_item() -> UpgradeItem {
+    fn upgrade_version_item() -> UpgradeItem {
         UpgradeItem {
             name: "serde".to_string(),
             tool: "cargo".to_string(),
@@ -839,6 +1080,36 @@ mod tests {
             applied: false,
             skipped: Some(skipped_info()),
             error: Some(diagnostic()),
+            edge: None,
+        }
+    }
+
+    fn upgrade_edge_item() -> UpgradeItem {
+        UpgradeItem {
+            name: "serde".to_string(),
+            tool: "cargo".to_string(),
+            project: ".".to_string(),
+            direct: false,
+            downgrade: false,
+            members: Vec::new(),
+            registry: Some("crates.io".to_string()),
+            from: "1.0.0".to_string(),
+            to: "1.2.3".to_string(),
+            kind: UpdateKind::Minor,
+            applied: false,
+            skipped: None,
+            error: None,
+            edge: Some(upgrade_edge_info()),
+        }
+    }
+
+    fn upgrade_edge_info() -> UpgradeEdgeInfo {
+        UpgradeEdgeInfo {
+            dependent: "diesel".to_string(),
+            dependent_version: "2.3.11".to_string(),
+            dependent_source: Some("registry+https://example.invalid/index".to_string()),
+            action: cooldown_core::EdgeBindingAction::Held,
+            detail: Some("would orphan its last lock reference".to_string()),
         }
     }
 

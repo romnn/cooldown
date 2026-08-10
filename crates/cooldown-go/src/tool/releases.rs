@@ -25,8 +25,7 @@ pub(super) fn classify_quality(version: &str) -> ReleaseQuality {
 /// The `MajorKey` for a module *path* — the `/vN` suffix (`""` for v0/v1/+incompatible base
 /// paths).
 pub(super) fn major_key_for_path(path: &str) -> MajorKey {
-    let (_, path_major, _) = semver::split_path_version(path);
-    MajorKey(path_major)
+    MajorKey(semver::split_path_version(path).path_major)
 }
 
 /// Classify a set of source-tagged raw releases into ordered, deduped [`Release`]s: assign quality
@@ -215,29 +214,47 @@ pub(super) fn classify_kind(current: &str, candidate: &str) -> Option<UpdateKind
     }
 }
 
-/// The `(prefix, current major)` of a module *path* — `1` for a v0/v1/base path — or `None` when the
-/// path is not a well-formed module path to discover other majors from.
-fn path_current_major(module: &str) -> Option<(String, u32)> {
-    let (prefix, path_major, ok) = semver::split_path_version(module);
-    if !ok {
+/// The base prefix of a module *path* and the major version the path itself encodes.
+struct ModulePathMajor {
+    /// The module path without its trailing major-version element — the base other
+    /// major-version paths are built from.
+    prefix: String,
+    /// The numeric major encoded by the path's `/vN` (or `gopkg.in` `.vN`) element;
+    /// `1` for a v0/v1/base path with no such element.
+    current_major: u32,
+}
+
+/// The [`ModulePathMajor`] of a module *path* — major `1` for a v0/v1/base path — or `None` when
+/// the path is not a well-formed module path to discover other majors from.
+fn path_current_major(module: &str) -> Option<ModulePathMajor> {
+    let split = semver::split_path_version(module);
+    if !split.well_formed {
         return None;
     }
-    let major = if path_major.is_empty() {
+    let current_major = if split.path_major.is_empty() {
         1
     } else {
-        path_major
+        split
+            .path_major
             .trim_start_matches(['/', '.'])
             .trim_start_matches('v')
             .parse()
             .unwrap_or(1)
     };
-    Some((prefix, major))
+    Some(ModulePathMajor {
+        prefix: split.prefix,
+        current_major,
+    })
 }
 
 /// Discover higher major-version module paths (`prefix/v2`, `/v3`, …) for cross-major *upgrade*
 /// candidates. Walks up from the current major, stopping after two consecutive misses (or `+8`).
 async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<String>> {
-    let Some((prefix, current_major)) = path_current_major(module) else {
+    let Some(ModulePathMajor {
+        prefix,
+        current_major,
+    }) = path_current_major(module)
+    else {
         return Ok(Vec::new());
     };
     let mut found = Vec::new();
@@ -262,7 +279,11 @@ async fn discover_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<Strin
 /// base path). The range is bounded by the current major, and a v0/v1 module has no lower path, so
 /// this is a no-op for the common case and only probes the rare v2+ module.
 async fn discover_lower_major_paths(proxy: &GoProxy, module: &str) -> Result<Vec<String>> {
-    let Some((prefix, current_major)) = path_current_major(module) else {
+    let Some(ModulePathMajor {
+        prefix,
+        current_major,
+    }) = path_current_major(module)
+    else {
         return Ok(Vec::new());
     };
     let mut found = Vec::new();

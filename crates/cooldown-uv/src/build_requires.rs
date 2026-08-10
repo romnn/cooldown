@@ -93,13 +93,22 @@ fn parse_build_require(requirement: &str) -> Option<BuildRequire> {
             .split_once(']')
             .map_or("", |(_, tail)| tail.trim_start());
     }
-    let (floor, pinned) = lower_bound(rest)?;
+    let lower = lower_bound(rest)?;
     Some(BuildRequire {
         name: native::normalize_name(name),
-        floor,
-        pinned,
+        floor: lower.version,
+        pinned: lower.pinned,
         bound: version::most_restrictive_declared_bound([rest.to_string()]),
     })
+}
+
+/// The lower-bound floor a PEP 440 specifier set declares.
+#[derive(Debug, PartialEq)]
+struct LowerBound {
+    /// The lower-bound version — the floor a `current` is anchored on.
+    version: String,
+    /// Whether the specifier is an exact `==`/`===` pin rather than an open lower bound.
+    pinned: bool,
 }
 
 /// The declared lower-bound version of a PEP 440 specifier set, and whether it is an exact pin.
@@ -108,19 +117,25 @@ fn parse_build_require(requirement: &str) -> Option<BuildRequire> {
 /// / `===1.28.0` yield that version, pinned. An upper-bound-only (`<2`, `<=1`, `!=1.0`), a
 /// prefix-wildcard pin (`==1.*`), or an empty specifier yields `None` — there is no concrete floor to
 /// anchor a `current` on.
-fn lower_bound(specifier: &str) -> Option<(String, bool)> {
+fn lower_bound(specifier: &str) -> Option<LowerBound> {
     let mut floor: Option<String> = None;
     for clause in specifier.split(',') {
         let clause = clause.trim();
         if let Some(version) = clause.strip_prefix("===") {
-            return Some((version.trim().to_string(), true));
+            return Some(LowerBound {
+                version: version.trim().to_string(),
+                pinned: true,
+            });
         }
         if let Some(version) = clause.strip_prefix("==") {
             let version = version.trim();
             if version.contains('*') {
                 return None; // a prefix-wildcard pin is not a single concrete floor
             }
-            return Some((version.to_string(), true));
+            return Some(LowerBound {
+                version: version.to_string(),
+                pinned: true,
+            });
         }
         if let Some(version) = clause.strip_prefix(">=") {
             push_floor(&mut floor, version.trim());
@@ -136,7 +151,10 @@ fn lower_bound(specifier: &str) -> Option<(String, bool)> {
             push_floor(&mut floor, version.trim());
         }
     }
-    floor.map(|version| (version, false))
+    floor.map(|version| LowerBound {
+        version,
+        pinned: false,
+    })
 }
 
 fn push_floor(floor: &mut Option<String>, candidate: &str) {
@@ -154,7 +172,8 @@ fn push_floor(floor: &mut Option<String>, candidate: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildRequire, build_require_names, build_requires, lower_bound, parse_build_require,
+        BuildRequire, LowerBound, build_require_names, build_requires, lower_bound,
+        parse_build_require,
     };
     use camino::Utf8PathBuf;
     use indoc::indoc;
@@ -165,6 +184,13 @@ mod tests {
             floor: floor.to_string(),
             pinned,
             bound: None,
+        }
+    }
+
+    fn floor(version: &str, pinned: bool) -> LowerBound {
+        LowerBound {
+            version: version.to_string(),
+            pinned,
         }
     }
 
@@ -186,16 +212,16 @@ mod tests {
 
     #[test]
     fn lower_bound_reads_the_floor_and_pin_flag() {
-        assert_eq!(lower_bound(">=1.28.0"), Some(("1.28.0".into(), false)));
-        assert_eq!(lower_bound(">= 1.28.0"), Some(("1.28.0".into(), false)));
-        assert_eq!(lower_bound(">1.27"), Some(("1.27".into(), false)));
-        assert_eq!(lower_bound("~=1.2"), Some(("1.2".into(), false)));
-        assert_eq!(lower_bound(">=1.2,<2"), Some(("1.2".into(), false)));
+        assert_eq!(lower_bound(">=1.28.0"), Some(floor("1.28.0", false)));
+        assert_eq!(lower_bound(">= 1.28.0"), Some(floor("1.28.0", false)));
+        assert_eq!(lower_bound(">1.27"), Some(floor("1.27", false)));
+        assert_eq!(lower_bound("~=1.2"), Some(floor("1.2", false)));
+        assert_eq!(lower_bound(">=1.2,<2"), Some(floor("1.2", false)));
         // Clause order does not matter: the highest lower bound is found wherever it sits.
-        assert_eq!(lower_bound("<2,>=1.2"), Some(("1.2".into(), false)));
-        assert_eq!(lower_bound(">=1.2,>=1.4"), Some(("1.4".into(), false)));
-        assert_eq!(lower_bound("==1.28.0"), Some(("1.28.0".into(), true)));
-        assert_eq!(lower_bound("===1.28.0"), Some(("1.28.0".into(), true)));
+        assert_eq!(lower_bound("<2,>=1.2"), Some(floor("1.2", false)));
+        assert_eq!(lower_bound(">=1.2,>=1.4"), Some(floor("1.4", false)));
+        assert_eq!(lower_bound("==1.28.0"), Some(floor("1.28.0", true)));
+        assert_eq!(lower_bound("===1.28.0"), Some(floor("1.28.0", true)));
         // No lower bound to anchor on.
         assert_eq!(lower_bound("<2"), None);
         assert_eq!(lower_bound("<=1.4"), None);
@@ -231,17 +257,31 @@ mod tests {
         assert_eq!(parse_build_require("flit_core <4"), None);
     }
 
-    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path =
-            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
-        std::fs::write(&path, contents).expect("write manifest");
-        (dir, path)
+    /// A `pyproject.toml` written into its own temporary directory.
+    struct TempManifest {
+        /// Owns the temporary directory; dropping it deletes the manifest from disk.
+        directory: tempfile::TempDir,
+        /// The path of the `pyproject.toml` inside the temporary directory.
+        manifest: Utf8PathBuf,
+    }
+
+    fn write_manifest(contents: &str) -> TempManifest {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest =
+            Utf8PathBuf::from_path_buf(directory.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&manifest, contents).expect("write manifest");
+        TempManifest {
+            directory,
+            manifest,
+        }
     }
 
     #[test]
     fn build_requires_reads_the_build_system_table() {
-        let (_dir, manifest) = write_manifest(indoc! {r#"
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(indoc! {r#"
             [project]
             name = "demo"
             dependencies = ["httpx>=0.27"]
@@ -268,8 +308,10 @@ mod tests {
 
     #[test]
     fn no_build_system_table_yields_nothing() {
-        let (_dir, manifest) =
-            write_manifest("[project]\nname = \"demo\"\ndependencies = [\"httpx>=0.27\"]\n");
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest("[project]\nname = \"demo\"\ndependencies = [\"httpx>=0.27\"]\n");
         assert!(
             build_requires(&manifest)
                 .expect("build requires")
@@ -284,7 +326,10 @@ mod tests {
 
     #[test]
     fn invalid_manifest_is_reported() {
-        let (_dir, manifest) = write_manifest("[build-system]\nrequires = [");
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest("[build-system]\nrequires = [");
 
         assert!(build_requires(&manifest).is_err());
         assert!(build_require_names(&manifest).is_err());

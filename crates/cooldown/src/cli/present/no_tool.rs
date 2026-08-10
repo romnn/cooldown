@@ -13,10 +13,27 @@ pub(in crate::cli) fn no_tool_json(command: &'static str) -> Result<String, Core
         "explain" => no_tool_explain(generated_at, error),
         "config" => no_tool_config(generated_at, error),
         "baseline" => no_tool_baseline(generated_at, error),
+        "recover" => no_tool_recover(generated_at, error),
         _ => Err(CoreError::Config(format!(
             "command `{command}` does not produce a workspace JSON envelope"
         ))),
     }
+}
+
+fn no_tool_recover(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
+    let summary = super::recovery_summary(&crate::app::RecoverySummary::default());
+    let items = super::recovery_items(&[]);
+    serialize_no_tool(&with_error(
+        render::Envelope::new(
+            "recover",
+            false,
+            generated_at,
+            render::RecoveryMeta {},
+            summary,
+            items,
+        ),
+        error,
+    ))
 }
 
 fn no_tool_outdated(generated_at: String, error: Diagnostic) -> Result<String, CoreError> {
@@ -36,6 +53,7 @@ fn no_tool_outdated(generated_at: String, error: Diagnostic) -> Result<String, C
                 held: 0,
                 unknown_age: 0,
                 errors: 0,
+                skipped_stale_projects: 0,
             },
             Vec::<render::OutdatedItem>::new(),
         ),
@@ -62,6 +80,7 @@ fn no_tool_check(generated_at: String, error: Diagnostic) -> Result<String, Core
                 unknown_age: 0,
                 errors: 0,
                 violations: 0,
+                skipped_stale_projects: 0,
             },
             Vec::<render::CheckItem>::new(),
         ),
@@ -91,6 +110,10 @@ fn no_tool_mutation(
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_rebound: 0,
+                edges_held: 0,
+                edges_unaddressable: 0,
             },
             Vec::<render::UpgradeItem>::new(),
         ),

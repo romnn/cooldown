@@ -138,7 +138,7 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
     };
     let exempt = allow.matched && allow.effective_floor.is_none();
     let (floor_duration, floor_origin) = match &allow.effective_floor {
-        Some((_, duration, origin)) => (Some(*duration), Some(origin.clone())),
+        Some(floor) => (Some(floor.duration), Some(floor.origin.clone())),
         None => (None, None),
     };
     // Provenance: when an allow applied, point at the highest-layer matching allow; else the pick.
@@ -357,14 +357,25 @@ fn pick_window(
     pick
 }
 
-/// Collects every matching `floor` rule (with its declaring layer index and origin), tracing each
-/// as a floor candidate.
+/// One matching `floor` rule: the floor duration plus the declaring layer, which decides whether
+/// an `allow` can bypass it (only a same-layer or audited env/CLI allow can).
+#[derive(Debug, Clone)]
+struct FloorCandidate {
+    /// Index of the declaring layer in the resolution stack.
+    layer_index: usize,
+    /// The floor's minimum-age duration.
+    duration: SignedDuration,
+    /// The declaring layer's origin, for attribution.
+    origin: Origin,
+}
+
+/// Collects every matching `floor` rule, tracing each as a floor candidate.
 fn collect_floor_candidates(
     layers: &[PolicyLayer],
     query: &ResolveQuery<'_>,
     trace: &mut Vec<TraceStep>,
-) -> Vec<(usize, SignedDuration, Origin)> {
-    let mut floors: Vec<(usize, SignedDuration, Origin)> = Vec::new();
+) -> Vec<FloorCandidate> {
+    let mut floors: Vec<FloorCandidate> = Vec::new();
     for (layer_index, layer) in layers.iter().enumerate() {
         for rule in &layer.rules {
             if !rule.selector.matches(query) {
@@ -379,7 +390,11 @@ fn collect_floor_candidates(
                     applied: false,
                     note: "floor candidate".into(),
                 });
-                floors.push((layer_index, floor, layer.origin.clone()));
+                floors.push(FloorCandidate {
+                    layer_index,
+                    duration: floor,
+                    origin: layer.origin.clone(),
+                });
             }
         }
     }
@@ -390,7 +405,7 @@ fn collect_floor_candidates(
 /// any), and the provenance (highest-layer matching allow) used to attribute the decision.
 struct AllowOutcome {
     matched: bool,
-    effective_floor: Option<(usize, SignedDuration, Origin)>,
+    effective_floor: Option<FloorCandidate>,
     provenance: Option<(Origin, Selector)>,
 }
 
@@ -406,7 +421,7 @@ struct AllowOutcome {
 fn resolve_allows(
     layers: &[PolicyLayer],
     query: &ResolveQuery<'_>,
-    floors: &[(usize, SignedDuration, Origin)],
+    floors: &[FloorCandidate],
     trace: &mut Vec<TraceStep>,
 ) -> AllowOutcome {
     let mut allows: Vec<(usize, Origin, Selector)> = Vec::new();
@@ -432,8 +447,8 @@ fn resolve_allows(
     };
     let effective_floor = floors
         .iter()
-        .filter(|(floor_layer_index, ..)| !bypassed(*floor_layer_index))
-        .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
+        .filter(|floor| !bypassed(floor.layer_index))
+        .max_by(|a, b| (a.duration, a.layer_index).cmp(&(b.duration, b.layer_index)))
         .cloned();
 
     for (layer_index, origin, selector) in &allows {
@@ -452,12 +467,12 @@ fn resolve_allows(
         });
     }
 
-    if let Some((_, duration, origin)) = &effective_floor {
+    if let Some(floor) = &effective_floor {
         trace.push(TraceStep {
-            layer: origin.clone(),
+            layer: floor.origin.clone(),
             field: "floor".into(),
             selector: None,
-            min_age_days: Some(duration_as_days(*duration)),
+            min_age_days: Some(duration_as_days(floor.duration)),
             applied: true,
             note: if allow_matched {
                 "residual floor (not bypassable by the matched allow)".into()

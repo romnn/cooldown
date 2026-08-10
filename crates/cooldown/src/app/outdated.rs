@@ -2,9 +2,10 @@
 //! candidate set; informational, so per-dep failures never change the exit code.
 
 use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
+use super::lock::ProjectAccessWriteGuard;
 use super::{
-    Exit, LockReportAction, RunOpts, Workspace, age_days, diag_from_error, lock_report_outcome,
-    render_window,
+    Exit, FetchedRelease, LockReportAction, RunOpts, Workspace, age_days, diag_from_error,
+    lock_report_outcome, render_window,
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
@@ -37,6 +38,7 @@ struct OutdatedRunner<'a> {
     items: Vec<OutdatedItem>,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
+    skipped_stale_projects: usize,
 }
 
 impl Workspace {
@@ -63,6 +65,7 @@ impl<'a> OutdatedRunner<'a> {
             items: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
+            skipped_stale_projects: 0,
         }
     }
 
@@ -85,7 +88,8 @@ impl<'a> OutdatedRunner<'a> {
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.current.cmp(&b.current))
         });
-        let summary = summarize(&self.items);
+        let mut summary = summarize(&self.items);
+        summary.skipped_stale_projects = self.skipped_stale_projects;
         OutdatedOutcome {
             summary,
             items: self.items,
@@ -100,9 +104,27 @@ impl<'a> OutdatedRunner<'a> {
             return;
         };
 
-        if !self.refresh_lock(pctx, &read.project_label).await {
+        let (continue_run, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
+        if !continue_run {
             return;
         }
+
+        let read_guard = if refresh_guard.is_some() {
+            None
+        } else {
+            match self.ws.project_read_guard(pctx).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        &read.project_label,
+                        None,
+                    ));
+                    return;
+                }
+            }
+        };
 
         self.opts.progress.phase("resolving dependency graph");
         let mut deps = match self
@@ -118,12 +140,16 @@ impl<'a> OutdatedRunner<'a> {
                     error = %error,
                     "could not enumerate dependencies"
                 );
-                self.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    &read.project_label,
-                    None,
-                ));
+                let diagnostic = diag_from_error(&error, pctx.tool, &read.project_label, None)
+                    .with_path(pctx.project.manifest.as_str());
+                if self.opts.allow_stale_lock
+                    && matches!(error, cooldown_core::CoreError::StaleLock(_))
+                {
+                    self.skipped_stale_projects += 1;
+                    self.warnings.push(stale_evaluation_skipped(diagnostic));
+                } else {
+                    self.errors.push(diagnostic);
+                }
                 return;
             }
         };
@@ -156,12 +182,16 @@ impl<'a> OutdatedRunner<'a> {
                 ));
             }
         }
+        drop(read_guard);
+        drop(refresh_guard);
         let fetched = self
             .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
             .await;
 
-        let (mut project_items, verification_candidates) =
-            self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
+        let ClassifiedProject {
+            items: mut project_items,
+            verification_candidates,
+        } = self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
 
         // Reconcile the per-package "adoptable" verdicts with what the whole-graph upgrade resolve would
         // actually land. A matured candidate the resolve cannot place (a conflicting requirement wins) is
@@ -183,11 +213,15 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &super::ProjectCtx,
         project_label: &str,
         rctx: &cooldown_core::ResolveContext<'_>,
-        fetched: Vec<(Dependency, cooldown_core::Result<Vec<Release>>)>,
-    ) -> (Vec<OutdatedItem>, Vec<VerificationCandidate>) {
+        fetched: Vec<FetchedRelease<Vec<Release>>>,
+    ) -> ClassifiedProject {
         let mut items = Vec::new();
         let mut candidates = Vec::new();
-        for (dep, result) in fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
             match result {
                 Ok(releases) => {
                     if is_yanked_locked(&releases, &dep) {
@@ -198,10 +232,7 @@ impl<'a> OutdatedRunner<'a> {
                     if item.status == OutdatedStatus::Adoptable
                         && let Some(change) = adoptable_change(&dep, &releases, &item)
                     {
-                        candidates.push(VerificationCandidate {
-                            item_index: items.len(),
-                            change,
-                        });
+                        candidates.push(VerificationCandidate::new(items.len(), &dep, change));
                     }
                     items.push(item);
                 }
@@ -212,7 +243,10 @@ impl<'a> OutdatedRunner<'a> {
                 }
             }
         }
-        (items, candidates)
+        ClassifiedProject {
+            items,
+            verification_candidates: candidates,
+        }
     }
 
     /// Re-classify any `adoptable` item the whole-graph upgrade resolve would not actually land as
@@ -277,16 +311,33 @@ impl<'a> OutdatedRunner<'a> {
         apply_held(items, &candidates, &held);
     }
 
-    async fn refresh_lock(&mut self, pctx: &'a super::ProjectCtx, project_label: &str) -> bool {
+    async fn refresh_lock(
+        &mut self,
+        pctx: &'a super::ProjectCtx,
+        project_label: &str,
+    ) -> (bool, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
-            Ok(Some(report)) => self.handle_lock_report(report, pctx, project_label),
-            Ok(None) => true,
+            Ok(refresh) => {
+                self.warnings.extend(refresh.recovery);
+                let continue_run = match refresh.report {
+                    Ok(report) => report
+                        .is_none_or(|report| self.handle_lock_report(report, pctx, project_label)),
+                    Err(error) => {
+                        self.errors.push(
+                            diag_from_error(&error, pctx.tool, project_label, None)
+                                .with_path(pctx.project.manifest.as_str()),
+                        );
+                        false
+                    }
+                };
+                (continue_run, refresh.guard)
+            }
             Err(error) => {
                 self.errors.push(
                     diag_from_error(&error, pctx.tool, project_label, None)
                         .with_path(pctx.project.manifest.as_str()),
                 );
-                false
+                (false, None)
             }
         }
     }
@@ -297,6 +348,7 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &'a super::ProjectCtx,
         project_label: &str,
     ) -> bool {
+        let stale = report.status == cooldown_core::LockStatus::Stale;
         let outcome = lock_report_outcome(
             report,
             pctx.tool,
@@ -307,9 +359,18 @@ impl<'a> OutdatedRunner<'a> {
         match outcome.action {
             LockReportAction::Continue => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.warnings.push(diagnostic);
+                    self.warnings.push(if stale {
+                        stale_evaluation_skipped(diagnostic)
+                    } else {
+                        diagnostic
+                    });
                 }
-                true
+                if stale {
+                    self.skipped_stale_projects += 1;
+                    false
+                } else {
+                    true
+                }
             }
             LockReportAction::Skip => {
                 if let Some(diagnostic) = outcome.diagnostic {
@@ -331,7 +392,7 @@ impl<'a> OutdatedRunner<'a> {
         project_label: &str,
         deps: Vec<Dependency>,
         fctx: &cooldown_core::FetchContext<'_>,
-    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+    ) -> Vec<FetchedRelease<Vec<Release>>> {
         tracing::info!(
             project = project_label,
             tool = pctx.tool.as_str(),
@@ -354,7 +415,11 @@ impl<'a> OutdatedRunner<'a> {
                 self.opts.fanout(),
             )
             .await;
-        for (dep, result) in &fetched {
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in &fetched
+        {
             match result {
                 Ok(releases) => tracing::trace!(
                     package = dep.package.name.as_str(),
@@ -513,11 +578,47 @@ fn error_item(
     }
 }
 
+/// One project's classified rows plus the adoptable candidates the whole-graph verification pass
+/// re-checks against the real upgrade trial.
+struct ClassifiedProject {
+    items: Vec<OutdatedItem>,
+    verification_candidates: Vec<VerificationCandidate>,
+}
+
 /// An `adoptable` item paired (by position in the project's item list) with the forward [`Change`]
 /// the policy preview verifies for it.
 struct VerificationCandidate {
     item_index: usize,
     change: Change,
+    /// The held-row key spelled under the dependency's *current* identity, kept only when the
+    /// planned change rewrites the package identity (a go `/vN` path-major move). A held
+    /// cross-path move leaves the tree on the source path, so the adapter's skip row truthfully
+    /// carries that source identity while `change` names the target path; the preview join must
+    /// accept either spelling or the item stays adoptable although `upgrade` would hold it.
+    source_key: Option<ChangeTargetKey>,
+}
+
+impl VerificationCandidate {
+    fn new(item_index: usize, dep: &Dependency, change: Change) -> Self {
+        // `target_package_for` rewrote the planned identity away from the dependency's own only
+        // for a cross-path move; everywhere else the two spellings coincide and no alias is kept.
+        // Only the name differs between the spellings: the rewrite preserves registry, target,
+        // directness, and members, so the alias reuses the change's own fields for those.
+        let source_key = (change.package != dep.package).then(|| {
+            change_target_key_parts(
+                &dep.package.name,
+                dep.package.registry.as_deref(),
+                change.to.as_str(),
+                change.direct,
+                &change.members,
+            )
+        });
+        VerificationCandidate {
+            item_index,
+            change,
+            source_key,
+        }
+    }
 }
 
 /// The forward [`Change`] an `adoptable` item would take — its matured target. `None` when the item
@@ -569,14 +670,19 @@ fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Opti
 
 /// Re-classify every `adoptable` item the upgrade resolve could not land (`held`) as `blocked`,
 /// carrying the blocker the resolve named. An item the resolve landed (absent from `held`) keeps its
-/// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set.
+/// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set. A held
+/// cross-path move is reported under its source identity (the require that still exists) rather
+/// than the planned target identity, so the lookup accepts either spelling of the same change.
 fn apply_held(
     items: &mut [OutdatedItem],
     candidates: &[VerificationCandidate],
     held: &HashMap<ChangeTargetKey, Option<String>>,
 ) {
     for candidate in candidates {
-        if let Some(blocker) = held.get(&change_target_key(&candidate.change))
+        let blocker = held
+            .get(&change_target_key(&candidate.change))
+            .or_else(|| candidate.source_key.as_ref().and_then(|key| held.get(key)));
+        if let Some(blocker) = blocker
             && let Some(item) = items.get_mut(candidate.item_index)
             && item.status == OutdatedStatus::Adoptable
         {
@@ -589,6 +695,7 @@ fn apply_held(
 fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
     let mut s = OutdatedSummary {
         total: items.len(),
+        skipped_stale_projects: 0,
         adoptable: 0,
         blocked: 0,
         in_cooldown: 0,
@@ -613,6 +720,13 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
         }
     }
     s
+}
+
+fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
+    diagnostic
+        .message
+        .push_str("; dependency evaluation was skipped for this project");
+    diagnostic
 }
 
 #[cfg(test)]
@@ -673,6 +787,7 @@ mod tests {
                 offending: Some(blocker.to_string()),
             }),
             error: None,
+            edge: None,
         }
     }
 
@@ -692,10 +807,25 @@ mod tests {
     }
 
     fn candidate(item_index: usize, item: &OutdatedItem) -> VerificationCandidate {
-        VerificationCandidate {
-            item_index,
-            change: adoptable_change(&dependency(item), &[], item).expect("a forward change"),
-        }
+        let dep = dependency(item);
+        let change = adoptable_change(&dep, &[], item).expect("a forward change");
+        VerificationCandidate::new(item_index, &dep, change)
+    }
+
+    fn go_adoptable(name: &str, current: &str, target: &str) -> (OutdatedItem, Dependency) {
+        let mut item = adoptable(name, current, target);
+        item.tool = "go".to_string();
+        item.registry = None;
+        let mut dep = dependency(&item);
+        dep.package = PackageId::new(GO, name, None);
+        (item, dep)
+    }
+
+    fn go_skipped(name: &str, current: &str, target: &str, blocker: &str) -> UpgradeItem {
+        let mut row = skipped(name, current, target, blocker);
+        row.tool = "go".to_string();
+        row.registry = None;
+        row
     }
 
     fn release(version: &str, order: u8, major: &str) -> Release {
@@ -736,6 +866,87 @@ mod tests {
         let change = adoptable_change(&dep, &releases, &item).expect("a cross-major change");
 
         assert_eq!(change.package.name, "example.com/foo/v2");
+    }
+
+    #[test]
+    fn cross_path_held_go_candidate_is_reclassified_blocked() {
+        // go.mod requires `github.com/foo/bar v2.9.0+incompatible`, a matured `/v3` release
+        // exists, and MVS holds the move. The candidate plans the target identity (`…/v3`) while
+        // the preview's skip row truthfully carries the base identity the tree still holds; the
+        // join must land on the source-identity spelling, or `outdated` reports adoptable an
+        // upgrade `upgrade` would hold.
+        let (item, dep) = go_adoptable("github.com/foo/bar", "v2.9.0+incompatible", "v3.0.2");
+        let releases = [
+            release("v2.9.0+incompatible", 1, ""),
+            release("v3.0.2", 2, "/v3"),
+        ];
+        let change = adoptable_change(&dep, &releases, &item).expect("a cross-path change");
+        assert_eq!(change.package.name, "github.com/foo/bar/v3");
+        let candidates = vec![VerificationCandidate::new(0, &dep, change)];
+
+        // Go's `resolver_conflict` reports the held move under the base identity, blaming itself.
+        let held = held_from_preview(vec![go_skipped(
+            "github.com/foo/bar",
+            "v2.9.0+incompatible",
+            "v3.0.2",
+            "github.com/foo/bar",
+        )]);
+
+        // The planned-identity key alone misses — the held row is spelled under the base path.
+        assert!(!held.contains_key(&change_target_key(&candidates[0].change)));
+
+        let mut items = vec![item];
+        apply_held(&mut items, &candidates, &held);
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        // Self-blame collapses to the generic "resolver rejected" form: no named blocker.
+        assert_eq!(items[0].blocked_by, None);
+    }
+
+    #[test]
+    fn same_path_held_go_candidate_still_joins_on_its_planned_identity() {
+        // A within-path go hold keeps its planned identity (no rewrite), so the join lands on the
+        // primary key and no source-identity alias is even constructed.
+        let (item, dep) = go_adoptable("golang.org/x/text", "v0.1.0", "v0.2.0");
+        let change = adoptable_change(&dep, &[], &item).expect("a forward change");
+        let candidate = VerificationCandidate::new(0, &dep, change);
+        assert!(candidate.source_key.is_none());
+
+        let held = held_from_preview(vec![go_skipped(
+            "golang.org/x/text",
+            "v0.1.0",
+            "v0.2.0",
+            "example.com/dep",
+        )]);
+
+        let mut items = vec![item];
+        apply_held(&mut items, &[candidate], &held);
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        assert_eq!(items[0].blocked_by.as_deref(), Some("example.com/dep"));
+    }
+
+    #[test]
+    fn source_identity_fallback_does_not_join_a_different_target() {
+        // The alias keys on the same target version as the planned change, so a base-named hold at
+        // some other target must not bleed onto this candidate.
+        let (item, dep) = go_adoptable("github.com/foo/bar", "v2.9.0+incompatible", "v3.0.2");
+        let releases = [
+            release("v2.9.0+incompatible", 1, ""),
+            release("v3.0.2", 2, "/v3"),
+        ];
+        let change = adoptable_change(&dep, &releases, &item).expect("a cross-path change");
+        let candidates = vec![VerificationCandidate::new(0, &dep, change)];
+
+        let held = held_from_preview(vec![go_skipped(
+            "github.com/foo/bar",
+            "v2.9.0+incompatible",
+            "v3.0.1",
+            "github.com/foo/bar",
+        )]);
+
+        let mut items = vec![item];
+        apply_held(&mut items, &candidates, &held);
+        assert_eq!(items[0].status, OutdatedStatus::Adoptable);
+        assert_eq!(items[0].blocked_by, None);
     }
 
     #[test]

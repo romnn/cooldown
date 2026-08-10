@@ -28,10 +28,25 @@ fn reject_tool_only_fields(selector: &SelectorToml, ctx: &str) -> Result<(), Cor
             "{ctx}: `{field}` is not valid here; exclusion lists live under [tool.*], [global], or a command table"
         )));
     }
+    if selector.edge_policy.is_some() {
+        return Err(CoreError::Config(format!(
+            "{ctx}: `edge-policy` is cargo-specific; move it to [tool.cargo]"
+        )));
+    }
     Ok(())
 }
 
 fn validate_structure(config: &ConfigToml, origin: &Origin) -> Result<(), CoreError> {
+    if let Some(tools) = &config.tool {
+        for (name, selector) in tools {
+            if name != "cargo" && selector.edge_policy.is_some() {
+                return Err(CoreError::Config(format!(
+                    "{}: `edge-policy` in [tool.{name}] is cargo-specific; move it to [tool.cargo]",
+                    origin.token()
+                )));
+            }
+        }
+    }
     if let Some(registries) = &config.registry {
         for (name, selector) in registries {
             reject_tool_only_fields(selector, &format!("{} [registry.{name:?}]", origin.token()))?;
@@ -87,6 +102,16 @@ impl ConfigDocument {
     pub fn scan_config(&self, origin: &Origin) -> Result<ScanConfig, CoreError> {
         scan_config_from_config(self.raw.clone(), origin)
     }
+
+    /// Returns the document's Cargo edge policy, if `[tool.cargo]` sets one.
+    #[must_use]
+    pub fn cargo_edge_policy(&self) -> Option<crate::EdgePolicy> {
+        self.raw
+            .tool
+            .as_ref()
+            .and_then(|tools| tools.get("cargo"))
+            .and_then(|cargo| cargo.edge_policy)
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +139,22 @@ mod tests {
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
         assert_eq!(scan.global.major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
+    }
+
+    /// The cargo-only `edge-policy` key is rejected under registry/project selectors (which are
+    /// policy-only and could never honor it), like the misplaced exclude lists before it.
+    #[test]
+    fn edge_policy_is_rejected_under_registry_and_project_selectors() {
+        for src in [
+            "[registry.\"npmjs.com\"]\nedge-policy = \"preserve\"\n",
+            "[project.\"apps/*\"]\nedge-policy = \"preserve\"\n",
+        ] {
+            let err = ConfigDocument::parse(src, &Origin::Global)
+                .expect_err("a misplaced edge-policy must be rejected");
+            assert!(
+                err.to_string().contains("[tool.cargo]"),
+                "the error points at the correct placement: {err}"
+            );
+        }
     }
 }

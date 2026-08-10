@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use clap::parser::ValueSource;
-use clap::{ArgMatches, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 /// Verbosity for the diagnostic log written to stderr (independent of `--json`/report output).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -78,8 +78,8 @@ impl ColorMode {
 
 /// The parsed `cooldown` command line: a subcommand plus the global, mostly-policy flags.
 ///
-/// Construct it with clap's [`Parser`] (`Cli::parse()`) and hand it to [`run`](crate::cli::run).
-#[derive(Parser)]
+/// Use [`Cli::parse_with_overrides`] and pass both returned values to [`run`](crate::cli::run).
+#[derive(Debug, Parser)]
 #[command(
     name = "cooldown",
     version,
@@ -93,17 +93,77 @@ pub struct Cli {
     pub(in crate::cli) global: GlobalArgs,
 }
 
+impl Cli {
+    /// Parses the process arguments with command-specific help and captures explicit overrides.
+    ///
+    /// The typed CLI and override set come from the same [`ArgMatches`], so configuration
+    /// precedence can distinguish user-supplied flags from Clap defaults.
+    #[must_use]
+    pub fn parse_with_overrides() -> (Self, CliOverrides) {
+        let matches = Self::command().get_matches();
+        let cli = match <Self as FromArgMatches>::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(error) => error.exit(),
+        };
+        let overrides = CliOverrides::from_matches(&matches);
+        (cli, overrides)
+    }
+
+    /// Builds the parser command with help scoped to each command's supported options.
+    #[must_use]
+    pub fn command() -> clap::Command {
+        super::setup::configure_recovery_help(<Self as CommandFactory>::command())
+    }
+}
+
 /// `--transitive <mode>`: how `check`/`fix`/`upgrade` handle too-fresh *transitive* dependencies.
 /// Absent, each command acts on them by default (check fails, fix downgrades, upgrade reconciles);
 /// these modes relax that. The same spelling across the three commands keeps the surface consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub(crate) enum TransitiveMode {
-    /// Include transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
-    /// `upgrade` leave them in place (direct deps are still handled).
+    /// Relax the too-fresh handling only: `check` reports violations non-fatally, `fix` leaves
+    /// too-fresh transitives in place, and `upgrade` still advances matured ones but keeps a
+    /// floated-up too-fresh transitive instead of reconciling it.
     Allow,
-    /// Skip transitive deps entirely — a direct-only run.
+    /// Don't plan or evaluate transitive deps — a direct-only run (a re-lock can still move them;
+    /// such moves stay visible as collateral rows).
     Hide,
+}
+
+/// `upgrade`/`fix --cargo-edge-policy <preserve|canonicalize|none>`: how the cargo adapter treats
+/// resolved lock **edge bindings** after the whole-graph re-resolve.
+/// An incremental re-resolve can silently rebind an edge between two coexisting versions a wide
+/// declared range admits — a build-affecting change the per-version report cannot see.
+/// `preserve` (the default) restores
+/// such churn to the pre-upgrade binding; `canonicalize` prefers the highest satisfying locked
+/// version whose declared `rust-version` is workspace-compatible, then falls back to the highest
+/// satisfying version when none is compatible (also healing eligible pre-existing bad bindings);
+/// `none` only reports.
+/// Cargo-specific, so both the flag and the config key are cargo-scoped: in config it lives under
+/// `[tool.cargo]` as `edge-policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum EdgePolicyArg {
+    /// Restore an eligible crates.io edge rebound between still-coexisting versions (the default).
+    #[default]
+    Preserve,
+    /// Prefer the highest satisfying locked version with a workspace-compatible `rust-version`,
+    /// falling back to the highest satisfying version when none is compatible.
+    Canonicalize,
+    /// Leave bindings as the resolver produced them; rebinds are still reported.
+    None,
+}
+
+impl EdgePolicyArg {
+    /// Map the CLI flag onto the core [`EdgePolicy`](cooldown_core::EdgePolicy).
+    pub(in crate::cli) fn policy(self) -> cooldown_core::EdgePolicy {
+        match self {
+            EdgePolicyArg::Preserve => cooldown_core::EdgePolicy::Preserve,
+            EdgePolicyArg::Canonicalize => cooldown_core::EdgePolicy::Canonicalize,
+            EdgePolicyArg::None => cooldown_core::EdgePolicy::None,
+        }
+    }
 }
 
 /// `outdated --countdown <latest|soonest>`: which still-cooling upgrade the "Cooldown" column
@@ -130,7 +190,7 @@ impl Countdown {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub(in crate::cli) enum Command {
     /// What could update — split into "adoptable now" vs "in cooldown".
     Outdated {
@@ -168,8 +228,10 @@ pub(in crate::cli) enum Command {
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
         /// How to treat *transitive* (indirect) deps. Default: move them too — advance each to its
-        /// newest matured version, and reconcile any too-fresh one a re-lock drags in back down, so
-        /// the new lock is gate-clean. `hide` is direct-only (transitives untouched); `allow` still
+        /// newest matured version where the tool's engine can pin an undeclared package (cargo,
+        /// pnpm, go, uv; all other tools plan direct deps only), and reconcile any too-fresh one a
+        /// re-lock drags in back down, so the new lock is gate-clean. `hide` plans direct deps
+        /// only (a re-lock can still move transitives, reported as collateral); `allow` still
         /// advances the graph but leaves a floated-up too-fresh transitive in place (reported, not
         /// rolled back).
         #[arg(long, value_enum, value_name = "MODE")]
@@ -183,6 +245,13 @@ pub(in crate::cli) enum Command {
         /// upper bound: by default such a bound holds even with `--major`.
         #[arg(long)]
         rewrite: bool,
+        /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
+        /// `preserve` restores bindings the resolver churned between coexisting versions
+        /// (default), `canonicalize` prefers the highest satisfying workspace-compatible version
+        /// and falls back to the highest satisfying version, `none` only reports rebinds.
+        /// Config: `[tool.cargo] edge-policy`.
+        #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
+        edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]
         mutation: MutationArgs,
     },
@@ -197,6 +266,13 @@ pub(in crate::cli) enum Command {
         /// left in place with a warning, since a pin is a deliberate choice.
         #[arg(long = "downgrade-pinned")]
         downgrade_pinned: bool,
+        /// How the cargo adapter treats resolved lock *edge bindings* after the re-resolve:
+        /// `preserve` restores bindings the resolver churned between coexisting versions
+        /// (default), `canonicalize` prefers the highest satisfying workspace-compatible version
+        /// and falls back to the highest satisfying version, `none` only reports rebinds.
+        /// Config: `[tool.cargo] edge-policy`.
+        #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
+        edge_policy: Option<EdgePolicyArg>,
         #[command(flatten)]
         mutation: MutationArgs,
     },
@@ -239,13 +315,19 @@ pub(in crate::cli) enum Command {
     Init,
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
+    /// Recover interrupted Cargo project state without performing any other mutation.
+    ///
+    /// Recovery currently supports Cargo only.
+    /// It uses only project location, tool selection, and reporting options.
+    /// Normal policy, registry, sync, stale-lock, and dry-run options are rejected.
+    Recover,
     /// Write the resolved policy down into native configs.
     Sync,
 }
 
 /// Flags shared by the mutating commands (`upgrade`, `fix`). Flattened into each so the flag is
 /// scoped to where it applies (not silently accepted on every command).
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub(in crate::cli) struct MutationArgs {
     /// Fail (exit 1) if the mutation cannot complete cleanly.
     #[arg(long)]
@@ -254,7 +336,7 @@ pub(in crate::cli) struct MutationArgs {
 
 /// Flags shared by the policy-introspection commands (`check`, `config`). Flattened into each so
 /// the strict-native controls are scoped to where they apply.
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub(in crate::cli) struct StrictNativeArgs {
     /// Fail when repo policy overrides a stricter native value.
     #[arg(long = "fail-on-stricter-native")]
@@ -264,7 +346,7 @@ pub(in crate::cli) struct StrictNativeArgs {
     pub(in crate::cli) no_fail_on_stricter_native: bool,
 }
 
-#[derive(Args)]
+#[derive(Debug, Args)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent CLI flags; clap maps each bool to a --flag"
@@ -379,7 +461,8 @@ pub(in crate::cli) struct GlobalArgs {
     /// cross-major update). The reports and their counts are unaffected.
     #[arg(long = "no-suggestions", global = true)]
     pub(in crate::cli) no_suggestions: bool,
-    /// Downgrade a stale/absent lock from failure (the default) to a warning.
+    /// Downgrade a stale/absent lock from failure to a warning and skip that project's dependency
+    /// evaluation.
     #[arg(
         long = "allow-stale-lock",
         global = true,
@@ -493,6 +576,10 @@ pub struct CliOverrides {
     pub(crate) countdown: Option<Countdown>,
     /// `upgrade --rewrite` — CLI-only manifest-rewrite control (not config-backed).
     pub(crate) rewrite: Option<bool>,
+    /// `upgrade`/`fix --cargo-edge-policy <preserve|canonicalize|none>` — the cargo lock
+    /// edge-binding policy, if set on the CLI (`[tool.cargo] edge-policy` supplies the default
+    /// otherwise).
+    pub(crate) edge_policy: Option<cooldown_core::EdgePolicy>,
     /// `check`/`config --fail-on-stricter-native` — CLI-only (not config-backed).
     pub(crate) fail_on_stricter_native: Option<bool>,
     /// `check`/`config --no-fail-on-stricter-native` — CLI-only override of a config `strict-native`.
@@ -545,6 +632,16 @@ impl CliOverrides {
                 .subcommand_matches("outdated")
                 .and_then(|sub| sub.get_one::<Countdown>("countdown").copied()),
             rewrite: set_on_subcommand(matches, "upgrade", "rewrite").then_some(true),
+            // `--cargo-edge-policy <policy>` carries an enum value on the mutating commands; only
+            // the active subcommand holds a value, so take it from whichever ran.
+            edge_policy: ["upgrade", "fix"]
+                .iter()
+                .find_map(|command| {
+                    matches
+                        .subcommand_matches(command)
+                        .and_then(|sub| sub.get_one::<EdgePolicyArg>("edge_policy").copied())
+                })
+                .map(EdgePolicyArg::policy),
             // `--strict` is shared by the mutating commands (flattened into both `upgrade` and `fix`).
             strict: (set_on_subcommand(matches, "upgrade", "strict")
                 || set_on_subcommand(matches, "fix", "strict"))
@@ -625,7 +722,7 @@ fn set_on_subcommand(matches: &ArgMatches, command: &str, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Cli, CliOverrides};
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
 
     fn overrides(args: &[&str]) -> CliOverrides {
         let matches = Cli::command().get_matches_from(args);
@@ -650,6 +747,7 @@ mod tests {
             hide_pinned,
             countdown,
             rewrite,
+            edge_policy,
             fail_on_stricter_native,
             no_fail_on_stricter_native,
             lock,
@@ -675,6 +773,7 @@ mod tests {
             hide_pinned,
             countdown,
             rewrite,
+            edge_policy,
             fail_on_stricter_native,
             no_fail_on_stricter_native,
             lock,
@@ -929,8 +1028,14 @@ mod tests {
     #[test]
     fn parser_accepts_full_command_shape() {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
-        assert!(matches!(cli.command, super::Command::Check { .. }));
+        std::assert_matches!(cli.command, super::Command::Check { .. });
         assert!(cli.global.json);
+    }
+
+    #[test]
+    fn parser_accepts_recovery_only_command() {
+        let cli = Cli::parse_from(["cooldown", "recover"]);
+        std::assert_matches!(cli.command, super::Command::Recover);
     }
 
     #[test]

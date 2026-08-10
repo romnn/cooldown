@@ -221,12 +221,23 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
-    fn write_manifest(contents: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path =
-            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
-        std::fs::write(&path, contents).expect("write");
-        (dir, path)
+    /// A `pyproject.toml` written into its own temporary directory.
+    struct TempManifest {
+        /// Owns the temporary directory; dropping it deletes the manifest from disk.
+        directory: tempfile::TempDir,
+        /// The path of the `pyproject.toml` inside the temporary directory.
+        manifest: Utf8PathBuf,
+    }
+
+    fn write_manifest(contents: &str) -> TempManifest {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest =
+            Utf8PathBuf::from_path_buf(directory.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&manifest, contents).expect("write");
+        TempManifest {
+            directory,
+            manifest,
+        }
     }
 
     #[test]
@@ -269,7 +280,10 @@ mod tests {
 
     #[test]
     fn rewrites_across_all_pep621_sections_preserving_layout() {
-        let (_dir, manifest) = write_manifest(
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(
             "[project]\ndependencies = [\n  # keep me\n  \"httpx>=0.27\",\n  \"protobuf==6.0\",\n]\n\n[project.optional-dependencies]\ngrpc = [\"httpx>=0.27\"]\n\n[dependency-groups]\ndev = [\"ruff>=0.1\", \"httpx>=0.27\"]\n",
         );
 
@@ -291,7 +305,10 @@ mod tests {
 
     #[test]
     fn rewrites_build_system_requires_floor() {
-        let (_dir, manifest) = write_manifest(
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(
             "[project]\ndependencies = [\"httpx>=0.27\"]\n\n[build-system]\nrequires = [\"hatchling>=1.28.0\"]\nbuild-backend = \"hatchling.build\"\n",
         );
 
@@ -320,7 +337,10 @@ mod tests {
         // floor. Widening one surface must never touch the other — they are independent constraints.
         let manifest_text = "[project]\ndependencies = [\"setuptools>=60\"]\n\n[build-system]\nrequires = [\"setuptools>=70\"]\nbuild-backend = \"setuptools.build_meta\"\n";
 
-        let (_dir, manifest) = write_manifest(manifest_text);
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(manifest_text);
         widen_dependency_constraint(&manifest, "setuptools", "75.0").expect("widen dep");
         let after = std::fs::read_to_string(&manifest).expect("read");
         assert!(
@@ -332,7 +352,10 @@ mod tests {
             "build-backend floor untouched by a dependency widen: {after}"
         );
 
-        let (_dir, manifest) = write_manifest(manifest_text);
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest(manifest_text);
         widen_build_requirement(&manifest, "setuptools", "75.0").expect("widen build");
         let after = std::fs::read_to_string(&manifest).expect("read");
         assert!(
@@ -347,8 +370,10 @@ mod tests {
 
     #[test]
     fn unconstrained_or_absent_dependency_reports_no_change() {
-        let (_dir, manifest) =
-            write_manifest("[project]\ndependencies = [\"proto-shared\", \"httpx>=0.27\"]\n");
+        let TempManifest {
+            directory: _directory,
+            manifest,
+        } = write_manifest("[project]\ndependencies = [\"proto-shared\", \"httpx>=0.27\"]\n");
         // A bare workspace dep has no specifier to widen.
         assert!(!widen_dependency_constraint(&manifest, "proto-shared", "1.0.0").expect("widen"));
         // A dependency declared nowhere here.

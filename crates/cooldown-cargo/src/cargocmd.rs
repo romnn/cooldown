@@ -6,8 +6,9 @@ use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
-/// The `source` string a `Cargo.lock` entry and `cargo metadata` carry for crates.io packages.
-pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub(crate) use crate::lockfile::CRATES_IO_SOURCE;
+pub use crate::lockfile::LockPackageId;
+pub(crate) use crate::lockfile::PackageKey;
 
 /// The crates.io index in Cargo package-ID-spec form (`<url>#<name>@<version>`) — the same
 /// source as [`CRATES_IO_SOURCE`] without the `registry+` kind prefix.
@@ -50,6 +51,102 @@ pub struct ResolvedGraph {
     /// The most restrictive explicit upper-bound requirement declared by workspace members for
     /// each active resolved node.
     pub declared_bounds: HashMap<(String, String), String>,
+    /// Every active version requirement each resolved package imposes on a concrete resolved edge.
+    /// Keyed by [`LockPackageId`] so source-distinct packages never share requirements.
+    pub declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>>,
+    /// Each resolved package's declared `rust-version` (MSRV); absent when the package declares
+    /// none (or it is unparsable, which cargo's MSRV-aware resolver likewise treats as
+    /// compatible).
+    pub rust_versions: HashMap<LockPackageId, RustVersion>,
+    /// The lowest `rust-version` any workspace member declares, used as cooldown's conservative
+    /// compatibility preference.
+    /// Cargo uses heuristics for mixed-MSRV workspaces and may select a dependency above or below
+    /// an individual member's needs.
+    pub workspace_rust_version: Option<RustVersion>,
+}
+
+/// A declared `rust-version` (MSRV) as a release triple.
+/// The derived ordering compares `major`, then `minor`, then `patch` — semver precedence, since the
+/// manifest field forbids prereleases and build metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustVersion {
+    /// The major component (`1` in `1.70.3`).
+    pub major: u64,
+    /// The minor component; zero when the manifest omits it.
+    pub minor: u64,
+    /// The patch component; zero when the manifest omits it.
+    pub patch: u64,
+}
+
+impl RustVersion {
+    /// Builds the triple from its components.
+    #[must_use]
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        RustVersion {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+/// Parses a manifest `rust-version` value (`"1.70"`, `"1.70.0"`) into a comparable
+/// [`RustVersion`], with missing components zeroed.
+/// Returns `None` for anything else because the field forbids ranges and prereleases, so an
+/// unparsable value is treated as undeclared.
+fn parse_rust_version(value: &str) -> Option<RustVersion> {
+    let mut components = value.trim().splitn(3, '.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next().map_or(Some(0), |c| c.parse().ok())?;
+    let patch = components.next().map_or(Some(0), |c| c.parse().ok())?;
+    Some(RustVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+/// Accumulates the MSRV data [`build_graph`](Cargo::build_graph) collects per package: each
+/// declared `rust-version` keyed by package identity, and the workspace minimum across members.
+#[derive(Default)]
+struct MsrvIndex {
+    rust_versions: HashMap<LockPackageId, RustVersion>,
+    workspace_rust_version: Option<RustVersion>,
+}
+
+impl MsrvIndex {
+    fn record(&mut self, package: &RawPkg, is_member: bool) {
+        let Some(msrv) = package.rust_version.as_deref().and_then(parse_rust_version) else {
+            return;
+        };
+        self.rust_versions.insert(
+            LockPackageId::from_metadata(
+                &package.name,
+                &package.version,
+                package.source.as_deref(),
+            ),
+            msrv,
+        );
+        // Use the lowest member declaration as cooldown's conservative compatibility threshold;
+        // Cargo's mixed-MSRV workspace selection remains heuristic.
+        if is_member {
+            self.workspace_rust_version = Some(
+                self.workspace_rust_version
+                    .map_or(msrv, |current| current.min(msrv)),
+            );
+        }
+    }
+}
+
+/// One version requirement a resolved package declares, as the edge-policy module consumes it.
+#[derive(Debug, Clone)]
+pub struct DeclaredRequirement {
+    /// The depended-on crate's package name (not a manifest rename).
+    pub dependency: String,
+    /// The concrete package node this declaration resolves to.
+    pub resolved: LockPackageId,
+    /// The verbatim semver requirement string, e.g. `^1.0` or `>=0.7.0, <2.0.0`.
+    pub requirement: String,
 }
 
 /// A single resolved package from `cargo metadata`.
@@ -251,6 +348,25 @@ struct RawMeta {
     resolve: Option<RawResolve>,
 }
 
+/// Cargo's authoritative package and target topology for one locked resolve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StagingMetadata {
+    pub(crate) workspace_root: camino::Utf8PathBuf,
+    pub(crate) packages: Vec<StagingPackage>,
+}
+
+/// One package whose manifest and target paths Cargo may read during a resolve.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StagingPackage {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) manifest_path: camino::Utf8PathBuf,
+    pub(crate) target_paths: Vec<camino::Utf8PathBuf>,
+    pub(crate) source: Option<String>,
+    pub(crate) workspace_member: bool,
+}
+
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
 /// default bare `"1.2.3"` is `^1.2.3`, a range, not a pin.
 fn exact_req_version(req: &str) -> Option<String> {
@@ -268,11 +384,27 @@ struct UpperBound {
     inclusive: bool,
 }
 
-struct DeclaredBoundEdge {
+/// One manifest requirement awaiting a join to Cargo's active resolve edge — the
+/// requirement-candidate rows themselves, and the join half of a [`DeclaredBoundEdge`]. Both the
+/// bound and requirement joins resolve their candidates through [`joined_targets`], so the two
+/// cannot drift apart on the rename/package-identity rules.
+struct DeclaredEdge {
     requirer: String,
-    dependency_name: String,
+    /// The manifest rename (`alias = { package = "…" }`), when the declaration uses one. The
+    /// resolve graph names a renamed edge by the rename, so it stays the join key — which also
+    /// keeps an *inactive* renamed declaration off the same package's other active edges. A plain
+    /// declaration cannot join by edge name at all: the resolve graph then names the edge by the
+    /// dependency's **lib target**, which a custom `[lib] name` decouples from the package name,
+    /// so it joins through the edge's resolved package identity instead.
+    rename: Option<String>,
     package_name: String,
     requirement: String,
+}
+
+/// One workspace-member requirement carrying an explicit upper bound, joined to resolve edges the
+/// same way as the requirement candidates.
+struct DeclaredBoundEdge {
+    declaration: DeclaredEdge,
     upper: UpperBound,
 }
 
@@ -283,17 +415,53 @@ struct ActiveEdge {
 
 type PackageEdges = HashMap<String, Vec<String>>;
 type NamedPackageEdges = HashMap<String, Vec<ActiveEdge>>;
-type ExactEdge = (String, String, String);
-type ResolvedCeilings = (
-    HashSet<(String, String)>,
-    HashMap<(String, String), Vec<String>>,
-);
 
-fn resolved_edges(resolve: Option<RawResolve>) -> (PackageEdges, NamedPackageEdges) {
+/// One declared `=x.y.z` requirement, as a *candidate* ceiling edge: the requirer's package id and
+/// the dependency name and exact version it pins.
+/// Resolved against the activated graph before it caps anything — a pin behind a disabled feature
+/// or non-matching `target` is not a real edge.
+struct ExactEdge {
+    requirer: String,
+    dependency: String,
+    version: String,
+}
+
+/// One lower-bound requirement, as a *candidate* floor edge: the requirer's package id and the
+/// dependency name and floor version its requirement demands.
+/// Resolved against the activated graph before it floors anything, for the same activation reasons
+/// as [`ExactEdge`].
+struct FloorEdge {
+    requirer: String,
+    dependency: String,
+    /// The full declared requirement, kept beside the extracted `floor` so the resolved join can
+    /// attach the floor only to nodes the requirement admits.
+    requirement: String,
+    floor: String,
+}
+
+/// The activated `=`-pin ceilings [`resolved_graph_ceilings`] distills from the candidates: which
+/// `(name, version)` nodes are capped, and by which requirer package ids.
+struct ResolvedCeilings {
+    ceilings: HashSet<(String, String)>,
+    requirers: HashMap<(String, String), Vec<String>>,
+}
+
+/// The resolved dependency edges per package id, in the two projections the graph builder needs.
+struct ResolvedEdges {
+    /// Each package id's resolved dependency package ids.
+    by_package: PackageEdges,
+    /// The same edges with the resolve graph's dependency names attached.
+    named: NamedPackageEdges,
+}
+
+fn resolved_edges(resolve: Option<RawResolve>) -> ResolvedEdges {
     let mut package_edges = HashMap::new();
     let mut named_edges = HashMap::new();
     let Some(resolve) = resolve else {
-        return (package_edges, named_edges);
+        return ResolvedEdges {
+            by_package: package_edges,
+            named: named_edges,
+        };
     };
     for node in resolve.nodes {
         let mut package_ids = Vec::with_capacity(node.deps.len());
@@ -308,7 +476,10 @@ fn resolved_edges(resolve: Option<RawResolve>) -> (PackageEdges, NamedPackageEdg
         package_edges.insert(node.id.clone(), package_ids);
         named_edges.insert(node.id, named);
     }
-    (package_edges, named_edges)
+    ResolvedEdges {
+        by_package: package_edges,
+        named: named_edges,
+    }
 }
 
 fn explicit_upper_bound(req: &str) -> Option<UpperBound> {
@@ -342,49 +513,215 @@ fn upper_bound_is_stricter(candidate: &UpperBound, current: &UpperBound) -> bool
         || (candidate.version == current.version && !candidate.inclusive && current.inclusive)
 }
 
+/// The manifest renames that can own an active resolve edge, indexed per requirer package id and
+/// depended-on package name, normalized like resolve-edge names (hyphens to underscores).
+///
+/// A plain declaration joins through the edge's resolved package identity (see
+/// [`DeclaredEdge::rename`]), which alone would also attach it to a *sibling rename's* node:
+/// `foo = ">=0.5, <2"` beside `foo05 = { package = "foo", version = "0.5" }` resolves two `foo`
+/// nodes, and the plain range admits both. The index names the edges the renamed declarations
+/// own so the plain join can skip them. Keyed per depended-on package because a rename that
+/// happens to collide with another package's lib target name owns none of that package's edges.
+struct RenameIndex {
+    by_requirer: HashMap<String, HashMap<String, HashSet<String>>>,
+}
+
+impl RenameIndex {
+    /// Indexes the renamed declarations among `declarations`. Built from the
+    /// requirement-candidate list because that list is exactly the declarations whose edges can
+    /// appear in the resolve graph — every non-dev declaration plus a member's dev declarations
+    /// (a non-member's dev edge is never resolved). The bound candidates would not do: they are
+    /// the subset with explicit upper bounds and would miss a rename declared without one (a bare
+    /// `foo05 = { package = "foo", version = "0.5" }`).
+    fn from_declarations<'a>(declarations: impl IntoIterator<Item = &'a DeclaredEdge>) -> Self {
+        let mut by_requirer: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+        for declaration in declarations {
+            if let Some(rename) = &declaration.rename {
+                by_requirer
+                    .entry(declaration.requirer.clone())
+                    .or_default()
+                    .entry(declaration.package_name.clone())
+                    .or_default()
+                    .insert(rename.replace('-', "_"));
+            }
+        }
+        RenameIndex { by_requirer }
+    }
+
+    /// Whether `requirer`'s edge named `edge_name` onto `package_name` belongs to one of its
+    /// renamed declarations — the edges a plain declaration's package-identity join must skip.
+    fn owns_edge(&self, requirer: &str, package_name: &str, edge_name: &str) -> bool {
+        self.by_requirer
+            .get(requirer)
+            .and_then(|packages| packages.get(package_name))
+            .is_some_and(|renames| renames.contains(&edge_name.replace('-', "_")))
+    }
+}
+
+/// The resolved package nodes `declaration`'s active edges join to — the one join rule shared by
+/// the declared-bound and declared-requirement candidates.
+///
+/// A renamed declaration joins by its rename (hyphen/underscore-normalized, as Cargo spells
+/// resolve-edge names), which the resolve edge reliably carries. A plain declaration's edge name
+/// is the dependency's lib target name — decoupled from the package name by a custom `[lib]
+/// name` — so the package-identity and requirement-admission checks are its whole join, minus the
+/// edges a sibling renamed declaration of the same package owns (see [`RenameIndex`]). Reduced
+/// metadata fixtures that omit edge names still join their plain declarations, which never match
+/// on the edge name.
+fn joined_targets<'graph>(
+    declaration: &DeclaredEdge,
+    active_edges: &NamedPackageEdges,
+    packages: &'graph HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
+) -> Vec<&'graph PkgInfo> {
+    let Some(edges) = active_edges.get(&declaration.requirer) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for edge in edges {
+        match &declaration.rename {
+            Some(rename) => {
+                if edge.dependency_name.replace('-', "_") != rename.replace('-', "_") {
+                    continue;
+                }
+            }
+            None => {
+                if renames.owns_edge(
+                    &declaration.requirer,
+                    &declaration.package_name,
+                    &edge.dependency_name,
+                ) {
+                    continue;
+                }
+            }
+        }
+        let Some(target) = packages.get(&edge.package_id) else {
+            continue;
+        };
+        if target.name != declaration.package_name
+            || !crate::version::version_in_range(&declaration.requirement, &target.version)
+        {
+            continue;
+        }
+        targets.push(target);
+    }
+    targets
+}
+
 fn resolved_declared_bounds(
     candidates: Vec<DeclaredBoundEdge>,
-    active_edges: &HashMap<String, Vec<ActiveEdge>>,
+    active_edges: &NamedPackageEdges,
     packages: &HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
 ) -> HashMap<(String, String), String> {
     let mut picks: HashMap<(String, String), (UpperBound, String)> = HashMap::new();
     for candidate in candidates {
-        let Some(edges) = active_edges.get(&candidate.requirer) else {
-            continue;
-        };
-        for edge in edges {
-            // Cargo normalizes hyphens to underscores in dependency names used by the resolve graph.
-            // An empty name supports reduced metadata fixtures that omit this disambiguation.
-            let names_match = edge.dependency_name.is_empty()
-                || edge.dependency_name.replace('-', "_")
-                    == candidate.dependency_name.replace('-', "_");
-            if !names_match {
-                continue;
-            }
-            let Some(info) = packages.get(&edge.package_id) else {
-                continue;
-            };
-            if info.name != candidate.package_name
-                || !crate::version::version_in_range(&candidate.requirement, &info.version)
-            {
-                continue;
-            }
-            let key = (info.name.clone(), info.version.clone());
+        for target in joined_targets(&candidate.declaration, active_edges, packages, renames) {
+            let key = (target.name.clone(), target.version.clone());
             picks
                 .entry(key)
                 .and_modify(|current| {
                     if upper_bound_is_stricter(&candidate.upper, &current.0) {
-                        current
-                            .clone_from(&(candidate.upper.clone(), candidate.requirement.clone()));
+                        current.clone_from(&(
+                            candidate.upper.clone(),
+                            candidate.declaration.requirement.clone(),
+                        ));
                     }
                 })
-                .or_insert_with(|| (candidate.upper.clone(), candidate.requirement.clone()));
+                .or_insert_with(|| {
+                    (
+                        candidate.upper.clone(),
+                        candidate.declaration.requirement.clone(),
+                    )
+                });
         }
     }
     picks
         .into_iter()
         .map(|(key, (_, requirement))| (key, requirement))
         .collect()
+}
+
+fn resolved_declared_requirements(
+    candidates: Vec<DeclaredEdge>,
+    active_edges: &NamedPackageEdges,
+    packages: &HashMap<String, PkgInfo>,
+    renames: &RenameIndex,
+) -> HashMap<LockPackageId, Vec<DeclaredRequirement>> {
+    let mut resolved: HashMap<LockPackageId, Vec<DeclaredRequirement>> = HashMap::new();
+    for candidate in candidates {
+        let Some(dependent) = packages.get(&candidate.requirer) else {
+            continue;
+        };
+        for target in joined_targets(&candidate, active_edges, packages, renames) {
+            let requirement = DeclaredRequirement {
+                dependency: target.name.clone(),
+                resolved: LockPackageId::from_metadata(
+                    &target.name,
+                    &target.version,
+                    target.source.as_deref(),
+                ),
+                requirement: candidate.requirement.clone(),
+            };
+            let requirements = resolved
+                .entry(LockPackageId::from_metadata(
+                    &dependent.name,
+                    &dependent.version,
+                    dependent.source.as_deref(),
+                ))
+                .or_default();
+            if !requirements.iter().any(|existing| {
+                existing.dependency == requirement.dependency
+                    && existing.resolved == requirement.resolved
+                    && existing.requirement == requirement.requirement
+            }) {
+                requirements.push(requirement);
+            }
+        }
+    }
+    resolved
+}
+
+/// Walks each active requirer edge to the depended node of the candidate's name that the
+/// candidate's requirement admits and records the highest lower bound demanded of it, per resolved
+/// `(name, version)` node.
+fn resolved_graph_floors(
+    floor_edges: Vec<FloorEdge>,
+    edges: &HashMap<String, Vec<String>>,
+    packages: &HashMap<String, PkgInfo>,
+) -> HashMap<(String, String), String> {
+    let mut graph_floors: HashMap<(String, String), String> = HashMap::new();
+    for candidate in floor_edges {
+        let Some(dep_ids) = edges.get(&candidate.requirer) else {
+            continue;
+        };
+        for id in dep_ids {
+            let Some(info) = packages.get(id) else {
+                continue;
+            };
+            if info.name != candidate.dependency {
+                continue;
+            }
+            // A renamed multi-major dependency resolves several same-name nodes into one
+            // requirer's dep ids (`syn 1` beside `syn 2`). Joining by name alone would let the
+            // max-wins merge below push the new major's floor onto the old major's node — a floor
+            // above that node's own version, which [`req_floor`]'s contract rules out. A floor
+            // attaches only to the node its requirement admits.
+            if !crate::version::version_in_range(&candidate.requirement, &info.version) {
+                continue;
+            }
+            let key = (info.name.clone(), info.version.clone());
+            graph_floors
+                .entry(key)
+                .and_modify(|current| {
+                    if crate::version::compare(&candidate.floor, current).is_gt() {
+                        current.clone_from(&candidate.floor);
+                    }
+                })
+                .or_insert_with(|| candidate.floor.clone());
+        }
+    }
+    graph_floors
 }
 
 fn resolved_graph_ceilings(
@@ -394,24 +731,30 @@ fn resolved_graph_ceilings(
 ) -> ResolvedCeilings {
     let mut ceilings = HashSet::new();
     let mut requirers: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for (requirer, name, version) in candidates {
-        let active = edges.get(&requirer).is_some_and(|dep_ids| {
+    for candidate in candidates {
+        let active = edges.get(&candidate.requirer).is_some_and(|dep_ids| {
             dep_ids.iter().any(|id| {
-                packages
-                    .get(id)
-                    .is_some_and(|info| info.name == name && info.version == version)
+                packages.get(id).is_some_and(|info| {
+                    info.name == candidate.dependency && info.version == candidate.version
+                })
             })
         });
         if !active {
             continue;
         }
-        let key = (name, version);
+        let key = (candidate.dependency, candidate.version);
         ceilings.insert(key.clone());
-        if let Some(requirer_name) = packages.get(&requirer).map(|info| info.name.clone()) {
+        if let Some(requirer_name) = packages
+            .get(&candidate.requirer)
+            .map(|info| info.name.clone())
+        {
             requirers.entry(key).or_default().push(requirer_name);
         }
     }
-    (ceilings, requirers)
+    ResolvedCeilings {
+        ceilings,
+        requirers,
+    }
 }
 
 /// The lowest concrete version a Cargo requirement admits — the floor its lower-bound comparators
@@ -481,6 +824,16 @@ struct RawPkg {
     /// `=x.y.z` pins on workspace-member crates.
     #[serde(default)]
     dependencies: Vec<RawDep>,
+    /// The crate's declared `rust-version` (MSRV), absent when it declares none.
+    #[serde(default)]
+    rust_version: Option<String>,
+    #[serde(default)]
+    targets: Vec<RawTarget>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawTarget {
+    src_path: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -542,6 +895,14 @@ impl Cargo {
         Self::default()
     }
 
+    /// A wrapper driving an explicit binary, so hermetic tests can substitute a scripted fake for
+    /// the real `cargo` without touching the process environment. Unix-gated with its only
+    /// consumers (the script-driven widen tests), which need a shell to run the fake.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
+        Cargo { bin: bin.into() }
+    }
+
     async fn output(
         &self,
         dir: &Utf8Path,
@@ -562,9 +923,22 @@ impl Cargo {
             bin = self.bin,
             args = ?args,
             elapsed_ms = started.elapsed().as_millis(),
+            // `ok` covers the spawn only; a launched command that exits non-zero still logs
+            // `ok=true` here and its own `cargo command failed` line below.
             ok = result.is_ok(),
             "cargo finished"
         );
+        if let Ok(out) = &result
+            && !out.status.success()
+        {
+            tracing::debug!(
+                bin = self.bin,
+                args = ?args,
+                status = %out.status,
+                detail = %failure_detail(out),
+                "cargo command failed"
+            );
+        }
         result
     }
 
@@ -581,7 +955,36 @@ impl Cargo {
         }
     }
 
-    /// Resolves the dependency graph for `dir` via `cargo metadata --format-version 1`.
+    async fn run_locked_metadata(&self, dir: &Utf8Path) -> Result<String, CoreError> {
+        let out = self
+            .output(
+                dir,
+                &[
+                    "metadata",
+                    "--all-features",
+                    "--locked",
+                    "--format-version",
+                    "1",
+                ],
+            )
+            .await?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stale_lock_diagnostic(&stderr) {
+            return Err(CoreError::StaleLock(format!(
+                "Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`"
+            )));
+        }
+        Err(CoreError::Tool {
+            tool: self.bin.clone(),
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(&out),
+        })
+    }
+
+    /// Resolves the lock-generation graph for `dir` via `cargo metadata --all-features`.
     ///
     /// # Errors
     ///
@@ -590,11 +993,83 @@ impl Cargo {
     /// output cannot be parsed.
     pub async fn metadata(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
         let stdout = self
-            .run(dir, &["metadata", "--format-version", "1"])
+            .run(
+                dir,
+                &["metadata", "--all-features", "--format-version", "1"],
+            )
             .await?;
+        Self::parse_graph(&stdout)
+    }
+
+    /// Reads the lock-generation graph without allowing Cargo to update `Cargo.lock`.
+    ///
+    /// Unlike [`Self::verify_locked`], this command may access the registry and therefore does not
+    /// require every resolved package to be available offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the corresponding Cargo
+    /// tool error for any other failure.
+    pub async fn metadata_locked(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
+        let stdout = self.run_locked_metadata(dir).await?;
+        Self::parse_graph(&stdout)
+    }
+
+    /// Reads the locked package and target topology without allowing Cargo to rewrite the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleLock`] when the source lock is stale and a lock-read error when
+    /// Cargo emits malformed or non-UTF-8 filesystem paths.
+    pub(crate) async fn staging_metadata(
+        &self,
+        dir: &Utf8Path,
+    ) -> Result<StagingMetadata, CoreError> {
+        let stdout = self.run_locked_metadata(dir).await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
-            .map_err(|e| CoreError::LockUnreadable(format!("cargo metadata: {e}")))?;
-        Ok(Self::build_graph(raw))
+            .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
+        let workspace_root = camino::Utf8PathBuf::from(raw.workspace_root);
+        if !workspace_root.is_absolute() {
+            return Err(CoreError::LockUnreadable(
+                "cargo metadata returned a relative or empty workspace root".to_string(),
+            ));
+        }
+        let members: HashSet<_> = raw.workspace_members.into_iter().collect();
+        let mut packages = Vec::with_capacity(raw.packages.len());
+        for package in raw.packages {
+            let manifest_path = camino::Utf8PathBuf::from(package.manifest_path);
+            if !manifest_path.is_absolute() {
+                return Err(CoreError::LockUnreadable(
+                    "cargo metadata returned a relative or empty package manifest path".to_string(),
+                ));
+            }
+            let mut target_paths = package
+                .targets
+                .into_iter()
+                .map(|target| camino::Utf8PathBuf::from(target.src_path))
+                .collect::<Vec<_>>();
+            if target_paths.iter().any(|path| !path.is_absolute()) {
+                return Err(CoreError::LockUnreadable(format!(
+                    "cargo metadata returned a relative target path for {manifest_path}"
+                )));
+            }
+            target_paths.sort();
+            let workspace_member = members.contains(&package.id);
+            packages.push(StagingPackage {
+                id: package.id,
+                name: package.name,
+                version: package.version,
+                manifest_path,
+                target_paths,
+                source: package.source,
+                workspace_member,
+            });
+        }
+        packages.sort();
+        Ok(StagingMetadata {
+            workspace_root,
+            packages,
+        })
     }
 
     /// Builds a [`ResolvedGraph`] from raw `cargo metadata` JSON, for tests that exercise the graph
@@ -614,19 +1089,20 @@ impl Cargo {
         let roots: HashSet<String> = raw.workspace_members.iter().cloned().collect();
         let mut packages = HashMap::new();
         let mut exact_pins = HashSet::new();
-        // `(requirer id, dep name, exact pinned version)` for every non-dev `=x.y.z` requirement.
-        // Resolved against the activated graph below: a declared pin behind a disabled feature or a
-        // non-matching `target` cfg is not a real edge and must not cap, so this is a candidate list,
-        // not the final ceiling set.
+        // Every non-dev `=x.y.z` requirement, as a candidate list — not the final ceiling set.
         let mut exact_edges: Vec<ExactEdge> = Vec::new();
-        // `(requirer id, dep name, floor)` for every non-root, non-dev requirement with a parseable
-        // lower bound. Like `exact_edges`, a candidate list resolved against the activated graph
-        // below: a requirement behind a disabled feature or non-matching `target` is not a real edge
-        // and demands no floor. Root requirements are intentionally excluded: they are direct project
-        // constraints cooldown may rewrite, not structural third-party graph floors.
-        let mut floor_edges: Vec<(String, String, String)> = Vec::new();
+        // Every non-root, non-dev requirement with a parseable lower bound.
+        // Like `exact_edges`, this is a candidate list resolved against the activated graph below:
+        // a requirement behind a disabled feature or non-matching `target` is not a real edge and
+        // demands no floor.
+        // Root requirements are intentionally excluded because they are direct project constraints
+        // cooldown may rewrite, not structural third-party graph floors.
+        let mut floor_edges: Vec<FloorEdge> = Vec::new();
         let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
+        let mut declared_requirement_edges: Vec<DeclaredEdge> = Vec::new();
+        let mut msrv = MsrvIndex::default();
         for p in raw.packages {
+            msrv.record(&p, roots.contains(&p.id));
             for dep in &p.dependencies {
                 // A dev dependency of a transitive crate is not in the resolved build graph and caps
                 // nothing; normal and build dependencies do, once confirmed active below.
@@ -638,14 +1114,23 @@ impl Cargo {
                         exact_pins.insert((dep.name.clone(), version.clone()));
                     }
                     if !is_dev {
-                        exact_edges.push((p.id.clone(), dep.name.clone(), version));
+                        exact_edges.push(ExactEdge {
+                            requirer: p.id.clone(),
+                            dependency: dep.name.clone(),
+                            version,
+                        });
                     }
                 }
                 if !is_dev
                     && !roots.contains(&p.id)
                     && let Some(floor) = req_floor(&dep.req)
                 {
-                    floor_edges.push((p.id.clone(), dep.name.clone(), floor));
+                    floor_edges.push(FloorEdge {
+                        requirer: p.id.clone(),
+                        dependency: dep.name.clone(),
+                        requirement: dep.req.clone(),
+                        floor,
+                    });
                 }
                 // A member's dev-dependency bound is as deliberate as its normal one, and dev deps
                 // are resolved and upgradeable — the same reasoning that keeps dev pins in
@@ -654,11 +1139,26 @@ impl Cargo {
                     && let Some(upper) = explicit_upper_bound(&dep.req)
                 {
                     declared_bound_edges.push(DeclaredBoundEdge {
+                        declaration: DeclaredEdge {
+                            requirer: p.id.clone(),
+                            rename: dep.rename.clone(),
+                            package_name: dep.name.clone(),
+                            requirement: dep.req.clone(),
+                        },
+                        upper,
+                    });
+                }
+                // A non-member's dev dependency gets the same treatment as in the exact/floor
+                // edges above: it is not in the resolved build graph, yet its requirement would
+                // join by *name* onto the crate's one active normal edge and veto edge rewrites
+                // the real requirement admits. A member's dev requirement stays, mirroring the
+                // dev-pin and dev-bound reasoning above.
+                if !is_dev || roots.contains(&p.id) {
+                    declared_requirement_edges.push(DeclaredEdge {
                         requirer: p.id.clone(),
-                        dependency_name: dep.rename.clone().unwrap_or_else(|| dep.name.clone()),
+                        rename: dep.rename.clone(),
                         package_name: dep.name.clone(),
                         requirement: dep.req.clone(),
-                        upper,
                     });
                 }
             }
@@ -672,43 +1172,33 @@ impl Cargo {
                 },
             );
         }
-        let (edges, active_edges) = resolved_edges(raw.resolve);
+        let ResolvedEdges {
+            by_package: edges,
+            named: active_edges,
+        } = resolved_edges(raw.resolve);
         // A `=x.y.z` requirement caps a node only when its edge is actually in the resolved graph:
         // keep an exact pin only if the requirer resolves an edge to a node of that name and version.
         // An inactive (optional/target-gated) edge is declared but absent from `resolve.nodes`, so it
         // contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate.
-        let (graph_ceilings, ceiling_requirers) =
-            resolved_graph_ceilings(exact_edges, &edges, &packages);
-        // A non-root requirement floors a node only at the version its edge actually resolved to: walk
-        // each active requirer edge to the depended node of that name and record the highest lower
-        // bound demanded of it. An inactive (optional/target-gated) edge is absent from
-        // `resolve.nodes`, so it contributes no floor — mirroring the ceiling's active-edge
-        // intersection above.
-        let mut graph_floors: HashMap<(String, String), String> = HashMap::new();
-        for (requirer, name, floor) in floor_edges {
-            let Some(dep_ids) = edges.get(&requirer) else {
-                continue;
-            };
-            for id in dep_ids {
-                let Some(info) = packages.get(id) else {
-                    continue;
-                };
-                if info.name != name {
-                    continue;
-                }
-                let key = (info.name.clone(), info.version.clone());
-                graph_floors
-                    .entry(key)
-                    .and_modify(|current| {
-                        if crate::version::compare(&floor, current).is_gt() {
-                            current.clone_from(&floor);
-                        }
-                    })
-                    .or_insert_with(|| floor.clone());
-            }
-        }
+        let ResolvedCeilings {
+            ceilings: graph_ceilings,
+            requirers: ceiling_requirers,
+        } = resolved_graph_ceilings(exact_edges, &edges, &packages);
+        // A non-root requirement floors a node only at the version its edge actually resolved to;
+        // an inactive (optional/target-gated) edge is absent from `resolve.nodes`, so it
+        // contributes no floor — mirroring the ceiling's active-edge intersection above.
+        let graph_floors = resolved_graph_floors(floor_edges, &edges, &packages);
+        // Indexed from the requirement candidates rather than the bound candidates: only the
+        // former list every edge-owning declaration (see [`RenameIndex::from_declarations`]).
+        let renames = RenameIndex::from_declarations(&declared_requirement_edges);
         let declared_bounds =
-            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages);
+            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages, &renames);
+        let declared_requirements = resolved_declared_requirements(
+            declared_requirement_edges,
+            &active_edges,
+            &packages,
+            &renames,
+        );
         ResolvedGraph {
             packages,
             roots,
@@ -718,32 +1208,50 @@ impl Cargo {
             ceiling_requirers,
             graph_floors,
             declared_bounds,
+            declared_requirements,
+            rust_versions: msrv.rust_versions,
+            workspace_rust_version: msrv.workspace_rust_version,
         }
     }
 
-    /// Returns whether `Cargo.lock` is current relative to `Cargo.toml`.
+    fn parse_graph(stdout: &str) -> Result<ResolvedGraph, CoreError> {
+        let raw: RawMeta = serde_json::from_str(stdout)
+            .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
+        Ok(Self::build_graph(raw))
+    }
+
+    /// Verifies `Cargo.lock` and returns the authoritative resolved graph when it is current.
     ///
-    /// Runs `cargo metadata --locked --offline`; a stale lock exits 101 and yields `Ok(false)`.
+    /// Runs `cargo metadata --all-features --locked --offline`; a stale lock exits 101 and yields
+    /// `Ok(None)`.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if it
     /// fails for a reason other than a stale lock (e.g. a missing offline index).
-    pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<bool, CoreError> {
+    pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<Option<ResolvedGraph>, CoreError> {
         let out = self
             .output(
                 dir,
-                &["metadata", "--locked", "--offline", "--format-version", "1"],
+                &[
+                    "metadata",
+                    "--all-features",
+                    "--locked",
+                    "--offline",
+                    "--format-version",
+                    "1",
+                ],
             )
             .await?;
         if out.status.success() {
-            return Ok(true);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Self::parse_graph(&stdout).map(Some);
         }
         // `--locked` on a stale lock exits 101 with a clear message. A different failure (e.g.
         // missing offline index) is reported as a tool error.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("--locked") || stderr.contains("lock file") {
-            Ok(false)
+        if stale_lock_diagnostic(&stderr) {
+            Ok(None)
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),
@@ -802,9 +1310,79 @@ impl Cargo {
     }
 }
 
+fn stale_lock_diagnostic(stderr: &str) -> bool {
+    stderr.contains("needs to be updated but --locked was passed")
+        || (stderr.contains("cannot update the lock file")
+            && stderr.contains("because --locked was passed to prevent this"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
+    use indoc::indoc;
+
+    #[tokio::test]
+    async fn locked_metadata_rejects_a_stale_lock_without_rewriting_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2024"
+            "#},
+        )?;
+        std::fs::write(root.join("src/lib.rs"), "pub fn app() {}\n")?;
+        let generated = std::process::Command::new(Cargo::new().bin)
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .output()?;
+        if !generated.status.success() {
+            return Err(eyre::eyre!(
+                "cargo generate-lockfile failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            ));
+        }
+        let before = std::fs::read(root.join("Cargo.lock"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.2.0"
+                edition = "2024"
+            "#},
+        )?;
+
+        let cargo = Cargo::new();
+        let error = cargo.metadata_locked(root).await.err();
+        std::assert_matches!(error, Some(CoreError::StaleLock(_)));
+        let staging_error = cargo.staging_metadata(root).await.err();
+        std::assert_matches!(staging_error, Some(CoreError::StaleLock(_)));
+        assert_eq!(std::fs::read(root.join("Cargo.lock"))?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_lock_classification_matches_only_cargos_update_diagnostic() {
+        assert!(stale_lock_diagnostic(
+            "the lock file /tmp/Cargo.lock needs to be updated but --locked was passed to prevent this"
+        ));
+        assert!(stale_lock_diagnostic(
+            "cannot update the lock file /tmp/Cargo.lock because --locked was passed to prevent this"
+        ));
+        assert!(!stale_lock_diagnostic(
+            "failed to read lock file while --locked was passed: permission denied"
+        ));
+        assert!(!stale_lock_diagnostic(
+            "failed to parse lock file: invalid TOML"
+        ));
+    }
 
     #[test]
     fn member_path_relativizes_workspace_members() {
@@ -819,6 +1397,291 @@ mod tests {
     fn member_path_defaults_to_root_when_metadata_is_missing() {
         assert_eq!(member_path("", "/repo"), ".");
         assert_eq!(member_path("/repo/crates/app/Cargo.toml", ""), ".");
+    }
+
+    #[test]
+    fn parse_rust_version_pads_missing_components_and_rejects_junk() {
+        assert_eq!(parse_rust_version("1.70"), Some(RustVersion::new(1, 70, 0)));
+        assert_eq!(
+            parse_rust_version("1.70.3"),
+            Some(RustVersion::new(1, 70, 3))
+        );
+        assert_eq!(
+            parse_rust_version(" 1.70 "),
+            Some(RustVersion::new(1, 70, 0))
+        );
+        assert_eq!(parse_rust_version("1"), Some(RustVersion::new(1, 0, 0)));
+        assert_eq!(parse_rust_version("^1.70"), None);
+        assert_eq!(parse_rust_version("edition2021"), None);
+    }
+
+    #[test]
+    fn build_graph_collects_msrv_data_for_the_edge_policy() {
+        // The workspace MSRV is the lowest member declaration; per-package `rust-version`s are
+        // keyed by full lock identity for the canonicalize candidate filter.
+        let json = r#"{
+            "packages": [
+                {"id": "root-a", "name": "app-a", "version": "0.1.0", "rust_version": "1.75",
+                 "dependencies": []},
+                {"id": "root-b", "name": "app-b", "version": "0.1.0", "rust_version": "1.70.1",
+                 "dependencies": []},
+                {"id": "uuid", "name": "uuid", "version": "1.24.0", "rust_version": "1.63",
+                 "dependencies": []},
+                {"id": "old", "name": "uuid", "version": "0.8.2", "dependencies": []}
+            ],
+            "workspace_members": ["root-a", "root-b"],
+            "workspace_root": "",
+            "resolve": {"nodes": []}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(
+            graph.workspace_rust_version,
+            Some(RustVersion::new(1, 70, 1))
+        );
+        assert_eq!(
+            graph
+                .rust_versions
+                .get(&LockPackageId::new("uuid", "1.24.0", None::<String>)),
+            Some(&RustVersion::new(1, 63, 0))
+        );
+        assert!(
+            !graph
+                .rust_versions
+                .contains_key(&LockPackageId::new("uuid", "0.8.2", None::<String>)),
+            "a package without a declared rust-version contributes nothing"
+        );
+    }
+
+    #[test]
+    fn build_graph_keeps_source_distinct_requirements_separate() {
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "registry-twin", "name": "twin", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "rust_version": "1.70",
+                     "dependencies": [{"name": "dep", "req": "^1"}]},
+                    {"id": "git-twin", "name": "twin", "version": "1.0.0",
+                     "source": "git+https://example.com/twin#abcdef",
+                     "rust_version": "1.80",
+                     "dependencies": [{"name": "dep", "req": "^2"}]},
+                    {"id": "dep-one", "name": "dep", "version": "1.5.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "dep-two", "name": "dep", "version": "2.5.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "registry-twin", "deps": [{"name": "dep", "pkg": "dep-one"}]},
+                    {"id": "git-twin", "deps": [{"name": "dep", "pkg": "dep-two"}]}
+                ]}
+            }
+        "#});
+        let registry = LockPackageId::new("twin", "1.0.0", Some(CRATES_IO_SOURCE));
+        let git = LockPackageId::new("twin", "1.0.0", Some("git+https://example.com/twin#abcdef"));
+
+        assert_eq!(graph.declared_requirements[&registry][0].requirement, "^1");
+        assert_eq!(graph.declared_requirements[&git][0].requirement, "^2");
+        assert_eq!(graph.rust_versions[&registry], RustVersion::new(1, 70, 0));
+        assert_eq!(graph.rust_versions[&git], RustVersion::new(1, 80, 0));
+    }
+
+    #[test]
+    fn edge_requirements_exclude_inactive_renamed_declarations() {
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "consumer", "name": "consumer", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                         {"name": "dep", "req": ">=1, <3"},
+                         {"name": "dep", "rename": "dep-narrow", "req": "^1.0"}
+                     ]},
+                    {"id": "dep", "name": "dep", "version": "2.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "consumer", "deps": [{"name": "dep", "pkg": "dep"}]}
+                ]}
+            }
+        "#});
+        let consumer = LockPackageId::new("consumer", "1.0.0", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&consumer];
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].requirement, ">=1, <3");
+        assert_eq!(requirements[0].resolved.version, "2.0.0");
+    }
+
+    #[test]
+    fn edge_requirements_join_a_custom_lib_target_name_through_package_identity() {
+        // `resolve.nodes[].deps[].name` is the dependency's *lib target* name: a package with
+        // `[lib] name = "weird_lib"` never matches its own package name, so a name-based join
+        // silently degraded every edge onto it to an Unaddressable "metadata did not identify"
+        // row. Plain declarations join through the edge's package id instead; the renamed
+        // declaration beside it still joins through its rename.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "consumer", "name": "consumer", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                         {"name": "odd-crate", "req": "^1"},
+                         {"name": "dep", "rename": "dep-one", "req": "^1"}
+                     ]},
+                    {"id": "odd", "name": "odd-crate", "version": "1.2.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "dep-v1", "name": "dep", "version": "1.5.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "consumer", "deps": [
+                        {"name": "weird_lib", "pkg": "odd"},
+                        {"name": "dep_one", "pkg": "dep-v1"}
+                    ]},
+                    {"id": "odd", "deps": []},
+                    {"id": "dep-v1", "deps": []}
+                ]}
+            }
+        "#});
+        let consumer = LockPackageId::new("consumer", "1.0.0", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&consumer];
+
+        assert_eq!(requirements.len(), 2);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.dependency == "odd-crate"
+                    && requirement.resolved.version == "1.2.0"
+                    && requirement.requirement == "^1"
+            }),
+            "a custom lib target name must not break the requirement join"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.dependency == "dep" && requirement.resolved.version == "1.5.0"
+            }),
+            "a manifest rename still joins through its rename"
+        );
+    }
+
+    #[test]
+    fn edge_requirements_attach_a_plain_declaration_beside_a_rename_to_its_own_node() {
+        // `foo = ">=0.5, <2"` beside `foo05 = { package = "foo", version = "0.5" }` resolves two
+        // `foo` nodes, and the plain range admits both. The package-identity join alone would
+        // attach the plain requirement to the rename's 0.5 node too; the rename's edge belongs to
+        // the renamed declaration, so each requirement stays on its own node.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "consumer", "name": "consumer", "version": "1.0.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                         {"name": "foo", "req": ">=0.5, <2"},
+                         {"name": "foo", "rename": "foo05", "req": "^0.5"}
+                     ]},
+                    {"id": "foo-v1", "name": "foo", "version": "1.9.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "foo-v05", "name": "foo", "version": "0.5.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": [],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "consumer", "deps": [
+                        {"name": "foo", "pkg": "foo-v1"},
+                        {"name": "foo05", "pkg": "foo-v05"}
+                    ]},
+                    {"id": "foo-v1", "deps": []},
+                    {"id": "foo-v05", "deps": []}
+                ]}
+            }
+        "#});
+        let consumer = LockPackageId::new("consumer", "1.0.0", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&consumer];
+
+        assert_eq!(requirements.len(), 2);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.requirement == ">=0.5, <2" && requirement.resolved.version == "1.9.0"
+            }),
+            "the plain requirement joins only its own node"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.requirement == "^0.5" && requirement.resolved.version == "0.5.3"
+            }),
+            "the rename's requirement joins only the rename's node"
+        );
+    }
+
+    #[test]
+    fn edge_requirements_exclude_a_non_member_dev_dependency() {
+        // diesel (a non-member) declares normal `uuid >=0.7, <2.0` beside dev `uuid ^0.8`. The
+        // dev dep of a transitive crate is not in the resolved build graph, yet its requirement
+        // would join by name onto diesel's one active uuid edge and make
+        // `RequirementIndex::admits` veto a `0.8.2 → 1.24.0` restoration the normal range allows.
+        // A member's own dev requirement stays indexed (dev deps of members are resolved).
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [
+                        {"name": "diesel", "req": "^2"},
+                        {"name": "criterion", "req": "^0.5", "kind": "dev"}
+                     ]},
+                    {"id": "diesel", "name": "diesel", "version": "2.3.11",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": [
+                        {"name": "uuid", "req": ">=0.7.0, <2.0.0"},
+                        {"name": "uuid", "req": "^0.8", "kind": "dev"}
+                     ]},
+                    {"id": "uuid", "name": "uuid", "version": "0.8.2",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "criterion", "name": "criterion", "version": "0.5.1",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [
+                        {"name": "diesel", "pkg": "diesel"},
+                        {"name": "criterion", "pkg": "criterion"}
+                    ]},
+                    {"id": "diesel", "deps": [{"name": "uuid", "pkg": "uuid"}]},
+                    {"id": "uuid", "deps": []},
+                    {"id": "criterion", "deps": []}
+                ]}
+            }
+        "#});
+        let diesel = LockPackageId::new("diesel", "2.3.11", Some(CRATES_IO_SOURCE));
+        let requirements = &graph.declared_requirements[&diesel];
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].requirement, ">=0.7.0, <2.0.0");
+
+        let root = LockPackageId::new("app", "0.1.0", None::<String>);
+        let member_requirements = &graph.declared_requirements[&root];
+        assert!(
+            member_requirements
+                .iter()
+                .any(|requirement| requirement.dependency == "criterion"
+                    && requirement.requirement == "^0.5"),
+            "a workspace member's dev requirement stays indexed"
+        );
     }
 
     #[test]
@@ -866,22 +1729,27 @@ mod tests {
                 }],
             ),
         ]);
-        let candidates = [
+        let candidates: Vec<DeclaredBoundEdge> = [
             ("root-a", "serde", ">=1, <3"),
             ("root-b", "serde", ">=1, <2"),
             ("inactive-root", "serde", "<1.5"),
         ]
         .into_iter()
         .map(|(root, name, requirement)| DeclaredBoundEdge {
-            requirer: root.to_string(),
-            dependency_name: name.to_string(),
-            package_name: name.to_string(),
-            requirement: requirement.to_string(),
+            declaration: DeclaredEdge {
+                requirer: root.to_string(),
+                rename: None,
+                package_name: name.to_string(),
+                requirement: requirement.to_string(),
+            },
             upper: explicit_upper_bound(requirement).expect("upper bound"),
         })
         .collect();
+        let renames = RenameIndex::from_declarations(
+            candidates.iter().map(|candidate| &candidate.declaration),
+        );
 
-        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages, &renames);
 
         assert_eq!(
             bounds
@@ -926,18 +1794,23 @@ mod tests {
                 },
             ],
         )]);
-        let candidates = [("foo-v1", ">=1, <2"), ("foo-v2", ">=2, <3")]
+        let candidates: Vec<DeclaredBoundEdge> = [("foo-v1", ">=1, <2"), ("foo-v2", ">=2, <3")]
             .into_iter()
-            .map(|(dependency_name, requirement)| DeclaredBoundEdge {
-                requirer: "root".to_string(),
-                dependency_name: dependency_name.to_string(),
-                package_name: "foo".to_string(),
-                requirement: requirement.to_string(),
+            .map(|(rename, requirement)| DeclaredBoundEdge {
+                declaration: DeclaredEdge {
+                    requirer: "root".to_string(),
+                    rename: Some(rename.to_string()),
+                    package_name: "foo".to_string(),
+                    requirement: requirement.to_string(),
+                },
                 upper: explicit_upper_bound(requirement).expect("upper bound"),
             })
             .collect();
+        let renames = RenameIndex::from_declarations(
+            candidates.iter().map(|candidate| &candidate.declaration),
+        );
 
-        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages);
+        let bounds = resolved_declared_bounds(candidates, &active_edges, &packages, &renames);
 
         assert_eq!(
             bounds
@@ -950,6 +1823,78 @@ mod tests {
                 .get(&("foo".to_string(), "2.4.0".to_string()))
                 .map(String::as_str),
             Some(">=2, <3")
+        );
+    }
+
+    #[test]
+    fn declared_bounds_join_a_custom_lib_target_name_through_package_identity() {
+        // The bounds-level mirror of the requirements test above: a member's deliberate `<1.5`
+        // cap on a crate shipping `[lib] name = "weird_lib"` never matched the resolve edge's
+        // lib-target name, so `declared_bound` yielded `None`, `honor_declared_bounds` could not
+        // veto targets past the cap, and the tentative-widen loop would rewrite the member's own
+        // deliberate upper bound.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [{"name": "odd-crate", "req": ">=1, <1.5"}]},
+                    {"id": "odd", "name": "odd-crate", "version": "1.2.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [{"name": "weird_lib", "pkg": "odd"}]},
+                    {"id": "odd", "deps": []}
+                ]}
+            }
+        "#});
+        assert_eq!(
+            graph.declared_bound("odd-crate", "1.2.0"),
+            Some(">=1, <1.5"),
+            "a custom lib target name must not break the bound join"
+        );
+    }
+
+    #[test]
+    fn declared_bounds_exclude_edges_owned_by_a_sibling_renamed_declaration() {
+        // The bounds-level plain-beside-rename case, with the rename declared as a bare caret:
+        // `^0.5` writes no explicit upper bound, so its node must end up with *no* declared
+        // bound — the plain `<2` must not leak across the package-identity join onto the
+        // rename's node.
+        let graph = Cargo::build_graph_from_json(indoc! {r#"
+            {
+                "packages": [
+                    {"id": "root", "name": "app", "version": "0.1.0",
+                     "dependencies": [
+                         {"name": "foo", "req": ">=0.5, <2"},
+                         {"name": "foo", "rename": "foo05", "req": "^0.5"}
+                     ]},
+                    {"id": "foo-v1", "name": "foo", "version": "1.9.0",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []},
+                    {"id": "foo-v05", "name": "foo", "version": "0.5.3",
+                     "source": "registry+https://github.com/rust-lang/crates.io-index",
+                     "dependencies": []}
+                ],
+                "workspace_members": ["root"],
+                "workspace_root": "",
+                "resolve": {"nodes": [
+                    {"id": "root", "deps": [
+                        {"name": "foo", "pkg": "foo-v1"},
+                        {"name": "foo05", "pkg": "foo-v05"}
+                    ]},
+                    {"id": "foo-v1", "deps": []},
+                    {"id": "foo-v05", "deps": []}
+                ]}
+            }
+        "#});
+        assert_eq!(graph.declared_bound("foo", "1.9.0"), Some(">=0.5, <2"));
+        assert_eq!(
+            graph.declared_bound("foo", "0.5.3"),
+            None,
+            "the plain bound must not attach to the rename's node"
         );
     }
 
@@ -1093,6 +2038,38 @@ mod tests {
     }
 
     #[test]
+    fn graph_floor_stays_on_the_node_each_requirement_admits() {
+        // `renamer` depends on both syn majors via rename, so its resolved dep ids carry two
+        // same-name `syn` nodes. The `^2` floor (2.0.0) must not attach to the 1.x node — that
+        // would be a floor above the node's own version and would misclassify the 1.x line as
+        // irreducible; each requirement floors only the node it admits.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "renamer", "req": "^1.0"}]},
+                {"id": "renamer", "name": "renamer", "version": "1.0.0",
+                 "dependencies": [
+                    {"name": "syn", "req": "^1"},
+                    {"name": "syn", "rename": "syn2", "req": "^2"}
+                 ]},
+                {"id": "syn-1", "name": "syn", "version": "1.0.100", "dependencies": []},
+                {"id": "syn-2", "name": "syn", "version": "2.0.50", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "renamer"}]},
+                {"id": "renamer", "deps": [{"pkg": "syn-1"}, {"pkg": "syn-2"}]},
+                {"id": "syn-1", "deps": []},
+                {"id": "syn-2", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+        assert_eq!(graph.graph_floor("syn", "1.0.100"), Some("1.0.0"));
+        assert_eq!(graph.graph_floor("syn", "2.0.50"), Some("2.0.0"));
+    }
+
+    #[test]
     fn graph_floor_ignores_inactive_requirer_edges() {
         // `ghost` declares `quote ^1.5` but resolves no edge to it (an inactive optional/target dep),
         // so it must not raise the floor; only the active `^1.0` from `syn` counts.
@@ -1130,6 +2107,9 @@ mod tests {
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
+            declared_requirements: HashMap::new(),
+            rust_versions: HashMap::new(),
+            workspace_rust_version: None,
         };
 
         assert!(graph.is_exact_pinned("serde", "1.0.197"));
@@ -1149,6 +2129,9 @@ mod tests {
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
+            declared_requirements: HashMap::new(),
+            rust_versions: HashMap::new(),
+            workspace_rust_version: None,
         };
 
         assert!(graph.is_graph_capped("serde_derive", "1.0.228"));
@@ -1232,6 +2215,9 @@ mod tests {
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
+            declared_requirements: HashMap::new(),
+            rust_versions: HashMap::new(),
+            workspace_rust_version: None,
         };
 
         assert_eq!(
@@ -1453,6 +2439,9 @@ mod tests {
             ceiling_requirers: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
+            declared_requirements: HashMap::new(),
+            rust_versions: HashMap::new(),
+            workspace_rust_version: None,
         };
 
         let names = |members: Vec<MemberRef>| {

@@ -7,7 +7,9 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{ConfigDocument, ScanConfig};
-use cooldown_core::{CoreError, Origin, PolicyLayer};
+use cooldown_core::{CoreError, EdgePolicy, Origin, PolicyLayer};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
 /// detection.
@@ -72,6 +74,16 @@ pub struct ConfigSources {
     global: Option<LoadedConfigFile>,
     repo_root: Option<LoadedConfigFile>,
     explicit: Option<LoadedConfigFile>,
+    nested: Arc<Mutex<HashMap<Utf8PathBuf, Option<LoadedConfigFile>>>>,
+}
+
+/// The per-project projections of its repository config cascade.
+#[derive(Debug)]
+pub struct ProjectConfig {
+    /// Policy layers from the repository root through the project directory.
+    pub policy_layers: Vec<PolicyLayer>,
+    /// The resolved Cargo edge policy from the config documents applicable to this project.
+    pub cargo_edge_policy: Option<EdgePolicy>,
 }
 
 impl ConfigSources {
@@ -113,11 +125,12 @@ impl ConfigSources {
             global,
             repo_root: repo_root_doc,
             explicit,
+            nested: Arc::default(),
         })
     }
 
     /// The merged non-policy scan config (`[global]`/`[<command>]`/`[tool.*]` settings) that
-    /// controls detection and runtime defaults.
+    /// controls detection and run-wide defaults.
     ///
     /// Lowest precedence first: global, repo-root, explicit.
     ///
@@ -164,8 +177,9 @@ impl ConfigSources {
             .transpose()
     }
 
-    /// The repo cascade for a project: layers from the repo root down to the project dir, lowest
-    /// authority first (root) → highest (the project's own `cooldown.toml`).
+    /// The config projection for a project: policy layers from the repo root down to the project
+    /// directory, plus the Cargo runtime setting resolved across global, that repository cascade,
+    /// and explicit config.
     ///
     /// Directories without a `cooldown.toml` contribute no layer. Both `repo_root` and
     /// `project_dir` are expected to be absolute and to share a common root.
@@ -174,11 +188,11 @@ impl ConfigSources {
     ///
     /// Returns [`CoreError::Filesystem`] if a discovered `cooldown.toml` cannot be read, or
     /// [`CoreError::Config`] if one does not parse as valid config.
-    pub fn repo_cascade_layers(
+    pub fn project_config(
         &self,
         repo_root: &Utf8Path,
         project_dir: &Utf8Path,
-    ) -> Result<Vec<PolicyLayer>, CoreError> {
+    ) -> Result<ProjectConfig, CoreError> {
         let mut dirs: Vec<Utf8PathBuf> = Vec::new();
         let mut cur = Some(project_dir.to_owned());
         while let Some(d) = cur {
@@ -198,20 +212,45 @@ impl ConfigSources {
         dirs.reverse();
         dirs.dedup();
 
-        let mut layers = Vec::new();
+        let mut policy_layers = Vec::new();
+        let mut cargo_edge_policy = self
+            .global
+            .as_ref()
+            .and_then(|config| config.document.cargo_edge_policy());
         let repo_root_config = repo_root.join(CONFIG_FILE);
         for dir in dirs {
             let path = dir.join(CONFIG_FILE);
             let maybe_doc = if path == repo_root_config {
                 self.repo_root.clone()
             } else {
-                read_document(&path, &Origin::Repo(path.clone()))?
+                self.nested_document(&path)?
             };
             if let Some(config) = maybe_doc {
-                layers.push(config.policy_layer(Origin::Repo(config.path.clone()))?);
+                cargo_edge_policy = config.document.cargo_edge_policy().or(cargo_edge_policy);
+                policy_layers.push(config.policy_layer(Origin::Repo(config.path.clone()))?);
             }
         }
-        Ok(layers)
+        cargo_edge_policy = self
+            .explicit
+            .as_ref()
+            .and_then(|config| config.document.cargo_edge_policy())
+            .or(cargo_edge_policy);
+        Ok(ProjectConfig {
+            policy_layers,
+            cargo_edge_policy,
+        })
+    }
+
+    fn nested_document(&self, path: &Utf8Path) -> Result<Option<LoadedConfigFile>, CoreError> {
+        let mut nested = self.nested.lock().map_err(|_| {
+            CoreError::Filesystem("config document cache lock was poisoned".to_string())
+        })?;
+        if let Some(document) = nested.get(path) {
+            return Ok(document.clone());
+        }
+        let document = read_document(path, &Origin::Repo(path.to_owned()))?;
+        nested.insert(path.to_owned(), document.clone());
+        Ok(document)
     }
 }
 
@@ -250,6 +289,7 @@ pub fn cache_dir() -> Utf8PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     #[test]
     fn repo_root_stops_at_git() {
@@ -272,11 +312,17 @@ mod tests {
         std::fs::write(proj.join(CONFIG_FILE), "min-age = \"21d\"").unwrap();
 
         let configs = ConfigSources::load(root, None, true).unwrap();
-        let layers = configs.repo_cascade_layers(root, &proj).unwrap();
-        assert_eq!(layers.len(), 2);
+        let config = configs.project_config(root, &proj).unwrap();
+        assert_eq!(config.policy_layers.len(), 2);
         // Root first (lower authority), project last (higher).
-        assert_eq!(layers[0].origin, Origin::Repo(root.join(CONFIG_FILE)));
-        assert_eq!(layers[1].origin, Origin::Repo(proj.join(CONFIG_FILE)));
+        assert_eq!(
+            config.policy_layers[0].origin,
+            Origin::Repo(root.join(CONFIG_FILE))
+        );
+        assert_eq!(
+            config.policy_layers[1].origin,
+            Origin::Repo(proj.join(CONFIG_FILE))
+        );
     }
 
     #[test]
@@ -285,6 +331,142 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).unwrap();
         let err = ConfigSources::load(root, Some(&root.join("missing.toml")), true)
             .expect_err("missing config");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
+    }
+
+    #[test]
+    fn cargo_edge_policy_resolves_per_project_from_the_nearest_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "preserve"
+            "#},
+        )
+        .expect("root config");
+        let canonical = root.join("apps/canonical");
+        let inherited = root.join("apps/inherited");
+        std::fs::create_dir_all(&canonical).expect("canonical project");
+        std::fs::create_dir_all(&inherited).expect("inherited project");
+        std::fs::write(
+            canonical.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "canonicalize"
+            "#},
+        )
+        .expect("nested config");
+
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+        assert_eq!(
+            configs
+                .project_config(root, &canonical)
+                .expect("canonical config")
+                .cargo_edge_policy,
+            Some(EdgePolicy::Canonicalize)
+        );
+        assert_eq!(
+            configs
+                .project_config(root, &inherited)
+                .expect("inherited config")
+                .cargo_edge_policy,
+            Some(EdgePolicy::Preserve)
+        );
+    }
+
+    #[test]
+    fn explicit_config_overrides_the_project_edge_policy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "canonicalize"
+            "#},
+        )
+        .expect("root config");
+        let explicit = root.join("explicit.toml");
+        std::fs::write(
+            &explicit,
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "none"
+            "#},
+        )
+        .expect("explicit config");
+
+        let configs = ConfigSources::load(root, Some(&explicit), true).expect("config sources");
+        assert_eq!(
+            configs
+                .project_config(root, root)
+                .expect("project config")
+                .cargo_edge_policy,
+            Some(EdgePolicy::None)
+        );
+    }
+
+    #[test]
+    fn nested_misplaced_edge_policy_is_rejected_during_project_projection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let project = root.join("apps/api");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::write(
+            project.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.npm]
+                edge-policy = "preserve"
+            "#},
+        )
+        .expect("nested config");
+
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+        let error = configs
+            .project_config(root, &project)
+            .expect_err("misplaced nested edge policy");
+        assert!(error.to_string().contains("[tool.cargo]"), "{error}");
+    }
+
+    #[test]
+    fn nested_config_is_parsed_once_for_the_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        let project = root.join("apps/api");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let nested = project.join(CONFIG_FILE);
+        std::fs::write(
+            &nested,
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "preserve"
+            "#},
+        )
+        .expect("nested config");
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+        let first = configs
+            .project_config(root, &project)
+            .expect("first projection");
+
+        std::fs::write(
+            &nested,
+            indoc! {r#"
+                [tool.cargo]
+                edge-policy = "canonicalize"
+            "#},
+        )
+        .expect("replace nested config");
+        let second = configs
+            .project_config(root, &project)
+            .expect("second projection");
+
+        assert_eq!(first.cargo_edge_policy, Some(EdgePolicy::Preserve));
+        assert_eq!(second.cargo_edge_policy, first.cargo_edge_policy);
     }
 }

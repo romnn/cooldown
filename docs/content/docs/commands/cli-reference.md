@@ -49,7 +49,7 @@ See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder a
 | `--offline` | Cache only; a cache miss becomes `unknown-age`, never a false "ok". |
 | `--fresh` | Ignore the local cache and always hit the registry (alias `--no-cache`; use in CI gates). |
 | `--concurrency <N>` | Registry request fan-out width and per-host in-flight cap (default `16`). |
-| `--allow-stale-lock` | Demote a stale/absent lock from an error to a warning. |
+| `--allow-stale-lock` | Demote a stale/absent lock to a warning and skip that project's dependency evaluation. |
 
 ## Config layers
 

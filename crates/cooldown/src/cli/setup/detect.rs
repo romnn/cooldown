@@ -1,12 +1,11 @@
 use crate::app::AdapterSet;
 use crate::cli::GlobalArgs;
 use crate::discovery;
-use crate::scan::find_marker_dirs;
 use camino::Utf8PathBuf;
 use cooldown_cargo::CargoTool;
 use cooldown_conda::{CondaTool, PixiTool};
 use cooldown_core::config::ScanConfig;
-use cooldown_core::{CoreError, Project, ToolId};
+use cooldown_core::{CoreError, Project, ProjectDetection, ToolId, ToolRead};
 use cooldown_go::GoTool;
 use cooldown_hex::HexTool;
 use cooldown_maven::{GradleTool, MavenTool};
@@ -16,6 +15,7 @@ use cooldown_registry::{HttpOptions, SharedHttp};
 use cooldown_rubygems::BundlerTool;
 use cooldown_swift::SwiftTool;
 use cooldown_uv::UvTool;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,8 @@ pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
 /// `revalidate_npm_listings` is set for version-adopting commands that honor the dist-tag ceiling:
 /// the npm-family `latest` dist-tag is mutable, so the ceiling must be judged against the
 /// registry's current state, not a listing-TTL-stale cached copy (a maintainer's downward retag
-/// within the hour must hold, not authorize, the adoption). A run that ignores the tag reads it
+/// within the hour must hold, not authorize, the adoption).
+/// A run that ignores the tag reads it
 /// never, and pays nothing for its freshness.
 pub(super) fn adapter_set(
     offline: bool,
@@ -62,33 +63,33 @@ pub(super) fn adapter_set(
     )?;
 
     let mut adapters = AdapterSet::new();
-    adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())))?;
     adapters.register_target_verified_mutator(Arc::new(
         NpmCliTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         PnpmTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         YarnTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(
         BunTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
-    ));
+    ))?;
     // Deno applies no dist-tag ceiling (`has_dist_tags` is false on that adapter), so it has
     // nothing to keep fresh — it stays on the cached listing path.
-    adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(MavenTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(GradleTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PipTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PoetryTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())));
-    adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())));
+    adapters.register_target_verified_mutator(Arc::new(DenoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(BundlerTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(HexTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(MavenTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(GradleTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PipTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PoetryTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())))?;
     Ok(adapters)
 }
 
@@ -100,47 +101,109 @@ pub(super) fn detect_projects(
     tools: &[ToolId],
     respect_gitignore: bool,
 ) -> Result<Vec<(ToolId, Project)>, CoreError> {
-    let mut projects = Vec::new();
-    for adapter in adapters.readers() {
-        let id = adapter.id();
-        // `--tool`/`--cargo` restrict *detection itself*: an unselected tool is never walked
-        // or enumerated, so a polyglot monorepo doesn't pay for (or hang on) Go/Python discovery.
-        if !tools.is_empty() && !tools.contains(&id) {
-            tracing::debug!(tool = id.as_str(), "skipping detection (filtered out)");
-            continue;
-        }
-        // The orchestrator owns the scan: the adapter only declares its marker, and we apply the
-        // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
-        let marker = adapter.project_marker();
-        let exclude = scan.exclude_folders_for(exclude_folders_base, id.as_str());
-        let dirs = find_marker_dirs(
+    struct PendingDetection<'a> {
+        adapter: &'a dyn ToolRead,
+        id: ToolId,
+        detection: ProjectDetection,
+        exclude: Vec<String>,
+    }
+
+    let selected = adapters
+        .readers()
+        .filter_map(|adapter| {
+            let id = adapter.id();
+            // `--tool`/`--cargo` restrict *detection itself*: an unselected tool is never walked
+            // or enumerated, so a polyglot monorepo doesn't pay for (or hang on) its discovery.
+            if !tools.is_empty() && !tools.contains(&id) {
+                tracing::debug!(tool = id.as_str(), "skipping detection (filtered out)");
+                return None;
+            }
+            Some(PendingDetection {
+                adapter: adapter.as_ref(),
+                id,
+                detection: adapter.project_detection(),
+                exclude: scan.exclude_folders_for(exclude_folders_base, id.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut groups = BTreeMap::<Vec<String>, Vec<usize>>::new();
+    for (index, pending) in selected.iter().enumerate() {
+        groups
+            .entry(pending.exclude.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut found_by_adapter = vec![None; selected.len()];
+    for (exclude, indices) in groups {
+        let detections = indices
+            .iter()
+            .filter_map(|index| selected.get(*index).map(|pending| pending.detection))
+            .collect::<Vec<_>>();
+        let found = crate::scan::find_project_marker_dirs_batch(
             workdir,
-            marker.lockfile,
+            &detections,
             respect_gitignore,
             &exclude,
-            marker.workspace_root,
         )?;
+        for (index, found) in indices.into_iter().zip(found) {
+            let slot = found_by_adapter.get_mut(index).ok_or_else(|| {
+                CoreError::System("project discovery adapter index was invalid".to_string())
+            })?;
+            *slot = Some(found);
+        }
+    }
+
+    let mut projects = Vec::new();
+    for (pending, found) in selected.into_iter().zip(found_by_adapter) {
+        // The orchestrator owns the scan: the adapter only declares its markers, and we apply the
+        // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
+        let marker = pending.detection.primary();
+        let found = found.ok_or_else(|| {
+            CoreError::System(format!(
+                "project discovery produced no result for {}",
+                pending.id.as_str()
+            ))
+        })?;
+        let validation_only = validation_roots_outside_primary(&found);
+        pending
+            .adapter
+            .validate_manifests_without_lock(&validation_only)?;
+        let dirs = found.primary;
         tracing::info!(
-            tool = id.as_str(),
+            tool = pending.id.as_str(),
             projects = dirs.len(),
             gitignore = respect_gitignore,
             "detected projects"
         );
         for dir in dirs {
-            tracing::debug!(tool = id.as_str(), root = %dir, "detected project");
+            tracing::debug!(tool = pending.id.as_str(), root = %dir, "detected project");
             let manifest = marker_manifest_path(&dir, &marker);
             projects.push((
-                id,
+                pending.id,
                 Project {
                     manifest,
                     root: dir,
-                    kind: id,
+                    kind: pending.id,
                     exclude_newer: None,
                 },
             ));
         }
     }
     Ok(projects)
+}
+
+fn validation_roots_outside_primary(found: &crate::scan::ProjectMarkerDirs) -> Vec<Utf8PathBuf> {
+    found
+        .validation_only
+        .iter()
+        .filter(|candidate| {
+            !found
+                .primary
+                .iter()
+                .any(|primary| candidate.starts_with(primary))
+        })
+        .cloned()
+        .collect()
 }
 
 fn marker_manifest_path(
@@ -175,5 +238,17 @@ mod tests {
         };
 
         assert_eq!(marker_manifest_path(root, &marker), root.join("deno.jsonc"));
+    }
+
+    #[test]
+    fn validation_skips_manifests_owned_by_a_detected_workspace() {
+        let root = Utf8PathBuf::from("/repo");
+        let sibling = Utf8PathBuf::from("/other");
+        let found = crate::scan::ProjectMarkerDirs {
+            primary: vec![root.clone()],
+            validation_only: vec![root.clone(), root.join("member"), sibling.clone()],
+        };
+
+        assert_eq!(validation_roots_outside_primary(&found), vec![sibling]);
     }
 }

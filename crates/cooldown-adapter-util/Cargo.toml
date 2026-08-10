@@ -15,6 +15,7 @@ workspace = true
 cooldown-core.workspace = true
 camino.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

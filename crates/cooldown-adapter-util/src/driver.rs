@@ -126,7 +126,10 @@ impl Driver {
     }
 
     async fn output(&self, dir: &Utf8Path, args: &[String]) -> Result<std::process::Output> {
-        Command::new(resolve_program(&self.bin))
+        // `--log-level trace` documents itself as covering subprocess argv; this is the one spawn
+        // point every adapter driver funnels through, so the promise is kept here.
+        tracing::trace!(tool = %self.bin, %dir, args = %args.join(" "), "spawning subprocess");
+        let out = Command::new(resolve_program(&self.bin))
             .args(args)
             .current_dir(dir.as_std_path())
             .output()
@@ -134,7 +137,16 @@ impl Driver {
             .map_err(|e| CoreError::ToolSpawn {
                 tool: self.bin.clone(),
                 detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            })
+            })?;
+        if !out.status.success() {
+            tracing::debug!(
+                tool = %self.bin,
+                status = %out.status,
+                detail = %failure_detail(&out),
+                "subprocess failed"
+            );
+        }
+        Ok(out)
     }
 
     /// Runs the driver, mapping a non-zero exit to a [`CoreError::Tool`].

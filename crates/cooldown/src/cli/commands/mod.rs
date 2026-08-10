@@ -1,11 +1,12 @@
 mod baseline;
 mod common;
+mod recover;
 mod report;
 
 use super::{Command, present};
 use crate::app::{Exit, RunOpts, Workspace};
 use camino::Utf8Path;
-use cooldown_core::CoreError;
+use cooldown_core::{CoreError, Diagnostic};
 
 pub(crate) struct CommandContext<'a> {
     pub(crate) ws: &'a Workspace,
@@ -13,6 +14,7 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) repo_root: &'a Utf8Path,
     pub(crate) color: bool,
     pub(crate) generated_at: &'a str,
+    pub(crate) pre_sync_warnings: &'a [Diagnostic],
 }
 
 pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Result<Exit, CoreError> {
@@ -31,8 +33,18 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
             clippy::unreachable,
             reason = "schema/init are dispatched before any workspace exists"
         )]
-        Command::Schema | Command::Init => unreachable!("handled earlier"),
+        Command::Schema | Command::Init | Command::Recover => unreachable!("handled earlier"),
     }
+}
+
+pub(crate) fn run_recover(
+    prepared: crate::cli::setup::PreparedRecovery,
+) -> Result<Exit, CoreError> {
+    recover::run(prepared)
+}
+
+pub(crate) fn run_recover_error(error: &CoreError, exit: Exit) -> Result<Exit, CoreError> {
+    recover::run_preparation_error(error, exit)
 }
 
 pub(crate) fn no_tool_json(command: &'static str) -> Result<String, CoreError> {

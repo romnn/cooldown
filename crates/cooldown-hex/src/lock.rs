@@ -5,10 +5,19 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// Returns the resolved `(name, version)` of every hex.pm-sourced entry in a `mix.lock`. Non-hex
-/// sources (`:git`, `:path`) are skipped, as cooldown has no registry publish time for them.
+/// A package and the exact version a `mix.lock` entry resolves it to.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedPin {
+    /// The package name (the lock entry's map key).
+    pub name: String,
+    /// The resolved version recorded in the entry's tuple.
+    pub version: String,
+}
+
+/// Returns the [`ResolvedPin`] of every hex.pm-sourced entry in a `mix.lock`.
+/// Non-hex sources (`:git`, `:path`) are skipped, as cooldown has no registry publish time for them.
 #[must_use]
-pub fn parse_resolved(content: &str) -> Vec<(String, String)> {
+pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     for line in content.lines() {
         if let Some(entry) = parse_entry(line.trim()) {
@@ -20,7 +29,7 @@ pub fn parse_resolved(content: &str) -> Vec<(String, String)> {
 
 /// Parses one lock line `"name": {:hex, :name, "version", ...}`. The version is the first quoted
 /// string inside the tuple (the atoms before it are unquoted).
-fn parse_entry(line: &str) -> Option<(String, String)> {
+fn parse_entry(line: &str) -> Option<ResolvedPin> {
     let line = line.strip_prefix('"')?;
     let (name, after) = line.split_once("\":")?;
     let after = after.trim_start();
@@ -30,7 +39,10 @@ fn parse_entry(line: &str) -> Option<(String, String)> {
     let start = after.find('"')?;
     let rest = after.get(start + 1..)?;
     let end = rest.find('"')?;
-    Some((name.to_string(), rest.get(..end)?.to_string()))
+    Some(ResolvedPin {
+        name: name.to_string(),
+        version: rest.get(..end)?.to_string(),
+    })
 }
 
 /// The graph ceiling for each dependency some *requirer* pins exactly in `mix.lock`. Every lock
@@ -43,18 +55,28 @@ fn parse_entry(line: &str) -> Option<(String, String)> {
 pub fn graph_ceilings(content: &str) -> HashMap<String, String> {
     let mut ceilings = HashMap::new();
     for line in content.lines() {
-        for (name, version) in exact_dep_pins(line.trim()) {
-            ceilings.insert(name.to_string(), version.to_string());
+        for pin in exact_dep_pins(line.trim()) {
+            ceilings.insert(pin.name.to_string(), pin.version.to_string());
         }
     }
     ceilings
 }
 
-/// The `(name, version)` of every exact (`== X`) dependency edge on a `mix.lock` line. A dependency
-/// tuple is `{:name, "requirement", …}`: an atom immediately followed by a quoted requirement. This
-/// distinguishes it from the entry's own opening tuple `{:hex, :name, "version", …}` (whose second
-/// element is another atom, not a quoted string), so that is never mistaken for a dependency edge.
-fn exact_dep_pins(line: &str) -> Vec<(&str, &str)> {
+/// An exact (`== X`) dependency edge on a `mix.lock` line, borrowing from that line.
+struct ExactDepPin<'a> {
+    /// The dependency's name (the tuple's leading atom).
+    name: &'a str,
+    /// The version the requirer pins the dependency to.
+    version: &'a str,
+}
+
+/// Every exact (`== X`) dependency edge on a `mix.lock` line.
+/// A dependency tuple is `{:name, "requirement", …}`: an atom immediately followed by a quoted
+/// requirement.
+/// This distinguishes it from the entry's own opening tuple `{:hex, :name, "version", …}` (whose
+/// second element is another atom, not a quoted string), so that is never mistaken for a dependency
+/// edge.
+fn exact_dep_pins(line: &str) -> Vec<ExactDepPin<'_>> {
     let mut pins = Vec::new();
     for piece in line.split("{:").skip(1) {
         let name_len = piece
@@ -71,7 +93,7 @@ fn exact_dep_pins(line: &str) -> Vec<(&str, &str)> {
             continue;
         };
         if let Some(version) = exact_requirement(&after[..end]) {
-            pins.push((name, version));
+            pins.push(ExactDepPin { name, version });
         }
     }
     pins
@@ -131,17 +153,18 @@ mod tests {
 
     const MIX_EXS: &str = "defmodule Demo.MixProject do\n  use Mix.Project\n  def project do\n    [app: :demo, deps: deps()]\n  end\n  defp deps do\n    [\n      {:jason, \"~> 1.4\"},\n      {:plug, \"~> 1.14\"}\n    ]\n  end\nend\n";
 
+    fn pin(name: &str, version: &str) -> ResolvedPin {
+        ResolvedPin {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
     #[test]
     fn resolved_skips_non_hex_sources() {
         let mut got = parse_resolved(LOCK);
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                ("jason".to_string(), "1.4.0".to_string()),
-                ("plug".to_string(), "1.14.0".to_string()),
-            ]
-        );
+        got.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(got, vec![pin("jason", "1.4.0"), pin("plug", "1.14.0")]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "cooldown-core"
-description = "The pure policy core of the cooldown CLI: domain model, evaluate/check_pin/resolve, ports, and config — no concrete I/O."
+description = "Shared dependency policy, adapter contracts, and portable mutation lifecycle for cooldown."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,8 +21,18 @@ globset.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 camino.workspace = true
+same-file.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 jiff.workspace = true
 tempfile.workspace = true
 camino.workspace = true

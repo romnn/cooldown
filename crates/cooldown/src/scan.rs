@@ -1,22 +1,24 @@
 //! Gitignore-aware project-root discovery shared by the tool adapters' `detect`.
 //!
-//! Each adapter looks for its own marker file (`Cargo.lock`, `go.mod`, `uv.lock`), but the walk is
-//! identical: descend from a root, skip what shouldn't be scanned, and collect the directories that
-//! hold the marker. Centralizing it here means `.gitignore` handling, the exclude list, and the
-//! workspace-root rule are implemented (and tested) once.
+//! Each adapter declares a primary marker and may add a validation-only marker.
+//! The shared walk descends from a root, skips excluded inputs, and collects both marker sets in one
+//! traversal.
+//! Centralizing it here keeps `.gitignore`, exclude, and workspace-root policy consistent.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::CoreError;
 use cooldown_core::config::{compile_folder_globset, compile_package_globset};
+use cooldown_core::{CoreError, ProjectDetection};
 use globset::GlobSet;
 use ignore::WalkBuilder;
+use std::collections::BTreeSet;
 
 /// Find every directory under `root` that directly contains a file named `marker`.
 ///
 /// - `respect_gitignore`: when true (the default), ignore files (`.gitignore`, `.git/info/exclude`,
 ///   the global gitignore, and ripgrep's `.ignore`/`.rgignore`) prune which *directories* are
 ///   walked — skipping `target/`, vendored, generated, and cache trees (correct, and faster since
-///   those often-huge trees are never descended). The marker is matched per *directory*, not by the
+///   those often-huge trees are never descended).
+///   The marker is matched per *directory*, not by the
 ///   walk yielding the lockfile, so the rule is: a lockfile inside an ignored directory is skipped
 ///   (a stray `Cargo.lock` in a generated folder is not a project), but a lockfile that is itself
 ///   ignored at the file level is still detected — libraries routinely `.gitignore` their
@@ -24,17 +26,21 @@ use ignore::WalkBuilder;
 /// - `exclude`: extra directory globs that are never scanned, in addition to gitignore, with
 ///   `.gitignore` semantics (see [`compile_folder_globset`]): a bare name (`"target"`, trailing
 ///   slash optional) prunes that directory at any depth, a leading slash (`"/build"`) anchors to
-///   `root`, and an interior slash (`"third_party/grammars"`) is a root-relative path. `**` is
+///   `root`, and an interior slash (`"third_party/grammars"`) is a root-relative path.
+///   `**` is
 ///   supported.
-/// - `topmost_only`: when true, a match's descendants are not reported. A `Cargo.lock`/`uv.lock`
+/// - `topmost_only`: when true, a match's descendants are not reported.
+///   A `Cargo.lock`/`uv.lock`
 ///   marks a workspace root that already owns its members, so nested lockfiles below it are skipped.
 ///
-/// Hidden directories (dotfiles such as `.git`, `.venv`) are always skipped. Unreadable
+/// Hidden directories (dotfiles such as `.git`, `.venv`) are always skipped.
+/// Unreadable
 /// directories are skipped rather than failing the whole scan.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+#[cfg(test)]
 pub fn find_marker_dirs(
     root: &Utf8Path,
     marker: &str,
@@ -42,8 +48,106 @@ pub fn find_marker_dirs(
     exclude: &[String],
     topmost_only: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
+    Ok(scan_marker_dirs(root, marker, None, respect_gitignore, exclude, topmost_only)?.primary)
+}
+
+/// Directly detected roots and validation-only roots found during one repository traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectMarkerDirs {
+    pub(crate) primary: Vec<Utf8PathBuf>,
+    pub(crate) validation_only: Vec<Utf8PathBuf>,
+}
+
+/// Finds an adapter's primary and validation-only markers during one filesystem traversal.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+#[cfg(test)]
+pub(crate) fn find_project_marker_dirs(
+    root: &Utf8Path,
+    detection: ProjectDetection,
+    respect_gitignore: bool,
+    exclude: &[String],
+) -> Result<ProjectMarkerDirs, CoreError> {
+    let primary = detection.primary();
+    scan_marker_dirs(
+        root,
+        primary.lockfile,
+        detection.validation_marker(),
+        respect_gitignore,
+        exclude,
+        primary.workspace_root,
+    )
+}
+
+/// Finds several adapters' marker sets during one filesystem traversal.
+///
+/// Every detection must use the same gitignore and folder-exclusion policy.
+/// Results preserve the input order.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+pub(crate) fn find_project_marker_dirs_batch(
+    root: &Utf8Path,
+    detections: &[ProjectDetection],
+    respect_gitignore: bool,
+    exclude: &[String],
+) -> Result<Vec<ProjectMarkerDirs>, CoreError> {
+    let scans = detections
+        .iter()
+        .map(|detection| {
+            let primary = detection.primary();
+            MarkerScan {
+                primary: primary.lockfile,
+                validation: detection.validation_marker(),
+                topmost_only: primary.workspace_root,
+            }
+        })
+        .collect::<Vec<_>>();
+    scan_marker_groups(root, &scans, respect_gitignore, exclude)
+}
+
+#[derive(Clone, Copy)]
+struct MarkerScan<'a> {
+    primary: &'a str,
+    validation: Option<&'a str>,
+    topmost_only: bool,
+}
+
+#[cfg(test)]
+fn scan_marker_dirs(
+    root: &Utf8Path,
+    primary_marker: &str,
+    validation_marker: Option<&str>,
+    respect_gitignore: bool,
+    exclude: &[String],
+    topmost_only: bool,
+) -> Result<ProjectMarkerDirs, CoreError> {
+    let scan = MarkerScan {
+        primary: primary_marker,
+        validation: validation_marker,
+        topmost_only,
+    };
+    scan_marker_groups(root, &[scan], respect_gitignore, exclude)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CoreError::System("marker scan produced no result".to_string()))
+}
+
+fn scan_marker_groups(
+    root: &Utf8Path,
+    scans: &[MarkerScan<'_>],
+    respect_gitignore: bool,
+    exclude: &[String],
+) -> Result<Vec<ProjectMarkerDirs>, CoreError> {
     let excludes = compile_folder_globset(exclude)?;
     let root_owned = root.to_owned();
+    let markers = scans
+        .iter()
+        .flat_map(|scan| std::iter::once(scan.primary).chain(scan.validation))
+        .collect::<BTreeSet<_>>();
 
     let mut builder = WalkBuilder::new(root);
     builder
@@ -52,7 +156,8 @@ pub fn find_marker_dirs(
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
         .parents(respect_gitignore)
-        // `.ignore`/`.rgignore` (ripgrep's files) prune directories too. Their file-level lock
+        // `.ignore`/`.rgignore` (ripgrep's files) prune directories too.
+        // Their file-level lock
         // patterns (repos routinely add `**/*.lock` to cut search noise) are harmless here because
         // we test the marker per *directory* below rather than trusting the walk to yield the
         // lockfile — so a directory entry like `testdata/` still prunes, but a hidden lockfile
@@ -67,7 +172,13 @@ pub fn find_marker_dirs(
         !is_excluded(entry.path(), &root_owned, &excludes)
     });
 
-    let mut dirs = Vec::new();
+    let mut found = scans
+        .iter()
+        .map(|_| ProjectMarkerDirs {
+            primary: Vec::new(),
+            validation_only: Vec::new(),
+        })
+        .collect::<Vec<_>>();
     for result in builder.build() {
         let entry = match result {
             Ok(entry) => entry,
@@ -82,22 +193,154 @@ pub fn find_marker_dirs(
         // common for libraries that don't commit `Cargo.lock` — is still detected.
         if entry.file_type().is_some_and(|t| t.is_dir())
             && let Some(dir) = Utf8Path::from_path(entry.path())
-            && dir.join(marker).is_file()
         {
-            dirs.push(dir.to_owned());
+            let present = present_markers(dir, &markers);
+            for (scan, result) in scans.iter().zip(&mut found) {
+                if present.contains(scan.primary) {
+                    result.primary.push(dir.to_owned());
+                }
+                if scan
+                    .validation
+                    .is_some_and(|marker| present.contains(marker))
+                {
+                    result.validation_only.push(dir.to_owned());
+                }
+            }
         }
     }
 
+    for (scan, result) in scans.iter().zip(&mut found) {
+        result.primary.sort();
+        result.primary.dedup();
+        result.validation_only.sort();
+        result.validation_only.dedup();
+        if scan.topmost_only {
+            result.primary = keep_topmost(std::mem::take(&mut result.primary));
+            result
+                .validation_only
+                .retain(|candidate| result.primary.binary_search(candidate).is_err());
+        }
+    }
+    Ok(found)
+}
+
+/// Finds reserved recovery artifact names without applying normal project-discovery ignore policy.
+///
+/// Hidden and gitignored projects remain visible because recovery must follow durable ownership
+/// evidence rather than the current discovery configuration.
+/// Known metadata, dependency, build, and cache trees are pruned to keep a repository-root safety
+/// scan bounded.
+/// Unreadable entries are skipped rather than failing the scan, matching the marker walks the same
+/// discovery pairs this with: one unreadable subtree (a root-owned volume mount) must not block
+/// recovering every project the walk *can* see, and recovery inside a subtree this process cannot
+/// read could not have proceeded anyway. The skip is only partially fail-closed, though: an
+/// interrupted project behind the unreadable subtree is rediscovered through its recovery
+/// authority anchor only when it shares the scan root's git common directory — a nested git
+/// repository or submodule inside that subtree anchors under its own git directory, and orphan
+/// artifacts with no anchor at all have nothing outside the subtree pointing at them. Both shapes
+/// escape silently, so every skipped path is returned as a warning for the caller to surface.
+pub(crate) fn find_recovery_artifact_dirs(
+    root: &Utf8Path,
+    is_artifact: impl Fn(&str) -> bool,
+) -> RecoveryArtifactScan {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .ignore(false)
+        .require_git(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || entry.file_type().is_none_or(|kind| !kind.is_dir()) {
+                return true;
+            }
+            !matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | ".hg"
+                        | ".svn"
+                        | ".cache"
+                        | ".venv"
+                        | "node_modules"
+                        | "target"
+                        | "vendor"
+                )
+            )
+        });
+    let mut dirs = Vec::new();
+    let mut skipped_unreadable = Vec::new();
+    for result in builder.build() {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                // The walker's error display names the offending path when it is known; keep the
+                // scan root as the fallback context for the rare pathless failure.
+                skipped_unreadable.push(format!(
+                    "recovery artifact scan under {root} skipped an unreadable path: {error}"
+                ));
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if is_artifact(name)
+            && let Some(parent) = entry.path().parent().and_then(Utf8Path::from_path)
+        {
+            dirs.push(parent.to_owned());
+        }
+    }
     dirs.sort();
     dirs.dedup();
-    if topmost_only {
-        dirs = keep_topmost(dirs);
+    RecoveryArtifactScan {
+        dirs,
+        skipped_unreadable,
     }
-    Ok(dirs)
+}
+
+/// The outcome of [`find_recovery_artifact_dirs`]: the artifact-owning directories plus the
+/// unreadable paths the walk had to skip (see the function's fail-closed caveats).
+pub(crate) struct RecoveryArtifactScan {
+    /// Directories that directly contain a reserved recovery artifact name.
+    pub(crate) dirs: Vec<Utf8PathBuf>,
+    /// One preformatted message per skipped unreadable path; the caller surfaces them (recovery
+    /// reports them as user-visible warnings) rather than losing them to a debug trace.
+    pub(crate) skipped_unreadable: Vec<String>,
+}
+
+fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<&'a str> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(%error, %dir, "skipping unreadable directory markers");
+            return BTreeSet::new();
+        }
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let marker = markers.get(name).copied()?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_file()
+                || (kind.is_symlink()
+                    && std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
+            {
+                Some(marker)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Whether `path` (a directory) is excluded, matching its path relative to `root` against the
-/// folder globset. Matching the relative path (rather than the bare name) is what lets a leading
+/// folder globset.
+/// Matching the relative path (rather than the bare name) is what lets a leading
 /// slash anchor to the root: a bare name still prunes at any depth because
 /// [`compile_folder_globset`] gives it the `**/` variant.
 fn is_excluded(path: &std::path::Path, root: &Utf8Path, excludes: &GlobSet) -> bool {
@@ -120,7 +363,8 @@ fn keep_topmost(dirs: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
     kept
 }
 
-/// `exclude-folders` compiled for filtering workspace members by *location*. A member is excluded
+/// `exclude-folders` compiled for filtering workspace members by *location*.
+/// A member is excluded
 /// when its path — or any ancestor, so `packages/ts/luup` also excludes `packages/ts/luup/api` —
 /// matches a folder glob (`.gitignore` semantics; see [`compile_folder_globset`]).
 #[derive(Debug, Clone)]
@@ -148,7 +392,8 @@ impl FolderExcludeSet {
     }
 }
 
-/// `exclude-packages` compiled for filtering workspace members by *package name*. A scoped glob like
+/// `exclude-packages` compiled for filtering workspace members by *package name*.
+/// A scoped glob like
 /// `@luup/*` excludes every `@luup/...` member regardless of where it lives in the tree (see
 /// [`compile_package_globset`]).
 #[derive(Debug, Clone)]
@@ -174,6 +419,7 @@ impl PackageExcludeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre;
 
     fn utf8(p: &std::path::Path) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(p.to_path_buf()).expect("utf8 path")
@@ -235,6 +481,135 @@ mod tests {
     }
 
     #[test]
+    fn project_scan_separates_primary_and_validation_only_markers() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir_all(root.join("with-lock"))?;
+        std::fs::create_dir_all(root.join("custom-lock"))?;
+        std::fs::write(root.join("with-lock/Cargo.lock"), "")?;
+        std::fs::write(root.join("with-lock/Cargo.toml"), "")?;
+        std::fs::write(root.join("custom-lock/Cargo.toml"), "")?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert_eq!(found.primary, vec![root.join("with-lock")]);
+        assert_eq!(found.validation_only, vec![root.join("custom-lock")]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_scan_batches_distinct_adapter_markers() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir_all(root.join("rust"))?;
+        std::fs::create_dir_all(root.join("go/service"))?;
+        std::fs::write(root.join("rust/Cargo.lock"), "")?;
+        std::fs::write(root.join("rust/Cargo.toml"), "")?;
+        std::fs::write(root.join("go/go.mod"), "")?;
+        std::fs::write(root.join("go/service/go.mod"), "")?;
+        let detections = [
+            ProjectDetection::PrimaryWithValidation {
+                primary: cooldown_core::ProjectMarker {
+                    lockfile: "Cargo.lock",
+                    manifest: "Cargo.toml",
+                    alternate_manifests: &[],
+                    workspace_root: true,
+                },
+                validation_marker: "Cargo.toml",
+            },
+            ProjectDetection::Primary(cooldown_core::ProjectMarker {
+                lockfile: "go.mod",
+                manifest: "go.mod",
+                alternate_manifests: &[],
+                workspace_root: false,
+            }),
+        ];
+
+        let found = find_project_marker_dirs_batch(&root, &detections, false, &[])?;
+
+        assert_eq!(found[0].primary, vec![root.join("rust")]);
+        assert!(found[0].validation_only.is_empty());
+        assert_eq!(
+            found[1].primary,
+            vec![root.join("go"), root.join("go/service")]
+        );
+        assert!(found[1].validation_only.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn outer_validation_marker_does_not_hide_a_nested_validation_marker() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let nested = root.join("tools/custom");
+        std::fs::create_dir_all(nested.join(".cargo"))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"custom\"\n")?;
+        std::fs::write(
+            nested.join(".cargo/config.toml"),
+            "[resolver]\nlockfile-path = \"Custom.lock\"\n",
+        )?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert!(found.primary.is_empty());
+        assert_eq!(found.validation_only, vec![root, nested]);
+        Ok(())
+    }
+
+    #[test]
+    fn primary_root_does_not_hide_a_nested_validation_marker() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let nested = root.join("tools/custom");
+        std::fs::create_dir_all(nested.join(".cargo"))?;
+        std::fs::write(root.join("Cargo.lock"), "")?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"custom\"\n")?;
+        std::fs::write(
+            nested.join(".cargo/config.toml"),
+            "[resolver]\nlockfile-path = \"Custom.lock\"\n",
+        )?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert_eq!(found.primary, vec![root]);
+        assert_eq!(found.validation_only, vec![nested]);
+        Ok(())
+    }
+
+    #[test]
     fn without_topmost_all_markers_are_reported() {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = utf8(tmp.path());
@@ -266,7 +641,8 @@ mod tests {
         touch(&root.join("nested/examples/uv.lock"));
 
         // `"examples/"` is the natural directory-exclude idiom; the trailing slash must not change
-        // its meaning. Like the bare name, it prunes `examples/` at any depth.
+        // its meaning.
+        // Like the bare name, it prunes `examples/` at any depth.
         let excludes = vec!["examples/".to_string()];
         let found = find_marker_dirs(&root, "uv.lock", false, &excludes, false).expect("scan");
         assert_eq!(found, vec![root]);
@@ -320,7 +696,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("git dir");
         touch(&root.join("Cargo.lock"));
         // Libraries routinely gitignore their own lockfile; a ripgrep `.ignore` may hide it from
-        // search. Neither should make the project disappear — the marker is tested per directory.
+        // search.
+        // Neither should make the project disappear because the marker is tested per directory.
         std::fs::write(root.join(".gitignore"), "Cargo.lock\n").expect("gitignore");
         std::fs::write(root.join(".ignore"), "**/*.lock\n").expect("rgignore");
 
@@ -332,12 +709,98 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dangling_lock_symlink_does_not_mark_a_project() -> eyre::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        symlink("missing.lock", root.join("Cargo.lock"))?;
+
+        let found = find_marker_dirs(&root, "Cargo.lock", false, &[], true)?;
+
+        assert!(found.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn invalid_exclude_glob_is_a_config_error() {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = utf8(tmp.path());
         let err = find_marker_dirs(&root, "Cargo.lock", false, &["a/**/[".to_string()], false)
             .expect_err("bad glob");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
+    }
+
+    #[test]
+    fn recovery_scan_finds_hidden_and_ignored_projects_but_prunes_bulk_trees() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join(".gitignore"), "ignored/\n")?;
+        for marker in [
+            "ignored/project/.recovery.123.0.publish",
+            ".hidden/project/recovery",
+            "target/fixture/.recovery.123.0.publish",
+        ] {
+            let marker = root.join(marker);
+            std::fs::create_dir_all(
+                marker
+                    .parent()
+                    .ok_or_else(|| eyre::eyre!("recovery marker has no parent"))?,
+            )?;
+            std::fs::write(marker, "")?;
+        }
+
+        let found = find_recovery_artifact_dirs(root, |name| {
+            matches!(name, "recovery" | ".recovery.123.0.publish")
+        });
+        assert_eq!(
+            found.dirs,
+            vec![root.join(".hidden/project"), root.join("ignored/project")]
+        );
+        assert!(found.skipped_unreadable.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_scan_skips_an_unreadable_subtree_instead_of_failing() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let project = root.join("project");
+        // Not in the pruned-name list — e.g. a root-owned `data/` volume mount inside the repo.
+        let sealed = root.join("data");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&sealed)?;
+        std::fs::write(project.join("recovery"), "")?;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))?;
+
+        let result = find_recovery_artifact_dirs(root, |name| name == "recovery");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))?;
+
+        assert_eq!(
+            result.dirs,
+            vec![project],
+            "the interrupted project the walk can see is still recovered"
+        );
+        // The skip is not fully fail-closed (a nested repository or orphan artifacts behind the
+        // unreadable subtree escape silently), so it must surface as a warning, not a debug trace.
+        let warning = result
+            .skipped_unreadable
+            .first()
+            .ok_or_else(|| eyre::eyre!("the unreadable subtree must be reported"))?;
+        assert!(
+            warning.contains(sealed.as_str()),
+            "the warning names the unreadable path, got: {warning}"
+        );
+        Ok(())
     }
 }

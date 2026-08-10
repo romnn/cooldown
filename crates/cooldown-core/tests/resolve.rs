@@ -147,7 +147,7 @@ fn max_major_is_authority_first_then_specificity() {
     let query = q("widget", Utf8Path::new("."), ResolveKind::CurrentPin);
     let pick = resolve_max_major(&layers, &query).expect("ceiling");
     assert_eq!(pick.limit, 5, "repo authority wins, then tool specificity");
-    assert!(matches!(pick.origin, Origin::Repo(_)));
+    std::assert_matches!(pick.origin, Origin::Repo(_));
 
     let resolution = resolve(&layers, &query, now());
     let applied = resolution

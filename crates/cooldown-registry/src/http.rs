@@ -296,6 +296,14 @@ impl SharedHttp {
                 Err(FetchError::Backoff(delay)) if attempt <= self.inner.opts.max_retries => {
                     tokio::time::sleep(delay).await;
                 }
+                // One bounded retry for a transport failure (connection reset, DNS blip): these
+                // index GETs are idempotent, and a lone flicker otherwise fails a whole gate run
+                // with a transient-error row. The fail-closed path below still holds when the
+                // retry also fails.
+                Err(FetchError::Transient(e)) if attempt == 1 => {
+                    tracing::debug!(url, host, error = %e, "transient transport failure; retrying once");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
                 Err(FetchError::Transient(e)) => {
                     // Fall back to a stale cached copy if we have one; else propagate.
                     if !self.inner.opts.fresh
@@ -467,7 +475,7 @@ mod tests {
         .expect("shared http");
 
         let result = http.get(url, Duration::ZERO).await;
-        assert!(matches!(result, Err(CoreError::Transient(_))));
+        std::assert_matches!(result, Err(CoreError::Transient(_)));
     }
 
     #[tokio::test]
@@ -488,6 +496,36 @@ mod tests {
         let response = http.get(url, Duration::ZERO).await.expect("stale fallback");
         assert!(response.from_cache);
         assert_eq!(response.body, "cached");
+    }
+
+    /// A lone transport flicker (connection dropped mid-request) must not fail the run: the
+    /// request is retried once and the second attempt's response is returned as a normal fetch.
+    #[tokio::test]
+    async fn transient_transport_failure_is_retried_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // First connection: accepted and dropped without a response — the transport flicker.
+            let (first, _) = listener.accept().await.expect("first connection");
+            drop(first);
+            // Second connection: a minimal 200.
+            let (mut second, _) = listener.accept().await.expect("second connection");
+            let mut buf = [0u8; 1024];
+            let _ = second.read(&mut buf).await;
+            let _ = second
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(dir.path(), HttpOptions::default()).expect("shared http");
+
+        let url = format!("http://{addr}/index");
+        let response = http.get(&url, Duration::ZERO).await.expect("retried fetch");
+        assert_eq!(response.body, "ok");
+        assert!(!response.from_cache);
     }
 
     #[tokio::test]

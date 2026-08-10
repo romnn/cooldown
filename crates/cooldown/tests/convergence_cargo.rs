@@ -35,7 +35,7 @@
 mod support;
 
 use indoc::indoc;
-use support::{Fixture, changed_packages, toml_lock_pins};
+use support::{ChangeVersions, Fixture, changed_packages, toml_lock_pins};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
 /// the matured-version set — and the precise targets cooldown computes — reproduce forever.
@@ -209,12 +209,12 @@ fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
 
     assert_eq!(
         upgrade.changes_for("jsonschema"),
-        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        vec![ChangeVersions::new("0.46.5", "0.46.6")],
         "jsonschema must have one baseline-to-final report row"
     );
     assert_eq!(
         upgrade.changes_for("referencing"),
-        vec![("0.46.5".to_owned(), "0.46.6".to_owned())],
+        vec![ChangeVersions::new("0.46.5", "0.46.6")],
         "referencing must not retain a false skip or its transient 0.46.10 position"
     );
     assert_eq!(
@@ -322,6 +322,84 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
     );
 }
 
+/// The cutoff admits `rand_core` 0.6.4 (2022-09-15) as matured, while the exact-pinned parent
+/// `rand 0.8.5` (2022-02-14) keeps the direct layer inert.
+const TRANSITIVE_ADVANCE_FREEZE: &str = "2023-01-01T00:00:00Z";
+
+const TRANSITIVE_ADVANCE_MANIFEST: &str = r#"[package]
+name = "cargo-transitive-advance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "=0.8.5"
+"#;
+
+fn transitive_advance_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", TRANSITIVE_ADVANCE_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Push the undeclared transitive behind its line's newest: rand_core 0.6.3 (2021-06-15), with
+    // 0.6.4 matured under the freeze. The exact-pinned parent never plans, so nothing drags the
+    // line — the standalone shape only graph-wide transitive advance can move.
+    fixture
+        .run_tool(
+            "cargo",
+            &["update", "-p", "rand_core", "--precise", "0.6.3"],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+#[test]
+fn upgrade_advances_a_matured_transitive_no_direct_pin_drags() {
+    skip_if_missing!("cargo");
+    let fixture = transitive_advance_fixture();
+    let lock_before = fixture.read_bytes("Cargo.lock");
+    assert_eq!(
+        cargo_lock_versions_of("rand_core", &lock_before),
+        vec!["0.6.3".to_owned()],
+        "the seed must hold the behind transitive"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(upgrade.ok(), "upgrade should succeed");
+    assert!(
+        upgrade.applied_names().contains("rand_core"),
+        "the transitive advance must be its own applied row, got {:?}",
+        upgrade.applied_names()
+    );
+    assert!(
+        !upgrade.applied_names().contains("rand"),
+        "the exact-pinned parent must not move"
+    );
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    assert_eq!(
+        cargo_lock_versions_of("rand_core", &lock_after),
+        vec!["0.6.4".to_owned()],
+        "rand_core advances to the newest release matured under the freeze"
+    );
+    assert_eq!(
+        cargo_lock_versions_of("rand", &lock_after),
+        vec!["0.8.5".to_owned()],
+        "the exact pin stays"
+    );
+
+    // Converged: a second run under the same freeze plans nothing new for the line.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        !second.applied_names().contains("rand_core"),
+        "a converged line re-applies to a fixed point, got {:?}",
+        second.applied_names()
+    );
+}
+
 #[test]
 fn upgrade_holds_back_a_cargo_floated_transitive_instead_of_skipping() {
     skip_if_missing!("cargo");
@@ -396,9 +474,10 @@ fn outdated_agrees_with_upgrade() {
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
     let held = upgrade.held_conflict_names();
 
-    // Everything `upgrade` reports held, `outdated` must mark blocked. Cargo's
-    // `outdated --transitive` can additionally flag candidates `upgrade` never plans, so `blocked`
-    // is a superset, not a strict equal.
+    // Everything `upgrade` reports held, `outdated` must mark blocked. `outdated --transitive` can
+    // additionally mark statically-blocked candidates (a declared bound, an exact pin) that
+    // `upgrade` — even with graph-wide transitive advance — never plans, so `blocked` is a
+    // superset, not a strict equal.
     assert!(
         held.is_subset(&blocked),
         "every held candidate must be blocked by outdated\nheld={held:?}\nblocked={blocked:?}"
@@ -507,14 +586,16 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "crates/app/Cargo.toml",
         &format!("{APP_MANIFEST}regex = \"1\"\n"),
     );
+    let stale_lock = fixture.read_bytes("Cargo.lock");
 
     let stale = fixture.cooldown_json(&["check", "--latest", "--package", "log"]);
     assert!(!stale.ok(), "stale lock must fail closed by default");
     assert_eq!(stale.summary_errors(), 1);
     assert!(
         stale.error_kinds().contains("stale_lock"),
-        "expected a stale_lock diagnostic, got {:?}",
-        stale.error_kinds()
+        "expected a stale_lock diagnostic, got {:?}: {:?}",
+        stale.error_kinds(),
+        stale.error_messages()
     );
 
     let allowed = fixture.cooldown_json(&[
@@ -542,6 +623,22 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "stale-lock warning should name the manifest path, got {:?}",
         allowed.warning_paths()
     );
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--allow-stale-lock"]);
+    assert!(
+        outdated.ok(),
+        "outdated remains informational on a stale lock"
+    );
+    assert!(outdated.warning_kinds().contains("stale_lock"));
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+
+    let explain = fixture.cooldown(&["explain", "log"]);
+    assert!(
+        !explain.status.success(),
+        "explain must fail closed on a stale lock"
+    );
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
 }
 
 #[test]

@@ -1,14 +1,15 @@
 use super::Window;
 use super::baseline::Baseline;
-use super::lock::ProjectLock;
+use super::lock::{ProjectAccessReadGuard, ProjectAccessWriteGuard};
 use super::progress::Progress;
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext,
-    LockStatus, LockVerifyReport, PatternGlob, PolicyLayer, PolicyStack, Project, Release,
-    ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead, ToolWrite,
+    LockStatus, LockVerifyReport, MutationRecovery, PatternGlob, PolicyLayer, PolicyStack, Project,
+    RecoveryDisposition, Release, ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead,
+    ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
@@ -26,6 +27,46 @@ pub struct ProjectCtx {
     pub rel_path: Utf8PathBuf,
     /// The fully-assembled, project-scoped policy layers.
     pub policy: PolicyStack,
+    /// The Cargo edge policy resolved for this project's config cascade.
+    pub edge_policy: cooldown_core::EdgePolicy,
+}
+
+pub(crate) struct LockRefresh {
+    pub(crate) report: cooldown_core::Result<Option<LockVerifyReport>>,
+    pub(crate) recovery: Vec<Diagnostic>,
+    pub(crate) guard: Option<ProjectAccessWriteGuard>,
+}
+
+pub(crate) fn recovery_diagnostics(
+    recovery: MutationRecovery,
+    tool: ToolId,
+    project: &str,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = recovery
+        .warnings
+        .into_iter()
+        .map(|warning| warning.with_tool(tool.as_str()).with_project(project))
+        .collect::<Vec<_>>();
+    let message = match recovery.disposition {
+        RecoveryDisposition::Unchanged => None,
+        RecoveryDisposition::Accepted => {
+            Some("completed an interrupted accepted publication before continuing")
+        }
+        RecoveryDisposition::Restored => {
+            Some("restored an interrupted mutation to its preimage before continuing")
+        }
+        RecoveryDisposition::CleanupOnly => {
+            Some("removed recovery artifacts for an already settled mutation before continuing")
+        }
+    };
+    if let Some(message) = message {
+        diagnostics.push(
+            Diagnostic::new(DiagnosticKind::Recovery, message)
+                .with_tool(tool.as_str())
+                .with_project(project),
+        );
+    }
+    diagnostics
 }
 
 /// The exit-code taxonomy. `check` is the CI gate, so non-zero is its contract.
@@ -96,14 +137,17 @@ impl Exit {
 /// The full graph is in scope by default; the modes relax that consistently across the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransitiveGate {
-    /// Act on too-fresh transitive deps (the default, full graph): `check` fails on them, `fix`
-    /// downgrades them, `upgrade` reconciles them to a matured version.
+    /// Act on transitive deps (the default, full graph): `check` fails on too-fresh ones, `fix`
+    /// downgrades them, `upgrade` advances matured in-range ones (where the tool's engine can pin
+    /// an undeclared package) and reconciles any too-fresh one a re-lock drags in.
     #[default]
     Enforce,
-    /// Evaluate transitive deps but don't act on them: `check` reports them non-fatally, `fix`/
-    /// `upgrade` leave them in place while still handling direct deps.
+    /// Relax only the too-fresh handling: `check` reports violations non-fatally, `fix` leaves
+    /// too-fresh transitives in place, and `upgrade` still advances matured ones but keeps a
+    /// floated-up too-fresh transitive instead of reconciling it (reported, not rolled back).
     Allow,
-    /// Don't evaluate transitive deps at all (direct-only).
+    /// Don't plan or evaluate transitive deps (direct-only). A direct re-resolve can still move
+    /// them; such moves stay visible as collateral rows.
     Hide,
 }
 
@@ -356,12 +400,17 @@ pub struct Workspace {
     release_cache: Box<dyn ReleaseResolver>,
 }
 
-/// The registered tool adapters, split into read-side and mutation-side ports.
+struct RegisteredAdapter {
+    reader: Arc<dyn ToolRead>,
+    fetcher: Arc<dyn ReleaseFetcher>,
+    writer: Option<Arc<dyn ToolWrite>>,
+}
+
+/// The registered tool adapters, with one coherent port family per tool identifier.
 #[derive(Default)]
 pub struct AdapterSet {
-    readers: Vec<Arc<dyn ToolRead>>,
-    fetchers: HashMap<ToolId, Arc<dyn ReleaseFetcher>>,
-    writers: HashMap<ToolId, Arc<dyn ToolWrite>>,
+    order: Vec<ToolId>,
+    adapters: HashMap<ToolId, RegisteredAdapter>,
 }
 
 impl AdapterSet {
@@ -371,53 +420,106 @@ impl AdapterSet {
         Self::default()
     }
 
-    /// Register one concrete adapter as read-side and registry-fetch ports only.
-    pub fn register_read<T>(&mut self, adapter: Arc<T>)
+    /// Registers one concrete adapter as read-side and registry-fetch ports only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`cooldown_core::CoreError::System`] when that tool family is already registered.
+    pub fn register_read<T>(&mut self, adapter: Arc<T>) -> cooldown_core::Result<()>
     where
         T: ToolRead + ReleaseFetcher + 'static,
     {
         let id = adapter.id();
         let reader: Arc<dyn ToolRead> = adapter.clone();
         let fetcher: Arc<dyn ReleaseFetcher> = adapter;
-        self.readers.push(reader);
-        self.fetchers.insert(id, fetcher);
+        self.register(
+            id,
+            RegisteredAdapter {
+                reader,
+                fetcher,
+                writer: None,
+            },
+        )
     }
 
     /// Register one concrete adapter as read/fetch ports plus a mutator whose writes are verified
     /// by the application layer's post-apply graph proof before they are committed.
-    pub fn register_target_verified_mutator<T>(&mut self, adapter: Arc<T>)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`cooldown_core::CoreError::System`] when the adapter's read and write sides declare
+    /// different tool-family identifiers or when that tool family is already registered.
+    pub fn register_target_verified_mutator<T>(
+        &mut self,
+        adapter: Arc<T>,
+    ) -> cooldown_core::Result<()>
     where
         T: cooldown_core::Tool + 'static,
     {
-        let id = adapter.id();
-        self.register_read(adapter.clone());
+        let read_id = adapter.id();
+        let write_id = adapter.mutation_tool();
+        if read_id != write_id {
+            return Err(cooldown_core::CoreError::System(format!(
+                "adapter registration mismatched read tool {} and write tool {}",
+                read_id.as_str(),
+                write_id.as_str()
+            )));
+        }
+        let reader: Arc<dyn ToolRead> = adapter.clone();
+        let fetcher: Arc<dyn ReleaseFetcher> = adapter.clone();
         let writer: Arc<dyn ToolWrite> = adapter;
-        self.writers.insert(id, writer);
+        self.register(
+            read_id,
+            RegisteredAdapter {
+                reader,
+                fetcher,
+                writer: Some(writer),
+            },
+        )
+    }
+
+    fn register(&mut self, id: ToolId, adapter: RegisteredAdapter) -> cooldown_core::Result<()> {
+        if self.adapters.contains_key(&id) {
+            return Err(cooldown_core::CoreError::System(format!(
+                "adapter tool family {} is already registered",
+                id.as_str()
+            )));
+        }
+        self.order.push(id);
+        self.adapters.insert(id, adapter);
+        Ok(())
     }
 
     /// Iterate the read-side adapters in registration order.
     pub fn readers(&self) -> impl Iterator<Item = &Arc<dyn ToolRead>> {
-        self.readers.iter()
+        self.order
+            .iter()
+            .filter_map(|id| self.adapters.get(id).map(|adapter| &adapter.reader))
     }
 
     /// Look up the read-side port for one tool.
+    #[must_use]
     pub fn reader(&self, id: ToolId) -> Option<&dyn ToolRead> {
-        self.readers
-            .iter()
-            .find(|adapter| adapter.id() == id)
-            .map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .map(|adapter| adapter.reader.as_ref())
     }
 
     /// Look up the mutation-side port for one tool.
+    #[must_use]
     pub fn writer(&self, id: ToolId) -> Option<&dyn ToolWrite> {
-        self.writers.get(&id).map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .and_then(|adapter| adapter.writer.as_deref())
     }
 
     /// The registry-fetch port for one tool. Intentionally private to this module: it is reached
     /// only by [`Workspace`]'s cache-backed fetch methods, so no caller elsewhere can fetch releases
     /// without going through the release cache — the [`ReleaseFetcher`] never leaves this module.
     fn release_fetcher(&self, id: ToolId) -> Option<&dyn ReleaseFetcher> {
-        self.fetchers.get(&id).map(std::convert::AsRef::as_ref)
+        self.adapters
+            .get(&id)
+            .map(|adapter| adapter.fetcher.as_ref())
     }
 }
 
@@ -488,19 +590,63 @@ impl Workspace {
         &self,
         pctx: &ProjectCtx,
         opts: &RunOpts,
-    ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+    ) -> cooldown_core::Result<LockRefresh> {
         if !opts.lock || opts.dry_run {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+                guard: None,
+            });
         }
         let Some(writer) = self.mutator(pctx.tool) else {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+                guard: None,
+            });
         };
         if !writer.supports_lock_refresh() {
-            return Ok(None);
+            return Ok(LockRefresh {
+                report: Ok(None),
+                recovery: Vec::new(),
+                guard: None,
+            });
         }
         opts.progress.phase("refreshing lock state");
-        let _guard = ProjectLock::acquire(&pctx.project.root)?;
-        writer.refresh_lock(&pctx.project).await
+        let guard = ProjectAccessWriteGuard::acquire(
+            self.repo_root(),
+            &pctx.project.root,
+            pctx.tool,
+            writer.sync_scope() == cooldown_core::SyncScope::Repo,
+        )?;
+        let recovery = writer
+            .recover_pending_mutation(&pctx.project, guard.coordination())
+            .await?;
+        let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
+        let report = writer.refresh_lock(&pctx.project).await;
+        Ok(LockRefresh {
+            report,
+            recovery,
+            guard: Some(guard),
+        })
+    }
+
+    /// Starts a read session and checks adapter-owned pending state without mutating it.
+    pub(crate) async fn project_read_guard(
+        &self,
+        pctx: &ProjectCtx,
+    ) -> cooldown_core::Result<ProjectAccessReadGuard> {
+        let writer = self.mutator(pctx.tool);
+        let guard = ProjectAccessReadGuard::acquire(
+            self.repo_root(),
+            &pctx.project.root,
+            pctx.tool,
+            writer.is_some_and(|writer| writer.sync_scope() == cooldown_core::SyncScope::Repo),
+        )?;
+        if let Some(writer) = writer {
+            writer.ensure_no_pending_mutation(&pctx.project).await?;
+        }
+        Ok(guard)
     }
 
     /// Projects in scope for this run (filtered by `--tool`).
@@ -514,9 +660,11 @@ impl Workspace {
             .filter(move |project| Self::project_in_source_scope(project, opts))
     }
 
-    pub(crate) fn progress_projects(&self, opts: &RunOpts) -> Vec<(ToolId, String)> {
+    /// The tool of each project the run's scope covers, one entry per project — what the
+    /// progress display needs to size its per-tool counters.
+    pub(crate) fn progress_project_tools(&self, opts: &RunOpts) -> Vec<ToolId> {
         self.scoped_projects(opts)
-            .map(|project| (project.tool, project.rel_path.to_string()))
+            .map(|project| project.tool)
             .collect()
     }
 
@@ -675,7 +823,7 @@ impl Workspace {
         fetch: &FetchContext<'_>,
         progress: &Progress,
         fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Release>)> {
+    ) -> Vec<FetchedRelease<Release>> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
@@ -691,7 +839,10 @@ impl Workspace {
                         .locked_release(fetcher, &dep, fetch)
                         .await;
                     progress.package_finished(&dep.package.name);
-                    (dep, result)
+                    FetchedRelease {
+                        dependency: dep,
+                        result,
+                    }
                 }
             })
             .buffer_unordered(fanout)
@@ -716,7 +867,7 @@ impl Workspace {
         candidate_scope: CandidateScope,
         progress: &Progress,
         fanout: usize,
-    ) -> Vec<(Dependency, cooldown_core::Result<Vec<Release>>)> {
+    ) -> Vec<FetchedRelease<Vec<Release>>> {
         let started = std::time::Instant::now();
         let Some(fetcher) = self.adapters.release_fetcher(adapter.id()) else {
             return no_fetcher_results(adapter.id(), deps);
@@ -732,7 +883,10 @@ impl Workspace {
                         .candidate_releases(fetcher, &dep, fetch, candidate_scope)
                         .await;
                     progress.package_finished(&dep.package.name);
-                    (dep, result)
+                    FetchedRelease {
+                        dependency: dep,
+                        result,
+                    }
                 }
             })
             .buffer_unordered(fanout)
@@ -756,19 +910,28 @@ impl Workspace {
     }
 }
 
+/// One dependency's release-fetch outcome, keeping the input beside its result so per-dep
+/// reporting never loses attribution.
+pub(crate) struct FetchedRelease<T> {
+    /// The dependency the fetch was for.
+    pub(crate) dependency: Dependency,
+    /// The fetch outcome: a locked release, the candidate list, or the per-dep error.
+    pub(crate) result: cooldown_core::Result<T>,
+}
+
 /// The fallback result when a tool somehow has no registered [`ReleaseFetcher`] (every registered
 /// adapter has one, so this is unreachable in practice) — one typed error per dep, never a panic.
-fn no_fetcher_results<T>(
-    tool: ToolId,
-    deps: Vec<Dependency>,
-) -> Vec<(Dependency, cooldown_core::Result<T>)> {
+fn no_fetcher_results<T>(tool: ToolId, deps: Vec<Dependency>) -> Vec<FetchedRelease<T>> {
     deps.into_iter()
         .map(|dep| {
             let err = cooldown_core::CoreError::System(format!(
                 "no release fetcher registered for tool {}",
                 tool.as_str()
             ));
-            (dep, Err(err))
+            FetchedRelease {
+                dependency: dep,
+                result: Err(err),
+            }
         })
         .collect()
 }
@@ -800,7 +963,12 @@ pub(crate) fn diag_from_error(
     project: &str,
     package: Option<&str>,
 ) -> Diagnostic {
-    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), err.to_string())
+    // `CoreError::Tool` embeds the tool's verbatim stderr, which can quote credentialed registry
+    // URLs (`https://user:secret@host/`). Every error that becomes a report diagnostic funnels
+    // through here, so redact at this choke point — the message reaches the TTY and the JSON
+    // envelope unmodified downstream.
+    let message = cooldown_core::redact::url_secrets(&err.to_string());
+    let mut diagnostic = Diagnostic::new(err.diagnostic_kind(), message)
         .with_tool(tool.as_str())
         .with_project(project);
     if let Some(package) = package {
@@ -826,7 +994,11 @@ pub(crate) fn lock_report_outcome(
         LockStatus::Stale => DiagnosticKind::StaleLock,
         LockStatus::Unknown => DiagnosticKind::LockUnknown,
     };
-    let diagnostic = Diagnostic::new(kind, report.detail)
+    // The detail is tool output (a verifier's stderr can quote registry URLs), so it gets the same
+    // secret redaction as `diag_from_error` messages. Moving it out keeps `report` consumed for
+    // the by-value signature.
+    let detail = report.detail;
+    let diagnostic = Diagnostic::new(kind, cooldown_core::redact::url_secrets(&detail))
         .with_tool(tool.as_str())
         .with_project(project_label)
         .with_path(manifest.as_str());
@@ -845,12 +1017,12 @@ pub(crate) fn lock_report_outcome(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use color_eyre::eyre;
     use cooldown_core::config::builtin_default_layer;
     use cooldown_core::{
         Capabilities, DepScope, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
         PackageId, ProjectMarker, ReleaseQuality, Version,
     };
-
     const CARGO: ToolId = ToolId("cargo");
     const PNPM: ToolId = ToolId("pnpm");
     const UV: ToolId = ToolId("uv");
@@ -858,6 +1030,199 @@ mod tests {
     struct FakeReader {
         id: ToolId,
         deps: Vec<Dependency>,
+    }
+
+    struct TestAdapter {
+        write_id: ToolId,
+        refresh: bool,
+    }
+
+    #[async_trait]
+    impl ToolRead for TestAdapter {
+        fn id(&self) -> ToolId {
+            CARGO
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn project_detection(&self) -> cooldown_core::ProjectDetection {
+            cooldown_core::ProjectDetection::Primary(ProjectMarker {
+                lockfile: "lock",
+                manifest: "manifest",
+                alternate_manifests: &[],
+                workspace_root: true,
+            })
+        }
+
+        async fn dependencies(
+            &self,
+            _project: &Project,
+            _scope: DepScope,
+        ) -> cooldown_core::Result<Vec<Dependency>> {
+            Ok(Vec::new())
+        }
+
+        async fn native_policy(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<Option<NativePolicyLayer>> {
+            Ok(None)
+        }
+
+        async fn verify_lock_current(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<LockVerifyReport> {
+            Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "current".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl cooldown_core::ReleaseFetcher for TestAdapter {
+        async fn releases(
+            &self,
+            _dep: &Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+            _candidates: cooldown_core::CandidateScope,
+        ) -> cooldown_core::Result<Vec<cooldown_core::Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn locked_release(
+            &self,
+            dep: &Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+        ) -> cooldown_core::Result<cooldown_core::Release> {
+            Err(cooldown_core::CoreError::NotFound(dep.package.name.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl ToolWrite for TestAdapter {
+        fn mutation_tool(&self) -> ToolId {
+            self.write_id
+        }
+
+        async fn mutation_journal(
+            &self,
+            project: &Project,
+            _plan: &cooldown_core::Plan,
+        ) -> cooldown_core::Result<cooldown_core::ProjectMutationJournal> {
+            cooldown_core::ProjectMutationJournal::capture(
+                &project.root,
+                std::iter::empty::<&camino::Utf8Path>(),
+            )
+        }
+
+        async fn apply(
+            &self,
+            mutation: &cooldown_core::PreparedMutation,
+        ) -> cooldown_core::Result<cooldown_core::ApplyReport> {
+            mutation.parts_for(self)?;
+            Ok(cooldown_core::ApplyReport::default())
+        }
+
+        async fn build(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<cooldown_core::VerifyReport> {
+            Ok(cooldown_core::VerifyReport {
+                ok: true,
+                detail: String::new(),
+            })
+        }
+
+        async fn refresh_lock(
+            &self,
+            _project: &Project,
+        ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+            Ok(Some(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "refreshed".to_string(),
+            }))
+        }
+
+        fn supports_lock_refresh(&self) -> bool {
+            self.refresh
+        }
+    }
+
+    #[test]
+    fn adapter_registration_rejects_mismatched_read_and_write_tool_families() {
+        let mut adapters = AdapterSet::new();
+
+        let result = adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: PNPM,
+            refresh: false,
+        }));
+
+        std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        assert_eq!(adapters.readers().count(), 0);
+        assert!(adapters.writer(CARGO).is_none());
+        assert!(adapters.writer(PNPM).is_none());
+    }
+
+    #[test]
+    fn adapter_registration_rejects_a_duplicate_tool_family_atomically() {
+        let mut adapters = AdapterSet::new();
+        std::assert_matches!(
+            adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+                write_id: CARGO,
+                refresh: false,
+            })),
+            Ok(())
+        );
+
+        let result = adapters.register_read(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: false,
+        }));
+
+        std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
+        assert_eq!(adapters.readers().count(), 1);
+        assert_eq!(adapters.reader(CARGO).map(ToolRead::id), Some(CARGO));
+        assert!(adapters.writer(CARGO).is_some());
+    }
+
+    #[tokio::test]
+    async fn lock_refresh_retains_exclusive_access_for_the_following_read() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let pctx = project_ctx(CARGO, root.as_str());
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: true,
+        }))?;
+        let ws = Workspace::new(
+            adapters,
+            vec![pctx],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+        let opts = RunOpts {
+            lock: true,
+            ..RunOpts::default()
+        };
+
+        let refresh = ws.refresh_project_lock(&ws.projects()[0], &opts).await?;
+
+        assert!(refresh.guard.is_some());
+        std::assert_matches!(
+            ProjectAccessReadGuard::acquire(&root, &root, CARGO, false),
+            Err(cooldown_core::CoreError::LockConflict(_))
+        );
+        drop(refresh);
+        ProjectAccessReadGuard::acquire(&root, &root, CARGO, false)?;
+        Ok(())
     }
 
     #[async_trait]
@@ -870,13 +1235,13 @@ mod tests {
             Capabilities::default()
         }
 
-        fn project_marker(&self) -> ProjectMarker {
-            ProjectMarker {
+        fn project_detection(&self) -> cooldown_core::ProjectDetection {
+            cooldown_core::ProjectDetection::Primary(ProjectMarker {
                 lockfile: "lock",
                 manifest: "manifest",
                 alternate_manifests: &[],
                 workspace_root: true,
-            }
+            })
         }
 
         async fn dependencies(
@@ -936,6 +1301,7 @@ mod tests {
                 layers: vec![builtin_default_layer()],
                 strict_native: false,
             },
+            edge_policy: cooldown_core::EdgePolicy::default(),
         }
     }
 
@@ -1157,5 +1523,32 @@ mod tests {
             .expect("dependencies");
 
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn diag_from_error_redacts_url_secrets_in_tool_stderr() {
+        // A registry configured with inline credentials leaks them through the tool's stderr; the
+        // diagnostic message reaches the TTY and JSON envelope verbatim, so the choke point must
+        // mask the secret while keeping the host for debuggability.
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".to_string(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: "failed to fetch https://user:hunter2@registry.example/index/config.json"
+                .to_string(),
+        };
+
+        let diag = diag_from_error(&error, CARGO, ".", Some("serde"));
+
+        assert_eq!(diag.kind, cooldown_core::DiagnosticKind::ToolFailed);
+        assert!(
+            diag.message.contains("registry.example"),
+            "the host survives redaction, got: {}",
+            diag.message
+        );
+        assert!(
+            !diag.message.contains("hunter2"),
+            "the credential must be redacted, got: {}",
+            diag.message
+        );
     }
 }

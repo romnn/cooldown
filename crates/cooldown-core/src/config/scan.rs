@@ -226,6 +226,16 @@ mod tests {
     }
 
     #[test]
+    fn edge_policy_is_rejected_under_non_cargo_tools() {
+        let err = parse_scan_config("[tool.npm]\nedge-policy = \"preserve\"\n", &Origin::Default)
+            .expect_err("edge-policy under a non-cargo tool must be rejected");
+        assert!(
+            err.to_string().contains("[tool.cargo]"),
+            "the error points at the correct placement: {err}"
+        );
+    }
+
+    #[test]
     fn invalid_exclude_glob_is_rejected_at_parse() {
         assert!(
             parse_scan_config(

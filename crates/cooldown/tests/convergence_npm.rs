@@ -11,7 +11,7 @@
 mod support;
 
 use indoc::indoc;
-use support::Fixture;
+use support::{ChangeVersions, Fixture};
 
 const SEED_BEFORE: &str = "2025-05-20T00:00:00Z";
 const FREEZE: &str = "2026-06-30T00:00:00Z";
@@ -162,7 +162,7 @@ fn upgrade_keeps_a_safe_sibling_when_another_candidate_has_no_mature_transitive(
 
     assert_eq!(
         upgrade.changes_for("tree-sitter-cli"),
-        vec![("0.25.4".to_owned(), "0.26.10".to_owned())],
+        vec![ChangeVersions::new("0.25.4", "0.26.10")],
         "the safe sibling must retain its baseline-to-target applied row: {upgrade:?}"
     );
     assert!(
@@ -219,7 +219,7 @@ fn outdated_and_upgrade_resolve_eslint_with_mature_transitives() {
     let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
     assert_eq!(
         upgrade.changes_for("eslint"),
-        vec![("9.16.0".to_owned(), "10.6.0".to_owned())]
+        vec![ChangeVersions::new("9.16.0", "10.6.0")]
     );
     assert!(upgrade.skipped_reasons_for("eslint").is_empty());
     assert!(upgrade.summary_applied() >= 1);
@@ -616,7 +616,7 @@ fn upgrade_moves_a_member_install_without_saving_into_the_roots_peer_contract() 
     assert!(report.ok(), "upgrade should succeed");
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "5.6.2".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "5.6.2")],
         "the admitted move must land: {report:?}"
     );
     assert_eq!(
@@ -679,7 +679,7 @@ fn upgrade_advances_a_peer_only_declaration_without_rewriting_it() {
     );
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "5.6.2".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "5.6.2")],
         "the in-range move lands through the manifest-preserving updater: {report:?}"
     );
     assert_eq!(
@@ -797,7 +797,7 @@ fn upgrade_preserves_a_tilde_range_when_landing_an_npm_major() {
 
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "6.0.0".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "6.0.0")],
         "the exact planned major must land: {report:?}"
     );
     assert_eq!(
@@ -834,7 +834,7 @@ fn upgrade_resynchronizes_root_lock_metadata_after_restoring_the_manifest() {
 
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "6.0.0".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "6.0.0")],
         "the exact planned major must land: {report:?}"
     );
     assert!(
@@ -877,7 +877,7 @@ fn upgrade_keeps_a_compatible_root_range_while_widening_a_member() {
 
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "6.0.0".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "6.0.0")],
         "the exact planned major must land: {report:?}"
     );
     assert_eq!(
@@ -929,7 +929,7 @@ fn upgrade_resynchronizes_workspace_lock_metadata_after_restoring_manifests() {
 
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.0".to_owned(), "6.0.0".to_owned())],
+        vec![ChangeVersions::new("5.6.0", "6.0.0")],
         "the exact planned major must land: {report:?}"
     );
     assert!(
@@ -1013,7 +1013,7 @@ fn upgrade_lands_the_exact_target_under_a_broad_peer_range() {
     assert!(
         report
             .changes_for("chalk")
-            .contains(&("5.6.0".to_owned(), "5.6.2".to_owned())),
+            .contains(&ChangeVersions::new("5.6.0", "5.6.2")),
         "the exact planned target is the one reported: {report:?}"
     );
     assert_eq!(
@@ -1068,7 +1068,7 @@ fn fix_downgrades_a_peer_only_declaration_without_rewriting_it() {
     assert!(report.ok(), "fix should succeed");
     assert_eq!(
         report.changes_for("chalk"),
-        vec![("5.6.2".to_owned(), "5.6.0".to_owned())],
+        vec![ChangeVersions::new("5.6.2", "5.6.0")],
         "the downgrade must land: a within-range update could not move backwards: {report:?}"
     );
     assert_eq!(

@@ -2,18 +2,27 @@
 //! releases from the crates.io sparse index, and `cargo`-driven apply/build.
 //!
 //! Cargo has no publish-date cutoff flag (no `--exclude-newer` equivalent), so the cooldown window
-//! is realized entirely in [`cooldown_core`]: the crates.io sparse index supplies publish times, the
-//! core computes each crate's newest-within-window target, and this adapter applies those as concrete
-//! `cargo update --precise <version>` pins. Apply re-resolves the **whole** graph by issuing all of
-//! a project's planned pins (one `cargo update -p <spec> --precise V` per pin — cargo silently drops
-//! all but the first spec when several share one `--precise`) as one logical unit, then builds the
-//! report from the FULL before/after `Cargo.lock` diff — not from per-change outcomes. So every net
-//! version change is surfaced (the planned moves, the collateral moves the re-resolve forces on
-//! non-candidate crates, and the candidates a mutually-exclusive `=`-pin or single-major shared
-//! transitive leaves held), and a converged graph re-applies to a byte-stable fixed point.
+//! is realized entirely in [`cooldown_core`].
+//! The crates.io sparse index supplies publish times, the core computes each crate's
+//! newest-within-window target, and this adapter applies those targets as concrete
+//! `cargo update --precise <version>` pins.
+//!
+//! Apply re-resolves the **whole** graph by issuing all planned pins as one logical unit.
+//! Each target gets its own command because Cargo silently applies only the first package spec when
+//! several share one `--precise` argument.
+//! Version reporting compares before/after `Cargo.lock` slots, while edge reporting audits moves
+//! paired across stable dependent identities whose endpoints coexist in both snapshots.
+//! The slot comparison reports planned and collateral version changes, while a planned candidate
+//! that does not reach its target receives a held row.
+//! Changed dependent identities and unpaired entries remain package-set changes rather than
+//! attributable binding rows.
+//! A converged graph re-applies to a byte-stable fixed point.
 
-use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
+use crate::CARGO_ID;
+use crate::cargocmd::{Cargo, ResolvedGraph};
+use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
+use crate::lockfile::{CargoLock, SlotKey, SourcedSlotKey};
 use crate::manifest;
 use crate::native::parse_native;
 use crate::version;
@@ -23,17 +32,15 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyObserver, ApplyReport, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
+    Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
+    MemberRef, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason,
+    Skipped, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
-
-/// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
-pub const CARGO_ID: ToolId = ToolId("cargo");
 
 /// The Rust/Cargo implementation of the [`Tool`] port.
 ///
@@ -64,6 +71,10 @@ impl CargoTool {
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         CargoTool::new(CratesIoIndex::new(http))
+    }
+
+    pub(crate) const fn cargo(&self) -> &Cargo {
+        &self.cargo
     }
 }
 
@@ -131,15 +142,22 @@ impl ToolRead for CargoTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // A `Cargo.lock` marks a workspace root: `cargo metadata` there already covers every
         // member, so nested lockfiles below it are not separate projects.
-        ProjectMarker {
-            lockfile: "Cargo.lock",
-            manifest: "Cargo.toml",
-            alternate_manifests: &[],
-            workspace_root: true,
+        cooldown_core::ProjectDetection::PrimaryWithValidation {
+            primary: ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
         }
+    }
+
+    fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {
+        crate::staging::reject_custom_lockfiles(roots)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -147,7 +165,9 @@ impl ToolRead for CargoTool {
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
-        let graph = self.cargo.metadata(&project.root).await?;
+        crate::staging::reject_custom_lockfile(&project.root)?;
+        edges::enforce::ensure_no_pending(project)?;
+        let graph = self.cargo.metadata_locked(&project.root).await?;
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
             if graph.roots.contains(id) || !info.is_crates_io() {
@@ -198,9 +218,11 @@ impl ToolRead for CargoTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
+        edges::enforce::ensure_no_pending(project)?;
         match self.cargo.verify_locked(&project.root).await {
-            Ok(ok) => Ok(verify_current_report(
-                ok,
+            Ok(graph) => Ok(verify_current_report(
+                graph.is_some(),
                 "Cargo.lock is current",
                 "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
             )),
@@ -258,105 +280,6 @@ impl ReleaseFetcher for CargoTool {
     }
 }
 
-/// A `(name, major)` slot key. Cargo coexists multiple majors of one crate (`serde 0.9` and
-/// `serde 1.0` can both be in the lock), so a name alone is ambiguous; the slot a `--precise` pin
-/// moves and the slot the before/after diff compares is the `(name, major)` pair. A net version
-/// change within one slot is a *move*; a slot that appears or disappears is graph-shape churn the
-/// diff ignores (a consequence of a reported move, not a silent version change).
-type SlotKey = (String, String);
-
-/// Every registry version present in each Cargo compatibility slot.
-type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
-
-fn locked_slots(lock: &CargoLock) -> LockedSlots {
-    matching_locked_slots(lock, LockPackage::is_registry)
-}
-
-fn crates_io_locked_slots(lock: &CargoLock) -> LockedSlots {
-    matching_locked_slots(lock, LockPackage::is_crates_io)
-}
-
-fn matching_locked_slots(lock: &CargoLock, include: impl Fn(&LockPackage) -> bool) -> LockedSlots {
-    let mut slots: LockedSlots = BTreeMap::new();
-    for package in &lock.package {
-        let (Some(version), true) = (package.version.as_deref(), include(package)) else {
-            continue;
-        };
-        slots
-            .entry((package.name.clone(), version::major_key(version).0))
-            .or_default()
-            .insert(version.to_string());
-    }
-    slots
-}
-
-/// The resolved registry-crate versions of a `Cargo.lock`, keyed per `(name, major)` slot — the
-/// snapshot `apply` diffs before/after the whole-graph re-resolve to report *every* net version
-/// change (the planned moves, the collateral moves the resolve forced for consistency, and the
-/// candidates a conflict left held). Path/git/workspace packages carry no comparable registry
-/// version and are skipped. When two nodes share a `(name, major)` slot (rare; only via distinct
-/// `source` registries), the highest version wins so the slot is single-valued.
-fn locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
-    highest_locked_versions(locked_slots(lock))
-}
-
-fn crates_io_locked_versions(lock: &CargoLock) -> BTreeMap<SlotKey, String> {
-    highest_locked_versions(crates_io_locked_slots(lock))
-}
-
-fn highest_locked_versions(slots: LockedSlots) -> BTreeMap<SlotKey, String> {
-    slots
-        .into_iter()
-        .filter_map(|(key, versions)| {
-            versions
-                .into_iter()
-                .max_by(|left, right| version::compare(left, right))
-                .map(|version| (key, version))
-        })
-        .collect()
-}
-
-/// The `Cargo.lock`'s `[[package]]` array, parsed for the before/after version diff. Only the
-/// fields the diff needs are read; `cargo` owns the canonical format.
-#[derive(serde::Deserialize)]
-struct CargoLock {
-    #[serde(default)]
-    package: Vec<LockPackage>,
-}
-
-#[derive(serde::Deserialize)]
-struct LockPackage {
-    name: String,
-    #[serde(default)]
-    version: Option<String>,
-    /// The source URL. Absent for path/workspace members; present for registry and git crates. Only
-    /// registry crates have a comparable, fetchable version, so the diff keeps only those.
-    #[serde(default)]
-    source: Option<String>,
-}
-
-impl LockPackage {
-    /// Whether this locked package came from a registry (crates.io or an alternate registry), the
-    /// only source kind whose version the cooldown diff can move and compare. Git and path/workspace
-    /// sources are excluded.
-    fn is_registry(&self) -> bool {
-        self.source
-            .as_deref()
-            .is_some_and(|source| source.starts_with("registry+"))
-    }
-
-    fn is_crates_io(&self) -> bool {
-        self.source.as_deref() == Some(CRATES_IO_SOURCE)
-    }
-}
-
-impl CargoLock {
-    fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content)
-            .map_err(|err| cooldown_core::CoreError::LockUnreadable(format!("Cargo.lock: {err}")))
-    }
-}
-
 /// Selects the currently resolved node that represents a planned change without changing the
 /// change's immutable baseline `from` version.
 ///
@@ -368,7 +291,7 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     if change.package.registry.as_deref() != Some(CRATES_IO) {
         return None;
     }
-    let slots = crates_io_locked_slots(lock);
+    let slots = lock.crates_io_locked_slots();
     let source_key = (
         change.package.name.clone(),
         version::major_key(change.from.as_str()).0,
@@ -402,48 +325,120 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     None
 }
 
-/// The net version changes of the before/after lock diff that `applied` does not already report,
-/// as sorted collateral rows.
+/// The paired version-slot changes that `applied` does not already report, as sorted collateral
+/// rows.
 ///
-/// Exclusion is by exact `(name, from, to)` move, not by planned package name: a planned candidate
-/// the resolve *held* can still have been floated off its baseline by a sibling pin, and that real
-/// movement must surface beside its held skip row instead of being silently dropped.
+/// Exclusion is by exact registry plus `(name, from, to)` move, not by planned package name: a
+/// planned candidate the resolve *held* can still have been floated off its baseline by a sibling
+/// pin, and that real movement must surface beside its held skip row instead of being silently
+/// dropped. Slots are compared per registry source, so a crates.io crate and an
+/// alternate-registry crate sharing a name and major can neither pair with each other nor borrow
+/// each other's registry label.
 fn collateral_changes(
-    before: &BTreeMap<SlotKey, String>,
-    after: &BTreeMap<SlotKey, String>,
+    before: &BTreeMap<SourcedSlotKey, String>,
+    after: &BTreeMap<SourcedSlotKey, String>,
     applied: &[Change],
 ) -> Vec<Change> {
-    let reported: BTreeSet<(&str, &str, &str)> = applied
+    let reported: BTreeSet<(&str, &str, &str, &str)> = applied
         .iter()
         .map(|change| {
             (
+                change.package.registry.as_deref().unwrap_or(CRATES_IO),
                 change.package.name.as_str(),
                 change.from.as_str(),
                 change.to.as_str(),
             )
         })
         .collect();
-    let mut changes: Vec<Change> = before
-        .iter()
-        .filter_map(|((name, _), from)| {
-            let to = after.get(&(name.clone(), version::major_key(from).0))?;
-            (version::compare(from, to).is_ne()
-                && !reported.contains(&(name.as_str(), from.as_str(), to.as_str())))
-            .then(|| collateral_change(name, from, to))
-        })
-        .collect();
-    changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    // Group each side's version lines per source and name. Pairing only within a slot line would
+    // lose every cross-line float — a companion crate dragged to its dependent's next major
+    // (cranelift 0.133 → 0.134 beside wasmtime 46 → 47) is exactly the collateral this report
+    // exists to surface, and 0.x lines make even minor companions cross-line.
+    let mut before_by_name: BTreeMap<(&String, &String), Vec<&String>> = BTreeMap::new();
+    for ((source, name, _), version) in before {
+        before_by_name
+            .entry((source, name))
+            .or_default()
+            .push(version);
+    }
+    let mut after_by_name: BTreeMap<(&String, &String), Vec<&String>> = BTreeMap::new();
+    for ((source, name, _), version) in after {
+        after_by_name
+            .entry((source, name))
+            .or_default()
+            .push(version);
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    for ((source, name), before_versions) in &before_by_name {
+        let empty = Vec::new();
+        let after_versions = after_by_name.get(&(*source, *name)).unwrap_or(&empty);
+        // Identical versions on both sides are unmoved lines; only the residuals moved.
+        let mut from_residual: Vec<&String> = before_versions
+            .iter()
+            .filter(|version| !after_versions.contains(version))
+            .copied()
+            .collect();
+        let mut to_residual: Vec<&String> = after_versions
+            .iter()
+            .filter(|version| !before_versions.contains(version))
+            .copied()
+            .collect();
+        from_residual.sort_by(|a, b| version::compare(a, b));
+        to_residual.sort_by(|a, b| version::compare(a, b));
+        let pairs: Vec<(&String, &String)> = if from_residual.len() == to_residual.len() {
+            // Equal residual counts: each line moved somewhere; rank order pairs each old line
+            // with its successor (coexisting lines keep their relative order across a re-lock).
+            from_residual.into_iter().zip(to_residual).collect()
+        } else {
+            // A line appeared or vanished (a fork or a dropped duplicate): rank pairing would
+            // misattribute, so fall back to same-line pairing and leave the structural change to
+            // the lock diff.
+            from_residual
+                .into_iter()
+                .filter_map(|from| {
+                    let line = version::major_key(from).0;
+                    to_residual
+                        .iter()
+                        .find(|to| version::major_key(to).0 == line)
+                        .map(|to| (from, *to))
+                })
+                .collect()
+        };
+        // The compact label the slot's lock source resolves to (`crates.io` for the default
+        // registry), computed once per group and matched against the applied rows' registry.
+        let registry = cooldown_core::redact::source_label(source);
+        for (from, to) in pairs {
+            if version::compare(from, to).is_ne()
+                && !reported.contains(&(
+                    registry.as_str(),
+                    name.as_str(),
+                    from.as_str(),
+                    to.as_str(),
+                ))
+            {
+                changes.push(collateral_change(&registry, name, from, to));
+            }
+        }
+    }
+    changes.sort_by(|a, b| {
+        a.package
+            .name
+            .cmp(&b.package.name)
+            .then_with(|| a.package.registry.cmp(&b.package.registry))
+            .then_with(|| a.from.as_str().cmp(b.from.as_str()))
+    });
     changes
 }
 
-/// A net version change `apply` derived from the before/after lock diff that no planned row
-/// reports — collateral movement the whole-graph re-resolve forced. Reported so no crate's
-/// version change is ever silent: a transitive pushed backward to keep the lock consistent, or
-/// matured down by `fix`, surfaces as its own report row.
-fn collateral_change(name: &str, from: &str, to: &str) -> Change {
+/// A paired version-slot change that no planned row reports, labeled with the registry its lock
+/// source resolves to.
+///
+/// The whole-graph re-resolve can force collateral movement, such as pushing a transitive backward
+/// for consistency or maturing a crate down during `fix`.
+fn collateral_change(registry: &str, name: &str, from: &str, to: &str) -> Change {
     let downgrade = version::compare(to, from).is_lt();
     Change {
-        package: PackageId::new(CARGO_ID, name.to_string(), Some(CRATES_IO.to_string())),
+        package: PackageId::new(CARGO_ID, name.to_string(), Some(registry.to_string())),
         from: Version::new(from.to_string()),
         to: Version::new(to.to_string()),
         // A collateral move is transitive consistency churn, not a directly-declared bump; its kind
@@ -453,6 +448,143 @@ fn collateral_change(name: &str, from: &str, to: &str) -> Change {
         direct: false,
         members: Vec::new(),
     }
+}
+
+/// Pin-rejection diagnostics keyed by planned-change identity. Keying by name alone would let
+/// coexisting-major plans for one crate (cargo forks distinct majors side by side) overwrite each
+/// other's diagnostics and attach one target's rejection to the other's held row.
+type PinRejections = BTreeMap<(String, String, String), String>;
+
+/// The [`PinRejections`] key of one planned change: its `(name, from, to)` line.
+fn rejection_key(change: &Change) -> (String, String, String) {
+    (
+        change.package.name.clone(),
+        change.from.as_str().to_string(),
+        change.to.as_str().to_string(),
+    )
+}
+
+/// Each planned candidate either reached cooldown's target (its newest-within-window) — reported
+/// applied — or fell short because a mutually-exclusive `=`-pin or single-major shared transitive
+/// won — reported held, naming the blocker.
+fn classify_planned_changes(
+    plan: &Plan,
+    crates_io_after: &BTreeMap<SlotKey, String>,
+    graph: Option<&crate::cargocmd::ResolvedGraph>,
+    pin_rejections: &PinRejections,
+    report: &mut ApplyReport,
+) {
+    for change in &plan.changes {
+        if reached_after(crates_io_after, graph, change) {
+            report.applied.push(change.clone());
+        } else {
+            let offender = graph
+                .and_then(|graph| {
+                    blocking_requirer(graph, &change.package.name, change.to.as_str())
+                })
+                .unwrap_or_else(|| change.package.name.clone());
+            report.skipped.push(Skipped {
+                change: change.clone(),
+                reason: SkipReason::ResolverConflict,
+                offending: Some(PackageId::new(
+                    CARGO_ID,
+                    offender,
+                    Some(CRATES_IO.to_string()),
+                )),
+                // Cargo's own rejection sentence (which requirement, declared by whom) beats
+                // both the generic reason and the `=`-pin-only graph offender.
+                detail: pin_rejections.get(&rejection_key(change)).cloned(),
+            });
+        }
+    }
+}
+
+/// The files a candidate's tentative widen may touch — its members' manifests plus the workspace
+/// root's (the inherited-requirement fallback), and the staged `Cargo.lock` — with their pre-widen
+/// contents, so a widen whose pin cannot land is restored byte-identically instead of leaving a
+/// requirement the lock does not honor.
+///
+/// The lock belongs in this snapshot because the rollback runs *after* the unlocked
+/// `cargo metadata` probe, which can itself re-lock the widened requirement — forking a major that
+/// no requirement admits once the manifests are restored. Restoring the manifests alone would
+/// leave that poisoned lock for `resolver_lock` and the preserve preflight to observe until a
+/// later unlocked resolve incidentally healed it.
+fn widen_snapshot(
+    root: &Utf8Path,
+    members: &[MemberRef],
+) -> Result<Vec<(Utf8PathBuf, Option<String>)>> {
+    let mut paths: Vec<Utf8PathBuf> = members
+        .iter()
+        .map(|member| manifest::member_manifest_rel(&member.path))
+        .collect();
+    paths.push(Utf8PathBuf::from("Cargo.toml"));
+    paths.push(Utf8PathBuf::from("Cargo.lock"));
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|rel| {
+            let contents = match std::fs::read_to_string(root.join(&rel)) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(CoreError::from(error)),
+            };
+            Ok((rel, contents))
+        })
+        .collect()
+}
+
+/// Writes a [`widen_snapshot`] back verbatim. A path captured as absent is left alone — the
+/// widen machinery never creates manifests or locks.
+fn restore_widen_snapshot(
+    root: &Utf8Path,
+    snapshot: &[(Utf8PathBuf, Option<String>)],
+) -> Result<()> {
+    for (rel, contents) in snapshot {
+        if let Some(contents) = contents {
+            std::fs::write(root.join(rel), contents)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compresses a rejected `cargo update --precise` stderr into one report-friendly line: cargo's
+/// `error:` sentence plus the first `required by package` attribution — the two facts that say
+/// which requirement blocked the pin and whose manifest declares it. `None` when the error carries
+/// no stderr (nothing better than the generic reason exists). The summary reaches the TTY and
+/// JSON reports verbatim, so embedded URLs are stripped of credentials here, at construction.
+fn summarize_pin_rejection(error: &CoreError) -> Option<String> {
+    use std::fmt::Write as _;
+    let CoreError::Tool { stderr, .. } = error else {
+        return None;
+    };
+    let sentence = stderr.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix("error: ")
+            .or_else(|| line.strip_prefix("error["))
+            .map(|rest| rest.trim_end_matches('.'))
+    })?;
+    let mut summary = sentence.to_string();
+    // Cargo prints the first attribution either bare (`required by package …`) or as a chain
+    // continuation (`... required by package …`); accept both.
+    if let Some(requirer) = stderr.lines().map(str::trim).find_map(|line| {
+        line.trim_start_matches('.')
+            .trim_start()
+            .strip_prefix("required by package `")
+            .and_then(|rest| rest.split('`').next())
+    }) {
+        // The path/hash suffix cargo prints for workspace members is noise at report width.
+        let requirer = requirer.split(" (").next().unwrap_or(requirer);
+        let _ = write!(summary, " (required by {requirer})");
+    }
+    // Cargo quotes registry URLs inside requirement errors; a private-registry URL can embed
+    // credentials, so redact before the cap bounds the (possibly lengthened) line.
+    let mut summary = cooldown_core::redact::url_secrets(&summary);
+    // Char-boundary-safe cap: the requirement sentence quotes tool-controlled strings.
+    if let Some((cut, _)) = summary.char_indices().nth(220) {
+        summary.truncate(cut);
+        summary.push('…');
+    }
+    Some(summary)
 }
 
 /// The crate whose `=x.y.z` requirement structurally holds `held` out of the graph at `target` —
@@ -483,21 +615,42 @@ fn blocking_requirer(
 }
 
 impl CargoTool {
-    /// Re-resolve the **whole** graph once under cooldown's window, then build the report from the
-    /// full before/after `Cargo.lock` diff. `upgrade` is informational for the rewrite policy; cargo
-    /// has no date cutoff, so every move is expressed as a concrete `--precise` pin computed by the
-    /// core. Widening for `Always`/`Auto` happens before pinning so a cross-major target is admitted.
+    /// Revalidates `mutation` through whichever execution mode this platform selected.
+    ///
+    /// The two accessors carry the same parts but enforce different capabilities, so the choice
+    /// has to track [`ToolWrite::mutation_execution`] exactly or every dispatch fails closed.
+    fn mutation_parts<'a>(
+        &self,
+        mutation: &'a PreparedMutation,
+    ) -> Result<(&'a Project, &'a Plan, &'a ProjectMutationJournal)> {
+        match self.mutation_execution() {
+            MutationExecution::Isolated(_) => mutation.isolated_parts_for(self),
+            MutationExecution::InPlace => mutation.parts_for(self),
+        }
+    }
+
+    /// Re-resolves the **whole** graph under cooldown's window.
+    ///
+    /// `upgrade` is informational for the rewrite policy.
+    /// Cargo has no date cutoff, so each planned target is expressed as a concrete `--precise` pin
+    /// computed by the core.
+    /// Under `Always`, every owning constraint is widened up front, before the pin batch. Under
+    /// `Auto`, the pin batch runs first and only the candidates it left short of a cross-major
+    /// target get a *tentative* post-pin widen — kept when the re-pin lands, restored when it
+    /// does not (see the loop below).
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
+        journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
-    ) -> Result<()> {
+    ) -> Result<PinRejections> {
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
         if matches!(plan.rewrite, RewriteMode::Always) {
             for change in &plan.changes {
+                journal.validate_project(&project.root)?;
                 manifest::widen_constraint(
                     &project.root,
                     &change.members,
@@ -506,33 +659,48 @@ impl CargoTool {
                 )?;
             }
         }
-        self.pin_batch(project, &plan.changes, observer).await?;
+        let mut rejections = BTreeMap::new();
+        self.pin_batch(project, &plan.changes, journal, observer, &mut rejections)
+            .await?;
 
         if matches!(plan.rewrite, RewriteMode::Auto) {
             // Widen only the candidates the pin batch could not place at their target because their
-            // own declared requirement caps them, then re-pin. A candidate still short after a no-op
-            // widen round is blocked by another crate (a real conflict the diff reports), so the loop
-            // stops widening.
+            // own declared requirement caps them, then re-pin. Each widen is *tentative*: a widened
+            // requirement whose pin still cannot land (a third-party crate holds the old major)
+            // would leave the manifest demanding a version the lock does not carry, and that poisons
+            // the whole batch at lock verification (`--locked`) — so a widen whose candidate stays
+            // short is restored, and the candidate remains a held skip carrying its recorded
+            // rejection. A short candidate whose widen is a *no-op* (its own requirement already
+            // admits the target, or nothing declares it) may be held only by a sibling's
+            // not-yet-widened requirement, so a round in which any widen+pin progresses re-pins
+            // those candidates before it ends; a round that progresses nowhere proves the
+            // remaining short candidates conflict with another crate (a real conflict the diff
+            // reports), and only then does the loop stop widening.
             // The member-aware reach check is the only thing in this loop that needs the resolved
             // graph, so skip the `cargo metadata` spawn entirely when no candidate is a direct
             // member dep. When it is needed, fail closed: falling back to the lock-slot check is the
             // false positive this loop exists to avoid.
             let needs_graph = plan.changes.iter().any(needs_member_graph);
             for _ in 0..plan.changes.len() {
-                let after = crates_io_locked_versions(&read_lock(project)?);
+                let after = read_lock(project)?.crates_io_locked_versions();
                 let graph = if needs_graph {
+                    journal.validate_project(&project.root)?;
                     Some(self.cargo.metadata(&project.root).await?)
                 } else {
                     None
                 };
-                let mut widened_any = false;
-                let mut short = Vec::new();
+                let mut progressed = false;
+                let mut unwidened_short: Vec<Change> = Vec::new();
                 for change in &plan.changes {
                     if reached_after(&after, graph.as_ref(), change) {
                         continue;
                     }
-                    short.push(change.clone());
-                    if !manifest::widen_constraint(
+                    // Captured before the widen — the first mutation the rollback must undo; the
+                    // pin and the metadata probe below both mutate the staged lock the snapshot
+                    // carries.
+                    let snapshot = widen_snapshot(&project.root, &change.members)?;
+                    journal.validate_project(&project.root)?;
+                    if manifest::widen_constraint(
                         &project.root,
                         &change.members,
                         &change.package.name,
@@ -541,16 +709,71 @@ impl CargoTool {
                     .modified
                     .is_empty()
                     {
-                        widened_any = true;
+                        unwidened_short.push(change.clone());
+                        continue;
+                    }
+                    self.pin_batch(
+                        project,
+                        std::slice::from_ref(change),
+                        journal,
+                        observer,
+                        &mut rejections,
+                    )
+                    .await?;
+                    // The unlocked metadata resolve runs *before* the lock re-read: it may itself
+                    // re-lock the widened requirement — including forking a new major alongside a
+                    // third-party-held old one, which `update --precise` cannot express — and the
+                    // reach check must see that result. A resolve the widened requirement makes
+                    // unsatisfiable is this candidate's rejection, not a batch failure: record
+                    // cargo's explanation, restore the widen, and move on.
+                    let landed_graph = if needs_member_graph(change) {
+                        journal.validate_project(&project.root)?;
+                        match self.cargo.metadata(&project.root).await {
+                            Ok(graph) => Some(graph),
+                            Err(err)
+                                if err.is_tool_spawn_failure()
+                                    || err.is_local_environment_failure() =>
+                            {
+                                return Err(err);
+                            }
+                            Err(err) => {
+                                if let Some(summary) = summarize_pin_rejection(&err) {
+                                    rejections.entry(rejection_key(change)).or_insert(summary);
+                                }
+                                restore_widen_snapshot(&project.root, &snapshot)?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let landed = read_lock(project)?.crates_io_locked_versions();
+                    if reached_after(&landed, landed_graph.as_ref(), change) {
+                        progressed = true;
+                    } else {
+                        restore_widen_snapshot(&project.root, &snapshot)?;
                     }
                 }
-                if !widened_any {
+                // A sibling's landed widen+pin may have removed the shared blocker behind an
+                // unwidened candidate's recorded rejection, so give those candidates their re-pin
+                // (the batch skips any node already at target) before the next round decides they
+                // are conflicted.
+                if progressed && !unwidened_short.is_empty() {
+                    self.pin_batch(
+                        project,
+                        &unwidened_short,
+                        journal,
+                        observer,
+                        &mut rejections,
+                    )
+                    .await?;
+                }
+                if !progressed {
                     break;
                 }
-                self.pin_batch(project, &short, observer).await?;
             }
         }
-        Ok(())
+        Ok(rejections)
     }
 
     /// Applies all `changes` as one logical unit, driving each to its exact target.
@@ -567,7 +790,9 @@ impl CargoTool {
         &self,
         project: &Project,
         changes: &[Change],
+        journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
     ) -> Result<()> {
         // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
         // are one lock move, so issue each distinct spec once, in a deterministic order.
@@ -584,7 +809,7 @@ impl CargoTool {
 
         let mut seen = BTreeSet::new();
         for _ in 0..worklist.len().saturating_add(1) {
-            let before = locked_slots(&read_lock(project)?);
+            let before = read_lock(project)?.locked_slots();
             if !seen.insert(before.clone()) {
                 break;
             }
@@ -598,10 +823,17 @@ impl CargoTool {
                 if let Some(observer) = observer {
                     observer.candidate_started(change);
                 }
-                self.update_precise(project, &change.package.name, &current, change.to.as_str())
-                    .await?;
+                journal.validate_project(&project.root)?;
+                if let Some(rejection) = self
+                    .update_precise(project, &change.package.name, &current, change.to.as_str())
+                    .await?
+                {
+                    // Last rejection wins; a candidate a later pass still lands never reads its
+                    // stale entry (details are consulted only for unreached candidates).
+                    rejections.insert(rejection_key(change), rejection);
+                }
             }
-            let after = locked_slots(&read_lock(project)?);
+            let after = read_lock(project)?.locked_slots();
             if !attempted || after == before {
                 break;
             }
@@ -611,25 +843,27 @@ impl CargoTool {
 
     /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
     ///
-    /// A rejected precise pin is a resolver outcome, so the final lock diff reports the candidate
-    /// held. Broken local state must propagate; otherwise disk-full or spawn failures would
-    /// masquerade as a conflict in the candidate set.
+    /// A rejected precise pin is a resolver outcome the final lock diff reports as held; the
+    /// returned summary of cargo's own explanation lets the skip row name the blocking requirement
+    /// instead of the generic "the resolver rejected this change". Broken local state must
+    /// propagate; otherwise disk-full or spawn failures would masquerade as a conflict in the
+    /// candidate set.
     async fn update_precise(
         &self,
         project: &Project,
         name: &str,
         from: &str,
         to: &str,
-    ) -> Result<()> {
-        if let Err(err) = self
+    ) -> Result<Option<String>> {
+        match self
             .cargo
             .update_precise_crates_io(&project.root, name, from, to)
             .await
-            && err.is_local_environment_failure()
         {
-            return Err(err);
+            Ok(()) => Ok(None),
+            Err(err) if err.is_local_environment_failure() => Err(err),
+            Err(err) => Ok(summarize_pin_rejection(&err)),
         }
-        Ok(())
     }
 
     async fn apply_plan(
@@ -639,84 +873,125 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<ApplyReport> {
+        journal.validate_project(&project.root)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);
         }
-
         // The pre-apply lock, taken from the journal (`mutation_journal` captured `Cargo.lock` before
-        // the re-resolve). The batched precise pins emit one consistent lock; the report is the diff
-        // of this snapshot against the result, so *every* net version change is surfaced. A
-        // missing/unparsable snapshot leaves `before` empty, so a crate that moved is still reported
-        // (never silent).
-        let before = journal
-            .files
+        // the re-resolve), parsed once: its slot map feeds the version diff below and its edge view
+        // feeds the edge policy.
+        // The batched precise pins emit one consistent lock; the report is the paired version-slot
+        // diff of this snapshot against the result.
+        // A missing or unparsable snapshot leaves `before` empty.
+        // Planned target reporting still uses the resolved result, but collateral comparison then
+        // has no baseline.
+        let before_lock = journal
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("Cargo.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("Cargo.lock"))
+            .and_then(ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|content| CargoLock::parse(content).ok())
-            .map(|lock| locked_versions(&lock))
+            .and_then(|content| CargoLock::parse(content).ok());
+        let before = before_lock
+            .as_ref()
+            .map(CargoLock::locked_versions_by_source)
             .unwrap_or_default();
 
         // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
         // invocation, repeated to a bounded fixed point because one invocation may move a package
-        // another planned pin still needs to address. The diff below surfaces every net move.
-        match self.whole_graph_resolve(project, plan, observer).await {
-            Ok(()) => {}
+        // another planned pin still needs to address.
+        // The diff below surfaces every paired version-slot move.
+        let pin_phase = std::time::Instant::now();
+        let pin_rejections = match self
+            .whole_graph_resolve(project, plan, journal, observer)
+            .await
+        {
+            Ok(rejections) => rejections,
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
             // version). Propagate so the caller's `apply_resilient` can isolate the offending
-            // candidate(s) and apply the rest, instead of holding every candidate. Local environment
-            // failures propagate through `apply_resilient` without bisection. The caller restores the
-            // journal, so no partial lock is kept.
+            // candidate(s) and apply the rest, instead of holding every candidate.
+            // Local environment failures propagate through `apply_resilient` without bisection.
+            // The caller restores the journal, so no partial lock is kept.
             Err(err) => return Err(err),
-        }
+        };
 
-        let after_lock = read_lock(project)?;
-        let after = locked_versions(&after_lock);
-        let crates_io_after = crates_io_locked_versions(&after_lock);
-        // The resolved graph proves direct member changes reached the target and names the crate
-        // whose `=`-pin holds a short candidate back.
-        let needs_graph = plan.changes.iter().any(needs_member_graph);
-        let graph = if needs_graph {
+        tracing::debug!(
+            candidates = plan.changes.len(),
+            elapsed_ms = pin_phase.elapsed().as_millis(),
+            "cargo pin phase finished"
+        );
+        let resolver_lock = read_lock(project)?;
+
+        // The resolved graph supplies declared requirements to edge enforcement, proves which
+        // direct member edges reached their targets, and names the requirement blocking a target
+        // absent from its lock slot.
+        // Preserve needs requirements only when the before/resolver lock pair contains an
+        // addressable rebind; successful lock verification returns a fresh graph after any
+        // correction.
+        let resolver_versions = resolver_lock.crates_io_locked_versions();
+        let needs_graph = needs_apply_graph(&plan.changes, &resolver_versions);
+        let preserve_needs_graph = matches!(plan.edge_policy, EdgePolicy::Preserve)
+            && before_lock.as_ref().is_some_and(|before_lock| {
+                edges::preserve::has_potential_restoration(
+                    &edges::LockEdgeView::from_lock(before_lock),
+                    &edges::LockEdgeView::from_lock(&resolver_lock),
+                )
+            });
+        let corrective_edges =
+            matches!(plan.edge_policy, EdgePolicy::Canonicalize) || preserve_needs_graph;
+        let graph = if needs_graph || corrective_edges {
+            journal.validate_project(&project.root)?;
             Some(self.cargo.metadata(&project.root).await?)
         } else {
-            self.cargo.metadata(&project.root).await.ok()
+            None
         };
-        // Each planned candidate either reached cooldown's target (its newest-within-window) —
-        // reported applied — or fell short because a mutually-exclusive `=`-pin or single-major shared
-        // transitive won — reported held, naming the blocker.
-        for change in &plan.changes {
-            if reached_after(&crates_io_after, graph.as_ref(), change) {
-                report.applied.push(change.clone());
-            } else {
-                let offender = graph
-                    .as_ref()
-                    .and_then(|graph| {
-                        blocking_requirer(graph, &change.package.name, change.to.as_str())
-                    })
-                    .unwrap_or_else(|| change.package.name.clone());
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: Some(PackageId::new(
-                        CARGO_ID,
-                        offender,
-                        Some(CRATES_IO.to_string()),
-                    )),
-                    detail: None,
-                });
-            }
-        }
 
-        // The hard requirement: no net version change to *any* crate may be omitted. Every moved
-        // slot the applied rows above do not already report is surfaced as its own collateral
+        // Enforce the plan's edge policy over the re-resolved lock and collect the moves observation
+        // can pair across stable dependent identities and coexisting endpoints.
+        journal.validate_project(&project.root)?;
+        let edge_phase = std::time::Instant::now();
+        let enforced = edges::enforce::enforce(
+            &self.cargo,
+            project,
+            plan.edge_policy,
+            before_lock.as_ref(),
+            graph,
+        )
+        .await?;
+        tracing::debug!(
+            elapsed_ms = edge_phase.elapsed().as_millis(),
+            "cargo edge phase finished"
+        );
+        let graph = enforced.graph;
+        let edge_rebinds = enforced.rebinds;
+
+        let after_lock = read_lock(project)?;
+        let after = after_lock.locked_versions_by_source();
+        let crates_io_after = after_lock.crates_io_locked_versions();
+        classify_planned_changes(
+            plan,
+            &crates_io_after,
+            graph.as_ref(),
+            &pin_rejections,
+            &mut report,
+        );
+
+        // No paired version-slot change may be omitted.
+        // Every moved slot the applied rows above do not already report is surfaced as a collateral
         // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
         // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
         // would hide that real move).
         let collateral = collateral_changes(&before, &after, &report.applied);
+        tracing::debug!(
+            before_slots = before.len(),
+            after_slots = after.len(),
+            collateral = collateral.len(),
+            "cargo apply collateral diff"
+        );
         report.applied.extend(collateral);
+        report.edge_rebinds = edge_rebinds;
         Ok(report)
     }
 }
@@ -745,6 +1020,12 @@ fn needs_member_graph(change: &Change) -> bool {
     change.direct && !change.members.is_empty()
 }
 
+fn needs_apply_graph(changes: &[Change], after: &BTreeMap<SlotKey, String>) -> bool {
+    changes
+        .iter()
+        .any(|change| needs_member_graph(change) || !reached(after, change))
+}
+
 fn reached_after(
     after: &BTreeMap<SlotKey, String>,
     graph: Option<&ResolvedGraph>,
@@ -765,14 +1046,47 @@ fn reached_after(
 
 #[async_trait]
 impl ToolWrite for CargoTool {
+    fn mutation_tool(&self) -> ToolId {
+        CARGO_ID
+    }
+
+    fn supports_transitive_advance(&self) -> bool {
+        // The per-spec `update -p name@from --precise to` pin addresses any locked crate, declared
+        // or not.
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
-        // `cargo update`/`generate-lockfile` validates every workspace member's declared targets, so
-        // the throwaway copy must include `.rs` source — a member with an empty `src/` errors with "no
-        // targets specified". Source is small (the bulk of a repo is build `target/`, which is pruned).
+        // Only the in-place path reads this — the isolated strategy stages its own authoritative
+        // read set — so this is what a non-Unix preview copy is assembled from.
+        // `cargo update`/`generate-lockfile` validates every workspace member's declared targets,
+        // so the throwaway copy must include `.rs` source: a member with an empty `src/` errors
+        // with "no targets specified".
+        // Source is small (the bulk of a repo is build `target/`, which is pruned).
         ResolveInputs {
             source_extensions: &["rs"],
             ..ResolveInputs::DEFAULT
         }
+    }
+
+    fn mutation_execution(&self) -> MutationExecution<'_> {
+        // Publishing an isolated trial needs recovery authority, which coordination only grants
+        // where the platform can prove its namespace is private to the current user.
+        // Committing to the isolated path on a platform that never grants it would fail every
+        // Cargo mutation closed at publication rather than degrade, so those platforms fall
+        // back to the in-place trial-and-rollback path every other ecosystem already uses.
+        // A non-Git project on a supported platform still fails closed: what it lacks is an
+        // authority anchor outside project content, not platform support.
+        if RecoveryAuthority::platform_supported() {
+            MutationExecution::Isolated(self)
+        } else {
+            MutationExecution::InPlace
+        }
+    }
+
+    async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
+        edges::enforce::ensure_no_pending(project)
     }
 
     async fn mutation_journal(
@@ -792,55 +1106,153 @@ impl ToolWrite for CargoTool {
                 relative.insert(manifest::member_manifest_rel(&member.path));
             }
         }
-        let mut files = Vec::with_capacity(relative.len());
-        for rel in relative {
-            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
-        }
-        Ok(ProjectMutationJournal { files })
+        ProjectMutationJournal::capture(&project.root, relative)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = self.mutation_parts(mutation)?;
         self.apply_plan(project, plan, journal, None).await
     }
 
     async fn apply_with_observer(
         &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
+        mutation: &PreparedMutation,
         observer: &dyn ApplyObserver,
-    ) -> Result<ApplyReport> {
-        self.apply_plan(project, plan, journal, Some(observer))
-            .await
+    ) -> Result<ApplyAttempt> {
+        let (project, plan, journal) = self.mutation_parts(mutation)?;
+        let report = self
+            .apply_plan(project, plan, journal, Some(observer))
+            .await;
+        let report = match report {
+            Err(CoreError::PendingRecovery(detail)) => {
+                return Ok(mutation.pending_recovery_attempt(detail));
+            }
+            report => report,
+        };
+        let postimage = journal.capture_state()?;
+        mutation.finished_attempt(report, &postimage)
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         self.cargo.build(&project.root).await
+    }
+
+    async fn recover_pending_mutation(
+        &self,
+        project: &Project,
+        coordination: &cooldown_core::fs::ProjectCoordination,
+    ) -> Result<cooldown_core::MutationRecovery> {
+        // Every mutation flow calls this before touching the project, so a project that never
+        // published a record must settle as unchanged rather than fail closed. Without recovery
+        // authority nothing could have been published, and demanding it here would reject every
+        // Cargo mutation on the in-place path such a platform selects.
+        // Artifacts that are present still require authority: untrusted project bytes cannot
+        // authorize restoration.
+        if coordination.recovery_authority().is_none()
+            && !crate::publication::has_project_recovery_artifacts(
+                &project.root.join("Cargo.lock"),
+            )?
+        {
+            return Ok(cooldown_core::MutationRecovery::settled(
+                cooldown_core::RecoveryDisposition::Unchanged,
+            ));
+        }
+        let authority = crate::publication::require_recovery_authority(project, coordination)?;
+        edges::enforce::recover_pending(project, authority)
+    }
+
+    async fn lock_edge_snapshot(&self, project: &Project) -> Result<Option<Vec<u8>>> {
+        std::fs::read(project.root.join("Cargo.lock"))
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    /// Final edge-binding enforcement and run-start-to-final audit.
+    async fn normalize_lock_edges(
+        &self,
+        mutation: &PreparedMutation,
+        policy: EdgePolicy,
+        before: Option<&[u8]>,
+        committed: &[EdgeRebind],
+    ) -> Result<EdgeNormalizationReport> {
+        let (project, _, _) = self.mutation_parts(mutation)?;
+        let before_lock = before
+            .map(|contents| {
+                std::str::from_utf8(contents)
+                    .map_err(|error| {
+                        CoreError::LockUnreadable(format!("Cargo.lock snapshot: {error}"))
+                    })
+                    .and_then(CargoLock::parse)
+            })
+            .transpose()?;
+        let current_lock = read_lock(project)?;
+        let graph = match policy {
+            EdgePolicy::None => None,
+            EdgePolicy::Preserve => {
+                let needs_graph = before_lock.as_ref().is_some_and(|before_lock| {
+                    edges::preserve::has_potential_restoration(
+                        &edges::LockEdgeView::from_lock(before_lock),
+                        &edges::LockEdgeView::from_lock(&current_lock),
+                    )
+                });
+                if needs_graph {
+                    Some(self.cargo.metadata(&project.root).await?)
+                } else {
+                    None
+                }
+            }
+            // A metadata failure must remain a project error; otherwise requested canonical
+            // healing would degrade to a successful no-op.
+            EdgePolicy::Canonicalize => Some(self.cargo.metadata(&project.root).await?),
+        };
+        let mut result =
+            edges::enforce::enforce(&self.cargo, project, policy, before_lock.as_ref(), graph)
+                .await?;
+        let final_view = edges::LockEdgeView::from_lock(&read_lock(project)?);
+        edges::enforce::reconcile_committed_outcomes(&final_view, &mut result.rebinds, committed);
+        Ok(EdgeNormalizationReport {
+            rebinds: result.rebinds,
+            warnings: Vec::new(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only [`InPlaceCargoFamilyWriter`] implements a trait here, and it is Unix-only.
+    #[cfg(unix)]
+    use async_trait::async_trait;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
-        use std::fmt::Write as _;
+        let sourced: Vec<(&str, &str, &str)> = packages
+            .iter()
+            .map(|(name, version)| {
+                (
+                    *name,
+                    *version,
+                    "registry+https://github.com/rust-lang/crates.io-index",
+                )
+            })
+            .collect();
+        lock_with_sources(&sourced)
+    }
+
+    fn lock_with_sources(packages: &[(&str, &str, &str)]) -> CargoLock {
         let mut content = String::from("version = 4\n");
-        for (name, version) in packages {
-            write!(
-                content,
-                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
-            )
-            .expect("writing to a String never fails");
+        for (name, version, source) in packages {
+            content.push_str(&formatdoc! {r#"
+
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                source = "{source}"
+            "#});
         }
         CargoLock::parse(&content).expect("lock parses")
     }
@@ -854,6 +1266,44 @@ mod tests {
             downgrade,
             direct: true,
             members: Vec::new(),
+        }
+    }
+
+    /// A same-family writer that prepares mutations in place, standing in for a rogue adapter.
+    ///
+    /// Only the isolated execution mode rejects a mutation this produced, so the tests using it
+    /// are Unix-only.
+    #[cfg(unix)]
+    struct InPlaceCargoFamilyWriter;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ToolWrite for InPlaceCargoFamilyWriter {
+        fn mutation_tool(&self) -> ToolId {
+            CARGO_ID
+        }
+
+        async fn mutation_journal(
+            &self,
+            project: &Project,
+            _plan: &Plan,
+        ) -> Result<ProjectMutationJournal> {
+            ProjectMutationJournal::capture(
+                &project.root,
+                [Utf8Path::new("Cargo.toml"), Utf8Path::new("Cargo.lock")],
+            )
+        }
+
+        async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+            mutation.parts_for(self)?;
+            Ok(ApplyReport::default())
+        }
+
+        async fn build(&self, _project: &Project) -> Result<VerifyReport> {
+            Ok(VerifyReport {
+                ok: true,
+                detail: String::new(),
+            })
         }
     }
 
@@ -897,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_versions_skips_non_registry_and_keys_per_major() {
+    fn locked_versions_by_source_skips_non_registry_and_keys_per_major() {
         let lock = CargoLock::parse(indoc! {r#"
             version = 4
 
@@ -926,26 +1376,30 @@ mod tests {
             source = "git+https://example.com/x#abc"
         "#})
         .expect("lock parses");
-        let slots = locked_versions(&lock);
+        let slots = lock.locked_versions_by_source();
         // The path/workspace member `demo` and the git source are excluded; the two serde majors are
         // distinct slots, and semantic ordering chooses 1.0.197 over lexically-greater 1.0.99.
+        let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
         assert_eq!(
-            slots.get(&("serde".into(), "1".into())).map(String::as_str),
+            slots
+                .get(&(crates_io.into(), "serde".into(), "1".into()))
+                .map(String::as_str),
             Some("1.0.197")
         );
         assert_eq!(
             slots
-                .get(&("serde".into(), "0.9".into()))
+                .get(&(crates_io.into(), "serde".into(), "0.9".into()))
                 .map(String::as_str),
             Some("0.9.15")
         );
-        assert!(!slots.keys().any(|(name, _)| name == "demo"));
-        assert!(!slots.keys().any(|(name, _)| name == "local-git"));
+        assert!(!slots.keys().any(|(_, name, _)| name == "demo"));
+        assert!(!slots.keys().any(|(_, name, _)| name == "local-git"));
     }
 
     #[test]
     fn reached_requires_the_exact_target_in_its_major_slot() {
-        let after = locked_versions(&lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]));
+        let after =
+            lock_with(&[("serde", "1.0.200"), ("syn", "2.0.50")]).crates_io_locked_versions();
         // A concrete Cargo `--precise` target must land exactly; an overshoot remains off-policy.
         assert!(reached(
             &after,
@@ -977,11 +1431,26 @@ mod tests {
         .expect("mixed-registry lock parses");
         assert!(
             !reached(
-                &crates_io_locked_versions(&private_target),
+                &private_target.crates_io_locked_versions(),
                 &change("serde", "1.0.100", "1.0.200", false),
             ),
             "an alternate-registry target does not satisfy a crates.io plan"
         );
+    }
+
+    #[test]
+    fn apply_graph_is_loaded_to_attribute_a_held_transitive_candidate() {
+        let landed = lock_with(&[("shared", "1.1.0")]).crates_io_locked_versions();
+        let mut transitive = change("shared", "1.0.0", "1.1.0", false);
+        transitive.direct = false;
+
+        assert!(!needs_apply_graph(
+            std::slice::from_ref(&transitive),
+            &landed
+        ));
+
+        let held = lock_with(&[("shared", "1.0.0")]).crates_io_locked_versions();
+        assert!(needs_apply_graph(&[transitive], &held));
     }
 
     #[test]
@@ -1034,7 +1503,7 @@ mod tests {
 
     #[test]
     fn target_gated_workspace_duplicate_requires_member_aware_rewrite() {
-        let after = locked_versions(&lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]));
+        let after = lock_with(&[("nix", "0.28.0"), ("nix", "0.31.3")]).crates_io_locked_versions();
         let graph = crate::cargocmd::Cargo::build_graph_from_json(
             r#"{
                 "packages": [
@@ -1110,13 +1579,63 @@ mod tests {
         assert!(manifest.contains(r#"features = ["signal"]"#), "{manifest}");
     }
 
+    /// A corrective edge rewrite can be the operation that makes a direct member reach its planned
+    /// target.
+    /// Success classification must therefore consume the graph returned by verification, not the
+    /// metadata snapshot taken before enforcement.
+    #[test]
+    fn member_reach_classification_changes_with_the_verified_edge_graph() {
+        let graph = |app_target: &str| {
+            let json = formatdoc!(
+                r#"{{
+                    "packages": [
+                        {{"id": "app", "name": "app", "version": "0.1.0",
+                         "manifest_path": "/repo/Cargo.toml",
+                         "dependencies": [{{"name": "dep", "req": ">=1.0, <2"}}]}},
+                        {{"id": "keeper", "name": "keeper", "version": "1.0.0",
+                         "dependencies": [{{"name": "dep", "req": "=1.0.0"}}]}},
+                        {{"id": "consumer", "name": "consumer", "version": "1.0.0",
+                         "dependencies": [{{"name": "dep", "req": "=1.1.0"}}]}},
+                        {{"id": "dep-old", "name": "dep", "version": "1.0.0",
+                         "source": "registry+https://github.com/rust-lang/crates.io-index",
+                         "dependencies": []}},
+                        {{"id": "dep-target", "name": "dep", "version": "1.1.0",
+                         "source": "registry+https://github.com/rust-lang/crates.io-index",
+                         "dependencies": []}}
+                    ],
+                    "workspace_members": ["app"],
+                    "workspace_root": "/repo",
+                    "resolve": {{"nodes": [
+                        {{"id": "app", "deps": [{{"pkg": "{app_target}"}}, {{"pkg": "keeper"}}, {{"pkg": "consumer"}}]}},
+                        {{"id": "keeper", "deps": [{{"pkg": "dep-old"}}]}},
+                        {{"id": "consumer", "deps": [{{"pkg": "dep-target"}}]}},
+                        {{"id": "dep-old", "deps": []}},
+                        {{"id": "dep-target", "deps": []}}
+                    ]}}
+                }}"#,
+            );
+            crate::cargocmd::Cargo::build_graph_from_json(&json)
+        };
+        let stale = graph("dep-old");
+        let verified = graph("dep-target");
+        let after = lock_with(&[("dep", "1.0.0"), ("dep", "1.1.0")]).crates_io_locked_versions();
+        let mut change = change("dep", "1.0.0", "1.1.0", false);
+        change.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+
+        assert!(!reached_after(&after, Some(&stale), &change));
+        assert!(reached_after(&after, Some(&verified), &change));
+    }
+
     #[test]
     fn collateral_change_surfaces_a_forced_non_candidate_downgrade() {
         // Raising `a` forces the shared transitive `shared` from 1.1.0 down to 1.0.0 as a consistency
         // move. No applied row reports `shared`, so the diff must surface it as its own collateral
         // row — the silent drift the earlier per-precise-pin design allowed.
-        let before = locked_versions(&lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]));
-        let after = locked_versions(&lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]));
+        let before = lock_with(&[("a", "1.0.0"), ("shared", "1.1.0")]).locked_versions_by_source();
+        let after = lock_with(&[("a", "2.0.0"), ("shared", "1.0.0")]).locked_versions_by_source();
         let applied = [change("a", "1.0.0", "2.0.0", false)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1131,19 +1650,62 @@ mod tests {
     }
 
     #[test]
+    fn collateral_change_pairs_a_cross_line_companion_float() {
+        // The luup5 cranelift case: pinning wasmtime 46 → 47 drags its unplanned cranelift
+        // companion from the 0.133 line onto 0.134. Same-line pairing can never see this move —
+        // 0.x minors are distinct lines — so it was silently absent from the report, and the later
+        // reconcile leg (0.134.3 → 0.134.2) had no first leg to collapse against.
+        let before = lock_with(&[("wasmtime", "46.0.1"), ("cranelift-codegen", "0.133.1")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("wasmtime", "47.0.2"), ("cranelift-codegen", "0.134.3")])
+            .locked_versions_by_source();
+        let applied = [change("wasmtime", "46.0.1", "47.0.2", false)];
+        let collateral = collateral_changes(&before, &after, &applied);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].package.name, "cranelift-codegen");
+        assert_eq!(collateral[0].from.as_str(), "0.133.1");
+        assert_eq!(collateral[0].to.as_str(), "0.134.3");
+        assert!(!collateral[0].downgrade);
+    }
+
+    #[test]
+    fn collateral_change_zips_coexisting_lines_by_rank() {
+        // Two coexisting wasmparser lines each advance one step in the same re-lock; rank order
+        // pairs each old line with its successor instead of cross-wiring them.
+        let before = lock_with(&[("wasmparser", "0.251.0"), ("wasmparser", "0.253.0")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("wasmparser", "0.252.0"), ("wasmparser", "0.254.0")])
+            .locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        let moves: Vec<(&str, &str)> = collateral
+            .iter()
+            .map(|change| (change.from.as_str(), change.to.as_str()))
+            .collect();
+        assert_eq!(moves, [("0.251.0", "0.252.0"), ("0.253.0", "0.254.0")]);
+    }
+
+    #[test]
+    fn collateral_change_falls_back_to_same_line_pairing_when_a_line_appears() {
+        // `dep` forks a new major (2.0.0 appears) while its 1.x line also patches: unequal residual
+        // counts make rank pairing ambiguous, so only the same-line 1.x move is reported.
+        let before = lock_with(&[("dep", "1.0.0")]).locked_versions_by_source();
+        let after = lock_with(&[("dep", "1.0.1"), ("dep", "2.0.0")]).locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        let moves: Vec<(&str, &str)> = collateral
+            .iter()
+            .map(|change| (change.from.as_str(), change.to.as_str()))
+            .collect();
+        assert_eq!(moves, [("1.0.0", "1.0.1")]);
+    }
+
+    #[test]
     fn collateral_change_excludes_applied_and_unchanged_packages() {
         // `a`'s move is already told by its applied row (no duplicate), `b` is unchanged (no row),
         // `c` is an unplanned forward move (a real collateral change). Only `c` is surfaced.
-        let before = locked_versions(&lock_with(&[
-            ("a", "2.0.0"),
-            ("b", "2.0.0"),
-            ("c", "1.0.0"),
-        ]));
-        let after = locked_versions(&lock_with(&[
-            ("a", "1.0.0"),
-            ("b", "2.0.0"),
-            ("c", "1.5.0"),
-        ]));
+        let before = lock_with(&[("a", "2.0.0"), ("b", "2.0.0"), ("c", "1.0.0")])
+            .locked_versions_by_source();
+        let after = lock_with(&[("a", "1.0.0"), ("b", "2.0.0"), ("c", "1.5.0")])
+            .locked_versions_by_source();
         let applied = [change("a", "2.0.0", "1.0.0", true)];
         let collateral = collateral_changes(&before, &after, &applied);
         assert_eq!(collateral.len(), 1);
@@ -1152,12 +1714,34 @@ mod tests {
     }
 
     #[test]
+    fn collateral_change_keeps_registries_apart() {
+        // A crates.io crate and an alternate-registry crate share a name and major line. Slots are
+        // compared per source, so the alternate registry's move neither pairs against the
+        // crates.io baseline (which would fabricate endpoints) nor gets labeled crates.io.
+        let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+        let alt = "registry+sparse+https://registry.example.com/index/";
+        let before = lock_with_sources(&[("dep", "1.0.0", crates_io), ("dep", "1.2.0", alt)])
+            .locked_versions_by_source();
+        let after = lock_with_sources(&[("dep", "1.0.0", crates_io), ("dep", "1.3.0", alt)])
+            .locked_versions_by_source();
+        let collateral = collateral_changes(&before, &after, &[]);
+        assert_eq!(collateral.len(), 1);
+        assert_eq!(collateral[0].from.as_str(), "1.2.0");
+        assert_eq!(collateral[0].to.as_str(), "1.3.0");
+        assert_eq!(
+            collateral[0].package.registry.as_deref(),
+            Some("registry:registry.example.com"),
+            "the row names its own registry, not crates.io"
+        );
+    }
+
+    #[test]
     fn collateral_changes_surface_a_held_candidates_real_movement() {
         // A held planned candidate has no applied row, yet a sibling pin still floated it off its
         // baseline. That net move must surface as a collateral row beside the held skip instead of
         // being silently dropped behind the planned name.
-        let before = locked_versions(&lock_with(&[("referencing", "0.46.5")]));
-        let after = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let before = lock_with(&[("referencing", "0.46.5")]).locked_versions_by_source();
+        let after = lock_with(&[("referencing", "0.46.10")]).locked_versions_by_source();
         let collateral = collateral_changes(&before, &after, &[]);
         assert_eq!(collateral.len(), 1);
         assert_eq!(collateral[0].package.name, "referencing");
@@ -1166,9 +1750,87 @@ mod tests {
 
         // Once the candidate reaches its target, its applied row already tells the move: no
         // duplicate collateral row.
-        let landed = locked_versions(&lock_with(&[("referencing", "0.46.10")]));
+        let landed = lock_with(&[("referencing", "0.46.10")]).locked_versions_by_source();
         let applied = [change("referencing", "0.46.5", "0.46.10", false)];
         assert!(collateral_changes(&before, &landed, &applied).is_empty());
+    }
+
+    #[test]
+    fn summarize_pin_rejection_names_the_requirement_and_requirer() {
+        // Verbatim (trimmed) stderr shape from a live `cargo update -p regex --precise 1.13.1`
+        // rejection: the blocking requirement plus the first requirer make the report row
+        // actionable where "the resolver rejected this change" was not.
+        let stderr = indoc::indoc! {r#"
+            error: failed to select a version for the requirement `regex = ">=1.0, <1.13"`
+            candidate versions found which didn't match: 1.13.1
+            location searched: crates.io index
+            required by package `serde-saphyr v0.0.16`
+                ... which satisfies dependency `serde-saphyr = "^0.0.16"` (locked to 0.0.16) of package `mistralrs-core v0.9.0 (https://github.com/EricLBuehler/mistral.rs.git?tag=v0.9.0#54957525)`
+        "#};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some(
+                "failed to select a version for the requirement `regex = \">=1.0, <1.13\"` \
+                 (required by serde-saphyr v0.0.16)"
+            ),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_drops_workspace_path_noise_from_the_requirer() {
+        // A workspace member requirer carries its path suffix; the report only needs the name.
+        let stderr = indoc::indoc! {r#"
+            error: failed to select a version for the requirement `bincode = "^2"`
+            candidate versions found which didn't match: 3.0.0
+            required by package `y-airtype-core v0.0.20 (/home/user/repo/services/collab/y-airtype-core)`
+        "#};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some(
+                "failed to select a version for the requirement `bincode = \"^2\"` \
+                 (required by y-airtype-core v0.0.20)"
+            ),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_reads_the_chain_form_attribution() {
+        // The unsatisfiable-fork shape: no `the requirement` clause, and the attribution arrives as
+        // a `... required by package` chain continuation rather than the bare form.
+        let stderr = indoc::indoc! {r"
+            Updating crates.io index
+            error: failed to select a version for `bincode`.
+                ... required by package `y-airtype-core v0.0.20 (/tmp/tree/services/collab/y-airtype-core)`
+                ... which satisfies path dependency `y-airtype-core` (locked to 0.0.20) of package `y-airtype v0.0.20 (/tmp/tree/services/collab/y-airtype)`
+            versions that meet the requirements `^3.0.0` are: 3.0.0
+        "};
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            summarize_pin_rejection(&error).as_deref(),
+            Some("failed to select a version for `bincode` (required by y-airtype-core v0.0.20)"),
+        );
+    }
+
+    #[test]
+    fn summarize_pin_rejection_without_stderr_stays_generic() {
+        assert_eq!(
+            summarize_pin_rejection(&cooldown_core::CoreError::StaleLock("x".into())),
+            None,
+        );
     }
 
     #[test]
@@ -1218,27 +1880,131 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
+        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
+    }
+
+    /// A project Cargo did not stage itself cannot be prepared for mutation.
+    ///
+    /// The enforcement lives in the isolated execution mode, which Cargo only selects where the
+    /// platform grants recovery authority — hence `#[cfg(unix)]`.
+    /// Elsewhere Cargo runs the same in-place trial every other ecosystem uses, and a
+    /// directly-prepared mutation is exactly what that mode expects.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_cargo_preparation_requires_an_isolated_project() -> eyre::Result<()> {
+        let other = tempfile::tempdir()?;
+        let other_root = Utf8PathBuf::from_path_buf(other.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(other_root.join("Cargo.toml"), "[workspace]\n")?;
+        let other_project = Project {
+            root: other_root.clone(),
+            kind: CARGO_ID,
+            manifest: other_root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let result = PreparedMutation::prepare(&tool, &other_project, &Plan::default()).await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_edge_normalization_requires_an_isolated_project() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+        let project = Project {
+            root: root.clone(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let mutation =
+            PreparedMutation::prepare(&InPlaceCargoFamilyWriter, &project, &Plan::default())
+                .await?;
+
+        let result = tool
+            .normalize_lock_edges(&mutation, EdgePolicy::None, None, &[])
+            .await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_cargo_apply_rejects_an_in_place_tool_family_capability() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "demo"
+                version = "0.1.0"
+                edition = "2024"
+
+                [dependencies]
+                serde = "1"
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let plan = Plan {
+            changes: vec![change("serde", "1.0.0", "1.0.1", false)],
+            ..Plan::default()
+        };
+        let mutation =
+            PreparedMutation::prepare(&InPlaceCargoFamilyWriter, &project, &plan).await?;
+
+        let result = tool.apply(&mutation).await;
+
+        std::assert_matches!(result, Err(CoreError::LockConflict(_)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn mutation_journal_restore_removes_lock_created_after_capture() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+    async fn mutation_journal_restore_removes_lock_created_after_capture() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let manifest = root.join("Cargo.toml");
         std::fs::write(
             &manifest,
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("write manifest");
-        let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = CargoTool::from_http(
-            cooldown_registry::SharedHttp::new(
-                cache_dir.path(),
-                cooldown_registry::HttpOptions::default(),
-            )
-            .expect("http"),
-        );
+            indoc! {r#"
+                [package]
+                name = "demo"
+                version = "0.1.0"
+                edition = "2024"
+            "#},
+        )?;
+        let cache_dir = tempfile::tempdir()?;
+        let eco = CargoTool::from_http(cooldown_registry::SharedHttp::new(
+            cache_dir.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let project = Project {
             root: root.clone(),
             kind: CARGO_ID,
@@ -1246,14 +2012,552 @@ mod tests {
             exclude_newer: None,
         };
 
-        let journal = eco
-            .mutation_journal(&project, &Plan::default())
-            .await
-            .expect("journal");
+        let journal = eco.mutation_journal(&project, &Plan::default()).await?;
         let lock = root.join("Cargo.lock");
-        std::fs::write(&lock, "generated").expect("write lock");
+        std::fs::write(&lock, "generated")?;
 
-        journal.restore(&project.root).expect("restore");
+        journal.restore()?;
         assert!(!lock.exists());
+        Ok(())
+    }
+
+    /// The manifest the tentative-Auto fixture starts from: `dep = "1"` caps the planned
+    /// cross-major target, so the pin batch must fail first and the Auto loop must widen.
+    #[cfg(unix)]
+    const WIDEN_MANIFEST: &str = indoc! {r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2024"
+
+        [dependencies]
+        dep = "1"
+    "#};
+
+    #[cfg(unix)]
+    const WIDEN_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["dep"]
+
+        [[package]]
+        name = "dep"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+
+    /// A tentative-Auto fixture project driven by a scripted `cargo` stand-in. The script rejects
+    /// every `update --precise` while the manifest still declares `dep = "1"` (a real pin cannot
+    /// land outside the requirement); with `accept_when_widened` it models the third-party-held
+    /// old major staying put by rewriting the lock to *fork* dep 2.0.0 beside the 1.0.0 line once
+    /// the widen removed the cap — without it, the pin stays rejected even after widening.
+    #[cfg(unix)]
+    fn widen_fixture(
+        root: &camino::Utf8Path,
+        accept_when_widened: bool,
+    ) -> eyre::Result<(Project, CargoTool)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("Cargo.toml"), WIDEN_MANIFEST)?;
+        std::fs::write(root.join("Cargo.lock"), WIDEN_LOCK)?;
+        let accept = if accept_when_widened {
+            std::fs::write(
+                root.join("Cargo.lock.forked"),
+                formatdoc! {r#"
+                    {WIDEN_LOCK}
+                    [[package]]
+                    name = "dep"
+                    version = "2.0.0"
+                    source = "registry+https://github.com/rust-lang/crates.io-index"
+                "#},
+            )?;
+            indoc! {r#"
+                if ! grep -q 'dep = "1"' Cargo.toml; then
+                  cp Cargo.lock.forked Cargo.lock
+                  exit 0
+                fi
+            "#}
+        } else {
+            ""
+        };
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            formatdoc! {r#"
+                #!/bin/sh
+                {accept}
+                echo 'error: failed to select a version for the requirement `dep = "^1"`' >&2
+                echo 'required by package `app v0.1.0 (/repo/app)`' >&2
+                exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_auto_widen_is_restored_when_the_pin_still_cannot_land() -> eyre::Result<()> {
+        // The luup5 widen-poison regression: a third-party crate holds the old major, so the
+        // widened requirement can never re-lock. The widen must be rolled back byte-identically —
+        // a manifest demanding a version the lock does not carry poisons the whole batch at
+        // `--locked` verification — and the candidate must keep cargo's own rejection sentence.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = widen_fixture(root, false)?;
+        let plan = Plan {
+            changes: vec![change("dep", "1.0.0", "2.0.0", false)],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            WIDEN_LOCK,
+            "a rejected pin leaves the lock untouched"
+        );
+        let detail = rejections
+            .get(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string()))
+            .expect("the held candidate keeps its planned-change-keyed rejection");
+        assert!(
+            detail.contains("failed to select a version") && detail.contains("required by app"),
+            "cargo's own sentence and requirer survive: {detail}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_auto_widen_is_kept_when_the_pin_lands_as_a_fork() -> eyre::Result<()> {
+        // The success arm of the same state machine: once the widen lifts the declared cap, the
+        // re-pin forks the new major beside the third-party-held old line. The widened manifest
+        // must be kept — restoring it would demand the old major back and undo the landing.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = widen_fixture(root, true)?;
+        let plan = Plan {
+            changes: vec![change("dep", "1.0.0", "2.0.0", false)],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+        assert!(
+            !manifest.contains(r#"dep = "1""#),
+            "the landed widen keeps the manifest on the new requirement: {manifest}"
+        );
+        let landed = read_lock(&project)?.crates_io_locked_versions();
+        assert_eq!(
+            landed.get(&("dep".into(), "2".into())).map(String::as_str),
+            Some("2.0.0"),
+            "the pin landed in the target major slot"
+        );
+        assert_eq!(
+            landed.get(&("dep".into(), "1".into())).map(String::as_str),
+            Some("1.0.0"),
+            "the third-party-held old major coexists as its own line"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_widen_repins_a_noop_widen_sibling_after_another_widen_lands() -> eyre::Result<()>
+    {
+        // A lock-step pair: `lock-a` needs a cross-major widen, while `lock-b`'s target is a
+        // transitive move nothing in the manifest declares, so its widen is a no-op. The fake
+        // cargo rejects every pin while `lock-a` is unwidened (the shared blocker) and accepts
+        // both once the widen landed. `lock-b` must be re-pinned after its sibling's widen+pin
+        // progresses — not left held on the stale rejection recorded before the widen.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let manifest = indoc! {r#"
+            [package]
+            name = "app"
+            version = "0.1.0"
+            edition = "2024"
+
+            [dependencies]
+            lock-a = "1"
+        "#};
+        std::fs::write(root.join("Cargo.toml"), manifest)?;
+        let lock = |a: &str, b: &str| {
+            formatdoc! {r#"
+                version = 4
+
+                [[package]]
+                name = "app"
+                version = "0.1.0"
+                dependencies = ["lock-a", "lock-b"]
+
+                [[package]]
+                name = "lock-a"
+                version = "{a}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+
+                [[package]]
+                name = "lock-b"
+                version = "{b}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#}
+        };
+        std::fs::write(root.join("Cargo.lock"), lock("1.0.0", "1.0.0"))?;
+        std::fs::write(root.join("Cargo.lock.a-landed"), lock("2.0.0", "1.0.0"))?;
+        std::fs::write(root.join("Cargo.lock.b-landed"), lock("2.0.0", "1.2.0"))?;
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            indoc! {r##"
+                #!/bin/sh
+                if ! grep -q 'lock-a = "1"' Cargo.toml; then
+                  case "$*" in
+                    *"#lock-a@"*) cp Cargo.lock.a-landed Cargo.lock; exit 0 ;;
+                    *"#lock-b@"*) cp Cargo.lock.b-landed Cargo.lock; exit 0 ;;
+                  esac
+                fi
+                echo 'error: failed to select a version for the requirement `lock-a = "^1"`' >&2
+                echo 'required by package `app v0.1.0 (/repo/app)`' >&2
+                exit 1
+            "##},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        let plan = Plan {
+            changes: vec![
+                Change {
+                    direct: false,
+                    ..change("lock-b", "1.0.0", "1.2.0", false)
+                },
+                change("lock-a", "1.0.0", "2.0.0", false),
+            ],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        let landed = read_lock(&project)?.crates_io_locked_versions();
+        assert_eq!(
+            landed
+                .get(&("lock-a".into(), "2".into()))
+                .map(String::as_str),
+            Some("2.0.0"),
+            "the widened sibling landed at its cross-major target"
+        );
+        assert_eq!(
+            landed
+                .get(&("lock-b".into(), "1".into()))
+                .map(String::as_str),
+            Some("1.2.0"),
+            "the no-op-widen candidate is re-pinned once the sibling's widen removed the blocker"
+        );
+        Ok(())
+    }
+
+    /// The manifest the member-candidate fixture starts from: the workspace member `app` itself
+    /// declares `dep = "1"`, capping the planned cross-major target so the Auto loop must widen.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_MANIFEST: &str = indoc! {r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2024"
+
+        [dependencies]
+        dep = "1"
+        holder = "1"
+    "#};
+
+    #[cfg(unix)]
+    const MEMBER_WIDEN_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["dep", "holder"]
+
+        [[package]]
+        name = "dep"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "holder"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+
+    /// What the fixture's `metadata` probe reports while the manifest still declares `dep = "1"`:
+    /// the member `app` resolves the old major, so the reach check sends the candidate into the
+    /// widen. The member paths only need to be mutually consistent (`/repo` + `/repo/Cargo.toml`
+    /// relativize to the `.` member): `metadata` parsing never touches the real filesystem.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_METADATA_UNWIDENED: &str = indoc! {r#"
+        {
+            "packages": [
+                {"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "/repo/Cargo.toml",
+                 "dependencies": [
+                    {"name": "dep", "req": "^1"},
+                    {"name": "holder", "req": "^1"}
+                 ]},
+                {"id": "holder", "name": "holder", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": [{"name": "dep", "req": "^1"}]},
+                {"id": "dep-old", "name": "dep", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []}
+            ],
+            "workspace_members": ["app"],
+            "workspace_root": "/repo",
+            "resolve": {"nodes": [
+                {"id": "app", "deps": [
+                    {"name": "dep", "pkg": "dep-old"},
+                    {"name": "holder", "pkg": "holder"}
+                ]},
+                {"id": "holder", "deps": [{"name": "dep", "pkg": "dep-old"}]},
+                {"id": "dep-old", "deps": []}
+            ]}
+        }
+    "#};
+
+    /// What the probe reports after its own fork: `app` resolves dep 2.1.0 — past the 2.0.0
+    /// target, so the member-aware reach check must fail — while `holder` keeps the 1.0.0 line.
+    #[cfg(unix)]
+    const MEMBER_WIDEN_METADATA_WIDENED: &str = indoc! {r#"
+        {
+            "packages": [
+                {"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "/repo/Cargo.toml",
+                 "dependencies": [
+                    {"name": "dep", "req": "^2.0.0"},
+                    {"name": "holder", "req": "^1"}
+                 ]},
+                {"id": "holder", "name": "holder", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": [{"name": "dep", "req": "^1"}]},
+                {"id": "dep-old", "name": "dep", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []},
+                {"id": "dep-new", "name": "dep", "version": "2.1.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index",
+                 "dependencies": []}
+            ],
+            "workspace_members": ["app"],
+            "workspace_root": "/repo",
+            "resolve": {"nodes": [
+                {"id": "app", "deps": [
+                    {"name": "dep", "pkg": "dep-new"},
+                    {"name": "holder", "pkg": "holder"}
+                ]},
+                {"id": "holder", "deps": [{"name": "dep", "pkg": "dep-old"}]},
+                {"id": "dep-old", "deps": []},
+                {"id": "dep-new", "deps": []}
+            ]}
+        }
+    "#};
+
+    /// A member-candidate tentative-Auto fixture (`needs_member_graph`, unlike [`widen_fixture`]'s
+    /// member-less candidates): workspace member `app` directly declares `dep = "1"` while
+    /// third-party `holder` keeps the old major locked. The scripted cargo rejects every
+    /// `update --precise`; its *unlocked* `metadata` probe, once the widen removed the manifest
+    /// cap, re-locks the widened requirement by forking dep 2.1.0 — the newest version the widened
+    /// caret admits, past the 2.0.0 cooldown target — beside the held 1.0.0 line. With
+    /// `probe_errs` the same forking probe then exits nonzero, exercising the probe-error rollback
+    /// branch instead of the reach-check one.
+    #[cfg(unix)]
+    fn member_widen_fixture(
+        root: &camino::Utf8Path,
+        probe_errs: bool,
+    ) -> eyre::Result<(Project, CargoTool)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("Cargo.toml"), MEMBER_WIDEN_MANIFEST)?;
+        std::fs::write(root.join("Cargo.lock"), MEMBER_WIDEN_LOCK)?;
+        std::fs::write(
+            root.join("Cargo.lock.forked"),
+            formatdoc! {r#"
+                {MEMBER_WIDEN_LOCK}
+                [[package]]
+                name = "dep"
+                version = "2.1.0"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#},
+        )?;
+        std::fs::write(
+            root.join("metadata.unwidened.json"),
+            MEMBER_WIDEN_METADATA_UNWIDENED,
+        )?;
+        std::fs::write(
+            root.join("metadata.widened.json"),
+            MEMBER_WIDEN_METADATA_WIDENED,
+        )?;
+        // The forking probe either reports the graph its own fork produced or, in the
+        // probe-error variant, leaves the forked lock behind and fails like a resolver conflict.
+        let widened_probe = if probe_errs {
+            ""
+        } else {
+            indoc! {"
+                cat metadata.widened.json
+                exit 0
+            "}
+        };
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            formatdoc! {r#"
+                #!/bin/sh
+                if [ "$1" = metadata ]; then
+                  if grep -q 'dep = "1"' Cargo.toml; then
+                    cat metadata.unwidened.json
+                    exit 0
+                  fi
+                  cp Cargo.lock.forked Cargo.lock
+                {widened_probe}fi
+                echo 'error: failed to select a version for the requirement `dep = "^1"`' >&2
+                echo 'required by package `holder v1.0.0`' >&2
+                exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    fn member_widen_change() -> Change {
+        let mut planned = change("dep", "1.0.0", "2.0.0", false);
+        planned.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+        planned
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_member_widen_rollback_restores_the_probe_forked_lock() -> eyre::Result<()> {
+        // The member-candidate rollback defect: the precise pin is rejected, but the *unlocked*
+        // metadata probe between pin and rollback re-locks the widened requirement, forking dep
+        // at 2.1.0 — newer than the 2.0.0 target, so the member-aware reach check fails. The
+        // rollback must restore the staged lock beside the manifests: restoring the manifests
+        // alone would keep a fork no surviving requirement admits, visible to `resolver_lock` and
+        // the preserve preflight until a later unlocked resolve incidentally healed it.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = member_widen_fixture(root, false)?;
+        let plan = Plan {
+            changes: vec![member_widen_change()],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        tool.whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            MEMBER_WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            MEMBER_WIDEN_LOCK,
+            "the staged lock the probe forked is restored with the manifests, \
+             not left for a later resolve to heal"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tentative_member_widen_rollback_restores_the_lock_when_the_probe_errs()
+    -> eyre::Result<()> {
+        // The sibling rollback branch: the widened-manifest probe forks the lock *and then* fails
+        // as a resolver rejection. That branch must likewise restore the staged lock with the
+        // manifests, and the candidate keeps a rejection detail for its skip row.
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = member_widen_fixture(root, true)?;
+        let plan = Plan {
+            changes: vec![member_widen_change()],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            MEMBER_WIDEN_MANIFEST,
+            "the unlandable widen is restored byte-identically"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            MEMBER_WIDEN_LOCK,
+            "the probe-error rollback restores the staged lock the probe forked"
+        );
+        assert!(
+            rejections.contains_key(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string())),
+            "the held candidate keeps its rejection detail"
+        );
+        Ok(())
     }
 }

@@ -149,6 +149,14 @@ pub enum CoreError {
     #[error("lock conflict: {0}")]
     LockConflict(String),
 
+    /// A filesystem change is visible, but syncing its containing directory failed.
+    #[error("durability uncertain: {0}")]
+    DurabilityUncertain(String),
+
+    /// Adapter-owned recovery evidence remains authoritative, so no outer rollback may run.
+    #[error("pending recovery: {0}")]
+    PendingRecovery(String),
+
     /// A non-transient local runtime/environment setup step failed.
     #[error("system error: {0}")]
     System(String),
@@ -196,7 +204,9 @@ impl CoreError {
             | CoreError::PathEncoding(_)
             | CoreError::Serialization(_)
             | CoreError::System(_)
-            | CoreError::LockConflict(_) => true,
+            | CoreError::LockConflict(_)
+            | CoreError::DurabilityUncertain(_)
+            | CoreError::PendingRecovery(_) => true,
             CoreError::Tool { stderr, .. } => detail_indicates_broken_environment(stderr),
             _ => false,
         }
@@ -224,6 +234,8 @@ impl CoreError {
             CoreError::PathEncoding(_) => DiagnosticKind::PathEncoding,
             CoreError::Serialization(_) => DiagnosticKind::Serialization,
             CoreError::LockConflict(_) => DiagnosticKind::LockConflict,
+            CoreError::DurabilityUncertain(_) => DiagnosticKind::DurabilityUncertain,
+            CoreError::PendingRecovery(_) => DiagnosticKind::PendingRecovery,
             CoreError::System(_) => DiagnosticKind::System,
         }
     }
@@ -296,77 +308,86 @@ pub struct Diagnostic {
     pub path: Option<String>,
 }
 
-/// The closed set of diagnostic kinds. Part of the JSON contract (`schemaVersion` bumps on change).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiagnosticKind {
-    /// A transient failure (network blip, 5xx, 429, or an offline cache miss)
-    /// that a retry might resolve.
-    Transient,
-    /// The requested package, version, or module was not found upstream.
-    NotFound,
-    /// The release age of a version could not be determined, so the cooldown
-    /// policy could not be evaluated for it.
-    UnknownAge,
-    /// A native tool constraint is stricter than the configured cooldown,
-    /// so the tool's own rule governs instead.
-    StricterNative,
-    /// The version under consideration has been yanked upstream.
-    Yanked,
-    /// A lockfile or manifest is stale relative to its source, or absent.
-    StaleLock,
-    /// Lock currency could not be determined by the adapter.
-    LockUnknown,
-    /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
-    ToolFailed,
-    /// An external tool (`go`, `cargo`, `uv`) could not be spawned at all.
-    ToolSpawnFailed,
-    /// A local lockfile/manifest or resolved-graph dump could not be read.
-    LockfileUnreadable,
-    /// A local filesystem operation failed.
-    Filesystem,
-    /// A local path could not be represented in cooldown's UTF-8/path model.
-    PathEncoding,
-    /// A local JSON/TOML serialization step failed.
-    Serialization,
-    /// Another cooldown process already holds the project mutation lock.
-    LockConflict,
-    /// A non-transient local runtime/environment setup step failed.
-    System,
-    /// Invalid configuration or command input (the user must fix it).
-    Config,
-    /// An upstream registry payload could not be parsed.
-    Parse,
-    /// A cooldown violation `fix` left in place: an exact pin (without `--downgrade-pinned`), or a
-    /// dependency with no older version matured enough to downgrade to. Informational — the user
-    /// chooses how to act (manual downgrade, `--downgrade-pinned`, `baseline`, or wait).
-    Held,
+macro_rules! diagnostic_kinds {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// The closed set of diagnostic kinds.
+        ///
+        /// This is part of the JSON contract, so adding a variant requires a schema-version bump.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        pub enum DiagnosticKind {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl DiagnosticKind {
+            /// Every variant in declaration order.
+            pub const ALL: &'static [DiagnosticKind] = &[
+                $( DiagnosticKind::$variant, )+
+            ];
+
+            /// Returns the serialized wire token for this diagnostic kind.
+            #[must_use]
+            pub const fn wire_value(self) -> &'static str {
+                match self {
+                    $( DiagnosticKind::$variant => $wire, )+
+                }
+            }
+        }
+
+        impl fmt::Display for DiagnosticKind {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.wire_value())
+            }
+        }
+    };
 }
 
-impl fmt::Display for DiagnosticKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            DiagnosticKind::Transient => "transient",
-            DiagnosticKind::NotFound => "not_found",
-            DiagnosticKind::UnknownAge => "unknown_age",
-            DiagnosticKind::StricterNative => "stricter_native",
-            DiagnosticKind::Yanked => "yanked",
-            DiagnosticKind::StaleLock => "stale_lock",
-            DiagnosticKind::LockUnknown => "lock_unknown",
-            DiagnosticKind::ToolFailed => "tool_failed",
-            DiagnosticKind::ToolSpawnFailed => "tool_spawn_failed",
-            DiagnosticKind::LockfileUnreadable => "lockfile_unreadable",
-            DiagnosticKind::Filesystem => "filesystem",
-            DiagnosticKind::PathEncoding => "path_encoding",
-            DiagnosticKind::Serialization => "serialization",
-            DiagnosticKind::LockConflict => "lock_conflict",
-            DiagnosticKind::System => "system",
-            DiagnosticKind::Config => "config",
-            DiagnosticKind::Parse => "parse",
-            DiagnosticKind::Held => "held",
-        };
-        f.write_str(s)
-    }
+diagnostic_kinds! {
+    /// A transient failure such as a network blip, 5xx, 429, or offline cache miss that a retry
+    /// might resolve.
+    Transient = "transient",
+    /// The requested package, version, or module was not found upstream.
+    NotFound = "not_found",
+    /// The release age could not be determined, so cooldown could not evaluate policy.
+    UnknownAge = "unknown_age",
+    /// A stricter native constraint governs instead of the configured cooldown.
+    StricterNative = "stricter_native",
+    /// The version under consideration has been yanked upstream.
+    Yanked = "yanked",
+    /// A lockfile or manifest is stale relative to its source, or absent.
+    StaleLock = "stale_lock",
+    /// Lock currency could not be determined by the adapter.
+    LockUnknown = "lock_unknown",
+    /// An external tool exited non-zero after being spawned.
+    ToolFailed = "tool_failed",
+    /// An external tool could not be spawned.
+    ToolSpawnFailed = "tool_spawn_failed",
+    /// A local lockfile, manifest, or resolved graph could not be read.
+    LockfileUnreadable = "lockfile_unreadable",
+    /// A local filesystem operation failed.
+    Filesystem = "filesystem",
+    /// A local path could not be represented in cooldown's UTF-8 path model.
+    PathEncoding = "path_encoding",
+    /// A local JSON or TOML serialization step failed.
+    Serialization = "serialization",
+    /// Another cooldown process already holds the project mutation lock.
+    LockConflict = "lock_conflict",
+    /// A filesystem change is visible, but its power-loss durability is uncertain.
+    DurabilityUncertain = "durability_uncertain",
+    /// Adapter-owned recovery evidence still controls the project mutation state.
+    PendingRecovery = "pending_recovery",
+    /// An interrupted mutation was settled before the requested operation continued.
+    Recovery = "recovery",
+    /// A non-transient local runtime or environment setup step failed.
+    System = "system",
+    /// Invalid configuration or command input requires a user correction.
+    Config = "config",
+    /// An upstream registry payload could not be parsed.
+    Parse = "parse",
+    /// A cooldown violation remains in place because it is exactly pinned or has no sufficiently
+    /// mature older version.
+    /// The user can downgrade it manually, opt into pinned downgrades, acknowledge it in the
+    /// baseline, or wait.
+    Held = "held",
 }
 
 impl Diagnostic {

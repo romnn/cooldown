@@ -44,13 +44,21 @@ struct SolrDoc {
     timestamp: Option<i64>,
 }
 
+/// The two halves of a `group:artifact` Maven coordinate, borrowing from it.
+struct Coordinate<'a> {
+    /// The group id (e.g. `org.slf4j`).
+    group: &'a str,
+    /// The artifact id (e.g. `slf4j-api`).
+    artifact: &'a str,
+}
+
 /// Splits a `group:artifact` coordinate into its parts.
-fn split_coord(coord: &str) -> Option<(&str, &str)> {
+fn split_coord(coord: &str) -> Option<Coordinate<'_>> {
     let (group, artifact) = coord.split_once(':')?;
     if group.is_empty() || artifact.is_empty() {
         return None;
     }
-    Some((group, artifact))
+    Some(Coordinate { group, artifact })
 }
 
 impl MavenCentral {
@@ -80,7 +88,7 @@ impl MavenCentral {
     }
 
     async fn get_versions(&self, coord: &str) -> Result<Option<Vec<SolrDoc>>, CoreError> {
-        let Some((group, artifact)) = split_coord(coord) else {
+        let Some(Coordinate { group, artifact }) = split_coord(coord) else {
             return Err(CoreError::Parse(format!(
                 "{coord}: expected a `group:artifact` coordinate"
             )));

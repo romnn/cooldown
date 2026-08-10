@@ -12,9 +12,10 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -83,13 +84,13 @@ impl ToolRead for BundlerTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
-        ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: "Gemfile.lock",
             manifest: "Gemfile",
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -101,25 +102,29 @@ impl ToolRead for BundlerTool {
         let direct = lock::parse_direct(&content);
         let ceilings = lock::graph_ceilings(&content);
         let mut deps = Vec::new();
-        for (name, ver) in lock::parse_resolved(&content) {
-            let is_direct = direct.contains(&name);
+        for resolved in lock::parse_resolved(&content) {
+            let is_direct = direct.contains(&resolved.name);
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
             deps.push(Dependency {
-                package: PackageId::new(BUNDLER_ID, name.clone(), Some(RUBYGEMS.to_string())),
-                current: Version::new(ver.clone()),
-                current_quality: classify_quality(&ver),
+                package: PackageId::new(
+                    BUNDLER_ID,
+                    resolved.name.clone(),
+                    Some(RUBYGEMS.to_string()),
+                ),
+                current: Version::new(resolved.version.clone()),
+                current_quality: classify_quality(&resolved.version),
                 direct: is_direct,
                 artifacts: Vec::new(),
                 graph_floor: None,
                 // A requirer pinning this gem `(= X)` caps it at its resolved version. The active
                 // check (pin equals the resolved version) records the canonical resolved form so it
                 // matches a fetched release, mirroring the uv adapter.
-                graph_ceiling: ceilings.get(&name).and_then(|pin| {
-                    version::compare(pin, &ver)
+                graph_ceiling: ceilings.get(&resolved.name).and_then(|pin| {
+                    version::compare(pin, &resolved.version)
                         .is_eq()
-                        .then(|| Version::new(ver.clone()))
+                        .then(|| Version::new(resolved.version.clone()))
                 }),
                 declared_bound: None,
                 members: Vec::new(),
@@ -172,6 +177,10 @@ impl ReleaseFetcher for BundlerTool {
 
 #[async_trait]
 impl ToolWrite for BundlerTool {
+    fn mutation_tool(&self) -> ToolId {
+        BUNDLER_ID
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // A `gemspec` directive in the Gemfile makes bundler load the project's `*.gemspec` (Ruby),
         // which typically `require_relative`s a `lib/**/version.rb`. The throwaway probe copy must
@@ -187,20 +196,14 @@ impl ToolWrite for BundlerTool {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        Ok(ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile"))?,
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("Gemfile.lock"))?,
-            ],
-        })
+        ProjectMutationJournal::capture(
+            &project.root,
+            [Utf8Path::new("Gemfile"), Utf8Path::new("Gemfile.lock")],
+        )
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        _journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
             // `bundle update --conservative <gem>` re-resolves just this gem (and its requirements)

@@ -47,10 +47,22 @@ const PACKAGE_JSON: &str = indoc! {r#"
 /// A plain `x.y.z` triple for ordering assertions. The fixture package versions all parse; a
 /// non-conforming version (prerelease build metadata) would simply be excluded from the stable set
 /// before this is called.
-fn triple(version: &str) -> Option<(u64, u64, u64)> {
+/// A parsed `x.y.z` version; the derived ordering compares `major`, then `minor`, then `patch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SemverTriple {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn triple(version: &str) -> Option<SemverTriple> {
     let mut parts = version.split('.').map(str::parse::<u64>);
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Some((major, minor, patch)),
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Some(SemverTriple {
+            major,
+            minor,
+            patch,
+        }),
         _ => None,
     }
 }

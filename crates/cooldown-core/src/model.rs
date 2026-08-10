@@ -4,6 +4,7 @@
 //! update-kind relative to the current pin.
 
 use crate::duration::since;
+use crate::error::Diagnostic;
 use crate::policy::ResolvedWindow;
 use camino::Utf8PathBuf;
 use std::fmt;
@@ -612,11 +613,164 @@ pub enum RewriteMode {
     Always,
 }
 
+/// How an adapter treats addressable resolved lock **edge bindings** after a whole-graph re-resolve.
+///
+/// A lock records not only which package versions exist but which coexisting version each
+/// dependent's edge is *bound* to (cargo's `dependencies = ["uuid 0.8.2"]` entries).
+/// When a dependent's declared range admits several locked versions (e.g. diesel's
+/// `uuid = ">=0.7, <2.0"` with both `0.8.2` and `1.x` in the lock), an incremental re-resolve can
+/// silently rebind such an edge between them — a build-affecting change (`rustc` receives the other
+/// copy as `--extern`) that is invisible at the per-version level and passes the tool's own lock
+/// verification.
+/// This policy decides what the adapter does about it.
+/// Currently enforced by the cargo adapter; adapters without ambiguous edge bindings ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgePolicy {
+    /// Restore an addressable, unambiguous crates.io edge the re-resolve rebound between two
+    /// still-coexisting versions when its earlier binding still satisfies the active requirement.
+    /// This is the default.
+    #[default]
+    Preserve,
+    /// Bind each addressable, unambiguous crates.io edge to the **highest** locked version satisfying
+    /// the dependent's active requirement, preferring candidates whose declared `rust-version` is
+    /// workspace-compatible.
+    ///
+    /// This adapter-owned normalization matches a from-scratch resolve in the common case and also
+    /// heals eligible bad bindings that predate the run.
+    Canonicalize,
+    /// Leave every binding exactly as the resolver produced it.
+    /// Unplanned rebinds are still *reported* (never silent), just not corrected.
+    None,
+}
+
+macro_rules! edge_binding_actions {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// What the adapter's edge policy did or observed about one lock edge.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        pub enum EdgeBindingAction {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl EdgeBindingAction {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [EdgeBindingAction] =
+                &[ $( EdgeBindingAction::$variant, )+ ];
+
+            /// Returns the serialized wire token for this action.
+            #[must_use]
+            pub fn wire_value(self) -> &'static str {
+                match self {
+                    $( EdgeBindingAction::$variant => $wire, )+
+                }
+            }
+
+            /// Whether a row with this action describes state committed to the project.
+            #[must_use]
+            pub const fn is_applied(self) -> bool {
+                match self {
+                    EdgeBindingAction::Restored
+                    | EdgeBindingAction::Canonicalized
+                    | EdgeBindingAction::Rebound
+                    | EdgeBindingAction::Unaddressable => true,
+                    EdgeBindingAction::Held => false,
+                }
+            }
+
+            /// Whether a row with this action must explain its policy limitation.
+            #[must_use]
+            pub const fn requires_detail(self) -> bool {
+                match self {
+                    EdgeBindingAction::Held | EdgeBindingAction::Unaddressable => true,
+                    EdgeBindingAction::Restored
+                    | EdgeBindingAction::Canonicalized
+                    | EdgeBindingAction::Rebound => false,
+                }
+            }
+        }
+    };
+}
+
+edge_binding_actions! {
+    /// The re-resolve rebound the edge; [`EdgePolicy::Preserve`] restored the earlier binding.
+    Restored = "restored",
+    /// [`EdgePolicy::Canonicalize`] wrote the canonical binding.
+    Canonicalized = "canonicalized",
+    /// The resolver-produced binding was allowed and committed.
+    Rebound = "rebound",
+    /// A concrete corrective target was withheld; [`EdgeRebind::to`] carries that target.
+    Held = "held",
+    /// A binding moved, but the lock does not identify the requirement precisely enough to correct
+    /// it safely; [`EdgeRebind::detail`] explains the limitation.
+    Unaddressable = "unaddressable",
+}
+
+/// A policy-relevant lock edge that enforcement corrected, withheld a correction for, or observed
+/// rebound.
+///
+/// For [`Restored`](EdgeBindingAction::Restored)/[`Canonicalized`](EdgeBindingAction::Canonicalized)
+/// `to` is the binding the committed lock ends with and `from` the resolver-produced binding it
+/// superseded; for [`Rebound`](EdgeBindingAction::Rebound) and
+/// [`Unaddressable`](EdgeBindingAction::Unaddressable), `from` is the pre-apply binding and `to` the
+/// committed one; for [`Held`](EdgeBindingAction::Held) the committed binding **stays at** `from`
+/// and `to` is the correction that was withheld.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRebind {
+    /// The dependent package whose edge moved (e.g. `diesel`).
+    pub dependent: String,
+    /// The dependent's resolved version (a dependent can coexist at several versions).
+    pub dependent_version: Version,
+    /// The dependent's package source, absent for path and workspace packages.
+    pub dependent_source: Option<String>,
+    /// The dependency the edge points at (e.g. `uuid`).
+    pub dependency: PackageId,
+    /// The superseded binding version (or, for [`Held`](EdgeBindingAction::Held), the binding that
+    /// remains in place).
+    pub from: Version,
+    /// The binding version the committed lock ends with (or, for
+    /// [`Held`](EdgeBindingAction::Held), the withheld correction target).
+    pub to: Version,
+    /// What the policy did (or observed) about the rebind.
+    pub action: EdgeBindingAction,
+    /// Source-transition or policy-limitation context.
+    /// Required for [`Held`](EdgeBindingAction::Held) and
+    /// [`Unaddressable`](EdgeBindingAction::Unaddressable); observed source moves may also carry it.
+    pub detail: Option<String>,
+}
+
+impl EdgeRebind {
+    /// Validates the action-specific invariants required by the report contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Serialization`](crate::CoreError::Serialization) when a required detail
+    /// is absent or any provided detail is empty.
+    pub fn validate(&self) -> crate::Result<()> {
+        let detail = self
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty());
+        if self.detail.is_some() && detail.is_none() {
+            return Err(crate::CoreError::Serialization(format!(
+                "edge action `{}` has an empty detail",
+                self.action.wire_value()
+            )));
+        }
+        if self.action.requires_detail() && detail.is_none() {
+            return Err(crate::CoreError::Serialization(format!(
+                "edge action `{}` requires a detail",
+                self.action.wire_value()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// A resolved package version already rejected by the active policy before an apply trial begins.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BaselineViolation {
-    /// The package name in its tool's native spelling.
-    pub package: String,
+    /// The complete package identity, including its registry or source.
+    pub package: PackageId,
     /// The exact version present in the starting graph.
     pub version: Version,
 }
@@ -627,8 +781,13 @@ pub struct Plan {
     /// The planned version changes.
     pub changes: Vec<Change>,
     /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
-    /// flag). Defaults to [`RewriteMode::Auto`].
+    /// flag).
+    /// Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
+    /// How the adapter treats resolved lock edge bindings after the re-resolve (the
+    /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key).
+    /// Defaults to [`EdgePolicy::Preserve`].
+    pub edge_policy: EdgePolicy,
     /// Policy violations already present before this trial.
     ///
     /// Adapters may authorize these exact starting versions while resolving a repair, but must not
@@ -771,6 +930,22 @@ pub struct ApplyReport {
     pub applied: Vec<Change>,
     /// The changes that were skipped, with reasons.
     pub skipped: Vec<Skipped>,
+    /// Lock edges whose binding moved between coexisting versions, with what the
+    /// [`EdgePolicy`] did about each.
+    /// Empty for adapters without ambiguous edge bindings.
+    pub edge_rebinds: Vec<EdgeRebind>,
+    /// Non-fatal adapter warnings about a mutation that is already visible and must still be
+    /// reported as committed.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// The authoritative final edge audit plus non-fatal durability warnings.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeNormalizationReport {
+    /// Final lock-edge outcomes after reconciling run-level observation and batch provenance.
+    pub rebinds: Vec<EdgeRebind>,
+    /// Warnings raised after a verified correction crossed its visible commit point.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Whether to gate only environment-relevant artifacts or every recorded artifact (`--all-artifacts`).
@@ -793,12 +968,11 @@ pub enum CandidateScope {
     AllowCrossMajor,
 }
 
-/// How an tool's project roots are recognized on disk.
+/// The primary filesystem markers that directly identify a tool's project root.
 ///
-/// Adapters *declare* this rather than scanning themselves: the orchestrator runs one
-/// gitignore-aware, exclude-aware walk per tool from these markers, so detection policy
-/// (`.gitignore` honoring, the exclude list) is owned in one agnostic place and an adapter cannot
-/// bypass it.
+/// Adapters carry this inside [`ProjectDetection`] rather than scanning themselves.
+/// The orchestrator owns gitignore-aware and exclude-aware traversal, so an adapter cannot bypass
+/// shared detection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectMarker {
     /// The lock/manifest filename whose presence marks a project root (e.g. `"Cargo.lock"`).
@@ -810,6 +984,44 @@ pub struct ProjectMarker {
     /// When `true`, a marked root's descendants are not also reported — a workspace root already
     /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
     pub workspace_root: bool,
+}
+
+/// The complete filesystem-marker specification for one adapter's project discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDetection {
+    /// A primary marker directly identifies every project root.
+    Primary(ProjectMarker),
+    /// A second marker identifies roots that must be validated but not automatically accepted.
+    PrimaryWithValidation {
+        /// The marker that directly identifies project roots.
+        primary: ProjectMarker,
+        /// The validation-only filename inspected during the same repository traversal.
+        validation_marker: &'static str,
+    },
+}
+
+impl ProjectDetection {
+    /// Returns the primary marker that directly identifies project roots.
+    #[must_use]
+    pub fn primary(self) -> ProjectMarker {
+        match self {
+            ProjectDetection::Primary(marker)
+            | ProjectDetection::PrimaryWithValidation {
+                primary: marker, ..
+            } => marker,
+        }
+    }
+
+    /// Returns the optional validation-only marker scanned alongside the primary marker.
+    #[must_use]
+    pub fn validation_marker(self) -> Option<&'static str> {
+        match self {
+            ProjectDetection::Primary(_) => None,
+            ProjectDetection::PrimaryWithValidation {
+                validation_marker, ..
+            } => Some(validation_marker),
+        }
+    }
 }
 
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.
@@ -940,5 +1152,69 @@ mod tests {
                 "ALL must list every wire token once"
             );
         }
+    }
+
+    /// The enum, serde token, and `wire_value` expand from one macro literal, so the remaining
+    /// property to check is that every variant has a distinct wire token.
+    #[test]
+    fn edge_binding_action_wire_tokens_match_serde() {
+        use super::EdgeBindingAction;
+        let mut seen = std::collections::BTreeSet::new();
+        for action in EdgeBindingAction::ALL {
+            let serialized = toml::Value::try_from(action).ok();
+            assert_eq!(
+                serialized,
+                Some(toml::Value::String(action.wire_value().to_string())),
+                "wire_value must equal serde's token"
+            );
+            assert!(
+                seen.insert(action.wire_value()),
+                "ALL must list every wire token once"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_binding_action_report_invariants_are_exhaustive() {
+        use super::EdgeBindingAction;
+
+        for action in EdgeBindingAction::ALL {
+            assert_eq!(
+                action.is_applied(),
+                !matches!(action, EdgeBindingAction::Held)
+            );
+            assert_eq!(
+                action.requires_detail(),
+                matches!(
+                    action,
+                    EdgeBindingAction::Held | EdgeBindingAction::Unaddressable
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn edge_rebind_validation_requires_non_empty_policy_reasons() {
+        use super::{EdgeBindingAction, EdgeRebind, PackageId, ToolId, Version};
+
+        let mut rebind = EdgeRebind {
+            dependent: "consumer".to_string(),
+            dependent_version: Version::new("1.0.0"),
+            dependent_source: None,
+            dependency: PackageId::new(ToolId("cargo"), "dependency", None),
+            from: Version::new("1.0.0"),
+            to: Version::new("2.0.0"),
+            action: EdgeBindingAction::Held,
+            detail: None,
+        };
+
+        assert!(rebind.validate().is_err());
+        rebind.detail = Some("   ".to_string());
+        assert!(rebind.validate().is_err());
+        rebind.detail = Some("candidate would orphan a lock block".to_string());
+        assert!(rebind.validate().is_ok());
+        rebind.action = EdgeBindingAction::Rebound;
+        rebind.detail = None;
+        assert!(rebind.validate().is_ok());
     }
 }

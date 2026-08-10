@@ -196,13 +196,15 @@ impl Progress {
         }
     }
 
-    pub(crate) fn start_run(&self, projects: &[(ToolId, String)]) {
+    /// `project_tools` carries one entry per in-scope project (its tool), so per-tool project
+    /// counts fall out of the multiplicity.
+    pub(crate) fn start_run(&self, project_tools: &[ToolId]) {
         let Some(inner) = &self.inner else {
             return;
         };
         let mut tracker = lock_tracker(inner);
         tracker.remaining_projects.clear();
-        for (tool, _) in projects {
+        for tool in project_tools {
             *tracker.remaining_projects.entry(tool.as_str()).or_default() += 1;
         }
         tracker.completed_tools = 0;
@@ -602,11 +604,8 @@ mod tests {
     #[test]
     fn tools_complete_only_after_their_last_project() {
         let progress = Progress::plain();
-        progress.start_run(&[
-            (CARGO, "a".to_string()),
-            (CARGO, "b".to_string()),
-            (GO, ".".to_string()),
-        ]);
+        // One entry per project: two cargo projects, one go project.
+        progress.start_run(&[CARGO, CARGO, GO]);
 
         drop(progress.project(CARGO, "a"));
         assert_eq!(completed_tools(&progress), 0);

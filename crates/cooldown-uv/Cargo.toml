@@ -27,6 +27,7 @@ camino.workspace = true
 pep440_rs.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 indoc.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

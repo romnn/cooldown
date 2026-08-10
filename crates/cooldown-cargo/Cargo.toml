@@ -17,6 +17,7 @@ cooldown-adapter-util.workspace = true
 cooldown-toml-util.workspace = true
 cooldown-registry.workspace = true
 jiff.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -25,9 +26,12 @@ tokio.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 semver.workspace = true
+sha2.workspace = true
+same-file.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
 indoc.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

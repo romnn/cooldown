@@ -1,4 +1,5 @@
 use crate::app::{SyncItem, SyncSummary};
+use cooldown_core::Diagnostic;
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -52,7 +53,11 @@ pub(in crate::cli) fn sync_items(items: &[SyncItem]) -> Vec<SyncItemJson> {
 }
 
 /// Render the human-readable `sync` report: a line per project plus the summary tally.
-pub(in crate::cli) fn render_sync_text(summary: &SyncSummary, items: &[SyncItem]) -> String {
+pub(in crate::cli) fn render_sync_text(
+    summary: &SyncSummary,
+    items: &[SyncItem],
+    warnings: &[Diagnostic],
+) -> String {
     let mut out = String::new();
     for item in items {
         let window = match &item.window {
@@ -76,5 +81,8 @@ pub(in crate::cli) fn render_sync_text(summary: &SyncSummary, items: &[SyncItem]
         "{} written · {} unchanged · {} unsupported · {} errors",
         summary.written, summary.unchanged, summary.unsupported, summary.errors
     );
+    for warning in warnings {
+        let _ = writeln!(out, "warning [{}]: {}", warning.kind, warning.message);
+    }
     out
 }

@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, Plan, Project, ProjectMarker, ProjectMutationJournal,
-    Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport,
+    LockVerifyReport, NativePolicyLayer, Plan, PreparedMutation, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseFetcher, ResolveInputs, Result, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::HashMap;
@@ -98,15 +98,15 @@ impl ToolRead for GoTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // Go multi-module repos nest independent modules, so every `go.mod` is its own project
         // (not a workspace root).
-        ProjectMarker {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: "go.mod",
             manifest: "go.mod",
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -153,6 +153,16 @@ impl ReleaseFetcher for GoTool {
 
 #[async_trait]
 impl ToolWrite for GoTool {
+    fn mutation_tool(&self) -> ToolId {
+        GO_ID
+    }
+
+    fn supports_transitive_advance(&self) -> bool {
+        // `go get module@version` raises any module in the graph, adding an `// indirect` require
+        // when no package imports it directly.
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `go get`/`go mod tidy` reads the package import graph from `.go` source to keep `go.mod`
         // requires consistent, so the throwaway copy must include source. Go source is small; the bulk
@@ -171,12 +181,8 @@ impl ToolWrite for GoTool {
         mutation::mutation_journal(&project.root, plan)
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         apply::apply(&self.go, project, plan, journal).await
     }
 

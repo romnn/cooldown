@@ -256,14 +256,21 @@ fn check_cooldown_cell(window: &Window, age_days: Option<f64>) -> String {
     age_over_window_cell(window, &age)
 }
 
-fn check_status_cell(status: CheckStatus) -> (&'static str, Color) {
-    match status {
+/// A status column cell: the one-word label and the color the row renders it in.
+struct StatusCell {
+    label: &'static str,
+    color: Color,
+}
+
+fn check_status_cell(status: CheckStatus) -> StatusCell {
+    let (label, color) = match status {
         CheckStatus::Violation => ("violation", Color::Red),
         CheckStatus::Acknowledged => ("acknowledged", Color::Cyan),
         CheckStatus::Allowed => ("allowed", Color::Yellow),
         CheckStatus::UnknownAge => ("unknown age", Color::Magenta),
         CheckStatus::Error => ("error", Color::Red),
-    }
+    };
+    StatusCell { label, color }
 }
 
 fn check_notes_cell(item: &CheckItem) -> String {
@@ -272,7 +279,10 @@ fn check_notes_cell(item: &CheckItem) -> String {
         notes.push("graph-held".to_string());
     }
     if let Some(graph_floor) = &item.graph_floor {
-        notes.push(format!("floor {graph_floor}"));
+        // "graph floor", not bare "floor": beside a violation a bare "floor 0.4.4" reads as the
+        // version a fix would land on, but this is the resolved graph's lower bound — the
+        // remediation target is the newest matured release at/above it, which may differ.
+        notes.push(format!("graph floor {graph_floor}"));
     }
     if let Some(error) = &item.error {
         notes.push(error.message.clone());
@@ -413,6 +423,12 @@ pub fn render_outdated(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
+    push_outdated_summary(&mut out, summary);
+    push_diagnostics(&mut out, warnings, errors, use_color);
+    out
+}
+
+fn push_outdated_summary(out: &mut String, summary: &OutdatedSummary) {
     let _ = write!(
         out,
         "\n{} adoptable · {} blocked · {} in cooldown · {} up-to-date · {} exempt · {} held · {} unknown-age",
@@ -427,9 +443,15 @@ pub fn render_outdated(
     if summary.errors > 0 {
         let _ = write!(out, " · {} errors", summary.errors);
     }
+    if summary.skipped_stale_projects > 0 {
+        let _ = write!(
+            out,
+            " · {} stale {} skipped",
+            summary.skipped_stale_projects,
+            stale_project_word(summary.skipped_stale_projects),
+        );
+    }
     out.push('\n');
-    push_diagnostics(&mut out, warnings, errors, use_color);
-    out
 }
 
 /// Render the `check` report.
@@ -451,13 +473,13 @@ pub fn render_check(
         no_suggestions: _,
     } = *opts;
     let mut out = String::new();
-    if items.is_empty() && errors.is_empty() {
+    if items.is_empty() && errors.is_empty() && summary.skipped_stale_projects == 0 {
         let _ = writeln!(
             out,
             "✓ {} dependencies pass the cooldown gate ({} scope).",
             summary.checked, meta.scope
         );
-    } else {
+    } else if !items.is_empty() {
         let used_by = has_attribution(items, |it| &it.members);
         let project = project_column_needed(
             items,
@@ -469,7 +491,7 @@ pub fn render_check(
                     used_by.then(|| members_cell(&item.members, list_packages, paths, item.direct)),
                     item.current.clone(),
                     check_cooldown_cell(&item.window, item.age_days),
-                    check_status_cell(item.status).0,
+                    check_status_cell(item.status).label,
                     check_notes_cell(item),
                 )
             },
@@ -485,7 +507,7 @@ pub fn render_check(
         header.extend(["Version", "Cooldown", "Status", "Notes"]);
         t.set_header(header);
         for it in items {
-            let (label, color) = check_status_cell(it.status);
+            let StatusCell { label, color } = check_status_cell(it.status);
             let cooldown = check_cooldown_cell(&it.window, it.age_days);
             let notes = check_notes_cell(it);
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
@@ -511,9 +533,11 @@ pub fn render_check(
     }
     let _ = writeln!(
         out,
-        "\nchecked {} ({} direct) · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
+        "\nchecked {} ({} direct) · {} stale {} skipped · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
         summary.checked,
         summary.direct,
+        summary.skipped_stale_projects,
+        stale_project_word(summary.skipped_stale_projects),
         summary.violations,
         summary.acknowledged,
         summary.allowed,
@@ -523,6 +547,10 @@ pub fn render_check(
     );
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
+}
+
+fn stale_project_word(count: usize) -> &'static str {
+    if count == 1 { "project" } else { "projects" }
 }
 
 /// Render the `upgrade` report.
@@ -551,30 +579,261 @@ pub fn render_fix(
     render_mutation("fix", meta, summary, items, warnings, errors, *opts)
 }
 
-/// The (status word, reason detail, color) for one mutation row — both cells share the color. The
-/// applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is `downgraded`,
-/// not `upgraded`. A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean
-/// apply has an empty reason (Status says it).
-fn mutation_status(it: &UpgradeItem) -> (&'static str, String, Color) {
-    if it.applied {
-        let word = if it.downgrade {
-            "downgraded"
-        } else {
-            "upgraded"
+/// One table row's worth of items: either a lone item or a batch of identical clean edge
+/// corrections collapsed into a single row.
+enum EdgeRenderUnit<'a> {
+    Single(&'a UpgradeItem),
+    Group(Vec<&'a UpgradeItem>),
+}
+
+/// Collapses identical clean edge corrections — same tool, project, package identity, binding
+/// move, and action, with no per-edge detail — into one render unit each, keeping first-occurrence
+/// order. A run that restores the same `windows-sys 0.52.0 → 0.59.0` binding for a dozen
+/// dependents reads as one row naming them, not a dozen rows differing only in the dependent.
+/// Tool, project, and registry are part of the identity: the same correction in two projects (or
+/// for a same-named package from another registry) is two facts, and merging them would attribute
+/// one project's edges to the other. Detail-carrying rows (held, unaddressable,
+/// rebound-with-reason) stay individual: their details are per-edge facts.
+fn group_edge_corrections(items: &[UpgradeItem]) -> Vec<EdgeRenderUnit<'_>> {
+    type GroupKey<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        &'a str,
+        &'static str,
+    );
+    let mut units: Vec<EdgeRenderUnit<'_>> = Vec::new();
+    let mut group_index: std::collections::HashMap<GroupKey<'_>, usize> =
+        std::collections::HashMap::new();
+    for item in items {
+        let groupable = item.edge.as_ref().filter(|edge| {
+            matches!(
+                edge.action,
+                cooldown_core::EdgeBindingAction::Restored
+                    | cooldown_core::EdgeBindingAction::Canonicalized
+            ) && edge.detail.is_none()
+        });
+        let Some(edge) = groupable else {
+            units.push(EdgeRenderUnit::Single(item));
+            continue;
         };
-        (word, String::new(), Color::Green)
-    } else if let Some(sk) = &it.skipped {
-        let detail = if sk.reason == SkipReason::NeedsMajor {
-            "needs --major".to_string()
+        let key = (
+            item.tool.as_str(),
+            item.project.as_str(),
+            item.name.as_str(),
+            item.registry.as_deref(),
+            item.from.as_str(),
+            item.to.as_str(),
+            edge.action.wire_value(),
+        );
+        if let Some(&index) = group_index.get(&key) {
+            if let Some(EdgeRenderUnit::Group(group)) = units.get_mut(index) {
+                group.push(item);
+            } else {
+                // `group_index` only ever records indices of `Group` units pushed right below, so
+                // this arm should be unreachable.
+                // Should the invariant ever break, an extra standalone row beats silently dropping
+                // the correction from the mutation report.
+                units.push(EdgeRenderUnit::Single(item));
+            }
         } else {
-            sk.message.clone()
-        };
-        ("skipped", detail, Color::Yellow)
-    } else if let Some(e) = &it.error {
-        ("failed", e.message.clone(), Color::Red)
-    } else {
-        ("planned", String::new(), Color::Cyan)
+            group_index.insert(key, units.len());
+            units.push(EdgeRenderUnit::Group(vec![item]));
+        }
     }
+    units
+}
+
+/// The status cells for a collapsed correction group: the singular phrasing when the group holds
+/// one edge, the dependent roster (capped) when it holds several.
+fn edge_group_status(group: &[&UpgradeItem]) -> MutationStatus {
+    const SHOWN: usize = 3;
+    let (Some(first), Some(edge)) = (group.first(), group.first().and_then(|it| it.edge.as_ref()))
+    else {
+        return MutationStatus {
+            status: "planned",
+            reason: String::new(),
+            color: Color::Cyan,
+        };
+    };
+    if group.len() == 1 {
+        return mutation_status(first);
+    }
+    let mut labels: Vec<String> = group
+        .iter()
+        .filter_map(|it| it.edge.as_ref())
+        .map(|edge| {
+            // Same-name/version dependents from different sources are distinct facts; the
+            // abbreviated source keeps them tellable apart, matching the single-row phrasing.
+            let source = edge
+                .dependent_source
+                .as_deref()
+                .map(|source| format!(" ({})", abbreviated_source(source)))
+                .unwrap_or_default();
+            format!("{} {}{source}", edge.dependent, edge.dependent_version)
+        })
+        .collect();
+    labels.sort();
+    let mut list = labels
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if labels.len() > SHOWN {
+        let _ = write!(list, ", +{} more", labels.len() - SHOWN);
+    }
+    let subject = format!(
+        "{} dependents' {} edge bindings ({list})",
+        labels.len(),
+        first.name
+    );
+    match edge.action {
+        cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
+            status: "canonicalized",
+            reason: format!("{subject} bound to the canonical satisfying locked version"),
+            color: Color::Green,
+        },
+        _ => MutationStatus {
+            status: "restored",
+            reason: format!("the re-resolve rebound {subject}; restored"),
+            color: Color::Green,
+        },
+    }
+}
+
+/// The Status/Reason cells of one mutation row — both cells share the color.
+struct MutationStatus {
+    /// The one-word status cell.
+    status: &'static str,
+    /// The reason/detail cell; empty for a clean apply.
+    reason: String,
+    color: Color,
+}
+
+/// The status cells for one mutation row. The applied word is per-item, not per-command: a
+/// too-fresh pin an `upgrade` rolls back is `downgraded`, not `upgraded`. A held-back cross-major
+/// is a `skipped` row whose reason is `needs --major`; a clean apply has an empty reason because
+/// Status says it. An edge row reports a lock-edge *binding* move (the From/To cells are binding
+/// versions), so its status word names the edge-policy outcome and its reason names the dependent
+/// whose edge moved.
+fn mutation_status(it: &UpgradeItem) -> MutationStatus {
+    if let Some(edge) = &it.edge {
+        let source = edge
+            .dependent_source
+            .as_deref()
+            .map(|source| format!(" ({})", abbreviated_source(source)))
+            .unwrap_or_default();
+        let subject = format!(
+            "{} {}{source}'s {} edge binding",
+            edge.dependent, edge.dependent_version, it.name
+        );
+        return match edge.action {
+            cooldown_core::EdgeBindingAction::Restored => MutationStatus {
+                status: "restored",
+                reason: format!("the re-resolve rebound {subject}; restored"),
+                color: Color::Green,
+            },
+            cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
+                status: "canonicalized",
+                reason: format!("{subject} bound to the canonical satisfying locked version"),
+                color: Color::Green,
+            },
+            cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
+                status: "rebound",
+                reason: match &edge.detail {
+                    Some(detail) => format!(
+                        "the re-resolve moved {subject}; left as bound: {}",
+                        cooldown_core::redact::url_secrets(detail)
+                    ),
+                    None => format!("the re-resolve moved {subject}; left as bound"),
+                },
+                color: Color::Yellow,
+            },
+            cooldown_core::EdgeBindingAction::Held => MutationStatus {
+                status: "held",
+                reason: match &edge.detail {
+                    Some(detail) => format!(
+                        "{subject} left in place: {}",
+                        cooldown_core::redact::url_secrets(detail)
+                    ),
+                    None => format!("{subject} left in place; correction withheld"),
+                },
+                color: Color::Yellow,
+            },
+            cooldown_core::EdgeBindingAction::Unaddressable => MutationStatus {
+                status: "unaddressable",
+                reason: match &edge.detail {
+                    Some(detail) => format!(
+                        "{subject} could not be corrected: {}",
+                        cooldown_core::redact::url_secrets(detail)
+                    ),
+                    None => format!("{subject} could not be corrected safely"),
+                },
+                color: Color::Yellow,
+            },
+        };
+    }
+    if it.applied {
+        MutationStatus {
+            status: if it.downgrade {
+                "downgraded"
+            } else {
+                "upgraded"
+            },
+            reason: String::new(),
+            color: Color::Green,
+        }
+    } else if let Some(sk) = &it.skipped {
+        MutationStatus {
+            status: "skipped",
+            reason: if sk.reason == SkipReason::NeedsMajor {
+                "needs --major".to_string()
+            } else {
+                sk.message.clone()
+            },
+            color: Color::Yellow,
+        }
+    } else if let Some(e) = &it.error {
+        MutationStatus {
+            status: "failed",
+            reason: e.message.clone(),
+            color: Color::Red,
+        }
+    } else {
+        MutationStatus {
+            status: "planned",
+            reason: String::new(),
+            color: Color::Cyan,
+        }
+    }
+}
+
+fn abbreviated_source(source: &str) -> String {
+    cooldown_core::redact::source_label(source)
+}
+
+fn edge_summary_note(summary: &UpgradeSummary) -> String {
+    let mut note = String::new();
+    if summary.edges_corrected > 0 {
+        let _ = write!(note, " · {} edges corrected", summary.edges_corrected);
+    }
+    if summary.edges_rebound > 0 {
+        let _ = write!(note, " · {} edges rebound", summary.edges_rebound);
+    }
+    if summary.edges_held > 0 {
+        let _ = write!(note, " · {} edges held", summary.edges_held);
+    }
+    if summary.edges_unaddressable > 0 {
+        let _ = write!(
+            note,
+            " · {} edges unaddressable",
+            summary.edges_unaddressable
+        );
+    }
+    note
 }
 
 fn mutation_project_column_needed(
@@ -587,7 +846,7 @@ fn mutation_project_column_needed(
         opts.show_projects,
         |item| item.project.as_str(),
         |item| {
-            let (status, detail, _) = mutation_status(item);
+            let status = mutation_status(item);
             (
                 item.name.clone(),
                 used_by.then(|| {
@@ -595,8 +854,8 @@ fn mutation_project_column_needed(
                 }),
                 item.from.clone(),
                 item.to.clone(),
-                status,
-                detail,
+                status.status,
+                status.reason,
             )
         },
     )
@@ -638,8 +897,19 @@ fn render_mutation(
         // the row's color).
         header.extend(["From", "To", "Status", "Reason"]);
         t.set_header(header);
-        for it in items {
-            let (status, detail, color) = mutation_status(it);
+        for unit in group_edge_corrections(items) {
+            let (it, cells) = match &unit {
+                EdgeRenderUnit::Single(it) => (*it, mutation_status(it)),
+                EdgeRenderUnit::Group(group) => {
+                    let Some(first) = group.first() else { continue };
+                    (*first, edge_group_status(group))
+                }
+            };
+            let MutationStatus {
+                status,
+                reason,
+                color,
+            } = cells;
             let mut row = vec![cell_colored(it.name.clone(), PACKAGE_COLOR, use_color)];
             if used_by {
                 row.push(Cell::new(members_cell(
@@ -655,7 +925,7 @@ fn render_mutation(
             row.push(Cell::new(&it.from));
             row.push(Cell::new(&it.to));
             row.push(cell_colored(status, color, use_color));
-            row.push(cell_colored(detail, color, use_color));
+            row.push(cell_colored(reason, color, use_color));
             t.add_row(row);
         }
         out.push_str(&dim_borders(&t.to_string(), use_color));
@@ -683,10 +953,11 @@ fn render_mutation(
     } else {
         format!(" ({needs_major} need --major)")
     };
+    let edge_note = edge_summary_note(summary);
     let _ = writeln!(
         out,
-        "\n{} applied · {} skipped{} · {} errors · {}",
-        summary.applied, summary.skipped, major_note, summary.errors, lock
+        "\n{} applied · {} skipped{} · {} errors{} · {}",
+        summary.applied, summary.skipped, major_note, summary.errors, edge_note, lock
     );
     if meta.build.requested {
         let _ = writeln!(
@@ -883,9 +1154,9 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderOptions, check_cooldown_cell, has_distinct_project, members_cell,
-        outdated_status_cell, path_label, render_check, render_fix, render_outdated,
-        render_upgrade,
+        RenderOptions, abbreviated_source, check_cooldown_cell, has_distinct_project, members_cell,
+        mutation_status, outdated_status_cell, path_label, render_check, render_fix,
+        render_outdated, render_upgrade, stale_project_word,
     };
     use crate::{
         BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
@@ -893,6 +1164,116 @@ mod tests {
         Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef, SkipReason, UpdateKind};
+
+    #[test]
+    fn edge_sources_are_short_and_credential_free() {
+        assert_eq!(
+            abbreviated_source("registry+https://github.com/rust-lang/crates.io-index"),
+            "crates.io"
+        );
+        assert_eq!(
+            abbreviated_source(
+                "git+https://token@example.com/private/repo.git?branch=release#abcdef"
+            ),
+            "git:example.com/private/repo"
+        );
+        assert_eq!(
+            abbreviated_source("git+file:///home/user/private/repo#abcdef"),
+            "git:local"
+        );
+    }
+
+    #[test]
+    fn rebound_status_shows_sanitized_source_detail() {
+        let mut item = needs_major_item("foo", "1.0.0", "1.0.0", UpdateKind::Patch, ".");
+        item.applied = true;
+        item.skipped = None;
+        item.edge = Some(crate::UpgradeEdgeInfo {
+            dependent: "app".to_string(),
+            dependent_version: "0.1.0".to_string(),
+            dependent_source: None,
+            action: cooldown_core::EdgeBindingAction::Rebound,
+            detail: Some(
+                "source git+https://token@example.com/foo#aaaa → git+https://example.com/foo#bbbb"
+                    .to_string(),
+            ),
+        });
+
+        let status = mutation_status(&item);
+
+        assert!(status.reason.contains("git+https://example.com/foo"));
+        assert!(!status.reason.contains("token"));
+        assert!(!status.reason.contains("aaaa"));
+        assert!(!status.reason.contains("bbbb"));
+    }
+
+    #[test]
+    fn identical_clean_edge_corrections_collapse_into_one_row_naming_dependents() {
+        use super::{EdgeRenderUnit, edge_group_status, group_edge_corrections};
+        let restored_edge = |dependent: &str| {
+            let mut item =
+                needs_major_item("windows-sys", "0.52.0", "0.59.0", UpdateKind::Minor, ".");
+            item.applied = true;
+            item.skipped = None;
+            item.edge = Some(crate::UpgradeEdgeInfo {
+                dependent: dependent.to_string(),
+                dependent_version: "1.0.0".to_string(),
+                dependent_source: None,
+                action: cooldown_core::EdgeBindingAction::Restored,
+                detail: None,
+            });
+            item
+        };
+        let items = vec![
+            restored_edge("fd-lock"),
+            restored_edge("fs-set-times"),
+            restored_edge("rustix"),
+            restored_edge("winx"),
+        ];
+        let units = group_edge_corrections(&items);
+        assert_eq!(units.len(), 1, "four identical corrections are one row");
+        let EdgeRenderUnit::Group(group) = &units[0] else {
+            panic!("expected a grouped unit");
+        };
+        let status = edge_group_status(group);
+        assert_eq!(status.status, "restored");
+        assert!(
+            status
+                .reason
+                .contains("4 dependents' windows-sys edge bindings")
+        );
+        assert!(status.reason.contains("fd-lock 1.0.0"));
+        assert!(
+            status.reason.contains("+1 more"),
+            "roster caps at three names: {}",
+            status.reason
+        );
+        // A detail-carrying held row for the same package must stay its own unit.
+        let mut held = restored_edge("held-dep");
+        if let Some(edge) = held.edge.as_mut() {
+            edge.action = cooldown_core::EdgeBindingAction::Held;
+            edge.detail = Some("verification failed".to_string());
+        }
+        let mixed = vec![restored_edge("fd-lock"), held];
+        assert_eq!(group_edge_corrections(&mixed).len(), 2);
+        // The same correction observed in a different project (or registry) is a different fact;
+        // merging would attribute one project's edges to the other.
+        let mut other_project = restored_edge("fs-set-times");
+        other_project.project = "other-project".to_string();
+        let mut other_registry = restored_edge("fd-lock");
+        other_registry.registry = Some("registry.example.com".to_string());
+        let cross = vec![
+            restored_edge("fd-lock"),
+            restored_edge("fs-set-times"),
+            other_project,
+            other_registry,
+        ];
+        assert_eq!(
+            group_edge_corrections(&cross).len(),
+            3,
+            "cross-project and cross-registry corrections stay separate"
+        );
+    }
 
     /// Members whose name is the given string and whose path is `path/<name>`.
     fn members(names: &[&str]) -> Vec<MemberRef> {
@@ -1027,6 +1408,13 @@ mod tests {
     }
 
     #[test]
+    fn stale_project_summary_uses_singular_and_plural_words() {
+        assert_eq!(stale_project_word(1), "project");
+        assert_eq!(stale_project_word(0), "projects");
+        assert_eq!(stale_project_word(2), "projects");
+    }
+
+    #[test]
     fn check_table_uses_single_cooldown_column() {
         let out = render_check(
             &CheckMeta {
@@ -1042,6 +1430,7 @@ mod tests {
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,
+                skipped_stale_projects: 0,
             },
             &[CheckItem {
                 name: "github.com/example/pkg".into(),
@@ -1088,6 +1477,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let item = OutdatedItem {
             name: "ruff".into(),
@@ -1137,6 +1527,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let item = OutdatedItem {
             name: "once_cell".into(),
@@ -1218,6 +1609,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         }
     }
 
@@ -1297,6 +1689,7 @@ mod tests {
             held: 6,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
 
         let out = render_outdated(
@@ -1342,6 +1735,7 @@ mod tests {
                 offending: None,
             }),
             error: None,
+            edge: None,
         }
     }
 
@@ -1359,6 +1753,10 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_rebound: 0,
+                edges_held: 0,
+                edges_unaddressable: 0,
             },
             items,
             &[],
@@ -1382,6 +1780,7 @@ mod tests {
             applied: true,
             skipped: None,
             error: None,
+            edge: None,
         }
     }
 
@@ -1458,6 +1857,10 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_rebound: 0,
+                edges_held: 0,
+                edges_unaddressable: 0,
             },
             &items,
             &[],
@@ -1535,6 +1938,10 @@ mod tests {
                 applied: 0,
                 skipped: 1,
                 errors: 0,
+                edges_corrected: 0,
+                edges_rebound: 0,
+                edges_held: 0,
+                edges_unaddressable: 0,
             },
             &items,
             &[],
@@ -1574,6 +1981,10 @@ mod tests {
                 applied: 0,
                 skipped: 0,
                 errors: 0,
+                edges_corrected: 0,
+                edges_rebound: 0,
+                edges_held: 0,
+                edges_unaddressable: 0,
             },
             &[],
             &[],
@@ -1596,6 +2007,7 @@ mod tests {
             held: 0,
             unknown_age: 0,
             errors: 0,
+            skipped_stale_projects: 0,
         };
         let errors = [Diagnostic::new(
             DiagnosticKind::LockfileUnreadable,

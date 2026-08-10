@@ -56,6 +56,18 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
         return result;
     }
 
+    if matches!(cli.command, Command::Recover) {
+        let prepared = match setup::prepare_recovery(global) {
+            Ok(prepared) => prepared,
+            Err(error) if global.json => {
+                let exit = exit_for_error(&error);
+                return commands::run_recover_error(&error, exit);
+            }
+            Err(error) => return Err(error),
+        };
+        return commands::run_recover(prepared);
+    }
+
     // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The
     // config (`[<command>]`/`[global]`) and `--major`/`--no-major` refine this inside `prepare_run`.
     let default_major = matches!(cli.command, Command::Outdated { .. });
@@ -94,13 +106,18 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     // `--sync` (opt-in) writes the policy into native config first, so the command runs against an
     // up-to-date lock and cooldown.toml stays the source of truth. Skipped under `--dry-run` (a dry
     // run must not mutate). Only the dependency commands pre-sync; `sync`/`config`/etc. do not.
+    let mut pre_sync_warnings = Vec::new();
     if global.sync && !opts.dry_run && pre_syncs(&cli.command) {
         let synced = ws.sync(&opts).await;
         if !synced.exit.is_ok() {
             opts.progress.finish_run();
+            for warning in &synced.warnings {
+                eprintln!("warning [{}]: {}", warning.kind, warning.message);
+            }
             eprintln!("sync failed before {}", command_name(&cli.command));
             return Ok(synced.exit);
         }
+        pre_sync_warnings = synced.warnings;
         if synced.summary.written > 0 {
             opts.progress.phase(format!(
                 "synced policy into {} native config(s)",
@@ -110,11 +127,11 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     }
 
     let generated_at = generated_at(ws.now());
-    let mut progress_projects = ws.progress_projects(&opts);
+    let mut progress_project_tools = ws.progress_project_tools(&opts);
     if matches!(cli.command, Command::Explain { .. }) {
-        progress_projects.truncate(1);
+        progress_project_tools.truncate(1);
     }
-    opts.progress.start_run(&progress_projects);
+    opts.progress.start_run(&progress_project_tools);
     let result = commands::dispatch(
         cli.command,
         commands::CommandContext {
@@ -123,6 +140,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
             repo_root: &repo_root,
             color,
             generated_at: &generated_at,
+            pre_sync_warnings: &pre_sync_warnings,
         },
     )
     .await;
@@ -173,6 +191,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Init => "init",
         Command::Schema => "schema",
+        Command::Recover => "recover",
         Command::Sync => "sync",
     }
 }

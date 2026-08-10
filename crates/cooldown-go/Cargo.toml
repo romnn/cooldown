@@ -26,5 +26,7 @@ regex.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+color-eyre.workspace = true
+indoc.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

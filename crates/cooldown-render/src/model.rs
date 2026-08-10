@@ -1,17 +1,17 @@
 //! The serializable view model — the stable `--json` contract. One common envelope, with
 //! command-specific `summary`, `items[]`, and a flattened command-specific top-level `meta`.
 //!
-//! Stability policy: SemVer-style — additive fields don't bump [`SCHEMA_VERSION`]; a
-//! removal/retype/semantic change does. Consumers ignore unknown fields. The `status` and
-//! `minAgeSource` enums are part of the contract.
+//! [`SCHEMA_VERSION`] identifies the exact closed JSON Schema contract.
+//! Any output field or enum change bumps it because schema objects reject unknown properties.
 
 use cooldown_core::{
-    Diagnostic, HeldReason, LockStatus, MemberRef, SkipReason, Status, UpdateKind,
+    Diagnostic, EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status,
+    UpdateKind,
 };
 use serde::{Serialize, Serializer};
 
-/// The JSON schema version. Bumped only on a removal/retype/semantic change.
-pub const SCHEMA_VERSION: u32 = 3;
+/// The JSON schema version.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -266,6 +266,8 @@ impl Serialize for HeldBy {
 pub struct OutdatedSummary {
     /// The total number of dependencies evaluated.
     pub total: usize,
+    /// Projects skipped because their stale lock was allowed but could not be evaluated safely.
+    pub skipped_stale_projects: usize,
     /// The number with status [`OutdatedStatus::Adoptable`].
     pub adoptable: usize,
     /// The number with status [`OutdatedStatus::Blocked`] — matured but held out of the graph by a
@@ -388,6 +390,8 @@ pub struct CheckItem {
 pub struct CheckSummary {
     /// The total number of dependencies checked.
     pub checked: usize,
+    /// Projects skipped because their stale lock was allowed but could not be evaluated safely.
+    pub skipped_stale_projects: usize,
     /// How many of [`checked`](CheckSummary::checked) are direct dependencies.
     pub direct: usize,
     /// The number exempted by an `allow` rule or a pseudo/commit pin (passing, not findings).
@@ -428,7 +432,29 @@ pub struct SkippedInfo {
     pub offending: Option<String>,
 }
 
-/// One row in an `upgrade` or `fix` report: a planned version change and its outcome.
+/// The lock-edge block on an [`UpgradeItem`]: which dependent's edge was rebound between two
+/// coexisting versions of the row's package, and what the edge policy did about it.
+/// Present iff the row reports an edge *binding* move rather than a package version change (cargo
+/// only; see [`cooldown_core::EdgePolicy`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeEdgeInfo {
+    /// The dependent package whose edge moved (e.g. `diesel`).
+    pub dependent: String,
+    /// The dependent's resolved version.
+    pub dependent_version: String,
+    /// The dependent's package source, absent for path and workspace packages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependent_source: Option<String>,
+    /// What the edge policy did or observed.
+    pub action: EdgeBindingAction,
+    /// Source-transition context or the reason a correction was withheld or unaddressable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One row in an `upgrade` or `fix` report: either a package version change or a lock-edge binding
+/// outcome, distinguished by [`edge`](UpgradeItem::edge).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeItem {
@@ -458,22 +484,30 @@ pub struct UpgradeItem {
     pub to: String,
     /// The update kind of the change relative to the current pin.
     pub kind: UpdateKind,
-    /// Whether the change was actually written to the manifest/lock.
+    /// Whether this row's version or edge-binding change is present in the committed result.
     pub applied: bool,
-    /// Why the change was not applied, present iff [`applied`](UpgradeItem::applied) is `false` and no error.
+    /// Why a package version change was not applied.
+    /// Edge outcomes carry their explanation in [`UpgradeEdgeInfo::detail`] instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<SkippedInfo>,
     /// The error that prevented the change, if one occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
+    /// The lock-edge block, present iff this row reports an edge *binding* move between coexisting
+    /// versions rather than a package version change.
+    /// [`from`](UpgradeItem::from)/[`to`](UpgradeItem::to) then carry the binding versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<UpgradeEdgeInfo>,
 }
 
 impl UpgradeItem {
-    /// Ordering key for the report: errored/skipped changes first, planned rows next, and applied
-    /// rows last.
+    /// Ordering key for the report: errored/skipped changes first, planned rows next, applied
+    /// rows after those, and edge-binding rows last (footnotes to the version changes above them).
     #[must_use]
     pub fn sort_rank(&self) -> u8 {
-        if let Some(skip) = &self.skipped {
+        if self.edge.is_some() {
+            5
+        } else if let Some(skip) = &self.skipped {
             if matches!(
                 skip.reason,
                 SkipReason::NeedsMajor
@@ -499,12 +533,27 @@ impl UpgradeItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeSummary {
-    /// The number of changes that were applied.
+    /// The number of package version changes that were applied.
+    /// Edge rows are counted separately.
     pub applied: usize,
     /// The number of planned changes that were skipped.
     pub skipped: usize,
     /// The number of changes that errored.
     pub errors: usize,
+    /// The number of lock-edge bindings a corrective edge policy wrote back (`restored` or
+    /// `canonicalized` rows).
+    /// Counted apart from [`applied`](UpgradeSummary::applied): an edge correction changes the lock
+    /// without moving any package version.
+    pub edges_corrected: usize,
+    /// The number of resolver-produced lock-edge moves that remain in the committed result.
+    pub edges_rebound: usize,
+    /// The number of lock-edge corrections that were withheld (`held` rows).
+    /// Under `--strict` a non-zero count fails the run — a requested correction could not be
+    /// completed.
+    pub edges_held: usize,
+    /// The number of committed edge moves a corrective policy could not address safely.
+    /// Under `--strict` a non-zero count fails the run.
+    pub edges_unaddressable: usize,
 }
 
 /// The post-mutation build result reported in [`UpgradeMeta`].
@@ -521,7 +570,8 @@ pub struct BuildInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeMeta {
-    /// Whether any change was applied (`false` for a dry run).
+    /// Whether any reported package-version or lock-edge mutation is present in the committed
+    /// result (a dry run reports what the real run would apply).
     pub applied: bool,
     /// Re-lock status; `null` for `--dry-run` (which never mutates).
     pub lock_status: Option<LockStatus>,
@@ -645,4 +695,68 @@ pub struct BaselineMeta {
     pub path: String,
     /// Whether the command computed the would-be baseline without writing it.
     pub dry_run: bool,
+}
+
+/// The flattened top-level `meta` for `recover`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryMeta {}
+
+/// Per-status counts for a recovery-only report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverySummary {
+    /// Projects whose interrupted state was settled as accepted, restored, or cleanup-only.
+    pub recovered: usize,
+    /// Projects without interrupted state.
+    pub unchanged: usize,
+    /// Projects that could not be safely recovered.
+    pub errors: usize,
+}
+
+/// One project result in a recovery-only report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryItem {
+    /// The package manager token.
+    pub tool: String,
+    /// The project path relative to the repository root.
+    pub project: String,
+    /// The recovery outcome.
+    pub status: RecoveryStatus,
+}
+
+macro_rules! recovery_statuses {
+    ($( $(#[$attr:meta])* $variant:ident = $wire:literal, )+) => {
+        /// The status of one recovery target.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        pub enum RecoveryStatus {
+            $( $(#[$attr])* #[serde(rename = $wire)] $variant, )+
+        }
+
+        impl RecoveryStatus {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [RecoveryStatus] = &[ $( RecoveryStatus::$variant, )+ ];
+
+            /// Returns the serialized wire token for this status.
+            #[must_use]
+            pub const fn wire_value(self) -> &'static str {
+                match self {
+                    $( RecoveryStatus::$variant => $wire, )+
+                }
+            }
+        }
+    };
+}
+
+recovery_statuses! {
+    /// A completely published accepted candidate was retained.
+    Accepted = "accepted",
+    /// A partial or speculative mutation was restored to its preimage.
+    Restored = "restored",
+    /// Only recovery artifacts remained and were consumed.
+    CleanupOnly = "cleanup_only",
+    /// No interrupted state was present.
+    Unchanged = "unchanged",
+    /// Recovery could not safely complete.
+    Error = "error",
 }

@@ -49,12 +49,63 @@ The lock-only default is honored where the tool can pin an exact in-range versio
 | npm, yarn, bun | *(no such command)* | always rewrites the manifest |
 | Go | `go.mod` *is* the version source | always rewrites the manifest |
 
+Cargo resolver and edge-normalization trials run in an isolated project copy. Cooldown compares the
+source manifests and lock with the preimage used for that trial, then publishes the accepted files
+under one owner-only recovery record. On Unix its directory transitions are durable; other
+platforms use their best available atomic replacement without promising parent-directory
+durability. An interrupted publication can therefore recover the complete
+old or accepted state without treating a rejected resolver trial as source-project state.
+
 ## Transitive dependencies
 
-By default `upgrade` moves the **whole graph**: it advances each dependency to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. `--transitive` relaxes this:
+By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent, a name resolved at several graph copies) is reported held rather than forced. `--transitive` relaxes the default:
 
-- **`--transitive hide`** — direct-only: leave transitive dependencies untouched.
+- **`--transitive hide`** — plan direct dependencies only. A re-lock can still move transitives; such moves stay visible as collateral rows.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
+
+## Lock edge bindings (cargo)
+
+A `Cargo.lock` records not only which versions exist but which coexisting version each dependent's
+edge is **bound** to (`dependencies = ["uuid 0.8.2"]`). When a crate declares a range wide enough to
+admit two locked versions at once — diesel's `uuid = ">=0.7, <2.0"` beside both a `0.8` and a `1.x`
+line — cargo's incremental re-resolves can silently rebind that edge between them. The rebinding is
+build-affecting (the dependent compiles against the other copy) yet invisible at the version level,
+and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` decides what
+`upgrade`/`fix` do about it:
+
+- **`preserve`** (default) — restore an addressable, unambiguous crates.io edge the re-resolve
+  rebound between two still-coexisting versions when its earlier binding still satisfies the
+  active requirement.
+- **`canonicalize`** — cooldown's owned normalization: bind each addressable, unambiguous crates.io
+  edge to the **highest** locked version satisfying the dependent's active requirement, preferring
+  candidates whose declared `rust-version` is workspace-compatible and falling back to the
+  highest satisfying candidate when none is compatible — a cooldown-owned conservative tier
+  inspired by cargo's `incompatible-rust-versions = "fallback"` rule. Unlike
+  `preserve` this also heals bad bindings that predate the run, including on a run that applies no
+  version change at all. It is a policy over the existing package set, not a re-run of cargo's
+  resolver: a workspace on resolver v1/v2 (default `allow`) may see a fresh cargo resolve bind a
+  higher, MSRV-incompatible version where `canonicalize` keeps the compatible one.
+- **`none`** — leave bindings exactly as the resolver produced them.
+
+Every corrected, withheld, unaddressable, or surviving rebind is reported as its own row
+(`restored`, `canonicalized`, `held`, `unaddressable`, or `rebound`) naming the dependent whose
+edge moved. Observation excludes a dependent whose own lock identity changed, an unpaired entry
+that appeared or vanished, and an endpoint that did not coexist in both snapshots; those are
+package-set changes rather than attributable binding-only moves. The report is audited from the
+run-start and final locks, so a temporary held attempt
+that a later batch resolves does not fail `--strict`, and a correction later overwritten does not
+remain `applied`. Corrections are applied as targeted lock edits and re-verified with
+`cargo metadata --locked`. A concrete correction rejected by the orphan guard or verification is
+`held`, with `to` naming the withheld target; when the resolver also moved that edge, a separate
+`rebound` row records the committed move. If a renamed multi-version or source-qualified lock
+entry moves but cannot be mapped safely to one declared requirement, it is `unaddressable` rather
+than being mislabeled as an ordinary rebound. The JSON summary counts edge activity apart from
+version changes (`edgesCorrected`, `edgesRebound`, `edgesHeld`, and `edgesUnaddressable`); each edge row's `applied`
+says whether its binding outcome is present in the committed lock, while top-level `applied` says
+whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a `--strict` run because
+the corrective policy is incomplete. The policy is cargo-specific, so its config placement is too:
+set `edge-policy` under `[tool.cargo]` in the nearest applicable `cooldown.toml`; nearer project
+config wins, then an explicit `--config`, and the CLI flag has highest precedence.
 
 ## Major versions
 
@@ -112,6 +163,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 |---|---|
 | `--transitive <mode>` | `allow` or `hide` — how to treat transitive dependencies (see above). |
 | `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound. |
+| `--cargo-edge-policy <policy>` | cargo: `preserve` (default), `canonicalize`, or `none` — how lock edge bindings are treated after the re-resolve (see above). Config: `[tool.cargo] edge-policy`. |
 | `--build` | Also compile / sync after re-locking. |
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |

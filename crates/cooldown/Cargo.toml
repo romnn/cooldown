@@ -55,6 +55,8 @@ console.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
+same-file.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 cooldown-adapter-util.workspace = true

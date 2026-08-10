@@ -5,7 +5,7 @@
 //! dependency's recorded registry. Both registries speak `SemVer`, so the version model is shared.
 
 use crate::jsr::{JSR, JsrRegistry};
-use crate::lock::split_name_version;
+use crate::lock::{NameVersion, split_name_version};
 use crate::nodecmd::NodeCmd;
 use crate::registry::{NPM, NpmRegistry};
 use crate::tool::{build_releases, classify_quality};
@@ -15,9 +15,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::verify_current_unknown;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project, ProjectMarker,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, Result, SkipReason, Skipped,
-    ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher,
+    ReleaseOrder, Result, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::hash_map::Entry;
@@ -75,18 +76,33 @@ impl DenoTool {
     }
 }
 
+/// The registry-backed parts of a `deno.lock` specifier.
+#[derive(Debug, PartialEq)]
+struct SpecifierParts {
+    /// The registry the specifier's scheme names: [`NPM`] or [`JSR`].
+    registry: &'static str,
+    /// The package name, with a scope's leading `@` preserved.
+    name: String,
+    /// The requested version.
+    version: String,
+}
+
 /// Splits a `deno.lock` specifier (`npm:lodash@4.17.15`, `jsr:@std/path@1.0.0`) into its registry,
 /// package name, and requested version. An unknown scheme (e.g. an `https:` import) yields `None`,
 /// so only registry-backed dependencies are surfaced.
-fn split_specifier(spec: &str) -> Option<(&'static str, String, String)> {
+fn split_specifier(spec: &str) -> Option<SpecifierParts> {
     let (scheme, rest) = spec.split_once(':')?;
     let registry = match scheme {
         "npm" => NPM,
         "jsr" => JSR,
         _ => return None,
     };
-    let (name, version) = split_name_version(rest)?;
-    Some((registry, name, version))
+    let NameVersion { name, version } = split_name_version(rest)?;
+    Some(SpecifierParts {
+        registry,
+        name,
+        version,
+    })
 }
 
 /// The resolved lock's `name -> (registry, newest version)` map, the snapshot `apply` diffs
@@ -106,7 +122,7 @@ fn locked_versions(content: &str) -> HashMap<String, (&'static str, String)> {
             continue;
         };
         for key in section.keys() {
-            let Some((name, version)) = split_name_version(key) else {
+            let Some(NameVersion { name, version }) = split_name_version(key) else {
                 continue;
             };
             match out.entry(name) {
@@ -256,7 +272,7 @@ fn pin_import(root: &Utf8Path, scheme: &str, name: &str, target: &str) -> Result
         let entry = imports.iter().find_map(|(alias, value)| {
             let spec = value.as_str()?;
             split_specifier(spec)
-                .is_some_and(|(reg, n, _)| reg == scheme && n == name)
+                .is_some_and(|parts| parts.registry == scheme && parts.name == name)
                 .then(|| (alias.clone(), spec.to_string()))
         });
         let Some((alias, old_spec)) = entry else {
@@ -330,7 +346,7 @@ fn workspace_direct_specifiers(lock: &serde_json::Value) -> HashSet<(&'static st
             .flatten()
         {
             if let Some(spec) = spec.as_str()
-                && let Some((registry, name, _)) = split_specifier(spec)
+                && let Some(SpecifierParts { registry, name, .. }) = split_specifier(spec)
             {
                 direct.insert((registry, name));
             }
@@ -365,7 +381,7 @@ impl DenoTool {
                 continue;
             };
             for key in section.keys() {
-                let Some((name, version)) = split_name_version(key) else {
+                let Some(NameVersion { name, version }) = split_name_version(key) else {
                     continue;
                 };
                 let is_direct = direct.contains(&(registry, name.clone()));
@@ -409,13 +425,13 @@ impl ToolRead for DenoTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
-        ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: "deno.lock",
             manifest: "deno.json",
             alternate_manifests: &["deno.jsonc"],
             workspace_root: true,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -468,6 +484,10 @@ impl ReleaseFetcher for DenoTool {
 
 #[async_trait]
 impl ToolWrite for DenoTool {
+    fn mutation_tool(&self) -> ToolId {
+        DENO_ID
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -477,15 +497,9 @@ impl ToolWrite for DenoTool {
         // workspace member's pair (an absent one is a no-op to restore) plus the lock, since the
         // resolve narrows whichever manifest declares a pinned import and re-locks. Capturing the
         // member manifests keeps rollback correct when a member-declared candidate is the one pinned.
-        let mut files = Vec::new();
-        for rel in workspace_manifest_rels(&project.root) {
-            files.push(ProjectMutationJournal::capture_file(&project.root, &rel)?);
-        }
-        files.push(ProjectMutationJournal::capture_file(
-            &project.root,
-            Utf8Path::new("deno.lock"),
-        )?);
-        Ok(ProjectMutationJournal { files })
+        let mut paths = workspace_manifest_rels(&project.root);
+        paths.push(Utf8PathBuf::from("deno.lock"));
+        ProjectMutationJournal::capture(&project.root, paths)
     }
 
     /// Re-resolve the **whole** dependency graph once under cooldown's window, pinning every planned
@@ -503,22 +517,18 @@ impl ToolWrite for DenoTool {
     /// result, so every planned candidate is reported reached or held and every collateral move of an
     /// unplanned package surfaces as its own row — no version change is ever silent. A resolver
     /// failure marks all candidates held and lets the caller restore the journal.
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);
         }
 
         let before = journal
-            .files
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("deno.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("deno.lock"))
+            .and_then(ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .map(locked_versions)
             .unwrap_or_default();
@@ -544,9 +554,9 @@ impl ToolWrite for DenoTool {
         match self.cmd.run(&project.root, &args).await {
             Ok(()) => {}
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
-            // The joint resolve is unsatisfiable as a whole. Propagate so the caller's `apply_resilient`
-            // can isolate the offending candidate(s) and apply the rest, instead of holding every
-            // candidate. The caller restores the journal, so no partial lock is kept.
+            // The joint resolve is unsatisfiable as a whole.
+            // Let `apply_resilient` isolate the offending candidate instead of holding the
+            // complete batch; its preserving transaction restores partial work.
             Err(err) => return Err(err),
         }
 
@@ -596,11 +606,19 @@ mod tests {
     fn splits_npm_and_jsr_specifiers() {
         assert_eq!(
             split_specifier("npm:lodash@4.17.15"),
-            Some((NPM, "lodash".into(), "4.17.15".into()))
+            Some(SpecifierParts {
+                registry: NPM,
+                name: "lodash".into(),
+                version: "4.17.15".into()
+            })
         );
         assert_eq!(
             split_specifier("jsr:@std/path@1.0.0"),
-            Some((JSR, "@std/path".into(), "1.0.0".into()))
+            Some(SpecifierParts {
+                registry: JSR,
+                name: "@std/path".into(),
+                version: "1.0.0".into()
+            })
         );
         assert_eq!(split_specifier("https://example.com/mod.ts"), None);
     }

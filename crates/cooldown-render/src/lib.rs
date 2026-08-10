@@ -44,11 +44,12 @@ use serde::Serialize;
 ///         held: 0,
 ///         unknown_age: 0,
 ///         errors: 0,
+///         skipped_stale_projects: 0,
 ///     },
 ///     Vec::<OutdatedItem>::new(),
 /// );
 /// let json = to_json(&env)?;
-/// assert!(json.contains("\"schemaVersion\": 3"));
+/// assert!(json.contains("\"schemaVersion\": 4"));
 /// # Ok::<(), serde_json::Error>(())
 /// ```
 pub fn to_json<M: Serialize, S: Serialize, I: Serialize>(
@@ -78,6 +79,7 @@ mod tests {
                 held: 0,
                 unknown_age: 0,
                 errors: 0,
+                skipped_stale_projects: 0,
             },
             vec![OutdatedItem {
                 name: "golang.org/x/mod".into(),
@@ -108,7 +110,7 @@ mod tests {
         );
         let json = to_json(&env).expect("envelope serializes");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schemaVersion"], 3);
+        assert_eq!(v["schemaVersion"], 4);
         assert_eq!(v["command"], "outdated");
         assert_eq!(v["ok"], true);
         assert_eq!(v["items"][0]["adoptableTarget"], "v0.18.0");
@@ -137,6 +139,7 @@ mod tests {
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,
+                skipped_stale_projects: 0,
             },
             Vec::<CheckItem>::new(),
         );

@@ -76,3 +76,39 @@ cooldown sync
 ```
 
 The same behavior is available as a global `--sync` flag on any command, which syncs before the command runs (a no-op under `--dry-run`). See [Supported ecosystems]({{< relref "../tools/_index.md" >}}) for which tools have a native cooldown that `sync` can write to.
+
+## `recover`
+
+Settle Cargo project state left by an interrupted cooldown mutation, then stop without resolving
+dependencies or applying another change:
+
+```bash
+cooldown recover
+```
+
+Recovery currently supports Cargo only. Selecting another ecosystem with `--tool` is rejected
+instead of reporting an empty successful run.
+
+Read-only commands fail closed when they find a pending transaction; they never repair it as a
+side effect. Recovery validates every recorded manifest and lock state before changing anything.
+It accepts an already complete publication or restores a mixed interrupted publication to its
+complete preimage, and leaves the project and recovery evidence untouched on unknown drift.
+The project-visible record is trusted only when its exact digest matches an owner-private authority
+under the repository's Git common directory. Non-Git projects do not grant recovery authority from
+their project-local coordination files, so recoverable Cargo source mutations currently require a
+Git worktree.
+It discovers Cargo's public marker and orphaned private state/publication artifacts without loading
+policy, manifests, baselines, or registries, so malformed normal-run inputs cannot prevent
+recovery. Setup failures also use the schema-v4 recovery envelope under `--json`.
+
+Repository recovery also inspects trusted authority records and their interrupted private
+publication names. This finds transactions that stopped after authority became durable but before
+the project-visible marker was published, including projects hidden from the ordinary repository
+walk.
+
+A repository-root recovery scan includes hidden and gitignored projects but deliberately skips
+bulk dependency, build, and cache directories: `.cache`, `.venv`, `node_modules`, `target`, and
+`vendor`. To recover an explicitly targeted Cargo project inside one of those directories, run
+`cooldown recover -C path/to/project --cargo`. An explicit scope scans only that directory's
+subtree and relevant ancestors, so unreadable or malformed repository siblings cannot block the
+selected project.

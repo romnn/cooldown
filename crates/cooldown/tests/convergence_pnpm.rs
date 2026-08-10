@@ -1,9 +1,10 @@
 //! End-to-end convergence tests that drive the REAL `pnpm` resolver against fixtures generated on
 //! the fly in temp dirs. These guard the pnpm adapter's whole-graph re-resolve: the adapter pins each
-//! eligible candidate to cooldown's exact target in one joint importer-filtered update, then builds
-//! the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can never silently
-//! move another package, mutually-exclusive peers settle at a single fixed point, and a converged
-//! graph re-applies to a byte-stable lock.
+//! eligible importer-declared candidate to cooldown's exact target in one joint importer-filtered
+//! update — a candidate no importer declares takes the temporary qualified-override leg instead —
+//! then builds the report from the full before/after `pnpm-lock.yaml` diff. So a candidate can
+//! never silently move another package, mutually-exclusive peers settle at a single fixed point,
+//! and a converged graph re-applies to a byte-stable lock.
 //!
 //! # The old bug
 //!
@@ -44,7 +45,8 @@
 
 mod support;
 
-use support::{Fixture, changed_packages, pnpm_lock_pins};
+use color_eyre::eyre;
+use support::{ChangeVersions, Fixture, changed_packages, pnpm_lock_pins};
 
 /// The absolute resolution cutoff. The npm registry's publish history before this instant is
 /// append-mostly (only an unpublish of a fixture dep could change it), so the matured-version set
@@ -274,6 +276,115 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
 }
 
 #[test]
+fn upgrade_advances_a_matured_transitive_no_importer_declares() {
+    skip_if_missing!("pnpm");
+    // The dompurify/quinn-proto class: `agent-base` is exact-pinned so the direct layer is inert,
+    // and no importer declares its transitive `debug` (declared range `^4.3.4`). Seeding under
+    // FREEZE locks debug at 4.3.6 (2024-07-27, the newest release then);
+    // 4.3.7 (2024-09-06) matures under FREEZE_LATER while 4.4.0 (2024-12-06) stays outside it.
+    // `pnpm update debug@…` cannot reach an undeclared package (named selectors match direct
+    // dependencies only, `--depth` notwithstanding), so only the temporary qualified-override leg
+    // can advance it.
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        r#"{ "name": "transitive-advance", "private": true, "dependencies": { "agent-base": "7.1.1" } }"#,
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, FREEZE);
+    let seeded = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        seeded.contains("debug@4.3.6"),
+        "seed sanity: registry history as of FREEZE locks debug at 4.3.6"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert!(
+        report.applied_names().contains("debug"),
+        "the transitive advance must be its own applied row, applied={:?}",
+        report.applied_names()
+    );
+    let lock = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        lock.contains("debug@4.3.7"),
+        "debug advances to the newest release matured under FREEZE_LATER"
+    );
+    assert!(
+        !lock.contains("overrides:"),
+        "the temporary override must not persist in the settled lock"
+    );
+
+    // Converged: a second run under the same freeze plans nothing new.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        second.applied_names().is_empty(),
+        "a converged graph re-applies to a fixed point, applied={:?}",
+        second.applied_names()
+    );
+}
+
+/// The settlement's self-validation: a transitive advance whose target a dependent's declared
+/// range excludes must NOT survive the temporary override — the override-free settlement reverts
+/// the pin instead of committing a broken constraint, and the row reports the hold truthfully.
+#[test]
+fn upgrade_reverts_a_transitive_advance_a_dependents_exact_pin_excludes() {
+    skip_if_missing!("pnpm");
+    // A first-party `file:` dependency exact-pins `debug 4.3.6`, standing in for the
+    // monaco-editor/dompurify shape: no importer declares debug, so the advance rides the
+    // qualified-override leg; 4.3.7 matures under FREEZE_LATER, the override forces it, and the
+    // settlement must take it back — 4.3.6 is the only version the pinner admits.
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        r#"{ "name": "settlement-revert", "private": true, "dependencies": { "pinner": "file:./pinner" } }"#,
+    );
+    fixture.write(
+        "pinner/package.json",
+        r#"{ "name": "pinner", "version": "1.0.0", "dependencies": { "debug": "4.3.6" } }"#,
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, FREEZE);
+    let seeded = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        seeded.contains("debug@4.3.6"),
+        "seed sanity: the exact pin locks debug at 4.3.6"
+    );
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(report.ok(), "a held advance is a skip, not an error");
+    assert!(
+        report.held_conflict_names().contains("debug"),
+        "the reverted advance is a held row, held={:?}",
+        report.held_conflict_names()
+    );
+    let detail = report.skip_detail_for("debug").unwrap_or_default();
+    assert!(
+        detail.contains("holds it at 4.3.6"),
+        "the hold names where the settlement actually left the copy: {detail}"
+    );
+    let lock = String::from_utf8(fixture.read_bytes("pnpm-lock.yaml")).expect("lock is utf-8");
+    assert!(
+        lock.contains("debug@4.3.6") && !lock.contains("debug@4.3.7"),
+        "the settlement reverts the out-of-range advance instead of committing it"
+    );
+    assert!(
+        !lock.contains("overrides:"),
+        "the temporary override must not persist in the settled lock"
+    );
+
+    // Converged: the held advance stays held, nothing oscillates.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE_LATER]);
+    assert!(second.ok(), "converged re-run should succeed");
+    assert!(
+        second.applied_names().is_empty(),
+        "a held advance must not oscillate into an applied row, applied={:?}",
+        second.applied_names()
+    );
+}
+
+#[test]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("pnpm");
     let fixture = conflict_fixture(FREEZE);
@@ -374,11 +485,7 @@ fn fix_matures_too_fresh_deps_and_is_idempotent() {
     );
 }
 
-/// `outdated` and `fix` recover after `sync` activates pnpm's native release-age gate.
-#[test]
-fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
-    skip_if_missing!("pnpm");
-
+fn native_minimum_age_migration_fixture() -> eyre::Result<(Fixture, Vec<u8>)> {
     // Seed without a persistent native policy so the lock can contain versions newer than FREEZE.
     // `nanoid` remains intentionally exempt after sync; the repair must preserve that native
     // exemption while adding exact allowances for the versions it is repairing. TypeScript is
@@ -389,10 +496,22 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
     fixture.write(".npmrc", NPMRC);
     add_root_dependency(&fixture, "nanoid", "^3.3.0");
     add_root_dependency(&fixture, "typescript", "^5.0.0");
-    seed_lock(&fixture, FREEZE_LATER);
     let seed_minutes = minimum_release_age_minutes(FREEZE_LATER).to_string();
     fixture
-        .run_tool(
+        .run_tool_traced(
+            "seed pre-policy lock",
+            "pnpm",
+            &[
+                "install",
+                "--lockfile-only",
+                &format!("--config.minimumReleaseAge={seed_minutes}"),
+            ],
+            &[],
+        )?
+        .require_success()?;
+    fixture
+        .run_tool_traced(
+            "pin independently adoptable TypeScript",
             "pnpm",
             &[
                 "update",
@@ -402,8 +521,8 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
                 &format!("--config.minimumReleaseAge={seed_minutes}"),
             ],
             &[],
-        )
-        .expect_success();
+        )?
+        .require_success()?;
     fixture.write("cooldown.toml", "[package.nanoid]\nlatest = true\n");
     let minimum_age_minutes = minimum_release_age_minutes(FREEZE);
     let min_age = format!("{minimum_age_minutes}m");
@@ -411,10 +530,13 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
     // Activating the native gate after resolution makes pnpm reject the existing lock. This is the
     // migration state `fix` must cross rather than misclassifying every downgrade as a conflict.
     fixture
-        .cooldown(&["sync", "--tool", "pnpm", "--min-age", &min_age])
-        .expect_success();
+        .cooldown_traced(
+            "activate native minimum age",
+            &["sync", "--tool", "pnpm", "--min-age", &min_age],
+        )?
+        .require_success()?;
     let native_before_fix = fixture.read_bytes("pnpm-workspace.yaml");
-    let native = String::from_utf8(native_before_fix.clone()).expect("native config is utf8");
+    let native = String::from_utf8(native_before_fix.clone())?;
     assert!(
         native.contains(&format!("minimumReleaseAge: {minimum_age_minutes}")),
         "sync must persist the requested native release-age gate: {native}"
@@ -423,9 +545,17 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         native.contains("minimumReleaseAgeExclude:") && native.contains("nanoid"),
         "sync must persist the package exemption the repair needs to preserve: {native}"
     );
+    Ok((fixture, native_before_fix))
+}
 
+fn assert_native_gate_rejects_starting_lock(fixture: &Fixture) -> eyre::Result<()> {
     let lock_before_rejection = fixture.read_bytes("pnpm-lock.yaml");
-    let rejected = fixture.run_tool("pnpm", &["install", "--lockfile-only"], &[]);
+    let rejected = fixture.run_tool_traced(
+        "verify the starting lock is rejected",
+        "pnpm",
+        &["install", "--lockfile-only"],
+        &[],
+    )?;
     let rejection = format!("{}\n{}", rejected.stdout_str(), rejected.stderr_str());
     assert!(
         !rejected.status.success(),
@@ -440,8 +570,21 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         fixture.read_bytes("pnpm-lock.yaml"),
         "the raw preflight probe must leave the rejected lock unchanged"
     );
+    Ok(())
+}
 
-    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE]);
+/// `outdated` and `fix` recover after `sync` activates pnpm's native release-age gate.
+#[test]
+fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+
+    let (fixture, native_before_fix) = native_minimum_age_migration_fixture()?;
+    assert_native_gate_rejects_starting_lock(&fixture)?;
+
+    let outdated = fixture.cooldown_json_traced(
+        "evaluate outdated from rejected lock",
+        &["outdated", "--freeze", FREEZE],
+    )?;
     assert!(outdated.ok(), "outdated should complete: {outdated:#?}");
     assert!(
         outdated
@@ -456,7 +599,8 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         "the valid TypeScript update must not be blocked by the starting-lock preflight"
     );
 
-    let fixed = fixture.cooldown_json(&["fix", "--freeze", FREEZE]);
+    let fixed =
+        fixture.cooldown_json_traced("repair the rejected lock", &["fix", "--freeze", FREEZE])?;
     assert!(
         fixed.ok(),
         "fix should repair the pre-policy lock: {fixed:#?}"
@@ -478,9 +622,11 @@ fn outdated_and_fix_recover_after_sync_activates_native_minimum_age() {
         "temporary repair overrides must not leak into native config"
     );
 
-    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    let check =
+        fixture.cooldown_json_traced("verify the repaired lock", &["check", "--freeze", FREEZE])?;
     assert!(check.ok(), "the repaired lock should satisfy the policy");
     assert_eq!(check.summary_violations(), 0);
+    Ok(())
 }
 
 /// The per-package-window fixture's manifest: a single direct `eslint` on the v9 line with a caret
@@ -569,7 +715,7 @@ fn upgrade_honors_a_stricter_per_package_window() {
     );
     assert_pnpm_lock_current(&upgrade);
 
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
@@ -710,7 +856,7 @@ fn upgrade_moves_a_root_declared_dependency_in_a_workspace() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");
@@ -750,7 +896,7 @@ fn upgrade_moves_a_member_declared_dependency() {
         upgrade.applied_names(),
         upgrade.held_conflict_names()
     );
-    let (from, to) = upgrade
+    let ChangeVersions { from, to } = upgrade
         .change_for("eslint")
         .expect("eslint should be in the report");
     assert_eq!(from, "9.0.0", "eslint started at the seeded 9.0.0");

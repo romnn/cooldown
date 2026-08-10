@@ -52,6 +52,7 @@ This is safe by construction: the graph floor *is* a version every requirer alre
 |---|---|
 | `--transitive <mode>` | `allow` or `hide` — how to treat too-fresh transitive dependencies (see above). |
 | `--downgrade-pinned` | Downgrade and rewrite exact-pinned dependencies too (off by default). |
+| `--cargo-edge-policy <policy>` | cargo: `preserve` (default), `canonicalize`, or `none` — how lock edge bindings are treated after the re-resolve (see [upgrade]({{< relref "upgrade.md" >}}#lock-edge-bindings-cargo)). Config: `[tool.cargo] edge-policy`. |
 | `--strict` | Exit `1` if the fix cannot complete cleanly. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 

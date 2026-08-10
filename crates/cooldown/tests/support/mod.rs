@@ -28,9 +28,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use color_eyre::eyre;
 use cooldown_adapter_util::{program_on_path, resolve_program};
 
 const TOOL_ATTEMPTS: usize = 3;
@@ -44,6 +45,25 @@ pub struct Fixture {
 impl Fixture {
     /// Create an empty fixture rooted at a fresh temp dir.
     pub fn new() -> Self {
+        let fixture = Self::new_non_git();
+        // Anchor discovery when an ambient ancestor belongs to another Git repository.
+        std::fs::create_dir(fixture.dir.path().join(".git")).expect("create fixture Git anchor");
+        // The valid Git metadata gives mutation fixtures an external recovery trust domain.
+        std::fs::write(
+            fixture.dir.path().join(".git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write fixture Git HEAD");
+        fixture
+    }
+
+    /// Create an empty fixture WITHOUT the Git anchor: a plain non-Git project directory, so
+    /// cooldown's coordination namespace falls back to the repo-root `.cooldown/locks` directory
+    /// instead of a Git common directory. This relies on the ambient temp dir having no Git
+    /// ancestor of its own (true for standard system temp dirs) — with one, discovery would anchor
+    /// there, which is exactly what [`Fixture::new`]'s stamp defends against. Tests that model a
+    /// Git checkout (or run `git init` themselves) keep using [`Fixture::new`].
+    pub fn new_non_git() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("cooldown-it-")
             .tempdir()
@@ -86,6 +106,17 @@ impl Fixture {
     /// Run a raw command in the project root, returning its captured output. Used to drive the real
     /// package manager when seeding a starting lock (e.g. `uv lock --exclude-newer …`).
     pub fn run_tool(&self, program: &str, args: &[&str], envs: &[(&str, &str)]) -> CapturedOutput {
+        self.run_tool_result(program, args, envs, None)
+            .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
+    }
+
+    fn run_tool_result(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        phase: Option<&str>,
+    ) -> eyre::Result<CapturedOutput> {
         let executable = resolve_program(program);
         let mut attempt = 1;
         loop {
@@ -94,15 +125,16 @@ impl Fixture {
             for (key, value) in envs {
                 command.env(key, value);
             }
-            let output = command
-                .output()
-                .unwrap_or_else(|err| panic!("spawn {program}: {err}"));
+            let output = match phase {
+                Some(phase) => traced_output(&mut command, phase)?,
+                None => command.output()?,
+            };
             let captured = CapturedOutput::from(program, args, output);
             if captured.status.success()
                 || !captured.is_transient_tool_failure()
                 || attempt == TOOL_ATTEMPTS
             {
-                return captured;
+                return Ok(captured);
             }
             eprintln!(
                 "retrying transient tool failure ({}/{TOOL_ATTEMPTS}): {}",
@@ -114,6 +146,24 @@ impl Fixture {
             ));
             attempt += 1;
         }
+    }
+
+    /// Runs a raw command while identifying its phase and retaining its captured diagnostics.
+    pub fn run_tool_traced(
+        &self,
+        phase: &str,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> eyre::Result<CapturedOutput> {
+        eprintln!(
+            "starting integration phase `{phase}`: {program} {}",
+            args.join(" ")
+        );
+        let started = Instant::now();
+        let captured = self.run_tool_result(program, args, envs, Some(phase))?;
+        trace_captured_phase(phase, started, &captured);
+        Ok(captured)
     }
 
     /// Run the built `cooldown` binary against the fixture with the given args, capturing output.
@@ -132,6 +182,26 @@ impl Fixture {
         CapturedOutput::from("cooldown", args, output)
     }
 
+    /// Runs cooldown while identifying its phase and retaining its captured diagnostics.
+    pub fn cooldown_traced(&self, phase: &str, args: &[&str]) -> eyre::Result<CapturedOutput> {
+        eprintln!(
+            "starting integration phase `{phase}`: cooldown {}",
+            args.join(" ")
+        );
+        let started = Instant::now();
+        let exe = env!("CARGO_BIN_EXE_cooldown");
+        let mut command = Command::new(exe);
+        command
+            .current_dir(self.dir.path())
+            .args(args)
+            .args(self.tag_independent.then_some("--no-respect-dist-tags"))
+            .arg("--dir")
+            .arg(self.dir.path());
+        let captured = CapturedOutput::from("cooldown", args, traced_output(&mut command, phase)?);
+        trace_captured_phase(phase, started, &captured);
+        Ok(captured)
+    }
+
     /// Run a `cooldown` subcommand with `--json` and parse the envelope. Panics with the captured
     /// stderr if the binary did not emit valid JSON, so a resolver/setup failure is legible.
     pub fn cooldown_json(&self, args: &[&str]) -> Envelope {
@@ -148,6 +218,79 @@ impl Fixture {
             });
         Envelope { value }
     }
+
+    /// Runs a JSON command while identifying its phase and retaining its captured diagnostics.
+    pub fn cooldown_json_traced(&self, phase: &str, args: &[&str]) -> eyre::Result<Envelope> {
+        let mut full: Vec<&str> = args.to_vec();
+        full.push("--json");
+        let captured = self.cooldown_traced(phase, &full)?;
+        let value: serde_json::Value = serde_json::from_slice(&captured.stdout).map_err(|error| {
+            eyre::eyre!(
+                "cooldown {args:?} did not emit JSON: {error}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                captured.stdout_str(),
+                captured.stderr_str(),
+            )
+        })?;
+        Ok(Envelope { value })
+    }
+}
+
+fn traced_output(command: &mut Command, phase: &str) -> eyre::Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| eyre::eyre!("traced command did not expose stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| eyre::eyre!("traced command did not expose stderr"))?;
+    let (status, stdout, stderr) = std::thread::scope(|scope| -> eyre::Result<_> {
+        let stdout = scope.spawn(|| capture_traced_stream(stdout, phase, "stdout"));
+        let stderr = scope.spawn(|| capture_traced_stream(stderr, phase, "stderr"));
+        let status = child.wait()?;
+        let stdout = stdout
+            .join()
+            .map_err(|_| eyre::eyre!("traced stdout reader panicked"))??;
+        let stderr = stderr
+            .join()
+            .map_err(|_| eyre::eyre!("traced stderr reader panicked"))??;
+        Ok((status, stdout, stderr))
+    })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn capture_traced_stream(
+    mut stream: impl std::io::Read,
+    phase: &str,
+    name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| std::io::Error::other("stream read exceeded its buffer"))?;
+        captured.extend_from_slice(chunk);
+        eprintln!("[{phase} {name}] {}", String::from_utf8_lossy(chunk));
+    }
+}
+
+fn trace_captured_phase(phase: &str, started: Instant, captured: &CapturedOutput) {
+    eprintln!(
+        "completed integration phase `{phase}` in {:?}: status={:?}",
+        started.elapsed(),
+        captured.status.code(),
+    );
 }
 
 /// Captured stdout/stderr/status of a subprocess run.
@@ -216,6 +359,76 @@ impl CapturedOutput {
         );
         self
     }
+
+    /// Returns successful output or an error containing both captured streams.
+    pub fn require_success(self) -> eyre::Result<Self> {
+        if self.status.success() {
+            return Ok(self);
+        }
+        Err(eyre::eyre!(
+            "command failed ({}): status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.label,
+            self.status.code(),
+            self.stdout_str(),
+            self.stderr_str(),
+        ))
+    }
+}
+
+/// The `from -> to` versions of one reported change row, extracted by
+/// [`Envelope::change_for`]/[`Envelope::changes_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeVersions {
+    /// The version the row moves from.
+    pub from: String,
+    /// The version the row moves to.
+    pub to: String,
+}
+
+impl ChangeVersions {
+    pub fn new(from: &str, to: &str) -> Self {
+        ChangeVersions {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+}
+
+/// One lock-edge row of an `upgrade`/`fix` report (an item carrying an `edge` block), extracted by
+/// [`Envelope::edge_rows`].
+#[derive(Debug)]
+pub struct EdgeRow {
+    /// The dependency whose binding moved (the row's package column).
+    pub dependency: String,
+    /// The dependent package whose edge it is.
+    pub dependent: String,
+    /// The dependent package's source-bearing lock identity, when present.
+    pub dependent_source: Option<String>,
+    /// The policy outcome: `restored`, `canonicalized`, `rebound`, `held`, or `unaddressable`.
+    pub action: String,
+    /// Whether this binding outcome is present in the committed lock.
+    pub applied: bool,
+    /// The binding version before the move (for `held`, the binding that stays in place).
+    pub from: String,
+    /// The binding version after the move (for `held`, the withheld correction target).
+    pub to: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawEdgeRow {
+    name: String,
+    applied: bool,
+    from: String,
+    to: String,
+    edge: RawEdgeInfo,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEdgeInfo {
+    dependent: String,
+    dependent_source: Option<String>,
+    action: String,
 }
 
 /// A parsed `cooldown --json` envelope with typed accessors for the fields the invariants check.
@@ -270,6 +483,30 @@ impl Envelope {
 
     pub fn summary_violations(&self) -> u64 {
         self.summary_u64("violations")
+    }
+
+    pub fn summary_edges_corrected(&self) -> u64 {
+        self.summary_u64("edgesCorrected")
+    }
+
+    pub fn summary_edges_rebound(&self) -> u64 {
+        self.summary_u64("edgesRebound")
+    }
+
+    pub fn summary_edges_held(&self) -> u64 {
+        self.summary_u64("edgesHeld")
+    }
+
+    pub fn summary_edges_unaddressable(&self) -> u64 {
+        self.summary_u64("edgesUnaddressable")
+    }
+
+    /// `meta.applied` (flattened at the top level): whether any reported mutation is committed.
+    pub fn meta_applied(&self) -> bool {
+        self.value
+            .get("applied")
+            .and_then(serde_json::Value::as_bool)
+            .expect("envelope.applied")
     }
 
     /// The number of *direct* dependencies `check` flagged as a cooldown violation (`direct == true`
@@ -340,6 +577,19 @@ impl Envelope {
             .collect()
     }
 
+    /// The named item's skip detail line (serialized as `skipped.message`), when present.
+    pub fn skip_detail_for(&self, name: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("skipped")
+                .and_then(|skipped| skipped.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    }
+
     pub fn skipped_reasons(&self) -> BTreeSet<String> {
         self.items()
             .iter()
@@ -399,26 +649,50 @@ impl Envelope {
     }
 
     /// The `from -> to` change reported for a named item, if present.
-    pub fn change_for(&self, name: &str) -> Option<(String, String)> {
+    pub fn change_for(&self, name: &str) -> Option<ChangeVersions> {
         self.items().iter().find_map(|item| {
             if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
                 return None;
             }
-            let from = item.get("from")?.as_str()?.to_owned();
-            let to = item.get("to")?.as_str()?.to_owned();
-            Some((from, to))
+            Some(ChangeVersions {
+                from: item.get("from")?.as_str()?.to_owned(),
+                to: item.get("to")?.as_str()?.to_owned(),
+            })
         })
     }
 
     /// Every `from -> to` row reported for a package, preserving report order.
-    pub fn changes_for(&self, name: &str) -> Vec<(String, String)> {
+    pub fn changes_for(&self, name: &str) -> Vec<ChangeVersions> {
         self.items()
             .iter()
             .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
             .filter_map(|item| {
-                let from = item.get("from")?.as_str()?.to_owned();
-                let to = item.get("to")?.as_str()?.to_owned();
-                Some((from, to))
+                Some(ChangeVersions {
+                    from: item.get("from")?.as_str()?.to_owned(),
+                    to: item.get("to")?.as_str()?.to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    /// The lock-edge rows of an `upgrade`/`fix` report, in report order.
+    /// Empty when no edge binding moved (or the tool has no edge policy).
+    pub fn edge_rows(&self) -> Vec<EdgeRow> {
+        self.items()
+            .iter()
+            .filter(|item| item.get("edge").is_some())
+            .map(|item| {
+                let raw: RawEdgeRow = serde_json::from_value(item.clone())
+                    .expect("edge-bearing upgrade row matches the JSON schema");
+                EdgeRow {
+                    dependency: raw.name,
+                    dependent: raw.edge.dependent,
+                    dependent_source: raw.edge.dependent_source,
+                    action: raw.edge.action,
+                    applied: raw.applied,
+                    from: raw.from,
+                    to: raw.to,
+                }
             })
             .collect()
     }
@@ -429,6 +703,10 @@ impl Envelope {
 
     pub fn error_kinds(&self) -> BTreeSet<String> {
         self.diagnostic_values("errors", "kind")
+    }
+
+    pub fn error_messages(&self) -> BTreeSet<String> {
+        self.diagnostic_values("errors", "message")
     }
 
     pub fn warning_paths(&self) -> BTreeSet<String> {
@@ -478,7 +756,7 @@ pub fn tool_on_path(tool: &str) -> bool {
 /// failure rather than a passing skipped test.
 #[macro_export]
 macro_rules! skip_if_missing {
-    ($tool:expr) => {
+    ($tool:expr, $return:expr) => {
         let tool = $tool;
         if !$crate::support::tool_on_path(tool) {
             assert!(
@@ -489,8 +767,11 @@ macro_rules! skip_if_missing {
                 "skipping: `{}` not found on PATH (provision it via the repo `mise.toml`)",
                 tool
             );
-            return;
+            return $return;
         }
+    };
+    ($tool:expr) => {
+        $crate::skip_if_missing!($tool, ());
     };
 }
 
@@ -563,15 +844,15 @@ pub fn go_mod_pins(go_mod: &[u8]) -> BTreeMap<String, String> {
         if in_block {
             if line == ")" {
                 in_block = false;
-            } else if let Some((path, version)) = go_require_pair(line) {
-                pins.insert(path, version);
+            } else if let Some(require) = go_require_pair(line) {
+                pins.insert(require.path, require.version);
             }
         } else if line == "require (" {
             in_block = true;
         } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some((path, version)) = go_require_pair(rest.trim())
+            && let Some(require) = go_require_pair(rest.trim())
         {
-            pins.insert(path, version);
+            pins.insert(require.path, require.version);
         }
     }
     pins
@@ -672,14 +953,23 @@ pub fn deno_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
     pins
 }
 
-/// Split a `module/path v1.2.3` line into `(path, version)`, requiring a `v`-prefixed second field.
-fn go_require_pair(line: &str) -> Option<(String, String)> {
+/// One `go.mod` require line split into its parts.
+struct GoRequire {
+    /// The required module path.
+    path: String,
+    /// The `v`-prefixed pinned version.
+    version: String,
+}
+
+/// Split a `module/path v1.2.3` line, requiring a `v`-prefixed second field.
+fn go_require_pair(line: &str) -> Option<GoRequire> {
     let mut fields = line.split_whitespace();
     let path = fields.next()?;
     let version = fields.next()?;
-    version
-        .starts_with('v')
-        .then(|| (path.to_string(), version.to_string()))
+    version.starts_with('v').then(|| GoRequire {
+        path: path.to_string(),
+        version: version.to_string(),
+    })
 }
 
 /// Extract the quoted value of a `key = "value"` line, if the line is exactly that field.

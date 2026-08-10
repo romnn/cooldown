@@ -10,16 +10,17 @@ use crate::pypi::{PYPI, PyPi};
 use crate::uvcmd::Uv;
 use crate::version;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
     ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan, Project,
-    ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, ResolvedPolicy, Result,
+    RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -165,18 +166,18 @@ impl ToolRead for UvTool {
         }
     }
 
-    fn project_marker(&self) -> ProjectMarker {
+    fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // Each `uv.lock` marks an independent project. A uv *workspace* keeps a single lock at its
         // root and its members carry only a `pyproject.toml` (no nested lock), so a `uv.lock` found
         // below another is never a workspace member — it is a separate project that resolves on its
         // own and must be synced/checked in its own right. Hence `workspace_root: false`: nested
         // locks are not collapsed into the topmost one.
-        ProjectMarker {
+        cooldown_core::ProjectDetection::Primary(ProjectMarker {
             lockfile: "uv.lock",
             manifest: "pyproject.toml",
             alternate_manifests: &[],
             workspace_root: false,
-        }
+        })
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -675,8 +676,107 @@ impl UvTool {
     }
 }
 
+/// Directory names the generic preview copy prunes from its selective tree walk.
+///
+/// Mirrors `SKIP_DIRS` in the application's `project_copy` module: the adapter needs the list to
+/// tell which in-tree directory sources the copy would drop, but it cannot import the binary
+/// crate that owns the walk. A unit test beside `SKIP_DIRS` pins the two lists equal so they
+/// cannot drift apart silently.
+pub const PREVIEW_PRUNED_DIRS: &[&str] = &[
+    ".venv",
+    "venv",
+    ".git",
+    ".jj",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "vendor",
+    "testdata",
+];
+
+/// Whether the selective preview copy would drop an in-tree directory at `rel`
+/// (project-relative): some path component is a pruned directory name, or the path sits under a
+/// top-level dot directory (which the walk descends only for explicit config path-prefixes no
+/// Python source ever occupies). Erring toward staging is safe — a root the walk would also
+/// reproduce is merely copied twice into the same position.
+fn preview_copy_prunes(rel: &Utf8Path) -> bool {
+    let under_dot_dir = rel
+        .components()
+        .next()
+        .is_some_and(|component| component.as_str().starts_with('.'));
+    under_dot_dir
+        || rel
+            .components()
+            .any(|component| PREVIEW_PRUNED_DIRS.contains(&component.as_str()))
+}
+
 #[async_trait]
 impl ToolWrite for UvTool {
+    fn mutation_tool(&self) -> ToolId {
+        UV_ID
+    }
+
+    fn supports_transitive_advance(&self) -> bool {
+        // `uv lock --upgrade-package name==version` re-pins any locked package, declared or not.
+        true
+    }
+
+    fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
+        // `uv lock` regenerates metadata for every local source in the lock — editable installs,
+        // directory dependencies, and local archives (`path` sources, a wheel/sdist file) — via
+        // the PEP 517 backend or the archive itself. A source outside the project root must
+        // therefore be staged into a preview copy at its relative position, or the copy's resolve
+        // fails with "Distribution not found" at a path that only exists in the real tree. A
+        // `path` archive contributes its file path; the copy stages single-file roots directly.
+        // An *in-tree* archive file is surfaced too: the selective preview copy keeps only
+        // resolver inputs, and a `.whl`/`.tar.gz` basename matches none of them, so without
+        // explicit staging the copy loses the very file the resolver reads. An in-tree
+        // *directory* source is surfaced only when the selective copy would drop it — when its
+        // project-relative path passes through a pruned directory (`vendor/`, `testdata/`, a
+        // top-level dot-dir); anywhere else the copy already reproduces its manifests and
+        // sources in place. Best-effort: an unreadable lock or a stale entry pointing at a
+        // removed source contributes nothing.
+        let Ok(lock) = read_lock(project) else {
+            return Vec::new();
+        };
+        let Ok(project_root) = std::fs::canonicalize(project.root.as_std_path()) else {
+            return Vec::new();
+        };
+        let mut roots = std::collections::BTreeSet::new();
+        for package in &lock.packages {
+            let Some(source) = &package.source else {
+                continue;
+            };
+            for rel in [
+                &source.editable,
+                &source.directory,
+                &source.r#virtual,
+                &source.path,
+            ] {
+                let Some(rel) = rel.as_deref().filter(|rel| !rel.is_empty() && *rel != ".") else {
+                    continue;
+                };
+                let Ok(abs) = std::fs::canonicalize(project.root.join(rel).as_std_path()) else {
+                    continue;
+                };
+                let Ok(abs) = Utf8PathBuf::from_path_buf(abs) else {
+                    continue;
+                };
+                let staged = match abs.strip_prefix(&project_root) {
+                    // An out-of-tree source is always staged: the copy has no other way to see it.
+                    Err(_) => true,
+                    Ok(in_tree) => abs.is_file() || preview_copy_prunes(in_tree),
+                };
+                if staged {
+                    roots.insert(abs);
+                }
+            }
+        }
+        roots.into_iter().collect()
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `uv lock` builds local/workspace-member metadata via the PEP 517 backend for a `dynamic`
         // version or `readme`/`license = {file = ...}`, which reads `.py` source (e.g. `_version.py`).
@@ -695,23 +795,14 @@ impl ToolWrite for UvTool {
         // Capture the lock and the manifest: `apply` re-locks (uv.lock) and, when the target falls
         // outside the declared requirement, rewrites the constraint (pyproject.toml). Capturing the
         // manifest unconditionally is harmless — restore runs only on rollback.
-        Ok(ProjectMutationJournal {
-            files: vec![
-                ProjectMutationJournal::capture_file(&project.root, Utf8Path::new("uv.lock"))?,
-                ProjectMutationJournal::capture_file(
-                    &project.root,
-                    Utf8Path::new("pyproject.toml"),
-                )?,
-            ],
-        })
+        ProjectMutationJournal::capture(
+            &project.root,
+            [Utf8Path::new("uv.lock"), Utf8Path::new("pyproject.toml")],
+        )
     }
 
-    async fn apply(
-        &self,
-        project: &Project,
-        plan: &Plan,
-        journal: &ProjectMutationJournal,
-    ) -> Result<ApplyReport> {
+    async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             return Ok(report);
@@ -773,10 +864,10 @@ impl ToolWrite for UvTool {
         // snapshot against the result, so *every* net version change is surfaced. A missing/unparsable
         // snapshot leaves `before` empty, so a package that moved is still reported (never silent).
         let before = journal
-            .files
+            .files()
             .iter()
-            .find(|file| file.path == Utf8Path::new("uv.lock"))
-            .and_then(|file| file.contents.as_deref())
+            .find(|file| file.path() == Utf8Path::new("uv.lock"))
+            .and_then(cooldown_core::ProjectMutationFile::contents)
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .and_then(|content| UvLock::parse(content).ok())
             .map(|lock| locked_versions(&lock))
@@ -892,6 +983,7 @@ impl ToolWrite for UvTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use color_eyre::eyre;
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::{ArtifactId, Change, CoreError, FetchContext, RawArtifact, RawRelease};
     use indoc::indoc;
@@ -1142,7 +1234,7 @@ mod tests {
         };
 
         let result = skipped_on_apply_error(&change, err);
-        assert!(matches!(result, Err(CoreError::ToolSpawn { .. })));
+        std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
     #[test]
@@ -1281,23 +1373,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_journal_restore_removes_lock_created_after_capture() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+    async fn mutation_journal_restore_removes_lock_created_after_capture() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let manifest = root.join("pyproject.toml");
         std::fs::write(
             &manifest,
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("write manifest");
-        let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let eco = UvTool::from_http(
-            cooldown_registry::SharedHttp::new(
-                cache_dir.path(),
-                cooldown_registry::HttpOptions::default(),
-            )
-            .expect("http"),
-        );
+        )?;
+        let cache_dir = tempfile::tempdir()?;
+        let eco = UvTool::from_http(cooldown_registry::SharedHttp::new(
+            cache_dir.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
         let project = Project {
             root: root.clone(),
             kind: UV_ID,
@@ -1305,15 +1394,13 @@ mod tests {
             exclude_newer: None,
         };
 
-        let journal = eco
-            .mutation_journal(&project, &Plan::default())
-            .await
-            .expect("journal");
+        let journal = eco.mutation_journal(&project, &Plan::default()).await?;
         let lock = root.join("uv.lock");
-        std::fs::write(&lock, "generated").expect("write lock");
+        std::fs::write(&lock, "generated")?;
 
-        journal.restore(&project.root).expect("restore");
+        journal.restore()?;
         assert!(!lock.exists());
+        Ok(())
     }
 
     fn uv_tool() -> UvTool {
@@ -1350,7 +1437,7 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(first, SyncReport::Written { .. }));
+        std::assert_matches!(first, SyncReport::Written { .. });
         // The flat top-level key is written into the repo-root uv.toml, not the [tool.uv] nested form.
         let written = std::fs::read_to_string(&uv_toml).expect("read uv.toml");
         assert!(
@@ -1364,7 +1451,7 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(second, SyncReport::Unchanged { .. }));
+        std::assert_matches!(second, SyncReport::Unchanged { .. });
     }
 
     #[tokio::test]
@@ -1381,8 +1468,241 @@ mod tests {
             .write_repo_native(&root, &policy, false)
             .await
             .expect("write");
-        assert!(matches!(report, SyncReport::Unchanged { .. }));
+        std::assert_matches!(report, SyncReport::Unchanged { .. });
         // A `Latest` window excludes nothing, so no uv.toml is created.
         assert!(!root.join("uv.toml").exists());
+    }
+
+    /// Out-of-tree local sources become external roots: editable/directory dependencies and
+    /// `path` archives outside the project must be staged into a preview copy, while the project
+    /// root itself, in-tree directory sources the selective tree copy reproduces in place, and
+    /// stale entries pointing at removed paths contribute nothing.
+    #[test]
+    fn external_resolve_roots_read_out_of_tree_local_sources_from_the_lock() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/sub")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("pkgs/lib")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("pkgs/data")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("vendor")).expect("mkdir");
+        std::fs::write(base_path.join("vendor/pkg-1.0.tar.gz"), "archive").expect("write");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "lib"
+            version = "0.1.0"
+            source = { editable = "../pkgs/lib" }
+
+            [[package]]
+            name = "data"
+            version = "0.1.0"
+            source = { directory = "../pkgs/data" }
+
+            [[package]]
+            name = "vendored"
+            version = "1.0.0"
+            source = { path = "../vendor/pkg-1.0.tar.gz" }
+
+            [[package]]
+            name = "inner"
+            version = "0.1.0"
+            source = { editable = "sub" }
+
+            [[package]]
+            name = "stale"
+            version = "0.1.0"
+            source = { editable = "../missing" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let canonical = |rel: &str| {
+            Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(base_path.join(rel)).expect("canonicalize fixture path"),
+            )
+            .expect("utf8 path")
+        };
+        assert_eq!(
+            roots,
+            vec![
+                canonical("pkgs/data"),
+                canonical("pkgs/lib"),
+                canonical("vendor/pkg-1.0.tar.gz"),
+            ],
+            "out-of-tree editable/directory/path sources, sorted; the project itself, unpruned \
+             in-tree directory sources, and stale entries contribute nothing"
+        );
+    }
+
+    /// An in-tree directory source under a pruned location is surfaced: the selective preview
+    /// copy never descends into `vendor/` (or a top-level dot-dir), so without staging the copy
+    /// loses the member's manifest and the resolve fails with "Distribution not found". A
+    /// directory source anywhere else stays out — the copy reproduces it in place.
+    #[test]
+    fn external_resolve_roots_include_in_tree_directory_sources_the_copy_prunes() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/vendor/mylib")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("project/.deps/hidden")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("project/sub")).expect("mkdir");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "mylib"
+            version = "0.1.0"
+            source = { directory = "vendor/mylib" }
+
+            [[package]]
+            name = "hidden"
+            version = "0.1.0"
+            source = { editable = ".deps/hidden" }
+
+            [[package]]
+            name = "inner"
+            version = "0.1.0"
+            source = { editable = "sub" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let canonical = |rel: &str| {
+            Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(base_path.join("project").join(rel))
+                    .expect("canonicalize fixture path"),
+            )
+            .expect("utf8 path")
+        };
+        assert_eq!(
+            roots,
+            vec![canonical(".deps/hidden"), canonical("vendor/mylib")],
+            "directory sources the copy prunes (vendor/, a top-level dot-dir) are staged; an \
+             unpruned in-tree directory contributes nothing"
+        );
+    }
+
+    /// An in-tree `path` archive is surfaced even though it lives under the project root: the
+    /// selective preview copy keeps only resolver inputs, and a `.tar.gz`/`.whl` basename matches
+    /// none of them, so the file must be staged explicitly for the copy's resolve to read it.
+    #[test]
+    fn external_resolve_roots_include_in_tree_archive_files() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/wheels")).expect("mkdir");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        std::fs::write(root.join("wheels/pkg-2.0.tar.gz"), "archive").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "self"
+            version = "0.1.0"
+            source = { editable = "." }
+
+            [[package]]
+            name = "vendored"
+            version = "2.0.0"
+            source = { path = "wheels/pkg-2.0.tar.gz" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let archive = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(root.join("wheels/pkg-2.0.tar.gz").as_std_path())
+                .expect("canonicalize fixture path"),
+        )
+        .expect("utf8 path");
+        assert_eq!(
+            roots,
+            vec![archive],
+            "the in-tree archive file is staged; the project root itself is not"
+        );
+    }
+
+    /// An in-tree symlink to an out-of-tree directory canonicalizes to its target: the target is
+    /// what must be staged, and the copy layer recreates the in-tree link on top of it so the
+    /// lock's relative reference still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn external_resolve_roots_canonicalize_an_in_tree_symlink_source() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path = base.path();
+        std::fs::create_dir_all(base_path.join("project/libs")).expect("mkdir");
+        std::fs::create_dir_all(base_path.join("shared/lib")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            base_path.join("shared/lib"),
+            base_path.join("project/libs/shared"),
+        )
+        .expect("symlink");
+        let root = Utf8PathBuf::from_path_buf(base_path.join("project")).expect("utf8 path");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "shared"
+            version = "0.1.0"
+            source = { editable = "libs/shared" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+        };
+
+        let roots = uv_tool().external_resolve_roots(&project);
+
+        let target = Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(base_path.join("shared/lib")).expect("canonicalize fixture path"),
+        )
+        .expect("utf8 path");
+        assert_eq!(
+            roots,
+            vec![target],
+            "the canonical out-of-tree target is the staged root"
+        );
     }
 }

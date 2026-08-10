@@ -165,21 +165,41 @@ fn rewrite_requirement_line(raw: &str, wanted: &str, target: &str) -> Option<Str
     Some(rewritten)
 }
 
+/// A distribution and the exact version a requirements/lock file resolves it to.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedPin {
+    /// The distribution name as recorded in the file (extras stripped, not normalised).
+    pub name: String,
+    /// The exact version the file pins the distribution to.
+    pub version: String,
+}
+
 /// Parses pinned `name==version` requirements. Unpinned (`>=`, `~=`), options (`-r`, `-e`,
 /// `--hash`), environment markers (`; python_version < …`), extras (`pkg[extra]`), and comments are
 /// handled or skipped, leaving the exact-pinned distributions cooldown can reason about.
 #[must_use]
-pub fn parse_requirements(content: &str) -> Vec<(String, String)> {
+pub fn parse_requirements(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     for raw in content.lines() {
-        if let Some((name, version)) = parse_requirement_pin(raw) {
-            out.push((name.to_string(), version.to_string()));
+        if let Some(pin) = parse_requirement_pin(raw) {
+            out.push(ResolvedPin {
+                name: pin.name.to_string(),
+                version: pin.version.to_string(),
+            });
         }
     }
     out
 }
 
-fn parse_requirement_pin(raw: &str) -> Option<(&str, &str)> {
+/// An exact `name==version` pin found on one requirements line, borrowing from that line.
+struct RequirementPin<'a> {
+    /// The distribution name (extras stripped, not normalised).
+    name: &'a str,
+    /// The exactly pinned version.
+    version: &'a str,
+}
+
+fn parse_requirement_pin(raw: &str) -> Option<RequirementPin<'_>> {
     let line = raw.split('#').next().unwrap_or("").trim();
     if line.is_empty() || line.starts_with('-') {
         return None;
@@ -207,12 +227,12 @@ fn parse_requirement_pin(raw: &str) -> Option<(&str, &str)> {
         version_end = version_start + offset + ch.len_utf8();
     }
     let version = line.get(version_start..version_end)?;
-    (!version.is_empty()).then_some((name, version))
+    (!version.is_empty()).then_some(RequirementPin { name, version })
 }
 
-/// Parses the `[[package]]` entries of a `poetry.lock` into resolved `(name, version)`.
+/// Parses the `[[package]]` entries of a `poetry.lock` into resolved [`ResolvedPin`]s.
 #[must_use]
-pub fn parse_poetry_lock(content: &str) -> Vec<(String, String)> {
+pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
     #[derive(serde::Deserialize)]
     struct Lock {
         #[serde(default)]
@@ -227,7 +247,10 @@ pub fn parse_poetry_lock(content: &str) -> Vec<(String, String)> {
         .map(|lock| {
             lock.package
                 .into_iter()
-                .map(|p| (p.name, p.version))
+                .map(|p| ResolvedPin {
+                    name: p.name,
+                    version: p.version,
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -290,17 +313,24 @@ mod tests {
     use super::*;
     use indoc::indoc;
 
+    fn pin(name: &str, version: &str) -> ResolvedPin {
+        ResolvedPin {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
     #[test]
     fn requirements_take_exact_pins_only() {
         let reqs = "# comment\nrequests==2.28.0\nignored===1.0.0\nflask == 2.2.0  # web\nclick>=8.0\n-e .\nrich[jupyter] == 12.0.0 ; python_version >= '3.7'\n";
         let mut got = parse_requirements(reqs);
-        got.sort();
+        got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
             vec![
-                ("flask".to_string(), "2.2.0".to_string()),
-                ("requests".to_string(), "2.28.0".to_string()),
-                ("rich".to_string(), "12.0.0".to_string()),
+                pin("flask", "2.2.0"),
+                pin("requests", "2.28.0"),
+                pin("rich", "12.0.0"),
             ]
         );
     }
@@ -359,13 +389,10 @@ mod tests {
     fn poetry_lock_and_direct() {
         let lock = "[[package]]\nname = \"requests\"\nversion = \"2.28.0\"\n\n[[package]]\nname = \"urllib3\"\nversion = \"1.26.0\"\n";
         let mut got = parse_poetry_lock(lock);
-        got.sort();
+        got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
-            vec![
-                ("requests".to_string(), "2.28.0".to_string()),
-                ("urllib3".to_string(), "1.26.0".to_string()),
-            ]
+            vec![pin("requests", "2.28.0"), pin("urllib3", "1.26.0")]
         );
 
         let manifest = "[tool.poetry.dependencies]\npython = \"^3.10\"\nRequests = \"^2.28\"\n";

@@ -59,4 +59,4 @@ When `check` goes red, there are three ways forward — covered in [Quick start]
 ## Unknown ages and stale locks
 
 - A dependency whose **publish time can't be determined** is reported as `unknown-age`. By default that is a warning; `--fail-on-unknown-age` makes it fatal, and `--offline` turns every cache miss into `unknown-age` rather than a false "ok".
-- A **stale or absent lock** is an error (exit `4`) by default, because gating an out-of-date graph is meaningless. Demote it to a warning with `--allow-stale-lock` (or the `COOLDOWN_ALLOW_STALE_LOCK` env var), or refresh in place with `--lock`.
+- A **stale or absent lock** is an error (exit `4`) by default, because gating an out-of-date graph is meaningless. `--allow-stale-lock` (or `COOLDOWN_ALLOW_STALE_LOCK`) demotes it to a warning and skips dependency evaluation for that project; the stale graph is never treated as checked. Refresh in place with `--lock` when the project must be evaluated.

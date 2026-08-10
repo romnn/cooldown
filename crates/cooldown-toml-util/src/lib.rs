@@ -150,7 +150,7 @@ mod tests {
         std::fs::write(&path, "value = [").expect("write");
 
         let err = read_toml_file::<Doc>(&path, "broken.toml").expect_err("must fail");
-        assert!(matches!(err, CoreError::Config(_)));
+        std::assert_matches!(err, CoreError::Config(_));
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct Source {
     /// The path for a local directory source.
     #[serde(default)]
     pub directory: Option<String>,
+    /// The path for a local archive source — a wheel or sdist file rather than a directory.
+    #[serde(default)]
+    pub path: Option<String>,
     /// The repository URL for a git source.
     #[serde(default)]
     pub git: Option<String>,
@@ -393,6 +396,7 @@ mod tests {
             r#virtual: None,
             editable: Some(".".to_string()),
             directory: None,
+            path: None,
             git: None,
         };
         let path_dep = Source {
@@ -400,6 +404,7 @@ mod tests {
             r#virtual: None,
             editable: Some("../airtype-common".to_string()),
             directory: None,
+            path: None,
             git: None,
         };
         assert!(own.is_project_root());

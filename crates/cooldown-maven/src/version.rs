@@ -79,7 +79,15 @@ pub fn is_prerelease(v: &str) -> bool {
         .any(|t| matches!(t, Tok::Str(s) if qualifier_rank(s) < 0))
 }
 
-fn first_two_numbers(v: &str) -> (u64, u64) {
+/// The first two numeric axes of a Maven version.
+struct MajorMinor {
+    /// The first numeric token (the major axis); `0` when absent.
+    major: u64,
+    /// The next numeric token after the major (the minor axis); `0` when absent.
+    minor: u64,
+}
+
+fn first_two_numbers(v: &str) -> MajorMinor {
     let nums: Vec<u64> = tokens(v)
         .into_iter()
         .filter_map(|t| match t {
@@ -87,10 +95,10 @@ fn first_two_numbers(v: &str) -> (u64, u64) {
             Tok::Str(_) => None,
         })
         .collect();
-    (
-        nums.first().copied().unwrap_or(0),
-        nums.get(1).copied().unwrap_or(0),
-    )
+    MajorMinor {
+        major: nums.first().copied().unwrap_or(0),
+        minor: nums.get(1).copied().unwrap_or(0),
+    }
 }
 
 /// Returns the compatibility "major" key for `v`, gating `--major`. A `0.x` version treats its
@@ -106,7 +114,7 @@ fn first_two_numbers(v: &str) -> (u64, u64) {
 /// ```
 #[must_use]
 pub fn major_key(v: &str) -> MajorKey {
-    let (major, minor) = first_two_numbers(v);
+    let MajorMinor { major, minor } = first_two_numbers(v);
     if major > 0 {
         MajorKey(major.to_string())
     } else {
@@ -135,11 +143,11 @@ pub fn major_number(v: &str) -> Option<u64> {
 /// ```
 #[must_use]
 pub fn classify_kind(current: &str, cand: &str) -> Option<UpdateKind> {
-    let (cm, cn) = first_two_numbers(current);
-    let (nm, nn) = first_two_numbers(cand);
-    if cm != nm {
+    let current = first_two_numbers(current);
+    let cand = first_two_numbers(cand);
+    if current.major != cand.major {
         Some(UpdateKind::Major)
-    } else if cn != nn {
+    } else if current.minor != cand.minor {
         Some(UpdateKind::Minor)
     } else {
         Some(UpdateKind::Patch)

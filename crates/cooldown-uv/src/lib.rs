@@ -14,4 +14,4 @@ pub mod uvcmd;
 pub mod version;
 
 pub use pypi::PyPi;
-pub use tool::{UV_ID, UvTool};
+pub use tool::{PREVIEW_PRUNED_DIRS, UV_ID, UvTool};
