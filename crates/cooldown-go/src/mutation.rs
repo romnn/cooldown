@@ -461,9 +461,12 @@ mod tests {
 
         let mut captured: Vec<&str> = out.iter().map(|path| path.as_str()).collect();
         captured.sort_unstable();
+        // Captured paths stay in the platform's own spelling because they are journal keys the
+        // restore reopens, so the expectation is built with `join` rather than a `/` literal.
+        let nested_source = Utf8Path::new("pkg").join("dep.go");
         assert_eq!(
             captured,
-            vec!["main.go", "pkg/dep.go"],
+            vec!["main.go", nested_source.as_str()],
             "the parent module's files are captured; the nested module's are not"
         );
     }

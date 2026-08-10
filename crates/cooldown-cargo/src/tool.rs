@@ -1220,6 +1220,8 @@ impl ToolWrite for CargoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only [`InPlaceCargoFamilyWriter`] implements a trait here, and it is Unix-only.
+    #[cfg(unix)]
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
@@ -1267,8 +1269,14 @@ mod tests {
         }
     }
 
+    /// A same-family writer that prepares mutations in place, standing in for a rogue adapter.
+    ///
+    /// Only the isolated execution mode rejects a mutation this produced, so the tests using it
+    /// are Unix-only.
+    #[cfg(unix)]
     struct InPlaceCargoFamilyWriter;
 
+    #[cfg(unix)]
     #[async_trait]
     impl ToolWrite for InPlaceCargoFamilyWriter {
         fn mutation_tool(&self) -> ToolId {
@@ -1875,6 +1883,13 @@ mod tests {
         std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
     }
 
+    /// A project Cargo did not stage itself cannot be prepared for mutation.
+    ///
+    /// The enforcement lives in the isolated execution mode, which Cargo only selects where the
+    /// platform grants recovery authority — hence `#[cfg(unix)]`.
+    /// Elsewhere Cargo runs the same in-place trial every other ecosystem uses, and a
+    /// directly-prepared mutation is exactly what that mode expects.
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_cargo_preparation_requires_an_isolated_project() -> eyre::Result<()> {
         let other = tempfile::tempdir()?;
@@ -1898,6 +1913,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_edge_normalization_requires_an_isolated_project() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1927,6 +1943,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_cargo_apply_rejects_an_in_place_tool_family_capability() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;

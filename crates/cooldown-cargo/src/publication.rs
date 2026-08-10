@@ -24,11 +24,12 @@ pub(super) fn recovery_anchor_name(project: &camino::Utf8Path) -> String {
 #[cfg(test)]
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(test)]
+use cooldown_core::{AcceptedProjectState, CoreError, Project, ProjectMutationJournal};
+#[cfg(all(test, unix))]
 use cooldown_core::{
-    AcceptedProjectState, AcceptedPublication, CoreError, MutationRecovery, Project,
-    ProjectMutationJournal, RecoveryDisposition, Result, fs::RecoveryAuthority,
+    AcceptedPublication, MutationRecovery, RecoveryDisposition, Result, fs::RecoveryAuthority,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs::File;
 
 #[cfg(test)]
@@ -36,14 +37,21 @@ mod tests {
     use super::artifact::{
         CommitOutcome, MAX_RECOVERY_RECORD_BYTES, PublicationError, PublicationOutcome,
         RemovalError, TrustedArtifact, cleanup_linked_publication_files,
-        create_synced_private_file, ensure_no_orphan_artifacts, publish_exclusive_bytes,
-        publish_exclusive_json, publish_exclusive_json_with, recovery_anchor_path, recovery_path,
-        remove_file, remove_file_with, remove_transaction_marker_with, validate_record_size,
+        ensure_no_orphan_artifacts, publish_exclusive_json, publish_exclusive_json_with,
+        recovery_path, remove_file, remove_file_with, remove_transaction_marker_with,
+        validate_record_size,
     };
     use super::model::{ProjectRecoveryRecord, RecoveryAnchor};
-    use super::publish::{
-        publish_accepted_with, publish_accepted_with_marker, retry_private_cleanup,
+    use super::publish::retry_private_cleanup;
+    // Publication and recovery evidence only exists where the platform grants recovery authority,
+    // so the tests driving it — and the items only they reach — are Unix-only.
+    #[cfg(unix)]
+    use super::artifact::{
+        create_synced_private_file, publish_exclusive_bytes, recovery_anchor_path,
     };
+    #[cfg(unix)]
+    use super::publish::{publish_accepted_with, publish_accepted_with_marker};
+    #[cfg(unix)]
     use super::recover::{TrustedRecoveryRecord, recover_project_publication_with};
     use super::*;
     use crate::CARGO_ID;
@@ -70,6 +78,13 @@ mod tests {
         (dir, project, lock_path)
     }
 
+    /// Resolves the trusted authority that publication and recovery evidence is anchored in.
+    ///
+    /// Coordination only grants one where the platform can prove the namespace is private to the
+    /// current user, so every test reaching this helper is `#[cfg(unix)]`: off Unix the authority
+    /// does not exist, Cargo selects in-place execution instead, and there is no publication to
+    /// assert against.
+    #[cfg(unix)]
     fn recovery_authority(project: &Project) -> Result<RecoveryAuthority> {
         let coordination = cooldown_core::fs::ProjectCoordination::resolve(&project.root)?;
         coordination
@@ -78,6 +93,7 @@ mod tests {
             .ok_or_else(|| CoreError::System("test project has no recovery authority".to_string()))
     }
 
+    #[cfg(unix)]
     fn test_publish(
         project: &Project,
         accepted: &AcceptedProjectState,
@@ -85,6 +101,7 @@ mod tests {
         publish_accepted(project, accepted, &recovery_authority(project)?)
     }
 
+    #[cfg(unix)]
     fn test_recover(project: &Project) -> Result<MutationRecovery> {
         recover_pending(project, &recovery_authority(project)?)
     }
@@ -115,6 +132,7 @@ mod tests {
         )?)
     }
 
+    #[cfg(unix)]
     fn publish_trusted_record<T: serde::Serialize>(
         project: &Project,
         marker: &Utf8Path,
@@ -130,6 +148,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepted_project_state_publishes_once_and_consumes_its_record() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -146,6 +165,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn project_publication_refuses_source_drift_before_creating_a_record() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -162,6 +182,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_restores_a_mixed_whole_project_publication() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -192,6 +213,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn project_content_cannot_forge_recovery_authority() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -260,6 +282,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_authority_rejects_an_oversized_marker_before_reading_it() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -308,6 +331,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_anchor_rejects_marker_content_drift() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -330,6 +354,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_retains_evidence_when_project_drifts_before_cleanup() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -367,6 +392,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_revalidates_the_restored_preimage_before_cleanup() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -405,6 +431,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_retains_authority_when_marker_identity_changes_before_cleanup() -> eyre::Result<()>
     {
@@ -434,6 +461,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_retains_evidence_when_authority_identity_changes_before_cleanup() -> eyre::Result<()>
     {
@@ -468,6 +496,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn git_recovery_authority_lives_in_repository_metadata() -> eyre::Result<()> {
         let (_directory, project, _lock_path) = setup();
@@ -491,6 +520,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn authority_discovery_finds_anchor_only_projects() -> eyre::Result<()> {
         let (_directory, project, _lock_path) = setup();
@@ -507,6 +537,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn authority_discovery_warns_when_an_anchored_project_was_deleted() -> eyre::Result<()> {
         let (_directory, repository, _lock_path) = setup();
@@ -530,6 +561,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn authority_discovery_and_recovery_find_private_anchor_publications() -> eyre::Result<()> {
         let (_directory, project, _lock_path) = setup();
@@ -650,6 +682,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_publication_keeps_one_receipt_that_recovers_the_preimage() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -688,6 +721,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn marker_cleanup_failure_preserves_the_published_result_and_recovery_owner() -> eyre::Result<()>
     {
@@ -723,6 +757,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_accepts_a_fully_published_project() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -741,6 +776,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_refuses_drift_in_an_unchanged_tracked_manifest() -> eyre::Result<()> {
         let (_directory, project, lock_path) = setup();
@@ -1051,6 +1087,7 @@ mod tests {
             .collect())
     }
 
+    #[cfg(unix)]
     #[test]
     fn untrusted_marker_leaves_user_data_untouched() {
         let (_dir, project, lock_path) = setup();
@@ -1070,6 +1107,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_side_pending_check_never_recovers_the_lock() -> eyre::Result<()> {
         let (_dir, project, lock_path) = setup();

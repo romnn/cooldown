@@ -1171,6 +1171,12 @@ mod tests {
         Ok(())
     }
 
+    /// Replacing the Git namespace under a captured coordination is reported as a conflict.
+    ///
+    /// Unix-only for the fixture, not the invariant: the captured coordination holds an open
+    /// handle beneath `.git`, and Windows refuses to rename a directory with live handles, so the
+    /// replacement cannot be staged there at all.
+    #[cfg(unix)]
     #[test]
     fn replaced_git_namespace_invalidates_captured_coordination() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;

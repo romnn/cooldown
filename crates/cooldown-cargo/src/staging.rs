@@ -891,10 +891,14 @@ fn isolation_error(detail: impl Into<String>) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CARGO_ID;
     use crate::test_support::canonical_root;
     use color_eyre::eyre;
-    use indoc::{formatdoc, indoc};
+    use indoc::indoc;
+    // Reached only from the fixtures that build a real project for the isolated execution mode.
+    #[cfg(unix)]
+    use crate::CARGO_ID;
+    #[cfg(unix)]
+    use indoc::formatdoc;
 
     fn write(path: &Utf8Path, contents: &str) -> eyre::Result<()> {
         if let Some(parent) = path.parent() {
@@ -904,6 +908,9 @@ mod tests {
         Ok(())
     }
 
+    // Building, locking, and publishing a real project is only exercised where the isolated
+    // execution mode runs, so these fixtures compile with the tests that use them.
+    #[cfg(unix)]
     fn package(root: &Utf8Path, name: &str) -> eyre::Result<()> {
         write(
             &root.join("Cargo.toml"),
@@ -917,6 +924,7 @@ mod tests {
         write(&root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")
     }
 
+    #[cfg(unix)]
     fn generate_lock(root: &Utf8Path) -> eyre::Result<()> {
         let cargo = std::env::var_os("COOLDOWN_CARGO").unwrap_or_else(|| "cargo".into());
         let output = std::process::Command::new(cargo)
@@ -932,6 +940,7 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
     fn project(root: &Utf8Path) -> Project {
         Project {
             root: root.to_owned(),
@@ -941,6 +950,12 @@ mod tests {
         }
     }
 
+    /// Makes `root` a Git worktree and resolves the authority its publication anchors in.
+    ///
+    /// Coordination only grants one where the platform can prove the namespace is private to the
+    /// current user, so every test that stages a publication is `#[cfg(unix)]`: off Unix Cargo
+    /// selects in-place execution and never reaches this strategy.
+    #[cfg(unix)]
     fn recovery_authority(root: &Utf8Path) -> Result<RecoveryAuthority> {
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
@@ -1208,6 +1223,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn sibling_path_dependency_keeps_its_relative_topology() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1242,6 +1258,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn vendored_source_is_available_to_the_isolated_resolver() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1344,6 +1361,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn changed_cargo_config_invalidates_the_accepted_state() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1386,6 +1404,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn newly_added_cargo_config_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1421,6 +1440,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn changed_git_namespace_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1451,6 +1471,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn non_git_project_cannot_publish_recoverable_state() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1476,6 +1497,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn newly_globbed_workspace_member_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;

@@ -779,6 +779,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn repository_recovery_finds_anchor_only_project_in_a_pruned_directory() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
