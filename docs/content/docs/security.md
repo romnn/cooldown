@@ -32,11 +32,16 @@ anything becomes visible in the source. The complete accepted manifest-and-lock 
 under one project-visible recovery record whose exact digest is anchored in cooldown's
 owner-private coordination namespace beneath Git's common directory on Unix. Recovery revalidates
 the complete expected project state and the exact marker and authority identities immediately
-before consuming that evidence. Cargo source mutations outside a Git worktree, and on platforms
-where cooldown cannot prove the authority is private to the current user, fail closed because
-untrusted bytes cannot authorize restoration.
+before consuming that evidence. A Cargo source mutation that reaches this path without anchored
+authority — outside a Git worktree — fails closed, because untrusted bytes cannot authorize
+restoration.
 
 Other ecosystems currently run resolver trials in place under the project lease. Cooldown records the files each trial may change, rolls a rejected trial back only when those files still match the observed resolver output, and stops if independent drift makes restoration unsafe. These ecosystems do not yet use Cargo's persistent whole-project recovery record.
+
+Cargo selects that same in-place path on platforms where cooldown cannot prove the coordination
+namespace is private to the current user — Unix ownership bits today, so Windows always. Those runs
+keep the rollback guarantees of the paragraph above but have no persistent recovery record, so an
+interrupted mutation is repaired by hand rather than by `cooldown recover`.
 
 Every mutation that reports success has passed the package manager's verification and the selected cooldown transitive policy. The default whole-graph policy leaves the graph gate-clean by construction. `--transitive allow` deliberately retains visible fresh transitives, while `--transitive hide` excludes transitives from the gate.
 

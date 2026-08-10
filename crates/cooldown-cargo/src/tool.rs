@@ -36,8 +36,8 @@ use cooldown_core::{
     Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
     MemberRef, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
     PreparedMutation, Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, Result, RewriteMode, SkipReason, Skipped, ToolId,
-    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason,
+    Skipped, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -615,6 +615,20 @@ fn blocking_requirer(
 }
 
 impl CargoTool {
+    /// Revalidates `mutation` through whichever execution mode this platform selected.
+    ///
+    /// The two accessors carry the same parts but enforce different capabilities, so the choice
+    /// has to track [`ToolWrite::mutation_execution`] exactly or every dispatch fails closed.
+    fn mutation_parts<'a>(
+        &self,
+        mutation: &'a PreparedMutation,
+    ) -> Result<(&'a Project, &'a Plan, &'a ProjectMutationJournal)> {
+        match self.mutation_execution() {
+            MutationExecution::Isolated(_) => mutation.isolated_parts_for(self),
+            MutationExecution::InPlace => mutation.parts_for(self),
+        }
+    }
+
     /// Re-resolves the **whole** graph under cooldown's window.
     ///
     /// `upgrade` is informational for the rewrite policy.
@@ -1042,8 +1056,32 @@ impl ToolWrite for CargoTool {
         true
     }
 
+    fn resolve_inputs(&self) -> ResolveInputs {
+        // Only the in-place path reads this — the isolated strategy stages its own authoritative
+        // read set — so this is what a non-Unix preview copy is assembled from.
+        // `cargo update`/`generate-lockfile` validates every workspace member's declared targets,
+        // so the throwaway copy must include `.rs` source: a member with an empty `src/` errors
+        // with "no targets specified".
+        // Source is small (the bulk of a repo is build `target/`, which is pruned).
+        ResolveInputs {
+            source_extensions: &["rs"],
+            ..ResolveInputs::DEFAULT
+        }
+    }
+
     fn mutation_execution(&self) -> MutationExecution<'_> {
-        MutationExecution::Isolated(self)
+        // Publishing an isolated trial needs recovery authority, which coordination only grants
+        // where the platform can prove its namespace is private to the current user.
+        // Committing to the isolated path on a platform that never grants it would fail every
+        // Cargo mutation closed at publication rather than degrade, so those platforms fall
+        // back to the in-place trial-and-rollback path every other ecosystem already uses.
+        // A non-Git project on a supported platform still fails closed: what it lacks is an
+        // authority anchor outside project content, not platform support.
+        if RecoveryAuthority::platform_supported() {
+            MutationExecution::Isolated(self)
+        } else {
+            MutationExecution::InPlace
+        }
     }
 
     async fn ensure_no_pending_mutation(&self, project: &Project) -> Result<()> {
@@ -1072,7 +1110,7 @@ impl ToolWrite for CargoTool {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
-        let (project, plan, journal) = mutation.isolated_parts_for(self)?;
+        let (project, plan, journal) = self.mutation_parts(mutation)?;
         self.apply_plan(project, plan, journal, None).await
     }
 
@@ -1081,7 +1119,7 @@ impl ToolWrite for CargoTool {
         mutation: &PreparedMutation,
         observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        let (project, plan, journal) = mutation.isolated_parts_for(self)?;
+        let (project, plan, journal) = self.mutation_parts(mutation)?;
         let report = self
             .apply_plan(project, plan, journal, Some(observer))
             .await;
@@ -1122,7 +1160,7 @@ impl ToolWrite for CargoTool {
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<EdgeNormalizationReport> {
-        let (project, _, _) = mutation.isolated_parts_for(self)?;
+        let (project, _, _) = self.mutation_parts(mutation)?;
         let before_lock = before
             .map(|contents| {
                 std::str::from_utf8(contents)

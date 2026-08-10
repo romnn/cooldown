@@ -118,8 +118,11 @@ impl ProjectCoordination {
             Some(marker) => (
                 git_common_directory(&marker)?,
                 &["cooldown", "locks"],
-                cfg!(unix),
+                RecoveryAuthority::platform_supported(),
             ),
+            // An in-tree namespace can be pre-created by project content, so it coordinates
+            // cooperating processes but never authorizes recovery, even where the platform
+            // could prove ownership.
             None => (
                 project.as_std_path().to_owned(),
                 &[".cooldown", "locks"],
@@ -187,6 +190,18 @@ impl ProjectCoordination {
 }
 
 impl RecoveryAuthority {
+    /// Returns whether this platform can prove a coordination directory is private to the
+    /// current user — the platform half of granting this authority to a Git project.
+    ///
+    /// Unix ownership bits are the only proof mechanism today.
+    /// Adapters consult this before committing to an execution mode that must publish recovery
+    /// evidence, so a platform that gains a proof mechanism upgrades every consumer together
+    /// instead of leaving stale `cfg!(unix)` copies to drift.
+    #[must_use]
+    pub const fn platform_supported() -> bool {
+        cfg!(unix)
+    }
+
     /// Returns the trusted directory containing recovery authority records.
     #[must_use]
     pub fn directory(&self) -> &Path {

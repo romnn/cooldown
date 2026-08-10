@@ -83,8 +83,8 @@
   `PreparedMutation`; callers inspect its validated `ApplyAttemptOutcome`, preventing a custom
   adapter from pairing another project or write set with a finished result. Adapter-owned pending
   recovery remains outside the application's rollback authority. `ToolWrite::normalize_lock_edges` also
-  accepts the prepared capability, and Cargo requires one carrying provenance from an
-  adapter-created isolated project. `ApplyReport`
+  accepts the prepared capability, and Cargo requires one whose provenance matches the execution
+  mode it selected for the platform. `ApplyReport`
   carries non-fatal committed warnings, final edge audits return an `EdgeNormalizationReport`, and
   `CoreError`/`DiagnosticKind` include `PendingRecovery` and `DurabilityUncertain` so a visible
   write whose directory sync failed is not misclassified as lock contention.
@@ -148,10 +148,13 @@
   complete result passes Cargo and cooldown verification, one owner-only, whole-project recovery
   record guards checked publication of the accepted manifests and lock. Its exact digest is
   anchored beneath Git's owner-private common-directory coordination namespace on Unix before
-  source publication, so project content alone cannot claim restoration authority. Cargo source
-  mutations outside a Git worktree, or on platforms without verified owner-private authority, fail
-  closed until a trusted external authority is available. Publication includes parent-directory
-  durability on Unix and best-effort directory persistence elsewhere.
+  source publication, so project content alone cannot claim restoration authority. A Cargo source
+  mutation that reaches publication without anchored authority — outside a Git worktree — fails
+  closed until a trusted external authority is available. On platforms that cannot prove the
+  coordination namespace is private to the current user (Unix ownership bits today, so Windows
+  always), Cargo instead selects the in-place trial-and-rollback execution every other ecosystem
+  uses, keeping its rollback guarantees but without a persistent recovery record. Publication
+  includes parent-directory durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
   `recover` command discovers public markers, orphaned private artifacts, and trusted authority
   records whose project marker was never published without loading policy, manifests, baselines,
