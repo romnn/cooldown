@@ -1142,6 +1142,21 @@ impl ToolWrite for CargoTool {
         project: &Project,
         coordination: &cooldown_core::fs::ProjectCoordination,
     ) -> Result<cooldown_core::MutationRecovery> {
+        // Every mutation flow calls this before touching the project, so a project that never
+        // published a record must settle as unchanged rather than fail closed. Without recovery
+        // authority nothing could have been published, and demanding it here would reject every
+        // Cargo mutation on the in-place path such a platform selects.
+        // Artifacts that are present still require authority: untrusted project bytes cannot
+        // authorize restoration.
+        if coordination.recovery_authority().is_none()
+            && !crate::publication::has_project_recovery_artifacts(
+                &project.root.join("Cargo.lock"),
+            )?
+        {
+            return Ok(cooldown_core::MutationRecovery::settled(
+                cooldown_core::RecoveryDisposition::Unchanged,
+            ));
+        }
         let authority = crate::publication::require_recovery_authority(project, coordination)?;
         edges::enforce::recover_pending(project, authority)
     }

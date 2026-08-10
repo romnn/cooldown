@@ -153,7 +153,10 @@
   closed until a trusted external authority is available. On platforms that cannot prove the
   coordination namespace is private to the current user (Unix ownership bits today, so Windows
   always), Cargo instead selects the in-place trial-and-rollback execution every other ecosystem
-  uses, keeping its rollback guarantees but without a persistent recovery record. Publication
+  uses, keeping its rollback guarantees but without a persistent recovery record. The
+  pending-recovery preflight every mutation runs settles as unchanged when a project carries no
+  recovery artifacts, so a project that could never have published one is not refused; artifacts
+  that are present still require authority. Publication
   includes parent-directory durability on Unix and best-effort directory persistence elsewhere.
   Unknown or unreferenced recovery artifacts are reported and left untouched. The new Cargo-only
   `recover` command discovers public markers, orphaned private artifacts, and trusted authority

@@ -41,7 +41,9 @@ Other ecosystems currently run resolver trials in place under the project lease.
 Cargo selects that same in-place path on platforms where cooldown cannot prove the coordination
 namespace is private to the current user — Unix ownership bits today, so Windows always. Those runs
 keep the rollback guarantees of the paragraph above but have no persistent recovery record, so an
-interrupted mutation is repaired by hand rather than by `cooldown recover`.
+interrupted mutation is repaired by hand rather than by `cooldown recover`. A project that does
+carry recovery artifacts still refuses to consume them without authority there: the fallback
+removes the ability to publish evidence, never the requirement to authenticate it.
 
 Every mutation that reports success has passed the package manager's verification and the selected cooldown transitive policy. The default whole-graph policy leaves the graph gate-clean by construction. `--transitive allow` deliberately retains visible fresh transitives, while `--transitive hide` excludes transitives from the gate.
 
