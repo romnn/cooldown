@@ -11,6 +11,8 @@ mod manifest;
 mod native;
 mod publication;
 mod staging;
+#[cfg(test)]
+mod test_support;
 pub mod tool;
 pub mod version;
 
@@ -179,14 +181,15 @@ pub use tool::CargoTool;
 #[cfg(test)]
 mod tests {
     use super::{RecoveryScope, recover_interrupted_mutation};
+    use crate::test_support::canonical_root;
     use color_eyre::eyre;
     use indoc::indoc;
 
     #[test]
     fn recovery_scope_canonicalizes_repository_and_explicit_roots() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = camino::Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         std::fs::create_dir_all(root.join("project/member"))?;
         std::fs::create_dir_all(root.join("sibling"))?;
 

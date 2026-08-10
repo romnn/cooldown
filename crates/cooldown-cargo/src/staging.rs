@@ -892,6 +892,7 @@ fn isolation_error(detail: impl Into<String>) -> CoreError {
 mod tests {
     use super::*;
     use crate::CARGO_ID;
+    use crate::test_support::canonical_root;
     use color_eyre::eyre;
     use indoc::{formatdoc, indoc};
 
@@ -953,7 +954,7 @@ mod tests {
     #[test]
     fn temporary_ancestor_overrides_are_rejected() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().to_owned())?;
+        let root = canonical_root(&directory)?;
         let scratch = root.join("scratch/trial");
         std::fs::create_dir_all(&scratch)?;
         let cargo_config = root.join(".cargo/config.toml");
@@ -989,7 +990,7 @@ mod tests {
     #[test]
     fn ambient_cargo_home_is_not_a_staging_divergence() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().to_owned())?;
+        let root = canonical_root(&directory)?;
         let scratch = root.join("scratch/trial");
         std::fs::create_dir_all(&scratch)?;
         let cargo_home = root.join(".cargo");
@@ -1086,7 +1087,7 @@ mod tests {
     #[test]
     fn custom_lockfile_config_is_rejected_before_project_use() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("workspace"))?;
+        let root = canonical_root(&directory)?.join("workspace");
         write(
             &root.join("Cargo.toml"),
             indoc! {r#"
@@ -1112,7 +1113,7 @@ mod tests {
     #[test]
     fn included_cargo_config_is_rejected_before_project_use() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("workspace"))?;
+        let root = canonical_root(&directory)?.join("workspace");
         write(
             &root.join("Cargo.toml"),
             indoc! {r#"
@@ -1142,7 +1143,7 @@ mod tests {
     #[test]
     fn batched_custom_lockfile_audit_checks_shared_configuration() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("repository"))?;
+        let root = canonical_root(&directory)?.join("repository");
         let first = root.join("crates/first");
         let second = root.join("crates/second");
         write(&first.join("Cargo.toml"), "[workspace]\n")?;
@@ -1210,8 +1211,9 @@ mod tests {
     #[tokio::test]
     async fn sibling_path_dependency_keeps_its_relative_topology() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
-        let shared = utf8_path(directory.path().join("shared"))?;
+        let base = canonical_root(&directory)?;
+        let root = base.join("app");
+        let shared = base.join("shared");
         package(&shared, "shared")?;
         write(
             &root.join("Cargo.toml"),
@@ -1243,7 +1245,7 @@ mod tests {
     #[tokio::test]
     async fn vendored_source_is_available_to_the_isolated_resolver() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         write(
             &root.join("Cargo.toml"),
             indoc! {r#"
@@ -1308,8 +1310,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("workspace"))?;
-        let member = utf8_path(directory.path().join("member"))?;
+        let base = canonical_root(&directory)?;
+        let root = base.join("workspace");
+        let member = base.join("member");
         package(&member, "member")?;
         write(
             &root.join("Cargo.toml"),
@@ -1344,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn changed_cargo_config_invalidates_the_accepted_state() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         package(&root, "app")?;
         write(
             &root.join(".cargo/config.toml"),
@@ -1386,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn newly_added_cargo_config_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         package(&root, "app")?;
         generate_lock(&root)?;
         let stage = CargoMutationStage::prepare(
@@ -1421,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn changed_git_namespace_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         package(&root, "app")?;
         generate_lock(&root)?;
         let stage = CargoMutationStage::prepare(
@@ -1451,7 +1454,7 @@ mod tests {
     #[tokio::test]
     async fn non_git_project_cannot_publish_recoverable_state() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         package(&root, "app")?;
         generate_lock(&root)?;
         let source_lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
@@ -1476,7 +1479,7 @@ mod tests {
     #[tokio::test]
     async fn newly_globbed_workspace_member_invalidates_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("workspace"))?;
+        let root = canonical_root(&directory)?.join("workspace");
         write(
             &root.join("Cargo.toml"),
             indoc! {r#"
@@ -1515,7 +1518,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = utf8_path(directory.path().join("app"))?;
+        let root = canonical_root(&directory)?.join("app");
         package(&root, "app")?;
         let config = root.join(".cargo/config.toml");
         write(

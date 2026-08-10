@@ -371,6 +371,7 @@ fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
 mod tests {
     use super::*;
     use crate::cli::Cli;
+    use crate::test_support::canonical_root;
     use clap::Parser;
     use color_eyre::eyre;
     use cooldown_cargo::RECOVERY_MARKER;
@@ -460,8 +461,8 @@ mod tests {
     #[test]
     fn recovery_marker_finds_project_without_cargo_lock() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         std::fs::write(root.join(RECOVERY_MARKER), "{}")?;
 
         assert_eq!(
@@ -477,8 +478,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         symlink("missing-record", root.join(RECOVERY_MARKER))?;
 
         assert_eq!(
@@ -495,8 +496,8 @@ mod tests {
     #[test]
     fn direct_walk_stops_at_workdir_when_repo_root_is_not_an_ancestor() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let workdir = root.join("srv/deploy/app");
         std::fs::create_dir_all(&workdir)?;
         // The `$HOME` fallback shape: `find_repo_root` returned a directory that exists but is not
@@ -528,8 +529,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let parent = root.join("deploy");
         let workdir = parent.join("app");
         std::fs::create_dir_all(&workdir)?;
@@ -571,8 +572,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let workdir = root.join("app");
         std::fs::create_dir_all(&workdir)?;
         let scope = explicit_scope(&workdir)?;
@@ -599,8 +600,8 @@ mod tests {
     #[test]
     fn nested_recovery_marker_is_not_hidden_by_an_outer_lock() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary directory is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let nested = root.join("tools/independent");
         std::fs::create_dir_all(&nested)?;
         std::fs::write(root.join("Cargo.lock"), "")?;
@@ -616,7 +617,8 @@ mod tests {
     #[test]
     fn recovery_setup_ignores_broken_normal_run_inputs() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let root = Utf8Path::from_path(directory.path()).expect("UTF-8 tempdir");
+        let temp_root = canonical_root(&directory).expect("canonical tempdir");
+        let root = temp_root.as_path();
         std::fs::create_dir(root.join(".git")).expect("create repository marker");
         std::fs::write(root.join("cooldown.toml"), "not valid = [").expect("write bad config");
         std::fs::write(root.join("Cargo.toml"), "not valid Cargo TOML").expect("write manifest");
@@ -634,8 +636,8 @@ mod tests {
     #[test]
     fn explicit_ignored_project_is_still_a_recovery_target() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let project = root.join("ignored/project");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(&project)?;
@@ -653,8 +655,8 @@ mod tests {
     #[test]
     fn explicit_hidden_project_is_still_a_recovery_target() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let project = root.join(".hidden/project");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(&project)?;
@@ -674,8 +676,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let first = root.join("projects/first");
         let second = root.join("projects/second");
         std::fs::create_dir_all(root.join(".git"))?;
@@ -717,8 +719,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let parent = root.join("projects");
         let descendant = parent.join(".hidden/interrupted");
         std::fs::create_dir_all(root.join(".git"))?;
@@ -752,8 +754,8 @@ mod tests {
     #[test]
     fn repository_recovery_finds_hidden_and_ignored_orphan_artifacts() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let hidden = root.join(".hidden/project");
         let ignored = root.join("ignored/project");
         std::fs::create_dir_all(root.join(".git"))?;
@@ -780,8 +782,8 @@ mod tests {
     #[test]
     fn repository_recovery_finds_anchor_only_project_in_a_pruned_directory() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let project = root.join("target/.hidden/project");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
@@ -820,8 +822,8 @@ mod tests {
     #[test]
     fn explicit_pruned_project_finds_an_orphan_publication() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let project = root.join("target/fixture");
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(&project)?;
@@ -844,8 +846,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let project = root.join("crates/target-project");
         let inaccessible = root.join("crates/unrelated");
         std::fs::create_dir_all(root.join(".git"))?;
@@ -867,8 +869,8 @@ mod tests {
     #[test]
     fn repository_recovery_from_a_nested_workdir_includes_sibling_projects() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let temp_root = canonical_root(&directory)?;
+        let root = temp_root.as_path();
         let workdir = root.join("crates/current");
         let sibling = root.join("tools/interrupted");
         std::fs::create_dir_all(root.join(".git"))?;

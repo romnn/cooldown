@@ -6,5 +6,7 @@ pub mod app;
 pub mod cli;
 pub mod discovery;
 mod scan;
+#[cfg(test)]
+mod test_support;
 
 pub use app::Exit;

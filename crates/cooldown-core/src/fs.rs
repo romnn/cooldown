@@ -1118,7 +1118,14 @@ mod tests {
         let coordination = ProjectCoordination::resolve(root)?;
 
         assert!(coordination.recovery_authority().is_none());
-        assert!(coordination.directory().starts_with(root.join(".cooldown")));
+        // `resolve` derives the namespace from the canonical project root, so compare against the
+        // canonical spelling: the platform temporary directory is a symlink on macOS
+        // (`/var` -> `/private/var`) and an 8.3 short name on Windows.
+        assert!(
+            coordination
+                .directory()
+                .starts_with(std::fs::canonicalize(root.join(".cooldown"))?)
+        );
         Ok(())
     }
 

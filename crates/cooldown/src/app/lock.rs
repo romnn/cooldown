@@ -401,6 +401,7 @@ fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::canonical_path;
     use color_eyre::eyre;
 
     #[cfg(unix)]
@@ -581,7 +582,10 @@ mod tests {
 
         let (coordination, _) = CoordinationRoot::resolve(&nested)?;
 
-        assert_eq!(coordination.0, root.join(".git/cooldown/locks"));
+        assert_eq!(
+            coordination.0,
+            canonical_path(&root.join(".git/cooldown/locks"))?
+        );
         Ok(())
     }
 
@@ -602,7 +606,10 @@ mod tests {
 
         let (coordination, _) = CoordinationRoot::resolve(&worktree)?;
 
-        assert_eq!(coordination.0, common.join("cooldown/locks"));
+        assert_eq!(
+            coordination.0,
+            canonical_path(&common.join("cooldown/locks"))?
+        );
         Ok(())
     }
 

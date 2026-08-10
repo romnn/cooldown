@@ -47,6 +47,7 @@ mod tests {
     use super::recover::{TrustedRecoveryRecord, recover_project_publication_with};
     use super::*;
     use crate::CARGO_ID;
+    use crate::test_support::canonical_root;
     use color_eyre::eyre;
 
     fn project(root: &Utf8Path) -> Project {
@@ -60,7 +61,7 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, Project, Utf8PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8 temp path");
+        let root = canonical_root(&dir).expect("canonical temp path");
         std::fs::create_dir_all(root.join(".git")).expect("create Git directory");
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write Git HEAD");
         let project = project(&root);
@@ -225,8 +226,7 @@ mod tests {
     #[test]
     fn matching_project_local_anchor_cannot_authorize_recovery() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
-        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
-            .map_err(|path| eyre::eyre!("non-UTF-8 project path: {path:?}"))?;
+        let root = canonical_root(&directory)?;
         let project = project(&root);
         let lock_path = root.join("Cargo.lock");
         std::fs::write(&lock_path, "original")?;
@@ -561,8 +561,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir()?;
-        let base = Utf8PathBuf::from_path_buf(directory.path().to_owned())
-            .map_err(|path| eyre::eyre!("non-UTF-8 test path: {path:?}"))?;
+        let base = canonical_root(&directory)?;
         let common = base.join("common.git");
         let first_root = base.join("first");
         let second_root = base.join("second");
