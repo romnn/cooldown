@@ -6297,7 +6297,7 @@ async fn advisory_feed_outage_fails_open_unless_the_gate_insists() {
     .with_advisory_source(down());
     let out = ws
         .check(&RunOpts {
-            fail_on_advisory_source: true,
+            advisory_failure: cooldown::app::AdvisoryFailureMode::Error,
             ..opts()
         })
         .await;

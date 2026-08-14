@@ -291,8 +291,7 @@ pub(in crate::cli) enum Command {
         /// Fail (not just warn) when the enabled advisory feed yields no usable evidence: it is
         /// unreachable, no wired source implements it, or its data is too stale to shorten.
         ///
-        /// A tool with no advisory-database ecosystem stays a warning (no feed covers it at
-        /// all).
+        /// A tool with no safe single advisory-database ecosystem mapping stays a warning.
         /// By default all of these fail open: the ordinary, stricter window stands.
         #[arg(long = "fail-on-advisory-source")]
         fail_on_advisory_source: bool,

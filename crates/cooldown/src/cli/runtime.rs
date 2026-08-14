@@ -68,16 +68,10 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
         return commands::run_recover(prepared);
     }
 
-    // `outdated` discovers, so it defaults to cross-major; mutating/gating commands don't. The
-    // config (`[<command>]`/`[global]`) and `--major`/`--no-major` refine this inside `prepare_run`.
-    let default_major = matches!(cli.command, Command::Outdated { .. });
-    let prepared = setup::prepare_run(
-        global,
-        &overrides,
-        command_name(&cli.command),
-        default_major,
-    )
-    .await?;
+    let setup_command = setup::SetupCommand::for_command(&cli.command).ok_or_else(|| {
+        CoreError::System("workspace-free command reached workspace setup".to_string())
+    })?;
+    let prepared = setup::prepare_run(global, &overrides, setup_command).await?;
     let repo_root = prepared.repo_root;
     let ws = prepared.ws;
     let opts = prepared.opts;

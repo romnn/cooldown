@@ -17,7 +17,7 @@ use self::transitive_gate::{
     TransitiveGateVerdict, insert_graph_violation, newly_introduced_violations, package_label,
     violation_identity,
 };
-use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories};
+use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories, advisory_fetch_policy};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
@@ -579,8 +579,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// [`top_up_advisories`](Self::top_up_advisories), which extends this snapshot without
     /// disturbing it.
     async fn fetch_advisories(&mut self, mut packages: Vec<String>) {
-        let policy = cooldown_core::resolve_advisory_policy(&self.ctx.pctx.policy.layers);
-        if !policy.enabled || policy.source == cooldown_core::AdvisorySourceKind::None {
+        if advisory_fetch_policy(self.ctx.pctx).is_none() {
             // `fetch_project_advisories` would be inert; skip the graph read below too.
             self.advisories = None;
             return;
@@ -606,9 +605,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts,
             )
             .await;
-        self.acc.warnings.extend(fetch.warnings);
-        self.acc.errors.extend(fetch.errors);
-        self.advisories = fetch.advisories.map(std::sync::Arc::new);
+        self.advisories = fetch
+            .record(&mut self.acc.warnings, &mut self.acc.errors)
+            .map(std::sync::Arc::new);
     }
 
     /// Extends the advisory snapshot to cover package identities it never queried — the ones a
@@ -640,7 +639,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let topped_up = self
             .ws
             .top_up_project_advisories(
-                self.ctx.reader,
                 self.ctx.pctx,
                 &self.project_label,
                 &existing,
@@ -648,9 +646,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts,
             )
             .await;
-        self.acc.warnings.extend(topped_up.warnings);
-        self.acc.errors.extend(topped_up.errors);
-        match topped_up.advisories {
+        match topped_up.record(&mut self.acc.warnings, &mut self.acc.errors) {
             Some(advisories) => self.advisories = Some(std::sync::Arc::new(advisories)),
             // Asking again every round would re-query a feed that just failed and repeat its
             // warning per round; one report of it is the honest amount.

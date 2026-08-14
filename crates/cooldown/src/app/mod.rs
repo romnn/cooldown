@@ -35,7 +35,9 @@ pub use cooldown_render::{
 pub use progress::Progress;
 pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
-pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace};
+pub use workspace::{
+    AdapterSet, AdvisoryFailureMode, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace,
+};
 
 pub(crate) use recover::{RecoveryTarget, recover_targets};
 pub(crate) use workspace::{

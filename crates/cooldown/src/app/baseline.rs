@@ -199,17 +199,19 @@ impl crate::app::Workspace {
             // A feed failure therefore changes what gets written, so its diagnostics travel
             // back to the caller instead of being dropped.
             let dep_names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
-            let outcome = self
-                .fetch_project_advisories(adapter, pctx, pctx.rel_path.as_str(), &dep_names, opts)
-                .await;
-            diagnostics.extend(outcome.warnings);
-            diagnostics.extend(outcome.errors);
-            let advisories = outcome.advisories;
             // Route through the cache-backed fetch — the only locked-release path — so a package
             // shared with other commands/projects this run is not re-fetched.
-            let fetched = self
-                .fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout())
-                .await;
+            let advisory_fetch = self.fetch_project_advisories(
+                adapter,
+                pctx,
+                pctx.rel_path.as_str(),
+                &dep_names,
+                opts,
+            );
+            let release_fetch =
+                self.fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout());
+            let (outcome, fetched) = tokio::join!(advisory_fetch, release_fetch);
+            let advisories = outcome.record_flat(&mut diagnostics);
 
             for FetchedRelease {
                 dependency: dep,

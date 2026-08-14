@@ -12,7 +12,7 @@
 //! Stale cached advisory data may still annotate but never shortens: the shorten mode degrades
 //! to flag for that project.
 
-use super::{ProjectCtx, RunOpts, Workspace};
+use super::{AdvisoryFailureMode, ProjectCtx, RunOpts, Workspace};
 use cooldown_core::{
     Advisory, AdvisoryContext, AdvisoryMode, AdvisorySourceId, AdvisorySourceKind, Dependency,
     Diagnostic, DiagnosticKind, RawAdvisory, Release, ResolveKind, ResolveQuery,
@@ -37,6 +37,8 @@ pub(crate) struct ProjectAdvisories {
     queried: std::collections::HashSet<String>,
     /// The source that served the fetch, stamped onto every classified advisory.
     source: AdvisorySourceId,
+    /// The advisory ecosystem used for the initial fetch and every later top-up.
+    ecosystem: &'static str,
     policy: ResolvedAdvisoryPolicy,
 }
 
@@ -118,14 +120,14 @@ impl ProjectAdvisories {
             by_package,
             queried: already,
             source: self.source,
+            ecosystem: self.ecosystem,
             policy: self.policy.clone(),
         }
     }
 }
 
-/// The outcome of one project's advisory fetch: the data (when the feed is enabled, supported,
-/// and reachable) plus any diagnostics to surface.
-pub(crate) struct AdvisoryFetchOutcome {
+/// The outcome of fetching or extending one project's advisories.
+pub(crate) struct AdvisoryOutcome {
     pub(crate) advisories: Option<ProjectAdvisories>,
     /// Non-fatal diagnostics: an unsupported tool, an unreachable feed (fail-open), a
     /// stale-cache shorten degradation, or a never-shortening security window.
@@ -136,9 +138,9 @@ pub(crate) struct AdvisoryFetchOutcome {
     pub(crate) errors: Vec<Diagnostic>,
 }
 
-impl AdvisoryFetchOutcome {
+impl AdvisoryOutcome {
     fn inert() -> Self {
-        AdvisoryFetchOutcome {
+        AdvisoryOutcome {
             advisories: None,
             warnings: Vec::new(),
             errors: Vec::new(),
@@ -147,53 +149,47 @@ impl AdvisoryFetchOutcome {
 
     /// No usable advisory data: fail open on the window (the ordinary, stricter one stands) and
     /// loud in the output — unless the gate insisted with `--fail-on-advisory-source`.
-    fn fail_open(diagnostic: Diagnostic, insisted: bool) -> Self {
-        let (warnings, errors) = fail_open_split(diagnostic, insisted);
-        AdvisoryFetchOutcome {
+    fn fail_open(diagnostic: Diagnostic, mode: AdvisoryFailureMode) -> Self {
+        let (warnings, errors) = fail_open_split(diagnostic, mode);
+        AdvisoryOutcome {
             advisories: None,
             warnings,
             errors,
         }
+    }
+
+    /// Records diagnostics in their severity channels and returns usable advisory data.
+    pub(crate) fn record(
+        self,
+        warnings: &mut Vec<Diagnostic>,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<ProjectAdvisories> {
+        warnings.extend(self.warnings);
+        errors.extend(self.errors);
+        self.advisories
+    }
+
+    /// Records every diagnostic into a caller that intentionally has one combined channel.
+    pub(crate) fn record_flat(
+        self,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<ProjectAdvisories> {
+        diagnostics.extend(self.warnings);
+        diagnostics.extend(self.errors);
+        self.advisories
     }
 }
 
 /// Routes one fail-open diagnostic to the warnings or, when the gate insisted with
 /// `--fail-on-advisory-source`, to the errors.
-fn fail_open_split(diagnostic: Diagnostic, insisted: bool) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
-    if insisted {
+fn fail_open_split(
+    diagnostic: Diagnostic,
+    mode: AdvisoryFailureMode,
+) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    if mode.is_error() {
         (Vec::new(), vec![diagnostic])
     } else {
         (vec![diagnostic], Vec::new())
-    }
-}
-
-/// The outcome of extending an existing fetch: the widened snapshot (absent when nothing usable
-/// came back) plus any diagnostics.
-pub(crate) struct AdvisoryTopUp {
-    pub(crate) advisories: Option<ProjectAdvisories>,
-    pub(crate) warnings: Vec<Diagnostic>,
-    pub(crate) errors: Vec<Diagnostic>,
-}
-
-impl AdvisoryTopUp {
-    /// Nothing to add: the snapshot stands as it is.
-    fn inert() -> Self {
-        AdvisoryTopUp {
-            advisories: None,
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-
-    /// No usable data for the new packages: they stay unadvised, which can only fail to shorten
-    /// their windows — reported like any other unusable feed.
-    fn fail_open(diagnostic: Diagnostic, insisted: bool) -> Self {
-        let (warnings, errors) = fail_open_split(diagnostic, insisted);
-        AdvisoryTopUp {
-            advisories: None,
-            warnings,
-            errors,
-        }
     }
 }
 
@@ -209,11 +205,13 @@ fn source_kind_matches(kind: AdvisorySourceKind, id: AdvisorySourceId) -> bool {
 
 /// The `[advisories] source` token, for diagnostics.
 fn source_token(kind: AdvisorySourceKind) -> &'static str {
-    match kind {
-        AdvisorySourceKind::Osv => "osv",
-        AdvisorySourceKind::Github => "github",
-        AdvisorySourceKind::None => "none",
-    }
+    kind.as_str()
+}
+
+/// Resolves the policy only when it asks the application to consult a feed.
+pub(crate) fn advisory_fetch_policy(pctx: &ProjectCtx) -> Option<ResolvedAdvisoryPolicy> {
+    let policy = resolve_advisory_policy(&pctx.policy.layers);
+    (policy.enabled && policy.source != AdvisorySourceKind::None).then_some(policy)
 }
 
 impl Workspace {
@@ -224,7 +222,7 @@ impl Workspace {
     /// Inert (`advisories: None`, no diagnostics) only when the policy asks for nothing: the
     /// feed disabled, `source = "none"`, or no packages to ask about.
     /// Every other way the fetch can come up empty — no wired source implements the selected
-    /// `source`, no advisory ecosystem covers the tool, the feed is unreachable — is reported,
+    /// `source`, no single advisory ecosystem maps the tool, the feed is unreachable — is reported,
     /// fail-open, so an enabled feed never certifies a run silently.
     pub(crate) async fn fetch_project_advisories(
         &self,
@@ -233,11 +231,12 @@ impl Workspace {
         project_label: &str,
         package_names: &[String],
         opts: &RunOpts,
-    ) -> AdvisoryFetchOutcome {
-        let mut policy = resolve_advisory_policy(&pctx.policy.layers);
-        if !policy.enabled || policy.source == AdvisorySourceKind::None || package_names.is_empty()
-        {
-            return AdvisoryFetchOutcome::inert();
+    ) -> AdvisoryOutcome {
+        let Some(mut policy) = advisory_fetch_policy(pctx) else {
+            return AdvisoryOutcome::inert();
+        };
+        if package_names.is_empty() {
+            return AdvisoryOutcome::inert();
         }
         // The policy selects a feed the wired source must actually implement.
         // A `Workspace` built outside the CLI can pair a `github` policy with the OSV source,
@@ -257,12 +256,12 @@ impl Workspace {
             )
             .with_tool(pctx.tool.as_str())
             .with_project(project_label);
-            return AdvisoryFetchOutcome::fail_open(diagnostic, opts.fail_on_advisory_source);
+            return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
         };
         let mut warnings = Vec::new();
         let Some(ecosystem) = adapter.capabilities().advisory_ecosystem else {
             warnings.push(unsupported_ecosystem_warning(pctx, project_label));
-            return AdvisoryFetchOutcome {
+            return AdvisoryOutcome {
                 advisories: None,
                 warnings,
                 errors: Vec::new(),
@@ -293,8 +292,7 @@ impl Workspace {
                 )
                 .with_tool(pctx.tool.as_str())
                 .with_project(project_label);
-                let mut outcome =
-                    AdvisoryFetchOutcome::fail_open(diagnostic, opts.fail_on_advisory_source);
+                let mut outcome = AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
                 outcome.warnings.splice(..0, warnings);
                 return outcome;
             }
@@ -312,7 +310,7 @@ impl Workspace {
             )
             .with_tool(pctx.tool.as_str())
             .with_project(project_label);
-            if opts.fail_on_advisory_source {
+            if opts.advisory_failure.is_error() {
                 errors.push(diagnostic);
             } else {
                 warnings.push(diagnostic);
@@ -332,11 +330,12 @@ impl Workspace {
                 .or_default()
                 .extend(package.advisories);
         }
-        AdvisoryFetchOutcome {
+        AdvisoryOutcome {
             advisories: Some(ProjectAdvisories {
                 by_package,
                 queried: packages.into_iter().collect(),
                 source: source.id(),
+                ecosystem,
                 policy,
             }),
             warnings,
@@ -354,26 +353,35 @@ impl Workspace {
     /// which can only fail to shorten their windows.
     pub(crate) async fn top_up_project_advisories(
         &self,
-        adapter: &dyn ToolRead,
         pctx: &ProjectCtx,
         project_label: &str,
         existing: &ProjectAdvisories,
         packages: &[String],
         opts: &RunOpts,
-    ) -> AdvisoryTopUp {
-        let (Some(source), Some(ecosystem)) = (
-            self.advisory_source.as_ref(),
-            adapter.capabilities().advisory_ecosystem,
-        ) else {
-            // Neither can have changed since the fetch that produced `existing` succeeded.
-            return AdvisoryTopUp::inert();
+    ) -> AdvisoryOutcome {
+        let Some(source) = self
+            .advisory_source
+            .as_ref()
+            .filter(|source| source.id() == existing.source)
+        else {
+            let diagnostic = Diagnostic::new(
+                DiagnosticKind::AdvisorySourceUnavailable,
+                format!(
+                    "advisory source `{}` no longer matches this project's snapshot; {} newly resolved packages stay un-annotated",
+                    existing.source,
+                    packages.len()
+                ),
+            )
+            .with_tool(pctx.tool.as_str())
+            .with_project(project_label);
+            return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
         };
         opts.progress.phase(format!(
             "querying {} advisories for {} newly resolved packages",
             source.id(),
             packages.len()
         ));
-        let fetch = match source.advisories(ecosystem, packages).await {
+        let fetch = match source.advisories(existing.ecosystem, packages).await {
             Ok(fetch) => fetch,
             Err(error) => {
                 let diagnostic = Diagnostic::new(
@@ -386,7 +394,7 @@ impl Workspace {
                 )
                 .with_tool(pctx.tool.as_str())
                 .with_project(project_label);
-                return AdvisoryTopUp::fail_open(diagnostic, opts.fail_on_advisory_source);
+                return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
             }
         };
         // Stale data may annotate but never shorten, and this project's shorten mode is already
@@ -402,11 +410,11 @@ impl Workspace {
             )
             .with_tool(pctx.tool.as_str())
             .with_project(project_label);
-            return AdvisoryTopUp::fail_open(diagnostic, opts.fail_on_advisory_source);
+            return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
         }
-        AdvisoryTopUp {
+        AdvisoryOutcome {
             advisories: Some(existing.extended(packages, fetch)),
-            ..AdvisoryTopUp::inert()
+            ..AdvisoryOutcome::inert()
         }
     }
 
@@ -459,7 +467,7 @@ fn unsupported_ecosystem_warning(pctx: &ProjectCtx, project_label: &str) -> Diag
     Diagnostic::new(
         DiagnosticKind::AdvisoryEcosystemUnsupported,
         format!(
-            "no advisory-database ecosystem covers tool `{}`; its packages are not annotated",
+            "tool `{}` is not mapped to one advisory-database ecosystem; its packages are not annotated",
             pctx.tool.as_str()
         ),
     )
@@ -541,13 +549,19 @@ mod tests {
         },
         /// Reports one advisory per queried package, named after it.
         Advising,
+        OtherSource,
         Unreachable,
     }
 
     #[async_trait]
     impl AdvisorySource for FakeFeed {
         fn id(&self) -> AdvisorySourceId {
-            AdvisorySourceId("osv")
+            match self {
+                FakeFeed::OtherSource => AdvisorySourceId("other"),
+                FakeFeed::Ok { .. } | FakeFeed::Advising | FakeFeed::Unreachable => {
+                    AdvisorySourceId("osv")
+                }
+            }
         }
 
         async fn advisories(
@@ -565,6 +579,16 @@ mod tests {
                         })
                         .collect(),
                     stale: *stale,
+                }),
+                FakeFeed::OtherSource => Ok(AdvisoryFetch {
+                    packages: packages
+                        .iter()
+                        .map(|package| PackageAdvisories {
+                            package: package.clone(),
+                            advisories: Vec::new(),
+                        })
+                        .collect(),
+                    stale: false,
                 }),
                 FakeFeed::Advising => Ok(AdvisoryFetch {
                     packages: packages
@@ -681,7 +705,7 @@ mod tests {
         );
 
         let opts = RunOpts {
-            fail_on_advisory_source: true,
+            advisory_failure: AdvisoryFailureMode::Error,
             ..RunOpts::default()
         };
         let outcome = ws
@@ -777,7 +801,7 @@ mod tests {
             advisory_ecosystem: Some("crates.io"),
         };
         let opts = RunOpts {
-            fail_on_advisory_source: true,
+            advisory_failure: AdvisoryFailureMode::Error,
             ..RunOpts::default()
         };
         let outcome = ws
@@ -833,7 +857,6 @@ mod tests {
 
         let topped_up = ws
             .top_up_project_advisories(
-                &reader,
                 &pctx,
                 ".",
                 &initial,
@@ -877,7 +900,6 @@ mod tests {
 
         let topped_up = workspace(FakeFeed::Ok { stale: true })
             .top_up_project_advisories(
-                &reader,
                 &shorten,
                 ".",
                 &initial,
@@ -904,7 +926,6 @@ mod tests {
             .expect("fetched");
         let topped_up = workspace(FakeFeed::Ok { stale: true })
             .top_up_project_advisories(
-                &reader,
                 &flag,
                 ".",
                 &initial,
@@ -938,7 +959,6 @@ mod tests {
 
         let topped_up = workspace(FakeFeed::Unreachable)
             .top_up_project_advisories(
-                &reader,
                 &pctx,
                 ".",
                 &initial,
@@ -953,6 +973,38 @@ mod tests {
             topped_up.warnings[0].kind,
             DiagnosticKind::AdvisorySourceUnavailable
         );
+    }
+
+    #[tokio::test]
+    async fn a_top_up_cannot_switch_advisory_sources() {
+        let reader = FakeReader {
+            advisory_ecosystem: Some("crates.io"),
+        };
+        let pctx = project_ctx(Some(enabled_policy(None)));
+        let initial = workspace(FakeFeed::Advising)
+            .fetch_project_advisories(
+                &reader,
+                &pctx,
+                ".",
+                &["serde".to_string()],
+                &RunOpts::default(),
+            )
+            .await
+            .advisories
+            .expect("fetched");
+
+        let topped_up = workspace(FakeFeed::OtherSource)
+            .top_up_project_advisories(
+                &pctx,
+                ".",
+                &initial,
+                &["tokio".to_string()],
+                &RunOpts::default(),
+            )
+            .await;
+        assert!(topped_up.advisories.is_none());
+        assert_eq!(topped_up.warnings.len(), 1);
+        assert!(topped_up.warnings[0].message.contains("no longer matches"));
     }
 
     /// A policy selecting a feed no wired source implements must not certify silently: the run
@@ -986,7 +1038,7 @@ mod tests {
         assert!(outcome.warnings[0].message.contains("github"));
 
         let opts = RunOpts {
-            fail_on_advisory_source: true,
+            advisory_failure: AdvisoryFailureMode::Error,
             ..RunOpts::default()
         };
         let outcome = ws

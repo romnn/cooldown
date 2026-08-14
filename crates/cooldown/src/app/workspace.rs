@@ -151,6 +151,22 @@ pub enum TransitiveGate {
     Hide,
 }
 
+/// How an unusable enabled advisory feed affects a command's diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdvisoryFailureMode {
+    /// Keep the ordinary, stricter window and surface a warning.
+    #[default]
+    Warn,
+    /// Refuse to certify the run without usable advisory evidence.
+    Error,
+}
+
+impl AdvisoryFailureMode {
+    pub(crate) const fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
 /// Per-run invocation controls (the non-policy flags). Policy lives in each project's
 /// [`PolicyStack`].
 #[derive(Debug, Clone, Default)]
@@ -225,12 +241,11 @@ pub struct RunOpts {
     pub allow_stale_lock: bool,
     /// `--fail-on-unknown-age`: make `check` fail on deps with no publish time.
     pub fail_on_unknown_age: bool,
-    /// `--fail-on-advisory-source` (check): fail rather than warn when the advisory feed is
-    /// enabled but unreachable — a gate that refuses to certify without the feed.
+    /// How an unusable enabled advisory feed is surfaced.
     ///
-    /// The default is fail-open: an outage can only fail to *shorten* a window, never to loosen
-    /// a verdict.
-    pub fail_on_advisory_source: bool,
+    /// Only `check` selects [`AdvisoryFailureMode::Error`]; other commands fail open because an
+    /// outage can only fail to shorten a window, never loosen a verdict.
+    pub advisory_failure: AdvisoryFailureMode,
     /// `--lock` (check/outdated): refresh the lock before reading it. No-op under `--dry-run`.
     pub lock: bool,
     /// `--strict` (upgrade/fix): fail if the mutation could not complete cleanly.

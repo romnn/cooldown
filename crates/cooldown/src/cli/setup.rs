@@ -5,7 +5,7 @@ mod recovery;
 
 pub(in crate::cli) use recovery::{PreparedRecovery, configure_recovery_help, prepare_recovery};
 
-use super::{CliOverrides, GlobalArgs};
+use super::{CliOverrides, Command, GlobalArgs};
 use crate::app::{Baseline, Clock, FixedClock, SystemClock, Workspace};
 use crate::discovery;
 use camino::Utf8PathBuf;
@@ -17,11 +17,64 @@ pub(crate) struct PreparedRun {
     pub(crate) opts: crate::app::RunOpts,
 }
 
+/// The workspace-backed command properties setup needs before dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCommand {
+    Outdated,
+    Upgrade,
+    Fix,
+    Check,
+    Baseline,
+    Explain,
+    Config,
+    Sync,
+}
+
+impl SetupCommand {
+    pub(crate) const fn for_command(command: &Command) -> Option<Self> {
+        match command {
+            Command::Outdated { .. } => Some(Self::Outdated),
+            Command::Upgrade { .. } => Some(Self::Upgrade),
+            Command::Fix { .. } => Some(Self::Fix),
+            Command::Check { .. } => Some(Self::Check),
+            Command::Baseline { .. } => Some(Self::Baseline),
+            Command::Explain { .. } => Some(Self::Explain),
+            Command::Config { .. } => Some(Self::Config),
+            Command::Sync => Some(Self::Sync),
+            Command::Init | Command::Schema | Command::Recover => None,
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Outdated => "outdated",
+            Self::Upgrade => "upgrade",
+            Self::Fix => "fix",
+            Self::Check => "check",
+            Self::Baseline => "baseline",
+            Self::Explain => "explain",
+            Self::Config => "config",
+            Self::Sync => "sync",
+        }
+    }
+
+    const fn adopts_versions(self) -> bool {
+        matches!(self, Self::Upgrade | Self::Fix)
+    }
+
+    const fn defaults_to_major(self) -> bool {
+        matches!(self, Self::Outdated)
+    }
+
+    const fn is_check(self) -> bool {
+        matches!(self, Self::Check)
+    }
+}
+
 pub(crate) async fn prepare_run(
     global: &GlobalArgs,
     overrides: &CliOverrides,
-    command_key: &str,
-    default_major: bool,
+    command: SetupCommand,
 ) -> Result<PreparedRun, CoreError> {
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
@@ -29,15 +82,14 @@ pub(crate) async fn prepare_run(
     let configs =
         discovery::ConfigSources::load(&repo_root, global.config.as_deref(), global.no_global)?;
     let scan = configs.scan_config()?;
-    let mut cfg = scan.resolved(command_key);
+    let mut cfg = scan.resolved(command.key());
     // CLI `--exclude-folders`/`--exclude-packages` are the highest-precedence layer: they replace the
     // resolved `[global]`/`[<command>]` lists (per-tool `[tool.*]` excludes, carried on `scan`, still
     // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
-    let invocation =
-        options::resolve_invocation(global, overrides, &cfg, default_major, command_key)?;
-    options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
+    let invocation = options::resolve_invocation(global, overrides, &cfg, command)?;
+    options::reject_offline_dry_run(command, invocation.dry_run(), invocation.offline())?;
     invocation.progress().phase("discovering projects");
     // Version-adopting commands revalidate npm package documents so the mutable `latest`
     // dist-tag ceiling reflects the registry's current state (read-only commands accept the
@@ -46,7 +98,7 @@ pub(crate) async fn prepare_run(
     // document — so it stays on the cached path. With the ceiling switched off
     // (`--no-respect-dist-tags`, `respect-dist-tags = false`) the tag is never read, so paying a
     // conditional request per npm-family package would buy nothing.
-    let adopting = matches!(command_key, "upgrade" | "fix");
+    let adopting = command.adopts_versions();
     let (adapters, http) = detect::adapter_set(
         invocation.offline(),
         invocation.fresh(),

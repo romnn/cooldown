@@ -240,44 +240,31 @@ impl<'a> CheckRunner<'a> {
         drop(refresh_guard);
 
         let dep_names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
-        let advisory_fetch = self
-            .ws
-            .fetch_project_advisories(
-                read.adapter,
-                pctx,
-                &read.project_label,
-                &dep_names,
-                self.opts,
-            )
-            .await;
-        self.acc.warnings.extend(advisory_fetch.warnings);
-        self.acc.errors.extend(advisory_fetch.errors);
-
+        let advisory_fetch = self.ws.fetch_project_advisories(
+            read.adapter,
+            pctx,
+            &read.project_label,
+            &dep_names,
+            self.opts,
+        );
         self.opts
             .progress
             .phase(format!("checking {} resolved dependencies", deps.len()));
-        let fetched = self
-            .ws
-            .fetch_locked_releases(
-                read.adapter,
-                deps,
-                &read.fetch,
-                &self.opts.progress,
-                self.opts.fanout(),
-            )
-            .await;
+        let release_fetch = self.ws.fetch_locked_releases(
+            read.adapter,
+            deps,
+            &read.fetch,
+            &self.opts.progress,
+            self.opts.fanout(),
+        );
+        let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
+        let advisories = advisory_fetch.record(&mut self.acc.warnings, &mut self.acc.errors);
         for FetchedRelease {
             dependency: dep,
             result,
         } in fetched
         {
-            self.gate_pin(
-                pctx,
-                &read,
-                advisory_fetch.advisories.as_ref(),
-                &dep,
-                result,
-            );
+            self.gate_pin(pctx, &read, advisories.as_ref(), &dep, result);
         }
     }
 

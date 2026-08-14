@@ -1,4 +1,5 @@
 use crate::app::{Progress, RunOpts};
+use crate::cli::setup::SetupCommand;
 use crate::cli::{CliOverrides, GlobalArgs, LogLevel};
 use cooldown_cargo::CARGO_ID;
 use cooldown_core::config::{CommandConfig, WindowFields};
@@ -81,11 +82,11 @@ impl ResolvedInvocation {
 /// necessarily resolves online; `--offline` promises no network. Reject the combination for the
 /// mutating commands instead of letting the native tool quietly violate that promise.
 pub(super) fn reject_offline_dry_run(
-    command_key: &str,
+    command: SetupCommand,
     dry_run: bool,
     offline: bool,
 ) -> Result<(), CoreError> {
-    if matches!(command_key, "upgrade" | "fix") && dry_run && offline {
+    if command.adopts_versions() && dry_run && offline {
         return Err(CoreError::Config(
             "--dry-run previews the plan with the real resolver, which needs the network; \
              it cannot be combined with --offline"
@@ -95,24 +96,13 @@ pub(super) fn reject_offline_dry_run(
     Ok(())
 }
 
-/// Whether `fail-on-advisory-source` escalates for this command.
-///
-/// It is a `check` gate, but it lives in shared config — a `[global]` table sets it for every
-/// command — and the advisory fetch it escalates is shared too, so the scoping happens here.
-/// Only `check` certifies anything: promoting the same warning elsewhere would fail a command
-/// that already did its work (an `upgrade` that mutated successfully), or file a "fatal"
-/// diagnostic in one that exits zero regardless (`outdated`, `baseline`).
-fn advisory_source_gate(command_key: &str, configured: Option<bool>) -> bool {
-    command_key == "check" && configured.unwrap_or(false)
-}
-
 pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
     cfg: &CommandConfig,
-    default_major: bool,
-    command_key: &str,
+    command: SetupCommand,
 ) -> Result<ResolvedInvocation, CoreError> {
+    let default_major = command.defaults_to_major();
     let explicit = explicit_command_config(global, overrides);
     let merged = builtin_command_config(default_major)
         .merge_layer(cfg.clone())
@@ -157,10 +147,7 @@ pub(super) fn resolve_invocation(
             all_artifacts: merged.all_artifacts.unwrap_or(false),
             allow_stale_lock: merged.allow_stale_lock.unwrap_or(false),
             fail_on_unknown_age: merged.fail_on_unknown_age.unwrap_or(false),
-            fail_on_advisory_source: advisory_source_gate(
-                command_key,
-                merged.fail_on_advisory_source,
-            ),
+            advisory_failure: advisory_failure_mode(command, merged.fail_on_advisory_source),
             // A CLI-only mutating convenience for read-only commands; intentionally not config-backed.
             lock: overrides.lock.unwrap_or(false),
             strict: merged.strict.unwrap_or(false),
@@ -194,6 +181,17 @@ pub(super) fn resolve_invocation(
         strict_native: strict_native_mode(overrides),
         edge_policy_override: overrides.edge_policy,
     })
+}
+
+fn advisory_failure_mode(
+    command: SetupCommand,
+    configured: Option<bool>,
+) -> crate::app::AdvisoryFailureMode {
+    if command.is_check() && configured.unwrap_or(false) {
+        crate::app::AdvisoryFailureMode::Error
+    } else {
+        crate::app::AdvisoryFailureMode::Warn
+    }
 }
 
 fn builtin_command_config(default_major: bool) -> CommandConfig {
@@ -372,7 +370,9 @@ fn env_window_fields() -> Result<WindowFields, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advisory_source_gate, builtin_command_config, reject_offline_dry_run};
+    use super::{advisory_failure_mode, builtin_command_config, reject_offline_dry_run};
+    use crate::app::AdvisoryFailureMode;
+    use crate::cli::setup::SetupCommand;
     use cooldown_core::CoreError;
     use cooldown_core::config::CommandConfig;
 
@@ -409,30 +409,47 @@ mod tests {
 
     #[test]
     fn offline_dry_run_is_rejected_for_mutating_commands_only() {
-        for command in ["upgrade", "fix"] {
+        for command in [SetupCommand::Upgrade, SetupCommand::Fix] {
             let err = reject_offline_dry_run(command, true, true)
                 .expect_err("offline dry-run must be a usage error");
-            std::assert_matches!(err, CoreError::Config(_), "command `{command}`");
+            std::assert_matches!(err, CoreError::Config(_));
         }
         // Non-mutating commands and non-conflicting flag combinations pass through.
-        assert!(reject_offline_dry_run("outdated", true, true).is_ok());
-        assert!(reject_offline_dry_run("upgrade", true, false).is_ok());
-        assert!(reject_offline_dry_run("upgrade", false, true).is_ok());
-        assert!(reject_offline_dry_run("fix", false, false).is_ok());
+        assert!(reject_offline_dry_run(SetupCommand::Outdated, true, true).is_ok());
+        assert!(reject_offline_dry_run(SetupCommand::Upgrade, true, false).is_ok());
+        assert!(reject_offline_dry_run(SetupCommand::Upgrade, false, true).is_ok());
+        assert!(reject_offline_dry_run(SetupCommand::Fix, false, false).is_ok());
     }
 
     /// `fail-on-advisory-source` is a `check` gate even when a `[global]` table sets it: no other
     /// command certifies, so none of them may turn an advisory warning into an error.
     #[test]
     fn the_advisory_source_gate_is_scoped_to_check() {
-        assert!(advisory_source_gate("check", Some(true)));
-        for command in ["outdated", "upgrade", "fix", "baseline", "sync", "explain"] {
-            assert!(
-                !advisory_source_gate(command, Some(true)),
-                "`{command}` must not escalate the advisory feed"
+        assert_eq!(
+            advisory_failure_mode(SetupCommand::Check, Some(true)),
+            AdvisoryFailureMode::Error
+        );
+        for command in [
+            SetupCommand::Outdated,
+            SetupCommand::Upgrade,
+            SetupCommand::Fix,
+            SetupCommand::Baseline,
+            SetupCommand::Sync,
+            SetupCommand::Explain,
+            SetupCommand::Config,
+        ] {
+            assert_eq!(
+                advisory_failure_mode(command, Some(true)),
+                AdvisoryFailureMode::Warn
             );
         }
-        assert!(!advisory_source_gate("check", None));
-        assert!(!advisory_source_gate("check", Some(false)));
+        assert_eq!(
+            advisory_failure_mode(SetupCommand::Check, None),
+            AdvisoryFailureMode::Warn
+        );
+        assert_eq!(
+            advisory_failure_mode(SetupCommand::Check, Some(false)),
+            AdvisoryFailureMode::Warn
+        );
     }
 }

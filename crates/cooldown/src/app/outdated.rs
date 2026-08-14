@@ -159,12 +159,20 @@ impl<'a> OutdatedRunner<'a> {
             .await;
         drop(read_guard);
         drop(refresh_guard);
-        let advisories = self
-            .project_advisories(read.adapter, pctx, &read.project_label, &deps)
-            .await;
-        let fetched = self
-            .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
-            .await;
+        let names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        let advisory_fetch = self.ws.fetch_project_advisories(
+            read.adapter,
+            pctx,
+            &read.project_label,
+            &names,
+            self.opts,
+        );
+        let release_fetch =
+            self.fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch);
+        let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
+        let advisories = advisory_fetch
+            .record(&mut self.warnings, &mut self.errors)
+            .map(std::sync::Arc::new);
 
         let ClassifiedProject {
             items: mut project_items,
@@ -230,27 +238,6 @@ impl<'a> OutdatedRunner<'a> {
             }
         }
         manifest_only
-    }
-
-    /// Fetches the project's advisories (when enabled), folding the fetch's diagnostics into
-    /// the report.
-    async fn project_advisories(
-        &mut self,
-        adapter: &dyn cooldown_core::ToolRead,
-        pctx: &super::ProjectCtx,
-        project_label: &str,
-        deps: &[Dependency],
-    ) -> Option<std::sync::Arc<ProjectAdvisories>> {
-        let names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
-        let fetch = self
-            .ws
-            .fetch_project_advisories(adapter, pctx, project_label, &names, self.opts)
-            .await;
-        self.warnings.extend(fetch.warnings);
-        self.errors.extend(fetch.errors);
-        // Shared with the upgrade-policy preview below, so classification and verification
-        // judge from one snapshot instead of two feed round trips that could disagree.
-        fetch.advisories.map(std::sync::Arc::new)
     }
 
     fn classify_fetched(
