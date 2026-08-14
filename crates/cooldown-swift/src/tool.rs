@@ -82,6 +82,7 @@ impl ToolRead for SwiftTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("SwiftURL"),
         }
     }
 
@@ -96,6 +97,16 @@ impl ToolRead for SwiftTool {
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
         version::classify_kind(from, to)
+    }
+
+    fn advisory_package(&self, package: &str) -> String {
+        // OSV's `SwiftURL` ecosystem names packages by repository URL; the adapter's identity
+        // is the `owner/repo` pair with the casing `Package.resolved` recorded.
+        // The OSV query API is case-sensitive and its SwiftURL entries use the lowercase URL,
+        // so the query must lowercase (GitHub URLs are case-insensitive, so this loses
+        // nothing); the response side additionally matches case-insensitively (see the
+        // `SwiftURL` comparison in the OSV source) for documents that keep the display casing.
+        format!("github.com/{package}").to_ascii_lowercase()
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -231,6 +242,21 @@ impl ToolWrite for SwiftTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    /// The OSV query API is case-sensitive and `SwiftURL` entries use the lowercase repository
+    /// URL: `Package.resolved` casing must be lowered or the query returns nothing at all (the
+    /// case-insensitive *response* matching never gets a chance).
+    #[test]
+    fn advisory_package_lowercases_the_repository_url() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = SwiftTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(
+            tool.advisory_package("Apple/Swift-NIO"),
+            "github.com/apple/swift-nio"
+        );
+    }
 
     #[tokio::test]
     async fn dependencies_read_github_pins() {

@@ -95,6 +95,7 @@ impl ToolRead for GoTool {
             has_dist_tags: false,
             can_sync: false,
             artifact_granular: false,
+            advisory_ecosystem: Some("Go"),
         }
     }
 
@@ -111,6 +112,16 @@ impl ToolRead for GoTool {
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
         releases::classify_kind(from, to)
+    }
+
+    fn advisory_version(&self, version: &str) -> String {
+        // OSV's `Go` ecosystem records semver without the `v` prefix Go module versions carry
+        // ("0.31.0" for the module version "v0.31.0").
+        if version.starts_with('v') {
+            version.to_string()
+        } else {
+            format!("v{version}")
+        }
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {

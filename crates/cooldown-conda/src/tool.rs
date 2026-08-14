@@ -188,6 +188,8 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            // No advisory-database ecosystem covers this tool; the feed is inert here.
+            advisory_ecosystem: None,
         }
     }
 

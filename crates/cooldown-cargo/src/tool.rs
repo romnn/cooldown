@@ -139,6 +139,7 @@ impl ToolRead for CargoTool {
             has_dist_tags: false,
             can_sync: false,
             artifact_granular: false,
+            advisory_ecosystem: Some("crates.io"),
         }
     }
 

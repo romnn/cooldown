@@ -82,6 +82,7 @@ impl ToolRead for HexTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("Hex"),
         }
     }
 

@@ -423,6 +423,10 @@ impl ToolRead for DenoTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            // Deno mixes jsr and npm identities in one lock; querying jsr names against OSV's
+            // `npm` ecosystem could alias onto unrelated npm packages, so the feed stays inert
+            // here rather than half-right.
+            advisory_ecosystem: None,
         }
     }
 

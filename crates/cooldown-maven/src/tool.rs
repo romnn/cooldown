@@ -186,6 +186,7 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("Maven"),
         }
     }
 

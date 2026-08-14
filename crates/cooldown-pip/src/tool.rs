@@ -178,6 +178,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("PyPI"),
         }
     }
 
@@ -192,6 +193,13 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
         version::classify_kind(from, to)
+    }
+
+    fn advisory_package(&self, package: &str) -> String {
+        // The lockfile may preserve the author's spelling (`Django`, `jupyter_server`); OSV's
+        // `PyPI` ecosystem stores PEP 503-normalized names, and its documents' `affected[]`
+        // entries only match the normalized form.
+        cooldown_adapter_util::pep503_normalize(package)
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -346,6 +354,22 @@ mod tests {
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
+
+    /// A lockfile spelling like `Django` or `jupyter_server` must query (and match) OSV's PEP
+    /// 503-normalized `PyPI` names, or every advisory for the package is silently lost.
+    #[test]
+    fn advisory_package_normalizes_per_pep503() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = PyTool::<Pip>::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.advisory_package("Django"), "django");
+        assert_eq!(tool.advisory_package("jupyter_server"), "jupyter-server");
+        assert_eq!(
+            tool.advisory_package("ruamel.yaml.clib"),
+            "ruamel-yaml-clib"
+        );
+    }
 
     #[tokio::test]
     async fn pip_apply_rewrites_requirements_without_invoking_pip_install() -> eyre::Result<()> {

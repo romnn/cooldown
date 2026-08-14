@@ -251,6 +251,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             has_dist_tags: true,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("npm"),
         }
     }
 

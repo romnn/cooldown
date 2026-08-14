@@ -81,6 +81,7 @@ impl ToolRead for BundlerTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("RubyGems"),
         }
     }
 

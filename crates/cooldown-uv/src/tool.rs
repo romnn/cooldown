@@ -163,6 +163,7 @@ impl ToolRead for UvTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: true,
+            advisory_ecosystem: Some("PyPI"),
         }
     }
 
@@ -178,6 +179,12 @@ impl ToolRead for UvTool {
             alternate_manifests: &[],
             workspace_root: false,
         })
+    }
+
+    fn advisory_package(&self, package: &str) -> String {
+        // `uv.lock` names are normalized already in practice, but PEP 503 normalization is
+        // idempotent and OSV's `PyPI` documents only match the normalized form.
+        cooldown_adapter_util::pep503_normalize(package)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
