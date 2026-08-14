@@ -346,6 +346,9 @@ pub struct PolicyLayer {
     pub rules: Vec<Rule>,
     /// A config layer may set `strict-native`; combined monotonically on the stack.
     pub strict_native: Option<bool>,
+    /// The layer's `[advisories]` table, when set; combined per field by
+    /// [`resolve_advisory_policy`](crate::advisory::resolve_advisory_policy).
+    pub advisories: Option<crate::advisory::AdvisoryPolicy>,
 }
 
 impl PolicyLayer {
@@ -368,6 +371,7 @@ impl PolicyLayer {
             origin,
             rules: Vec::new(),
             strict_native: None,
+            advisories: None,
         }
     }
 }
@@ -455,6 +459,22 @@ pub struct ResolvedWindow {
     pub exempt: bool,
     /// The origin of the `allow` entry that granted the exemption, if [`exempt`](Self::exempt).
     pub exempt_origin: Option<Origin>,
+    /// The advisory that replaced the ordinary window with the security window, when the
+    /// `[advisories]` shorten mode applied (the JSON `shortenedBy`, a sibling of `clampedBy` —
+    /// a clamp tightens, a shorten loosens; keeping them separate keeps `explain` honest about
+    /// which happened).
+    ///
+    /// `None` for every ordinarily-resolved window.
+    pub shortened_by: Option<crate::advisory::AdvisoryId>,
+    /// The floor that would still bind if the advisory security window replaced this window.
+    ///
+    /// `[advisories] bypass-floor = true` is resolved **per floor candidate by exact layer** —
+    /// the same mechanism `allow` uses — so a bypass lifts only its own layer's floor and the
+    /// largest floor no bypass could lift remains here.
+    /// Mirrors [`floor`](Self::floor) when no layer declares a bypass.
+    pub advisory_floor: Option<SignedDuration>,
+    /// The origin of [`advisory_floor`](Self::advisory_floor), if one remains.
+    pub advisory_floor_origin: Option<Origin>,
 }
 
 impl ResolvedWindow {

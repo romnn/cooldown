@@ -5,12 +5,16 @@
 //! passed in), and no version parsing (the tool hands back classified releases). "Unknown age
 //! is never mature" is enforced here, once.
 
+use crate::advisory::{
+    Advisory, AdvisoryContext, AdvisoryMode, SecurityRelevance, apply_security_window,
+};
 use crate::model::{
     Candidate, Dependency, HeldReason, MajorKey, PinVerdict, Release, ReleaseOrder, ReleaseQuality,
     Status, ToolId, UpdateKind, Verdict, Version,
 };
 use crate::policy::{
-    MaxMajorPick, PolicyLayer, ResolveKind, ResolveQuery, resolve, resolve_max_major,
+    MaxMajorPick, PolicyLayer, ResolveKind, ResolveQuery, ResolvedWindow, resolve,
+    resolve_max_major,
 };
 use camino::Utf8Path;
 use jiff::Timestamp;
@@ -256,19 +260,145 @@ fn commit_pin_verdict(dep: &Dependency, releases: &[Release], now: Timestamp) ->
     })
 }
 
-/// Classify one newer release as a [`Candidate`]: resolve its per-kind cooldown window and judge its
-/// publish instant against that window's cutoff at `now` ([`Exempt`](Status::Exempt) when an `allow`
-/// rule waives it, [`UnknownAge`](Status::UnknownAge) when undated). `None` for an unclassifiable
-/// jump (no `kind_from_current`) — the adapter classifies every real upgrade, so this only skips.
+/// The advisories adopting `candidate` would resolve: each non-withdrawn advisory that affects
+/// the current pin and that the candidate escapes.
+///
+/// For an [`unorderable`](Advisory::unorderable) advisory, "outside the surviving ranges" is
+/// not proof (the candidate could sit inside a *dropped* range), so the candidate must
+/// additionally be one of its exact fix versions.
+/// Positive evidence only; an uncertain advisory never flags.
+fn advisories_fixed_by_candidate<'a>(
+    advisories: &'a [Advisory],
+    current: &Release,
+    candidate: &Release,
+) -> Vec<&'a Advisory> {
+    advisories
+        .iter()
+        .filter(|advisory| {
+            !advisory.withdrawn
+                && advisory.affects(&current.version, Some(&current.order))
+                && !advisory.affects(&candidate.version, Some(&candidate.order))
+                && (!advisory.unorderable || advisory.fixed_by(&candidate.version))
+        })
+        .collect()
+}
+
+/// The advisories a rollback from `current` to `target` would re-enter: each non-withdrawn
+/// advisory the current pin escapes and the older target does not.
+///
+/// The mirror of [`advisories_fixed_by_candidate`], for the direction `fix` moves.
+/// `fix` exists to make `check` pass and is not a vulnerability gate, so this changes no verdict
+/// — but rolling a pin back *into* a known-affected version is the one thing a user would want
+/// said out loud, so callers report it.
+///
+/// Positive evidence only, on both sides of the move: for an
+/// [`unorderable`](Advisory::unorderable) advisory, "the current pin is outside the surviving
+/// ranges" is not proof it escaped (it could sit inside a *dropped* range, in which case there
+/// is no fix to keep), so the current pin must additionally be one of the exact fix versions.
+#[must_use]
+pub fn advisories_reintroduced_by<'a>(
+    advisories: &'a [Advisory],
+    current: &Release,
+    target: &Release,
+) -> Vec<&'a Advisory> {
+    advisories
+        .iter()
+        .filter(|advisory| {
+            !advisory.withdrawn
+                && advisory.affects(&target.version, Some(&target.order))
+                && !advisory.affects(&current.version, Some(&current.order))
+                && (!advisory.unorderable || advisory.fixed_by(&current.version))
+        })
+        .collect()
+}
+
+/// Fold a set of advisory matches into the row's [`SecurityRelevance`], shortening `window` to
+/// the security window when the policy's shorten mode applies.
+///
+/// Returns `None` (window untouched) when `fixed` is empty — the row is not security-relevant.
+///
+/// `fixed` (every advisory the row's version resolves — annotation evidence) and
+/// `shorten_evidence` (the subset whose evidence is an *exact fix-version match*) are split on
+/// purpose: the pin-side gate re-certifies an adopted version from the locked release alone,
+/// where exact fix membership is the only decidable test — so only that evidence may earn the
+/// security window, or the planner would fast-track a range-escape candidate the residual gate
+/// then rolls back.
+/// Both entry points exclude withdrawn advisories, so the severity threshold is the only
+/// shorten eligibility left to test here.
+/// `applied` reports whether the security window actually replaced the ordinary one (it never
+/// *extends* — see [`apply_security_window`]).
+fn security_relevance(
+    fixed: &[&Advisory],
+    shorten_evidence: &[&Advisory],
+    advisory: &AdvisoryContext<'_>,
+    window: &mut ResolvedWindow,
+    now: Timestamp,
+) -> Option<SecurityRelevance> {
+    let severity = fixed
+        .iter()
+        .map(|advisory| advisory.severity)
+        .max()
+        .unwrap_or(crate::advisory::AdvisorySeverity::Unknown);
+    let source = fixed.first().map(|advisory| advisory.source)?;
+    let mut applied = false;
+    if advisory.policy.mode == AdvisoryMode::Shorten {
+        let eligible = shorten_evidence
+            .iter()
+            .filter(|advisory_ref| advisory_ref.severity >= advisory.policy.severity)
+            .max_by_key(|advisory_ref| advisory_ref.severity);
+        if let Some(shortened) = eligible.and_then(|advisory_ref| {
+            apply_security_window(window, advisory.policy, &advisory_ref.id, now)
+        }) {
+            *window = shortened;
+            applied = true;
+        }
+    }
+    Some(SecurityRelevance {
+        fixes: fixed.iter().map(|advisory| advisory.id.clone()).collect(),
+        severity,
+        source,
+        applied,
+    })
+}
+
+/// Classify one newer release as a [`Candidate`]: resolve its per-kind cooldown window and
+/// judge its publish instant against that window's cutoff at `now` ([`Exempt`](Status::Exempt)
+/// when an `allow` rule waives it, [`UnknownAge`](Status::UnknownAge) when undated).
+///
+/// `None` for an unclassifiable jump (no `kind_from_current`) — the adapter classifies every
+/// real upgrade, so this only skips.
+///
+/// With an advisory context, a candidate that fixes an advisory affecting the current pin
+/// carries [`Candidate::security`], and under the shorten mode is judged against the security
+/// window.
 fn classify_candidate(
     r: &Release,
+    current: &Release,
     dep: &Dependency,
+    advisory: Option<&AdvisoryContext<'_>>,
     layers: &[PolicyLayer],
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> Option<Candidate> {
     let kind = r.kind_from_current?;
-    let window = resolve(layers, &query(dep, ctx, ResolveKind::Candidate(kind)), now).window;
+    let mut window = resolve(layers, &query(dep, ctx, ResolveKind::Candidate(kind)), now).window;
+    let security = advisory.and_then(|advisory| {
+        let fixed = advisories_fixed_by_candidate(advisory.advisories, current, r);
+        if fixed.is_empty() {
+            return None;
+        }
+        // Only an exact fix version may earn the security window: the residual gate
+        // re-certifies the adopted pin from the locked release alone (see
+        // [`check_pin_advised`]), where a range escape is undecidable — fast-tracking one here
+        // would adopt a version the gate then rolls back.
+        // A range-escape candidate still annotates.
+        let exact_fixes: Vec<&Advisory> = fixed
+            .iter()
+            .copied()
+            .filter(|advisory| advisory.fixed_by(&r.version))
+            .collect();
+        security_relevance(&fixed, &exact_fixes, advisory, &mut window, now)
+    });
     let status = if window.exempt {
         Status::Exempt
     } else {
@@ -284,6 +414,7 @@ fn classify_candidate(
         window,
         status,
         published_at: r.published_at,
+        security,
     })
 }
 
@@ -407,9 +538,30 @@ pub fn evaluate(
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> Verdict {
+    evaluate_advised(dep, releases, None, layers, ctx, now)
+}
+
+/// [`evaluate`] with an advisory feed: candidates that fix an advisory affecting the current
+/// pin carry [`Candidate::security`], and under [`AdvisoryMode::Shorten`] are judged against
+/// the security window instead of the ordinary one.
+///
+/// With `advisory` absent (or an empty advisory slice) this is exactly [`evaluate`] — the feed
+/// is additive by construction, which is the invariant the conformance suite pins.
+/// `upgrade` plans through the same call, so a shortened window adopts a security fix earlier
+/// with no separate "security upgrade" mode.
+#[must_use]
+pub fn evaluate_advised(
+    dep: &Dependency,
+    releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> Verdict {
     evaluate_with_filters(
         dep,
         releases,
+        advisory,
         layers,
         ctx,
         now,
@@ -420,6 +572,7 @@ pub fn evaluate(
 fn evaluate_with_filters(
     dep: &Dependency,
     releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
     layers: &[PolicyLayer],
     ctx: &ResolveContext<'_>,
     now: Timestamp,
@@ -502,7 +655,7 @@ fn evaluate_with_filters(
                     && r.beyond_declared_bound)
                 && !(latest_tagged.is_some() && r.beyond_latest_tag)
         })
-        .filter_map(|r| classify_candidate(r, dep, layers, ctx, now))
+        .filter_map(|r| classify_candidate(r, current, dep, advisory, layers, ctx, now))
         .collect();
 
     // `candidates` is in ascending order (from sorted releases); the headline is the newest. An
@@ -584,14 +737,40 @@ pub fn evaluate_ceiling_hold(
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> Option<CeilingHold> {
+    evaluate_ceiling_hold_advised(dep, releases, None, layers, ctx, now)
+}
+
+/// [`evaluate_ceiling_hold`] with an advisory feed: the probes run advised so a security fix
+/// that matured only under the shortened window still surfaces as a ceiling hold.
+///
+/// The bounded side filters a beyond-ceiling fix release out *before* classification, so
+/// advisory shortening only ever moves the unbounded probe — an unadvised probe would miss the
+/// hold during exactly the days the security window covers.
+/// With `advisory` absent this is exactly [`evaluate_ceiling_hold`].
+#[must_use]
+pub fn evaluate_ceiling_hold_advised(
+    dep: &Dependency,
+    releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> Option<CeilingHold> {
     if dep.pinned || dep.current_quality == ReleaseQuality::Pseudo {
         return None;
     }
 
     let filters = CeilingFilters::standard(ctx);
-    let bounded = evaluate_with_filters(dep, releases, layers, ctx, now, filters);
-    let unbounded =
-        evaluate_with_filters(dep, releases, layers, ctx, now, CeilingFilters::unbounded());
+    let bounded = evaluate_with_filters(dep, releases, advisory, layers, ctx, now, filters);
+    let unbounded = evaluate_with_filters(
+        dep,
+        releases,
+        advisory,
+        layers,
+        ctx,
+        now,
+        CeilingFilters::unbounded(),
+    );
     let target = unbounded.adoptable_target?;
     if bounded.adoptable_target.as_ref() == Some(&target) {
         return None;
@@ -601,7 +780,7 @@ pub fn evaluate_ceiling_hold(
         .find(|release| release.version == dep.current)?;
 
     let singly_causal = |reason: CeilingReason, lifted: CeilingFilters| -> Option<CeilingHold> {
-        let probe = evaluate_with_filters(dep, releases, layers, ctx, now, lifted);
+        let probe = evaluate_with_filters(dep, releases, advisory, layers, ctx, now, lifted);
         let target = probe.adoptable_target?;
         if bounded.adoptable_target.as_ref() == Some(&target) {
             return None;
@@ -657,24 +836,7 @@ pub fn evaluate_ceiling_hold(
     // No single ceiling exposes anything by itself — only the stack's joint removal reaches
     // `target`. Name the first ceiling the target provably violates (staged guidance, see above).
     let target_release = releases.iter().find(|release| release.version == target)?;
-    let reason = if filters.declared_bound
-        && dep.declared_bound.is_some()
-        && target_release.beyond_declared_bound
-    {
-        CeilingReason::DeclaredBound
-    } else {
-        let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
-        if !within_max_major(target_release, max_major.as_ref()) {
-            CeilingReason::MaxMajor
-        } else if filters.latest_tag
-            && !current.beyond_latest_tag
-            && target_release.beyond_latest_tag
-        {
-            CeilingReason::DistTag
-        } else {
-            return None;
-        }
-    };
+    let reason = joint_ceiling_reason(dep, current, target_release, layers, ctx, filters)?;
     let update_kind = unbounded
         .candidates
         .iter()
@@ -686,6 +848,36 @@ pub fn evaluate_ceiling_hold(
         target,
         update_kind,
     })
+}
+
+/// The first ceiling `target_release` provably violates, in the same actionability order the
+/// individual probes use (dist-tag last — the registry owns the tag).
+///
+/// This is [`evaluate_ceiling_hold`]'s joint fallback when no single ceiling is causal: staged
+/// guidance, where lifting the named ceiling is necessary and the next run names the remaining
+/// one.
+fn joint_ceiling_reason(
+    dep: &Dependency,
+    current: &Release,
+    target_release: &Release,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    filters: CeilingFilters,
+) -> Option<CeilingReason> {
+    if filters.declared_bound
+        && dep.declared_bound.is_some()
+        && target_release.beyond_declared_bound
+    {
+        return Some(CeilingReason::DeclaredBound);
+    }
+    let max_major = active_max_major(current, dep, layers, ctx, filters.max_major);
+    if !within_max_major(target_release, max_major.as_ref()) {
+        Some(CeilingReason::MaxMajor)
+    } else if filters.latest_tag && !current.beyond_latest_tag && target_release.beyond_latest_tag {
+        Some(CeilingReason::DistTag)
+    } else {
+        None
+    }
 }
 
 /// Judges the currently-locked release against the cooldown policy — the `check` gate.
@@ -721,8 +913,55 @@ pub fn check_pin(
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> PinVerdict {
+    check_pin_advised(dep, locked, None, layers, ctx, now)
+}
+
+/// [`check_pin`] with an advisory feed: a locked version that is itself an advisory's fix
+/// version carries [`PinVerdict::security`], and under [`AdvisoryMode::Shorten`] resolves
+/// against the security window — so merging a security bump does not fail the next gate run.
+///
+/// This deliberately needs no upgrade history — "you locked the release that fixes `GHSA-x`" is
+/// decidable from the feed alone.
+/// A fix release that also happens to be brand-new gets the shorter hold; that is the intent —
+/// it is precisely the version a security bot just proposed.
+/// The feed never *fails* a pin for being vulnerable: vulnerability gating stays with the
+/// scanners, so exit 1 keeps exactly one meaning.
+/// With `advisory` absent this is exactly [`check_pin`].
+#[must_use]
+pub fn check_pin_advised(
+    dep: &Dependency,
+    locked: &Release,
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> PinVerdict {
     let res = resolve(layers, &query(dep, ctx, ResolveKind::CurrentPin), now);
-    let window = res.window;
+    let mut window = res.window;
+
+    // The pin-side advisory test: the locked version is one of a non-withdrawn advisory's exact
+    // fix versions.
+    // Membership needs no ordering, so `check`'s locked-release-only fetch (no candidate list)
+    // still decides it — even when that minimal release list leaves the advisory's ranges
+    // unorderable.
+    // The `!affects` guard rejects contradictory feed data (a version listed as both fixed and
+    // affected earns nothing).
+    let security = advisory.and_then(|advisory| {
+        let fixed: Vec<&Advisory> = advisory
+            .advisories
+            .iter()
+            .filter(|candidate| {
+                !candidate.withdrawn
+                    && candidate.fixed_by(&locked.version)
+                    && !candidate.affects(&locked.version, Some(&locked.order))
+            })
+            .collect();
+        if fixed.is_empty() {
+            return None;
+        }
+        // Every pin-side entry is already an exact fix-version match, the strongest evidence.
+        security_relevance(&fixed, &fixed, advisory, &mut window, now)
+    });
 
     let status = if window.exempt || locked.quality == ReleaseQuality::Pseudo {
         // An `allow` exemption, or a pseudo-version/commit pin with no tagged version to
@@ -750,6 +989,7 @@ pub fn check_pin(
         graph_held,
         graph_floor: dep.graph_floor.clone(),
         published_at: locked.published_at,
+        security,
     }
 }
 
@@ -783,6 +1023,23 @@ pub fn evaluate_fix(
     ctx: &ResolveContext<'_>,
     now: Timestamp,
 ) -> FixVerdict {
+    evaluate_fix_advised(dep, releases, None, layers, ctx, now)
+}
+
+/// [`evaluate_fix`] with an advisory feed: the pin is judged via [`check_pin_advised`], so a
+/// locked security-fix version whose (shortened) window it satisfies is left alone rather than
+/// downgraded — `fix` only ever touches what an advised `check` would reject.
+///
+/// With `advisory` absent this is exactly [`evaluate_fix`].
+#[must_use]
+pub fn evaluate_fix_advised(
+    dep: &Dependency,
+    releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> FixVerdict {
     let Some(current) = releases.iter().find(|r| r.version == dep.current) else {
         // The adapter did not surface the locked version among the releases, so its age cannot be
         // judged here; `check` remains the real gate.
@@ -791,7 +1048,7 @@ pub fn evaluate_fix(
             target: None,
         };
     };
-    let pin = check_pin(dep, current, layers, ctx, now);
+    let pin = check_pin_advised(dep, current, advisory, layers, ctx, now);
     if pin.status != Status::CurrentInCooldown || pin.graph_held {
         return FixVerdict {
             current: pin,
@@ -844,6 +1101,7 @@ fn unknown_pin_verdict(
             || matches!(&dep.graph_ceiling, Some(v) if *v == dep.current),
         graph_floor: dep.graph_floor.clone(),
         published_at: None,
+        security: None,
     }
 }
 
@@ -1415,6 +1673,651 @@ mod tests {
             .cooldown_candidate(crate::CooldownHorizon::Soonest, now)
             .expect("a candidate");
         assert_eq!(soonest.version, Version::new("0.15.17"));
+    }
+
+    mod advisory {
+        use super::*;
+        use crate::advisory::{
+            Advisory, AdvisoryContext, AdvisoryId, AdvisoryMode, AdvisorySeverity,
+            AdvisorySourceId, AdvisorySourceKind, RawAdvisory, RawAffectedRange, RawRangeEvent,
+            ResolvedAdvisoryPolicy, classify_advisory,
+        };
+        use crate::policy::Origin;
+        use jiff::SignedDuration;
+
+        const OSV: AdvisorySourceId = AdvisorySourceId("osv");
+        const NOW: &str = "2026-06-17T00:00:00Z";
+
+        fn now() -> Timestamp {
+            NOW.parse().expect("now")
+        }
+
+        /// Locked at 1.0.0 (mature); 1.0.2 fixes the advisory but is only 2 days old — inside
+        /// the ordinary 7-day window, outside a 1-day security window.
+        fn releases() -> Vec<Release> {
+            vec![
+                dated("1.0.0", 0, "2026-01-01T00:00:00Z"),
+                dated("1.0.1", 1, "2026-01-10T00:00:00Z"),
+                dated("1.0.2", 2, "2026-06-15T00:00:00Z"),
+            ]
+        }
+
+        /// An advisory affecting `[0, 1.0.2)` with severity `severity`, classified against
+        /// [`releases`] so its boundaries are fully orderable.
+        fn advisory(severity: AdvisorySeverity, withdrawn: bool) -> Advisory {
+            let raw = RawAdvisory {
+                id: "GHSA-x".to_string(),
+                aliases: vec!["CVE-2026-0001".to_string()],
+                severity,
+                withdrawn,
+                summary: "bad".to_string(),
+                ranges: vec![RawAffectedRange {
+                    events: vec![
+                        RawRangeEvent::Introduced("0".to_string()),
+                        RawRangeEvent::Fixed("1.0.2".to_string()),
+                    ],
+                }],
+                affected_versions: Vec::new(),
+                fixes: vec!["1.0.2".to_string()],
+            };
+            classify_advisory(&raw, OSV, &releases(), &|v| Version::new(v))
+        }
+
+        /// A rollback is the mirror of an adoption: `fix` moving a pin back below the fix
+        /// version re-enters the advisory, and the caller is told so — with positive evidence
+        /// only, and never for a withdrawn record.
+        #[test]
+        fn a_rollback_below_the_fix_reports_what_it_re_enters() {
+            let releases = releases();
+            let (Some(fixed), Some(older)) = (releases.get(2), releases.first()) else {
+                panic!("the fixture's fix and older release");
+            };
+            let live = [advisory(AdvisorySeverity::High, false)];
+            let reintroduced = super::super::advisories_reintroduced_by(&live, fixed, older);
+            assert_eq!(reintroduced.len(), 1);
+            assert_eq!(reintroduced[0].id.as_str(), "GHSA-x");
+
+            // Forward, there is nothing to re-enter.
+            assert!(super::super::advisories_reintroduced_by(&live, older, fixed).is_empty());
+
+            let withdrawn = [advisory(AdvisorySeverity::High, true)];
+            assert!(super::super::advisories_reintroduced_by(&withdrawn, fixed, older).is_empty());
+        }
+
+        /// With a dropped (unorderable) range in play, "the current pin is outside the
+        /// surviving ranges" is not proof it escaped — it could sit inside the dropped range —
+        /// so the rollback report demands the exact-fix evidence the forward direction
+        /// already does.
+        #[test]
+        fn an_unorderable_advisory_only_reports_a_rollback_from_an_exact_fix() {
+            let releases = releases();
+            let (Some(current), Some(target)) = (releases.get(2), releases.first()) else {
+                panic!("the fixture's current and target release");
+            };
+            let raw = |fixes: Vec<String>| RawAdvisory {
+                id: "GHSA-m".to_string(),
+                aliases: Vec::new(),
+                severity: AdvisorySeverity::High,
+                withdrawn: false,
+                summary: "bad".to_string(),
+                ranges: vec![
+                    RawAffectedRange {
+                        events: vec![
+                            RawRangeEvent::Introduced("0".to_string()),
+                            RawRangeEvent::Fixed("1.0.1".to_string()),
+                        ],
+                    },
+                    // A second release line the fetched list does not cover: dropped, so
+                    // the advisory keeps only its exact evidence.
+                    RawAffectedRange {
+                        events: vec![
+                            RawRangeEvent::Introduced("2.0.0".to_string()),
+                            RawRangeEvent::Fixed("2.0.5".to_string()),
+                        ],
+                    },
+                ],
+                affected_versions: Vec::new(),
+                fixes,
+            };
+            let classify = |fixes: Vec<String>| {
+                classify_advisory(&raw(fixes), OSV, &releases, &|v| Version::new(v))
+            };
+
+            // 1.0.2 sits outside the surviving range but is not a listed fix: it may sit
+            // inside the dropped range, so there is no evidence of a fix to keep.
+            let uncertain = [classify(vec!["1.0.1".to_string()])];
+            assert!(uncertain[0].unorderable);
+            assert!(
+                super::super::advisories_reintroduced_by(&uncertain, current, target).is_empty()
+            );
+
+            // Listed as a fix, the current pin positively escaped, and the rollback reports.
+            let exact = [classify(vec!["1.0.1".to_string(), "1.0.2".to_string()])];
+            let reintroduced = super::super::advisories_reintroduced_by(&exact, current, target);
+            assert_eq!(reintroduced.len(), 1);
+        }
+
+        fn policy(mode: AdvisoryMode) -> ResolvedAdvisoryPolicy {
+            ResolvedAdvisoryPolicy {
+                enabled: true,
+                source: AdvisorySourceKind::Osv,
+                mode,
+                min_age: SignedDuration::from_hours(24),
+                min_age_origin: Origin::Repo("cooldown.toml".into()),
+                severity: AdvisorySeverity::High,
+                trace: Vec::new(),
+            }
+        }
+
+        fn verdict_with(
+            advisories: &[Advisory],
+            policy: &ResolvedAdvisoryPolicy,
+        ) -> crate::model::Verdict {
+            let advisory = AdvisoryContext { advisories, policy };
+            evaluate_advised(
+                &fix_dep("1.0.0"),
+                &releases(),
+                Some(&advisory),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            )
+        }
+
+        /// The inertness invariant the conformance suite pins: with no advisories (or an empty
+        /// slice) the advised functions are bit-for-bit the unadvised ones.
+        #[test]
+        fn empty_advisories_are_inert() {
+            let plain = evaluate(
+                &fix_dep("1.0.0"),
+                &releases(),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            let advised = verdict_with(&[], &policy(AdvisoryMode::Shorten));
+            assert_eq!(advised.status, plain.status);
+            assert_eq!(advised.adoptable_target, plain.adoptable_target);
+            assert_eq!(advised.candidates.len(), plain.candidates.len());
+            assert!(advised.candidates.iter().all(|c| c.security.is_none()));
+
+            let locked = dated("1.0.2", 2, "2026-06-15T00:00:00Z");
+            let pin = check_pin(
+                &fix_dep("1.0.2"),
+                &locked,
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory = AdvisoryContext {
+                advisories: &[],
+                policy: &shorten,
+            };
+            let advised = check_pin_advised(
+                &fix_dep("1.0.2"),
+                &locked,
+                Some(&advisory),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert_eq!(advised.status, pin.status);
+            assert!(advised.security.is_none());
+        }
+
+        /// Flag mode: the fixing candidate is annotated but its verdict is untouched — the safe
+        /// default changes no decision.
+        #[test]
+        fn flag_mode_annotates_without_changing_the_verdict() {
+            let verdict = verdict_with(
+                &[advisory(AdvisorySeverity::High, false)],
+                &policy(AdvisoryMode::Flag),
+            );
+            assert_eq!(verdict.status, Status::Adoptable, "1.0.1 has matured");
+            assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.1")));
+            let fixing = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.2"))
+                .expect("the fixing candidate");
+            assert_eq!(fixing.status, Status::InCooldown, "verdict unchanged");
+            let security = fixing.security.as_ref().expect("security relevance");
+            assert_eq!(security.fixes, vec![AdvisoryId("GHSA-x".to_string())]);
+            assert_eq!(security.severity, AdvisorySeverity::High);
+            assert!(!security.applied);
+            assert!(fixing.window.shortened_by.is_none());
+            // The intermediate 1.0.1 is still affected, so it is NOT flagged as a fix.
+            let intermediate = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.1"))
+                .expect("intermediate candidate");
+            assert!(intermediate.security.is_none());
+        }
+
+        /// Shorten mode: the fixing candidate resolves against the 1-day security window and
+        /// becomes adoptable — `upgrade` adopts the fix earlier via the same code path.
+        #[test]
+        fn shorten_mode_applies_the_security_window_to_the_fixing_candidate() {
+            let verdict = verdict_with(
+                &[advisory(AdvisorySeverity::High, false)],
+                &policy(AdvisoryMode::Shorten),
+            );
+            let fixing = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.2"))
+                .expect("the fixing candidate");
+            assert_eq!(
+                fixing.status,
+                Status::Adoptable,
+                "2d old > 1d security window"
+            );
+            let security = fixing.security.as_ref().expect("security relevance");
+            assert!(security.applied);
+            assert_eq!(
+                fixing.window.shortened_by,
+                Some(AdvisoryId("GHSA-x".to_string()))
+            );
+            assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.2")));
+        }
+
+        /// A candidate that merely escapes the affected range without being an exact fix
+        /// version is annotated but never fast-tracked: the residual gate re-certifies the
+        /// adopted pin from the locked release alone, where only exact fix membership is
+        /// decidable — a shortened range-escape would be planned, applied, and then rolled back
+        /// by that gate.
+        #[test]
+        fn range_escape_without_exact_fix_annotates_but_never_shortens() {
+            let releases = vec![
+                dated("1.0.0", 0, "2026-01-01T00:00:00Z"),
+                dated("1.0.2", 2, "2026-06-15T00:00:00Z"),
+                dated("1.0.3", 3, "2026-06-15T00:00:00Z"),
+            ];
+            let raw = RawAdvisory {
+                id: "GHSA-x".to_string(),
+                aliases: Vec::new(),
+                severity: AdvisorySeverity::High,
+                withdrawn: false,
+                summary: String::new(),
+                ranges: vec![RawAffectedRange {
+                    events: vec![
+                        RawRangeEvent::Introduced("0".to_string()),
+                        RawRangeEvent::Fixed("1.0.2".to_string()),
+                    ],
+                }],
+                affected_versions: Vec::new(),
+                fixes: vec!["1.0.2".to_string()],
+            };
+            let advisory = classify_advisory(&raw, OSV, &releases, &|v| Version::new(v));
+            let advisories = [advisory];
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &shorten,
+            };
+            let verdict = evaluate_advised(
+                &fix_dep("1.0.0"),
+                &releases,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            let fix = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.2"))
+                .expect("the exact fix");
+            assert!(fix.security.as_ref().is_some_and(|s| s.applied));
+            assert_eq!(fix.status, Status::Adoptable);
+            let escape = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.3"))
+                .expect("the range escape");
+            let security = escape.security.as_ref().expect("still annotated");
+            assert!(!security.applied, "no exact fix evidence, no fast-track");
+            assert_eq!(escape.status, Status::InCooldown);
+            // The headline lands on the certifiable fix, not the newest escape.
+            assert_eq!(verdict.adoptable_target, Some(Version::new("1.0.2")));
+        }
+
+        /// A severity below the threshold annotates but never earns the security window.
+        #[test]
+        fn below_threshold_severity_annotates_but_never_shortens() {
+            for severity in [AdvisorySeverity::Low, AdvisorySeverity::Unknown] {
+                let verdict =
+                    verdict_with(&[advisory(severity, false)], &policy(AdvisoryMode::Shorten));
+                let fixing = verdict
+                    .candidates
+                    .iter()
+                    .find(|c| c.version == Version::new("1.0.2"))
+                    .expect("the fixing candidate");
+                assert_eq!(fixing.status, Status::InCooldown, "severity {severity}");
+                let security = fixing.security.as_ref().expect("still annotated");
+                assert!(!security.applied);
+            }
+        }
+
+        /// A withdrawn advisory neither flags nor shortens anything.
+        #[test]
+        fn withdrawn_advisory_is_ignored_entirely() {
+            let verdict = verdict_with(
+                &[advisory(AdvisorySeverity::Critical, true)],
+                &policy(AdvisoryMode::Shorten),
+            );
+            assert!(verdict.candidates.iter().all(|c| c.security.is_none()));
+        }
+
+        /// An unorderable range boundary drops the advisory's range testimony, so only exact
+        /// evidence remains: a candidate that *is* one of its fix versions still flags — and
+        /// still earns the security window, that match needs no ordering — while a candidate
+        /// that merely escapes the surviving ranges (it could sit inside the dropped one) is
+        /// not flagged.
+        #[test]
+        fn unorderable_advisory_flags_and_shortens_only_on_exact_fix_evidence() {
+            let raw = RawAdvisory {
+                id: "GHSA-y".to_string(),
+                aliases: Vec::new(),
+                severity: AdvisorySeverity::Critical,
+                withdrawn: false,
+                summary: String::new(),
+                ranges: vec![RawAffectedRange {
+                    // 0.9.0 predates the fetched releases, so the range cannot be ordered.
+                    events: vec![
+                        RawRangeEvent::Introduced("0.9.0".to_string()),
+                        RawRangeEvent::Fixed("1.0.2".to_string()),
+                    ],
+                }],
+                // The pin is enumerated affected, so flagging has positive evidence.
+                affected_versions: vec!["1.0.0".to_string()],
+                fixes: vec!["1.0.2".to_string()],
+            };
+            let advisory = classify_advisory(&raw, OSV, &releases(), &|v| Version::new(v));
+            assert!(advisory.unorderable);
+
+            let verdict = verdict_with(
+                std::slice::from_ref(&advisory),
+                &policy(AdvisoryMode::Shorten),
+            );
+            let fixing = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.2"))
+                .expect("the fixing candidate");
+            assert_eq!(
+                fixing.status,
+                Status::Adoptable,
+                "an exact fix-version match shortens without ordering"
+            );
+            assert!(fixing.security.as_ref().is_some_and(|s| s.applied));
+
+            // 1.0.1 escapes the (dropped) range but is not a fix version: no exact evidence, so
+            // it is not flagged — the false-escape protection unorderability exists for.
+            let intermediate = verdict
+                .candidates
+                .iter()
+                .find(|c| c.version == Version::new("1.0.1"))
+                .expect("intermediate candidate");
+            assert!(intermediate.security.is_none());
+        }
+
+        /// The regression shape of the real `check` gate: the pin is classified against the
+        /// locked release ALONE (no candidate list), so a multi-range advisory is inevitably
+        /// unorderable there — the exact fix-version match must still flag it and earn the
+        /// security window, else "merging a security bump stops failing the next gate run"
+        /// silently only holds for single-range `introduced = "0"` advisories.
+        #[test]
+        fn check_pin_shortens_with_only_the_locked_release_classified() {
+            let raw = RawAdvisory {
+                id: "GHSA-v778-237x-gjrc".to_string(),
+                aliases: Vec::new(),
+                severity: AdvisorySeverity::High,
+                withdrawn: false,
+                summary: String::new(),
+                // The x/crypto shape: two ranges, three boundaries outside `[locked]`.
+                ranges: vec![
+                    RawAffectedRange {
+                        events: vec![
+                            RawRangeEvent::Introduced("0".to_string()),
+                            RawRangeEvent::Fixed("0.17.0".to_string()),
+                        ],
+                    },
+                    RawAffectedRange {
+                        events: vec![
+                            RawRangeEvent::Introduced("0.19.0".to_string()),
+                            RawRangeEvent::Fixed("0.31.0".to_string()),
+                        ],
+                    },
+                ],
+                affected_versions: Vec::new(),
+                fixes: vec!["0.17.0".to_string(), "0.31.0".to_string()],
+            };
+            let locked = dated("0.31.0", 7, "2026-06-15T00:00:00Z");
+            let advisory = classify_advisory(&raw, OSV, std::slice::from_ref(&locked), &|v| {
+                Version::new(v)
+            });
+            assert!(advisory.unorderable, "boundaries outside [locked]");
+
+            let advisories = [advisory];
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &shorten,
+            };
+            let pin = check_pin_advised(
+                &fix_dep("0.31.0"),
+                &locked,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert_eq!(
+                pin.status,
+                Status::UpToDate,
+                "the fresh fix passes the gate"
+            );
+            assert!(pin.security.as_ref().is_some_and(|s| s.applied));
+        }
+
+        /// Contradictory feed data — a version listed as both a fix and (enumerated) affected —
+        /// earns nothing: not flagged, never shortened.
+        #[test]
+        fn a_version_both_fixed_and_affected_is_ignored() {
+            let raw = RawAdvisory {
+                id: "GHSA-z".to_string(),
+                aliases: Vec::new(),
+                severity: AdvisorySeverity::Critical,
+                withdrawn: false,
+                summary: String::new(),
+                ranges: Vec::new(),
+                affected_versions: vec!["1.0.2".to_string()],
+                fixes: vec!["1.0.2".to_string()],
+            };
+            let locked = dated("1.0.2", 2, "2026-06-15T00:00:00Z");
+            let advisory = classify_advisory(&raw, OSV, std::slice::from_ref(&locked), &|v| {
+                Version::new(v)
+            });
+            let advisories = [advisory];
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &shorten,
+            };
+            let pin = check_pin_advised(
+                &fix_dep("1.0.2"),
+                &locked,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert!(pin.security.is_none());
+            assert_eq!(
+                pin.status,
+                Status::CurrentInCooldown,
+                "the ordinary window stands"
+            );
+        }
+
+        /// The pin side: a locked version that is itself the advisory's fix resolves against
+        /// the security window under the shorten mode, so merging a security bump stops failing
+        /// the very next `check` — while flag mode leaves the violation (annotated) in place.
+        #[test]
+        fn check_pin_passes_a_fresh_security_fix_under_shorten_mode() {
+            let locked = dated("1.0.2", 2, "2026-06-15T00:00:00Z");
+            let advisories = [advisory(AdvisorySeverity::High, false)];
+
+            let flag = policy(AdvisoryMode::Flag);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &flag,
+            };
+            let pin = check_pin_advised(
+                &fix_dep("1.0.2"),
+                &locked,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert_eq!(
+                pin.status,
+                Status::CurrentInCooldown,
+                "flag mode: unchanged"
+            );
+            let security = pin.security.as_ref().expect("annotated");
+            assert!(!security.applied);
+
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &shorten,
+            };
+            let pin = check_pin_advised(
+                &fix_dep("1.0.2"),
+                &locked,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert_eq!(pin.status, Status::UpToDate, "the fix passes the gate");
+            let security = pin.security.as_ref().expect("annotated");
+            assert!(security.applied);
+            assert_eq!(
+                pin.window.shortened_by,
+                Some(AdvisoryId("GHSA-x".to_string()))
+            );
+            // A pin that is merely *affected* (not a fix) is never treated as
+            // security-relevant: cooldown is not a scanner, so nothing changes for 1.0.0.
+            let old_locked = dated("1.0.0", 0, "2026-01-01T00:00:00Z");
+            let pin = check_pin_advised(
+                &fix_dep("1.0.0"),
+                &old_locked,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            );
+            assert!(pin.security.is_none());
+            assert_eq!(pin.status, Status::UpToDate);
+        }
+
+        /// The poisoned-feed bound, end to end: a Critical advisory cannot undercut an org
+        /// (global) floor unless `bypass-floor` was declared in that floor's own layer.
+        #[test]
+        fn security_window_respects_an_org_floor_without_a_same_layer_bypass() {
+            let global_floor_layer = |bypass: Option<bool>| {
+                let mut global = PolicyLayer::new(Origin::Global);
+                let mut rule = crate::Rule::new(crate::Selector::Default);
+                rule.floor = Some(SignedDuration::from_hours(24 * 7));
+                global.rules.push(rule);
+                global.advisories = bypass.map(|value| crate::AdvisoryPolicy {
+                    bypass_floor: Some(value),
+                    ..crate::AdvisoryPolicy::default()
+                });
+                global
+            };
+
+            let advisories = [advisory(AdvisorySeverity::Critical, false)];
+            let shorten = policy(AdvisoryMode::Shorten);
+            let fixing_status = |layers: &[PolicyLayer]| {
+                let advisory_ctx = AdvisoryContext {
+                    advisories: &advisories,
+                    policy: &shorten,
+                };
+                let verdict = evaluate_advised(
+                    &fix_dep("1.0.0"),
+                    &releases(),
+                    Some(&advisory_ctx),
+                    layers,
+                    &ctx(),
+                    now(),
+                );
+                verdict
+                    .candidates
+                    .iter()
+                    .find(|c| c.version == Version::new("1.0.2"))
+                    .map(|c| c.status)
+                    .expect("the fixing candidate")
+            };
+
+            // No bypass: the 7d floor stands, so the 2d-old fix stays in cooldown.
+            let layers = [seven_day_layer(), global_floor_layer(None)];
+            assert_eq!(fixing_status(&layers), Status::InCooldown);
+            // A repo-declared bypass cannot lift the org floor (same per-floor rule as
+            // `allow`).
+            let mut repo = seven_day_layer();
+            repo.advisories = Some(crate::AdvisoryPolicy {
+                bypass_floor: Some(true),
+                ..crate::AdvisoryPolicy::default()
+            });
+            let layers = [repo, global_floor_layer(None)];
+            assert_eq!(fixing_status(&layers), Status::InCooldown);
+            // A bypass declared in the floor's own (global) layer lifts it.
+            let layers = [seven_day_layer(), global_floor_layer(Some(true))];
+            assert_eq!(fixing_status(&layers), Status::Adoptable);
+        }
+
+        /// The individual ceiling probes stay advised: lifting the declared bound must surface
+        /// the security-fast-tracked fix as the hold target, not an older, still-affected
+        /// release that happens to be ordinarily mature — the named action (rewriting the
+        /// bound) should reach the fix, not reintroduce the vulnerability one version lower.
+        #[test]
+        fn ceiling_probe_stays_advised_and_targets_the_fast_tracked_fix() {
+            let mut releases = releases();
+            for release in &mut releases {
+                if release.version != Version::new("1.0.0") {
+                    release.beyond_declared_bound = true;
+                }
+            }
+            let mut dep = fix_dep("1.0.0");
+            dep.declared_bound = Some("<1.0.1".to_string());
+            let advisories = [advisory(AdvisorySeverity::Critical, false)];
+            let shorten = policy(AdvisoryMode::Shorten);
+            let advisory_ctx = AdvisoryContext {
+                advisories: &advisories,
+                policy: &shorten,
+            };
+
+            let hold = evaluate_ceiling_hold_advised(
+                &dep,
+                &releases,
+                Some(&advisory_ctx),
+                &[seven_day_layer()],
+                &ctx(),
+                now(),
+            )
+            .expect("a declared-bound hold");
+            assert_eq!(hold.reason, CeilingReason::DeclaredBound);
+            // 1.0.1 is ordinarily mature but still affected; the advised probe reports the
+            // 2-day-old fix the security window fast-tracks.
+            assert_eq!(hold.target, Version::new("1.0.2"));
+        }
     }
 
     #[test]

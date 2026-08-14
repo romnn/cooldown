@@ -1,5 +1,8 @@
 use super::document::ConfigDocument;
-use super::schema::{ConfigToml, MinAgeToml, PackageRuleToml, SelectorToml, WindowFields};
+use super::schema::{
+    AdvisoriesToml, ConfigToml, MinAgeToml, PackageRuleToml, SelectorToml, WindowFields,
+};
+use crate::advisory::{AdvisoryMode, AdvisoryPolicy, AdvisorySeverity, AdvisorySourceKind};
 use crate::duration::{parse_duration, parse_freeze};
 use crate::error::CoreError;
 use crate::model::{recognized_tool_names, tool_id};
@@ -249,7 +252,60 @@ pub(crate) fn policy_layer_from_config(
     }
 
     layer.strict_native = config.strict_native;
+    if let Some(advisories) = &config.advisories {
+        layer.advisories = Some(advisory_policy(advisories)?);
+    }
     Ok(layer)
+}
+
+/// Parses one `[advisories]` table into the typed [`AdvisoryPolicy`], rejecting unknown tokens.
+fn advisory_policy(advisories: &AdvisoriesToml) -> Result<AdvisoryPolicy, CoreError> {
+    let source = advisories
+        .source
+        .as_deref()
+        .map(|token| {
+            AdvisorySourceKind::parse(token).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "[advisories]: unknown source {token:?}; expected `osv`, `github`, or `none`"
+                ))
+            })
+        })
+        .transpose()?;
+    let mode = advisories
+        .mode
+        .as_deref()
+        .map(|token| {
+            AdvisoryMode::parse(token).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "[advisories]: unknown mode {token:?}; expected `flag` or `shorten`"
+                ))
+            })
+        })
+        .transpose()?;
+    let severity = advisories
+        .severity
+        .as_deref()
+        .map(|token| {
+            AdvisorySeverity::parse(token).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "[advisories]: unknown severity {token:?}; expected `low`, `moderate`, `high`, or `critical`"
+                ))
+            })
+        })
+        .transpose()?;
+    let min_age = advisories
+        .min_age
+        .as_deref()
+        .map(parse_duration)
+        .transpose()?;
+    Ok(AdvisoryPolicy {
+        enabled: advisories.enabled,
+        source,
+        mode,
+        min_age,
+        severity,
+        bypass_floor: advisories.bypass_floor,
+    })
 }
 
 /// Parse the policy view of one config document into a unified [`PolicyLayer`].
@@ -332,7 +388,43 @@ pub fn layer_from_fields(
         layer.rules.push(rule);
     }
 
-    if layer.rules.is_empty() {
+    let advisory_fields_set = fields.advisories.is_some()
+        || fields.advisory_min_age.is_some()
+        || fields.advisory_severity.is_some();
+    if advisory_fields_set {
+        layer.advisories = Some(AdvisoryPolicy {
+            // Declaring any advisory field on the CLI/env means you want the feed consulted, so
+            // `--advisory-min-age`/`--advisory-severity` enable it here too — otherwise either
+            // flag without `--advisories` (or a config `enabled = true`) would be a complete
+            // silent no-op.
+            // An explicit `--no-advisories` still wins.
+            enabled: fields.advisories.or(Some(true)),
+            source: None,
+            // Declaring a security window on the CLI/env means you want it applied, so setting
+            // `--advisory-min-age` selects the shorten mode at this layer (still monotone: an
+            // explicit config `flag` elsewhere declines it).
+            mode: fields.advisory_min_age.is_some().then_some(AdvisoryMode::Shorten),
+            min_age: fields
+                .advisory_min_age
+                .as_deref()
+                .map(parse_duration)
+                .transpose()?,
+            severity: fields
+                .advisory_severity
+                .as_deref()
+                .map(|token| {
+                    AdvisorySeverity::parse(token).ok_or_else(|| {
+                        CoreError::Config(format!(
+                            "{ctx}: unknown advisory severity {token:?}; expected `low`, `moderate`, `high`, or `critical`"
+                        ))
+                    })
+                })
+                .transpose()?,
+            bypass_floor: None,
+        });
+    }
+
+    if layer.rules.is_empty() && layer.advisories.is_none() {
         Ok(None)
     } else {
         Ok(Some(layer))

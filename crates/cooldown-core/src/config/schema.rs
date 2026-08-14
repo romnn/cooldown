@@ -92,6 +92,12 @@ pub struct CommandConfig {
     pub allow_stale_lock: Option<bool>,
     /// Make `check` fail on deps with no publish time (`--fail-on-unknown-age`).
     pub fail_on_unknown_age: Option<bool>,
+    /// Make `check` fail when the enabled advisory feed yields no usable evidence —
+    /// unreachable, unimplemented, or too stale to shorten (`--fail-on-advisory-source`) — for
+    /// a CI gate that refuses to certify without it.
+    ///
+    /// An uncovered ecosystem stays a warning.
+    pub fail_on_advisory_source: Option<bool>,
     /// Fail `upgrade`/`fix` if a mutation cannot complete cleanly (`--strict`).
     pub strict: Option<bool>,
     /// Compile/sync after re-locking in `upgrade` (`--build`).
@@ -134,6 +140,7 @@ impl CommandConfig {
             all_artifacts,
             allow_stale_lock,
             fail_on_unknown_age,
+            fail_on_advisory_source,
             strict,
             build,
             transitive,
@@ -157,6 +164,7 @@ impl CommandConfig {
         self.all_artifacts = all_artifacts.or(self.all_artifacts);
         self.allow_stale_lock = allow_stale_lock.or(self.allow_stale_lock);
         self.fail_on_unknown_age = fail_on_unknown_age.or(self.fail_on_unknown_age);
+        self.fail_on_advisory_source = fail_on_advisory_source.or(self.fail_on_advisory_source);
         self.strict = strict.or(self.strict);
         self.build = build.or(self.build);
         self.transitive = transitive.or(self.transitive);
@@ -191,6 +199,7 @@ impl CommandConfig {
             all_artifacts,
             allow_stale_lock,
             fail_on_unknown_age,
+            fail_on_advisory_source,
             strict,
             build,
             transitive,
@@ -216,6 +225,7 @@ impl CommandConfig {
         self.all_artifacts = (*all_artifacts).or(self.all_artifacts);
         self.allow_stale_lock = (*allow_stale_lock).or(self.allow_stale_lock);
         self.fail_on_unknown_age = (*fail_on_unknown_age).or(self.fail_on_unknown_age);
+        self.fail_on_advisory_source = (*fail_on_advisory_source).or(self.fail_on_advisory_source);
         self.strict = (*strict).or(self.strict);
         self.build = (*build).or(self.build);
         self.transitive = (*transitive).or(self.transitive);
@@ -255,6 +265,30 @@ impl CommandConfig {
     }
 }
 
+/// The `[advisories]` table: the security-relevant signal (OSV feed) and what it may do.
+///
+/// Kept as raw strings here; [`policy_layer_from_config`](super::layers) parses and validates
+/// them into a typed [`AdvisoryPolicy`](crate::advisory::AdvisoryPolicy) so a bad token fails
+/// fast with the selector context in the message.
+///
+/// [`policy_layer_from_config`]: super::layers
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct AdvisoriesToml {
+    /// Whether to consult the feed at all (off by default: a new network dependency).
+    pub(crate) enabled: Option<bool>,
+    /// `"osv"` (default) | `"github"` | `"none"`.
+    pub(crate) source: Option<String>,
+    /// `"flag"` (annotate only, default) | `"shorten"` (also apply `min-age` below).
+    pub(crate) mode: Option<String>,
+    /// The SECURITY window — used only under `mode = "shorten"`.
+    pub(crate) min_age: Option<String>,
+    /// The minimum normalized severity that earns it: `low|moderate|high|critical`.
+    pub(crate) severity: Option<String>,
+    /// Whether the security window may undercut a `floor` (honored only at the floor's layer).
+    pub(crate) bypass_floor: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigToml {
@@ -266,6 +300,8 @@ pub(crate) struct ConfigToml {
     pub(crate) allow: Option<Vec<String>>,
     #[serde(rename = "strict-native")]
     pub(crate) strict_native: Option<bool>,
+    /// The advisory feed (security-relevant signal); see [`AdvisoriesToml`].
+    pub(crate) advisories: Option<AdvisoriesToml>,
     pub(crate) tool: Option<BTreeMap<String, SelectorToml>>,
     pub(crate) registry: Option<BTreeMap<String, SelectorToml>>,
     pub(crate) package: Option<BTreeMap<String, PackageRuleToml>>,
@@ -301,6 +337,16 @@ pub struct WindowFields {
     pub freeze: Option<String>,
     /// Glob patterns exempted from the cooldown, each becoming an `allow` package rule.
     pub allow: Vec<String>,
+    /// `--advisories`/`--no-advisories` / `COOLDOWN_ADVISORIES`: consult the advisory feed.
+    pub advisories: Option<bool>,
+    /// `--advisory-min-age` / `COOLDOWN_ADVISORY_MIN_AGE`: the security window.
+    ///
+    /// Setting it also selects the shorten mode at this layer — declaring a security window on
+    /// the command line means you want it applied.
+    pub advisory_min_age: Option<String>,
+    /// `--advisory-severity` / `COOLDOWN_ADVISORY_SEVERITY`: the minimum severity that earns
+    /// the security window.
+    pub advisory_severity: Option<String>,
 }
 
 impl WindowFields {
@@ -312,6 +358,9 @@ impl WindowFields {
             && !self.latest
             && self.freeze.is_none()
             && self.allow.is_empty()
+            && self.advisories.is_none()
+            && self.advisory_min_age.is_none()
+            && self.advisory_severity.is_none()
     }
 }
 

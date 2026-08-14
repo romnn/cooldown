@@ -42,6 +42,12 @@ pub struct Capabilities {
     pub can_sync: bool,
     /// Releases are artifact-granular (a universal lock with per-file upload times, e.g. uv).
     pub artifact_granular: bool,
+    /// The advisory database's ecosystem string for this tool's packages (`Go`, `crates.io`,
+    /// `PyPI`, `npm`, `Maven`, `RubyGems`, `Hex`, `SwiftURL`), or `None` when no advisory feed
+    /// covers the tool (conda) — the feature is then inert there, and any run with the feed
+    /// enabled says so with an `advisory_ecosystem_unsupported` warning rather than pretending
+    /// coverage.
+    pub advisory_ecosystem: Option<&'static str>,
 }
 
 /// The run's clock — the single source of the evaluation instant ("now").
@@ -131,6 +137,28 @@ pub trait ToolRead: Send + Sync {
     /// the original leg's kind.
     fn classify_update_kind(&self, _from: &str, _to: &str) -> Option<UpdateKind> {
         None
+    }
+
+    /// Translates an advisory database's version spelling into this tool's display spelling, so
+    /// advisory range boundaries can be matched against the tool's release list (see
+    /// [`classify_advisory`](crate::advisory::classify_advisory)).
+    ///
+    /// The identity default is correct for most tools; Go overrides it because OSV's `Go`
+    /// ecosystem omits the `v` prefix the Go adapter displays.
+    fn advisory_version(&self, version: &str) -> String {
+        version.to_string()
+    }
+
+    /// Translates one of this tool's package names into the advisory database's spelling, for
+    /// the feed query.
+    ///
+    /// The query side of the advisory API is case- and separator-sensitive, so a name that does
+    /// not match the database's canonical spelling silently returns no advisories at all.
+    /// Identity for most tools; Swift maps its `owner/repo` identity onto OSV's `SwiftURL`
+    /// repository URL (`github.com/apple/swift-nio`, lowercased), and the Python tools normalize
+    /// to the PEP 503 form OSV's `PyPI` ecosystem stores.
+    fn advisory_package(&self, package: &str) -> String {
+        package.to_string()
     }
 
     /// Returns the **raw, unscoped** resolved dependencies for `project`.

@@ -469,12 +469,18 @@ pub struct Candidate {
     pub version: Version,
     /// The update kind relative to the current pin.
     pub kind: UpdateKind,
-    /// The cooldown window resolved for this candidate.
+    /// The cooldown window resolved for this candidate — the security window when the advisory
+    /// shorten mode applied (then [`ResolvedWindow::shortened_by`] names the advisory).
     pub window: ResolvedWindow,
     /// The verdict for this candidate.
     pub status: Status,
     /// The candidate's publish instant, threaded through for rendering (`ageDays`).
     pub published_at: Option<jiff::Timestamp>,
+    /// Why this candidate is security-relevant (adopting it fixes an advisory affecting the
+    /// current pin), or `None` for an ordinary candidate.
+    ///
+    /// Always `None` without an advisory feed.
+    pub security: Option<crate::advisory::SecurityRelevance>,
 }
 
 impl Candidate {
@@ -576,7 +582,8 @@ impl Verdict {
 pub struct PinVerdict {
     /// The verdict over the currently-locked release.
     pub status: Status,
-    /// The cooldown window resolved for the locked release.
+    /// The cooldown window resolved for the locked release — the security window when the
+    /// locked version is itself an advisory's fix and the shorten mode applied.
     pub window: ResolvedWindow,
     /// Whether the resolved graph forces this (too-fresh) version (MVS floor / `=` pin).
     pub graph_held: bool,
@@ -584,6 +591,11 @@ pub struct PinVerdict {
     pub graph_floor: Option<Version>,
     /// The locked release's publish instant, threaded for rendering.
     pub published_at: Option<jiff::Timestamp>,
+    /// Why this pin is security-relevant (the locked version is an advisory's fix version), or
+    /// `None` for an ordinary pin.
+    ///
+    /// Always `None` without an advisory feed.
+    pub security: Option<crate::advisory::SecurityRelevance>,
 }
 
 /// A detected project rooted at a manifest within one tool.
