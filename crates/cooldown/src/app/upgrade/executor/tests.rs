@@ -893,8 +893,8 @@ fn collapse_carries_the_final_legs_security_block() {
         Some(crate::app::SecurityInfo {
             version: version.to_string(),
             fixes: vec![id.to_string()],
-            severity: "high".to_string(),
-            source: "osv".to_string(),
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: true,
         })
     };

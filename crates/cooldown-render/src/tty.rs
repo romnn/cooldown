@@ -242,16 +242,27 @@ fn with_window_clamp(mut cell: String, window: &Window) -> String {
     cell
 }
 
+fn with_window_shorten(mut cell: String, window: &Window) -> String {
+    if let Some(by) = &window.shortened_by {
+        let _ = write!(cell, " (security {by})");
+    }
+    cell
+}
+
+fn with_window_provenance(cell: String, window: &Window) -> String {
+    with_window_shorten(with_window_clamp(cell, window), window)
+}
+
 fn age_over_window_cell(window: &Window, age: &str) -> String {
-    with_window_clamp(format!("{age}/{}", fmt_days(window.min_age_days)), window)
+    with_window_provenance(format!("{age}/{}", fmt_days(window.min_age_days)), window)
 }
 
 /// The `outdated` "Cooldown" cell: the shown version's `age/window` (e.g. `13d/14d`) — the upgrade
 /// candidate's age when a newer version exists, or the current pin's age when up to date. Falls back
 /// to the bare window when no age applies — a commit pin, or an unknown publish time. A stricter
-/// native / registry clamp is appended as `(≥<source>)`, matching the rest of the report. When the
-/// countdown refers to a version no other column names (under `--countdown soonest`), that version is
-/// appended in parentheses, e.g. `4d/7d (0.15.17)`.
+/// native / registry clamp is appended as `(≥<source>)`; an advisory shortening is appended as
+/// `(security <id>)`. When the countdown refers to a version no other column names (under
+/// `--countdown soonest`), that version is appended in parentheses, e.g. `4d/7d (0.15.17)`.
 fn cooldown_cell(
     window: &Window,
     candidate_age_days: Option<f64>,
@@ -259,7 +270,7 @@ fn cooldown_cell(
 ) -> String {
     let cell = match candidate_age_days {
         Some(age) => age_over_window_cell(window, &fmt_days(age)),
-        None => with_window_clamp(fmt_days(window.min_age_days), window),
+        None => with_window_provenance(fmt_days(window.min_age_days), window),
     };
     match version {
         Some(version) => format!("{cell} ({version})"),
@@ -1405,6 +1416,16 @@ mod tests {
             cooldown_cell(&window(Some("native")), None, None),
             "14d (≥native)"
         );
+        let shortened = Window {
+            min_age_days: 1.0,
+            source: "advisories".into(),
+            clamped_by: None,
+            shortened_by: Some("GHSA-wcg3-cvx6-7396".into()),
+        };
+        assert_eq!(
+            cooldown_cell(&shortened, Some(2.0), None),
+            "2d/1d (security GHSA-wcg3-cvx6-7396)"
+        );
         // Under `--countdown soonest` the cooldown refers to a version no other column names, so it
         // is appended in parentheses (after any clamp).
         assert_eq!(
@@ -1431,6 +1452,16 @@ mod tests {
         assert_eq!(
             check_cooldown_cell(&window(Some("native")), Some(2.0)),
             "2d/14d (≥native)"
+        );
+        let shortened = Window {
+            min_age_days: 1.0,
+            source: "advisories".into(),
+            clamped_by: Some("org-floor".into()),
+            shortened_by: Some("GHSA-wcg3-cvx6-7396".into()),
+        };
+        assert_eq!(
+            check_cooldown_cell(&shortened, Some(2.0)),
+            "2d/1d (≥org-floor) (security GHSA-wcg3-cvx6-7396)"
         );
     }
 
@@ -1748,8 +1779,8 @@ mod tests {
         let security = SecurityInfo {
             version: "0.2.23".into(),
             fixes: vec!["GHSA-wcg3-cvx6-7396".into(), "CVE-2020-26235".into()],
-            severity: "moderate".into(),
-            source: "osv".into(),
+            severity: cooldown_core::AdvisorySeverity::Moderate,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: false,
         };
 
@@ -1803,8 +1834,8 @@ mod tests {
         item.security = Some(SecurityInfo {
             version: "0.2.23".into(),
             fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
-            severity: "high".into(),
-            source: "osv".into(),
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: true,
         });
         let reason = mutation_status(&item, true).reason;
@@ -1839,8 +1870,8 @@ mod tests {
         let fast_tracked = SecurityInfo {
             version: "0.2.23".into(),
             fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
-            severity: "high".into(),
-            source: "osv".into(),
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: true,
         };
 
@@ -1888,8 +1919,8 @@ mod tests {
         item.security = Some(SecurityInfo {
             version: "0.2.23".into(),
             fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
-            severity: "high".into(),
-            source: "osv".into(),
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: true,
         });
         let meta = |dry_run| UpgradeMeta {

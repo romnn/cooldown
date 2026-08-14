@@ -174,25 +174,16 @@ impl<'a> ExplainService<'a> {
     /// The resolved `[advisories]` policy plus the project tool's feed coverage.
     ///
     /// Coverage is reported here rather than only as a run-time warning: a project whose tool
-    /// no advisory database covers can enable the feed and see nothing happen, and `config` is
-    /// where one looks to find out why.
+    /// has no safe project-wide database mapping can enable the feed and see nothing happen, and
+    /// `config` is where one looks to find out why.
     fn advisory_config(&self, pctx: &ProjectCtx) -> crate::app::AdvisoryConfigInfo {
         let policy = cooldown_core::resolve_advisory_policy(&pctx.policy.layers);
         crate::app::AdvisoryConfigInfo {
             enabled: policy.enabled,
-            source: match policy.source {
-                cooldown_core::AdvisorySourceKind::Osv => "osv",
-                cooldown_core::AdvisorySourceKind::Github => "github",
-                cooldown_core::AdvisorySourceKind::None => "none",
-            }
-            .to_string(),
-            mode: match policy.mode {
-                cooldown_core::AdvisoryMode::Flag => "flag",
-                cooldown_core::AdvisoryMode::Shorten => "shorten",
-            }
-            .to_string(),
+            source: policy.source,
+            mode: policy.mode,
             min_age_days: round2(cooldown_core::duration::duration_as_days(policy.min_age)),
-            severity: policy.severity.as_str().to_string(),
+            severity: policy.severity,
             ecosystem: self
                 .ws
                 .adapter(pctx.tool)

@@ -991,8 +991,8 @@ pub(crate) fn security_info(
             .iter()
             .map(|advisory| advisory.as_str().to_string())
             .collect(),
-        severity: security.severity.as_str().to_string(),
-        source: security.source.as_str().to_string(),
+        severity: security.severity,
+        source: security.source,
         applied: security.applied,
     }
 }

@@ -5763,7 +5763,7 @@ async fn advisory_flag_mode_annotates_outdated_without_changing_the_verdict() {
     assert_eq!(flagged.adoptable_target, plain.adoptable_target);
     let security = flagged.security.as_ref().expect("annotated");
     assert_eq!(security.fixes, vec!["GHSA-CONF".to_string()]);
-    assert_eq!(security.severity, "high");
+    assert_eq!(security.severity, AdvisorySeverity::High);
     assert!(!security.applied);
     assert!(plain.security.is_none(), "no feed, no annotation");
 }

@@ -5,8 +5,8 @@
 //! Any output field or enum change bumps it because schema objects reject unknown properties.
 
 use cooldown_core::{
-    Diagnostic, EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status,
-    UpdateKind,
+    AdvisoryMode, AdvisorySeverity, AdvisorySourceId, AdvisorySourceKind, Diagnostic,
+    EdgeBindingAction, HeldReason, LockStatus, MemberRef, SkipReason, Status, UpdateKind,
 };
 use serde::{Serialize, Serializer};
 
@@ -108,9 +108,9 @@ pub struct SecurityInfo {
     pub fixes: Vec<String>,
     /// The highest normalized severity among [`fixes`](SecurityInfo::fixes):
     /// `low|moderate|high|critical|unknown`.
-    pub severity: String,
+    pub severity: AdvisorySeverity,
     /// The advisory source the ids came from (e.g. `"osv"`).
-    pub source: String,
+    pub source: AdvisorySourceId,
     /// Whether the security window replaced the ordinary one for this row (`false` under the
     /// annotate-only flag mode, or when the security window would not have been shorter).
     ///
@@ -711,22 +711,22 @@ pub struct ConfigItem {
     pub advisories: AdvisoryConfigInfo,
 }
 
-/// The resolved `[advisories]` policy for one project, plus whether a feed covers its tool.
+/// The resolved `[advisories]` policy for one project, plus its tool's database mapping.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdvisoryConfigInfo {
     /// Whether the feed is consulted at all.
     pub enabled: bool,
     /// The selected feed: `osv`, `github`, or `none`.
-    pub source: String,
+    pub source: AdvisorySourceKind,
     /// `flag` (annotate only) or `shorten` (also apply the security window).
-    pub mode: String,
+    pub mode: AdvisoryMode,
     /// The security window in fractional days (meaningful under `shorten`).
     pub min_age_days: f64,
     /// The minimum normalized severity that earns the security window.
-    pub severity: String,
+    pub severity: AdvisorySeverity,
     /// The advisory-database ecosystem covering this tool (`crates.io`, `PyPI`, …), or `None`
-    /// when no feed covers it — its packages are never annotated.
+    /// when its package graph has no safe single project-wide mapping.
     pub ecosystem: Option<String>,
 }
 

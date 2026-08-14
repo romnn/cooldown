@@ -1,7 +1,7 @@
 //! The machine-readable JSON schema for `--json` output, printed by `cooldown schema`.
 
 use crate::model::SCHEMA_VERSION;
-use cooldown_core::DiagnosticKind;
+use cooldown_core::{AdvisoryMode, AdvisorySeverity, AdvisorySourceKind, DiagnosticKind};
 use serde_json::{Map, Value, json};
 
 /// A JSON Schema (draft 2020-12) describing the command-specific envelopes.
@@ -14,6 +14,22 @@ pub fn json_schema() -> Value {
     let diagnostic_kinds = DiagnosticKind::ALL
         .iter()
         .map(|kind| Value::String(kind.wire_value().to_string()))
+        .collect::<Vec<_>>();
+    let advisory_severities = AdvisorySeverity::ALL
+        .iter()
+        .map(|severity| Value::String(severity.as_str().to_string()))
+        .collect::<Vec<_>>();
+    let advisory_thresholds = AdvisorySeverity::THRESHOLDS
+        .iter()
+        .map(|severity| Value::String(severity.as_str().to_string()))
+        .collect::<Vec<_>>();
+    let advisory_sources = AdvisorySourceKind::ALL
+        .iter()
+        .map(|source| Value::String(source.as_str().to_string()))
+        .collect::<Vec<_>>();
+    let advisory_modes = AdvisoryMode::ALL
+        .iter()
+        .map(|mode| Value::String(mode.as_str().to_string()))
         .collect::<Vec<_>>();
     let diagnostic = json!({
         "type": "object",
@@ -56,7 +72,7 @@ pub fn json_schema() -> Value {
         "properties": {
             "version": { "type": "string" },
             "fixes": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-            "severity": { "enum": ["low", "moderate", "high", "critical", "unknown"] },
+            "severity": { "enum": advisory_severities },
             "source": { "type": "string" },
             "applied": { "type": "boolean" }
         },
@@ -402,10 +418,10 @@ pub fn json_schema() -> Value {
             "required": ["enabled", "source", "mode", "minAgeDays", "severity", "ecosystem"],
             "properties": {
                 "enabled": { "type": "boolean" },
-                "source": { "enum": ["osv", "github", "none"] },
-                "mode": { "enum": ["flag", "shorten"] },
+                "source": { "enum": advisory_sources },
+                "mode": { "enum": advisory_modes },
                 "minAgeDays": { "type": "number" },
-                "severity": { "enum": ["low", "moderate", "high", "critical", "unknown"] },
+                "severity": { "enum": advisory_thresholds },
                 "ecosystem": { "type": ["string", "null"] }
             },
             "additionalProperties": false
@@ -631,7 +647,8 @@ mod tests {
     };
     use color_eyre::eyre;
     use cooldown_core::{
-        Diagnostic, DiagnosticKind, LockStatus, MemberRef, SkipReason, UpdateKind,
+        AdvisoryMode, AdvisorySeverity, AdvisorySourceKind, Diagnostic, DiagnosticKind, LockStatus,
+        MemberRef, SkipReason, UpdateKind,
     };
     use serde::Serialize;
     use serde_json::Value;
@@ -642,6 +659,27 @@ mod tests {
         let schema = json_schema();
         assert_definition_keys_match(&schema);
         assert_envelope_keys_match(&schema);
+    }
+
+    #[test]
+    fn advisory_schema_enums_match_their_typed_values() {
+        let schema = json_schema();
+        assert_eq!(
+            schema["$defs"]["securityInfo"]["properties"]["severity"]["enum"],
+            serde_json::to_value(AdvisorySeverity::ALL).expect("severities serialize")
+        );
+        assert_eq!(
+            schema["$defs"]["advisoryConfigInfo"]["properties"]["severity"]["enum"],
+            serde_json::to_value(AdvisorySeverity::THRESHOLDS).expect("thresholds serialize")
+        );
+        assert_eq!(
+            schema["$defs"]["advisoryConfigInfo"]["properties"]["source"]["enum"],
+            serde_json::to_value(AdvisorySourceKind::ALL).expect("sources serialize")
+        );
+        assert_eq!(
+            schema["$defs"]["advisoryConfigInfo"]["properties"]["mode"]["enum"],
+            serde_json::to_value(AdvisoryMode::ALL).expect("modes serialize")
+        );
     }
 
     #[test]
@@ -770,6 +808,7 @@ mod tests {
     fn assert_definition_keys_match(schema: &Value) {
         assert_def_keys(schema, "diagnostic", diagnostic());
         assert_def_keys(schema, "window", window());
+        assert_def_keys(schema, "securityInfo", security_info());
         assert_def_keys(schema, "latestInfo", latest_info());
         assert_def_keys(schema, "memberRef", member());
         assert_def_keys(schema, "skippedInfo", skipped_info());
@@ -793,6 +832,7 @@ mod tests {
         assert_def_keys(schema, "explainStep", explain_step());
         assert_def_keys(schema, "configSummary", config_summary());
         assert_def_keys(schema, "configItem", config_item());
+        assert_def_keys(schema, "advisoryConfigInfo", advisory_config_info());
         assert_def_keys(schema, "baselineSummary", baseline_summary());
         assert_def_keys(schema, "baselineItem", baseline_item());
         assert_def_keys(schema, "recoverySummary", recovery_summary());
@@ -989,8 +1029,8 @@ mod tests {
         SecurityInfo {
             version: "0.31.0".to_string(),
             fixes: vec!["GHSA-v778-237x-gjrc".to_string()],
-            severity: "high".to_string(),
-            source: "osv".to_string(),
+            severity: AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
             applied: true,
         }
     }
@@ -1202,14 +1242,18 @@ mod tests {
             source: "default".to_string(),
             strict_native: true,
             layers: vec!["default".to_string(), "workspace".to_string()],
-            advisories: AdvisoryConfigInfo {
-                enabled: true,
-                source: "osv".to_string(),
-                mode: "shorten".to_string(),
-                min_age_days: 1.0,
-                severity: "high".to_string(),
-                ecosystem: Some("crates.io".to_string()),
-            },
+            advisories: advisory_config_info(),
+        }
+    }
+
+    fn advisory_config_info() -> AdvisoryConfigInfo {
+        AdvisoryConfigInfo {
+            enabled: true,
+            source: AdvisorySourceKind::Osv,
+            mode: AdvisoryMode::Shorten,
+            min_age_days: 1.0,
+            severity: AdvisorySeverity::High,
+            ecosystem: Some("crates.io".to_string()),
         }
     }
 

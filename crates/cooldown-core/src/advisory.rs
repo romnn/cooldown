@@ -50,7 +50,8 @@ impl fmt::Display for AdvisoryId {
 }
 
 /// An advisory source identifier, registered by its adapter (e.g. `"osv"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct AdvisorySourceId(
     /// The stable source name, e.g. `"osv"`.
     pub &'static str,
@@ -90,6 +91,19 @@ pub enum AdvisorySeverity {
 }
 
 impl AdvisorySeverity {
+    /// Every serialized severity value, in ascending order.
+    pub const ALL: &'static [Self] = &[
+        Self::Unknown,
+        Self::Low,
+        Self::Moderate,
+        Self::High,
+        Self::Critical,
+    ];
+
+    /// The severities accepted as policy thresholds, in ascending order.
+    pub const THRESHOLDS: &'static [Self] =
+        &[Self::Low, Self::Moderate, Self::High, Self::Critical];
+
     /// Parses a severity token (case-insensitive; `medium` is accepted as `moderate`).
     ///
     /// Returns `None` for an unrecognised token so config validation can reject it; source
@@ -126,7 +140,8 @@ impl fmt::Display for AdvisorySeverity {
 }
 
 /// Which advisory feed the policy consults (`[advisories] source`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdvisorySourceKind {
     /// The OSV database (<https://osv.dev>) — the default.
     Osv,
@@ -141,6 +156,9 @@ pub enum AdvisorySourceKind {
 }
 
 impl AdvisorySourceKind {
+    /// Every serialized source token.
+    pub const ALL: &'static [Self] = &[Self::Osv, Self::Github, Self::None];
+
     /// Parses a source token.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
@@ -151,10 +169,27 @@ impl AdvisorySourceKind {
             _ => None,
         }
     }
+
+    /// The stable lowercase token this source renders as.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Osv => "osv",
+            Self::Github => "github",
+            Self::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for AdvisorySourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// What an advisory match does to a row (`[advisories] mode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdvisoryMode {
     /// Annotate only: verdicts unchanged, rows labeled (the safe default).
     Flag,
@@ -164,6 +199,9 @@ pub enum AdvisoryMode {
 }
 
 impl AdvisoryMode {
+    /// Every serialized advisory mode.
+    pub const ALL: &'static [Self] = &[Self::Flag, Self::Shorten];
+
     /// Parses a mode token.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
@@ -172,6 +210,21 @@ impl AdvisoryMode {
             "shorten" => Some(AdvisoryMode::Shorten),
             _ => None,
         }
+    }
+
+    /// The stable lowercase token this mode renders as.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Shorten => "shorten",
+        }
+    }
+}
+
+impl fmt::Display for AdvisoryMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -646,20 +699,11 @@ impl PolicyAccumulator {
         }
         if let Some(value) = policy.source {
             self.source = value;
-            let token = match value {
-                AdvisorySourceKind::Osv => "osv",
-                AdvisorySourceKind::Github => "github",
-                AdvisorySourceKind::None => "none",
-            };
-            self.step(origin, "source", format!("source = {token}"), None);
+            self.step(origin, "source", format!("source = {value}"), None);
         }
         if let Some(value) = policy.mode {
-            let token = match value {
-                AdvisoryMode::Flag => "flag",
-                AdvisoryMode::Shorten => "shorten",
-            };
             self.mode_steps.push((self.trace.len(), value));
-            self.step(origin, "mode", format!("mode = {token}"), None);
+            self.step(origin, "mode", format!("mode = {value}"), None);
         }
         if let Some(value) = policy.min_age {
             self.min_age = value;

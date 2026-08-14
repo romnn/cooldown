@@ -20,17 +20,17 @@ pub(in crate::cli) fn render_config_text(items: &[app::ConfigItem]) -> String {
 }
 
 /// The `[advisories]` one-liner: the resolved policy plus this tool's feed coverage, so a run
-/// that never annotates anything says why (disabled, or no ecosystem covers the tool).
+/// that never annotates anything says why (disabled, or no safe project-wide ecosystem mapping).
 fn advisories_line(advisories: &app::AdvisoryConfigInfo) -> String {
     if !advisories.enabled {
         return "disabled".to_string();
     }
     let coverage = match &advisories.ecosystem {
         Some(ecosystem) => format!("ecosystem {ecosystem}"),
-        None => "no ecosystem covers this tool".to_string(),
+        None => "no single ecosystem maps this tool's package graph".to_string(),
     };
     format!(
-        "{} via {} · mode {} · security window {}d · severity ≥ {} · {coverage}",
-        "enabled", advisories.source, advisories.mode, advisories.min_age_days, advisories.severity,
+        "enabled via {} · mode {} · security window {}d · severity ≥ {} · {coverage}",
+        advisories.source, advisories.mode, advisories.min_age_days, advisories.severity,
     )
 }
