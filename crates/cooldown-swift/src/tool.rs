@@ -243,6 +243,15 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = SwiftTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("SwiftURL"));
+    }
+
     /// The OSV query API is case-sensitive and `SwiftURL` entries use the lowercase repository
     /// URL: `Package.resolved` casing must be lowered or the query returns nothing at all (the
     /// case-insensitive *response* matching never gets a chance).

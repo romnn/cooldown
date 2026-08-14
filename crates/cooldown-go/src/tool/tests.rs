@@ -18,6 +18,16 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[test]
+fn advisory_mapping_matches_osv() {
+    let cache = tempfile::tempdir().expect("cache");
+    let tool =
+        GoTool::from_http(SharedHttp::new(cache.path(), HttpOptions::default()).expect("http"));
+    assert_eq!(tool.capabilities().advisory_ecosystem, Some("Go"));
+    assert_eq!(tool.advisory_version("0.31.0"), "v0.31.0");
+    assert_eq!(tool.advisory_version("v0.31.0"), "v0.31.0");
+}
+
 struct TestServer {
     base_url: String,
     stop: Arc<AtomicBool>,

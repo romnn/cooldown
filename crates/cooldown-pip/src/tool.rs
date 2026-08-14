@@ -355,6 +355,25 @@ mod tests {
     use color_eyre::eyre;
     use indoc::indoc;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+        assert_eq!(
+            PyTool::<Pip>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            Some("PyPI")
+        );
+        assert_eq!(
+            PyTool::<Poetry>::from_http(http)
+                .capabilities()
+                .advisory_ecosystem,
+            Some("PyPI")
+        );
+    }
+
     /// A lockfile spelling like `Django` or `jupyter_server` must query (and match) OSV's PEP
     /// 503-normalized `PyPI` names, or every advisory for the package is silently lost.
     #[test]

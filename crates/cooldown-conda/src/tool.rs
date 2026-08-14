@@ -188,7 +188,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
-            // No advisory-database ecosystem covers this tool; the feed is inert here.
+            // Conda and PyPI packages share this graph, so no single OSV ecosystem is safe.
             advisory_ecosystem: None,
         }
     }
@@ -339,6 +339,25 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    #[test]
+    fn mixed_registry_graphs_have_no_single_osv_ecosystem() {
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+        assert_eq!(
+            CondaEnvTool::<CondaLock>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            None
+        );
+        assert_eq!(
+            CondaEnvTool::<Pixi>::from_http(http)
+                .capabilities()
+                .advisory_ecosystem,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn pixi_routes_conda_and_pypi_registries() {

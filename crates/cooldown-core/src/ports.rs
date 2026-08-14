@@ -43,10 +43,10 @@ pub struct Capabilities {
     /// Releases are artifact-granular (a universal lock with per-file upload times, e.g. uv).
     pub artifact_granular: bool,
     /// The advisory database's ecosystem string for this tool's packages (`Go`, `crates.io`,
-    /// `PyPI`, `npm`, `Maven`, `RubyGems`, `Hex`, `SwiftURL`), or `None` when no advisory feed
-    /// covers the tool (conda) — the feature is then inert there, and any run with the feed
-    /// enabled says so with an `advisory_ecosystem_unsupported` warning rather than pretending
-    /// coverage.
+    /// `PyPI`, `npm`, `Maven`, `RubyGems`, `Hex`, `SwiftURL`), or `None` when the tool's mixed
+    /// package graph has no safe single project-wide mapping (conda, pixi, Deno). The feature is
+    /// then inert there, and any run with the feed enabled says so with an
+    /// `advisory_ecosystem_unsupported` warning rather than pretending coverage.
     pub advisory_ecosystem: Option<&'static str>,
 }
 

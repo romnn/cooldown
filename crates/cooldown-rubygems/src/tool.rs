@@ -239,6 +239,15 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = BundlerTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("RubyGems"));
+    }
+
     #[tokio::test]
     async fn dependencies_split_direct_from_transitive() {
         let dir = tempfile::tempdir().expect("tempdir");

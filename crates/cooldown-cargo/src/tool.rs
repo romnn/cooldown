@@ -1338,6 +1338,15 @@ mod tests {
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = CargoTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("crates.io"));
+    }
+
     fn lock_with(packages: &[(&str, &str)]) -> CargoLock {
         let sourced: Vec<(&str, &str, &str)> = packages
             .iter()

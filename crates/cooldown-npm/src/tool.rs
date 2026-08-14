@@ -1736,10 +1736,34 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::{Npm, Pnpm};
+    use crate::lock::{Bun, Npm, Pnpm, Yarn};
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
+
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+        for ecosystem in [
+            NpmTool::<Npm>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            NpmTool::<Pnpm>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            NpmTool::<Yarn>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            NpmTool::<Bun>::from_http(http)
+                .capabilities()
+                .advisory_ecosystem,
+        ] {
+            assert_eq!(ecosystem, Some("npm"));
+        }
+    }
+
     fn raw(version: &str) -> RawRelease {
         RawRelease {
             version: cooldown_core::Version::new(version),

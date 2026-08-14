@@ -608,6 +608,15 @@ mod tests {
     use indoc::indoc;
 
     #[test]
+    fn mixed_registry_graph_has_no_single_osv_ecosystem() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = DenoTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, None);
+    }
+
+    #[test]
     fn splits_npm_and_jsr_specifiers() {
         assert_eq!(
             split_specifier("npm:lodash@4.17.15"),

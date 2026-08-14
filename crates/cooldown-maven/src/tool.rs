@@ -312,6 +312,25 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+        assert_eq!(
+            JavaTool::<Maven>::from_http(http.clone())
+                .capabilities()
+                .advisory_ecosystem,
+            Some("Maven")
+        );
+        assert_eq!(
+            JavaTool::<Gradle>::from_http(http)
+                .capabilities()
+                .advisory_ecosystem,
+            Some("Maven")
+        );
+    }
+
     #[tokio::test]
     async fn maven_reads_declared_dependencies() {
         let dir = tempfile::tempdir().expect("tempdir");

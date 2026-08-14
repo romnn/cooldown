@@ -998,6 +998,15 @@ mod tests {
     use indoc::indoc;
     use jiff::Timestamp;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = UvTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("PyPI"));
+    }
+
     fn lock_with(packages: &[(&str, &str)]) -> UvLock {
         use std::fmt::Write as _;
         let mut content = String::from("version = 1\nrevision = 3\n");
