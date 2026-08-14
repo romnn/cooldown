@@ -52,7 +52,9 @@ With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enable
 that is itself an advisory's fix version is counted in the summary (`… · 1 security-relevant`) and
 carries a `security` object in `--json`. Under the feed's `shorten` mode such a pin resolves
 against the shorter security window, so merging a security bot's bump stops failing the next gate
-run. `check` never *fails* because a pin is vulnerable — that job stays with `govulncheck` /
+run. The TTY Notes column adds `security window applied`, and the Cooldown cell names the advisory
+that shortened it, so the shorter number cannot be mistaken for ordinary configuration.
+`check` never *fails* because a pin is vulnerable — that job stays with `govulncheck` /
 `cargo audit`, so exit `1` keeps exactly one meaning.
 
 ## Handling a red gate

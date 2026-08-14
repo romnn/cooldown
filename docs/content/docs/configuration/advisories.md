@@ -64,6 +64,10 @@ against the **security window** (`min-age` above) instead of the ordinary one:
 An `upgrade` row that moved for security reasons says so — `⚠ fixes GHSA-… (high); adopted on the
 security window` in the Reason column, and the same `security` object in `--json` — so a
 fast-tracked adoption is never indistinguishable from a routine bump in the report.
+The `outdated` and `check` cooldown cells also append `(security GHSA-…)` when the displayed
+window was shortened; a surviving floor remains visible beside it as `(≥source)`.
+In JSON, the same provenance is the window's `shortenedBy` field, kept separate from `clampedBy`
+because shortening loosens a window while clamping tightens it.
 
 The security window is **min-clamped**: it only ever *shortens* the ordinary window, never extends
 it. A dependency whose ordinary window is already shorter is unaffected, and a security `min-age`
@@ -107,8 +111,8 @@ The feed's failure semantics are deliberately the *inverse* of the registry's:
   refuses to certify without the feed can escalate it: `check --fail-on-advisory-source` turns the
   warning into an error (exit `4`). That covers every way the enabled feed can yield no usable
   evidence — unreachable, no wired source implements the selected `source`, or data too stale to
-  shorten. A tool no advisory database covers stays a warning under the flag: no feed covers it at
-  all, so no run of yours can change that.
+  shorten. A mixed-registry tool with no safe single database mapping stays a warning under the
+  flag: the project-wide query cannot run, so no feed outage is involved.
 - **Stale cache data annotates but never shortens.** Cached advisory responses live for 24 hours.
   Past that (e.g. under `--offline`), the data may still flag rows, but `shorten` degrades to
   `flag` for that project, with a warning saying so. The registry cache's rule is a monotonic
@@ -175,8 +179,14 @@ tool), never silently skipped:
 | `bundler` | RubyGems |
 | `hex` | Hex |
 | `swift` | SwiftURL (GitHub-hosted packages, queried as the lowercase repository URL) |
-| `conda`, `pixi` | — not covered by OSV |
-| `deno` | — not covered (a jsr/npm mix could alias names) |
+| `conda`, `pixi` | — mixed conda/PyPI graphs are not mapped to one ecosystem |
+| `deno` | — mixed jsr/npm graphs are not mapped to one ecosystem |
+
+`conda-lock.yml` and `pixi.lock` can contain PyPI packages that OSV covers in isolation.
+Cooldown currently queries one advisory ecosystem per tool project, so it does not send those
+PyPI entries separately from the conda entries in the same resolved graph; the warning means the
+mixed tool has no safe single mapping, not that every package in its lock is absent from OSV.
+The same limitation applies to Deno's mixed JSR/npm graph.
 
 ## Reference
 

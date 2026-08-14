@@ -22,7 +22,7 @@ cooldown outdated
 | **Current** | The version currently locked. |
 | **Adoptable** | The newest version that has already cleared its cooldown — blank (`—`) if nothing new has matured. |
 | **Latest** | The newest version that exists, cooled down or not. |
-| **Cooldown** | `age/window` for the relevant candidate — how old it is versus the window it must clear. |
+| **Cooldown** | `age/window` for the relevant candidate — how old it is versus the window it must clear. A shortened advisory window appends `(security GHSA-…)`; a stricter clamp appends `(≥source)`. |
 | **Status** | `adoptable`, `in cooldown`, `exempt`, `held`, or `up-to-date`; held rows show the reason. With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enabled, a candidate that fixes an advisory affecting the current pin is annotated `⚠ fixes GHSA-… (high)`. |
 
 The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default.

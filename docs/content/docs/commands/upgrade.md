@@ -172,4 +172,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
-`upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with `--json` to feed the plan into other tooling.
+`upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with
+`--json` to feed the plan into other tooling. The JSON envelope sets its top-level `dryRun` field
+to `true` for a preview and `false` for a real mutation, independently of whether every proposed
+item ultimately lands.
