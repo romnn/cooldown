@@ -23,7 +23,7 @@ fn recovery_setup_error_honors_json_output() -> eyre::Result<()> {
         document
             .pointer("/schemaVersion")
             .and_then(serde_json::Value::as_u64),
-        Some(4)
+        Some(5)
     );
     assert_eq!(
         document
@@ -82,7 +82,7 @@ fn clean_cargo_project_recovers_as_unchanged() -> eyre::Result<()> {
         document
             .pointer("/schemaVersion")
             .and_then(serde_json::Value::as_u64),
-        Some(4)
+        Some(5)
     );
     assert_eq!(
         document.pointer("/ok").and_then(serde_json::Value::as_bool),

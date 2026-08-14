@@ -67,6 +67,14 @@ recovery_options! {
         "latest" => ("--latest", |global| global.latest),
         "freeze" => ("--freeze", |global| global.freeze.is_some()),
         "allow" => ("--allow", |global| !global.allow.is_empty()),
+        "advisories" => ("--advisories", |global| global.advisories),
+        "no_advisories" => ("--no-advisories", |global| global.no_advisories),
+        "advisory_min_age" => ("--advisory-min-age", |global| {
+            global.advisory_min_age.is_some()
+        }),
+        "advisory_severity" => ("--advisory-severity", |global| {
+            global.advisory_severity.is_some()
+        }),
         "major" => ("--major", |global| global.major),
         "no_major" => ("--no-major", |global| global.no_major),
         "respect_dist_tags" => ("--respect-dist-tags", |global| global.respect_dist_tags),

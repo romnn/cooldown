@@ -35,7 +35,8 @@ pub(crate) async fn prepare_run(
     // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
-    let invocation = options::resolve_invocation(global, overrides, &cfg, default_major)?;
+    let invocation =
+        options::resolve_invocation(global, overrides, &cfg, default_major, command_key)?;
     options::reject_offline_dry_run(command_key, invocation.dry_run(), invocation.offline())?;
     invocation.progress().phase("discovering projects");
     // Version-adopting commands revalidate npm package documents so the mutable `latest`
@@ -46,7 +47,7 @@ pub(crate) async fn prepare_run(
     // (`--no-respect-dist-tags`, `respect-dist-tags = false`) the tag is never read, so paying a
     // conditional request per npm-family package would buy nothing.
     let adopting = matches!(command_key, "upgrade" | "fix");
-    let adapters = detect::adapter_set(
+    let (adapters, http) = detect::adapter_set(
         invocation.offline(),
         invocation.fresh(),
         invocation.concurrency(),
@@ -97,7 +98,12 @@ pub(crate) async fn prepare_run(
         baseline,
         repo_root.clone(),
         repo_layers,
-    );
+    )
+    // The OSV feed shares the adapters' HTTP client (cache, per-host budget, offline/fresh
+    // modes).
+    // Wiring it unconditionally is harmless: nothing is fetched unless a project's
+    // `[advisories]` policy enables the feed.
+    .with_advisory_source(std::sync::Arc::new(cooldown_registry::OsvSource::new(http)));
     let mut opts = invocation.into_run_opts();
     if workdir != scan_root {
         opts.source_dir = Some(workdir);

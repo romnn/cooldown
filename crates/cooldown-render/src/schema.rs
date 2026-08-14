@@ -39,7 +39,26 @@ pub fn json_schema() -> Value {
         "properties": {
             "minAgeDays": { "type": "number" },
             "source": { "type": "string" },
-            "clampedBy": { "type": "string" }
+            "clampedBy": { "type": "string" },
+            "shortenedBy": { "type": "string" }
+        },
+        "additionalProperties": false
+    });
+
+    // The advisory block on a security-relevant row (`[advisories]`): which advisories
+    // `version` fixes and whether the security window was applied to it.
+    // On a `check` row `version` is the locked pin; on an `outdated` row it is the
+    // security-relevant candidate, which need not be the candidate whose cooldown the row
+    // displays.
+    let security = json!({
+        "type": "object",
+        "required": ["version", "fixes", "severity", "source", "applied"],
+        "properties": {
+            "version": { "type": "string" },
+            "fixes": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "severity": { "enum": ["low", "moderate", "high", "critical", "unknown"] },
+            "source": { "type": "string" },
+            "applied": { "type": "boolean" }
         },
         "additionalProperties": false
     });
@@ -125,6 +144,7 @@ pub fn json_schema() -> Value {
     let defs = json!({
         "diagnostic": diagnostic,
         "window": window,
+        "securityInfo": security,
         "latestInfo": latest,
         "memberRef": member_ref,
         "skippedInfo": skipped,
@@ -177,13 +197,14 @@ pub fn json_schema() -> Value {
                 "blockedBy": { "type": "string" },
                 "heldBy": { "type": "string" },
                 "latest": { "$ref": "#/$defs/latestInfo" },
+                "security": { "$ref": "#/$defs/securityInfo" },
                 "error": { "$ref": "#/$defs/diagnostic" }
             },
             "additionalProperties": false
         },
         "checkSummary": {
             "type": "object",
-            "required": ["checked", "skippedStaleProjects", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations"],
+            "required": ["checked", "skippedStaleProjects", "direct", "exempt", "acknowledged", "allowed", "unknownAge", "errors", "violations", "securityRelevant"],
             "properties": {
                 "checked": { "type": "integer", "minimum": 0 },
                 "skippedStaleProjects": { "type": "integer", "minimum": 0 },
@@ -193,7 +214,8 @@ pub fn json_schema() -> Value {
                 "allowed": { "type": "integer", "minimum": 0 },
                 "unknownAge": { "type": "integer", "minimum": 0 },
                 "errors": { "type": "integer", "minimum": 0 },
-                "violations": { "type": "integer", "minimum": 0 }
+                "violations": { "type": "integer", "minimum": 0 },
+                "securityRelevant": { "type": "integer", "minimum": 0 }
             },
             "additionalProperties": false
         },
@@ -214,6 +236,7 @@ pub fn json_schema() -> Value {
                 "status": { "enum": ["violation", "acknowledged", "allowed", "unknown_age", "error"] },
                 "graphHeld": { "type": "boolean" },
                 "graphFloor": { "type": "string" },
+                "security": { "$ref": "#/$defs/securityInfo" },
                 "error": { "$ref": "#/$defs/diagnostic" }
             },
             "additionalProperties": false
@@ -313,7 +336,8 @@ pub fn json_schema() -> Value {
                 "applied": { "type": "boolean" },
                 "skipped": { "$ref": "#/$defs/skippedInfo" },
                 "error": { "$ref": "#/$defs/diagnostic" },
-                "edge": { "$ref": "#/$defs/upgradeEdgeInfo" }
+                "edge": { "$ref": "#/$defs/upgradeEdgeInfo" },
+                "security": { "$ref": "#/$defs/securityInfo" }
             },
             "additionalProperties": false
         },
@@ -361,14 +385,28 @@ pub fn json_schema() -> Value {
         },
         "configItem": {
             "type": "object",
-            "required": ["project", "tool", "effectiveDefaultMinAgeDays", "source", "strictNative", "layers"],
+            "required": ["project", "tool", "effectiveDefaultMinAgeDays", "source", "strictNative", "layers", "advisories"],
             "properties": {
                 "project": { "type": "string" },
                 "tool": { "type": "string" },
                 "effectiveDefaultMinAgeDays": { "type": "number" },
                 "source": { "type": "string" },
                 "strictNative": { "type": "boolean" },
-                "layers": { "type": "array", "items": { "type": "string" } }
+                "layers": { "type": "array", "items": { "type": "string" } },
+                "advisories": { "$ref": "#/$defs/advisoryConfigInfo" }
+            },
+            "additionalProperties": false
+        },
+        "advisoryConfigInfo": {
+            "type": "object",
+            "required": ["enabled", "source", "mode", "minAgeDays", "severity", "ecosystem"],
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "source": { "enum": ["osv", "github", "none"] },
+                "mode": { "enum": ["flag", "shorten"] },
+                "minAgeDays": { "type": "number" },
+                "severity": { "enum": ["low", "moderate", "high", "critical", "unknown"] },
+                "ecosystem": { "type": ["string", "null"] }
             },
             "additionalProperties": false
         },
@@ -436,6 +474,7 @@ pub fn json_schema() -> Value {
                 "upgrade",
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
+                    ("dryRun", json!({ "type": "boolean" })),
                     ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
@@ -447,7 +486,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockStatus", "build"],
+                vec!["applied", "dryRun", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),
@@ -455,6 +494,7 @@ pub fn json_schema() -> Value {
                 "fix",
                 map(&[
                     ("applied", json!({ "type": "boolean" })),
+                    ("dryRun", json!({ "type": "boolean" })),
                     ("lockStatus", json!({ "enum": ["current", "stale", "unknown", null] })),
                     ("build", json!({
                         "type": "object",
@@ -466,7 +506,7 @@ pub fn json_schema() -> Value {
                         "additionalProperties": false
                     }))
                 ]),
-                vec!["applied", "lockStatus", "build"],
+                vec!["applied", "dryRun", "lockStatus", "build"],
                 "#/$defs/upgradeSummary",
                 "#/$defs/upgradeItem"
             ),
@@ -582,11 +622,12 @@ pub fn json_schema_string() -> Result<String, serde_json::Error> {
 mod tests {
     use super::json_schema;
     use crate::model::{
-        BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem, CheckMeta, CheckStatus,
-        CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo, Envelope, ExplainMeta,
-        ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
-        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus, RecoverySummary, SkippedInfo,
-        UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
+        AdvisoryConfigInfo, BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem,
+        CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo,
+        Envelope, ExplainMeta, ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta,
+        OutdatedStatus, OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus,
+        RecoverySummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta,
+        UpgradeSummary, Window,
     };
     use color_eyre::eyre;
     use cooldown_core::{
@@ -940,6 +981,17 @@ mod tests {
             min_age_days: 7.0,
             source: "default".to_string(),
             clamped_by: Some("native".to_string()),
+            shortened_by: Some("GHSA-v778-237x-gjrc".to_string()),
+        }
+    }
+
+    fn security_info() -> SecurityInfo {
+        SecurityInfo {
+            version: "0.31.0".to_string(),
+            fixes: vec!["GHSA-v778-237x-gjrc".to_string()],
+            severity: "high".to_string(),
+            source: "osv".to_string(),
+            applied: true,
         }
     }
 
@@ -998,6 +1050,7 @@ mod tests {
             blocked_by: Some("typer".to_string()),
             held_by: Some(cooldown_core::HeldReason::DeclaredBound("<2".to_string()).into()),
             latest: Some(latest_info()),
+            security: Some(security_info()),
             error: Some(diagnostic()),
         }
     }
@@ -1019,6 +1072,7 @@ mod tests {
             unknown_age: 0,
             errors: 0,
             violations: 1,
+            security_relevant: 0,
             skipped_stale_projects: 0,
         }
     }
@@ -1038,6 +1092,7 @@ mod tests {
             status: CheckStatus::Violation,
             graph_held: true,
             graph_floor: Some("1.0.0".to_string()),
+            security: Some(security_info()),
             error: Some(diagnostic()),
         }
     }
@@ -1045,6 +1100,7 @@ mod tests {
     fn upgrade_meta() -> UpgradeMeta {
         UpgradeMeta {
             applied: true,
+            dry_run: false,
             lock_status: Some(LockStatus::Current),
             build: BuildInfo {
                 requested: true,
@@ -1081,6 +1137,7 @@ mod tests {
             skipped: Some(skipped_info()),
             error: Some(diagnostic()),
             edge: None,
+            security: Some(security_info()),
         }
     }
 
@@ -1100,6 +1157,7 @@ mod tests {
             skipped: None,
             error: None,
             edge: Some(upgrade_edge_info()),
+            security: None,
         }
     }
 
@@ -1144,6 +1202,14 @@ mod tests {
             source: "default".to_string(),
             strict_native: true,
             layers: vec!["default".to_string(), "workspace".to_string()],
+            advisories: AdvisoryConfigInfo {
+                enabled: true,
+                source: "osv".to_string(),
+                mode: "shorten".to_string(),
+                min_age_days: 1.0,
+                severity: "high".to_string(),
+                ecosystem: Some("crates.io".to_string()),
+            },
         }
     }
 

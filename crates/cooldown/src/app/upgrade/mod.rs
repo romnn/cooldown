@@ -262,12 +262,18 @@ impl Workspace {
     }
 
     /// Runs preselected upgrade targets through the complete policy trial in a project copy.
+    ///
+    /// `advisories` carries the caller's already-fetched feed snapshot, so the trial judges
+    /// from exactly the data that selected the targets — a second fetch here could see a newer
+    /// snapshot and hold a candidate the caller just reported adoptable.
+    /// `None` fetches one as usual.
     pub(super) async fn preview_project_upgrade(
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
+        advisories: Option<std::sync::Arc<crate::app::advisories::ProjectAdvisories>>,
     ) -> UpgradeAccum {
         let mut acc = UpgradeAccum::default();
         let Some(reader) = self.adapter(pctx.tool) else {
@@ -322,7 +328,10 @@ impl Workspace {
         };
         let mut preview_opts = opts.clone();
         preview_opts.build = false;
-        preview_opts.dry_run = false;
+        // The preview really mutates — but only its throwaway copy, so a diagnostic it
+        // publishes into a read-only report (`outdated` forwards its warnings) must speak
+        // conditionally, the way a dry run's does.
+        preview_opts.dry_run = true;
         preview_opts.lock = false;
 
         ProjectUpgradeExecutor::new(
@@ -341,7 +350,7 @@ impl Workspace {
             },
             &mut acc,
         )
-        .run_policy(changes, manifest_only)
+        .run_policy(changes, manifest_only, advisories)
         .await;
         acc
     }
@@ -751,6 +760,7 @@ fn dedupe_edge_items(items: &mut Vec<UpgradeItem>) {
 fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> UpgradeMeta {
     UpgradeMeta {
         applied: mutations > 0,
+        dry_run: opts.dry_run,
         lock_status: if opts.dry_run { None } else { acc.lock_status },
         build: BuildInfo {
             requested: acc.build_requested,
@@ -788,6 +798,7 @@ mod tests {
                 action: EdgeBindingAction::Rebound,
                 detail: None,
             }),
+            security: None,
         }
     }
 

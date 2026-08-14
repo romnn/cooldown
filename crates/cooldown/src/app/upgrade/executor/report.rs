@@ -1,6 +1,15 @@
-use crate::app::{SkippedInfo, UpgradeItem};
+use crate::app::{SecurityInfo, SkippedInfo, UpgradeItem};
 use cooldown_core::{BaselineViolation, Change, LockStatus, SkipReason, UpdateKind};
 use std::collections::{HashMap, HashSet};
+
+/// One collapsed chain: the surviving row and the net fields recomputed for it.
+struct CollapsedLeg {
+    head: usize,
+    net_to: String,
+    downgrade: bool,
+    kind: UpdateKind,
+    security: Option<SecurityInfo>,
+}
 
 /// Collapses chronological version legs into the net rows present in the committed lock.
 ///
@@ -39,7 +48,7 @@ pub(super) fn collapse_applied_legs(
     }
     let mut remove: HashSet<usize> = HashSet::new();
     // Store each chain's first leg and its recomputed net fields.
-    let mut retarget: Vec<(usize, String, bool, UpdateKind)> = Vec::new();
+    let mut retarget: Vec<CollapsedLeg> = Vec::new();
     for indices in groups.values() {
         // Link a leg to the chain whose current target equals the leg's source.
         let mut chains: Vec<Vec<usize>> = Vec::new();
@@ -84,15 +93,25 @@ pub(super) fn collapse_applied_legs(
                     .iter()
                     .any(|violation| violation_matches_report_row(violation, tool, head));
             let kind = classify_update_kind(&head.from, &net_to).unwrap_or(head.kind);
-            retarget.push((first, net_to, downgrade, kind));
+            // The security block describes the row's *target*, so it follows the net one — the
+            // first leg's provenance would name a version this row no longer reports.
+            let security = items.get(last).and_then(|item| item.security.clone());
+            retarget.push(CollapsedLeg {
+                head: first,
+                net_to,
+                downgrade,
+                kind,
+                security,
+            });
             remove.extend(chain.iter().skip(1).copied());
         }
     }
-    for (first, net_to, downgrade, kind) in retarget {
-        if let Some(head) = items.get_mut(first) {
-            head.to = net_to;
-            head.downgrade = downgrade;
-            head.kind = kind;
+    for leg in retarget {
+        if let Some(head) = items.get_mut(leg.head) {
+            head.to = leg.net_to;
+            head.downgrade = leg.downgrade;
+            head.kind = leg.kind;
+            head.security = leg.security;
         }
     }
     if remove.is_empty() {
@@ -177,5 +196,6 @@ pub(super) fn plan_item(
         skipped,
         error: None,
         edge: None,
+        security: None,
     }
 }

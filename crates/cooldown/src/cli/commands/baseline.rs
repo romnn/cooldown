@@ -8,7 +8,8 @@ use std::fmt::Write as _;
 pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Result<Exit, CoreError> {
     let path = ctx.repo_root.join(crate::app::baseline::BASELINE_FILE);
     let existing = Baseline::load(&path)?;
-    let young = ctx.ws.baseline_entries(ctx.opts).await?;
+    let scan = ctx.ws.baseline_entries(ctx.opts).await?;
+    let young = scan.entries;
 
     let key = |entry: &crate::app::baseline::AckEntry| {
         (
@@ -75,21 +76,32 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
         acknowledged: items.len(),
         pruned: removed,
     };
-    let env = render::Envelope::new(
-        "baseline",
-        true,
-        ctx.generated_at.to_owned(),
-        render::BaselineMeta {
-            path: path.to_string(),
-            dry_run: ctx.opts.dry_run,
-        },
-        summary.clone(),
-        items,
+    // The advisory feed decides which pins the advised gate would have passed, so a feed
+    // failure changes what was just written — never write silently on top of it.
+    let env = super::common::with_diags(
+        render::Envelope::new(
+            "baseline",
+            true,
+            ctx.generated_at.to_owned(),
+            render::BaselineMeta {
+                path: path.to_string(),
+                dry_run: ctx.opts.dry_run,
+            },
+            summary.clone(),
+            items,
+        ),
+        scan.diagnostics.clone(),
+        Vec::new(),
     );
 
     let dry_run = ctx.opts.dry_run;
+    let diagnostics = scan.diagnostics;
     emit_envelope(ctx.opts.json, &env, || {
-        baseline_text(&path, &summary, prune, dry_run)
+        let mut text = baseline_text(&path, &summary, prune, dry_run);
+        for diagnostic in &diagnostics {
+            let _ = writeln!(text, "warning: {}", diagnostic.message);
+        }
+        text
     })?;
 
     Ok(Exit::Ok)

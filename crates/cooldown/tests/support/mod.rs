@@ -622,6 +622,36 @@ impl Envelope {
         })
     }
 
+    /// The `security` block of the first item with this `name`, when present — the
+    /// advisory-feed annotation (`fixes`, `severity`, `source`, `applied`).
+    pub fn security_for(&self, name: &str) -> Option<serde_json::Value> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("security").cloned()
+        })
+    }
+
+    /// The `window.shortenedBy` advisory id of the first item with this `name`, when present —
+    /// set only when the advisory security window replaced the ordinary one.
+    pub fn shortened_by_for(&self, name: &str) -> Option<String> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            item.get("window")?
+                .get("shortenedBy")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    }
+
+    /// `summary.securityRelevant` of a `check` envelope.
+    pub fn summary_security_relevant(&self) -> u64 {
+        self.summary_u64("securityRelevant")
+    }
+
     /// The `latest.version` of the named `outdated` item, when present.
     pub fn latest_version_for(&self, name: &str) -> Option<String> {
         self.items().iter().find_map(|item| {

@@ -70,6 +70,14 @@ const STARTER_CONFIG: &str = indoc! {r#"
     # A hard minimum no nearer config can weaken:
     # floor = "3d"
 
+    # The advisory feed (OSV): flag versions that fix a known advisory affecting the current pin,
+    # and optionally hold them only for a shorter security window instead of the full cooldown:
+    # [advisories]
+    # enabled = true
+    # mode = "flag"      # "flag" annotates only (default); "shorten" also applies min-age below
+    # min-age = "1d"     # the security window — only ever *shortens* the ordinary window
+    # severity = "high"  # minimum severity that earns it: low | moderate | high | critical
+
     # Flag defaults: [global] applies to every subcommand; a [<command>] section overrides it; an
     # explicit CLI flag overrides both. Keys are the kebab-case flag names. A few examples:
     # [global]

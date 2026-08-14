@@ -11,7 +11,7 @@ use cooldown_core::{
 use serde::{Serialize, Serializer};
 
 /// The JSON schema version.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -71,8 +71,9 @@ impl<M: Serialize, S: Serialize, I: Serialize> Envelope<M, S, I> {
     }
 }
 
-/// The resolved window block on an item: `{ minAgeDays, source, clampedBy? }`. Days are
-/// display-only float days; the boundary comparison is on the underlying instant.
+/// The resolved window block on an item: `{ minAgeDays, source, clampedBy?, shortenedBy? }`.
+///
+/// Days are display-only float days; the boundary comparison is on the underlying instant.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
@@ -83,6 +84,40 @@ pub struct Window {
     /// The selector of a stricter native/registry policy that clamped the window, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clamped_by: Option<String>,
+    /// The advisory whose security window replaced the ordinary one (`[advisories]` shorten
+    /// mode), if any.
+    ///
+    /// A sibling of [`clamped_by`](Window::clamped_by), kept separate on purpose: a clamp
+    /// tightens, a shorten loosens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortened_by: Option<String>,
+}
+
+/// The advisory block on a security-relevant row: which advisories [`version`](Self::version)
+/// fixes and whether the security window was actually applied to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityInfo {
+    /// The version this block describes.
+    ///
+    /// On a `check` row it is the locked pin (the row's `current`); on an `outdated` row it is
+    /// the security-relevant candidate, which need not be the candidate whose cooldown the row
+    /// displays — an applied fix wins over a newer, merely-annotated candidate.
+    pub version: String,
+    /// The advisory ids the version fixes (`GHSA-…`, `GO-…`, …).
+    pub fixes: Vec<String>,
+    /// The highest normalized severity among [`fixes`](SecurityInfo::fixes):
+    /// `low|moderate|high|critical|unknown`.
+    pub severity: String,
+    /// The advisory source the ids came from (e.g. `"osv"`).
+    pub source: String,
+    /// Whether the security window replaced the ordinary one for this row (`false` under the
+    /// annotate-only flag mode, or when the security window would not have been shorter).
+    ///
+    /// This is about the *window*, not about any mutation: on an `upgrade` row it says the
+    /// shorter window is what made the target eligible, which a later gate may still reject —
+    /// [`UpgradeItem::applied`] is what says the change landed.
+    pub applied: bool,
 }
 
 /// The `latest` block on an [`OutdatedItem`]: the newest existing version and its age.
@@ -217,6 +252,10 @@ pub struct OutdatedItem {
     /// The newest existing version and its age, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<LatestInfo>,
+    /// Present iff the row is security-relevant: a candidate fixes an advisory affecting the
+    /// current pin (see [`SecurityInfo`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityInfo>,
     /// The error that prevented evaluation, present iff `status` is [`OutdatedStatus::Error`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
@@ -379,6 +418,10 @@ pub struct CheckItem {
     /// The lowest version the resolved graph permits, when [`graph_held`](CheckItem::graph_held).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_floor: Option<String>,
+    /// Present iff the pin is security-relevant: the locked version is itself an advisory's fix
+    /// version (see [`SecurityInfo`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityInfo>,
     /// The error that prevented evaluation, present iff `status` is [`CheckStatus::Error`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Diagnostic>,
@@ -407,6 +450,8 @@ pub struct CheckSummary {
     pub errors: usize,
     /// The number of unacknowledged violations (status [`CheckStatus::Violation`]).
     pub violations: usize,
+    /// How many evaluated pins are security-relevant (the locked version is an advisory's fix).
+    pub security_relevant: usize,
 }
 
 /// The flattened top-level `meta` for `check`: the scope of the run.
@@ -484,7 +529,10 @@ pub struct UpgradeItem {
     pub to: String,
     /// The update kind of the change relative to the current pin.
     pub kind: UpdateKind,
-    /// Whether this row's version or edge-binding change is present in the committed result.
+    /// Whether this row's version or edge-binding change is present in the committed result —
+    /// or, under `--dry-run`, would have been (the run resolves for real against a throwaway
+    /// copy, so its rows carry the outcome the real run would produce).
+    /// [`UpgradeMeta::lock_status`] is what distinguishes the two.
     pub applied: bool,
     /// Why a package version change was not applied.
     /// Edge outcomes carry their explanation in [`UpgradeEdgeInfo::detail`] instead.
@@ -498,6 +546,10 @@ pub struct UpgradeItem {
     /// [`from`](UpgradeItem::from)/[`to`](UpgradeItem::to) then carry the binding versions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge: Option<UpgradeEdgeInfo>,
+    /// Why [`to`](UpgradeItem::to) is security-relevant: the advisories adopting it resolves, and
+    /// whether the security window is what let it be adopted this early (see [`SecurityInfo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityInfo>,
 }
 
 impl UpgradeItem {
@@ -573,7 +625,16 @@ pub struct UpgradeMeta {
     /// Whether any reported package-version or lock-edge mutation is present in the committed
     /// result (a dry run reports what the real run would apply).
     pub applied: bool,
-    /// Re-lock status; `null` for `--dry-run` (which never mutates).
+    /// Whether this was a `--dry-run`: the rows report what the real run would have done and
+    /// nothing was mutated.
+    ///
+    /// Carried explicitly rather than inferred from an absent
+    /// [`lock_status`](Self::lock_status), which a *real* run can also end with — see there.
+    pub dry_run: bool,
+    /// Re-lock status; `null` for `--dry-run` (which never mutates) — but also for a real run
+    /// that ended before the final lock verification (for example a failed edge normalization
+    /// terminated it after a batch had already committed), so `null` alone does not mean the
+    /// lock is untouched.
     pub lock_status: Option<LockStatus>,
     /// The post-mutation build result.
     pub build: BuildInfo,
@@ -646,6 +707,27 @@ pub struct ConfigItem {
     pub strict_native: bool,
     /// The project policy layers, lowest authority first.
     pub layers: Vec<String>,
+    /// The resolved `[advisories]` policy and this tool's feed coverage.
+    pub advisories: AdvisoryConfigInfo,
+}
+
+/// The resolved `[advisories]` policy for one project, plus whether a feed covers its tool.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvisoryConfigInfo {
+    /// Whether the feed is consulted at all.
+    pub enabled: bool,
+    /// The selected feed: `osv`, `github`, or `none`.
+    pub source: String,
+    /// `flag` (annotate only) or `shorten` (also apply the security window).
+    pub mode: String,
+    /// The security window in fractional days (meaningful under `shorten`).
+    pub min_age_days: f64,
+    /// The minimum normalized severity that earns the security window.
+    pub severity: String,
+    /// The advisory-database ecosystem covering this tool (`crates.io`, `PyPI`, …), or `None`
+    /// when no feed covers it — its packages are never annotated.
+    pub ecosystem: Option<String>,
 }
 
 /// The aggregate counts for a `config` report.

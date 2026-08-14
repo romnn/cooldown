@@ -3,8 +3,8 @@
 
 use crate::model::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, ExplainMeta, ExplainStep, OutdatedItem,
-    OutdatedStatus, OutdatedSummary, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
-    held_reason_label,
+    OutdatedStatus, OutdatedSummary, SecurityInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta,
+    UpgradeSummary, Window, held_reason_label,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table};
 use cooldown_core::{Diagnostic, MemberRef, SkipReason, Status};
@@ -198,11 +198,27 @@ fn outdated_cooldown_cell(item: &OutdatedItem) -> String {
 fn outdated_status_cell(item: &OutdatedItem) -> String {
     // A blocked row names the conflicting requirer inline ("blocked by <pkg>") so the matured target
     // reads as "wanted but held out of the graph by …", mirroring the `upgrade` skip.
-    match (item.status, &item.blocked_by, &item.held_by) {
+    let status = match (item.status, &item.blocked_by, &item.held_by) {
         (OutdatedStatus::Blocked, Some(blocker), _) => format!("blocked by {blocker}"),
         (OutdatedStatus::Held, _, Some(reason)) => held_reason_label(reason.reason()),
         _ => status_label(item.status).to_string(),
+    };
+    // A security-relevant row names what adopting the candidate fixes — the difference between
+    // a silent hold and "those days are spent on a known-exploitable version".
+    match &item.security {
+        Some(security) => format!("{status} {}", security_note(security)),
+        None => status,
     }
+}
+
+/// The security annotation on a flagged row: `⚠ fixes GHSA-… (high)`, listing every fixed
+/// advisory id and the highest severity.
+fn security_note(security: &SecurityInfo) -> String {
+    format!(
+        "⚠ fixes {} ({})",
+        security.fixes.join(", "),
+        security.severity
+    )
 }
 
 fn cell_colored(text: impl Into<String>, color: Color, use_color: bool) -> Cell {
@@ -275,6 +291,15 @@ fn check_status_cell(status: CheckStatus) -> StatusCell {
 
 fn check_notes_cell(item: &CheckItem) -> String {
     let mut notes = Vec::new();
+    if let Some(security) = &item.security {
+        // The pin is itself an advisory's fix version; under the shorten mode its window is the
+        // security window, so merging a security bump stops failing the very next gate run.
+        let mut note = security_note(security);
+        if security.applied {
+            note.push_str("; security window applied");
+        }
+        notes.push(note);
+    }
     if item.graph_held {
         notes.push("graph-held".to_string());
     }
@@ -531,7 +556,7 @@ pub fn render_check(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
-    let _ = writeln!(
+    let _ = write!(
         out,
         "\nchecked {} ({} direct) · {} stale {} skipped · {} violations · {} acknowledged · {} allowed · {} exempt · {} unknown-age · {} errors",
         summary.checked,
@@ -545,6 +570,12 @@ pub fn render_check(
         summary.unknown_age,
         summary.errors,
     );
+    // The optional clause joins the summary *before* its newline, or it would start a
+    // malformed, unterminated line that runs into the first diagnostic.
+    if summary.security_relevant > 0 {
+        let _ = write!(out, " · {} security-relevant", summary.security_relevant);
+    }
+    out.push('\n');
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
 }
@@ -659,7 +690,7 @@ fn edge_group_status(group: &[&UpgradeItem]) -> MutationStatus {
         };
     };
     if group.len() == 1 {
-        return mutation_status(first);
+        return edge_status(first, edge);
     }
     let mut labels: Vec<String> = group
         .iter()
@@ -713,69 +744,113 @@ struct MutationStatus {
     color: Color,
 }
 
-/// The status cells for one mutation row. The applied word is per-item, not per-command: a
-/// too-fresh pin an `upgrade` rolls back is `downgraded`, not `upgraded`. A held-back cross-major
-/// is a `skipped` row whose reason is `needs --major`; a clean apply has an empty reason because
-/// Status says it. An edge row reports a lock-edge *binding* move (the From/To cells are binding
-/// versions), so its status word names the edge-policy outcome and its reason names the dependent
-/// whose edge moved.
-fn mutation_status(it: &UpgradeItem) -> MutationStatus {
-    if let Some(edge) = &it.edge {
-        let source = edge
-            .dependent_source
-            .as_deref()
-            .map(|source| format!(" ({})", abbreviated_source(source)))
-            .unwrap_or_default();
-        let subject = format!(
-            "{} {}{source}'s {} edge binding",
-            edge.dependent, edge.dependent_version, it.name
-        );
-        return match edge.action {
-            cooldown_core::EdgeBindingAction::Restored => MutationStatus {
-                status: "restored",
-                reason: format!("the re-resolve rebound {subject}; restored"),
-                color: Color::Green,
+/// The status cells for a lock-edge *binding* row: the outcome word names the edge-policy
+/// result and the reason names the dependent whose edge moved.
+fn edge_status(it: &UpgradeItem, edge: &UpgradeEdgeInfo) -> MutationStatus {
+    let source = edge
+        .dependent_source
+        .as_deref()
+        .map(|source| format!(" ({})", abbreviated_source(source)))
+        .unwrap_or_default();
+    let subject = format!(
+        "{} {}{source}'s {} edge binding",
+        edge.dependent, edge.dependent_version, it.name
+    );
+    match edge.action {
+        cooldown_core::EdgeBindingAction::Restored => MutationStatus {
+            status: "restored",
+            reason: format!("the re-resolve rebound {subject}; restored"),
+            color: Color::Green,
+        },
+        cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
+            status: "canonicalized",
+            reason: format!("{subject} bound to the canonical satisfying locked version"),
+            color: Color::Green,
+        },
+        cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
+            status: "rebound",
+            reason: match &edge.detail {
+                Some(detail) => format!(
+                    "the re-resolve moved {subject}; left as bound: {}",
+                    cooldown_core::redact::url_secrets(detail)
+                ),
+                None => format!("the re-resolve moved {subject}; left as bound"),
             },
-            cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
-                status: "canonicalized",
-                reason: format!("{subject} bound to the canonical satisfying locked version"),
-                color: Color::Green,
+            color: Color::Yellow,
+        },
+        cooldown_core::EdgeBindingAction::Held => MutationStatus {
+            status: "held",
+            reason: match &edge.detail {
+                Some(detail) => format!(
+                    "{subject} left in place: {}",
+                    cooldown_core::redact::url_secrets(detail)
+                ),
+                None => format!("{subject} left in place; correction withheld"),
             },
-            cooldown_core::EdgeBindingAction::Rebound => MutationStatus {
-                status: "rebound",
-                reason: match &edge.detail {
-                    Some(detail) => format!(
-                        "the re-resolve moved {subject}; left as bound: {}",
-                        cooldown_core::redact::url_secrets(detail)
-                    ),
-                    None => format!("the re-resolve moved {subject}; left as bound"),
-                },
-                color: Color::Yellow,
+            color: Color::Yellow,
+        },
+        cooldown_core::EdgeBindingAction::Unaddressable => MutationStatus {
+            status: "unaddressable",
+            reason: match &edge.detail {
+                Some(detail) => format!(
+                    "{subject} could not be corrected: {}",
+                    cooldown_core::redact::url_secrets(detail)
+                ),
+                None => format!("{subject} could not be corrected safely"),
             },
-            cooldown_core::EdgeBindingAction::Held => MutationStatus {
-                status: "held",
-                reason: match &edge.detail {
-                    Some(detail) => format!(
-                        "{subject} left in place: {}",
-                        cooldown_core::redact::url_secrets(detail)
-                    ),
-                    None => format!("{subject} left in place; correction withheld"),
-                },
-                color: Color::Yellow,
-            },
-            cooldown_core::EdgeBindingAction::Unaddressable => MutationStatus {
-                status: "unaddressable",
-                reason: match &edge.detail {
-                    Some(detail) => format!(
-                        "{subject} could not be corrected: {}",
-                        cooldown_core::redact::url_secrets(detail)
-                    ),
-                    None => format!("{subject} could not be corrected safely"),
-                },
-                color: Color::Yellow,
-            },
-        };
+            color: Color::Yellow,
+        },
     }
+}
+
+/// The status cells for one mutation row, plus the security annotation a fast-tracked row
+/// carries.
+///
+/// `committed` is false for a `--dry-run`, whose rows carry the outcome the real run *would*
+/// have produced; the security clause is then phrased in that mood rather than claiming an
+/// adoption the run never made.
+///
+/// An edge row reports a lock-edge *binding* move (the From/To cells are binding versions), so
+/// its status word names the edge-policy outcome and its reason names the dependent whose edge
+/// moved.
+fn mutation_status(it: &UpgradeItem, committed: bool) -> MutationStatus {
+    if let Some(edge) = &it.edge {
+        return edge_status(it, edge);
+    }
+    let cells = plain_status(it);
+    // Say what a security-relevant move fixes, and — when the security window is what made the
+    // target eligible this early — that the fast-track is the reason it was in play at all.
+    let Some(security) = &it.security else {
+        return cells;
+    };
+    let mut note = security_note(security);
+    if security.applied {
+        // `SecurityInfo::applied` is about the *window*, not the mutation.
+        // A fast-tracked candidate the transitive gate rejected was eligible, never adopted;
+        // and a dry run adopted nothing at all, however its rows are labelled.
+        note.push_str(match (it.applied, committed) {
+            (true, true) => "; adopted on the security window",
+            (true, false) => "; would adopt on the security window",
+            (false, _) => "; eligible on the security window",
+        });
+    }
+    MutationStatus {
+        reason: if cells.reason.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", cells.reason)
+        },
+        ..cells
+    }
+}
+
+/// The status cells for a version-change row, before any security annotation.
+///
+/// The applied word is per-item, not per-command: a too-fresh pin an `upgrade` rolls back is
+/// `downgraded`, not `upgraded`.
+/// A held-back cross-major is a `skipped` row whose reason is `needs --major`; a clean apply has
+/// an empty reason because Status already says it.
+fn plain_status(it: &UpgradeItem) -> MutationStatus {
     if it.applied {
         MutationStatus {
             status: if it.downgrade {
@@ -840,13 +915,14 @@ fn mutation_project_column_needed(
     items: &[UpgradeItem],
     used_by: bool,
     opts: RenderOptions,
+    committed: bool,
 ) -> bool {
     project_column_needed(
         items,
         opts.show_projects,
         |item| item.project.as_str(),
         |item| {
-            let status = mutation_status(item);
+            let status = mutation_status(item, committed);
             (
                 item.name.clone(),
                 used_by.then(|| {
@@ -859,6 +935,23 @@ fn mutation_project_column_needed(
             )
         },
     )
+}
+
+/// The report's lock line: what the run did (or deliberately did not do) to the lock.
+fn lock_line(meta: &UpgradeMeta) -> &'static str {
+    if meta.dry_run {
+        "dry-run (lock untouched)"
+    } else {
+        match meta.lock_status {
+            Some(cooldown_core::LockStatus::Current) => "lock re-verified",
+            Some(cooldown_core::LockStatus::Stale) => "lock stale",
+            Some(cooldown_core::LockStatus::Unknown) => "lock currency unknown",
+            // A real run can end before the final verification (a failed edge normalization
+            // terminates it after a batch already committed), so an absent status means
+            // "not verified", never "untouched".
+            None => "lock not verified",
+        }
+    }
 }
 
 fn render_mutation(
@@ -882,7 +975,11 @@ fn render_mutation(
         let _ = writeln!(out, "Nothing to {verb}.");
     } else {
         let used_by = has_attribution(items, |it| &it.members);
-        let project = mutation_project_column_needed(items, used_by, opts);
+        // Explicit, not inferred from an absent lock status: a real run can end before the
+        // final lock verification with a batch already committed, and its rows must not read
+        // as a dry run's.
+        let committed = !meta.dry_run;
+        let project = mutation_project_column_needed(items, used_by, opts, committed);
         let mut t = base_table(use_color);
         let mut header = vec!["Package"];
         if used_by {
@@ -899,7 +996,7 @@ fn render_mutation(
         t.set_header(header);
         for unit in group_edge_corrections(items) {
             let (it, cells) = match &unit {
-                EdgeRenderUnit::Single(it) => (*it, mutation_status(it)),
+                EdgeRenderUnit::Single(it) => (*it, mutation_status(it, committed)),
                 EdgeRenderUnit::Group(group) => {
                     let Some(first) = group.first() else { continue };
                     (*first, edge_group_status(group))
@@ -931,12 +1028,7 @@ fn render_mutation(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
-    let lock = match meta.lock_status {
-        Some(cooldown_core::LockStatus::Current) => "lock re-verified",
-        Some(cooldown_core::LockStatus::Stale) => "lock stale",
-        Some(cooldown_core::LockStatus::Unknown) => "lock currency unknown",
-        None => "dry-run (lock untouched)",
-    };
+    let lock = lock_line(meta);
     // The held-back `needs --major` rows are counted in `skipped`; break out how many so the user
     // sees what is merely a flag away.
     let names = major_held_back(items);
@@ -1154,14 +1246,14 @@ pub fn check_status_of(status: Status, acknowledged: bool) -> Option<CheckStatus
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderOptions, abbreviated_source, check_cooldown_cell, has_distinct_project, members_cell,
-        mutation_status, outdated_status_cell, path_label, render_check, render_fix,
-        render_outdated, render_upgrade, stale_project_word,
+        RenderOptions, abbreviated_source, check_cooldown_cell, check_notes_cell,
+        has_distinct_project, members_cell, mutation_status, outdated_status_cell, path_label,
+        render_check, render_fix, render_outdated, render_upgrade, stale_project_word,
     };
     use crate::{
         BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
-        OutdatedStatus, OutdatedSummary, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
-        Window,
+        OutdatedStatus, OutdatedSummary, SecurityInfo, SkippedInfo, UpgradeItem, UpgradeMeta,
+        UpgradeSummary, Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef, SkipReason, UpdateKind};
 
@@ -1199,7 +1291,7 @@ mod tests {
             ),
         });
 
-        let status = mutation_status(&item);
+        let status = mutation_status(&item, true);
 
         assert!(status.reason.contains("git+https://example.com/foo"));
         assert!(!status.reason.contains("token"));
@@ -1295,6 +1387,7 @@ mod tests {
             min_age_days: 14.0,
             source: "default".into(),
             clamped_by: clamped_by.map(str::to_string),
+            shortened_by: None,
         };
 
         // A newer candidate reads as `age/window` — 13 days into a 14-day cooldown.
@@ -1330,6 +1423,7 @@ mod tests {
             min_age_days: 14.0,
             source: "default".into(),
             clamped_by: clamped_by.map(str::to_string),
+            shortened_by: None,
         };
 
         assert_eq!(check_cooldown_cell(&window(None), Some(0.02)), "0d/14d");
@@ -1430,6 +1524,7 @@ mod tests {
                 unknown_age: 0,
                 errors: 0,
                 violations: 1,
+                security_relevant: 0,
                 skipped_stale_projects: 0,
             },
             &[CheckItem {
@@ -1446,10 +1541,12 @@ mod tests {
                     min_age_days: 14.0,
                     source: "default".into(),
                     clamped_by: None,
+                    shortened_by: None,
                 },
                 status: CheckStatus::Violation,
                 graph_held: false,
                 graph_floor: None,
+                security: None,
                 error: None,
             }],
             &[],
@@ -1461,6 +1558,45 @@ mod tests {
         assert!(!out.contains(" Age "));
         assert!(!out.contains(" Window "));
         assert!(out.contains("13d/14d"));
+    }
+
+    /// The security-relevant clause extends the summary *line*: it must sit between the error
+    /// count and the summary's newline, never start an unterminated line that runs into the
+    /// first diagnostic.
+    #[test]
+    fn check_summary_security_clause_stays_on_the_summary_line() {
+        let out = render_check(
+            &CheckMeta {
+                scope: "lockfile-graph".into(),
+                artifact_scope: "environment".into(),
+            },
+            &CheckSummary {
+                checked: 3,
+                direct: 3,
+                exempt: 0,
+                acknowledged: 0,
+                allowed: 0,
+                unknown_age: 0,
+                errors: 0,
+                violations: 0,
+                security_relevant: 2,
+                skipped_stale_projects: 0,
+            },
+            &[],
+            &[Diagnostic::new(
+                DiagnosticKind::AdvisorySourceUnavailable,
+                "advisory source `osv` is unavailable",
+            )],
+            &[],
+            &RenderOptions::default(),
+        );
+
+        let summary_line = out
+            .lines()
+            .find(|line| line.contains("checked 3"))
+            .expect("the summary line");
+        assert!(summary_line.ends_with("· 2 security-relevant"));
+        assert!(out.contains("advisory source `osv` is unavailable"));
     }
 
     #[test]
@@ -1491,6 +1627,7 @@ mod tests {
                 min_age_days: 7.0,
                 source: "default".into(),
                 clamped_by: None,
+                shortened_by: None,
             },
             candidate_age_days: Some(4.0),
             cooldown_version: Some("0.15.17".into()),
@@ -1503,6 +1640,7 @@ mod tests {
                 published_at: None,
                 age_days: None,
             }),
+            security: None,
             error: None,
         };
         let out = render_outdated(&summary, &[item], &[], &[], &RenderOptions::default());
@@ -1541,6 +1679,7 @@ mod tests {
                 min_age_days: 7.0,
                 source: "default".into(),
                 clamped_by: None,
+                shortened_by: None,
             },
             candidate_age_days: None,
             cooldown_version: None,
@@ -1553,6 +1692,7 @@ mod tests {
                 published_at: None,
                 age_days: Some(102.0),
             }),
+            security: None,
             error: None,
         };
         let out = render_outdated(&summary, &[item], &[], &[], &RenderOptions::default());
@@ -1575,6 +1715,7 @@ mod tests {
                 min_age_days: 7.0,
                 source: "default".into(),
                 clamped_by: None,
+                shortened_by: None,
             },
             candidate_age_days: Some(4.0),
             cooldown_version: None,
@@ -1583,6 +1724,7 @@ mod tests {
             blocked_by: None,
             held_by: None,
             latest: None,
+            security: None,
             error: None,
         }
     }
@@ -1596,6 +1738,201 @@ mod tests {
 
         item.held_by = Some(cooldown_core::HeldReason::MaxMajor(5).into());
         assert_eq!(outdated_status_cell(&item), "max-major 5");
+    }
+
+    /// A security-relevant row is annotated in place — on the outdated Status cell, in the
+    /// check Notes (plus "applied" when the security window replaced the ordinary one), and in
+    /// the check summary tally.
+    #[test]
+    fn security_relevant_rows_are_annotated_everywhere() {
+        let security = SecurityInfo {
+            version: "0.2.23".into(),
+            fixes: vec!["GHSA-wcg3-cvx6-7396".into(), "CVE-2020-26235".into()],
+            severity: "moderate".into(),
+            source: "osv".into(),
+            applied: false,
+        };
+
+        let mut item = project_outdated_item("time", ".");
+        item.status = OutdatedStatus::InCooldown;
+        item.security = Some(security.clone());
+        assert_eq!(
+            outdated_status_cell(&item),
+            "in cooldown ⚠ fixes GHSA-wcg3-cvx6-7396, CVE-2020-26235 (moderate)"
+        );
+
+        let mut check_item = CheckItem {
+            name: "time".into(),
+            tool: "cargo".into(),
+            project: ".".into(),
+            members: Vec::new(),
+            registry: None,
+            direct: true,
+            current: "0.2.23".into(),
+            published_at: None,
+            age_days: Some(0.5),
+            window: Window {
+                min_age_days: 1.0,
+                source: "default".into(),
+                clamped_by: None,
+                shortened_by: Some("GHSA-wcg3-cvx6-7396".into()),
+            },
+            status: CheckStatus::Allowed,
+            graph_held: false,
+            graph_floor: None,
+            security: Some(SecurityInfo {
+                applied: true,
+                ..security
+            }),
+            error: None,
+        };
+        assert!(check_notes_cell(&check_item).contains("security window applied"));
+        if let Some(security) = check_item.security.as_mut() {
+            security.applied = false;
+        }
+        assert!(!check_notes_cell(&check_item).contains("security window applied"));
+        assert!(check_notes_cell(&check_item).contains("⚠ fixes"));
+    }
+
+    /// An `upgrade` row explains its own security provenance: which advisories the adopted
+    /// target fixes, and whether the security window is what let it land before its ordinary
+    /// cooldown — otherwise a fast-tracked adoption is indistinguishable from a routine one.
+    #[test]
+    fn a_fast_tracked_upgrade_row_says_what_earned_it() {
+        let mut item = applied_item("time", "0.2.22", "0.2.23", false);
+        item.security = Some(SecurityInfo {
+            version: "0.2.23".into(),
+            fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
+            severity: "high".into(),
+            source: "osv".into(),
+            applied: true,
+        });
+        let reason = mutation_status(&item, true).reason;
+        assert_eq!(
+            reason,
+            "⚠ fixes GHSA-wcg3-cvx6-7396 (high); adopted on the security window"
+        );
+        assert!(render_upgrade_of(&[item.clone()]).contains("⚠ fixes GHSA-wcg3-cvx6-7396"));
+
+        // Merely annotated: the row still names the advisory, without claiming a fast-track.
+        if let Some(security) = item.security.as_mut() {
+            security.applied = false;
+        }
+        assert_eq!(
+            mutation_status(&item, true).reason,
+            "⚠ fixes GHSA-wcg3-cvx6-7396 (high)"
+        );
+
+        // A skip keeps its own reason and gains the annotation, rather than losing either.
+        let mut skipped = needs_major_item("time", "0.2.22", "1.0.0", UpdateKind::Major, ".");
+        skipped.security.clone_from(&item.security);
+        assert_eq!(
+            mutation_status(&skipped, true).reason,
+            "needs --major; ⚠ fixes GHSA-wcg3-cvx6-7396 (high)"
+        );
+    }
+
+    /// `SecurityInfo::applied` says the security window made the target *eligible*, not that the
+    /// mutation landed — so a row the graph gate rejected must not claim it was adopted.
+    #[test]
+    fn a_rejected_fast_track_says_eligible_not_adopted() {
+        let fast_tracked = SecurityInfo {
+            version: "0.2.23".into(),
+            fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
+            severity: "high".into(),
+            source: "osv".into(),
+            applied: true,
+        };
+
+        let mut skipped = applied_item("time", "0.2.22", "0.2.23", false);
+        skipped.applied = false;
+        skipped.skipped = Some(SkippedInfo {
+            reason: SkipReason::TransitiveInCooldown,
+            message: "would introduce a fresh transitive".into(),
+            offending: None,
+        });
+        skipped.security = Some(fast_tracked.clone());
+        let reason = mutation_status(&skipped, true).reason;
+        assert!(
+            reason.ends_with("; eligible on the security window"),
+            "{reason}"
+        );
+        assert!(!reason.contains("adopted"), "{reason}");
+
+        // The adopted wording is reserved for a row that actually landed.
+        let mut landed = applied_item("time", "0.2.22", "0.2.23", false);
+        landed.security = Some(fast_tracked);
+        assert!(
+            mutation_status(&landed, true)
+                .reason
+                .ends_with("; adopted on the security window")
+        );
+        // A `--dry-run` row carries the outcome the real run *would* have produced, and says so
+        // rather than claiming an adoption beside "lock untouched".
+        assert!(
+            mutation_status(&landed, false)
+                .reason
+                .ends_with("; would adopt on the security window")
+        );
+    }
+
+    /// A real run can end before the final lock verification (a failed edge normalization
+    /// terminates it after a batch already committed), leaving the lock status absent — a state
+    /// a dry run also reports.
+    /// The two must not read alike: `committed` comes from the explicit dry-run flag, so the
+    /// terminated run's landed rows still say adopted, and its lock line says "not verified"
+    /// rather than "untouched".
+    #[test]
+    fn a_terminated_real_run_does_not_read_as_a_dry_run() {
+        let mut item = applied_item("time", "0.2.22", "0.2.23", false);
+        item.security = Some(SecurityInfo {
+            version: "0.2.23".into(),
+            fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
+            severity: "high".into(),
+            source: "osv".into(),
+            applied: true,
+        });
+        let meta = |dry_run| UpgradeMeta {
+            applied: true,
+            dry_run,
+            lock_status: None,
+            build: BuildInfo {
+                requested: false,
+                ok: None,
+            },
+        };
+        let render = |dry_run| {
+            render_upgrade(
+                &meta(dry_run),
+                &UpgradeSummary {
+                    applied: 1,
+                    skipped: 0,
+                    errors: 0,
+                    edges_corrected: 0,
+                    edges_rebound: 0,
+                    edges_held: 0,
+                    edges_unaddressable: 0,
+                },
+                std::slice::from_ref(&item),
+                &[],
+                &[],
+                &RenderOptions::default(),
+            )
+        };
+
+        let terminated = render(false);
+        assert!(
+            terminated.contains("adopted on the security window"),
+            "the committed row must not turn conditional:\n{terminated}"
+        );
+        assert!(
+            terminated.contains("lock not verified"),
+            "a real run's absent lock status is unverified, not untouched:\n{terminated}"
+        );
+
+        let dry = render(true);
+        assert!(dry.contains("would adopt on the security window"), "{dry}");
+        assert!(dry.contains("dry-run (lock untouched)"), "{dry}");
     }
 
     fn two_adoptable_summary() -> OutdatedSummary {
@@ -1736,6 +2073,7 @@ mod tests {
             }),
             error: None,
             edge: None,
+            security: None,
         }
     }
 
@@ -1743,6 +2081,7 @@ mod tests {
         render_upgrade(
             &UpgradeMeta {
                 applied: false,
+                dry_run: false,
                 lock_status: None,
                 build: BuildInfo {
                     requested: false,
@@ -1781,6 +2120,7 @@ mod tests {
             skipped: None,
             error: None,
             edge: None,
+            security: None,
         }
     }
 
@@ -1847,6 +2187,7 @@ mod tests {
         let out = render_upgrade(
             &UpgradeMeta {
                 applied: false,
+                dry_run: false,
                 lock_status: None,
                 build: BuildInfo {
                     requested: false,
@@ -1928,6 +2269,7 @@ mod tests {
         let out = render_upgrade(
             &UpgradeMeta {
                 applied: false,
+                dry_run: false,
                 lock_status: None,
                 build: BuildInfo {
                     requested: false,
@@ -1971,6 +2313,7 @@ mod tests {
         let out = render_fix(
             &UpgradeMeta {
                 applied: false,
+                dry_run: false,
                 lock_status: Some(cooldown_core::LockStatus::Current),
                 build: BuildInfo {
                     requested: false,

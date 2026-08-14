@@ -95,11 +95,23 @@ pub(super) fn reject_offline_dry_run(
     Ok(())
 }
 
+/// Whether `fail-on-advisory-source` escalates for this command.
+///
+/// It is a `check` gate, but it lives in shared config — a `[global]` table sets it for every
+/// command — and the advisory fetch it escalates is shared too, so the scoping happens here.
+/// Only `check` certifies anything: promoting the same warning elsewhere would fail a command
+/// that already did its work (an `upgrade` that mutated successfully), or file a "fatal"
+/// diagnostic in one that exits zero regardless (`outdated`, `baseline`).
+fn advisory_source_gate(command_key: &str, configured: Option<bool>) -> bool {
+    command_key == "check" && configured.unwrap_or(false)
+}
+
 pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
     cfg: &CommandConfig,
     default_major: bool,
+    command_key: &str,
 ) -> Result<ResolvedInvocation, CoreError> {
     let explicit = explicit_command_config(global, overrides);
     let merged = builtin_command_config(default_major)
@@ -145,6 +157,10 @@ pub(super) fn resolve_invocation(
             all_artifacts: merged.all_artifacts.unwrap_or(false),
             allow_stale_lock: merged.allow_stale_lock.unwrap_or(false),
             fail_on_unknown_age: merged.fail_on_unknown_age.unwrap_or(false),
+            fail_on_advisory_source: advisory_source_gate(
+                command_key,
+                merged.fail_on_advisory_source,
+            ),
             // A CLI-only mutating convenience for read-only commands; intentionally not config-backed.
             lock: overrides.lock.unwrap_or(false),
             strict: merged.strict.unwrap_or(false),
@@ -173,7 +189,7 @@ pub(super) fn resolve_invocation(
         offline: merged.offline.unwrap_or(false),
         fresh: merged.fresh.unwrap_or(false),
         respect_gitignore: merged.gitignore.unwrap_or(true),
-        env_policy: env_window_fields(),
+        env_policy: env_window_fields()?,
         cli_policy: cli_window_fields(global),
         strict_native: strict_native_mode(overrides),
         edge_policy_override: overrides.edge_policy,
@@ -193,6 +209,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         all_artifacts: Some(false),
         allow_stale_lock: Some(false),
         fail_on_unknown_age: Some(false),
+        fail_on_advisory_source: Some(false),
         strict: Some(false),
         build: Some(false),
         transitive: Some(false),
@@ -224,6 +241,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         all_artifacts: overrides.all_artifacts,
         allow_stale_lock: overrides.allow_stale_lock,
         fail_on_unknown_age: overrides.fail_on_unknown_age,
+        fail_on_advisory_source: overrides.fail_on_advisory_source,
         strict: overrides.strict,
         build: overrides.build,
         transitive: overrides.transitive,
@@ -296,13 +314,41 @@ fn cli_window_fields(global: &GlobalArgs) -> WindowFields {
         latest: global.latest,
         freeze: global.freeze.clone(),
         allow: global.allow.clone(),
+        advisories: if global.advisories {
+            Some(true)
+        } else if global.no_advisories {
+            Some(false)
+        } else {
+            None
+        },
+        advisory_min_age: global.advisory_min_age.clone(),
+        advisory_severity: global.advisory_severity.clone(),
     }
 }
 
-fn env_window_fields() -> WindowFields {
+fn env_window_fields() -> Result<WindowFields, CoreError> {
     let var = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     let truthy = |key: &str| matches!(var(key).as_deref(), Some("1" | "true" | "yes" | "on"));
-    WindowFields {
+    // Unlike the presence-only truthy flags, `COOLDOWN_ADVISORIES=0` must *disable* the feed a
+    // config layer enabled, so an explicit falsy value maps to `Some(false)`, not `None`.
+    // A value that is neither is rejected rather than guessed: silently ignoring it leaves the
+    // feed in whatever state the config chose while the operator believes the variable took
+    // effect, and treating it as falsy would let a typo switch off a feed the org's config
+    // turned on.
+    // The other advisory tokens (`min-age`, `severity`) are validated the same way.
+    let advisories = match var("COOLDOWN_ADVISORIES") {
+        None => None,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            other => {
+                return Err(CoreError::Config(format!(
+                    "COOLDOWN_ADVISORIES: expected one of 1/true/yes/on or 0/false/no/off, got {other:?}"
+                )));
+            }
+        },
+    };
+    Ok(WindowFields {
         min_age: var("COOLDOWN_MIN_AGE"),
         min_age_major: var("COOLDOWN_MIN_AGE_MAJOR"),
         min_age_minor: var("COOLDOWN_MIN_AGE_MINOR"),
@@ -318,12 +364,15 @@ fn env_window_fields() -> WindowFields {
                     .collect()
             })
             .unwrap_or_default(),
-    }
+        advisories,
+        advisory_min_age: var("COOLDOWN_ADVISORY_MIN_AGE"),
+        advisory_severity: var("COOLDOWN_ADVISORY_SEVERITY"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_command_config, reject_offline_dry_run};
+    use super::{advisory_source_gate, builtin_command_config, reject_offline_dry_run};
     use cooldown_core::CoreError;
     use cooldown_core::config::CommandConfig;
 
@@ -370,5 +419,20 @@ mod tests {
         assert!(reject_offline_dry_run("upgrade", true, false).is_ok());
         assert!(reject_offline_dry_run("upgrade", false, true).is_ok());
         assert!(reject_offline_dry_run("fix", false, false).is_ok());
+    }
+
+    /// `fail-on-advisory-source` is a `check` gate even when a `[global]` table sets it: no other
+    /// command certifies, so none of them may turn an advisory warning into an error.
+    #[test]
+    fn the_advisory_source_gate_is_scoped_to_check() {
+        assert!(advisory_source_gate("check", Some(true)));
+        for command in ["outdated", "upgrade", "fix", "baseline", "sync", "explain"] {
+            assert!(
+                !advisory_source_gate(command, Some(true)),
+                "`{command}` must not escalate the advisory feed"
+            );
+        }
+        assert!(!advisory_source_gate("check", None));
+        assert!(!advisory_source_gate("check", Some(false)));
     }
 }

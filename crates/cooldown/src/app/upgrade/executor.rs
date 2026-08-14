@@ -9,7 +9,7 @@ use self::batch::{
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    candidate_scope, dep_resolve_ctx, effective_hold, fix_change, is_downgrade,
+    EffectiveHold, candidate_scope, dep_resolve_ctx, effective_hold, fix_change, is_downgrade,
     plan_baseline_violations, sort_planned_changes,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
@@ -17,6 +17,7 @@ use self::transitive_gate::{
     TransitiveGateVerdict, insert_graph_violation, newly_introduced_violations, package_label,
     violation_identity,
 };
+use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories};
 use crate::app::change_key::{ChangeTargetKey, change_target_key};
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
@@ -26,7 +27,8 @@ use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
     DiagnosticKind, FixVerdict, LockStatus, PackageId, Plan, ProjectMutationJournal,
     ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
-    UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
+    UpdateKind, Version, check_pin_advised, evaluate_advised, evaluate_ceiling_hold_advised,
+    evaluate_fix_advised,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -83,7 +85,113 @@ struct FixWarning {
 struct FixPlan {
     changes: Vec<Change>,
     warnings: Vec<FixWarning>,
+    /// Warnings about planned changes, keyed by the change each one describes.
+    ///
+    /// Handed to the batch apply, which attaches each note to the outcome only once its
+    /// change's landing is verified (the committed-batch seam) — published at plan time, a
+    /// note would survive a rejected apply or a restored batch and claim a rollback that
+    /// never happened.
+    /// They never mark the run incomplete: the change each one annotates did apply.
+    notes: Vec<(ChangeTargetKey, Diagnostic)>,
     errors: Vec<Diagnostic>,
+}
+
+/// The warning for a rollback that re-enters an advisory the current pin escapes — a security
+/// bump `fix` is about to undo because the bump is younger than even the security window.
+///
+/// A warning, not a hold: `fix` exists to make `check` pass and the feed is explicitly not a
+/// vulnerability gate, so the verdict is unchanged and the user decides (`baseline` the pin to
+/// keep it, or accept the rollback).
+/// Silence is the one thing that would be wrong.
+///
+/// The message matches the run's mood: a dry run *would* roll the pin back, a real run *is*
+/// rolling it back — and even then the caller holds the note until the rollback verifiably
+/// lands (see [`FixPlan`]'s `notes`).
+fn reintroduces_advisory_warning(
+    dep: &Dependency,
+    releases: &[Release],
+    target: &Version,
+    advisories: Option<&cooldown_core::AdvisoryContext<'_>>,
+    dry_run: bool,
+) -> Option<Diagnostic> {
+    let advisories = advisories?;
+    let release_of = |version: &Version| releases.iter().find(|rel| rel.version == *version);
+    let (current, target) = (release_of(&dep.current)?, release_of(target)?);
+    let reintroduced =
+        cooldown_core::advisories_reintroduced_by(advisories.advisories, current, target);
+    let ids: Vec<&str> = reintroduced
+        .iter()
+        .map(|advisory| advisory.id.as_str())
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    let rollback = if dry_run {
+        format!("would roll it back to {}, re-entering", target.version)
+    } else {
+        format!("rolling it back to {} re-enters", target.version)
+    };
+    Some(
+        Diagnostic::new(
+            DiagnosticKind::AdvisoryRollback,
+            format!(
+                "{}@{} is younger than its cooldown; {rollback} {} — `baseline` the current pin instead to keep the fix",
+                dep.package.name,
+                dep.current,
+                ids.join(", ")
+            ),
+        )
+        .with_package(&dep.package.name),
+    )
+}
+
+/// Why a too-fresh pin is left in place rather than downgraded, as the deferred warning `fix`
+/// surfaces once the fixpoint settles — or `None` when the downgrade may proceed.
+fn fix_hold_warning(
+    dep: &Dependency,
+    fix: &FixVerdict,
+    effective: &EffectiveHold,
+    transitive: TransitiveGate,
+    downgrade_pinned: bool,
+) -> Option<FixWarning> {
+    // `--transitive allow`: leave a too-fresh transitive in place (still reported), only
+    // downgrade direct deps.
+    // `hide` never reaches here — transitives aren't in scope.
+    let message = if transitive == TransitiveGate::Allow && !dep.direct {
+        format!(
+            "{}@{} is younger than its cooldown; left in place by --transitive allow",
+            dep.package.name, dep.current
+        )
+    } else if fix.current.graph_held {
+        match &effective.compliant_holder {
+            // Attribution names the genuine obstacle: a *compliant* requirer whose requirement
+            // demands the too-fresh version.
+            Some(holder) => format!(
+                "{}@{} is younger than its cooldown, but {} {} requires `{}`; baseline it or relax that dependency",
+                dep.package.name,
+                dep.current,
+                holder.requirer,
+                holder.requirer_version,
+                holder.requirement
+            ),
+            None => format!(
+                "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
+                dep.package.name, dep.current
+            ),
+        }
+    } else if dep.pinned && !downgrade_pinned {
+        // An exact pin is a deliberate choice: warn and leave it unless `--downgrade-pinned`.
+        format!(
+            "{}@{} is pinned and younger than its cooldown; downgrade it manually or rerun with --downgrade-pinned",
+            dep.package.name, dep.current
+        )
+    } else {
+        return None;
+    };
+    Some(FixWarning {
+        package: dep.package.name.clone(),
+        message,
+    })
 }
 
 struct MutationTerminated;
@@ -209,6 +317,25 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// chronological legs of one copy can only span batches (one report emits one row per copy),
     /// so two same-batch rows sharing a name are coexisting version lines that must not chain.
     batch_item_offsets: Vec<usize>,
+    /// The security provenance of planned targets, keyed like the landed/held bookkeeping.
+    ///
+    /// The report's rows are built from [`Change`]s, which carry no policy provenance, so the
+    /// advisory evidence that made a target adoptable is parked here rather than pushed into the
+    /// apply instruction.
+    security_by_target: HashMap<ChangeTargetKey, crate::app::SecurityInfo>,
+    /// Advisory-package identities a top-up tried and could not cover.
+    ///
+    /// A feed that just failed (or served data too stale to shorten) will fail the same way next
+    /// round, so retrying would re-query it and repeat its warning once per round.
+    top_up_declined: HashSet<String>,
+    /// The project's fetched advisories, set once before planning.
+    ///
+    /// Advising the planner AND the graph gate from the same data is load-bearing under the
+    /// shorten mode: a freshly-adopted security fix is itself a young pin, so an unadvised
+    /// residual gate would immediately roll back the very change the advised planner just made.
+    /// `Arc` so the per-round borrow of the planning loops is a refcount bump, not a deep copy
+    /// of the advisory map.
+    advisories: Option<std::sync::Arc<ProjectAdvisories>>,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -230,6 +357,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
             batch_item_offsets: Vec::new(),
+            security_by_target: HashMap::new(),
+            top_up_declined: HashSet::new(),
+            advisories: None,
         }
     }
 
@@ -268,6 +398,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(deps) = self.scoped_deps().await else {
             return ProjectRunStatus::Terminated;
         };
+        self.fetch_advisories(deps.iter().map(|dep| dep.package.name.clone()).collect())
+            .await;
         let verb = match self.mode {
             PlanMode::Upgrade { .. } => "upgrades",
             PlanMode::Fix { .. } => "downgrades",
@@ -381,6 +513,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &mut self,
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
+        advisories: Option<std::sync::Arc<ProjectAdvisories>>,
     ) {
         let guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
@@ -414,10 +547,115 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         ));
         self.manifest_only = manifest_only;
         sort_planned_changes(&mut changes);
+        // The caller's snapshot when it has one: the trial must judge from the same feed data
+        // that selected these targets, or it could hold a candidate on a newer snapshot's
+        // evidence.
+        match advisories {
+            Some(shared) => self.advisories = Some(shared),
+            None => {
+                self.fetch_advisories(
+                    changes
+                        .iter()
+                        .map(|change| change.package.name.clone())
+                        .collect(),
+                )
+                .await;
+            }
+        }
         let Some(mut state) = self.initial_trial_state().await else {
             return;
         };
         let _ = self.apply_upgrade_changes(changes, &mut state).await;
+    }
+
+    /// Fetches the project's advisories once, before planning, so the planner and every
+    /// subsequent graph gate judge from the same feed data.
+    ///
+    /// The fetch covers `packages` (the planning scope) joined with the raw, unscoped graph's
+    /// package names, because the residual gate judges the whole graph (see
+    /// [`graph_violations`](Self::graph_violations)) and a pin outside the fetch set would be
+    /// gated unadvised — rolling back the very security fix the advised planner adopted.
+    /// A package a later re-lock introduces is picked up by
+    /// [`top_up_advisories`](Self::top_up_advisories), which extends this snapshot without
+    /// disturbing it.
+    async fn fetch_advisories(&mut self, mut packages: Vec<String>) {
+        let policy = cooldown_core::resolve_advisory_policy(&self.ctx.pctx.policy.layers);
+        if !policy.enabled || policy.source == cooldown_core::AdvisorySourceKind::None {
+            // `fetch_project_advisories` would be inert; skip the graph read below too.
+            self.advisories = None;
+            return;
+        }
+        // Without a wired source there is nothing to query, but the fetch still runs: it reports
+        // that no feed implements the selected `source` rather than certifying silently.
+        if self.ws.advisory_source.is_some()
+            && let Ok(graph) = self
+                .ctx
+                .reader
+                .dependencies(&self.ctx.pctx.project, DepScope::Graph)
+                .await
+        {
+            packages.extend(graph.into_iter().map(|dep| dep.package.name));
+        }
+        let fetch = self
+            .ws
+            .fetch_project_advisories(
+                self.ctx.reader,
+                self.ctx.pctx,
+                &self.project_label,
+                &packages,
+                self.ctx.opts,
+            )
+            .await;
+        self.acc.warnings.extend(fetch.warnings);
+        self.acc.errors.extend(fetch.errors);
+        self.advisories = fetch.advisories.map(std::sync::Arc::new);
+    }
+
+    /// Extends the advisory snapshot to cover package identities it never queried — the ones a
+    /// re-lock introduced after the initial fetch.
+    ///
+    /// Without this a freshly resolved pin is judged *unadvised*: the residual gate reads its
+    /// young age as an ordinary cooldown violation, and reconciliation then rolls it back to the
+    /// newest matured release — which, when the new pin is itself the security fix, is the
+    /// vulnerable version it replaced.
+    ///
+    /// Already-queried identities are left exactly as they were, including the ones that came
+    /// back with no advisories.
+    /// Only *new* keys are added, so the planner's evidence for everything it has already
+    /// decided cannot shift underneath a later round — the hazard a wholesale re-fetch would
+    /// introduce.
+    async fn top_up_advisories(&mut self, deps: &[Dependency]) {
+        let Some(existing) = self.advisories.clone() else {
+            return;
+        };
+        let names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        let unqueried: Vec<String> = existing
+            .unqueried(self.ctx.reader, &names)
+            .into_iter()
+            .filter(|package| !self.top_up_declined.contains(package))
+            .collect();
+        if unqueried.is_empty() {
+            return;
+        }
+        let topped_up = self
+            .ws
+            .top_up_project_advisories(
+                self.ctx.reader,
+                self.ctx.pctx,
+                &self.project_label,
+                &existing,
+                &unqueried,
+                self.ctx.opts,
+            )
+            .await;
+        self.acc.warnings.extend(topped_up.warnings);
+        self.acc.errors.extend(topped_up.errors);
+        match topped_up.advisories {
+            Some(advisories) => self.advisories = Some(std::sync::Arc::new(advisories)),
+            // Asking again every round would re-query a feed that just failed and repeat its
+            // warning per round; one report of it is the honest amount.
+            None => self.top_up_declined.extend(unqueried),
+        }
     }
 
     async fn initial_trial_state(&mut self) -> Option<TrialState> {
@@ -726,7 +964,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
         let lock_outcome = self
-            .apply_batch_with_rollback(changes, state, Some(rollback))
+            .apply_batch_with_rollback(changes, state, Some(rollback), HashMap::new())
             .await;
         // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated
         // up, and a broken re-lock probe must not be re-hit.
@@ -977,6 +1215,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.fanout(),
             )
             .await;
+        let advisories = self.advisories.clone();
         let mut planned = Vec::new();
         for FetchedRelease {
             dependency: dep,
@@ -990,17 +1229,28 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     continue;
                 }
             };
-            let verdict = evaluate(
+            let advised = advisories
+                .as_ref()
+                .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
+            let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+            let verdict = evaluate_advised(
                 &dep,
                 &releases,
+                advisory_ctx.as_ref(),
                 &self.ctx.pctx.policy.layers,
                 &dep_resolve_ctx(&rctx, &dep),
                 self.ws.now(),
             );
-            self.record_held_back_ceiling(&dep, &releases, &rctx);
+            self.record_held_back_ceiling(&dep, &releases, advisory_ctx.as_ref(), &rctx);
             // Surface an adoptable cross-major update the user could take with `--major` (it would
             // otherwise vanish from a default run even though `outdated` lists it).
-            self.record_held_back_major(&dep, &releases, &rctx, verdict.adoptable_target.as_ref());
+            self.record_held_back_major(
+                &dep,
+                &releases,
+                advisory_ctx.as_ref(),
+                &rctx,
+                verdict.adoptable_target.as_ref(),
+            );
             // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
             // version a human could manually pin to — but `upgrade` must never move it on its own.
             if verdict.status == cooldown_core::Status::Held {
@@ -1012,18 +1262,21 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             if target == dep.current {
                 continue;
             }
-            let kind = verdict
+            let chosen = verdict
                 .candidates
                 .iter()
-                .find(|candidate| candidate.version == target)
-                .map_or(cooldown_core::UpdateKind::Minor, |candidate| candidate.kind);
+                .find(|candidate| candidate.version == target);
+            let kind = chosen.map_or(cooldown_core::UpdateKind::Minor, |candidate| candidate.kind);
+            let security = chosen
+                .and_then(|candidate| candidate.security.as_ref())
+                .map(|relevance| crate::app::workspace::security_info(relevance, &target));
             let package = target_package_for(&releases, &dep, &target);
             // Whether this move is a rollback. The forward planner only adopts a strictly newer
             // matured version (`evaluate` filters to `order > current`), so this is currently always
             // false — a too-fresh pin is rolled back by the fix/reconcile pass instead, which flags it
             // directly. Computed rather than hardcoded so the label stays correct if that ever changes.
             let downgrade = is_downgrade(&releases, &dep.current, &target);
-            planned.push(Change {
+            let change = Change {
                 package,
                 from: dep.current.clone(),
                 to: target,
@@ -1031,7 +1284,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 downgrade,
                 direct: dep.direct,
                 members: dep.members.clone(),
-            });
+            };
+            // The advisory evidence lives on the verdict, but the report is built from the
+            // `Change` — an apply instruction that deliberately carries no policy provenance —
+            // so keep it beside the plan, keyed by the same identity the applied/held
+            // bookkeeping uses.
+            if let Some(security) = security {
+                self.security_by_target
+                    .insert(change_target_key(&change), security);
+            }
+            planned.push(change);
         }
         sort_planned_changes(&mut planned);
         planned
@@ -1046,15 +1308,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &mut self,
         dep: &Dependency,
         releases: &[Release],
+        advisory: Option<&cooldown_core::AdvisoryContext<'_>>,
         rctx: &ResolveContext<'_>,
     ) {
         let probe_ctx = ResolveContext {
             allow_major: dep.direct,
             ..dep_resolve_ctx(rctx, dep)
         };
-        let Some(hold) = evaluate_ceiling_hold(
+        // Advised like the planner: a security fix matured only under the shortened window must
+        // still surface as a ceiling hold while the ceiling hides it.
+        let Some(hold) = evaluate_ceiling_hold_advised(
             dep,
             releases,
+            advisory,
             &self.ctx.pctx.policy.layers,
             &probe_ctx,
             self.ws.now(),
@@ -1093,6 +1359,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &mut self,
         dep: &Dependency,
         releases: &[Release],
+        advisory: Option<&cooldown_core::AdvisoryContext<'_>>,
         rctx: &ResolveContext,
         scoped_target: Option<&Version>,
     ) {
@@ -1103,9 +1370,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             allow_major: true,
             ..*rctx
         };
-        let major = evaluate(
+        let major = evaluate_advised(
             dep,
             releases,
+            advisory,
             &self.ctx.pctx.policy.layers,
             &major_rctx,
             self.ws.now(),
@@ -1153,15 +1421,21 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// A violation with no matured target stays in the set: whether it can move is for the
     /// resolver to decide (the `icu_locale_fallback` shape — a fresh-era-only crate that simply
     /// drops out once its family moves — depends on discounting it).
-    async fn evaluate_fix_candidates(
+    async fn evaluate_fix_candidates<'p>(
         &mut self,
         deps: &[Dependency],
         transitive: TransitiveGate,
         downgrade_pinned: bool,
         rctx: &ResolveContext<'_>,
+        advisories: Option<&'p ProjectAdvisories>,
         errors: &mut Vec<Diagnostic>,
     ) -> (
-        Vec<(Dependency, Vec<Release>, FixVerdict)>,
+        Vec<(
+            Dependency,
+            Vec<Release>,
+            FixVerdict,
+            Option<ClassifiedAdvisories<'p>>,
+        )>,
         HashSet<(String, String)>,
     ) {
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
@@ -1190,9 +1464,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     continue;
                 }
             };
-            let fix = evaluate_fix(
+            let advised =
+                advisories.and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
+            let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+            let fix = evaluate_fix_advised(
                 &dep,
                 &releases,
+                advisory_ctx.as_ref(),
                 &self.ctx.pctx.policy.layers,
                 &dep_resolve_ctx(rctx, &dep),
                 self.ws.now(),
@@ -1204,7 +1482,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             if fix.current.status == Status::CurrentInCooldown && movable {
                 violations.insert((dep.package.name.clone(), dep.current.as_str().to_string()));
             }
-            evaluated.push((dep, releases, fix));
+            evaluated.push((dep, releases, fix, advised));
         }
         (evaluated, violations)
     }
@@ -1225,38 +1503,38 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             deps.len()
         ));
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let advisories = self.advisories.clone();
         let mut planned = Vec::new();
         let mut warnings = Vec::new();
+        let mut notes = Vec::new();
         let mut errors = Vec::new();
         let (evaluated, violations) = self
-            .evaluate_fix_candidates(deps, transitive, downgrade_pinned, &rctx, &mut errors)
+            .evaluate_fix_candidates(
+                deps,
+                transitive,
+                downgrade_pinned,
+                &rctx,
+                advisories.as_deref(),
+                &mut errors,
+            )
             .await;
-        for (dep, releases, fix) in evaluated {
+        for (dep, releases, fix, advised) in evaluated {
             // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
             // alone, so `fix` only ever touches what `check` would reject.
             if fix.current.status != Status::CurrentInCooldown {
                 continue;
             }
-            // `--transitive allow`: leave a too-fresh transitive in place (still reported), only
-            // downgrade direct deps. `hide` never reaches here — transitives aren't in scope.
-            if transitive == TransitiveGate::Allow && !dep.direct {
-                warnings.push(FixWarning {
-                    package: dep.package.name.clone(),
-                    message: format!(
-                        "{}@{} is younger than its cooldown; left in place by --transitive allow",
-                        dep.package.name, dep.current
-                    ),
-                });
-                continue;
-            }
+            let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
             // Pass two: re-judge the violation with circular holds discounted, so a family of
             // too-fresh versions holding each other in place is planned as a whole instead of
-            // being reported graph-held member by member.
+            // being reported graph-held member by member. The advisory context rides along, so a
+            // discounted re-judge keeps any advisory-shortened window the first pass applied.
             let effective = effective_hold(&dep, &releases, &violations);
             let fix = if effective.discounted {
-                evaluate_fix(
+                evaluate_fix_advised(
                     &effective.dep,
                     &releases,
+                    advisory_ctx.as_ref(),
                     &self.ctx.pctx.policy.layers,
                     &dep_resolve_ctx(&rctx, &dep),
                     self.ws.now(),
@@ -1264,38 +1542,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             } else {
                 fix
             };
-            if fix.current.graph_held {
-                let message = match &effective.compliant_holder {
-                    // Attribution names the genuine obstacle: a *compliant* requirer whose
-                    // requirement demands the too-fresh version.
-                    Some(holder) => format!(
-                        "{}@{} is younger than its cooldown, but {} {} requires `{}`; baseline it or relax that dependency",
-                        dep.package.name,
-                        dep.current,
-                        holder.requirer,
-                        holder.requirer_version,
-                        holder.requirement
-                    ),
-                    None => format!(
-                        "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
-                        dep.package.name, dep.current
-                    ),
-                };
-                warnings.push(FixWarning {
-                    package: dep.package.name.clone(),
-                    message,
-                });
-                continue;
-            }
-            // An exact pin is a deliberate choice: warn and leave it unless `--downgrade-pinned`.
-            if dep.pinned && !downgrade_pinned {
-                warnings.push(FixWarning {
-                    package: dep.package.name.clone(),
-                    message: format!(
-                        "{}@{} is pinned and younger than its cooldown; downgrade it manually or rerun with --downgrade-pinned",
-                        dep.package.name, dep.current
-                    ),
-                });
+            if let Some(warning) =
+                fix_hold_warning(&dep, &fix, &effective, transitive, downgrade_pinned)
+            {
+                warnings.push(warning);
                 continue;
             }
             let Some(target) = fix.target else {
@@ -1313,12 +1563,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|release| release.version == target)
                 .and_then(|release| release.kind_from_current)
                 .unwrap_or(UpdateKind::Minor);
-            planned.push(fix_change(&releases, &dep, target, kind));
+            let change = fix_change(&releases, &dep, target, kind);
+            if let Some(note) = reintroduces_advisory_warning(
+                &dep,
+                &releases,
+                &change.to,
+                advisory_ctx.as_ref(),
+                self.ctx.opts.dry_run,
+            ) {
+                notes.push((
+                    change_target_key(&change),
+                    note.with_tool(self.ctx.tool_name())
+                        .with_project(self.project_label.clone()),
+                ));
+            }
+            planned.push(change);
         }
         sort_planned_changes(&mut planned);
         FixPlan {
             changes: planned,
             warnings,
+            notes,
             errors,
         }
     }
@@ -1359,6 +1624,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let FixPlan {
                 changes,
                 warnings,
+                notes,
                 errors,
             } = self
                 .plan_fix_changes(&deps, transitive, downgrade_pinned)
@@ -1373,7 +1639,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .progress
                 .candidates(&changes, "checking cooldown fixes");
             let decided = changes.clone();
-            let outcome = self.apply_batch(changes, state).await;
+            let outcome = self
+                .apply_batch_with_rollback(changes, state, None, notes.into_iter().collect())
+                .await;
             self.ctx.opts.progress.candidates_decided(&decided);
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
@@ -1399,6 +1667,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let FixPlan {
             changes,
             mut warnings,
+            // This pass deliberately applies nothing, and a note may only publish once its
+            // change's landing is verified — see `FixPlan::notes`.
+            notes: _,
             errors,
         } = self
             .plan_fix_changes(&deps, transitive, downgrade_pinned)
@@ -1455,6 +1726,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let FixPlan {
                 changes,
                 warnings,
+                notes,
                 errors,
             } = self
                 .plan_fix_changes(&deps, TransitiveGate::Enforce, false)
@@ -1471,7 +1743,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return outcomes;
             }
             let outcome = self
-                .apply_batch_with_rollback(changes, state, Some(rollback))
+                .apply_batch_with_rollback(
+                    changes,
+                    state,
+                    Some(rollback),
+                    notes.into_iter().collect(),
+                )
                 .await;
             let applied = outcome.applied_count();
             Self::advance_trial_state(&outcome, state);
@@ -1516,14 +1793,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// restore and partition a policy-rejected multi-change trial, but this method's outcome remains
     /// invisible to the report until the caller keeps and merges it.
     async fn apply_batch(&mut self, changes: Vec<Change>, state: &TrialState) -> BatchOutcome {
-        self.apply_batch_with_rollback(changes, state, None).await
+        self.apply_batch_with_rollback(changes, state, None, HashMap::new())
+            .await
     }
 
+    /// `notes` carries the advisory-rollback warnings parked for this batch's changes, keyed by
+    /// the change each one describes; a note whose change never verifiably lands is dropped
+    /// with the batch, so a rejected apply or a restored batch cannot publish a claim about a
+    /// mutation that never happened.
     async fn apply_batch_with_rollback(
         &mut self,
         changes: Vec<Change>,
         state: &TrialState,
         mut rollback: Option<&mut TrialRollback>,
+        notes: HashMap<ChangeTargetKey, Diagnostic>,
     ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
@@ -1625,7 +1908,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         };
 
-        self.commit_batch_report(&mut outcome, &changes, report, committed);
+        self.commit_batch_report(&mut outcome, &changes, report, committed, notes);
         if let Some(rollback) = rollback
             && let Err(error) = rollback.accept(expected)
         {
@@ -1682,7 +1965,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn verify_batch_graph(
-        &self,
+        &mut self,
         outcome: &mut BatchOutcome,
         changes: &[Change],
         applied: &HashSet<ChangeTargetKey>,
@@ -1728,6 +2011,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         report: VerifiedBatchReport,
         committed: CommittedBatch,
+        mut notes: HashMap<ChangeTargetKey, Diagnostic>,
     ) {
         let VerifiedBatchReport {
             applied,
@@ -1744,7 +2028,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .with_project(self.project_label.clone())
         }));
         for change in changes {
-            if applied.contains(&change_target_key(change)) {
+            let key = change_target_key(change);
+            if applied.contains(&key) {
+                // This is the first point that knows the change verifiably landed, so it is
+                // where a parked advisory-rollback note may finally surface.
+                if let Some(note) = notes.remove(&key) {
+                    outcome.warnings.push(note);
+                }
                 outcome.items.push(self.change_applied_item(change));
             }
         }
@@ -2081,7 +2371,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// can try to roll it back without violating known lower bounds. `upgrade` uses this same set for
     /// the final residual check, but it no longer relies on the boolean prediction before attempting
     /// reconciliation.
-    async fn graph_violations(&self) -> cooldown_core::Result<HashMap<BaselineViolation, bool>> {
+    async fn graph_violations(
+        &mut self,
+    ) -> cooldown_core::Result<HashMap<BaselineViolation, bool>> {
         // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
         // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
         // must not narrow it. Only pin ages are read here — never `members` — so nothing leaks.
@@ -2090,6 +2382,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .reader
             .dependencies(&self.ctx.pctx.project, DepScope::Graph)
             .await?;
+        // The gate is the first pass to see a re-locked graph, and the reconcile planner that
+        // follows reads the same snapshot, so covering the new pins here covers both.
+        self.top_up_advisories(&deps).await;
         let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
@@ -2110,9 +2405,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         } in fetched
         {
             let locked = result?;
-            let pin = check_pin(
+            // Advised with the same feed data the planner used: under the shorten mode a
+            // freshly adopted security fix is itself a young pin, and an unadvised gate here
+            // would count it as a new violation and roll back the very change the planner just
+            // made.
+            let advised = self.advisories.as_ref().and_then(|project| {
+                project.classify(self.ctx.reader, &dep, std::slice::from_ref(&locked))
+            });
+            let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+            let pin = check_pin_advised(
                 &dep,
                 &locked,
+                advisory_ctx.as_ref(),
                 &self.ctx.pctx.policy.layers,
                 &rctx,
                 self.ws.now(),
@@ -2189,36 +2493,40 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    fn change_applied_item(&self, change: &Change) -> UpgradeItem {
-        plan_item(
-            change,
-            &self.project_label,
-            self.ctx.tool_name(),
-            true,
-            None,
-        )
-    }
-
-    fn change_error_item(&self, change: &Change, diag: Diagnostic) -> UpgradeItem {
+    /// One report row for `change`, carrying the security provenance the planner recorded for
+    /// that exact target.
+    fn change_item(
+        &self,
+        change: &Change,
+        applied: bool,
+        skipped: Option<SkippedInfo>,
+    ) -> UpgradeItem {
         let mut item = plan_item(
             change,
             &self.project_label,
             self.ctx.tool_name(),
-            false,
-            None,
+            applied,
+            skipped,
         );
+        item.security = self
+            .security_by_target
+            .get(&change_target_key(change))
+            .cloned();
+        item
+    }
+
+    fn change_applied_item(&self, change: &Change) -> UpgradeItem {
+        self.change_item(change, true, None)
+    }
+
+    fn change_error_item(&self, change: &Change, diag: Diagnostic) -> UpgradeItem {
+        let mut item = self.change_item(change, false, None);
         item.error = Some(diag);
         item
     }
 
     fn change_skip_item(&self, change: &Change, skipped: Option<SkippedInfo>) -> UpgradeItem {
-        plan_item(
-            change,
-            &self.project_label,
-            self.ctx.tool_name(),
-            false,
-            skipped,
-        )
+        self.change_item(change, false, skipped)
     }
 
     /// The report row for one lock-edge rebind: the package column names the dependency whose
@@ -2262,6 +2570,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     .as_deref()
                     .map(cooldown_core::redact::url_secrets),
             }),
+            security: None,
         }
     }
 

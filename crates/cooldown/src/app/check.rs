@@ -2,6 +2,7 @@
 //! attributable to a dependency you couldn't evaluate forces a non-zero exit. Evaluates the
 //! resolved graph (direct + transitive) by default.
 
+use super::advisories::{ClassifiedAdvisories, ProjectAdvisories};
 use super::lock::ProjectAccessWriteGuard;
 use super::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
@@ -10,7 +11,7 @@ use super::{
 };
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, Origin, Resolution,
-    ResolveKind, ResolveQuery, Status, check_pin, resolve,
+    ResolveKind, ResolveQuery, Status, check_pin_advised, resolve,
 };
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
@@ -63,6 +64,8 @@ struct CheckAccum {
     allowed: usize,
     unknown_age: usize,
     violations: usize,
+    /// How many evaluated pins are security-relevant (the locked version is an advisory's fix).
+    security_relevant: usize,
     /// Set when a stricter-native override tripped under `strict-native`.
     stricter_native_tripped: bool,
     items: Vec<CheckItem>,
@@ -151,6 +154,7 @@ impl<'a> CheckRunner<'a> {
             unknown_age: self.acc.unknown_age,
             errors: err_count,
             violations: self.acc.violations,
+            security_relevant: self.acc.security_relevant,
         };
         let meta = CheckMeta {
             scope: if self.scope == DepScope::Graph {
@@ -235,6 +239,20 @@ impl<'a> CheckRunner<'a> {
         drop(read_guard);
         drop(refresh_guard);
 
+        let dep_names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        let advisory_fetch = self
+            .ws
+            .fetch_project_advisories(
+                read.adapter,
+                pctx,
+                &read.project_label,
+                &dep_names,
+                self.opts,
+            )
+            .await;
+        self.acc.warnings.extend(advisory_fetch.warnings);
+        self.acc.errors.extend(advisory_fetch.errors);
+
         self.opts
             .progress
             .phase(format!("checking {} resolved dependencies", deps.len()));
@@ -253,7 +271,13 @@ impl<'a> CheckRunner<'a> {
             result,
         } in fetched
         {
-            self.gate_pin(pctx, &read.project_label, &dep, result, &read.resolve);
+            self.gate_pin(
+                pctx,
+                &read,
+                advisory_fetch.advisories.as_ref(),
+                &dep,
+                result,
+            );
         }
     }
 
@@ -360,11 +384,12 @@ impl<'a> CheckRunner<'a> {
     fn gate_pin(
         &mut self,
         pctx: &super::ProjectCtx,
-        project_label: &str,
+        read: &super::read::ReadProjectCtx<'_>,
+        advisories: Option<&ProjectAdvisories>,
         dep: &Dependency,
         result: cooldown_core::Result<cooldown_core::Release>,
-        rctx: &cooldown_core::ResolveContext<'_>,
     ) {
+        let project_label = read.project_label.as_str();
         self.acc.checked += 1;
         if dep.direct {
             self.acc.direct += 1;
@@ -390,7 +415,22 @@ impl<'a> CheckRunner<'a> {
             );
         }
 
-        let pv = check_pin(dep, &locked, &pctx.policy.layers, rctx, self.ws.now());
+        // Classify against the locked release alone: the pin-side advisory test is the exact
+        // "is this version a fix?" match, which needs no candidate ordering.
+        let advised = advisories
+            .and_then(|project| project.classify(read.adapter, dep, std::slice::from_ref(&locked)));
+        let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+        let pv = check_pin_advised(
+            dep,
+            &locked,
+            advisory_ctx.as_ref(),
+            &pctx.policy.layers,
+            &read.resolve,
+            self.ws.now(),
+        );
+        if pv.security.is_some() {
+            self.acc.security_relevant += 1;
+        }
         if let Some(diag) = self.stricter_native_warning(pctx, project_label, dep) {
             self.acc.warnings.push(diag);
             if pctx.policy.strict_native {
@@ -448,6 +488,10 @@ impl<'a> CheckRunner<'a> {
             status,
             graph_held: pv.graph_held,
             graph_floor: pv.graph_floor.map(|v| v.to_string()),
+            security: pv
+                .security
+                .as_ref()
+                .map(|security| super::security_info(security, &dep.current)),
             error: None,
         });
     }
@@ -522,10 +566,12 @@ fn error_item(dep: &Dependency, project: &str, tool: &str, diag: Diagnostic) -> 
             min_age_days: 0.0,
             source: "n/a".into(),
             clamped_by: None,
+            shortened_by: None,
         },
         status: CheckStatus::Error,
         graph_held: false,
         graph_floor: None,
+        security: None,
         error: Some(diag),
     }
 }
