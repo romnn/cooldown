@@ -11,7 +11,7 @@ weight: 8
 
 The target is the **smash-and-grab window**: a malicious version is published to a registry and is detected and yanked within hours to a few days. A cooldown delays *adoption* until that window has passed, so the community's tooling and reports run before the code reaches your builds.
 
-It is **not a malware scanner** — it never inspects code — and it does not replace the tools that do a different job. It pairs with `govulncheck`, `cargo audit`, and advisory feeds, which catch known vulnerabilities and published advisories rather than not-yet-known malicious releases.
+It is **not a malware scanner** — it never inspects code — and it does not replace the tools that do a different job. It pairs with `govulncheck`, `cargo audit`, and advisory feeds, which catch known vulnerabilities and published advisories rather than not-yet-known malicious releases. The optional [advisory feed]({{< relref "configuration/advisories.md" >}}) closes the seam between the two: it flags (or fast-tracks) versions that fix a published advisory, but it never turns `check` into a vulnerability gate — a vulnerable pin is those tools' finding, not a cooldown violation.
 
 ## The risk surface is the resolved graph
 
@@ -60,12 +60,15 @@ This closes the obvious bypass — an attacker backdating a release so it appear
 
 Two flags control how the cache is used at the boundary: `--offline` turns every cache miss into `unknown-age` (never a false "ok"), and `--fresh` ignores the cache entirely and re-fetches — the right choice for a CI gate that must not pass on stale data.
 
+The [advisory feed]({{< relref "configuration/advisories.md" >}}) inverts the rule, because it is a *loosening* input where publish times are a tightening one: stale cached advisory data may still annotate a row, but it never shortens a window — the shorten mode degrades to annotate-only, with a warning. An unreachable feed likewise fails open (the ordinary, stricter window stands) where a registry outage fails closed.
+
 ## Escape hatches are explicit and audited
 
 Loosening the policy is always deliberate and always visible:
 
 - Exemptions (`--latest`, `--allow`, config `allow`) are audited — every one shows up in [`cooldown explain`]({{< relref "commands/other.md" >}}).
 - A [`floor`]({{< relref "configuration/precedence.md" >}}) bounds config-level loosening: it is max-clamped across layers, so a more specific block can't quietly weaken it, and an `allow` can only bypass it when co-declared with it (or via an audited CLI flag).
+- The [advisory security window]({{< relref "configuration/advisories.md" >}}) is bounded the same way: a `floor` clamps it unless `bypass-floor` is declared in the floor's own layer, so the worst a poisoned feed can do is drop a window to the floor.
 
 There is no silent path to "adopt anything" — every one leaves a trail.
 

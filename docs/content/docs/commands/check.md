@@ -44,6 +44,16 @@ For a too-fresh transitive you can't act on (a graph-held pin, or one you'd rath
 | `--lock` | Refresh lockfiles before checking (mutates lockfiles; ignored under `--dry-run`). |
 | `--fail-on-stricter-native` | Fail when repo policy overrides a *stricter* native cooldown value. |
 | `--no-fail-on-stricter-native` | Turn off a config-set `strict-native` (the only way to disable it on the CLI). |
+| `--fail-on-advisory-source` | Fail (exit `4`) when the enabled [advisory feed]({{< relref "../configuration/advisories.md" >}}) yields no usable evidence — unreachable, unimplemented, or too stale to shorten — instead of warning. An uncovered ecosystem stays a warning. |
+
+## Security-relevant pins
+
+With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enabled, a locked version
+that is itself an advisory's fix version is counted in the summary (`… · 1 security-relevant`) and
+carries a `security` object in `--json`. Under the feed's `shorten` mode such a pin resolves
+against the shorter security window, so merging a security bot's bump stops failing the next gate
+run. `check` never *fails* because a pin is vulnerable — that job stays with `govulncheck` /
+`cargo audit`, so exit `1` keeps exactly one meaning.
 
 ## Handling a red gate
 

@@ -75,8 +75,8 @@ Conclusion: the unified _local CLI_ niche is open.
   the app applies changes **one at a time** (single-change plans), checks the resulting graph, and
   on a fresh transitive **restores the lockfile snapshot** and skips that direct change as
   `SkipReason::TransitiveInCooldown` — never writing a violating lock (see § upgrade).
-- Every ecosystem on day one — MVP is Go + the policy core; Rust, Python, Node, and
-  `sync`/advisory-bypass come after (§ Phasing).
+- Every ecosystem on day one — MVP is Go + the policy core; Rust, Python, Node, `sync`, and the
+  advisory feed come after (§ Phasing).
 
 ## CLI design
 
@@ -459,8 +459,9 @@ cooldown upgrade --package golang.org/x/crypto --latest   # audited, one-off
 
 or a reviewed config exception
 (`[package."golang.org/x/crypto"] min-age = "0d"  # CVE-2026-xxxx; PR #123`). `check` evaluates the
-_currently pinned_ version's freshness against the bare scope `min-age`. (Automatic advisory-driven
-bypass is a later phase — § Later work.)
+_currently pinned_ version's freshness against the bare scope `min-age`. (An advisory feed turns this
+manual dance into a flagged row — and optionally a shorter window — instead of a silent hold; see
+§ Advisory feed.)
 
 ### 7. CI stricter than local; a sandbox opts out
 
@@ -943,17 +944,228 @@ need classification.
 - **Escape hatches are explicit and audited** (`--latest`/`--allow`/config `allow`, all in
   `explain`); a floor bounds config-level loosening to its layer or above.
 - **Reproducibility** via `freeze`/`exclude-newer-span`; org policy via the global layer.
+- **Security-relevant signal** (§ Advisory feed): age alone cannot tell a routine bump from a patch
+  for a known CVE, so an advisory feed supplies that one missing input.
+
+## Advisory feed (security-relevant signal)
+
+**The problem.** A cooldown and a security bot disagree by construction, in both directions.
+Dependabot opens a PR for `GHSA-…`, you merge the fix, and `cooldown check` fails the very next
+build — the pin it just gained is two days old, so the gate punishes prompt patching. Run the other
+way, `outdated` prints `x/crypto 0.31.0 → 0.33.0  in cooldown (matures in 12d)` and says nothing
+about the fact that those twelve days are spent sitting on a known-exploitable version: a **silent
+hold**. Both are the same missing input — cooldown knows how _old_ a version is and nothing about
+whether it is _security-relevant_.
+
+Feeding it advisories (OSV, GitHub Advisory Database) closes both gaps, and it is the one piece that
+makes `cooldown` and Dependabot genuinely **agree** rather than merely overlap: they start keying
+off the same advisory ids instead of each applying its own unrelated notion of "should this move".
+
+### What it does — and deliberately does not
+
+- **Annotates.** A candidate that fixes an advisory affecting the current pin renders as a flagged
+  row naming it, in the TTY and in `--json`. This is the floor of the feature and the default.
+- **Optionally shortens.** A separate, configurable **security window** replaces the ordinary one
+  for such a candidate — `min`-clamped, so it can only ever shorten, never extend.
+- **Stops punishing the fix.** `check` resolves the _pin's_ window against the security window when
+  the locked version is itself an advisory's fix version, so merging a security bump does not fail
+  the next gate run.
+- **Does not become a scanner.** `check` never fails because a pin is _vulnerable_ — that is
+  `govulncheck` / `cargo audit` / Dependabot's job, and duplicating it would make exit 1 ambiguous
+  ("too fresh" vs "vulnerable" are different remediations). The feed only annotates or shortens.
+- **Does not silently auto-bypass.** The default is `mode = "flag"`: verdicts unchanged, rows
+  labeled. Shortening is opt-in, per repo or org, and shows up in `explain` like any other rule.
+- **Does not do reachability.** Whether the vulnerable symbol is actually called is `govulncheck`'s
+  strength and stays there; cooldown consumes advisory _metadata_ only.
+
+### Configuration
+
+```toml
+[advisories]
+enabled  = true       # opt-in — off unless set: a new network dependency and a new thing to trust
+source   = "osv"      # "osv" (default) | "github" | "none"
+mode     = "flag"     # "flag" (annotate only, default) | "shorten" (also apply min-age below)
+min-age  = "1d"       # the SECURITY window — used only under mode = "shorten"
+severity = "high"     # minimum normalized severity that earns it: low|moderate|high|critical
+bypass-floor = false  # may the security window undercut a `floor`? (see resolution)
+```
+
+CLI/env mirror the policy keys as usual (`--advisories`/`--no-advisories`, `--advisory-min-age` —
+which also selects the shorten mode at its layer, since declaring a security window on the command
+line means you want it applied — `--advisory-severity`, `COOLDOWN_ADVISORIES=0`, …), plus a
+`check`-scoped `--fail-on-advisory-source` for a CI gate that refuses to certify without the feed.
+`source = "github"` parses for forward compatibility, but until the GitHub client exists (§ Later
+work) no wired source implements it, so an enabled policy naming it takes the same fail-open path
+as an unreachable feed: a warning, escalated to exit `4` under `--fail-on-advisory-source`.
+
+> **Resolution — per field, in the same idiom as § Precedence & resolution:**
+>
+> - **`advisories.min-age` — authority-first, then min-clamp.** Selected exactly like any other
+>   `min-age` (highest layer wins; most specific selector breaks the tie within a layer), then
+>   applied as `min(security_window, ordinary_window)`. It is a _shortening_ mechanism only; a
+>   security window longer than the ordinary one is a no-op plus a config warning, because holding a
+>   fix _longer_ than a routine bump is never what anyone meant.
+> - **`floor` still wins by default.** The security window clamps up to the largest surviving
+>   `floor` like every other window. `bypass-floor = true` lifts a floor, and — following exactly
+>   the same rule as `allow`, resolved **per floor candidate by exact layer** — is honored only
+>   against a floor declared in that same layer, so a repo cannot use a CVE as a lever against an
+>   org floor and lifting one layer's floor never erases another layer's. A CLI `--latest` remains
+>   the always-honored, always-audited override.
+> - **`mode` — monotone toward `flag`.** Only _explicitly set_ values combine: the built-in default
+>   is `flag` but does not participate, or no layer could ever enable `shorten`. `flag` is the safe
+>   direction — it changes no verdict — so if any layer sets it, flagging wins. A repo can therefore
+>   always decline an org's fast-track but never impose one, the same shape as `strict-native`.
+> - **`severity` — max across layers.** Thresholds only ratchet up. `Unknown` severity never meets a
+>   threshold, so an advisory with no rating annotates but never shortens.
+> - **`enabled`** follows ordinary authority-first precedence; `source = "none"` is the explicit
+>   spelling for "annotate nothing", distinct from an unreachable feed (below).
+
+### Port and domain model
+
+```rust
+pub struct AdvisoryId(String);          // "GHSA-…", "CVE-…", "RUSTSEC-…", "GO-…"
+pub struct AdvisorySourceId(&'static str);
+pub enum AdvisorySeverity { Low, Moderate, High, Critical, Unknown }  // normalized; Unknown never meets a threshold
+pub struct AffectedRange { pub introduced: Option<ReleaseOrder>, pub fixed: Option<ReleaseOrder>, pub last_affected: Option<ReleaseOrder> }
+pub struct Advisory {
+    pub id: AdvisoryId,
+    pub aliases: Vec<AdvisoryId>,       // cross-source dedup key (GHSA <-> CVE <-> RUSTSEC/GO)
+    pub source: AdvisorySourceId,
+    pub severity: AdvisorySeverity,
+    pub withdrawn: bool,                // a withdrawn advisory never flags or shortens anything
+    pub summary: String,
+    pub ranges: Vec<AffectedRange>,     // ORDER TOKENS, not versions — see below
+    pub affected_versions: Vec<Version>, // enumerated affected set (exact match), for range-less feeds
+    pub fixes: Vec<Version>,            // display, and the check-side "is this pin the fix?" test
+    pub unorderable: bool,              // a boundary failed to order: range testimony lost, exact-match evidence remains
+}
+
+#[async_trait]
+pub trait AdvisorySource: Send + Sync {
+    fn id(&self) -> AdvisorySourceId;
+    /// Batched deliberately: the whole package set at once (OSV `querybatch`, then one document
+    /// fetch per distinct advisory), never per dependency.
+    /// `ecosystem` is the tool's `Capabilities::advisory_ecosystem` string; the returned fetch
+    /// carries per-package raw advisories plus whether any of it came from a stale cache.
+    async fn advisories(&self, ecosystem: &str, packages: &[String]) -> Result<AdvisoryFetch>;
+}
+```
+
+**Versions stay opaque to the core** — the load-bearing constraint. Advisory ranges are version
+ranges, and the core parses no versions (§ Domain model). So range boundaries reach it as
+`ReleaseOrder` tokens: `AdvisorySource` yields a `RawAdvisory` carrying boundary version _strings_,
+and the **adapter** maps each to a `ReleaseOrder` with the same machinery that already orders its
+release list. Membership is then a pure comparison in the core, exactly like every other verdict —
+no new place learns PEP 440, semver, and `+incompatible`. A boundary the adapter cannot order drops
+that _range_, not the advisory: it degrades to "annotate, do not shorten", never to a silent pass.
+
+`Capabilities` gains `advisory_ecosystem: Option<&'static str>` — the source's ecosystem string
+(`Go`, `crates.io`, `PyPI`, `npm`, `Maven`, `RubyGems`, `Hex`, `SwiftURL`). `None` (conda) makes the
+feature inert there, and `cooldown config` reports it rather than pretending coverage.
+
+### Evaluation
+
+Both pure functions gain an advised variant taking the advisory set alongside the releases (the
+unadvised names stay and delegate with no context, so inertness holds by construction):
+
+```rust
+pub struct AdvisoryContext<'a> { pub advisories: &'a [Advisory], pub policy: &'a ResolvedAdvisoryPolicy }
+
+pub fn evaluate_advised(dep: &Dependency, releases: &[Release], advisory: Option<&AdvisoryContext>,
+                        layers: &[PolicyLayer], ctx: &ResolveContext, now: jiff::Timestamp) -> Verdict;
+pub fn check_pin_advised(dep: &Dependency, locked: &Release, advisory: Option<&AdvisoryContext>,
+                         layers: &[PolicyLayer], ctx: &ResolveContext, now: jiff::Timestamp) -> PinVerdict;
+```
+
+**Additive by construction:** with no context (or an empty advisory slice) both are bit-for-bit the
+unadvised functions, which is the invariant the test suite pins. The core answers two questions:
+
+1. **Candidate side** (`outdated`/`upgrade`): does candidate `V` fix an advisory whose affected range
+   contains the current pin? If so the candidate carries the advisory ids, and under
+   `mode = "shorten"` an **exact fix version** resolves against the security window — so `upgrade`
+   adopts the fix earlier via the same code path, with no separate "security upgrade" mode. A
+   candidate that merely escapes the affected ranges annotates but is never fast-tracked: the
+   pin-side gate re-certifies from the locked release alone, where only the exact fix-version match
+   is decidable, and planner and gate must agree or the residual gate rolls back the adoption.
+2. **Pin side** (`check`): is the locked version itself a `fixes` version of a non-withdrawn advisory
+   at or above the threshold? Then the pin resolves against the security window. This deliberately
+   needs no upgrade history — "you locked the release that fixes `GHSA-x`" is decidable from the feed
+   alone. Trade-off, stated: a fix release that also happens to be brand-new gets the shorter hold.
+   That is the intent — it is precisely the version Dependabot just told you to take.
+
+### Output
+
+```text
+golang.org/x/crypto  0.31.0 → 0.33.0  in cooldown  matures in 12d  ⚠ fixes GHSA-v778-237x-gjrc (high)
+```
+
+and under `mode = "shorten"` with `advisories.min-age = "1d"`:
+
+```text
+golang.org/x/crypto  0.31.0 → 0.33.0  adoptable  security window 1d  ⚠ fixes GHSA-v778-237x-gjrc (high)
+```
+
+JSON additions (the published schema is *closed* — objects reject unknown properties — so any new
+field bumps `schemaVersion`, per the implemented stability rule):
+
+- `items[]` gain `security?: { version, fixes:[AdvisoryId], severity, source, applied:bool }`,
+  present iff the row is advisory-relevant; `applied` is `false` under `mode = "flag"`. `version`
+  names the release the block describes — the locked pin in `check`, the security-relevant
+  candidate in `outdated`, which need not be the candidate whose cooldown the row displays (an
+  applied fix outranks a newer, merely-annotated one), so the block stays self-describing.
+- `window` gains `shortenedBy?: "<advisory id>"`, a sibling of `clampedBy` (a clamp tightens, a
+  shorten loosens; keeping them separate keeps `explain` honest about which happened).
+- `Diagnostic.kind` gains `advisory_source_unavailable | advisory_ecosystem_unsupported`.
+- `check.summary` gains `securityRelevant`; `explain` gains one advisory trace step per layer *and
+  field* (`advisories.mode`, `advisories.min-age`, …), each marked applied or merely considered, so
+  a value that lost to a higher layer or to a combine rule says so; `config` items gain the
+  resolved `advisories` policy plus the tool's advisory ecosystem (the coverage report).
+
+### Failure, trust, and why this one fails open
+
+The asymmetry decides it: a **registry** outage can make a fresh version look _mature_, so `check` is
+fail-closed (exit 4). An **advisory-feed** outage can only fail to shorten a window — the ordinary,
+stricter window stands. So the feed is **fail-open on the window, loud in the output**: a
+`warnings[]` entry, `ok` unchanged, and `--fail-on-advisory-source` for gates that want to insist.
+
+The feed is a _loosening_ input, so the cache hardening inverts too. Registry publish times may never
+move earlier on refresh (monotonic floor); advisory data may only shorten a window while **fresh**
+(short TTL, default 24h). `--offline`, `--no-cache` semantics follow: a stale cache still annotates,
+never shortens. And the poisoning blast radius is bounded by `bypass-floor = false` — the worst a
+hostile or compromised feed can do is drop a window to the org `floor`, never to zero.
+
+Severity normalization reads the canonical OSV `severity[]` entries, most package-specific first
+(an `affected[]` entry's rating beats the document-wide one, which beats the GHSA-style
+qualitative rating), scoring CVSS v3/v4 vectors; anything unscorable stays `unknown` and never
+meets a threshold. Alias-connected documents (a GHSA and a RUSTSEC/PYSEC record sharing a CVE)
+merge into one advisory, so one vulnerability annotates a package once. A `querybatch` page token
+is followed to exhaustion rather than truncated: a dropped tail would hide advisories while the
+fetch reported success, which `--fail-on-advisory-source` could never detect.
+
+### Testing
+
+The check truth table (§ Testing & conformance) extends by the cross product
+`{fixes-advisory? · severity ≥ threshold? · mode · withdrawn? · feed reachable?}`, plus:
+
+- **Inertness:** empty advisories ⇒ verdicts identical to the no-feed build, per adapter.
+- **Floor:** a Critical advisory does not undercut an org floor without `bypass-floor` _at that
+  layer_ (the poisoned-feed test).
+- **Ordering:** an unorderable range boundary drops its range's testimony — a row flags (and, for
+  an exact fix-version match, still shortens) only on exact evidence; a candidate that merely
+  escapes the *surviving* ranges proves nothing and is not flagged. The exact fix-version match
+  must keep working when classification sees only the locked release (the real `check` shape), so
+  a multi-range advisory — inevitably unorderable there — still passes a freshly merged fix.
 
 ## Later work (post-MVP)
 
 - **`sync`** into native configs (§ sync) — relative spans, uv per-package durations, and
   coexistence with any external writer of the same field.
-- **Automatic advisory-driven bypass.** Consume `govulncheck`/`cargo audit`/PyPI advisory feeds so a
-  version that _fixes_ an advisory affecting the current pin can bypass the cooldown (as
-  Renovate/Dependabot do). Deferred deliberately: doing it right means fully modeling
-  `{ advisory source, affected range, fixed version, status }` and a new
-  `security_override_available` status + JSON shape — too much surface for the MVP, and the manual
-  path (scenario 6) covers it meanwhile.
+- **Advisory feed (OSV / GitHub advisories)** — designed in § Advisory feed. Deferred from the MVP,
+  not dropped: it is the piece that makes `cooldown` and Dependabot agree rather than overlap, and
+  the manual path (scenario 6) covers it meanwhile. Two phases, because the annotation half carries
+  most of the value at a fraction of the risk: first `mode = "flag"` (the `AdvisorySource` port, the
+  OSV adapter, flagged rows and the `security` JSON field — no verdict ever changes), then
+  `mode = "shorten"` (the security window, its floor interaction, and the `check`-side pin rule).
 - **Rust, Python, Node adapters; crate extraction; plugin/dynamic registration.**
 
 ## Reference tools to port / reuse
@@ -967,6 +1179,9 @@ need classification.
 | Rust      | [`cargo-cooldown`](https://crates.io/crates/cargo-cooldown)                                                         | min-publish-age logic                     |
 | Python    | [uv](https://docs.astral.sh/uv/reference/settings/)                                                                 | resolution/apply engine (`exclude-newer`) |
 | All       | Renovate / Dependabot cooldown                                                                                      | semantics reference                       |
+| All       | [OSV](https://osv.dev) (`/v1/querybatch`)                                                                           | advisory feed (default source)            |
+| All       | [GitHub Advisory Database](https://github.com/advisories) (GraphQL `securityVulnerabilities`)                       | advisory feed (alternate source)          |
+| Rust / Go | [RustSec `advisory-db`](https://github.com/rustsec/advisory-db) / [Go vulndb](https://vuln.go.dev)                   | upstream of the OSV records; severity     |
 
 Watch [`rust-lang/cargo#15973`](https://github.com/rust-lang/cargo/issues/15973); if native cargo
 cooldown lands, the Rust adapter shrinks.
@@ -983,7 +1198,8 @@ One tool and one UX in place of the per-ecosystem patchwork teams stitch togethe
 
 `cooldown` complements CI bots (Renovate / Dependabot cooldown) rather than replacing them: the bots
 are the remote PR layer, `cooldown` is the local CLI and gate that uses the same notion of "too
-fresh."
+fresh." With the advisory feed they also share the same notion of "security-relevant", so the bot's
+security PR and the local gate stop contradicting each other (§ Advisory feed).
 
 ## Distribution & install
 
@@ -998,6 +1214,10 @@ initially. Ship a copy-paste GitHub Actions `cooldown check` recipe beside the u
 - **Crate naming** (only relevant after the MVP single-crate split): `cooldown-go` /
   `cooldown-cargo` / `cooldown-uv` / `cooldown-npm` (recommended) vs `cooldown-<lang>`.
 - **Clock-skew tolerance:** none (trust NTP) is the current choice — confirm for locked-down CI.
+- **Advisory-source trust and reach:** OSV needs no auth but is a third party that can _lower_ a
+  window (bounded by `floor`; § Advisory feed); the GitHub source needs a token, which a local CLI
+  cannot assume. Air-gapped CI needs a mirrored/offline feed, and conda has no OSV ecosystem at all —
+  so "annotate only where we have coverage, and say so" is the stance to confirm.
 
 ## Rough phasing
 
@@ -1012,4 +1232,5 @@ The MVP is the **policy model + Go + the JSON envelope + full-graph check**, fro
    `outdated`/`upgrade`/`check`/`baseline`.
 4. **Rust adapter** (crates.io index + `cargo update --precise`).
 5. **Python adapter** (read `uv.lock` + PyPI; drive uv for resolve/apply).
-6. **Later:** `sync`, advisory-driven bypass, Node adapter, crate extraction.
+6. **Later:** `sync`, the advisory feed (flag first, then shorten — § Later work), Node adapter,
+   crate extraction.

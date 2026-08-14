@@ -17,6 +17,8 @@ No. It doesn't intercept your package manager or your installs. It reasons about
 
 No — it never inspects code. It is a *timing* control: it refuses to be the first to adopt a brand-new release, so the window in which a smash-and-grab attack is live and undetected passes before the code reaches you. Run it alongside `govulncheck`, `cargo audit`, and advisory feeds, which catch a different class of problem. See the [Security model]({{< relref "security.md" >}}).
 
+That said, the timing control can consult the [OSV advisory feed]({{< relref "configuration/advisories.md" >}}): a candidate that fixes a published advisory is flagged instead of silently held, and can optionally clear a shorter security window. That makes the hold *visible and steerable* — it still doesn't gate on vulnerabilities.
+
 ## Why did `check` fail on a transitive dependency I don't control?
 
 Because the resolved graph — not just what you declared — is the real risk surface, and a re-lock can pull a brand-new transitive in. You have options: [`fix`]({{< relref "commands/fix.md" >}}) rolls it back to a matured version, `check --transitive allow` keeps it visible but non-fatal, and `check --transitive hide` gates direct dependencies only. If the graph pins it and nothing lower satisfies its requirers, `cooldown` names the dependency forcing the fresh pin so you can address the cause.
@@ -28,6 +30,8 @@ Because the resolved graph — not just what you declared — is the real risk s
 ## How is this different from Dependabot or Renovate?
 
 Those tools *propose* updates; `cooldown` gates on *age*. They're complementary: let Renovate open the PRs, and let `cooldown check` make sure none of them adopts something too fresh. `cooldown upgrade` also only ever moves to versions that have already matured, so the two compose cleanly.
+
+The one place they used to disagree is a security PR: Dependabot proposes a fix the moment it exists, and a plain age gate holds it like any other fresh version. The [advisory feed]({{< relref "configuration/advisories.md" >}}) resolves that — under its `shorten` mode a security fix clears a shorter window, and the pin a security PR just created stops failing the next `check`.
 
 ## Does it need network access?
 
