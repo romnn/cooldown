@@ -86,6 +86,7 @@ serde-saphyr = "1"
 toml = "1"
 toml_edit = "0.25.12"
 async-trait = "0.1"
+cvss = "2.2"
 thiserror = "2"
 color-eyre = "0.6"
 camino = { version = "1", features = ["serde1"] }
