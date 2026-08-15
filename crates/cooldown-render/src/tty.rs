@@ -206,8 +206,37 @@ fn outdated_status_cell(item: &OutdatedItem) -> String {
     // A security-relevant row names what adopting the candidate fixes — the difference between
     // a silent hold and "those days are spent on a known-exploitable version".
     match &item.security {
-        Some(security) => format!("{status} {}", security_note(security)),
+        Some(security) => format!(
+            "{status} {}",
+            outdated_security_note(security, outdated_row_referent(item))
+        ),
         None => status,
+    }
+}
+
+/// The version an outdated row's status cell speaks about: the adoptable target when there is
+/// one, else the candidate whose cooldown the row displays, else the current pin.
+fn outdated_row_referent(item: &OutdatedItem) -> &str {
+    item.adoptable_target
+        .as_deref()
+        .or(item.cooldown_version.as_deref())
+        .unwrap_or(&item.current)
+}
+
+/// [`security_note`], naming the security-relevant version when it is not the one the row's
+/// status refers to: with a mature routine target and a newer, still-cooling exact fix,
+/// `adoptable ⚠ fixes GHSA-…` would claim the adoptable target fixes the advisory — the fix is
+/// a different version, so the note must say which.
+fn outdated_security_note(security: &SecurityInfo, referent: &str) -> String {
+    if security.version == referent {
+        security_note(security)
+    } else {
+        format!(
+            "⚠ {} fixes {} ({})",
+            security.version,
+            security.fixes.join(", "),
+            security.severity
+        )
     }
 }
 
@@ -1786,6 +1815,9 @@ mod tests {
 
         let mut item = project_outdated_item("time", ".");
         item.status = OutdatedStatus::InCooldown;
+        item.adoptable_target = None;
+        // The row's cooldown column displays the fix itself, so the note stays un-versioned.
+        item.cooldown_version = Some("0.2.23".into());
         item.security = Some(security.clone());
         assert_eq!(
             outdated_status_cell(&item),
@@ -1823,6 +1855,37 @@ mod tests {
         }
         assert!(!check_notes_cell(&check_item).contains("security window applied"));
         assert!(check_notes_cell(&check_item).contains("⚠ fixes"));
+    }
+
+    /// With a mature routine target and a newer, still-cooling exact fix, the security block
+    /// belongs to the fix — a different version than the adoptable target — so the status cell
+    /// must name it: a bare `adoptable ⚠ fixes GHSA-…` would claim the adoptable target fixes
+    /// the advisory.
+    #[test]
+    fn a_security_note_for_another_version_names_it() {
+        let mut item = project_outdated_item("time", ".");
+        item.status = OutdatedStatus::Adoptable;
+        item.adoptable_target = Some("0.15.16".into());
+        item.security = Some(SecurityInfo {
+            version: "0.16.0".into(),
+            fixes: vec!["GHSA-wcg3-cvx6-7396".into()],
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
+            applied: true,
+        });
+        assert_eq!(
+            outdated_status_cell(&item),
+            "adoptable ⚠ 0.16.0 fixes GHSA-wcg3-cvx6-7396 (high)"
+        );
+
+        // The plain form is untouched when the note describes the row's own target.
+        if let Some(security) = item.security.as_mut() {
+            security.version = "0.15.16".into();
+        }
+        assert_eq!(
+            outdated_status_cell(&item),
+            "adoptable ⚠ fixes GHSA-wcg3-cvx6-7396 (high)"
+        );
     }
 
     /// An `upgrade` row explains its own security provenance: which advisories the adopted

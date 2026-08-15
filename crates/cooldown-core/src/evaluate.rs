@@ -74,6 +74,12 @@ pub struct CeilingHold {
     pub target: Version,
     /// The target's update kind relative to the current release.
     pub update_kind: UpdateKind,
+    /// Why the held target is security-relevant, when it is (see [`Candidate::security`]).
+    ///
+    /// Carried so a hold's report row keeps the same provenance an adoptable row would: a
+    /// security fix matured only under the shortened window is precisely the target a ceiling
+    /// hold must not report as a routine skip.
+    pub security: Option<crate::advisory::SecurityRelevance>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,6 +476,7 @@ fn classify_candidate(
 /// // A package locked at 1.0.0 with a fresh 1.0.1 patch released "now".
 /// let dep = Dependency {
 ///     package: PackageId::new(ToolId("cargo"), "widget", None),
+///     advisory_identity: Some("widget".to_string()),
 ///     current: Version::new("1.0.0"),
 ///     current_quality: ReleaseQuality::Stable,
 ///     direct: true,
@@ -785,15 +792,15 @@ pub fn evaluate_ceiling_hold_advised(
         if bounded.adoptable_target.as_ref() == Some(&target) {
             return None;
         }
-        let update_kind = probe
+        let candidate = probe
             .candidates
             .iter()
-            .find(|candidate| candidate.version == target)?
-            .kind;
+            .find(|candidate| candidate.version == target)?;
         Some(CeilingHold {
             reason,
+            update_kind: candidate.kind,
+            security: candidate.security.clone(),
             target,
-            update_kind,
         })
     };
     if filters.declared_bound
@@ -837,16 +844,16 @@ pub fn evaluate_ceiling_hold_advised(
     // `target`. Name the first ceiling the target provably violates (staged guidance, see above).
     let target_release = releases.iter().find(|release| release.version == target)?;
     let reason = joint_ceiling_reason(dep, current, target_release, layers, ctx, filters)?;
-    let update_kind = unbounded
+    let candidate = unbounded
         .candidates
         .iter()
-        .find(|candidate| candidate.version == target)?
-        .kind;
+        .find(|candidate| candidate.version == target)?;
 
     Some(CeilingHold {
         reason,
+        update_kind: candidate.kind,
+        security: candidate.security.clone(),
         target,
-        update_kind,
     })
 }
 
@@ -1194,6 +1201,7 @@ mod tests {
     fn fix_dep(current: &str) -> Dependency {
         Dependency {
             package: crate::PackageId::new(ToolId("cargo"), "widget", None),
+            advisory_identity: Some("widget".to_string()),
             current: Version::new(current),
             current_quality: ReleaseQuality::Stable,
             direct: true,

@@ -50,3 +50,49 @@ pub(crate) fn change_target_key_parts(
 fn member_key(member: &MemberRef) -> MemberTargetKey {
     (member.name.clone(), member.path.clone())
 }
+
+/// The identity of a planned change for **report provenance** — security blocks and
+/// advisory-rollback notes: [`change_target_key`] plus the *source* version.
+///
+/// The landed/held bookkeeping above is deliberately source-blind so recovery can collapse
+/// siblings onto one target; provenance must not be. Two coexisting transitive copies of a
+/// package converging on one target are distinct report rows, and an advisory can affect one
+/// copy's current version without affecting the other's — a source-blind key would stamp the
+/// one row's security evidence onto both.
+pub(crate) type ChangeProvenanceKey = (String, ChangeTargetKey);
+
+pub(crate) fn change_provenance_key(change: &Change) -> ChangeProvenanceKey {
+    (change.from.as_str().to_string(), change_target_key(change))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cooldown_core::{PackageId, ToolId, UpdateKind, Version};
+
+    /// Two coexisting copies of one transitive converging on the same target share the
+    /// (deliberately source-blind) target key but keep distinct provenance keys, so security
+    /// evidence recorded for one copy's move never labels the other's row.
+    #[test]
+    fn provenance_keys_distinguish_source_versions_that_target_keys_collapse() {
+        let change = |from: &str| Change {
+            package: PackageId {
+                tool: ToolId("cargo"),
+                name: "widget".to_string(),
+                registry: None,
+            },
+            from: Version::new(from),
+            to: Version::new("2.0.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: false,
+            members: Vec::new(),
+        };
+        let (affected, clean) = (change("1.0.0"), change("1.5.0"));
+        assert_eq!(change_target_key(&affected), change_target_key(&clean));
+        assert_ne!(
+            change_provenance_key(&affected),
+            change_provenance_key(&clean)
+        );
+    }
+}

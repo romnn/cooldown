@@ -17,8 +17,12 @@ use self::transitive_gate::{
     TransitiveGateVerdict, insert_graph_violation, newly_introduced_violations, package_label,
     violation_identity,
 };
-use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories, advisory_fetch_policy};
-use crate::app::change_key::{ChangeTargetKey, change_target_key};
+use crate::app::advisories::{
+    AdvisoryPackages, ClassifiedAdvisories, ProjectAdvisories, advisory_fetch_policy,
+};
+use crate::app::change_key::{
+    ChangeProvenanceKey, ChangeTargetKey, change_provenance_key, change_target_key,
+};
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
     recovery_diagnostics,
@@ -92,7 +96,11 @@ struct FixPlan {
     /// note would survive a rejected apply or a restored batch and claim a rollback that
     /// never happened.
     /// They never mark the run incomplete: the change each one annotates did apply.
-    notes: Vec<(ChangeTargetKey, Diagnostic)>,
+    ///
+    /// Keyed by [`ChangeProvenanceKey`] — source version included — because two coexisting
+    /// copies of one package can converge on the same rollback target while only one of them
+    /// re-enters the advisory.
+    notes: Vec<(ChangeProvenanceKey, Diagnostic)>,
     errors: Vec<Diagnostic>,
 }
 
@@ -317,17 +325,55 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// chronological legs of one copy can only span batches (one report emits one row per copy),
     /// so two same-batch rows sharing a name are coexisting version lines that must not chain.
     batch_item_offsets: Vec<usize>,
-    /// The security provenance of planned targets, keyed like the landed/held bookkeeping.
+    /// The security provenance of planned changes.
     ///
     /// The report's rows are built from [`Change`]s, which carry no policy provenance, so the
     /// advisory evidence that made a target adoptable is parked here rather than pushed into the
     /// apply instruction.
-    security_by_target: HashMap<ChangeTargetKey, crate::app::SecurityInfo>,
+    /// Keyed by [`ChangeProvenanceKey`], *not* the source-blind landed/held key: two coexisting
+    /// copies of one package can converge on the same target while an advisory affects only one
+    /// copy's current version, and only that copy's row is security-relevant.
+    security_by_change: HashMap<ChangeProvenanceKey, crate::app::SecurityInfo>,
+    /// The advisory relevance of locked pins, keyed by `(name, version, registry)`, captured on
+    /// every residual-gate pass ([`graph_violations`](Self::graph_violations)).
+    ///
+    /// [`security_by_change`](Self::security_by_change) covers only rows the planner produced;
+    /// a resolver-induced collateral change has no planned row, so its report provenance — and
+    /// its rollback warning, when the resolver rolls a fix back as consistency churn — comes
+    /// from what the gate already computed about the graph's pins: the pre-batch pass covered
+    /// every `from` version, the post-batch pass every `to`. Entries for versions no longer
+    /// locked are never looked up again; they are not pruned.
+    pin_security: HashMap<PinSecurityKey, cooldown_core::SecurityRelevance>,
+    /// Advisories that positively affect a locked pin (an enumerated-affected or orderable-range
+    /// match), captured alongside [`pin_security`](Self::pin_security) on every gate pass.
+    ///
+    /// The forward half of fix-loss detection: a committed move off an exact fix version warns
+    /// *forward* only when the landing version is provably affected again (an OSV range that
+    /// reintroduces the vulnerability). Without this positive evidence, either every routine
+    /// upgrade past a fix boundary would warn or none would.
+    pin_affected: HashMap<PinSecurityKey, Vec<cooldown_core::AdvisoryId>>,
+    /// The dependency set the most recent residual-gate pass read — the post-apply graph, by
+    /// the time a batch report is being committed.
+    ///
+    /// [`capture_reintroduction_evidence`](Self::capture_reintroduction_evidence) needs the
+    /// *dependency* (identity, spelling) behind a committed change's landing version to
+    /// re-classify its advisories against a full release list; the gate already materialized
+    /// exactly that set, so it is kept instead of re-reading the graph.
+    last_gate_graph: Vec<Dependency>,
     /// Advisory-package identities a top-up tried and could not cover.
     ///
-    /// A feed that just failed (or served data too stale to shorten) will fail the same way next
-    /// round, so retrying would re-query it and repeat its warning once per round.
+    /// A feed that just failed will fail the same way next round, so retrying would re-query it
+    /// and repeat its warning once per round. (Stale top-up data is not a failure: it merges
+    /// annotate-only — see [`ProjectAdvisories`]'s flag-only handling.)
     top_up_declined: HashSet<String>,
+    /// Package names already reported as carrying no advisory identity (source not provably in
+    /// the ecosystem), seeded by the initial fetch's exclusions.
+    ///
+    /// A re-lock can introduce an unproven package mid-run; it is safely never queried, but the
+    /// narrowed coverage must be said out loud exactly once — the gate re-reads the graph every
+    /// pass, so without this set the same package would warn every round (or, before it
+    /// existed, never).
+    unproven_reported: HashSet<String>,
     /// The project's fetched advisories, set once before planning.
     ///
     /// Advising the planner AND the graph gate from the same data is load-bearing under the
@@ -357,8 +403,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
             batch_item_offsets: Vec::new(),
-            security_by_target: HashMap::new(),
+            security_by_change: HashMap::new(),
+            pin_security: HashMap::new(),
+            pin_affected: HashMap::new(),
+            last_gate_graph: Vec::new(),
             top_up_declined: HashSet::new(),
+            unproven_reported: HashSet::new(),
             advisories: None,
         }
     }
@@ -398,8 +448,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(deps) = self.scoped_deps().await else {
             return ProjectRunStatus::Terminated;
         };
-        self.fetch_advisories(deps.iter().map(|dep| dep.package.name.clone()).collect())
-            .await;
+        self.fetch_advisories(deps.clone()).await;
         let verb = match self.mode {
             PlanMode::Upgrade { .. } => "upgrades",
             PlanMode::Fix { .. } => "downgrades",
@@ -553,13 +602,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         match advisories {
             Some(shared) => self.advisories = Some(shared),
             None => {
-                self.fetch_advisories(
-                    changes
-                        .iter()
-                        .map(|change| change.package.name.clone())
-                        .collect(),
-                )
-                .await;
+                // Planned changes carry no advisory identity of their own — identity lives on
+                // the resolved dependencies (see [`Dependency::advisory_identity`]) — so the
+                // fetch scopes itself from the graph read inside. Every planned package is
+                // locked in that graph; if the read fails, the run is honestly unadvised
+                // (fail-open) rather than queried on unproven identities.
+                self.fetch_advisories(Vec::new()).await;
             }
         }
         let Some(mut state) = self.initial_trial_state().await else {
@@ -571,14 +619,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Fetches the project's advisories once, before planning, so the planner and every
     /// subsequent graph gate judge from the same feed data.
     ///
-    /// The fetch covers `packages` (the planning scope) joined with the raw, unscoped graph's
-    /// package names, because the residual gate judges the whole graph (see
+    /// The fetch covers `deps` (the planning scope) joined with the raw, unscoped graph,
+    /// because the residual gate judges the whole graph (see
     /// [`graph_violations`](Self::graph_violations)) and a pin outside the fetch set would be
     /// gated unadvised — rolling back the very security fix the advised planner adopted.
     /// A package a later re-lock introduces is picked up by
     /// [`top_up_advisories`](Self::top_up_advisories), which extends this snapshot without
     /// disturbing it.
-    async fn fetch_advisories(&mut self, mut packages: Vec<String>) {
+    async fn fetch_advisories(&mut self, mut deps: Vec<Dependency>) {
         if advisory_fetch_policy(self.ctx.pctx).is_none() {
             // `fetch_project_advisories` would be inert; skip the graph read below too.
             self.advisories = None;
@@ -593,15 +641,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .dependencies(&self.ctx.pctx.project, DepScope::Graph)
                 .await
         {
-            packages.extend(graph.into_iter().map(|dep| dep.package.name));
+            deps.extend(graph);
         }
+        // Identities must be adapter-confirmed before they are queried or counted (see
+        // `ToolRead::confirm_advisory_identities`); the policy gate above already proved the
+        // feed will run.
+        self.ctx
+            .reader
+            .confirm_advisory_identities(&self.ctx.pctx.project, &mut deps)
+            .await;
+        let packages = AdvisoryPackages::from_deps(&deps);
+        // The fetch reports these exclusions itself; remembering them here keeps a later
+        // top-up's report scoped to packages a re-lock *newly* introduced.
+        self.unproven_reported
+            .extend(packages.excluded_names().iter().cloned());
         let fetch = self
             .ws
             .fetch_project_advisories(
                 self.ctx.reader,
                 self.ctx.pctx,
                 &self.project_label,
-                &packages,
+                packages,
                 self.ctx.opts,
             )
             .await;
@@ -627,9 +687,31 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(existing) = self.advisories.clone() else {
             return;
         };
-        let names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        // A re-lock can also introduce packages with no advisory identity at all. They are
+        // correctly never queried, but that narrows the coverage the initial fetch reported —
+        // so say so once per package, even when (especially when) nothing below is queryable.
+        let mut fresh_unproven: Vec<&str> = deps
+            .iter()
+            .filter(|dep| dep.advisory_identity.is_none())
+            .map(|dep| dep.package.name.as_str())
+            .filter(|name| !self.unproven_reported.contains(*name))
+            .collect();
+        fresh_unproven.sort_unstable();
+        fresh_unproven.dedup();
+        if !fresh_unproven.is_empty() {
+            self.acc
+                .warnings
+                .push(crate::app::advisories::top_up_excluded_warning(
+                    self.ctx.pctx,
+                    &self.project_label,
+                    existing.ecosystem(),
+                    fresh_unproven.len(),
+                ));
+            self.unproven_reported
+                .extend(fresh_unproven.into_iter().map(str::to_string));
+        }
         let unqueried: Vec<String> = existing
-            .unqueried(self.ctx.reader, &names)
+            .unqueried(deps)
             .into_iter()
             .filter(|package| !self.top_up_declined.contains(package))
             .collect();
@@ -1283,11 +1365,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             };
             // The advisory evidence lives on the verdict, but the report is built from the
             // `Change` — an apply instruction that deliberately carries no policy provenance —
-            // so keep it beside the plan, keyed by the same identity the applied/held
-            // bookkeeping uses.
+            // so keep it beside the plan, keyed by the exact (from, target) change it belongs
+            // to (see [`ChangeProvenanceKey`]).
             if let Some(security) = security {
-                self.security_by_target
-                    .insert(change_target_key(&change), security);
+                self.security_by_change
+                    .insert(change_provenance_key(&change), security);
             }
             planned.push(change);
         }
@@ -1337,6 +1419,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             direct: dep.direct,
             members: dep.members.clone(),
         };
+        // A held security fix must keep its provenance: without this the row reads as a routine
+        // skip exactly when the security window is the only reason the target matured.
+        if let Some(relevance) = &hold.security {
+            self.security_by_change.insert(
+                change_provenance_key(&change),
+                crate::app::workspace::security_info(relevance, &change.to),
+            );
+        }
         self.record_change_skip(
             &change,
             Some(SkippedInfo {
@@ -1380,11 +1470,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if Some(&major_target) == scoped_target {
             return;
         }
-        let kind = major
+        let candidate = major
             .candidates
             .iter()
-            .find(|candidate| candidate.version == major_target)
-            .map_or(UpdateKind::Major, |candidate| candidate.kind);
+            .find(|candidate| candidate.version == major_target);
+        let kind = candidate.map_or(UpdateKind::Major, |candidate| candidate.kind);
+        let security = candidate
+            .and_then(|candidate| candidate.security.as_ref())
+            .map(|relevance| crate::app::workspace::security_info(relevance, &major_target));
         let change = Change {
             package: dep.package.clone(),
             from: dep.current.clone(),
@@ -1395,6 +1488,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             direct: dep.direct,
             members: dep.members.clone(),
         };
+        // Same provenance rule as the ceiling holds: a cross-major security fix reported as
+        // `needs --major` still says why taking it matters.
+        if let Some(security) = security {
+            self.security_by_change
+                .insert(change_provenance_key(&change), security);
+        }
         self.record_change_skip(
             &change,
             Some(SkippedInfo {
@@ -1568,7 +1667,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.dry_run,
             ) {
                 notes.push((
-                    change_target_key(&change),
+                    change_provenance_key(&change),
                     note.with_tool(self.ctx.tool_name())
                         .with_project(self.project_label.clone()),
                 ));
@@ -1802,7 +1901,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: Vec<Change>,
         state: &TrialState,
         mut rollback: Option<&mut TrialRollback>,
-        notes: HashMap<ChangeTargetKey, Diagnostic>,
+        notes: HashMap<ChangeProvenanceKey, Diagnostic>,
     ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
@@ -1904,6 +2003,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         };
 
+        self.capture_reintroduction_evidence(&changes, &report)
+            .await;
         self.commit_batch_report(&mut outcome, &changes, report, committed, notes);
         if let Some(rollback) = rollback
             && let Err(error) = rollback.accept(expected)
@@ -2007,7 +2108,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         report: VerifiedBatchReport,
         committed: CommittedBatch,
-        mut notes: HashMap<ChangeTargetKey, Diagnostic>,
+        mut notes: HashMap<ChangeProvenanceKey, Diagnostic>,
     ) {
         let VerifiedBatchReport {
             applied,
@@ -2027,9 +2128,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let key = change_target_key(change);
             if applied.contains(&key) {
                 // This is the first point that knows the change verifiably landed, so it is
-                // where a parked advisory-rollback note may finally surface.
-                if let Some(note) = notes.remove(&key) {
+                // where a parked advisory-rollback note may finally surface. A planned move
+                // can abandon a fix with no parked note to say so — an upgrade landing where
+                // an OSV range reintroduces the vulnerability — so the gate's pin evidence is
+                // consulted for exactly the changes the notes do not already cover.
+                if let Some(note) = notes.remove(&change_provenance_key(change)) {
                     outcome.warnings.push(note);
+                } else if let Some(warning) = self.fix_loss_warning(change) {
+                    outcome.warnings.push(warning);
                 }
                 outcome.items.push(self.change_applied_item(change));
             }
@@ -2041,7 +2147,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 to = %change.to,
                 "collateral applied row committed"
             );
-            outcome.items.push(self.change_applied_item(change));
+            // A collateral row has no planned provenance, so the gate's pin evidence supplies
+            // it: a collateral exact fix admitted by the security window must not read as a
+            // routine move, and a collateral move off a fix must not commit in silence.
+            let mut item = self.change_applied_item(change);
+            if let Some(relevance) = self
+                .pin_security
+                .get(&pin_security_key(&change.package, &change.to))
+            {
+                item.security = Some(crate::app::workspace::security_info(relevance, &change.to));
+            }
+            if let Some(warning) = self.fix_loss_warning(change) {
+                outcome.warnings.push(warning);
+            }
+            outcome.items.push(item);
         }
         if self.initial_edge_snapshot.is_none() {
             for rebind in &edge_rebinds {
@@ -2050,6 +2169,174 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         } else {
             outcome.edge_rebinds.extend(edge_rebinds);
         }
+    }
+
+    /// The warning for a committed version change that abandons an advisory's exact fix: the
+    /// departed version was a listed fix, the landed one is not — and the change would
+    /// otherwise read as routine, because the landing version passes the residual gate on
+    /// ordinary age. Runs for planned and collateral rows alike; a landing version that is
+    /// itself a listed fix for the same advisory (a patched older series) never warns.
+    ///
+    /// Decidable from the gate's pin evidence alone, with direction setting the burden of
+    /// proof. A *downgrade* off a fix boundary warns on exact fix membership by itself —
+    /// whether the landing version is affected would need the full release list, so the
+    /// message claims exactly what is provable: the listed fix is no longer locked. A
+    /// *forward* move past a fix boundary ordinarily lands on a still-fixed version, so it
+    /// warns only on positive evidence that the landing version is affected *again* — OSV
+    /// ranges may reintroduce a vulnerability (fixed at 1.0.2, affected anew from 3.0.0), and
+    /// the gate's [`pin_affected`](Self::pin_affected) capture proves exactly that.
+    fn fix_loss_warning(&self, change: &Change) -> Option<Diagnostic> {
+        let from = self
+            .pin_security
+            .get(&pin_security_key(&change.package, &change.from))?;
+        let landed_fixes = self
+            .pin_security
+            .get(&pin_security_key(&change.package, &change.to))
+            .map(|relevance| relevance.fixes.as_slice())
+            .unwrap_or_default();
+        let abandoned: Vec<&cooldown_core::AdvisoryId> = from
+            .fixes
+            .iter()
+            .filter(|id| !landed_fixes.contains(id))
+            .collect();
+        if abandoned.is_empty() {
+            return None;
+        }
+        let message = if change.downgrade {
+            format!(
+                "the resolve rolled {} back from {} — the fix for {} — to {}; the fix is no longer locked (pin it to keep it)",
+                change.package.name,
+                change.from,
+                advisory_id_list(&abandoned),
+                change.to
+            )
+        } else {
+            let landed_affected = self
+                .pin_affected
+                .get(&pin_security_key(&change.package, &change.to))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let reentered: Vec<&cooldown_core::AdvisoryId> = abandoned
+                .into_iter()
+                .filter(|id| landed_affected.contains(id))
+                .collect();
+            if reentered.is_empty() {
+                return None; // moving past a fix normally lands on a still-fixed version
+            }
+            format!(
+                "the resolve moved {} from {} — the fix for {} — to {}, a version listed as affected again; the fix is no longer locked (pin it to keep it)",
+                change.package.name,
+                change.from,
+                advisory_id_list(&reentered),
+                change.to
+            )
+        };
+        Some(
+            Diagnostic::new(DiagnosticKind::AdvisoryRollback, message)
+                .with_package(&change.package.name),
+        )
+    }
+
+    /// Completes the forward half of the fix-loss evidence for this batch's committed moves.
+    ///
+    /// [`pin_affected`](Self::pin_affected) so far holds what the gate's single-release
+    /// classification could see — enumerated affected versions — while OSV advisories routinely
+    /// express a reintroduction as ranges alone (`fixed 1.0.2`, `introduced 3.0.0`), whose
+    /// boundaries that one-element release list cannot order. For exactly the committed changes
+    /// that abandon an exact fix going *forward*, re-classify the landing package's advisories
+    /// against its full candidate release list — cache-served when the planner already probed
+    /// the package — so an orderable reintroduction range convicts the landing version too.
+    /// A fetch or classification failure leaves the evidence absent and the move unwarned:
+    /// [`fix_loss_warning`](Self::fix_loss_warning) claims only what is provable.
+    async fn capture_reintroduction_evidence(
+        &mut self,
+        changes: &[Change],
+        report: &VerifiedBatchReport,
+    ) {
+        let Some(advisories) = self.advisories.clone() else {
+            return;
+        };
+        let targets: Vec<Dependency> = changes
+            .iter()
+            .filter(|change| report.applied.contains(&change_target_key(change)))
+            .chain(report.collateral.iter())
+            .filter(|change| !change.downgrade && self.abandons_a_fix(change))
+            .filter_map(|change| {
+                self.last_gate_graph
+                    .iter()
+                    .find(|dep| dep.package == change.package && dep.current == change.to)
+                    .cloned()
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                self.ctx.reader,
+                targets,
+                &fctx,
+                self.ctx.opts.candidate_scope(),
+                &self.ctx.opts.progress,
+                self.ctx.opts.fanout(),
+            )
+            .await;
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
+            let Ok(releases) = result else { continue };
+            let Some(classified) = advisories.classify(self.ctx.reader, &dep, &releases) else {
+                continue;
+            };
+            let ctx = classified.context();
+            let order = releases
+                .iter()
+                .find(|release| release.version == dep.current)
+                .map(|release| release.order.clone());
+            let affected: Vec<cooldown_core::AdvisoryId> = ctx
+                .advisories
+                .iter()
+                .filter(|advisory| {
+                    !advisory.withdrawn && advisory.affects(&dep.current, order.as_ref())
+                })
+                .map(|advisory| advisory.id.clone())
+                .collect();
+            if affected.is_empty() {
+                continue;
+            }
+            // Merged, not replaced: the gate's enumeration evidence for the same pin stays.
+            let slot = self
+                .pin_affected
+                .entry(pin_security_key(&dep.package, &dep.current))
+                .or_default();
+            for id in affected {
+                if !slot.contains(&id) {
+                    slot.push(id);
+                }
+            }
+        }
+    }
+
+    /// Whether a committed change departs an exact fix version its landing version is not a
+    /// fix for — the precondition of every fix-loss warning, and the trigger for fetching
+    /// destination-affectedness evidence.
+    fn abandons_a_fix(&self, change: &Change) -> bool {
+        let Some(from) = self
+            .pin_security
+            .get(&pin_security_key(&change.package, &change.from))
+        else {
+            return false;
+        };
+        let landed_fixes = self
+            .pin_security
+            .get(&pin_security_key(&change.package, &change.to))
+            .map(|relevance| relevance.fixes.as_slice())
+            .unwrap_or_default();
+        from.fixes.iter().any(|id| !landed_fixes.contains(id))
     }
 
     async fn verify_apply_report(
@@ -2373,11 +2660,21 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // Intentionally the raw, unscoped graph (not `dependencies_in_scope`): a graph-level cooldown
         // violation counts no matter which member pulls the offending version, so `exclude`/`-p`
         // must not narrow it. Only pin ages are read here — never `members` — so nothing leaks.
-        let deps = self
+        let mut deps = self
             .ctx
             .reader
             .dependencies(&self.ctx.pctx.project, DepScope::Graph)
             .await?;
+        // A re-locked graph's fresh identities need adapter confirmation like the initial
+        // fetch's, before the top-up queries or counts them (the adapter memoizes per project,
+        // so repeated gate passes ask the manager binary once). No snapshot means no feed this
+        // run — nothing downstream consumes identities.
+        if self.advisories.is_some() {
+            self.ctx
+                .reader
+                .confirm_advisory_identities(&self.ctx.pctx.project, &mut deps)
+                .await;
+        }
         // The gate is the first pass to see a re-locked graph, and the reconcile planner that
         // follows reads the same snapshot, so covering the new pins here covers both.
         self.top_up_advisories(&deps).await;
@@ -2395,6 +2692,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
 
         let mut violations = HashMap::new();
+        let mut graph = Vec::new();
         for FetchedRelease {
             dependency: dep,
             result,
@@ -2417,6 +2715,35 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &rctx,
                 self.ws.now(),
             );
+            // Remember what the feed says about this pin: a later committed change for exactly
+            // this (package, version) may have no planned provenance and reports from this
+            // evidence.
+            if let Some(security) = &pin.security {
+                self.pin_security.insert(
+                    pin_security_key(&dep.package, &dep.current),
+                    security.clone(),
+                );
+            }
+            // The other half of the fix-loss evidence: advisories that positively affect this
+            // locked version. With only the locked release fetched here, range boundaries are
+            // rarely orderable, so this pass contributes the enumerated-affected matches;
+            // range-only reintroductions are completed at commit time against a full release
+            // list (see capture_reintroduction_evidence).
+            if let Some(ctx) = &advisory_ctx {
+                let affected: Vec<cooldown_core::AdvisoryId> = ctx
+                    .advisories
+                    .iter()
+                    .filter(|advisory| {
+                        !advisory.withdrawn
+                            && advisory.affects(&locked.version, Some(&locked.order))
+                    })
+                    .map(|advisory| advisory.id.clone())
+                    .collect();
+                if !affected.is_empty() {
+                    self.pin_affected
+                        .insert(pin_security_key(&dep.package, &dep.current), affected);
+                }
+            }
             if pin.status == Status::CurrentInCooldown {
                 let acknowledged = self.ws.baseline.is_acknowledged(
                     self.ctx.tool_name(),
@@ -2430,7 +2757,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     insert_graph_violation(&mut violations, &dep);
                 }
             }
+            graph.push(dep);
         }
+        self.last_gate_graph = graph;
         Ok(violations)
     }
 
@@ -2505,8 +2834,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             skipped,
         );
         item.security = self
-            .security_by_target
-            .get(&change_target_key(change))
+            .security_by_change
+            .get(&change_provenance_key(change))
             .cloned();
         item
     }
@@ -2685,6 +3014,28 @@ fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeTargetKey>
     changes
         .iter()
         .any(|change| applied.contains(&change_target_key(change)))
+}
+
+/// One locked pin's identity in [`pin_security`](ProjectUpgradeExecutor::pin_security):
+/// `(name, version, registry)`. The registry is part of the key so same-named packages from
+/// different registries — which the collateral differ deliberately keeps apart — cannot borrow
+/// each other's relevance.
+type PinSecurityKey = (String, String, Option<String>);
+
+fn pin_security_key(package: &cooldown_core::PackageId, version: &Version) -> PinSecurityKey {
+    (
+        package.name.clone(),
+        version.as_str().to_string(),
+        package.registry.clone(),
+    )
+}
+
+/// Advisory ids joined for a diagnostic message.
+fn advisory_id_list(ids: &[&cooldown_core::AdvisoryId]) -> String {
+    ids.iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The applied rows the plan did not itself claim — the collateral movement recorded as its own

@@ -220,6 +220,7 @@ fn rel(version: &str, order: u8) -> Release {
 fn dep(name: &str, version: &str) -> Dependency {
     Dependency {
         package: PackageId::new(ToolId("mock"), name, None),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(version),
         current_quality: ReleaseQuality::Stable,
         direct: true,

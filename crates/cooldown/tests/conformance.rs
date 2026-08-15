@@ -58,6 +58,7 @@ fn rel(v: &str, ord: u32, pub_at: Option<&str>, kind: Option<UpdateKind>) -> Rel
 fn dep(name: &str, current: &str, direct: bool) -> Dependency {
     Dependency {
         package: PackageId::new(GO, name, Some("proxy.example".into())),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(current),
         current_quality: ReleaseQuality::Stable,
         direct,
@@ -142,6 +143,10 @@ struct FakeEco {
     fail_locked_release_after_apply_for: Option<String>,
     stale_lock_after_apply: bool,
     build_fails_after_apply: bool,
+    /// A package whose advisory identity the fake's `confirm_advisory_identities` withholds —
+    /// simulating an adapter's feed-time veto (npm's effective-registry query), so the
+    /// conformance tests can prove the app confirms before identities are queried or matched.
+    confirm_strips: Option<String>,
     state: Mutex<State>,
     root: Utf8PathBuf,
 }
@@ -278,6 +283,15 @@ impl ToolRead for FakeEco {
             alternate_manifests: &[],
             workspace_root: true,
         })
+    }
+    async fn confirm_advisory_identities(&self, _project: &Project, deps: &mut [Dependency]) {
+        if let Some(name) = &self.confirm_strips {
+            for dep in deps.iter_mut() {
+                if dep.package.name == *name {
+                    dep.advisory_identity = None;
+                }
+            }
+        }
     }
     async fn dependencies(&self, p: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let state = self.state.lock().unwrap();
@@ -832,6 +846,7 @@ fn fake(
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     }
@@ -1336,6 +1351,7 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -1724,6 +1740,7 @@ async fn outdated_transitive_scopes_in_indirect_deps() {
             fail_locked_release_after_apply_for: None,
             stale_lock_after_apply: false,
             build_fails_after_apply: false,
+            confirm_strips: None,
             state: Mutex::new(State::default()),
             root: root.clone(),
         };
@@ -1785,6 +1802,7 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::default(),
         root,
     };
@@ -1848,6 +1866,7 @@ async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::default(),
         root,
     };
@@ -1917,6 +1936,7 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::default(),
         root,
     };
@@ -1963,6 +1983,7 @@ async fn check_flags_fresh_transitive_and_baseline_acknowledges() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -2025,6 +2046,7 @@ async fn check_transitive_allow_and_hide_modes() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -2074,6 +2096,7 @@ async fn check_fails_closed_on_stale_lock() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -2132,6 +2155,7 @@ async fn upgrade_applies_clean_change() -> eyre::Result<()> {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -2184,6 +2208,7 @@ async fn upgrade_warns_when_final_lock_currency_is_unknown() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -2236,6 +2261,7 @@ async fn upgrade_honors_allow_stale_lock_after_apply() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: true,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -2319,6 +2345,7 @@ async fn upgrade_surfaces_a_forced_non_candidate_downgrade_never_silent() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -2391,6 +2418,7 @@ fn edge_reporting_fake(root: Utf8PathBuf, edge_rebinds_on_apply: Vec<EdgeRebind>
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     }
@@ -2715,6 +2743,7 @@ fn major_update_fake(root: camino::Utf8PathBuf, direct: bool, a_releases: Vec<Re
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     }
@@ -3667,6 +3696,7 @@ async fn fix_round_budget_exhaustion_warns_about_residual_violations() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -3884,6 +3914,7 @@ async fn upgrade_rolls_back_when_change_introduces_fresh_transitive() -> eyre::R
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -3954,6 +3985,7 @@ async fn upgrade_keeps_earlier_singleton_holds_when_later_selection_aborts() -> 
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State {
             fail_graph_after_attempt: Some(3),
             ..State::default()
@@ -4027,6 +4059,7 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State {
             // `t` enters the graph only after apply (the injected fresh transitive), so its
             // release probe is the one fetch reconciliation performs cold — graph-wide upgrade
@@ -4114,6 +4147,7 @@ async fn partial_outer_restore_reports_no_applied_rows() -> eyre::Result<()> {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State {
             // Like the reconcile-fetch test above: only the injected fresh transitive `t` is
             // fetch-cold after apply, now that graph-wide upgrade planning pre-fetches (and the
@@ -4192,6 +4226,7 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4262,6 +4297,7 @@ async fn upgrade_reconcile_discounts_a_hold_from_a_co_violating_requirer() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4331,6 +4367,7 @@ async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4384,6 +4421,7 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4463,6 +4501,7 @@ async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
         // `t@v0.5.0` is a violation already present in the baseline graph, before any apply.
+        confirm_strips: None,
         state: Mutex::new(State {
             fresh_transitive_present: true,
             ..State::default()
@@ -4526,6 +4565,7 @@ async fn upgrade_fails_closed_when_post_apply_validation_errors() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4573,6 +4613,7 @@ async fn upgrade_fails_closed_when_post_apply_locked_release_errors() {
         fail_locked_release_after_apply_for: Some("a".into()),
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4620,6 +4661,7 @@ async fn upgrade_stops_before_build_when_the_final_lock_is_stale() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: true,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -4674,6 +4716,7 @@ async fn upgrade_reports_a_failed_requested_build() {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: true,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root: root.clone(),
     };
@@ -4735,6 +4778,7 @@ async fn explain_traces_the_default_window() -> eyre::Result<()> {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -4790,6 +4834,7 @@ async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
         fail_locked_release_after_apply_for: None,
         stale_lock_after_apply: false,
         build_fails_after_apply: false,
+        confirm_strips: None,
         state: Mutex::new(State::default()),
         root,
     };
@@ -5809,6 +5854,703 @@ async fn advisory_shorten_mode_upgrades_the_fix_and_the_residual_gate_keeps_it()
     assert_eq!(flag_out.summary.applied, 0, "flag mode must not fast-track");
 }
 
+/// A young cross-major security fix (2 days old, matured only under the 1-day security window)
+/// with `a` locked at `v1.0.0`: the fix `v2.0.0` fixes `GHSA-CONF`.
+fn young_major_fix(root: Utf8PathBuf) -> (FakeEco, Arc<StaticAdvisories>) {
+    let fake = major_update_fake(
+        root,
+        true,
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v2.0.0",
+                1,
+                Some("2026-06-15T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+        ],
+    );
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("a".to_string(), ghsa_fixed_by("GHSA-CONF", "v2.0.0"))],
+        stale: false,
+        unreachable: false,
+    });
+    (fake, feed)
+}
+
+/// A `needs --major` hold keeps its security provenance: the held row says the target fixes the
+/// advisory (and that the security window is why it matured), instead of reading as a routine
+/// skip — the probe runs advised precisely so this hold surfaces at all.
+#[tokio::test]
+async fn a_held_back_major_security_fix_keeps_its_provenance() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let (fake, feed) = young_major_fix(root);
+    let out = workspace_with_layers(
+        fake,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&opts())
+    .await;
+
+    assert_eq!(out.summary.applied, 0);
+    let held = out
+        .items
+        .iter()
+        .find(|item| {
+            item.skipped
+                .as_ref()
+                .is_some_and(|skip| skip.reason == SkipReason::NeedsMajor)
+        })
+        .expect("the held-back major row");
+    assert_eq!(held.to, "v2.0.0");
+    let security = held.security.as_ref().expect("security provenance");
+    assert_eq!(security.fixes, vec!["GHSA-CONF".to_string()]);
+    assert!(security.applied, "matured only under the security window");
+}
+
+/// A ceiling hold (here a declared manifest bound) keeps its security provenance the same way —
+/// the ceiling recorder is a separate implementation from the `needs --major` one.
+#[tokio::test]
+async fn a_bound_held_security_fix_keeps_its_provenance() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let (mut fake, feed) = young_major_fix(root);
+    if let Some(release) = fake
+        .releases
+        .get_mut("a")
+        .and_then(|releases| releases.get_mut(1))
+    {
+        release.beyond_declared_bound = true;
+    }
+    if let Some(dep) = fake.direct.first_mut() {
+        dep.declared_bound = Some(">=1, <2".to_string());
+    }
+    let out = workspace_with_layers(
+        fake,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        allow_major: true,
+        ..opts()
+    })
+    .await;
+
+    assert_eq!(out.summary.applied, 0);
+    let held = out
+        .items
+        .iter()
+        .find(|item| {
+            item.skipped
+                .as_ref()
+                .is_some_and(|skip| skip.reason == SkipReason::DeclaredBoundHeld)
+        })
+        .expect("the bound-held row");
+    assert_eq!(held.to, "v2.0.0");
+    let security = held.security.as_ref().expect("security provenance");
+    assert_eq!(security.fixes, vec!["GHSA-CONF".to_string()]);
+    assert!(security.applied, "matured only under the security window");
+}
+
+/// A package whose resolved source is not provably in the advisory ecosystem (a private
+/// registry's namesake of a public package) carries no advisory identity: it is never queried,
+/// never annotated, and never earns the security window — the public package's advisories are
+/// about a different package. The narrowed coverage is said out loud, once.
+#[tokio::test]
+async fn an_unproven_source_gets_no_advisory_identity() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let private = |root: Utf8PathBuf| {
+        let mut eco = advisory_fake(root);
+        for dep in &mut eco.direct {
+            dep.advisory_identity = None;
+        }
+        eco
+    };
+
+    // Shorten mode: the same fixture whose public form fast-tracks the fix
+    // (see `advisory_shorten_mode_upgrades_the_fix_and_the_residual_gate_keeps_it`)
+    // must plan nothing when the package's origin is unproven.
+    let out = workspace_with_layers(
+        private(root.clone()),
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(advisory_feed())
+    .upgrade(&opts())
+    .await;
+    assert_eq!(
+        out.summary.applied, 0,
+        "a public namesake's advisory must not fast-track a private package: {:?}",
+        out.items
+    );
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryEcosystemUnsupported
+                && warning.message.contains("advisory ecosystem")
+        }),
+        "withheld coverage must be loud: {:?}",
+        out.warnings
+    );
+
+    // Flag mode: no annotation either — the advisory names a different package.
+    let advised = workspace_with_layers(private(root), Baseline::default(), advisory_layers(None))
+        .with_advisory_source(advisory_feed())
+        .outdated(&opts())
+        .await;
+    assert!(
+        advised.items[0].security.is_none(),
+        "an unproven source must not inherit the public package's annotation"
+    );
+}
+
+/// The read-side plumbing of feed-time confirmation: an identity the adapter withholds when
+/// `outdated` consults the feed (npm's effective-registry veto) is neither queried nor matched
+/// — the row loses its annotation and the withheld coverage warns — however confidently
+/// `dependencies()` granted it.
+#[tokio::test]
+async fn outdated_confirms_identities_with_the_adapter_before_the_feed() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = advisory_fake(root);
+    eco.confirm_strips = Some("a".to_string());
+    let ws = workspace_with_layers(eco, Baseline::default(), advisory_layers(None))
+        .with_advisory_source(advisory_feed());
+    let out = ws.outdated(&opts()).await;
+
+    assert!(
+        out.items[0].security.is_none(),
+        "a feed-time-withheld identity is never matched: {:?}",
+        out.items[0].security
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.kind == DiagnosticKind::AdvisoryEcosystemUnsupported),
+        "the withheld coverage is loud: {:?}",
+        out.warnings
+    );
+}
+
+/// The upgrade-side plumbing of the same confirmation: without it, the shorten mode adopts the
+/// young fix on the strength of an identity the adapter would have withheld at feed time.
+#[tokio::test]
+async fn upgrade_confirms_identities_with_the_adapter_before_the_feed() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = advisory_fake(root);
+    eco.confirm_strips = Some("a".to_string());
+    let ws = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(advisory_feed());
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(
+        out.summary.applied, 0,
+        "no security window without a confirmed identity: {:?}",
+        out.items
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.kind == DiagnosticKind::AdvisoryEcosystemUnsupported),
+        "the withheld coverage is loud: {:?}",
+        out.warnings
+    );
+}
+
+/// The collateral-provenance fixture: a matured routine `a` bump planned under `-p a`, with the
+/// transitive `t` outside the planning scope entirely — so any movement of `t` is purely the
+/// resolver's, claimed by no planned row and probed by no planner.
+fn collateral_fixture(root: Utf8PathBuf, t_releases: Vec<Release>, t_locked: Release) -> FakeEco {
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-01-02T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_current = t_locked.version.clone();
+    releases.insert("t".to_string(), t_releases);
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), t_locked);
+    fake(
+        root,
+        vec![dep("a", "v1.0.0", true)],
+        vec![dep("t", t_current.as_str(), false)],
+        releases,
+        locked,
+    )
+}
+
+fn collateral_move(from: &str, to: &str, kind: UpdateKind, downgrade: bool) -> Change {
+    Change {
+        package: PackageId::new(GO, "t", Some("proxy.example".into())),
+        from: Version::new(from),
+        to: Version::new(to),
+        kind,
+        downgrade,
+        direct: false,
+        members: Vec::new(),
+    }
+}
+
+/// A resolver-induced collateral change that lands an exact security fix must carry the same
+/// provenance a planned row would: `t` is outside the planning scope, but the joint resolve
+/// drags it onto the young fix admitted only by the security window — and that applied row must
+/// not read as a routine move.
+#[tokio::test]
+async fn a_collateral_security_fix_keeps_its_provenance() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = collateral_fixture(
+        root,
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            // Two days old: inside the 7d default window, past the 1d security window.
+            rel(
+                "v2.0.0",
+                1,
+                Some("2026-06-15T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+        ],
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    eco.collateral_on_apply = vec![collateral_move(
+        "v1.0.0",
+        "v2.0.0",
+        UpdateKind::Major,
+        false,
+    )];
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), ghsa_fixed_by("GHSA-COLL", "v2.0.0"))],
+        stale: false,
+        unreachable: false,
+    });
+    let out = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    let collateral_row = out
+        .items
+        .iter()
+        .find(|item| item.name == "t" && item.applied)
+        .expect("the collateral applied row");
+    assert_eq!(collateral_row.to, "v2.0.0");
+    let security = collateral_row
+        .security
+        .as_ref()
+        .expect("a collateral exact fix must not read as a routine move");
+    assert_eq!(security.fixes, vec!["GHSA-COLL".to_string()]);
+    assert_eq!(security.version, "v2.0.0");
+    assert!(security.applied, "the security window admits the young pin");
+}
+
+/// A collateral downgrade off an advisory's exact fix version must not commit in silence: the
+/// landing version is old and matured, so the residual gate passes it — the promised rollback
+/// warning is the only signal left.
+#[tokio::test]
+async fn a_collateral_rollback_off_a_fix_warns() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = collateral_fixture(
+        root,
+        vec![
+            rel("v1.0.1", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.0.2",
+                1,
+                Some("2026-01-02T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+        ],
+        rel("v1.0.2", 1, Some("2026-01-02T00:00:00Z"), None),
+    );
+    eco.collateral_on_apply = vec![collateral_move("v1.0.2", "v1.0.1", UpdateKind::Patch, true)];
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), ghsa_fixed_by("GHSA-COLL", "v1.0.2"))],
+        stale: false,
+        unreachable: false,
+    });
+    let out = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    let collateral_row = out
+        .items
+        .iter()
+        .find(|item| item.name == "t" && item.applied)
+        .expect("the collateral applied row");
+    assert_eq!(collateral_row.to, "v1.0.1");
+    assert!(collateral_row.downgrade);
+    assert!(
+        collateral_row.security.is_none(),
+        "the landing version fixes nothing"
+    );
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryRollback
+                && warning.message.contains("GHSA-COLL")
+                && warning.message.contains("rolled t back")
+        }),
+        "the rollback off the fix must warn: {:?}",
+        out.warnings
+    );
+}
+
+/// A *forward* collateral move can abandon a fix too: OSV ranges may reintroduce a
+/// vulnerability, so an advisory fixed at `v1.0.2` can list `v3.1.0` as affected again. Both
+/// versions here are old and matured, so the residual gate passes the landing pin as routine —
+/// the direction-neutral fix-loss warning is the only signal left.
+#[tokio::test]
+async fn a_collateral_forward_move_onto_a_reintroduced_advisory_warns() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = collateral_fixture(
+        root,
+        vec![
+            rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+            rel(
+                "v3.1.0",
+                1,
+                Some("2026-01-03T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+        ],
+        rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+    );
+    eco.collateral_on_apply = vec![collateral_move(
+        "v1.0.2",
+        "v3.1.0",
+        UpdateKind::Major,
+        false,
+    )];
+    let mut advisory = ghsa_fixed_by("GHSA-COLL", "v1.0.2");
+    advisory.affected_versions = vec!["v3.1.0".to_string()];
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), advisory)],
+        stale: false,
+        unreachable: false,
+    });
+    let out = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryRollback
+                && warning.message.contains("moved t from v1.0.2")
+                && warning.message.contains("GHSA-COLL")
+                && warning.message.contains("affected again")
+        }),
+        "the forward move off the fix must warn: {:?}",
+        out.warnings
+    );
+}
+
+/// The anti-noise half of direction-neutral fix loss: a forward move past a fix boundary onto a
+/// version the advisory does *not* list stays silent — past the boundary the graph is
+/// ordinarily still fixed, and warning there would fire on every routine upgrade of a package
+/// that ever adopted a security fix.
+#[tokio::test]
+async fn a_collateral_forward_move_past_a_fix_stays_silent() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = collateral_fixture(
+        root,
+        vec![
+            rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+            rel(
+                "v1.0.4",
+                1,
+                Some("2026-01-03T00:00:00Z"),
+                Some(UpdateKind::Patch),
+            ),
+        ],
+        rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+    );
+    eco.collateral_on_apply = vec![collateral_move(
+        "v1.0.2",
+        "v1.0.4",
+        UpdateKind::Patch,
+        false,
+    )];
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), ghsa_fixed_by("GHSA-COLL", "v1.0.2"))],
+        stale: false,
+        unreachable: false,
+    });
+    let out = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|warning| warning.kind == DiagnosticKind::AdvisoryRollback),
+        "a still-fixed landing version must not warn: {:?}",
+        out.warnings
+    );
+}
+
+/// The common OSV shape expresses a reintroduction as *ranges alone* — `introduced 0`,
+/// `fixed v1.0.2`, `introduced v3.0.0` — with no enumerated affected versions. The gate's
+/// single-release classification cannot order those boundaries, so the commit-time capture
+/// must re-classify the landing package against its full release list and still warn.
+#[tokio::test]
+async fn a_collateral_forward_move_onto_a_range_only_reintroduction_warns() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = collateral_fixture(
+        root,
+        vec![
+            rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+            rel(
+                "v3.0.0",
+                1,
+                Some("2026-01-03T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+            rel(
+                "v3.1.0",
+                2,
+                Some("2026-01-04T00:00:00Z"),
+                Some(UpdateKind::Major),
+            ),
+        ],
+        rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+    );
+    eco.collateral_on_apply = vec![collateral_move(
+        "v1.0.2",
+        "v3.1.0",
+        UpdateKind::Major,
+        false,
+    )];
+    let mut advisory = ghsa_fixed_by("GHSA-COLL", "v1.0.2");
+    advisory.ranges = vec![RawAffectedRange {
+        events: vec![
+            cooldown_core::RawRangeEvent::Introduced("0".to_string()),
+            cooldown_core::RawRangeEvent::Fixed("v1.0.2".to_string()),
+            cooldown_core::RawRangeEvent::Introduced("v3.0.0".to_string()),
+        ],
+    }];
+    assert!(
+        advisory.affected_versions.is_empty(),
+        "the reintroduction must be provable from the range alone"
+    );
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), advisory)],
+        stale: false,
+        unreachable: false,
+    });
+    let out = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed)
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryRollback
+                && warning.message.contains("moved t from v1.0.2")
+                && warning.message.contains("GHSA-COLL")
+                && warning.message.contains("affected again")
+        }),
+        "a range-only reintroduction must warn like an enumerated one: {:?}",
+        out.warnings
+    );
+}
+
+/// The planned twin of the range-only case: the newest matured candidate lands inside a
+/// reintroduced range the advisory expresses without enumerating a single version.
+#[tokio::test]
+async fn a_planned_move_onto_a_range_only_reintroduction_warns() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+            rel(
+                "v1.5.0",
+                1,
+                Some("2026-01-03T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+            rel(
+                "v1.9.0",
+                2,
+                Some("2026-01-04T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+    );
+    let eco = fake(
+        root,
+        vec![dep("a", "v1.0.2", true)],
+        Vec::new(),
+        releases,
+        locked,
+    );
+    let mut advisory = ghsa_fixed_by("GHSA-CONF", "v1.0.2");
+    advisory.ranges = vec![RawAffectedRange {
+        events: vec![
+            cooldown_core::RawRangeEvent::Introduced("0".to_string()),
+            cooldown_core::RawRangeEvent::Fixed("v1.0.2".to_string()),
+            cooldown_core::RawRangeEvent::Introduced("v1.5.0".to_string()),
+        ],
+    }];
+    let ws = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(Arc::new(StaticAdvisories {
+        advisories: vec![("a".to_string(), advisory)],
+        stale: false,
+        unreachable: false,
+    }));
+    let out = ws.upgrade(&opts()).await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    let row = out
+        .items
+        .iter()
+        .find(|item| item.name == "a" && item.applied)
+        .expect("the planned applied row");
+    assert_eq!(row.to, "v1.9.0");
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryRollback
+                && warning.message.contains("moved a from v1.0.2")
+                && warning.message.contains("GHSA-CONF")
+                && warning.message.contains("affected again")
+        }),
+        "the planned range-only reintroduction must warn: {:?}",
+        out.warnings
+    );
+}
+
+/// A *planned* move abandons a fix the same way a collateral one does — the planner prefers
+/// fixes but is deliberately not a vulnerability gate, so the newest matured candidate wins
+/// even when the advisory lists it as affected again — and planned rows previously carried no
+/// fix-loss check at all.
+#[tokio::test]
+async fn a_planned_move_onto_a_reintroduced_advisory_warns() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-01-03T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.2", 0, Some("2026-01-02T00:00:00Z"), None),
+    );
+    let eco = fake(
+        root,
+        vec![dep("a", "v1.0.2", true)],
+        Vec::new(),
+        releases,
+        locked,
+    );
+    let mut advisory = ghsa_fixed_by("GHSA-CONF", "v1.0.2");
+    advisory.affected_versions = vec!["v1.1.0".to_string()];
+    let ws = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(Arc::new(StaticAdvisories {
+        advisories: vec![("a".to_string(), advisory)],
+        stale: false,
+        unreachable: false,
+    }));
+    let out = ws.upgrade(&opts()).await;
+
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    let row = out
+        .items
+        .iter()
+        .find(|item| item.name == "a" && item.applied)
+        .expect("the planned applied row");
+    assert_eq!(row.to, "v1.1.0");
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.kind == DiagnosticKind::AdvisoryRollback
+                && warning.message.contains("moved a from v1.0.2")
+                && warning.message.contains("GHSA-CONF")
+        }),
+        "the planned move off the fix must warn: {:?}",
+        out.warnings
+    );
+}
+
 /// A project whose matured `a` upgrade drags a fresh transitive `t` into the graph on apply —
 /// the re-lock shape that introduces a package no initial advisory fetch could have asked about.
 ///
@@ -6219,6 +6961,53 @@ async fn advisory_snapshot_grows_to_cover_a_relock_introduced_fix() {
             .and_then(|item| item.skipped.as_ref())
             .map(|skipped| skipped.reason),
         Some(SkipReason::TransitiveInCooldown)
+    );
+}
+
+/// A re-lock can also introduce a package whose source is *not* provably in the ecosystem.
+/// Withholding its identity is correct — it must not inherit the public namesake's advisories,
+/// so the security window never applies and the young pin gates the batch — but the narrowed
+/// coverage must be said out loud, exactly once, not swallowed by the top-up's "nothing
+/// queryable" early return.
+#[tokio::test]
+async fn a_relock_introduced_unproven_package_narrows_coverage_loudly() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut eco = relock_introduces_fresh_transitive(root);
+    if let Some(dep) = eco.fresh_transitive.as_mut() {
+        dep.advisory_identity = None;
+    }
+    let ws = workspace_with_layers(
+        eco,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(Arc::new(StaticAdvisories {
+        advisories: vec![("t".to_string(), ghsa_fixed_by("GHSA-T", "v0.5.0"))],
+        stale: false,
+        unreachable: false,
+    }));
+    let out = ws.upgrade(&opts()).await;
+
+    assert_eq!(
+        out.summary.applied, 0,
+        "an unproven source earns no security window, so the young pin gates the batch: {:?}",
+        out.items
+    );
+    let narrowed: Vec<_> = out
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind == DiagnosticKind::AdvisoryEcosystemUnsupported)
+        .collect();
+    assert_eq!(
+        narrowed.len(),
+        1,
+        "the narrowing is reported exactly once, not once per gate pass: {:?}",
+        out.warnings
+    );
+    assert!(
+        narrowed[0].message.contains("newly resolved"),
+        "the report names the re-lock as the origin: {}",
+        narrowed[0].message
     );
 }
 
