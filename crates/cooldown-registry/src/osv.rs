@@ -523,6 +523,9 @@ fn raw_advisory(vuln: &OsvVuln, ecosystem: &str, package: &str) -> RawAdvisory {
 
 /// Whether one `affected[]` entry is about `(ecosystem, package)`.
 ///
+/// The schema's wildcard name `*` marks an advisory affecting *every* package of the ecosystem
+/// (e.g. an ecosystem version past end-of-life), so it matches any queried package; its
+/// evidence then weighs like any other advisory's.
 /// `SwiftURL` names packages by repository URL and GitHub URLs are case-insensitive, so the
 /// lockfile's casing need not match the advisory's; only that ecosystem compares
 /// case-insensitively.
@@ -530,6 +533,7 @@ fn affected_matches(affected: &OsvAffected, ecosystem: &str, package: &str) -> b
     affected.package.as_ref().is_some_and(|p| {
         p.ecosystem == ecosystem
             && (p.name == package
+                || p.name == "*"
                 || (ecosystem == "SwiftURL" && p.name.eq_ignore_ascii_case(package)))
     })
 }
@@ -1100,6 +1104,30 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    /// The schema's wildcard package name `*` marks an advisory affecting every package of the
+    /// ecosystem (e.g. an EOL ecosystem version), so it contributes evidence to any queried
+    /// package instead of being silently discarded by the name filter.
+    #[test]
+    fn wildcard_package_advisories_match_every_queried_package() {
+        let vuln = vuln_from(serde_json::json!({
+            "id": "GHSA-eol",
+            "summary": "ecosystem is end-of-life",
+            "affected": [{
+                "package": { "ecosystem": "npm", "name": "*" },
+                "versions": ["1.0.0"]
+            }]
+        }));
+
+        assert!(lists_package(&vuln, "npm", "left-pad"));
+        assert!(
+            !lists_package(&vuln, "PyPI", "left-pad"),
+            "the wildcard is scoped to its ecosystem"
+        );
+        let raw = raw_advisory(&vuln, "npm", "left-pad");
+        assert_eq!(raw.affected_versions, vec!["1.0.0".to_string()]);
+        assert_eq!(raw.summary, "ecosystem is end-of-life");
     }
 
     #[test]
