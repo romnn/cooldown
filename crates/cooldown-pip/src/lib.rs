@@ -3,6 +3,7 @@
 //! per tool via a [`PyLayout`](tool::PyLayout), so each is its own
 //! [`ToolId`](cooldown_core::ToolId) reading its own manifest/lock format.
 
+mod ambient;
 pub mod lock;
 pub mod tool;
 

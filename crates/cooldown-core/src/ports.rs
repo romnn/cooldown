@@ -149,16 +149,20 @@ pub trait ToolRead: Send + Sync {
         version.to_string()
     }
 
-    /// Translates one of this tool's package names into the advisory database's spelling, for
-    /// the feed query.
+    /// Confirms the advisory identities [`dependencies`](Self::dependencies) granted, with
+    /// evidence only worth gathering when the advisory feed is about to be consulted — for npm,
+    /// the package manager's *effective* registry routing, whose global and builtin layers no
+    /// enumerable file walk can locate (they live at prefix-relative paths behind
+    /// version-manager shims).
     ///
-    /// The query side of the advisory API is case- and separator-sensitive, so a name that does
-    /// not match the database's canonical spelling silently returns no advisories at all.
-    /// Identity for most tools; Swift maps its `owner/repo` identity onto OSV's `SwiftURL`
-    /// repository URL (`github.com/apple/swift-nio`, lowercased), and the Python tools normalize
-    /// to the PEP 503 form OSV's `PyPI` ecosystem stores.
-    fn advisory_package(&self, package: &str) -> String {
-        package.to_string()
+    /// The application calls this before identities are consumed — sent to the feed, matched
+    /// against fetched advisories, or counted as withheld — and never on feed-disabled runs.
+    /// An implementation may only *withhold* identities (set them to `None`), never grant or
+    /// alter one, and handles its own failures by withholding — unknown routing must not pass
+    /// as none. It should memoize per project: the residual gate re-reads the graph every
+    /// pass. The default keeps the identities exactly as granted.
+    async fn confirm_advisory_identities(&self, project: &Project, deps: &mut [Dependency]) {
+        let _ = (project, deps);
     }
 
     /// Returns the **raw, unscoped** resolved dependencies for `project`.

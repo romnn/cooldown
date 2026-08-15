@@ -33,6 +33,13 @@ pub trait NodeLock: Send + Sync + 'static {
     /// not-eligible skips for them.
     const SUPPORTS_TRANSITIVE_ADVANCE: bool = false;
 
+    /// Whether this manager's *effective* registry routing can be confirmed by asking the
+    /// binary itself (`npm config list --json` merges builtin, global, user, project, and
+    /// environment layers). `false` means it cannot be — yarn classic merges `.yarnrc` files up
+    /// the directory tree with no reliably parseable query, and pnpm/bun grant no identities in
+    /// the first place — so every advisory identity is withheld at feed time.
+    const CONFIRMS_EFFECTIVE_REGISTRY: bool = false;
+
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
     /// # Errors
@@ -1069,14 +1076,20 @@ pub struct NameVersion {
     pub name: String,
     /// The version — everything after the specifier's last `@`.
     pub version: String,
+    /// The URL the lock records this entry as fetched from, when the format records one per
+    /// entry (`package-lock.json`'s and yarn classic's `resolved`). `None` for formats that
+    /// keep no per-entry origin (pnpm, bun) and for entries without one — advisory identity
+    /// then has no positive origin evidence and is withheld.
+    pub resolved: Option<String>,
 }
 
 impl NameVersion {
-    /// Builds the pair from its already-split halves.
+    /// Builds the pair from its already-split halves, with no recorded origin.
     pub(crate) fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             version: version.into(),
+            resolved: None,
         }
     }
 }
@@ -1089,6 +1102,7 @@ pub(crate) fn split_name_version(spec: &str) -> Option<NameVersion> {
     Some(NameVersion {
         name: name.to_string(),
         version: version[1..].to_string(),
+        resolved: None,
     })
 }
 
@@ -1144,6 +1158,7 @@ impl NodeLock for Npm {
     const ID: ToolId = ToolId("npm");
     const LOCKFILE: &'static str = "package-lock.json";
     const BIN: &'static str = "npm";
+    const CONFIRMS_EFFECTIVE_REGISTRY: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_npm(content)
@@ -1441,17 +1456,34 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
                 continue;
             }
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
-                out.push(NameVersion::new(name, version));
+                out.push(NameVersion {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    resolved: lock_entry_resolved(val),
+                });
             }
         }
     } else if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_object()) {
         for (name, val) in deps {
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
-                out.push(NameVersion::new(name.clone(), version));
+                out.push(NameVersion {
+                    name: name.clone(),
+                    version: version.to_string(),
+                    resolved: lock_entry_resolved(val),
+                });
             }
         }
     }
     Ok(out)
+}
+
+/// The `resolved` URL of one `package-lock.json` entry — npm's record of where the tarball was
+/// actually fetched from. Absent for link/bundled entries (and `false` in v1 locks installed
+/// with `--no-save`), which therefore carry no origin evidence.
+fn lock_entry_resolved(val: &serde_json::Value) -> Option<String> {
+    val.get("resolved")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// Parses `pnpm-lock.yaml` (v9, enforced by [`parse_pnpm_document_strict`]): the top-level
@@ -2065,13 +2097,27 @@ fn parse_npm_exact_pins(content: &str) -> HashSet<String> {
 fn parse_yarn(content: &str) -> Vec<NameVersion> {
     let mut out = Vec::new();
     let mut pending: Vec<String> = Vec::new();
+    // The entry's fields arrive line by line (`version` before `resolved` in yarn's own output,
+    // but the order is not load-bearing here): the names flush on `version`, and a later
+    // `resolved` back-fills the rows just flushed — they are the tail of `out`.
+    let mut flushed_at = 0;
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("  version ") {
             let version = rest.trim().trim_matches('"');
+            flushed_at = out.len();
             for name in pending.drain(..) {
                 out.push(NameVersion::new(name, version));
             }
+        } else if let Some(rest) = line.strip_prefix("  resolved ") {
+            // `resolved "https://registry.yarnpkg.com/…/lodash-4.17.21.tgz#<hash>"` — the
+            // fragment is yarn's checksum, not part of the origin URL.
+            let url = rest.trim().trim_matches('"');
+            let url = url.split('#').next().unwrap_or(url);
+            for entry in out.get_mut(flushed_at..).unwrap_or_default() {
+                entry.resolved = Some(url.to_string());
+            }
         } else if !line.starts_with([' ', '#']) && line.trim_end().ends_with(':') {
+            flushed_at = out.len();
             let key = line.trim_end().trim_end_matches(':');
             // One entry can list several ranges for the same name (`foo@^1, foo@~1.2`); they all
             // resolve to one version, so collapse them to a single name.
@@ -2187,14 +2233,16 @@ mod tests {
             split_name_version("lodash@4.17.15"),
             Some(NameVersion {
                 name: "lodash".into(),
-                version: "4.17.15".into()
+                version: "4.17.15".into(),
+                resolved: None
             })
         );
         assert_eq!(
             split_name_version("@babel/core@7.1.0"),
             Some(NameVersion {
                 name: "@babel/core".into(),
-                version: "7.1.0".into()
+                version: "7.1.0".into(),
+                resolved: None
             })
         );
         assert_eq!(split_name_version("no-version"), None);
@@ -2220,6 +2268,93 @@ mod tests {
                 NameVersion::new("b", "2.0.0"),
             ])
         );
+    }
+
+    /// The per-entry `resolved` URL is the advisory-identity origin evidence, so both npm lock
+    /// generations must surface it verbatim — and an entry without one must stay `None`.
+    #[test]
+    fn npm_entries_carry_their_resolved_urls() {
+        let lock = indoc! {r#"
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "version": "0.1.0" },
+                    "node_modules/lodash": { "version": "4.17.15", "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz" },
+                    "node_modules/private-api": { "version": "1.0.0", "resolved": "https://npm.corp.example/private-api/-/private-api-1.0.0.tgz" },
+                    "node_modules/unrecorded": { "version": "2.0.0" }
+                }
+            }"#};
+        let entries = parse_npm(lock).expect("parse");
+        let resolved_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("entry")
+                .resolved
+                .clone()
+        };
+        assert_eq!(
+            resolved_of("lodash").as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz")
+        );
+        assert_eq!(
+            resolved_of("private-api").as_deref(),
+            Some("https://npm.corp.example/private-api/-/private-api-1.0.0.tgz")
+        );
+        assert_eq!(resolved_of("unrecorded"), None);
+
+        let v1 = indoc! {r#"
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "lodash": { "version": "4.17.15", "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz" }
+                }
+            }"#};
+        let entries = parse_npm(v1).expect("parse v1");
+        assert_eq!(
+            entries[0].resolved.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz")
+        );
+    }
+
+    /// yarn classic's `resolved` line carries the origin URL with the checksum as a fragment;
+    /// the URL (fragment stripped) back-fills every name the entry's ranges collapsed to.
+    #[test]
+    fn yarn_entries_carry_their_resolved_urls() {
+        let lock = indoc! {r#"
+            # yarn lockfile v1
+
+            lodash@^4.17.0, lodash@~4.17.20:
+              version "4.17.21"
+              resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#679591c"
+              integrity sha512-x
+
+            "@corp/api@^1.0.0":
+              version "1.0.0"
+              resolved "https://npm.corp.example/@corp/api/-/api-1.0.0.tgz#abc"
+
+            unrecorded@^2.0.0:
+              version "2.0.0"
+        "#};
+        let entries = parse_yarn(lock);
+        let resolved_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("entry")
+                .resolved
+                .clone()
+        };
+        assert_eq!(
+            resolved_of("lodash").as_deref(),
+            Some("https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"),
+            "the checksum fragment is not part of the origin"
+        );
+        assert_eq!(
+            resolved_of("@corp/api").as_deref(),
+            Some("https://npm.corp.example/@corp/api/-/api-1.0.0.tgz")
+        );
+        assert_eq!(resolved_of("unrecorded"), None);
     }
 
     #[test]
@@ -2428,8 +2563,16 @@ mod tests {
         assert_eq!(
             sorted(parse_yarn(lock)),
             sorted(vec![
-                NameVersion::new("lodash", "4.17.15"),
-                NameVersion::new("@babel/core", "7.1.0"),
+                NameVersion {
+                    name: "lodash".into(),
+                    version: "4.17.15".into(),
+                    resolved: Some("https://x".into()),
+                },
+                NameVersion {
+                    name: "@babel/core".into(),
+                    version: "7.1.0".into(),
+                    resolved: Some("https://y".into()),
+                },
             ])
         );
     }

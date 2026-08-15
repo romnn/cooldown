@@ -64,6 +64,7 @@ pub fn yanked(mut r: Release) -> Release {
 pub fn dep(name: &str, current: &str, quality: ReleaseQuality) -> Dependency {
     Dependency {
         package: PackageId::new(GO, name, None),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(current),
         current_quality: quality,
         direct: true,

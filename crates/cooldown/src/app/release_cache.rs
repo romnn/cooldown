@@ -452,6 +452,7 @@ mod tests {
     fn test_dep() -> Dependency {
         Dependency {
             package: PackageId::new(ToolId("test"), "pkg".to_string(), None),
+            advisory_identity: Some("pkg".to_string()),
             current: Version::new("1.0.0".to_string()),
             current_quality: ReleaseQuality::Stable,
             direct: true,

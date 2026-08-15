@@ -328,6 +328,7 @@ fn old_import_path_for_cross_major_downgrade() {
 fn dep(name: &str, current: &str) -> Dependency {
     Dependency {
         package: PackageId::new(GO_ID, name, None),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(current),
         current_quality: classify_quality(current),
         direct: true,

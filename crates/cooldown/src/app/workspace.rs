@@ -1382,6 +1382,7 @@ mod tests {
     fn dep(name: &str, member_name: &str, member_path: &str) -> Dependency {
         Dependency {
             package: PackageId::new(PNPM, name.to_string(), Some("registry.example".to_string())),
+            advisory_identity: Some(name.to_string()),
             current: Version::new("1.0.0"),
             current_quality: ReleaseQuality::Stable,
             direct: true,
@@ -1535,6 +1536,7 @@ mod tests {
             id: CARGO,
             deps: vec![Dependency {
                 package: PackageId::new(CARGO, "shared-dep".to_string(), None),
+                advisory_identity: Some("shared-dep".to_string()),
                 current: Version::new("1.0.0"),
                 current_quality: ReleaseQuality::Stable,
                 direct: true,

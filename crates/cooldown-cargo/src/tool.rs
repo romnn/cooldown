@@ -201,6 +201,9 @@ impl ToolRead for CargoTool {
             let pinned = graph.is_exact_pinned(&info.name, &info.version);
             deps.push(Dependency {
                 package: PackageId::new(CARGO_ID, info.name.clone(), Some(CRATES_IO.to_string())),
+                // Non-crates.io sources are skipped above, so every dependency here is provably
+                // the crate OSV's `crates.io` ecosystem describes.
+                advisory_identity: Some(info.name.clone()),
                 current: Version::new(info.version.clone()),
                 current_quality: classify_quality(&info.version),
                 direct,
@@ -1430,6 +1433,7 @@ mod tests {
         let published_at = "2026-01-02T03:04:05Z".parse().expect("valid timestamp");
         let dep = Dependency {
             package: PackageId::new(CARGO_ID, "serde", Some(CRATES_IO.to_string())),
+            advisory_identity: Some("serde".to_string()),
             current: Version::new("1.0.200"),
             current_quality: ReleaseQuality::Stable,
             direct: true,

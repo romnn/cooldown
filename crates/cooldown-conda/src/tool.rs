@@ -240,6 +240,9 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             let registry = if entry.conda { CONDA } else { PYPI };
             deps.push(Dependency {
                 package: PackageId::new(L::ID, entry.name, Some(registry.to_string())),
+                // No advisory-database ecosystem maps conda channels (see `capabilities`), so
+                // no package carries an advisory identity.
+                advisory_identity: None,
                 current: Version::new(entry.version.clone()),
                 current_quality: classify_quality(&entry.version),
                 direct: is_direct,

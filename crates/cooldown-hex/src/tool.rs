@@ -111,8 +111,12 @@ impl ToolRead for HexTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // Only a hexpm-repo entry is the package OSV's `Hex` ecosystem describes; a private
+            // Hex repo's package merely shares the name.
+            let advisory_identity = resolved.hexpm.then(|| resolved.name.clone());
             deps.push(Dependency {
                 package: PackageId::new(HEX_ID, resolved.name.clone(), Some(HEXPM.to_string())),
+                advisory_identity,
                 current: Version::new(resolved.version.clone()),
                 current_quality: classify_quality(&resolved.version),
                 direct: is_direct,

@@ -10,7 +10,8 @@
 //! *shorten* a window — the ordinary, stricter window stands — so the feed fails open with a
 //! loud warning (`--fail-on-advisory-source` escalates it for gates that insist).
 //! Stale cached advisory data may still annotate but never shortens: the shorten mode degrades
-//! to flag for that project.
+//! to flag for that project — or, when the staleness arrives with an upgrade top-up after the
+//! mode is settled, for exactly the topped-up packages.
 
 use super::{AdvisoryFailureMode, ProjectCtx, RunOpts, Workspace};
 use cooldown_core::{
@@ -39,7 +40,19 @@ pub(crate) struct ProjectAdvisories {
     source: AdvisorySourceId,
     /// The advisory ecosystem used for the initial fetch and every later top-up.
     ecosystem: &'static str,
+    /// Advisory-package identities whose evidence arrived from a stale cache *after* the
+    /// project's shorten mode was settled by the initial fetch.
+    ///
+    /// Stale data may annotate but never shorten, and the earlier planning rounds already
+    /// resolved under the settled mode, so the demotion cannot be project-wide the way the
+    /// initial fetch's is — these packages classify under [`flag_policy`](Self::flag_policy)
+    /// instead: their advisories still flag rows and warn on rollbacks, but never earn the
+    /// security window.
+    flag_only: std::collections::HashSet<String>,
     policy: ResolvedAdvisoryPolicy,
+    /// [`policy`](Self::policy) with the shorten mode demoted to flag, for the
+    /// [`flag_only`](Self::flag_only) packages.
+    flag_policy: ResolvedAdvisoryPolicy,
 }
 
 /// One dependency's classified advisories, borrowing the project policy — everything an
@@ -60,6 +73,36 @@ impl ClassifiedAdvisories<'_> {
 }
 
 impl ProjectAdvisories {
+    /// Builds one project's initial snapshot from its (already policy-vetted) fetch.
+    fn from_fetch(
+        fetch: cooldown_core::AdvisoryFetch,
+        queried: Vec<String>,
+        source: AdvisorySourceId,
+        ecosystem: &'static str,
+        policy: ResolvedAdvisoryPolicy,
+    ) -> Self {
+        let mut by_package: HashMap<String, Vec<RawAdvisory>> = HashMap::new();
+        for package in fetch.packages {
+            by_package
+                .entry(package.package)
+                .or_default()
+                .extend(package.advisories);
+        }
+        let flag_policy = ResolvedAdvisoryPolicy {
+            mode: AdvisoryMode::Flag,
+            ..policy.clone()
+        };
+        ProjectAdvisories {
+            by_package,
+            queried: queried.into_iter().collect(),
+            source,
+            ecosystem,
+            flag_only: std::collections::HashSet::new(),
+            policy,
+            flag_policy,
+        }
+    }
+
     /// Classifies `dep`'s advisories against its fetched `releases`.
     ///
     /// `None` when no advisory names this package — evaluation then runs exactly unadvised.
@@ -73,9 +116,17 @@ impl ProjectAdvisories {
         dep: &Dependency,
         releases: &[Release],
     ) -> Option<ClassifiedAdvisories<'_>> {
-        let raws = self
-            .by_package
-            .get(&adapter.advisory_package(&dep.package.name))?;
+        // A dependency without an advisory identity (its source is not provably in the
+        // ecosystem) is never classified, even when a same-named queried package left an entry.
+        let package = dep.advisory_identity.as_ref()?;
+        let raws = self.by_package.get(package)?;
+        // A package whose evidence arrived stale after the shorten mode settled classifies
+        // under the demoted policy: it annotates but never shortens.
+        let policy = if self.flag_only.contains(package) {
+            &self.flag_policy
+        } else {
+            &self.policy
+        };
         let normalize =
             |version: &str| cooldown_core::Version::new(adapter.advisory_version(version));
         Some(ClassifiedAdvisories {
@@ -83,15 +134,17 @@ impl ProjectAdvisories {
                 .iter()
                 .map(|raw| classify_advisory(raw, self.source, releases, &normalize))
                 .collect(),
-            policy: &self.policy,
+            policy,
         })
     }
 
-    /// The advisory-package identities among `names` this fetch never queried, deduplicated.
-    pub(crate) fn unqueried(&self, adapter: &dyn ToolRead, names: &[String]) -> Vec<String> {
-        let mut packages: Vec<String> = names
+    /// The advisory-package identities among `deps` this fetch never queried, deduplicated.
+    /// Dependencies without an identity are not advisory packages at all, so they never count
+    /// as unqueried.
+    pub(crate) fn unqueried(&self, deps: &[Dependency]) -> Vec<String> {
+        let mut packages: Vec<String> = deps
             .iter()
-            .map(|name| adapter.advisory_package(name))
+            .filter_map(|dep| dep.advisory_identity.clone())
             .filter(|package| !self.queried.contains(package))
             .collect();
         packages.sort();
@@ -99,11 +152,46 @@ impl ProjectAdvisories {
         packages
     }
 
+    /// The advisory ecosystem this snapshot was fetched under, for diagnostics about packages
+    /// outside it.
+    pub(crate) fn ecosystem(&self) -> &'static str {
+        self.ecosystem
+    }
+
+    /// The snapshot of a fetch that consulted no feed because no package's source was
+    /// provable: no evidence, no queried identities — a later re-lock's provable packages
+    /// still top it up.
+    fn withheld(
+        source: AdvisorySourceId,
+        ecosystem: &'static str,
+        policy: ResolvedAdvisoryPolicy,
+    ) -> Self {
+        ProjectAdvisories::from_fetch(
+            cooldown_core::AdvisoryFetch {
+                packages: Vec::new(),
+                stale: false,
+            },
+            Vec::new(),
+            source,
+            ecosystem,
+            policy,
+        )
+    }
+
     /// This snapshot extended with `fetch`'s advisories for `queried`.
     ///
     /// Additive by construction: entries already present are copied verbatim, so evidence the
     /// planner has already acted on cannot change under it.
-    fn extended(&self, queried: &[String], fetch: cooldown_core::AdvisoryFetch) -> Self {
+    ///
+    /// `flag_only` marks the added identities as annotate-only (stale top-up data under the
+    /// shorten mode — see [`Self::flag_only`]); identities the initial fetch already covered
+    /// keep their standing either way.
+    fn extended(
+        &self,
+        queried: &[String],
+        fetch: cooldown_core::AdvisoryFetch,
+        flag_only: bool,
+    ) -> Self {
         let mut by_package = self.by_package.clone();
         for package in fetch.packages {
             if self.queried.contains(&package.package) {
@@ -115,14 +203,69 @@ impl ProjectAdvisories {
                 .extend(package.advisories);
         }
         let mut already = self.queried.clone();
-        already.extend(queried.iter().cloned());
+        let mut flagged = self.flag_only.clone();
+        for package in queried {
+            if flag_only && !self.queried.contains(package) {
+                flagged.insert(package.clone());
+            }
+            already.insert(package.clone());
+        }
         ProjectAdvisories {
             by_package,
             queried: already,
             source: self.source,
             ecosystem: self.ecosystem,
+            flag_only: flagged,
             policy: self.policy.clone(),
+            flag_policy: self.flag_policy.clone(),
         }
+    }
+}
+
+/// The feed query's scope for one project: the distinct advisory-package identities its
+/// dependencies carry, plus how many packages carried none.
+///
+/// Computed eagerly from the dependency list (rather than borrowing it) so callers can hand the
+/// dependencies to the release fetch while the advisory fetch runs concurrently.
+pub(crate) struct AdvisoryPackages {
+    /// The identities to query, sorted and deduplicated.
+    identities: Vec<String>,
+    /// The distinct package names that carry no advisory identity — their resolved source is
+    /// not provably in the tool's advisory ecosystem (see [`Dependency::advisory_identity`]).
+    /// Reported once per fetch (and remembered by the upgrade executor so a later top-up
+    /// reports only *newly* introduced ones), so an enabled feed never narrows its coverage
+    /// silently.
+    excluded: Vec<String>,
+}
+
+impl AdvisoryPackages {
+    pub(crate) fn from_deps(deps: &[Dependency]) -> Self {
+        let mut identities: Vec<String> = deps
+            .iter()
+            .filter_map(|dep| dep.advisory_identity.clone())
+            .collect();
+        identities.sort();
+        identities.dedup();
+        let mut excluded: Vec<String> = deps
+            .iter()
+            .filter(|dep| dep.advisory_identity.is_none())
+            .map(|dep| dep.package.name.clone())
+            .collect();
+        excluded.sort_unstable();
+        excluded.dedup();
+        AdvisoryPackages {
+            identities,
+            excluded,
+        }
+    }
+
+    /// The package names withheld from the feed, for the executor's top-up accounting.
+    pub(crate) fn excluded_names(&self) -> &[String] {
+        &self.excluded
+    }
+
+    fn is_empty(&self) -> bool {
+        self.identities.is_empty() && self.excluded.is_empty()
     }
 }
 
@@ -229,13 +372,13 @@ impl Workspace {
         adapter: &dyn ToolRead,
         pctx: &ProjectCtx,
         project_label: &str,
-        package_names: &[String],
+        packages: AdvisoryPackages,
         opts: &RunOpts,
     ) -> AdvisoryOutcome {
         let Some(mut policy) = advisory_fetch_policy(pctx) else {
             return AdvisoryOutcome::inert();
         };
-        if package_names.is_empty() {
+        if packages.is_empty() {
             return AdvisoryOutcome::inert();
         }
         // The policy selects a feed the wired source must actually implement.
@@ -267,20 +410,25 @@ impl Workspace {
                 errors: Vec::new(),
             };
         };
-
-        let mut packages: Vec<String> = package_names
-            .iter()
-            .map(|name| adapter.advisory_package(name))
-            .collect();
-        packages.sort();
-        packages.dedup();
+        let Some(identities) =
+            queryable_identities(packages, pctx, project_label, ecosystem, &mut warnings)
+        else {
+            // Every package's source is outside the ecosystem: nothing to send, so the feed is
+            // not consulted at all — but the snapshot still exists, so a later re-lock that
+            // introduces a provable package tops it up instead of going unadvised.
+            return AdvisoryOutcome {
+                advisories: Some(ProjectAdvisories::withheld(source.id(), ecosystem, policy)),
+                warnings,
+                errors: Vec::new(),
+            };
+        };
 
         opts.progress.phase(format!(
             "querying {} advisories for {} packages",
             source.id(),
-            packages.len()
+            identities.len()
         ));
-        let fetch = match source.advisories(ecosystem, &packages).await {
+        let fetch = match source.advisories(ecosystem, &identities).await {
             Ok(fetch) => fetch,
             Err(error) => {
                 let diagnostic = Diagnostic::new(
@@ -323,21 +471,14 @@ impl Workspace {
             warnings.push(warning);
         }
 
-        let mut by_package: HashMap<String, Vec<RawAdvisory>> = HashMap::new();
-        for package in fetch.packages {
-            by_package
-                .entry(package.package)
-                .or_default()
-                .extend(package.advisories);
-        }
         AdvisoryOutcome {
-            advisories: Some(ProjectAdvisories {
-                by_package,
-                queried: packages.into_iter().collect(),
-                source: source.id(),
+            advisories: Some(ProjectAdvisories::from_fetch(
+                fetch,
+                identities,
+                source.id(),
                 ecosystem,
                 policy,
-            }),
+            )),
             warnings,
             errors,
         }
@@ -349,8 +490,9 @@ impl Workspace {
     /// The policy (including a shorten mode already degraded by stale data) is carried over
     /// unchanged: this is one project's *one* advisory snapshot growing, not a second fetch with
     /// its own rules.
-    /// A failed top-up is fail-open like the initial fetch — the new packages stay unadvised,
-    /// which can only fail to shorten their windows.
+    /// A stale top-up under the settled shorten mode still merges, annotate-only (see
+    /// [`ProjectAdvisories::flag_only`]); a *failed* top-up is fail-open like the initial fetch
+    /// — the new packages stay unadvised, which can only fail to shorten their windows.
     pub(crate) async fn top_up_project_advisories(
         &self,
         pctx: &ProjectCtx,
@@ -398,23 +540,34 @@ impl Workspace {
             }
         };
         // Stale data may annotate but never shorten, and this project's shorten mode is already
-        // settled — the earlier rounds resolved under it — so stale top-up data is dropped
-        // rather than allowed to shorten a window the stale rule forbids.
-        if fetch.stale && existing.policy.mode == AdvisoryMode::Shorten {
+        // settled — the earlier rounds resolved under it — so the demotion is scoped to the
+        // topped-up packages instead of the project: their evidence still flags rows and warns
+        // on rollbacks, but classifies under the flag policy and never earns the security
+        // window.
+        // The withheld shortening is exactly the evidence `--fail-on-advisory-source` insists
+        // on, so the gate escalates the demotion like the initial fetch's.
+        let stale_flag_only = fetch.stale && existing.policy.mode == AdvisoryMode::Shorten;
+        let (mut warnings, mut errors) = (Vec::new(), Vec::new());
+        if stale_flag_only {
             let diagnostic = Diagnostic::new(
                 DiagnosticKind::AdvisorySourceUnavailable,
                 format!(
-                    "advisory data for {} newly resolved packages was served from a stale cache; they stay un-annotated",
+                    "advisory data for {} newly resolved packages was served from a stale cache; annotating them only — the security window is not applied",
                     packages.len()
                 ),
             )
             .with_tool(pctx.tool.as_str())
             .with_project(project_label);
-            return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
+            if opts.advisory_failure.is_error() {
+                errors.push(diagnostic);
+            } else {
+                warnings.push(diagnostic);
+            }
         }
         AdvisoryOutcome {
-            advisories: Some(existing.extended(packages, fetch)),
-            ..AdvisoryOutcome::inert()
+            advisories: Some(existing.extended(packages, fetch, stale_flag_only)),
+            warnings,
+            errors,
         }
     }
 
@@ -461,6 +614,70 @@ impl Workspace {
             .with_project(project_label)
         })
     }
+}
+
+/// The identities the fetch may query, warning once when some of the project's packages were
+/// withheld; `None` when nothing at all is provable and the feed must not be consulted.
+fn queryable_identities(
+    packages: AdvisoryPackages,
+    pctx: &ProjectCtx,
+    project_label: &str,
+    ecosystem: &'static str,
+    warnings: &mut Vec<Diagnostic>,
+) -> Option<Vec<String>> {
+    let AdvisoryPackages {
+        identities,
+        excluded,
+    } = packages;
+    if !excluded.is_empty() {
+        warnings.push(excluded_sources_warning(
+            pctx,
+            project_label,
+            ecosystem,
+            excluded.len(),
+        ));
+    }
+    (!identities.is_empty()).then_some(identities)
+}
+
+/// Packages whose resolved source is not provably in the tool's advisory ecosystem are
+/// withheld from the feed entirely — neither sent nor matched (see
+/// [`Dependency::advisory_identity`]). Withholding can only fail to *shorten* their windows, so
+/// it is a warning, never an error: the ordinary, stricter windows stand.
+fn excluded_sources_warning(
+    pctx: &ProjectCtx,
+    project_label: &str,
+    ecosystem: &str,
+    excluded: usize,
+) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticKind::AdvisoryEcosystemUnsupported,
+        format!(
+            "{excluded} package(s) cannot be proven to resolve from the {ecosystem} advisory ecosystem; they are not queried or annotated and their windows stay un-shortened"
+        ),
+    )
+    .with_tool(pctx.tool.as_str())
+    .with_project(project_label)
+}
+
+/// The top-up variant of [`excluded_sources_warning`]: a re-lock introduced packages whose
+/// source is not provably in the ecosystem, narrowing coverage the initial report never
+/// mentioned. The executor calls this once per newly seen package set — including when the
+/// re-lock brought nothing queryable at all.
+pub(crate) fn top_up_excluded_warning(
+    pctx: &ProjectCtx,
+    project_label: &str,
+    ecosystem: &str,
+    excluded: usize,
+) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticKind::AdvisoryEcosystemUnsupported,
+        format!(
+            "{excluded} newly resolved package(s) cannot be proven to resolve from the {ecosystem} advisory ecosystem; they are not queried or annotated and their windows stay un-shortened"
+        ),
+    )
+    .with_tool(pctx.tool.as_str())
+    .with_project(project_label)
 }
 
 fn unsupported_ecosystem_warning(pctx: &ProjectCtx, project_label: &str) -> Diagnostic {
@@ -548,7 +765,9 @@ mod tests {
             stale: bool,
         },
         /// Reports one advisory per queried package, named after it.
-        Advising,
+        Advising {
+            stale: bool,
+        },
         OtherSource,
         Unreachable,
     }
@@ -558,7 +777,7 @@ mod tests {
         fn id(&self) -> AdvisorySourceId {
             match self {
                 FakeFeed::OtherSource => AdvisorySourceId("other"),
-                FakeFeed::Ok { .. } | FakeFeed::Advising | FakeFeed::Unreachable => {
+                FakeFeed::Ok { .. } | FakeFeed::Advising { .. } | FakeFeed::Unreachable => {
                     AdvisorySourceId("osv")
                 }
             }
@@ -590,7 +809,7 @@ mod tests {
                         .collect(),
                     stale: false,
                 }),
-                FakeFeed::Advising => Ok(AdvisoryFetch {
+                FakeFeed::Advising { stale } => Ok(AdvisoryFetch {
                     packages: packages
                         .iter()
                         .map(|package| PackageAdvisories {
@@ -607,12 +826,38 @@ mod tests {
                             }],
                         })
                         .collect(),
-                    stale: false,
+                    stale: *stale,
                 }),
                 FakeFeed::Unreachable => {
                     Err(CoreError::transient("connection refused".to_string()))
                 }
             }
+        }
+    }
+
+    /// A minimal dependency whose advisory identity is its name — the common adapter case.
+    fn dep(name: &str) -> Dependency {
+        Dependency {
+            package: cooldown_core::PackageId::new(CARGO, name.to_string(), None),
+            advisory_identity: Some(name.to_string()),
+            current: cooldown_core::Version::new("1.0.0".to_string()),
+            current_quality: cooldown_core::ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        }
+    }
+
+    /// The fetch scope for `names`, every one of them carrying an identity.
+    fn queries(names: &[&str]) -> AdvisoryPackages {
+        AdvisoryPackages {
+            identities: names.iter().map(ToString::to_string).collect(),
+            excluded: Vec::new(),
         }
     }
 
@@ -668,7 +913,7 @@ mod tests {
                 &reader,
                 &project_ctx(None),
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -692,7 +937,7 @@ mod tests {
                 &reader,
                 &pctx,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -709,7 +954,7 @@ mod tests {
             ..RunOpts::default()
         };
         let outcome = ws
-            .fetch_project_advisories(&reader, &pctx, ".", &["serde".to_string()], &opts)
+            .fetch_project_advisories(&reader, &pctx, ".", queries(&["serde"]), &opts)
             .await;
         assert!(outcome.advisories.is_none());
         assert!(outcome.warnings.is_empty());
@@ -732,7 +977,7 @@ mod tests {
                 &reader,
                 &project_ctx(Some(enabled_policy(None))),
                 ".",
-                &["conda-thing".to_string()],
+                queries(&["conda-thing"]),
                 &RunOpts::default(),
             )
             .await;
@@ -759,7 +1004,7 @@ mod tests {
                     cooldown_core::AdvisoryMode::Shorten,
                 )))),
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -783,7 +1028,7 @@ mod tests {
                     cooldown_core::AdvisoryMode::Shorten,
                 )))),
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -811,7 +1056,7 @@ mod tests {
                     cooldown_core::AdvisoryMode::Shorten,
                 )))),
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &opts,
             )
             .await;
@@ -822,6 +1067,62 @@ mod tests {
         assert_eq!(advisories.policy.mode, cooldown_core::AdvisoryMode::Flag);
     }
 
+    /// Packages without an advisory identity are withheld from the feed, but never silently:
+    /// the fetch warns once, still queries the provable identities — and when nothing at all
+    /// is provable it skips the feed entirely while still building the (empty) snapshot, so a
+    /// later re-lock's provable packages can top it up.
+    #[tokio::test]
+    async fn unproven_sources_are_withheld_loudly() {
+        let ws = workspace(FakeFeed::Advising { stale: false });
+        let reader = FakeReader {
+            advisory_ecosystem: Some("crates.io"),
+        };
+        let pctx = project_ctx(Some(enabled_policy(None)));
+
+        let mut deps = vec![dep("serde"), dep("internal-utils")];
+        deps[1].advisory_identity = None;
+        let outcome = ws
+            .fetch_project_advisories(
+                &reader,
+                &pctx,
+                ".",
+                AdvisoryPackages::from_deps(&deps),
+                &RunOpts::default(),
+            )
+            .await;
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].message.contains("advisory ecosystem"));
+        let advisories = outcome.advisories.expect("fetched");
+        assert!(
+            advisories.by_package.contains_key("serde"),
+            "the provable identity is still queried"
+        );
+        assert!(
+            !advisories.by_package.contains_key("internal-utils"),
+            "the unproven package is never sent to the feed"
+        );
+
+        // Nothing provable at all: the feed is not consulted, the snapshot still exists.
+        let unreachable = workspace(FakeFeed::Unreachable);
+        let mut deps = vec![dep("internal-utils")];
+        deps[0].advisory_identity = None;
+        let outcome = unreachable
+            .fetch_project_advisories(
+                &reader,
+                &pctx,
+                ".",
+                AdvisoryPackages::from_deps(&deps),
+                &RunOpts::default(),
+            )
+            .await;
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        let advisories = outcome
+            .advisories
+            .expect("an all-withheld fetch still yields a snapshot for later top-ups");
+        assert!(advisories.by_package.is_empty());
+        assert!(advisories.queried.is_empty());
+    }
+
     /// A re-lock introduces packages the initial fetch never asked about, and an unadvised pin
     /// is gated as an ordinary cooldown violation — so the snapshot grows to cover them.
     ///
@@ -830,7 +1131,7 @@ mod tests {
     /// against different evidence later.
     #[tokio::test]
     async fn a_top_up_covers_new_packages_without_disturbing_queried_ones() {
-        let ws = workspace(FakeFeed::Advising);
+        let ws = workspace(FakeFeed::Advising { stale: false });
         let reader = FakeReader {
             advisory_ecosystem: Some("crates.io"),
         };
@@ -840,7 +1141,7 @@ mod tests {
                 &reader,
                 &pctx,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -849,11 +1150,8 @@ mod tests {
 
         // A package the first fetch did ask about is never re-queried, however many times it is
         // offered.
-        let names = vec!["serde".to_string(), "tokio".to_string()];
-        assert_eq!(
-            initial.unqueried(&reader, &names),
-            vec!["tokio".to_string()]
-        );
+        let deps = vec![dep("serde"), dep("tokio")];
+        assert_eq!(initial.unqueried(&deps), vec!["tokio".to_string()]);
 
         let topped_up = ws
             .top_up_project_advisories(
@@ -871,26 +1169,27 @@ mod tests {
             initial.by_package.get("serde").map(Vec::len),
             "the original entry is carried over untouched"
         );
-        assert!(merged.unqueried(&reader, &names).is_empty());
+        assert!(merged.unqueried(&deps).is_empty());
     }
 
     /// Stale data may annotate but never shorten, and a project's shorten mode is settled by its
-    /// first fetch — the rounds before this one already resolved under it — so stale top-up data
-    /// is declined outright rather than allowed to shorten a window the stale rule forbids.
+    /// first fetch — the rounds before this one already resolved under it — so stale top-up
+    /// evidence merges annotate-only: the topped-up packages classify under the demoted flag
+    /// policy while the initially fetched ones keep the settled shorten mode.
     #[tokio::test]
-    async fn a_stale_top_up_is_declined_under_the_shorten_mode() {
+    async fn a_stale_top_up_annotates_but_never_shortens() {
         let reader = FakeReader {
             advisory_ecosystem: Some("crates.io"),
         };
         let shorten = project_ctx(Some(enabled_policy(Some(
             cooldown_core::AdvisoryMode::Shorten,
         ))));
-        let initial = workspace(FakeFeed::Advising)
+        let initial = workspace(FakeFeed::Advising { stale: false })
             .fetch_project_advisories(
                 &reader,
                 &shorten,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await
@@ -898,7 +1197,7 @@ mod tests {
             .expect("fetched");
         assert_eq!(initial.policy.mode, cooldown_core::AdvisoryMode::Shorten);
 
-        let topped_up = workspace(FakeFeed::Ok { stale: true })
+        let topped_up = workspace(FakeFeed::Advising { stale: true })
             .top_up_project_advisories(
                 &shorten,
                 ".",
@@ -907,18 +1206,51 @@ mod tests {
                 &RunOpts::default(),
             )
             .await;
-        assert!(topped_up.advisories.is_none(), "stale data cannot shorten");
         assert_eq!(topped_up.warnings.len(), 1);
         assert!(topped_up.warnings[0].message.contains("stale cache"));
+        let merged = topped_up
+            .advisories
+            .expect("stale evidence still annotates");
+        assert!(
+            merged.by_package.contains_key("tokio"),
+            "the topped-up advisory is kept for annotations and rollback warnings"
+        );
+        assert!(
+            merged.flag_only.contains("tokio"),
+            "…but classifies under the demoted flag policy"
+        );
+        assert_eq!(merged.flag_policy.mode, cooldown_core::AdvisoryMode::Flag);
+        assert!(
+            !merged.flag_only.contains("serde"),
+            "the initially fetched package keeps the settled shorten mode"
+        );
+        assert_eq!(merged.policy.mode, cooldown_core::AdvisoryMode::Shorten);
+
+        // The gate escalates the withheld shortening like the initial fetch's stale degradation,
+        // and the evidence still merges.
+        let topped_up = workspace(FakeFeed::Advising { stale: true })
+            .top_up_project_advisories(
+                &shorten,
+                ".",
+                &initial,
+                &["tokio".to_string()],
+                &RunOpts {
+                    advisory_failure: AdvisoryFailureMode::Error,
+                    ..RunOpts::default()
+                },
+            )
+            .await;
+        assert_eq!(topped_up.errors.len(), 1);
+        assert!(topped_up.advisories.is_some());
 
         // Under `flag` nothing can be shortened in the first place, so the same data merges.
         let flag = project_ctx(Some(enabled_policy(None)));
-        let initial = workspace(FakeFeed::Advising)
+        let initial = workspace(FakeFeed::Advising { stale: false })
             .fetch_project_advisories(
                 &reader,
                 &flag,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await
@@ -945,12 +1277,12 @@ mod tests {
             advisory_ecosystem: Some("crates.io"),
         };
         let pctx = project_ctx(Some(enabled_policy(None)));
-        let initial = workspace(FakeFeed::Advising)
+        let initial = workspace(FakeFeed::Advising { stale: false })
             .fetch_project_advisories(
                 &reader,
                 &pctx,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await
@@ -981,12 +1313,12 @@ mod tests {
             advisory_ecosystem: Some("crates.io"),
         };
         let pctx = project_ctx(Some(enabled_policy(None)));
-        let initial = workspace(FakeFeed::Advising)
+        let initial = workspace(FakeFeed::Advising { stale: false })
             .fetch_project_advisories(
                 &reader,
                 &pctx,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await
@@ -1028,7 +1360,7 @@ mod tests {
                 &reader,
                 &pctx,
                 ".",
-                &["serde".to_string()],
+                queries(&["serde"]),
                 &RunOpts::default(),
             )
             .await;
@@ -1042,7 +1374,7 @@ mod tests {
             ..RunOpts::default()
         };
         let outcome = ws
-            .fetch_project_advisories(&reader, &pctx, ".", &["serde".to_string()], &opts)
+            .fetch_project_advisories(&reader, &pctx, ".", queries(&["serde"]), &opts)
             .await;
         assert_eq!(outcome.errors.len(), 1, "the gate refuses to certify");
     }

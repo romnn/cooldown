@@ -99,16 +99,6 @@ impl ToolRead for SwiftTool {
         version::classify_kind(from, to)
     }
 
-    fn advisory_package(&self, package: &str) -> String {
-        // OSV's `SwiftURL` ecosystem names packages by repository URL; the adapter's identity
-        // is the `owner/repo` pair with the casing `Package.resolved` recorded.
-        // The OSV query API is case-sensitive and its SwiftURL entries use the lowercase URL,
-        // so the query must lowercase (GitHub URLs are case-insensitive, so this loses
-        // nothing); the response side additionally matches case-insensitively (see the
-        // `SwiftURL` comparison in the OSV source) for documents that keep the display casing.
-        format!("github.com/{package}").to_ascii_lowercase()
-    }
-
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         // Package.resolved is the resolved graph and does not mark which pins are direct, so cross-
         // reference the manifest: a pin declared via `.package(url: …)` in Package.swift is direct,
@@ -128,8 +118,17 @@ impl ToolRead for SwiftTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // OSV's `SwiftURL` ecosystem names packages by repository URL, and the resolved
+            // pin's identity *is* its GitHub URL — origin provable by construction. The OSV
+            // query API is case-sensitive and its SwiftURL entries use the lowercase URL, so
+            // the query must lowercase (GitHub URLs are case-insensitive, so this loses
+            // nothing); the response side additionally matches case-insensitively (see the
+            // `SwiftURL` comparison in the OSV source) for documents that keep the display
+            // casing.
+            let advisory_identity = Some(format!("github.com/{repo}").to_ascii_lowercase());
             deps.push(Dependency {
                 package: PackageId::new(SWIFT_ID, repo, Some(GITHUB.to_string())),
+                advisory_identity,
                 current: Version::new(ver.clone()),
                 current_quality: classify_quality(&ver),
                 direct: is_direct,
@@ -255,15 +254,32 @@ mod tests {
     /// The OSV query API is case-sensitive and `SwiftURL` entries use the lowercase repository
     /// URL: `Package.resolved` casing must be lowered or the query returns nothing at all (the
     /// case-insensitive *response* matching never gets a chance).
-    #[test]
-    fn advisory_package_lowercases_the_repository_url() {
+    #[tokio::test]
+    async fn advisory_identity_lowercases_the_repository_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        std::fs::write(
+            root.join("Package.resolved"),
+            r#"{ "pins": [ { "identity": "swift-nio", "location": "https://github.com/Apple/Swift-NIO.git", "state": { "version": "2.60.0" } } ], "version": 3 }"#,
+        )
+        .expect("resolved");
+        let project = Project {
+            root: root.clone(),
+            kind: SWIFT_ID,
+            manifest: root.join("Package.swift"),
+            exclude_newer: None,
+        };
         let cache = tempfile::tempdir().expect("cache");
         let tool = SwiftTool::from_http(
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
         );
+        let deps = tool
+            .dependencies(&project, DepScope::Direct)
+            .await
+            .expect("deps");
         assert_eq!(
-            tool.advisory_package("Apple/Swift-NIO"),
-            "github.com/apple/swift-nio"
+            deps[0].advisory_identity.as_deref(),
+            Some("github.com/apple/swift-nio")
         );
     }
 

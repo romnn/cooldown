@@ -58,7 +58,7 @@ struct WholeGraphInputs {
 /// A caller with legitimately absent content decides fail-open at its own call site.
 fn locked_versions<L: NodeLock>(content: &str) -> Result<HashMap<String, String>> {
     let mut versions: HashMap<String, String> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content)? {
+    for NameVersion { name, version, .. } in L::parse(content)? {
         match versions.entry(name) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 if version::compare(&version, slot.get()).is_gt() {
@@ -122,6 +122,12 @@ fn pnpm_location_filter(path: &str) -> String {
 pub struct NpmTool<L> {
     registry: NpmRegistry,
     cmd: NodeCmd,
+    /// The effective registry routing per project root, queried from the manager binary once
+    /// per run when advisory identities need confirming (`None` cached for a failed query, so
+    /// a broken binary is asked once, not once per gate pass).
+    effective_registry: tokio::sync::Mutex<
+        std::collections::HashMap<Utf8PathBuf, Option<crate::npmrc::RegistryOverrides>>,
+    >,
     _lock: PhantomData<fn() -> L>,
 }
 
@@ -132,6 +138,7 @@ impl<L: NodeLock> NpmTool<L> {
         NpmTool {
             registry,
             cmd: NodeCmd::new(L::BIN),
+            effective_registry: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             _lock: PhantomData,
         }
     }
@@ -140,6 +147,29 @@ impl<L: NodeLock> NpmTool<L> {
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
         NpmTool::new(NpmRegistry::new(http))
+    }
+
+    /// The manager's effective registry overrides for `root`, asked of the binary once and
+    /// memoized — including a failed query, which yields `None` (withhold everything) rather
+    /// than a retry per gate pass.
+    async fn effective_overrides(
+        &self,
+        root: &Utf8Path,
+    ) -> Option<crate::npmrc::RegistryOverrides> {
+        let mut cache = self.effective_registry.lock().await;
+        if let Some(cached) = cache.get(root) {
+            return cached.clone();
+        }
+        let args: Vec<String> = ["config", "list", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let queried = match self.cmd.stdout(root, &args).await {
+            Ok(stdout) => crate::npmrc::overrides_from_effective_config(&stdout),
+            Err(_) => None,
+        };
+        cache.insert(root.to_owned(), queried.clone());
+        queried
     }
 
     /// Enables package-document revalidation for version-adopting runs, so the mutable `latest`
@@ -269,9 +299,40 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         version::classify_kind(from, to)
     }
 
+    /// The lock's `resolved` evidence says where the *locked* artifact came from; adopting a
+    /// shortened window fetches a *future* target under the manager's effective registry
+    /// routing, whose global and builtin layers no file walk can locate. So at feed time the
+    /// binary itself is asked (`npm config list --json`, memoized per root) and every identity
+    /// it reroutes — or, when the query fails or the manager offers no such query (yarn) —
+    /// every identity at all, is withheld.
+    async fn confirm_advisory_identities(&self, project: &Project, deps: &mut [Dependency]) {
+        if deps.iter().all(|dep| dep.advisory_identity.is_none()) {
+            return;
+        }
+        let overrides = if L::CONFIRMS_EFFECTIVE_REGISTRY {
+            self.effective_overrides(&project.root).await
+        } else {
+            None
+        };
+        match overrides {
+            Some(overrides) => {
+                for dep in deps {
+                    if dep.advisory_identity.is_some() && overrides.reroutes(&dep.package.name) {
+                        dep.advisory_identity = None;
+                    }
+                }
+            }
+            None => {
+                for dep in deps {
+                    dep.advisory_identity = None;
+                }
+            }
+        }
+    }
+
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-        let resolved = L::parse(&content)?;
+        let entries = L::parse(&content)?;
         // Which workspace member(s) declare each dependency, for source attribution; empty for lock
         // formats without per-member data (yarn classic, bun). Member paths are resolved to package
         // names once, by reading each member's `package.json`.
@@ -288,9 +349,19 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             Some(manifest::direct_names(&project.manifest)?)
         };
 
+        // Advisory identity needs positive origin evidence: the lock entry's own `resolved` URL
+        // naming the public npm registry (its integrity hash then pins the artifact to what that
+        // registry served). Formats without a per-entry record — pnpm, bun — grant nothing; the
+        // npm-config layers can only veto a granted identity, never substitute for the record.
+        let registry_overrides = crate::npmrc::RegistryOverrides::read(&project.root);
         let mut seen = HashSet::new();
         let mut deps = Vec::new();
-        for NameVersion { name, version } in resolved {
+        for NameVersion {
+            name,
+            version,
+            resolved,
+        } in entries
+        {
             // A non-registry resolution — an injected workspace package (`file:`/`link:`), a git
             // or tarball URL — has no registry release history to evaluate and, like cargo's
             // non-registry sources, is not cooldown's to move. The `:` discriminates: registry
@@ -325,8 +396,11 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             } else {
                 None
             };
+            let advisory_identity =
+                crate::npmrc::advisory_identity(&name, resolved.as_deref(), &registry_overrides);
             deps.push(Dependency {
                 package: PackageId::new(L::ID, name, Some(NPM.to_string())),
+                advisory_identity,
                 current: Version::new(version.clone()),
                 current_quality: classify_quality(&version),
                 direct: is_direct,
@@ -1467,7 +1541,7 @@ fn resolver_conflict_hold<L: NodeLock>(
 /// corrupted lock (see [`locked_versions`] for the same fail-closed contract).
 fn resolved_version_lines<L: NodeLock>(content: &str) -> Result<HashMap<String, BTreeSet<String>>> {
     let mut lines: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content)? {
+    for NameVersion { name, version, .. } in L::parse(content)? {
         if version.contains(':') {
             continue;
         }
@@ -2276,6 +2350,161 @@ packages:
             direct[0].members.is_empty(),
             "v1 locks have no member attribution"
         );
+    }
+
+    /// Advisory identity needs the lock entry's own `resolved` URL to name the public registry:
+    /// a private-registry URL or a missing record grants nothing. Only the decline direction is
+    /// asserted here — it holds whatever npm configuration the host machine carries, since
+    /// ambient config can only veto further, never grant. The grant chain is pinned by the
+    /// hermetic `npmrc::advisory_identity` tests.
+    #[tokio::test]
+    async fn advisory_identity_requires_a_public_resolved_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "lodash": "4.17.15" } }"#,
+        )
+        .expect("write manifest");
+        let lock_json = indoc! {r#"
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "version": "0.1.0", "dependencies": { "lodash": "4.17.15" } },
+                    "node_modules/lodash": { "version": "4.17.15", "resolved": "https://npm.corp.example/lodash/-/lodash-4.17.15.tgz" },
+                    "node_modules/ms": { "version": "2.1.3" }
+                }
+            }"#};
+        std::fs::write(root.join("package-lock.json"), lock_json).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+
+        let graph = tool()
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("graph deps");
+        let identity_of = |name: &str| {
+            graph
+                .iter()
+                .find(|dep| dep.package.name == name)
+                .expect("dep")
+                .advisory_identity
+                .clone()
+        };
+        assert_eq!(
+            identity_of("lodash"),
+            None,
+            "a private-registry resolved URL proves the wrong origin"
+        );
+        assert_eq!(
+            identity_of("ms"),
+            None,
+            "an entry without a resolved record carries no origin evidence"
+        );
+    }
+
+    /// A dependency as `dependencies()` would grant it: identity present, everything else
+    /// minimal — the confirmation hook's input. Unix-only because every consumer fakes the
+    /// manager binary with a script, which needs unix permission bits.
+    #[cfg(unix)]
+    fn granted_dep(name: &str) -> Dependency {
+        Dependency {
+            package: PackageId::new(Npm::ID, name.to_string(), Some(NPM.to_string())),
+            advisory_identity: Some(name.to_string()),
+            current: cooldown_core::Version::new("1.0.0".to_string()),
+            current_quality: cooldown_core::ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn effective_config_script(root: &Utf8Path, body: &str) -> Utf8PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = root.join("fake-npm.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        script
+    }
+
+    /// Confirmation asks the manager binary for its *effective* configuration — the merge of
+    /// layers (global, builtin) no file walk can locate — and withholds exactly the identities
+    /// it reroutes; a query that fails withholds them all, since unknown routing must not pass
+    /// as none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmation_withholds_identities_the_effective_registry_reroutes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let script = effective_config_script(
+            &root,
+            r#"echo '{"registry":"https://registry.npmjs.org/","@corp:registry":"https://npm.corp.example/"}'"#,
+        );
+        let mut npm = tool();
+        npm.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut deps = vec![granted_dep("lodash"), granted_dep("@corp/api")];
+
+        npm.confirm_advisory_identities(&project, &mut deps).await;
+        assert_eq!(deps[0].advisory_identity.as_deref(), Some("lodash"));
+        assert_eq!(
+            deps[1].advisory_identity, None,
+            "the effective scope routing vetoes what the lock granted"
+        );
+
+        // A failing query is asked once (memoized) and withholds everything.
+        let script = effective_config_script(&root, "exit 1");
+        let mut failing = tool();
+        failing.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let mut deps = vec![granted_dep("lodash")];
+        failing
+            .confirm_advisory_identities(&project, &mut deps)
+            .await;
+        assert_eq!(
+            deps[0].advisory_identity, None,
+            "unknown routing must not pass as none"
+        );
+    }
+
+    /// yarn classic offers no reliable effective-config query and merges `.yarnrc` files up the
+    /// directory tree, so its identities never survive confirmation — without spawning anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yarn_identities_never_survive_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let cache = tempfile::tempdir().expect("cache");
+        let mut tool: NpmTool<crate::lock::Yarn> = NpmTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        // A binary that must never run: confirmation for yarn decides without asking.
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(root.join("absent-yarn").as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: crate::lock::Yarn::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+        };
+        let mut deps = vec![granted_dep("lodash")];
+
+        tool.confirm_advisory_identities(&project, &mut deps).await;
+        assert_eq!(deps[0].advisory_identity, None);
     }
 
     fn pnpm_tool() -> NpmTool<crate::lock::Pnpm> {

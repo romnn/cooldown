@@ -220,7 +220,7 @@ impl<'a> CheckRunner<'a> {
             return;
         }
 
-        let deps = match self
+        let mut deps = match self
             .ws
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
@@ -239,12 +239,18 @@ impl<'a> CheckRunner<'a> {
         drop(read_guard);
         drop(refresh_guard);
 
-        let dep_names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        // Identities must be adapter-confirmed before they are queried, matched, or counted
+        // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
+        if super::advisories::advisory_fetch_policy(pctx).is_some() {
+            read.adapter
+                .confirm_advisory_identities(&pctx.project, &mut deps)
+                .await;
+        }
         let advisory_fetch = self.ws.fetch_project_advisories(
             read.adapter,
             pctx,
             &read.project_label,
-            &dep_names,
+            super::advisories::AdvisoryPackages::from_deps(&deps),
             self.opts,
         );
         self.opts

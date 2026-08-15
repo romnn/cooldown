@@ -339,6 +339,30 @@ pub struct Release {
 pub struct Dependency {
     /// The dependency's package identity.
     pub package: PackageId,
+    /// The package's identity in the tool's advisory-database ecosystem
+    /// ([`Capabilities::advisory_ecosystem`]), in the database's canonical spelling — or `None`
+    /// when the dependency's resolved source cannot be proven to belong to that ecosystem.
+    ///
+    /// The feed query is case- and separator-sensitive, so the spelling must be the database's
+    /// canonical form (the Python tools normalize to PEP 503, Swift lowercases its
+    /// repository-URL identity; identity is correct for most tools).
+    ///
+    /// `None` withholds the identity entirely: the package is never sent to the feed and never
+    /// matched against its advisories. Advisory data can only *loosen* policy (annotate rows,
+    /// shorten windows), so a package from a private or alternate registry that merely shares a
+    /// public package's name must not inherit the public package's advisories — OSV's `PyPI`
+    /// ecosystem identifies pypi.org packages, not arbitrary Python indexes. The proof must be
+    /// *positive*, in one of three forms: a per-package resolution record naming the public
+    /// registry; a fully enumerable configuration surface shown clean (pip's requirements
+    /// tree, rooted at the file and followed through its `-r`/`-c` includes); or the package
+    /// manager itself confirming its effective routing at feed time
+    /// ([`ToolRead::confirm_advisory_identities`](crate::ToolRead::confirm_advisory_identities)
+    /// — npm's and pip's `config list`). The absence of *unenumerable* configuration is never
+    /// proof — npm's global and builtin layers, pip's interpreter-prefix site config behind a
+    /// shim, Maven's parent poms — and configuration can only veto a grant, never substitute
+    /// for one. The adapter is the only side that sees the lock's source records, so it
+    /// decides here, at construction.
+    pub advisory_identity: Option<String>,
     /// The currently-locked version, or the declared floor for an explicit manifest-only candidate.
     pub current: Version,
     /// The quality of `current`; for lock-backed dependencies this mirrors

@@ -12,6 +12,10 @@ pub struct ResolvedPin {
     pub name: String,
     /// The resolved version, with any platform suffix dropped.
     pub version: String,
+    /// Whether the gem's section is served by the public rubygems.org remote — the registry
+    /// behind OSV's `RubyGems` ecosystem. `false` for a private/alternate `GEM` remote and for
+    /// `GIT`/`PATH` sections, whose gems merely share a name with the public one.
+    pub rubygems: bool,
 }
 
 /// Returns the [`ResolvedPin`] of every gem in a `specs:` block.
@@ -21,6 +25,10 @@ pub struct ResolvedPin {
 pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
     let mut out = Vec::new();
     let mut in_specs = false;
+    // The `remote:` lines of the current top-level section, seen before its `specs:` block. A
+    // section provably serves from rubygems.org only when every one of its remotes is it: the
+    // lock does not say which remote served which gem.
+    let mut remotes: Vec<String> = Vec::new();
     for line in content.lines() {
         if line.starts_with("  specs:") {
             in_specs = true;
@@ -29,6 +37,10 @@ pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
         // Any non-indented, non-blank line starts a new top-level section, ending the specs block.
         if !line.starts_with(' ') && !line.trim().is_empty() {
             in_specs = false;
+            remotes.clear();
+        }
+        if let Some(remote) = line.strip_prefix("  remote: ") {
+            remotes.push(remote.trim().to_string());
         }
         if !in_specs {
             continue;
@@ -38,11 +50,19 @@ pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
                 continue; // a gem's own dependency, indented further
             }
             if let Some(spec) = parse_spec(rest) {
-                out.push(spec);
+                let rubygems = !remotes.is_empty() && remotes.iter().all(|r| is_rubygems_remote(r));
+                out.push(ResolvedPin { rubygems, ..spec });
             }
         }
     }
     out
+}
+
+/// Whether `remote` is the public rubygems.org registry.
+fn is_rubygems_remote(remote: &str) -> bool {
+    remote
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("https://rubygems.org")
 }
 
 /// Parses a single `name (version)` spec line, dropping any platform suffix on the version
@@ -57,6 +77,8 @@ fn parse_spec(line: &str) -> Option<ResolvedPin> {
     Some(ResolvedPin {
         name: name.to_string(),
         version: version.to_string(),
+        // Provenance is a section-level fact the caller stamps; a lone spec line proves nothing.
+        rubygems: false,
     })
 }
 
@@ -154,6 +176,7 @@ mod tests {
         ResolvedPin {
             name: name.to_string(),
             version: version.to_string(),
+            rubygems: true,
         }
     }
 

@@ -187,10 +187,17 @@ impl crate::app::Workspace {
                 continue;
             };
             let read_guard = self.project_read_guard(pctx).await?;
-            let deps = self
+            let mut deps = self
                 .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
                 .await?;
             drop(read_guard);
+            // Identities must be adapter-confirmed before they are queried, matched, or
+            // counted (see `ToolRead::confirm_advisory_identities`) — only when the feed runs.
+            if super::advisories::advisory_fetch_policy(pctx).is_some() {
+                adapter
+                    .confirm_advisory_identities(&pctx.project, &mut deps)
+                    .await;
+            }
             let fctx = Self::fetch_context(pctx, opts);
             let rctx = Self::resolve_ctx(pctx, opts);
             // Advised like `check`: a pin the advised gate passes (a security fix under its
@@ -198,14 +205,13 @@ impl crate::app::Workspace {
             // shortened hold for no reason.
             // A feed failure therefore changes what gets written, so its diagnostics travel
             // back to the caller instead of being dropped.
-            let dep_names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
             // Route through the cache-backed fetch — the only locked-release path — so a package
             // shared with other commands/projects this run is not re-fetched.
             let advisory_fetch = self.fetch_project_advisories(
                 adapter,
                 pctx,
                 pctx.rel_path.as_str(),
-                &dep_names,
+                super::advisories::AdvisoryPackages::from_deps(&deps),
                 opts,
             );
             let release_fetch =

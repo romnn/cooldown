@@ -108,12 +108,16 @@ impl ToolRead for BundlerTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // Only a gem served by the public rubygems.org remote is the gem OSV's `RubyGems`
+            // ecosystem describes; a private remote's gem merely shares the name.
+            let advisory_identity = resolved.rubygems.then(|| resolved.name.clone());
             deps.push(Dependency {
                 package: PackageId::new(
                     BUNDLER_ID,
                     resolved.name.clone(),
                     Some(RUBYGEMS.to_string()),
                 ),
+                advisory_identity,
                 current: Version::new(resolved.version.clone()),
                 current_quality: classify_quality(&resolved.version),
                 direct: is_direct,

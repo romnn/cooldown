@@ -159,12 +159,18 @@ impl<'a> OutdatedRunner<'a> {
             .await;
         drop(read_guard);
         drop(refresh_guard);
-        let names: Vec<String> = deps.iter().map(|dep| dep.package.name.clone()).collect();
+        // Identities must be adapter-confirmed before they are queried, matched, or counted
+        // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
+        if super::advisories::advisory_fetch_policy(pctx).is_some() {
+            read.adapter
+                .confirm_advisory_identities(&pctx.project, &mut deps)
+                .await;
+        }
         let advisory_fetch = self.ws.fetch_project_advisories(
             read.adapter,
             pctx,
             &read.project_label,
-            &names,
+            super::advisories::AdvisoryPackages::from_deps(&deps),
             self.opts,
         );
         let release_fetch =
@@ -875,6 +881,7 @@ mod tests {
     fn dependency(item: &OutdatedItem) -> Dependency {
         Dependency {
             package: PackageId::new(UV, item.name.clone(), item.registry.clone()),
+            advisory_identity: Some(item.name.clone()),
             current: Version::new(item.current.clone()),
             current_quality: ReleaseQuality::Stable,
             direct: item.direct,

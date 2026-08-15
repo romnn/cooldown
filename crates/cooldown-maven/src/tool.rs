@@ -211,8 +211,19 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
             if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
+            // No advisory identity, ever: neither format records a per-artifact repository, and
+            // the routing that decides real origin lives outside the files this adapter reads —
+            // `settings.xml` mirrors and profile repositories, `settings.gradle`
+            // `dependencyResolutionManagement` blocks, init scripts, and repositories injected
+            // by (possibly external) parent poms. Origin evidence that cannot be positive must
+            // decline: OSV's `Maven` advisories describe Maven Central artifacts, and a
+            // same-named coordinate from a private repository must not inherit their shortened
+            // windows. Declining only fails to shorten — the ordinary window stands, and the
+            // app layer says so once per run.
+            let advisory_identity = None;
             deps.push(Dependency {
                 package: PackageId::new(L::ID, resolved.name, Some(MAVEN_CENTRAL.to_string())),
+                advisory_identity,
                 current: Version::new(resolved.version.clone()),
                 current_quality: classify_quality(&resolved.version),
                 direct: resolved.direct,
@@ -358,5 +369,9 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].package.name, "com.google.code.gson:gson");
         assert_eq!(deps[0].package.registry.as_deref(), Some(MAVEN_CENTRAL));
+        assert_eq!(
+            deps[0].advisory_identity, None,
+            "no Maven format records per-artifact origin, so no coordinate ever earns one"
+        );
     }
 }

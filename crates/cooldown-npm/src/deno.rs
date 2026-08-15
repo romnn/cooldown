@@ -97,7 +97,7 @@ fn split_specifier(spec: &str) -> Option<SpecifierParts> {
         "jsr" => JSR,
         _ => return None,
     };
-    let NameVersion { name, version } = split_name_version(rest)?;
+    let NameVersion { name, version, .. } = split_name_version(rest)?;
     Some(SpecifierParts {
         registry,
         name,
@@ -122,7 +122,7 @@ fn locked_versions(content: &str) -> HashMap<String, (&'static str, String)> {
             continue;
         };
         for key in section.keys() {
-            let Some(NameVersion { name, version }) = split_name_version(key) else {
+            let Some(NameVersion { name, version, .. }) = split_name_version(key) else {
                 continue;
             };
             match out.entry(name) {
@@ -381,7 +381,7 @@ impl DenoTool {
                 continue;
             };
             for key in section.keys() {
-                let Some(NameVersion { name, version }) = split_name_version(key) else {
+                let Some(NameVersion { name, version, .. }) = split_name_version(key) else {
                     continue;
                 };
                 let is_direct = direct.contains(&(registry, name.clone()));
@@ -393,6 +393,9 @@ impl DenoTool {
                 }
                 deps.push(Dependency {
                     package: PackageId::new(DENO_ID, name, Some(registry.to_string())),
+                    // No advisory ecosystem covers the mixed jsr/npm identity space (see
+                    // `capabilities`), so no deno package carries an advisory identity.
+                    advisory_identity: None,
                     current: Version::new(version.clone()),
                     current_quality: classify_quality(&version),
                     direct: is_direct,

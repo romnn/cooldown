@@ -119,6 +119,16 @@ impl Driver {
         }
     }
 
+    /// Creates a handle to exactly `program`, bypassing the `COOLDOWN_<BIN>` override — for
+    /// callers (hermetic tests, reproducible pipelines) that must pin the executable without
+    /// touching the process environment, which parallel tests cannot share.
+    #[must_use]
+    pub fn from_program(program: impl Into<String>) -> Self {
+        Driver {
+            bin: program.into(),
+        }
+    }
+
     /// The resolved binary name (after any `COOLDOWN_<BIN>` override).
     #[must_use]
     pub fn program(&self) -> &str {
@@ -159,6 +169,25 @@ impl Driver {
         let out = self.output(dir, args).await?;
         if out.status.success() {
             Ok(())
+        } else {
+            Err(CoreError::Tool {
+                tool: self.bin.clone(),
+                termination: ToolTermination::from_exit_status(out.status),
+                stderr: failure_detail(&out),
+            })
+        }
+    }
+
+    /// Runs the driver and returns its standard output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
+    /// it exits non-zero.
+    pub async fn stdout(&self, dir: &Utf8Path, args: &[String]) -> Result<String> {
+        let out = self.output(dir, args).await?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
             Err(CoreError::Tool {
                 tool: self.bin.clone(),

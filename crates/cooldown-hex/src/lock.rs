@@ -12,6 +12,10 @@ pub struct ResolvedPin {
     pub name: String,
     /// The resolved version recorded in the entry's tuple.
     pub version: String,
+    /// Whether the entry's repo element is `hexpm` — the public hex.pm repository behind OSV's
+    /// `Hex` ecosystem. A private Hex repo records its own name there, and an old-format entry
+    /// without the element is indistinguishable from one, so both decline.
+    pub hexpm: bool,
 }
 
 /// Returns the [`ResolvedPin`] of every hex.pm-sourced entry in a `mix.lock`.
@@ -39,9 +43,20 @@ fn parse_entry(line: &str) -> Option<ResolvedPin> {
     let start = after.find('"')?;
     let rest = after.get(start + 1..)?;
     let end = rest.find('"')?;
+    // The tuple's quoted strings, in order, are the version, the inner checksum, any quoted
+    // dependency requirements, the repo name, and the outer checksum — so the repo is the
+    // second-to-last. An old-format entry without repo + outer checksum lands on the version
+    // there instead, which correctly reads as not-hexpm.
+    let quoted: Vec<&str> = after.split('"').skip(1).step_by(2).collect();
+    let hexpm = quoted
+        .len()
+        .checked_sub(2)
+        .and_then(|repo| quoted.get(repo))
+        .is_some_and(|repo| *repo == crate::registry::HEXPM);
     Some(ResolvedPin {
         name: name.to_string(),
         version: rest.get(..end)?.to_string(),
+        hexpm,
     })
 }
 
@@ -157,6 +172,7 @@ mod tests {
         ResolvedPin {
             name: name.to_string(),
             version: version.to_string(),
+            hexpm: true,
         }
     }
 
