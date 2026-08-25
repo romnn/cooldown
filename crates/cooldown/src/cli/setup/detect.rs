@@ -158,12 +158,18 @@ pub(super) fn detect_projects(
         // The orchestrator owns the scan: the adapter only declares its markers, and we apply the
         // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
         let marker = pending.detection.primary();
-        let found = found.ok_or_else(|| {
+        let mut found = found.ok_or_else(|| {
             CoreError::System(format!(
                 "project discovery produced no result for {}",
                 pending.id.as_str()
             ))
         })?;
+        // The topmost-only rule assumed every nested lockfile root is covered by the workspace
+        // above it; give the adapter its appeal for the ones that are not (a nested workspace
+        // root the enclosing workspace can only exclude, never own).
+        promote_nested(&mut found, |dir| {
+            pending.adapter.nested_lockfile_root_escapes(dir)
+        });
         let validation_only = validation_roots_outside_primary(&found);
         pending
             .adapter
@@ -190,6 +196,32 @@ pub(super) fn detect_projects(
         }
     }
     Ok(projects)
+}
+
+/// Move every nested lockfile root that `escapes` says stands on its own into the primary set.
+///
+/// Escape is a property of the directory alone — a workspace root escapes any enclosure, however
+/// deep — so each candidate is judged independently rather than against its nearest kept ancestor.
+fn promote_nested(
+    found: &mut crate::scan::ProjectMarkerDirs,
+    escapes: impl Fn(&camino::Utf8Path) -> bool,
+) {
+    let promoted = found
+        .nested
+        .iter()
+        .filter(|dir| escapes(dir))
+        .cloned()
+        .collect::<Vec<_>>();
+    if promoted.is_empty() {
+        return;
+    }
+    found.nested.retain(|dir| !promoted.contains(dir));
+    found.primary.extend(promoted);
+    found.primary.sort();
+    found.primary.dedup();
+    found
+        .validation_only
+        .retain(|candidate| found.primary.binary_search(candidate).is_err());
 }
 
 fn validation_roots_outside_primary(found: &crate::scan::ProjectMarkerDirs) -> Vec<Utf8PathBuf> {
@@ -241,12 +273,46 @@ mod tests {
     }
 
     #[test]
+    fn promotion_moves_escaping_nested_roots_into_primary() {
+        let root = Utf8PathBuf::from("/repo");
+        let escaping = root.join("incubator");
+        let owned = root.join("member");
+        let mut found = crate::scan::ProjectMarkerDirs {
+            primary: vec![root.clone()],
+            validation_only: vec![escaping.clone(), owned.clone()],
+            nested: vec![escaping.clone(), owned.clone()],
+        };
+
+        promote_nested(&mut found, |dir| dir == escaping);
+
+        assert_eq!(found.primary, vec![root, escaping]);
+        assert_eq!(found.nested, vec![owned.clone()]);
+        assert_eq!(found.validation_only, vec![owned]);
+    }
+
+    #[test]
+    fn promotion_without_escaping_roots_changes_nothing() {
+        let root = Utf8PathBuf::from("/repo");
+        let mut found = crate::scan::ProjectMarkerDirs {
+            primary: vec![root.clone()],
+            validation_only: vec![root.join("member")],
+            nested: vec![root.join("member")],
+        };
+        let unchanged = found.clone();
+
+        promote_nested(&mut found, |_| false);
+
+        assert_eq!(found, unchanged);
+    }
+
+    #[test]
     fn validation_skips_manifests_owned_by_a_detected_workspace() {
         let root = Utf8PathBuf::from("/repo");
         let sibling = Utf8PathBuf::from("/other");
         let found = crate::scan::ProjectMarkerDirs {
             primary: vec![root.clone()],
             validation_only: vec![root.clone(), root.join("member"), sibling.clone()],
+            nested: vec![],
         };
 
         assert_eq!(validation_roots_outside_primary(&found), vec![sibling]);

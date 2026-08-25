@@ -144,7 +144,9 @@ impl ToolRead for CargoTool {
 
     fn project_detection(&self) -> cooldown_core::ProjectDetection {
         // A `Cargo.lock` marks a workspace root: `cargo metadata` there already covers every
-        // member, so nested lockfiles below it are not separate projects.
+        // member, so nested lockfiles below it are not separate projects — except one whose own
+        // manifest declares `[workspace]`, which the enclosing workspace can only `exclude`;
+        // `nested_lockfile_root_escapes` turns that shape back into a project.
         cooldown_core::ProjectDetection::PrimaryWithValidation {
             primary: ProjectMarker {
                 lockfile: "Cargo.lock",
@@ -154,6 +156,14 @@ impl ToolRead for CargoTool {
             },
             validation_marker: "Cargo.toml",
         }
+    }
+
+    fn nested_lockfile_root_escapes(&self, dir: &Utf8Path) -> bool {
+        // A workspace root can never be a member of an enclosing workspace — cargo demands the
+        // outer workspace `exclude` it — so the enclosing resolve does not cover this tree and it
+        // must be resolved as its own project. A nested lockfile *without* a `[workspace]` table
+        // stays covered: it can only be a member's stale lockfile, which cargo ignores.
+        manifest::declares_workspace(&dir.join("Cargo.toml"))
     }
 
     fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {

@@ -110,6 +110,19 @@ pub trait ToolRead: Send + Sync {
         Ok(())
     }
 
+    /// Decides whether a nested lockfile root escapes the enclosing detected project.
+    ///
+    /// For adapters that declare [`ProjectMarker::workspace_root`](crate::ProjectMarker), the
+    /// orchestrator keeps only the topmost lockfile directory, because a workspace-root resolve
+    /// already covers every member below it. That coverage claim is wrong for a nested directory
+    /// that is itself a workspace root the enclosing workspace merely excludes; an adapter
+    /// overrides this to recognize that shape from the nested manifest and turn the directory back
+    /// into a project of its own. `dir` always lies strictly below another detected project root
+    /// and carries the adapter's lockfile marker.
+    fn nested_lockfile_root_escapes(&self, _dir: &Utf8Path) -> bool {
+        false
+    }
+
     /// Classifies a version-to-version movement using the adapter's native version semantics.
     ///
     /// The core normally carries [`UpdateKind`] from registry release metadata. This hook is only for

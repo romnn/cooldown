@@ -983,6 +983,9 @@ pub struct ProjectMarker {
     pub alternate_manifests: &'static [&'static str],
     /// When `true`, a marked root's descendants are not also reported — a workspace root already
     /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
+    /// A dropped descendant gets one appeal: the adapter's
+    /// [`nested_lockfile_root_escapes`](crate::ToolRead::nested_lockfile_root_escapes) can
+    /// recognize it as a workspace root of its own that the enclosing workspace only excludes.
     pub workspace_root: bool,
 }
 

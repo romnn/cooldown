@@ -56,6 +56,11 @@ pub fn find_marker_dirs(
 pub(crate) struct ProjectMarkerDirs {
     pub(crate) primary: Vec<Utf8PathBuf>,
     pub(crate) validation_only: Vec<Utf8PathBuf>,
+    /// Lockfile roots dropped by the topmost-only rule for sitting below another primary root.
+    /// Kept so the orchestrator can appeal them to the adapter's
+    /// `nested_lockfile_root_escapes` — a nested workspace root the enclosing workspace merely
+    /// excludes is a project of its own. Empty for markers without the topmost-only rule.
+    pub(crate) nested: Vec<Utf8PathBuf>,
 }
 
 /// Finds an adapter's primary and validation-only markers during one filesystem traversal.
@@ -177,6 +182,7 @@ fn scan_marker_groups(
         .map(|_| ProjectMarkerDirs {
             primary: Vec::new(),
             validation_only: Vec::new(),
+            nested: Vec::new(),
         })
         .collect::<Vec<_>>();
     for result in builder.build() {
@@ -215,7 +221,9 @@ fn scan_marker_groups(
         result.validation_only.sort();
         result.validation_only.dedup();
         if scan.topmost_only {
-            result.primary = keep_topmost(std::mem::take(&mut result.primary));
+            let (topmost, nested) = split_topmost(std::mem::take(&mut result.primary));
+            result.primary = topmost;
+            result.nested = nested;
             result
                 .validation_only
                 .retain(|candidate| result.primary.binary_search(candidate).is_err());
@@ -352,15 +360,19 @@ fn is_excluded(path: &std::path::Path, root: &Utf8Path, excludes: &GlobSet) -> b
         .is_some_and(|rel| !rel.as_str().is_empty() && excludes.is_match(rel.as_std_path()))
 }
 
-/// Drop any directory that has an ancestor already in the set (sorted input puts ancestors first).
-fn keep_topmost(dirs: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+/// Split the set into topmost directories and those with an ancestor already in the set (sorted
+/// input puts ancestors first).
+fn split_topmost(dirs: Vec<Utf8PathBuf>) -> (Vec<Utf8PathBuf>, Vec<Utf8PathBuf>) {
     let mut kept: Vec<Utf8PathBuf> = Vec::new();
+    let mut nested: Vec<Utf8PathBuf> = Vec::new();
     for dir in dirs {
-        if !kept.iter().any(|root| dir.starts_with(root)) {
+        if kept.iter().any(|root| dir.starts_with(root)) {
+            nested.push(dir);
+        } else {
             kept.push(dir);
         }
     }
-    kept
+    (kept, nested)
 }
 
 /// `exclude-folders` compiled for filtering workspace members by *location*.
@@ -504,6 +516,33 @@ mod tests {
 
         assert_eq!(found.primary, vec![root.join("with-lock")]);
         assert_eq!(found.validation_only, vec![root.join("custom-lock")]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_scan_carries_nested_lockfile_roots_for_appeal() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir_all(root.join("incubator"))?;
+        std::fs::write(root.join("Cargo.lock"), "")?;
+        std::fs::write(root.join("Cargo.toml"), "")?;
+        std::fs::write(root.join("incubator/Cargo.lock"), "")?;
+        std::fs::write(root.join("incubator/Cargo.toml"), "")?;
+        let detection = ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        };
+
+        let found = find_project_marker_dirs(&root, detection, false, &[])?;
+
+        assert_eq!(found.primary, vec![root.clone()]);
+        assert_eq!(found.nested, vec![root.join("incubator")]);
         Ok(())
     }
 

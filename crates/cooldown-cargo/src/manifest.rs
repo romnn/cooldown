@@ -17,6 +17,22 @@ use cooldown_toml_util::{parse_document, write_document};
 use std::collections::BTreeSet;
 use toml_edit::{DocumentMut, Item, TableLike};
 
+/// Whether the manifest at `path` declares a top-level `[workspace]` table, marking the directory
+/// as a workspace root.
+///
+/// Read or parse failures deliberately read as `false`: a broken nested manifest cannot establish
+/// that its directory escapes the workspace above it, and project detection must not fail the
+/// whole run over one.
+pub(crate) fn declares_workspace(path: &Utf8Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = raw.parse::<DocumentMut>() else {
+        return false;
+    };
+    doc.get("workspace").is_some()
+}
+
 /// The manifests a single rewrite touched, relative to the workspace root — used to journal the
 /// write set for rollback and to tell the caller whether anything was actually editable.
 #[derive(Debug, Default)]
@@ -264,6 +280,43 @@ fn bump_req(old: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_table_marks_a_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\nmembers = [\"member\"]\n").expect("write");
+
+        assert!(declares_workspace(&manifest));
+    }
+
+    #[test]
+    fn package_only_manifest_is_not_a_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        let manifest = dir.join("Cargo.toml");
+        // `package.workspace` points a member at its root; only a top-level `[workspace]` table
+        // makes the directory a root itself.
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"member\"\nworkspace = \"..\"\n",
+        )
+        .expect("write");
+
+        assert!(!declares_workspace(&manifest));
+    }
+
+    #[test]
+    fn missing_or_invalid_manifest_is_not_a_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        assert!(!declares_workspace(&dir.join("Cargo.toml")));
+
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace\n").expect("write");
+        assert!(!declares_workspace(&manifest));
+    }
 
     fn member(name: &str, path: &str) -> MemberRef {
         MemberRef {
