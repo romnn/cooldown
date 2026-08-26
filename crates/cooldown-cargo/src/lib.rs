@@ -156,7 +156,12 @@ pub fn is_recovery_artifact_name(name: &str) -> bool {
 pub fn recover_interrupted_mutation(
     project_root: &camino::Utf8Path,
 ) -> cooldown_core::Result<cooldown_core::MutationRecovery> {
-    let lease = cooldown_core::fs::ProjectWriteLease::acquire(project_root)?;
+    // Recovery must observe a concurrent run, not wait it out: while another cooldown process
+    // owns the project, its journal is live and there is nothing valid to recover.
+    let lease = cooldown_core::fs::ProjectWriteLease::acquire_with_wait(
+        project_root,
+        cooldown_core::fs::LockWait::fail_fast(),
+    )?;
     let project_root = lease.coordination().project().to_owned();
     let project = cooldown_core::Project {
         root: project_root.clone(),

@@ -92,7 +92,8 @@ pub(crate) struct ProjectAccessWriteGuard {
 }
 
 impl ProjectReadGuard {
-    /// Acquires shared access, failing immediately while a writer owns the project.
+    /// Acquires shared access, waiting per [`LockWait::default`](cooldown_core::fs::LockWait)
+    /// while a writer owns the project.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
         let coordination = project_coordination(root)?;
         Ok(ProjectReadGuard {
@@ -107,7 +108,8 @@ impl ProjectReadGuard {
 }
 
 impl ProjectWriteGuard {
-    /// Acquires exclusive access, failing immediately while another reader or writer is active.
+    /// Acquires exclusive access, waiting per [`LockWait::default`](cooldown_core::fs::LockWait)
+    /// while another reader or writer is active.
     pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
         let coordination = project_coordination(root)?;
         Ok(ProjectWriteGuard {

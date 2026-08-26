@@ -23,6 +23,16 @@
   move `cargo metadata --locked` accepts silently. The `preserve` edge policy (the default) now
   restores line continuity: an edge whose binding target vanished is rebound to the unique
   surviving same-line successor whenever the dependent's declared requirement admits it.
+- **Lease acquisition waits for a busy project lock instead of failing immediately.** Concurrent
+  `cooldown` invocations against one repository (a task runner fanning per-tool gates out in
+  parallel) raced on the per-project lock and the losers died with `lock conflict`. All project and
+  repository-resource leases now wait for a foreign holder — up to 10 minutes by default,
+  configurable via the `COOLDOWN_LOCK_WAIT` environment variable (`"30s"`, `"10m"`; `"0"` or
+  `"none"` for the old fail-fast) — printing one `blocking waiting for …` note (naming the
+  recorded holder where the blocker is necessarily the exclusive owner). Contention with a
+  lock the same process already holds still fails immediately (waiting on oneself never ends), and
+  the recovery entry point keeps fail-fast semantics: a live concurrent run means there is nothing
+  valid to recover.
 
 ## v0.0.15
 
