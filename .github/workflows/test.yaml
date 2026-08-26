@@ -1,7 +1,10 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: test
 on:
-  push: {}
+  # main only: every other branch is covered by the pull_request trigger, and a tag push
+  # would duplicate the matrix release.yaml already calls through workflow_call.
+  push:
+    branches: [main]
   workflow_call: {}
   pull_request:
     types: [opened, synchronize, reopened, edited]

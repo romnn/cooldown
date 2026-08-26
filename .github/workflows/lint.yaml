@@ -1,7 +1,10 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: lint
 on:
-  push: {}
+  # main only: every other branch is covered by the pull_request trigger, and a tag points
+  # at a commit main already linted.
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
