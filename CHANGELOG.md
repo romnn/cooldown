@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Nested cargo workspaces the enclosing workspace excludes are projects of their own.** Cargo
+  project detection kept only the topmost `Cargo.lock` directory, so an excluded nested workspace
+  (a monorepo's incubator workspace, a cargo-fuzz project, a nested wasm guest workspace) was
+  invisible: its dependencies escaped the cooldown entirely, and a run from inside it scoped the
+  enclosing project to zero members and reported an empty, healthy-looking result. The scan now
+  carries the dropped nested roots and appeals each one to the new
+  `ToolRead::nested_lockfile_root_escapes` hook; the cargo adapter accepts a nested root exactly
+  when its manifest declares a top-level `[workspace]` table — a shape cargo forbids from being a
+  member, so the enclosing resolve never covered it. Mutation staging learned the matching
+  topology: a staged package outside the selected workspace now brings the workspace-root manifest
+  its `workspace = true` keys inherit from, instead of dying in the isolated copy with "failed to
+  find a workspace root".
 - **`upgrade` now advances matured in-range transitives** (the Dependabot-alert class no direct
   pin drags): planning walks the whole resolved graph by default, each transitive advancing within
   its major line, gated by the new `ToolWrite::supports_transitive_advance` capability
