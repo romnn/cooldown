@@ -3457,6 +3457,99 @@ async fn fix_plans_a_mutually_held_family_through_the_discount() {
     }
 }
 
+/// Release line for the discount/advisory seam: the locked `v1.0.2` and its predecessor `v1.0.1`
+/// both carry the advisory's patch, and `v1.0.1` sits in the gap between the two windows — older
+/// than the 1-day security window, younger than the ordinary 7-day one. Which of them a rollback
+/// can reach is therefore decided entirely by which window the verdict was judged under.
+fn advised_fix_releases() -> Vec<Release> {
+    vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v1.0.1",
+            1,
+            Some("2026-06-14T00:00:00Z"),
+            Some(UpdateKind::Patch),
+        ),
+        rel(
+            "v1.0.2",
+            2,
+            Some("2026-06-16T12:00:00Z"),
+            Some(UpdateKind::Patch),
+        ),
+    ]
+}
+
+/// The circular-hold discount and the security window meet here, and the seam between them is the
+/// re-judged verdict: discounting a family's mutual floors forces `fix` to evaluate each member a
+/// second time, and that second pass must carry the same advisory context as the first.
+///
+/// Both members are locked on `v1.0.2`, a patched release too fresh even for the shortened window,
+/// so both are violations that hold each other at their fresh versions. Under the security window
+/// the rollback reaches `v1.0.1` — the other patched release, and itself compliant once judged
+/// under that same window. Judged under the ordinary 7-day window instead, `v1.0.1` is invisible
+/// and the rollback falls through to `v1.0.0`, the one release the advisory still affects: losing
+/// the context on the second pass would quietly downgrade a security fix into a vulnerable
+/// version.
+#[tokio::test]
+async fn fix_discounting_a_family_keeps_the_security_window_on_the_re_judged_verdict() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = advised_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    releases.insert("b".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("b".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut a = dep("a", "v1.0.2", true);
+    a.graph_floor = Some(Version::new("v1.0.2"));
+    a.hold_edges = vec![floor_edge("b", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let mut b = dep("b", "v1.0.2", true);
+    b.graph_floor = Some(Version::new("v1.0.2"));
+    b.hold_edges = vec![floor_edge("a", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let feed = Arc::new(StaticAdvisories {
+        advisories: vec![
+            (
+                "a".to_string(),
+                ghsa_fixed_by_either("GHSA-A", "v1.0.1", "v1.0.2"),
+            ),
+            (
+                "b".to_string(),
+                ghsa_fixed_by_either("GHSA-B", "v1.0.1", "v1.0.2"),
+            ),
+        ],
+        stale: false,
+        unreachable: false,
+    });
+    let ws = workspace_with_layers(
+        fake(root, vec![a, b], Vec::new(), releases, locked),
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(feed);
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+    assert_eq!(
+        out.summary.applied, 2,
+        "both family members move: {:?}",
+        out.items
+    );
+    assert!(
+        out.warnings.is_empty(),
+        "no member may be reported graph-held: {:?}",
+        out.warnings
+    );
+    for name in ["a", "b"] {
+        let item = out.items.iter().find(|item| item.name == name).expect(name);
+        assert_eq!(
+            item.to, "v1.0.1",
+            "{name} rolls back to the other patched release, not past the advisory's fix"
+        );
+    }
+}
+
 /// A genuine hold through the `fix` planning entry: the floor comes from a *compliant* requirer
 /// (absent from the violation set), so the violation stays in place and the warning names that
 /// requirer and its requirement instead of the generic graph-held text.
@@ -5720,6 +5813,16 @@ fn ghsa_fixed_by(id: &str, fixed: &str) -> RawAdvisory {
         }],
         affected_versions: Vec::new(),
         fixes: vec![fixed.to_string()],
+    }
+}
+
+/// An advisory patched in `fixed` whose patch also ships in the later `also_fixed` release — the
+/// shape OSV produces when one fix lands on several maintained release lines, so the feed names
+/// more than one exact fix version. Only versions below `fixed` are affected.
+fn ghsa_fixed_by_either(id: &str, fixed: &str, also_fixed: &str) -> RawAdvisory {
+    RawAdvisory {
+        fixes: vec![fixed.to_string(), also_fixed.to_string()],
+        ..ghsa_fixed_by(id, fixed)
     }
 }
 
