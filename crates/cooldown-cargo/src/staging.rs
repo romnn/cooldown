@@ -265,6 +265,14 @@ impl StagingLayout {
         let ambient_config_paths = cargo_config_paths(&ambient_config_dirs)?;
         let vendor_roots = discover_vendor_roots(&config_paths)?;
         let ambient_vendor_roots = discover_vendor_roots(&ambient_config_paths)?;
+        // A local package outside the selected workspace inherits its `workspace = true` keys from
+        // its *own* workspace root, which cargo finds by walking up from the package — so that
+        // root manifest must exist in the staged topology, or every inherited key dies with
+        // "failed to find a workspace root". Seeding the closure walk with those roots also
+        // stages the `[workspace.dependencies]` path targets that member manifests name only as
+        // `dep.workspace = true`.
+        let foreign_roots = foreign_workspace_roots(&package_roots, &canonical_source);
+        package_roots.extend(foreign_roots);
         package_roots.extend(path_dependency_roots(&package_roots)?);
         let mut topology_paths = vec![canonical_source.clone()];
         topology_paths.extend(package_roots.iter().cloned());
@@ -758,6 +766,35 @@ fn reject_custom_lockfile_config(config: &Utf8Path, value: &toml::Value) -> Resu
     Ok(())
 }
 
+/// The workspace roots owning staged packages that live outside the selected workspace.
+///
+/// For each package root not under `source_root`, this walks up to the nearest ancestor whose
+/// manifest declares a top-level `[workspace]` table — the root cargo itself would find for the
+/// package. A package whose own manifest declares `[workspace]` is its own root and contributes
+/// nothing (the walk starts at the parent). Only the root manifest is needed: cargo resolves
+/// `workspace = true` inheritance from it alone, without loading the workspace's other members.
+fn foreign_workspace_roots(
+    package_roots: &BTreeSet<Utf8PathBuf>,
+    source_root: &Utf8Path,
+) -> BTreeSet<Utf8PathBuf> {
+    let mut roots = BTreeSet::new();
+    for package in package_roots {
+        if package.starts_with(source_root) {
+            continue;
+        }
+        if crate::manifest::declares_workspace(&package.join("Cargo.toml")) {
+            continue;
+        }
+        for ancestor in package.ancestors().skip(1) {
+            if crate::manifest::declares_workspace(&ancestor.join("Cargo.toml")) {
+                roots.insert(ancestor.to_owned());
+                break;
+            }
+        }
+    }
+    roots
+}
+
 fn path_dependency_roots(initial: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf8PathBuf>> {
     let mut discovered = initial.clone();
     let mut pending: VecDeque<_> = initial.iter().cloned().collect();
@@ -891,6 +928,63 @@ fn isolation_error(detail: impl Into<String>) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_workspace_roots_finds_the_owning_workspace_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        // repo/Cargo.toml owns repo/packages/dep; repo/incubator is the selected workspace.
+        std::fs::create_dir_all(repo.join("packages/dep")).expect("mkdir");
+        std::fs::create_dir_all(repo.join("incubator")).expect("mkdir");
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"packages/dep\"]\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join("packages/dep/Cargo.toml"),
+            "[package]\nname = \"dep\"\nedition.workspace = true\n",
+        )
+        .expect("write");
+        std::fs::write(repo.join("incubator/Cargo.toml"), "[workspace]\n").expect("write");
+
+        let mut package_roots = BTreeSet::new();
+        package_roots.insert(repo.join("incubator"));
+        package_roots.insert(repo.join("packages/dep"));
+
+        let roots = foreign_workspace_roots(&package_roots, &repo.join("incubator"));
+
+        assert_eq!(roots.into_iter().collect::<Vec<_>>(), vec![repo.clone()]);
+    }
+
+    #[test]
+    fn foreign_workspace_roots_skips_self_rooted_and_in_tree_packages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        // standalone/ is its own workspace root; member/ sits under the selected workspace.
+        std::fs::create_dir_all(repo.join("standalone")).expect("mkdir");
+        std::fs::create_dir_all(repo.join("ws/member")).expect("mkdir");
+        std::fs::write(
+            repo.join("standalone/Cargo.toml"),
+            "[workspace]\n[package]\nname = \"standalone\"\n",
+        )
+        .expect("write");
+        std::fs::write(repo.join("ws/Cargo.toml"), "[workspace]\n").expect("write");
+        std::fs::write(
+            repo.join("ws/member/Cargo.toml"),
+            "[package]\nname = \"member\"\n",
+        )
+        .expect("write");
+
+        let mut package_roots = BTreeSet::new();
+        package_roots.insert(repo.join("ws"));
+        package_roots.insert(repo.join("ws/member"));
+        package_roots.insert(repo.join("standalone"));
+
+        let roots = foreign_workspace_roots(&package_roots, &repo.join("ws"));
+
+        assert!(roots.is_empty());
+    }
     use crate::test_support::canonical_root;
     use color_eyre::eyre;
     use indoc::indoc;
