@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.16
+
 - **`fix` plans co-moving families instead of reporting them graph-held.** A family of too-fresh
   versions whose members' requirements floor each other (icu's libraries beside their exact-pinned
   data crates) held itself in place: every member was reported "the resolved graph requires that
