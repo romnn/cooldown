@@ -803,6 +803,7 @@ mod tests {
             declared_bound: None,
             members: item.members.clone(),
             pinned: false,
+            hold_edges: Vec::new(),
         }
     }
 

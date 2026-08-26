@@ -285,6 +285,15 @@ impl CargoLock {
             .map_err(|err| CoreError::LockUnreadable(format!("Cargo.lock: {err}")))
     }
 
+    /// Whether the lock carries the crates.io package `name` at exactly `version`.
+    pub(crate) fn has_crates_io_package(&self, name: &str, version: &str) -> bool {
+        self.package.iter().any(|package| {
+            package.name == name
+                && package.version.as_deref() == Some(version)
+                && package.is_crates_io()
+        })
+    }
+
     /// Returns every registry version grouped by Cargo compatibility slot.
     pub(crate) fn locked_slots(&self) -> LockedSlots {
         self.matching_slots(LockPackage::is_registry)
@@ -355,9 +364,266 @@ fn highest_versions(slots: LockedSlots) -> BTreeMap<SlotKey, String> {
         .collect()
 }
 
+/// One planned node move for [`rewrite_planned_nodes`]: the crates.io package `name` currently
+/// locked at `from`, to be seeded at `to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedNodeMove {
+    pub(crate) name: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+/// Rewrites each moved node's `[[package]]` block in the raw lock text so a single resolver
+/// reconcile can land a co-moving family atomically: the `version` field becomes the target, and
+/// the now-wrong `checksum` and stale `dependencies` array are dropped for the resolver to refill
+/// from the target's real manifest. Every other byte is preserved.
+///
+/// Only crates.io blocks are touched, matched by exact `(name, from)`. Returns `None` — atomicity
+/// abstains — when any move's block is missing, so a half-rewritten seed never reaches the
+/// resolver.
+pub(crate) fn rewrite_planned_nodes(lock_text: &str, moves: &[PlannedNodeMove]) -> Option<String> {
+    // Parse once to locate each move's block by identity; the surgery itself stays line-based so
+    // untouched blocks survive byte-identical.
+    let mut remaining: Vec<&PlannedNodeMove> = moves.iter().collect();
+    let mut output = String::with_capacity(lock_text.len());
+    let mut lines = lock_text.lines().peekable();
+    while let Some(line) = lines.next() {
+        output.push_str(line);
+        output.push('\n');
+        if line.trim() != "[[package]]" {
+            continue;
+        }
+        // Collect the block up to the next section header or EOF and decide whether it is a
+        // moved node before emitting it. Any `[`-led line ends the block — not just the next
+        // `[[package]]`: cargo serializes `[[patch.unused]]` entries (which carry their own
+        // `version = "…"` fields) after the last package, and absorbing one into that package's
+        // block would let the rewrite below corrupt it.
+        let mut block: Vec<&str> = Vec::new();
+        while let Some(&next) = lines.peek() {
+            if next.trim_start().starts_with('[') {
+                break;
+            }
+            block.push(next);
+            lines.next();
+        }
+        let field = |key: &str| {
+            block.iter().find_map(|entry| {
+                entry
+                    .strip_prefix(&format!("{key} = \""))
+                    .and_then(|rest| rest.strip_suffix('"'))
+            })
+        };
+        let matched = field("name")
+            .zip(field("version"))
+            .and_then(|(name, version)| {
+                (field("source") == Some(CRATES_IO_SOURCE))
+                    .then(|| {
+                        remaining
+                            .iter()
+                            .position(|planned| planned.name == name && planned.from == version)
+                    })
+                    .flatten()
+            });
+        let Some(index) = matched else {
+            for entry in block {
+                output.push_str(entry);
+                output.push('\n');
+            }
+            continue;
+        };
+        let planned = remaining.swap_remove(index);
+        let mut in_dependencies = false;
+        for entry in block {
+            if in_dependencies {
+                if entry.trim_start().starts_with(']') {
+                    in_dependencies = false;
+                }
+                continue;
+            }
+            if entry.starts_with("checksum = ") || entry.trim() == "dependencies = []" {
+                continue;
+            }
+            if entry.starts_with("dependencies = [") {
+                in_dependencies = true;
+                continue;
+            }
+            if entry.starts_with("version = \"") {
+                output.push_str("version = \"");
+                output.push_str(&planned.to);
+                output.push_str("\"\n");
+                continue;
+            }
+            output.push_str(entry);
+            output.push('\n');
+        }
+    }
+    remaining.is_empty().then_some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::LockPackageId;
+    use super::{PlannedNodeMove, rewrite_planned_nodes};
+    use indoc::indoc;
+
+    const FAMILY_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = [
+         "icu_normalizer",
+        ]
+
+        [[package]]
+        name = "icu_normalizer"
+        version = "2.3.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "aa"
+        dependencies = [
+         "icu_normalizer_data",
+         "icu_provider",
+        ]
+
+        [[package]]
+        name = "icu_normalizer_data"
+        version = "2.3.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "bb"
+
+        [[package]]
+        name = "icu_provider"
+        version = "2.3.1"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "cc"
+        dependencies = []
+    "#};
+
+    /// The atomic seed: every moved node's version is rewritten while its stale checksum and
+    /// dependency edges are dropped for the reconcile to refill; untouched blocks (the `app`
+    /// workspace member here) survive byte-identical.
+    #[test]
+    fn rewrite_planned_nodes_seeds_targets_and_drops_stale_fields() {
+        let moves = [
+            PlannedNodeMove {
+                name: "icu_normalizer".to_string(),
+                from: "2.3.0".to_string(),
+                to: "2.2.0".to_string(),
+            },
+            PlannedNodeMove {
+                name: "icu_normalizer_data".to_string(),
+                from: "2.3.0".to_string(),
+                to: "2.2.0".to_string(),
+            },
+            PlannedNodeMove {
+                name: "icu_provider".to_string(),
+                from: "2.3.1".to_string(),
+                to: "2.2.0".to_string(),
+            },
+        ];
+
+        let seeded = rewrite_planned_nodes(FAMILY_LOCK, &moves).expect("all moves present");
+
+        let expected = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "icu_normalizer",
+            ]
+
+            [[package]]
+            name = "icu_normalizer"
+            version = "2.2.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "icu_normalizer_data"
+            version = "2.2.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "icu_provider"
+            version = "2.2.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+        "#};
+        assert_eq!(seeded, expected);
+    }
+
+    /// A `[[patch.unused]]` tail (cargo serializes it after the last package, with its own
+    /// `version` field) must not be absorbed into the preceding package's block: when that
+    /// package is a seeded move, absorption would rewrite the patch record's version too.
+    #[test]
+    fn rewrite_planned_nodes_leaves_trailing_sections_untouched() {
+        let lock = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "icu_provider"
+            version = "2.3.1"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "cc"
+
+            [[patch.unused]]
+            name = "shadow"
+            version = "9.9.9"
+        "#};
+        let moves = [PlannedNodeMove {
+            name: "icu_provider".to_string(),
+            from: "2.3.1".to_string(),
+            to: "2.2.0".to_string(),
+        }];
+
+        let seeded = rewrite_planned_nodes(lock, &moves).expect("the move is present");
+
+        let expected = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "icu_provider"
+            version = "2.2.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[patch.unused]]
+            name = "shadow"
+            version = "9.9.9"
+        "#};
+        assert_eq!(seeded, expected);
+    }
+
+    /// A move whose node is absent aborts the whole seed: a partially seeded family handed to the
+    /// resolver would be indistinguishable from a legitimate half-landed state.
+    #[test]
+    fn rewrite_planned_nodes_abstains_when_a_move_is_missing() {
+        let moves = [PlannedNodeMove {
+            name: "icu_normalizer".to_string(),
+            from: "9.9.9".to_string(),
+            to: "2.2.0".to_string(),
+        }];
+        assert_eq!(rewrite_planned_nodes(FAMILY_LOCK, &moves), None);
+    }
+
+    /// Only crates.io blocks are seeded; a same-name node from another source never matches.
+    #[test]
+    fn rewrite_planned_nodes_ignores_non_registry_blocks() {
+        let lock = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "twin"
+            version = "1.0.0"
+            source = "git+https://example.com/twin#abcdef"
+        "#};
+        let moves = [PlannedNodeMove {
+            name: "twin".to_string(),
+            from: "1.0.0".to_string(),
+            to: "0.9.0".to_string(),
+        }];
+        assert_eq!(rewrite_planned_nodes(lock, &moves), None);
+    }
 
     #[test]
     fn git_source_identity_joins_metadata_and_lock_spellings() {

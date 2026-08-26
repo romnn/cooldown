@@ -383,6 +383,49 @@ pub struct Dependency {
     /// The `outdated --hide-pinned` flag only filters these rows from the human table; `check` gates
     /// a pinned dep's age like any other pin.
     pub pinned: bool,
+    /// The attributed constraint edges behind [`graph_floor`](Self::graph_floor) and
+    /// [`graph_ceiling`](Self::graph_ceiling), when the adapter can name each requirer. Empty when
+    /// attribution is unavailable; the collapsed fields then remain the only graph constraint and
+    /// `fix` planning treats every hold as genuine. See [`GraphHoldEdge`].
+    pub hold_edges: Vec<GraphHoldEdge>,
+}
+
+/// One active requirement edge through which the resolved graph constrains a [`Dependency`]: the
+/// requiring package (a resolved node, identified by name and version) and the bound its
+/// requirement imposes on this dependency's node.
+///
+/// The collapsed [`Dependency::graph_floor`] / [`Dependency::graph_ceiling`] keep the gate cheap
+/// for `check`; these attributed edges exist so `fix` planning can tell *who* holds a violation.
+/// A hold contributed only by requirers that are themselves too-fresh violations is circular — the
+/// floor is conditioned on the very resolution being fixed — so the planner discounts those edges
+/// and plans the whole co-moving family; a hold from a compliant requirer is genuine and is
+/// reported with the requirer's name and requirement. Adapters that cannot attribute constraints
+/// leave [`Dependency::hold_edges`] empty, which disables discounting and preserves the collapsed
+/// behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphHoldEdge {
+    /// The requiring package's name (a resolved non-member node in the graph).
+    pub requirer: String,
+    /// The requiring package's resolved version, used to match the requirer against the violation
+    /// set (coexisting versions of one name are distinct nodes).
+    pub requirer_version: Version,
+    /// The verbatim declared requirement, for display in held-dependency warnings.
+    pub requirement: String,
+    /// The bound this edge imposes on the dependency's resolved node: for a floor edge, the lowest
+    /// version the requirement admits; for a ceiling edge (an exact `=` pin), the pinned version,
+    /// which adapters guarantee equals the dependency's resolved version.
+    pub bound: Version,
+    /// Which direction the bound constrains.
+    pub kind: GraphHoldKind,
+}
+
+/// The direction a [`GraphHoldEdge`] constrains its dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphHoldKind {
+    /// The edge's requirement imposes a lower bound (contributes to [`Dependency::graph_floor`]).
+    Floor,
+    /// The edge is an exact pin capping the node (contributes to [`Dependency::graph_ceiling`]).
+    Ceiling,
 }
 
 /// A workspace member that declares a dependency: its package `name` and its `path` relative to the

@@ -128,6 +128,7 @@ impl ToolRead for HexTool {
                 declared_bound: None,
                 members: Vec::new(),
                 pinned: false,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)

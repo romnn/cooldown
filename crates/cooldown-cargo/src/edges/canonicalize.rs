@@ -114,6 +114,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            hold_edges: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
             declared_requirements,

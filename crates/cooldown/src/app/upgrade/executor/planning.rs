@@ -1,8 +1,8 @@
 use super::PlanMode;
 use crate::app::TransitiveGate;
 use cooldown_core::{
-    BaselineViolation, Change, DepScope, Dependency, MajorKey, PackageId, Release, ResolveContext,
-    UpdateKind, Version,
+    BaselineViolation, Change, DepScope, Dependency, GraphHoldEdge, GraphHoldKind, MajorKey,
+    PackageId, Release, ResolveContext, UpdateKind, Version,
 };
 use std::collections::HashSet;
 
@@ -101,6 +101,108 @@ pub(crate) fn target_package_for(
         .map(|release| release.major.clone())
         .unwrap_or(current_major.clone());
     target_package(&dep.package, &current_major, &target_major)
+}
+
+/// A violating dependency's graph constraints with circular contributions discounted: the
+/// constraints that remain once every hold edge whose requirer is *itself* a too-fresh violation
+/// in the same planning round is set aside.
+///
+/// The raw [`Dependency::graph_floor`]/[`Dependency::graph_ceiling`] describe the current
+/// resolution, so a family of violations holds itself in place: each member's floor comes from
+/// siblings the fix wants to move — a hold conditioned on the very resolution being questioned.
+/// Discounting those edges lets the planner schedule the whole family; the resolver remains the
+/// constraint oracle (an infeasible optimistic pin is rejected non-fatally and the next fix round
+/// re-plans against the re-locked graph, whose floors are then no longer circular).
+pub(super) struct EffectiveHold {
+    /// The dependency with its effective floor/ceiling substituted; identical to the input when
+    /// nothing was discounted or the adapter provided no attribution.
+    pub(super) dep: Dependency,
+    /// Whether any hold edge was discounted (so the effective verdict must be re-evaluated).
+    pub(super) discounted: bool,
+    /// A non-discounted edge that still holds the dependency at its current version, if any — the
+    /// requirer a genuine-hold warning names.
+    pub(super) compliant_holder: Option<GraphHoldEdge>,
+}
+
+/// Computes the [`EffectiveHold`] of `dep` against this round's violation set (package name and
+/// current version of every too-fresh dependency in scope).
+///
+/// Without attribution ([`Dependency::hold_edges`] empty) the collapsed constraints stand
+/// unchanged. With attribution, the effective floor is derived from the kept (non-violating)
+/// floor edges alone: a kept edge flooring the node at its own current version holds it exactly;
+/// otherwise the highest kept bound present in `releases` becomes the effective floor (a bound
+/// absent from the fetched releases imposes no clamp, matching how `evaluate_fix` treats an
+/// unknown collapsed floor). The effective ceiling survives only while a kept exact-pin edge caps
+/// the node.
+pub(super) fn effective_hold(
+    dep: &Dependency,
+    releases: &[Release],
+    violations: &HashSet<(String, String)>,
+) -> EffectiveHold {
+    if dep.hold_edges.is_empty() {
+        return EffectiveHold {
+            dep: dep.clone(),
+            discounted: false,
+            compliant_holder: None,
+        };
+    }
+    let kept: Vec<&GraphHoldEdge> = dep
+        .hold_edges
+        .iter()
+        .filter(|edge| {
+            !violations.contains(&(
+                edge.requirer.clone(),
+                edge.requirer_version.as_str().to_string(),
+            ))
+        })
+        .collect();
+    let discounted = kept.len() != dep.hold_edges.len();
+    let holding = |edge: &GraphHoldEdge| match edge.kind {
+        GraphHoldKind::Floor => edge.bound == dep.current,
+        // The adapter invariant guarantees an active exact-pin ceiling equals the resolved
+        // version, so any kept ceiling edge caps the node at `current`.
+        GraphHoldKind::Ceiling => true,
+    };
+    let compliant_holder = kept
+        .iter()
+        .find(|edge| holding(edge))
+        .map(|edge| (*edge).clone());
+    if !discounted {
+        return EffectiveHold {
+            dep: dep.clone(),
+            discounted,
+            compliant_holder,
+        };
+    }
+    let held_at_current = kept
+        .iter()
+        .any(|edge| matches!(edge.kind, GraphHoldKind::Floor) && edge.bound == dep.current);
+    let effective_floor = if held_at_current {
+        Some(dep.current.clone())
+    } else {
+        kept.iter()
+            .filter(|edge| matches!(edge.kind, GraphHoldKind::Floor))
+            .filter_map(|edge| {
+                releases
+                    .iter()
+                    .find(|release| release.version == edge.bound)
+                    .map(|release| (release.order.clone(), edge.bound.clone()))
+            })
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(_, bound)| bound)
+    };
+    let effective_ceiling = kept
+        .iter()
+        .any(|edge| matches!(edge.kind, GraphHoldKind::Ceiling))
+        .then(|| dep.current.clone());
+    let mut effective = dep.clone();
+    effective.graph_floor = effective_floor;
+    effective.graph_ceiling = effective_ceiling;
+    EffectiveHold {
+        dep: effective,
+        discounted,
+        compliant_holder,
+    }
 }
 
 /// Builds a `fix` change that matures one dependency back to its selected target.

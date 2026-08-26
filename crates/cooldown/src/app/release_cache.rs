@@ -461,6 +461,7 @@ mod tests {
             declared_bound: None,
             members: Vec::new(),
             pinned: false,
+            hold_edges: Vec::new(),
         }
     }
 

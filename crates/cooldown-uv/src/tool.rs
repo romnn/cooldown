@@ -243,6 +243,7 @@ impl ToolRead for UvTool {
                     Vec::new()
                 },
                 pinned,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)
@@ -285,6 +286,7 @@ impl ToolRead for UvTool {
                     declared_bound: bound,
                     members: members.clone(),
                     pinned,
+                    hold_edges: Vec::new(),
                 }
             })
             .collect();
@@ -1256,6 +1258,7 @@ mod tests {
             declared_bound: None,
             members: Vec::new(),
             pinned: false,
+            hold_edges: Vec::new(),
         };
         let raw = vec![RawRelease {
             version: Version::new("2.32.1"),

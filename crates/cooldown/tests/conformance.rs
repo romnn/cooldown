@@ -67,6 +67,24 @@ fn dep(name: &str, current: &str, direct: bool) -> Dependency {
         declared_bound: None,
         members: Vec::new(),
         pinned: false,
+        hold_edges: Vec::new(),
+    }
+}
+
+/// An attributed floor edge for the circular-hold discount tests: `requirer`@`requirer_version`
+/// floors the carrying dependency at `bound` via `requirement`.
+fn floor_edge(
+    requirer: &str,
+    requirer_version: &str,
+    requirement: &str,
+    bound: &str,
+) -> GraphHoldEdge {
+    GraphHoldEdge {
+        requirer: requirer.to_string(),
+        requirer_version: Version::new(requirer_version),
+        requirement: requirement.to_string(),
+        bound: Version::new(bound),
+        kind: GraphHoldKind::Floor,
     }
 }
 
@@ -3364,6 +3382,318 @@ async fn fix_warns_and_leaves_graph_held_violation() {
     assert!(out.warnings[0].message.contains("resolved graph requires"));
 }
 
+/// The circular-hold discount through the `fix` planning entry: two violations flooring each
+/// other at their fresh versions are a family holding itself in place — the hold is conditioned
+/// on the resolution being fixed, so both must be planned and downgraded, where the collapsed
+/// floors alone would warn each member graph-held (the previous test's shape, member by member).
+#[tokio::test]
+async fn fix_plans_a_mutually_held_family_through_the_discount() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    releases.insert("b".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("b".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut a = dep("a", "v1.0.2", true);
+    a.graph_floor = Some(Version::new("v1.0.2"));
+    a.hold_edges = vec![floor_edge("b", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let mut b = dep("b", "v1.0.2", true);
+    b.graph_floor = Some(Version::new("v1.0.2"));
+    b.hold_edges = vec![floor_edge("a", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let ws = workspace(
+        fake(root, vec![a, b], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 2, "both family members move");
+    assert!(
+        out.warnings.is_empty(),
+        "no member may be reported graph-held: {:?}",
+        out.warnings
+    );
+    for name in ["a", "b"] {
+        let item = out.items.iter().find(|item| item.name == name).expect(name);
+        assert_eq!(
+            item.to, "v1.0.1",
+            "{name} matures to the newest matured release"
+        );
+    }
+}
+
+/// A genuine hold through the `fix` planning entry: the floor comes from a *compliant* requirer
+/// (absent from the violation set), so the violation stays in place and the warning names that
+/// requirer and its requirement instead of the generic graph-held text.
+#[tokio::test]
+async fn fix_warning_names_the_compliant_holder() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut held = dep("a", "v1.0.2", true);
+    held.graph_floor = Some(Version::new("v1.0.2"));
+    held.hold_edges = vec![floor_edge("anchor", "v2.0.0", "^1.0.2", "v1.0.2")];
+    let ws = workspace(
+        fake(root, vec![held], Vec::new(), releases, locked),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0);
+    assert!(out.items.is_empty());
+    assert_eq!(out.warnings.len(), 1);
+    assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
+    assert!(
+        out.warnings[0]
+            .message
+            .contains("anchor v2.0.0 requires `^1.0.2`"),
+        "the warning names the compliant holder: {}",
+        out.warnings[0].message
+    );
+}
+
+/// The discount set holds only *movable* violations: a transitive `--transitive allow` leaves in
+/// place keeps flooring its dependents exactly like a compliant requirer — discounting it would
+/// plan changes whose only landing path is moving the very node the flag promised to keep.
+#[tokio::test]
+async fn fix_transitive_allow_keeps_the_allow_gated_hold() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("d".to_string(), package_releases.clone());
+    releases.insert("t".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("d".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("t".to_string(), release_named(&package_releases, "v1.0.2"));
+    // Direct violation `d` is held at its fresh version by transitive violation `t`.
+    let mut held = dep("d", "v1.0.2", true);
+    held.graph_floor = Some(Version::new("v1.0.2"));
+    held.hold_edges = vec![floor_edge("t", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let ws = workspace(
+        fake(
+            root,
+            vec![held],
+            vec![dep("t", "v1.0.2", false)],
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+    let mut allow = opts();
+    allow.transitive_mode = cooldown::app::TransitiveGate::Allow;
+
+    let out = ws.fix(&allow).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0, "nothing may move: {:?}", out.items);
+    // `t` is reported left-in-place by the flag; `d` stays held — and the hold is genuine now
+    // (its requirer is excluded from the discount), so the warning names `t`.
+    assert_eq!(out.warnings.len(), 2);
+    assert!(
+        out.warnings.iter().any(|warning| warning
+            .message
+            .contains("left in place by --transitive allow")),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("t v1.0.2 requires `~1.0.2`")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+/// The other direction of the movable-violations rule: a violation with no matured older release
+/// stays in the discount set — whether it can move is the resolver's call, and the fresh-era-only
+/// crate that simply drops out once its family moves (the `icu_locale_fallback` shape) depends on
+/// its edges being discounted.
+#[tokio::test]
+async fn fix_discounts_a_hold_from_an_untargetable_violation() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    // `x` exists only at its fresh version: a violation with no matured target.
+    releases.insert(
+        "x".to_string(),
+        vec![rel("v1.0.2", 0, Some("2026-06-16T00:00:00Z"), None)],
+    );
+    releases.insert("y".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert(
+        "x".to_string(),
+        rel("v1.0.2", 0, Some("2026-06-16T00:00:00Z"), None),
+    );
+    locked.insert("y".to_string(), release_named(&package_releases, "v1.0.2"));
+    let mut held = dep("y", "v1.0.2", true);
+    held.graph_floor = Some(Version::new("v1.0.2"));
+    held.hold_edges = vec![floor_edge("x", "v1.0.2", "~1.0.2", "v1.0.2")];
+    let ws = workspace(
+        fake(
+            root,
+            vec![dep("x", "v1.0.2", true), held],
+            Vec::new(),
+            releases,
+            locked,
+        ),
+        Baseline::default(),
+    );
+
+    let out = ws.fix(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(
+        out.summary.applied, 1,
+        "the held violation moves: {:?}",
+        out.items
+    );
+    let unblocked = out.items.iter().find(|item| item.name == "y").expect("y");
+    assert_eq!(unblocked.to, "v1.0.1");
+    // `x` itself remains: no matured release exists for it.
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("no older version has matured")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+/// The pinned half of the movable-violations rule: a pin left alone without `--downgrade-pinned`
+/// keeps flooring its dependents like a compliant requirer (the held dep's warning names it),
+/// while `--downgrade-pinned` puts the pin into the discount set and both violations plan.
+#[tokio::test]
+async fn fix_pinned_hold_follows_the_downgrade_pinned_flag() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("p".to_string(), package_releases.clone());
+    releases.insert("v".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("p".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("v".to_string(), release_named(&package_releases, "v1.0.2"));
+    let make = || {
+        let mut pinned = dep("p", "v1.0.2", true);
+        pinned.pinned = true;
+        let mut held = dep("v", "v1.0.2", true);
+        held.graph_floor = Some(Version::new("v1.0.2"));
+        held.hold_edges = vec![floor_edge("p", "v1.0.2", "~1.0.2", "v1.0.2")];
+        workspace(
+            fake(
+                root.clone(),
+                vec![pinned, held],
+                Vec::new(),
+                releases.clone(),
+                locked.clone(),
+            ),
+            Baseline::default(),
+        )
+    };
+
+    // Default: the pin is not movable, so its floor on `v` is a genuine hold — nothing moves,
+    // `p` warns as pinned, and `v`'s warning names `p` as the holder.
+    let out = make().fix(&opts()).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 0, "{:?}", out.items);
+    assert_eq!(out.warnings.len(), 2);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("rerun with --downgrade-pinned")),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("p v1.0.2 requires `~1.0.2`")),
+        "{:?}",
+        out.warnings
+    );
+
+    // --downgrade-pinned: the pin joins the discount set, unblocking `v`; both mature.
+    let mut with_pinned = opts();
+    with_pinned.downgrade_pinned = true;
+    let out = make().fix(&with_pinned).await;
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(out.summary.applied, 2, "{:?}", out.items);
+    for name in ["p", "v"] {
+        let item = out.items.iter().find(|item| item.name == name).expect(name);
+        assert_eq!(item.to, "v1.0.1");
+    }
+}
+
+/// The round-budget backstop: when the final round still applied changes (and its re-lock floated
+/// in fresh work), the exhaustion exit must not report a silent clean success — one plan-only pass
+/// surfaces the residual violation as a "rerun fix" warning that marks the run incomplete
+/// (`Exit::Policy` under `--strict`).
+#[tokio::test]
+async fn fix_round_budget_exhaustion_warns_about_residual_violations() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("d".to_string(), package_releases.clone());
+    releases.insert("t".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("d".to_string(), release_named(&package_releases, "v1.0.2"));
+    locked.insert("t".to_string(), release_named(&package_releases, "v1.0.2"));
+    // The re-lock of round 1's downgrade floats in a fresh, reconcilable transitive — work that
+    // would need round 2, which the budget denies.
+    let mut floated = dep("t", "v1.0.2", false);
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+    let fake = FakeEco {
+        direct: vec![dep("d", "v1.0.2", true)],
+        transitive: vec![],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true,
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let mut strict = opts();
+    strict.strict = true;
+    strict.fix_round_budget = Some(1);
+
+    let out = workspace(fake, Baseline::default()).fix(&strict).await;
+
+    assert_eq!(
+        out.summary.applied, 1,
+        "round 1's downgrade lands: {:?}",
+        out.items
+    );
+    assert!(
+        out.warnings.iter().any(|warning| {
+            warning.message.contains(
+                "t@v1.0.2 is still younger than its cooldown after 1 fix rounds; rerun fix",
+            )
+        }),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(
+        out.exit,
+        Exit::Policy,
+        "the exhausted budget marks a strict run incomplete"
+    );
+}
+
 #[tokio::test]
 async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
     let TmpRoot { guard: _g, root } = tmp_root();
@@ -3872,6 +4202,82 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
     assert_eq!(upgraded.to, "v1.1.0");
     let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
     assert_eq!(reconciled.to, "v1.0.1");
+}
+
+/// The circular-hold discount through the reconcile entry (`reconcile_to_fixpoint`): the floated
+/// transitive `t` arms the reconcile, whose planning also sees the pre-existing violation `u` —
+/// held at its fresh version only by `t`, itself in the violation set. The discount plans `u`
+/// beside `t`; with collapsed floors alone `u` would stay held while only `t` reconciled.
+#[tokio::test]
+async fn upgrade_reconcile_discounts_a_hold_from_a_co_violating_requirer() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let t_releases = too_fresh_fix_releases(); // v1.0.1 matured, v1.0.2 too fresh
+    releases.insert("t".to_string(), t_releases.clone());
+    releases.insert("u".to_string(), t_releases.clone());
+
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    locked.insert("t".to_string(), release_named(&t_releases, "v1.0.2"));
+    locked.insert("u".to_string(), release_named(&t_releases, "v1.0.2"));
+
+    // The floated transitive is reconcilable in the gate's collapsed view (floor below current).
+    let mut floated = dep("t", "v1.0.2", false);
+    floated.graph_floor = Some(Version::new("v1.0.0"));
+    // The pre-existing violation is held at its fresh version, but only by `t` — a co-violating
+    // requirer the reconcile's planning discounts.
+    let mut held = dep("u", "v1.0.2", false);
+    held.graph_floor = Some(Version::new("v1.0.2"));
+    held.hold_edges = vec![floor_edge("t", "v1.0.2", "~1.0.2", "v1.0.2")];
+
+    let fake = FakeEco {
+        direct: vec![dep("a", "v1.0.0", true)],
+        transitive: vec![held],
+        fresh_transitive: Some(floated),
+        releases,
+        locked,
+        inject_fresh_on_apply: true, // applying the `a` upgrade drags in `t`
+        collateral_on_apply: Vec::new(),
+        edge_rebinds_on_apply: Vec::new(),
+        stale_lock: false,
+        fail_graph_after_apply: false,
+        fail_locked_release_after_apply_for: None,
+        stale_lock_after_apply: false,
+        build_fails_after_apply: false,
+        state: Mutex::new(State::default()),
+        root,
+    };
+    let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
+
+    assert_eq!(out.exit, Exit::Ok);
+    assert_eq!(
+        out.summary.applied, 3,
+        "forward move plus both reconciled violations"
+    );
+    let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
+    assert_eq!(upgraded.to, "v1.1.0");
+    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
+    assert_eq!(reconciled.to, "v1.0.1");
+    let unblocked = out.items.iter().find(|item| item.name == "u").expect("u");
+    assert_eq!(
+        unblocked.to, "v1.0.1",
+        "the discount plans the violation its co-violating requirer held"
+    );
 }
 
 #[tokio::test]

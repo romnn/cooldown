@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`fix` plans co-moving families instead of reporting them graph-held.** A family of too-fresh
+  versions whose members' requirements floor each other (icu's libraries beside their exact-pinned
+  data crates) held itself in place: every member was reported "the resolved graph requires that
+  version" while the floors came from siblings `fix` wanted to move — a hold conditioned on the
+  very resolution being questioned. The cargo adapter now attributes each graph floor and exact-pin
+  ceiling to its requirer node, and fix planning discounts constraint edges whose requirer is
+  itself a violation in the same round: the whole family enters one plan. When the per-package pin
+  passes cannot land such a group (icu's tilde requirements admit no member-by-member order), the
+  adapter seeds every rejected planned node at its target in the staged lock and reconciles the
+  family with one resolver invocation — membership changes included: a crate that exists only in
+  the fresh era drops out of the lock with it, and a failed reconcile restores the lock and keeps
+  the recorded rejections. A genuine hold — a *compliant* requirer demanding the too-fresh version — is still
+  left in place, and its warning now names that requirer and its requirement instead of the generic
+  graph-held text. Applies to `fix` and to `upgrade`'s transitive reconcile alike.
+
 ## v0.0.15
 
 - **Nested cargo workspaces the enclosing workspace excludes are projects of their own.** Cargo

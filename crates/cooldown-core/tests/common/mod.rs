@@ -73,6 +73,7 @@ pub fn dep(name: &str, current: &str, quality: ReleaseQuality) -> Dependency {
         declared_bound: None,
         members: Vec::new(),
         pinned: false,
+        hold_edges: Vec::new(),
     }
 }
 

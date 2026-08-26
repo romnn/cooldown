@@ -1,4 +1,4 @@
-use super::planning::{plan_baseline_violations, target_package};
+use super::planning::{effective_hold, plan_baseline_violations, target_package};
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
     collateral_rows, combine_lock_status, conflict_skip_message, indeterminate_trial,
@@ -10,8 +10,9 @@ use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
 use cooldown_core::{
     ApplyReport, BaselineViolation, Change, DepScope, Dependency, Diagnostic, DiagnosticKind,
-    EdgeBindingAction, LockStatus, MajorKey, MemberRef, PackageId, ProjectMutationJournal, Release,
-    ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind, Version,
+    EdgeBindingAction, GraphHoldEdge, GraphHoldKind, LockStatus, MajorKey, MemberRef, PackageId,
+    ProjectMutationJournal, Release, ReleaseOrder, ReleaseQuality, SkipReason, ToolId, UpdateKind,
+    Version,
 };
 use std::collections::HashSet;
 
@@ -228,6 +229,7 @@ fn dep(name: &str, version: &str) -> Dependency {
         declared_bound: None,
         members: Vec::new(),
         pinned: false,
+        hold_edges: Vec::new(),
     }
 }
 
@@ -236,6 +238,142 @@ fn member(name: &str, path: &str) -> MemberRef {
         name: name.to_string(),
         path: path.to_string(),
     }
+}
+
+fn hold_edge(
+    requirer: &str,
+    requirer_version: &str,
+    bound: &str,
+    kind: GraphHoldKind,
+) -> GraphHoldEdge {
+    GraphHoldEdge {
+        requirer: requirer.to_string(),
+        requirer_version: Version::new(requirer_version),
+        requirement: format!("^{bound}"),
+        bound: Version::new(bound),
+        kind,
+    }
+}
+
+fn violation_set(entries: &[(&str, &str)]) -> HashSet<(String, String)> {
+    entries
+        .iter()
+        .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+        .collect()
+}
+
+/// The circular-family shape: every floor edge holding the violation comes from requirers that
+/// are themselves violations, so the effective constraints vanish and the dep becomes plannable.
+#[test]
+fn a_hold_from_co_moving_violations_is_discounted() {
+    let mut zerovec = dep("zerovec", "0.11.8");
+    zerovec.graph_floor = Some(Version::new("0.11.8"));
+    zerovec.hold_edges = vec![
+        hold_edge("icu_properties", "2.3.0", "0.11.8", GraphHoldKind::Floor),
+        hold_edge("icu_normalizer", "2.3.0", "0.11.8", GraphHoldKind::Floor),
+    ];
+    let releases = [rel("0.11.2", 1), rel("0.11.8", 2)];
+    let violations = violation_set(&[
+        ("zerovec", "0.11.8"),
+        ("icu_properties", "2.3.0"),
+        ("icu_normalizer", "2.3.0"),
+    ]);
+
+    let effective = effective_hold(&zerovec, &releases, &violations);
+
+    assert!(effective.discounted);
+    assert_eq!(effective.dep.graph_floor, None);
+    assert_eq!(effective.dep.graph_ceiling, None);
+    assert!(effective.compliant_holder.is_none());
+}
+
+/// A compliant requirer's floor survives the discount and clamps the downgrade range without
+/// holding the dep at its current version.
+#[test]
+fn a_compliant_floor_clamps_but_does_not_hold() {
+    let mut zerovec = dep("zerovec", "0.11.8");
+    zerovec.graph_floor = Some(Version::new("0.11.8"));
+    zerovec.hold_edges = vec![
+        hold_edge("icu_properties", "2.3.0", "0.11.8", GraphHoldKind::Floor),
+        hold_edge("hayagriva", "0.10.1", "0.11.2", GraphHoldKind::Floor),
+    ];
+    let releases = [rel("0.11.0", 1), rel("0.11.2", 2), rel("0.11.8", 3)];
+    let violations = violation_set(&[("zerovec", "0.11.8"), ("icu_properties", "2.3.0")]);
+
+    let effective = effective_hold(&zerovec, &releases, &violations);
+
+    assert!(effective.discounted);
+    assert_eq!(effective.dep.graph_floor, Some(Version::new("0.11.2")));
+    assert!(effective.compliant_holder.is_none());
+}
+
+/// A compliant requirer flooring the dep at its current version is a genuine hold, and the edge
+/// is surfaced so the warning can name it.
+#[test]
+fn a_compliant_hold_at_current_stays_held_and_names_the_requirer() {
+    let mut provider = dep("icu_provider", "2.3.0");
+    provider.graph_floor = Some(Version::new("2.3.0"));
+    provider.hold_edges = vec![
+        hold_edge("icu_normalizer", "2.3.0", "2.3.0", GraphHoldKind::Floor),
+        hold_edge("hayagriva", "0.10.1", "2.3.0", GraphHoldKind::Floor),
+    ];
+    let releases = [rel("2.2.0", 1), rel("2.3.0", 2)];
+    let violations = violation_set(&[("icu_provider", "2.3.0"), ("icu_normalizer", "2.3.0")]);
+
+    let effective = effective_hold(&provider, &releases, &violations);
+
+    assert!(effective.discounted);
+    assert_eq!(effective.dep.graph_floor, Some(Version::new("2.3.0")));
+    let holder = effective
+        .compliant_holder
+        .expect("the compliant requirer must be surfaced for the warning");
+    assert_eq!(holder.requirer, "hayagriva");
+}
+
+/// Without attribution the collapsed constraints stand: nothing is discounted and the verdict is
+/// whatever the raw floor implies.
+#[test]
+fn missing_attribution_disables_discounting() {
+    let mut provider = dep("icu_provider", "2.3.0");
+    provider.graph_floor = Some(Version::new("2.3.0"));
+    let releases = [rel("2.2.0", 1), rel("2.3.0", 2)];
+    let violations = violation_set(&[("icu_provider", "2.3.0")]);
+
+    let effective = effective_hold(&provider, &releases, &violations);
+
+    assert!(!effective.discounted);
+    assert_eq!(effective.dep.graph_floor, Some(Version::new("2.3.0")));
+    assert!(effective.compliant_holder.is_none());
+}
+
+/// An exact-pin ceiling from a violating requirer is discounted with it; one from a compliant
+/// requirer keeps capping the node and is surfaced as the holder.
+#[test]
+fn ceiling_edges_follow_their_requirers() {
+    let mut serde = dep("serde", "1.0.300");
+    serde.graph_ceiling = Some(Version::new("1.0.300"));
+    serde.hold_edges = vec![hold_edge(
+        "fresh-pinner",
+        "9.9.9",
+        "1.0.300",
+        GraphHoldKind::Ceiling,
+    )];
+    let releases = [rel("1.0.200", 1), rel("1.0.300", 2)];
+    let violations = violation_set(&[("serde", "1.0.300"), ("fresh-pinner", "9.9.9")]);
+
+    let discounted = effective_hold(&serde, &releases, &violations);
+    assert!(discounted.discounted);
+    assert_eq!(discounted.dep.graph_ceiling, None);
+    assert!(discounted.compliant_holder.is_none());
+
+    let compliant_only = violation_set(&[("serde", "1.0.300")]);
+    let kept = effective_hold(&serde, &releases, &compliant_only);
+    assert!(!kept.discounted);
+    assert_eq!(kept.dep.graph_ceiling, Some(Version::new("1.0.300")));
+    let holder = kept
+        .compliant_holder
+        .expect("the pinning requirer must be surfaced for the warning");
+    assert_eq!(holder.requirer, "fresh-pinner");
 }
 
 fn change(name: &str, from: &str, to: &str) -> Change {

@@ -348,6 +348,7 @@ fn classify_candidate(
 ///     declared_bound: None,
 ///     members: Vec::new(),
 ///     pinned: false,
+///     hold_edges: Vec::new(),
 /// };
 /// let now: Timestamp = "2026-01-08T00:00:00Z".parse()?;
 /// let mature: Timestamp = "2026-01-01T00:00:00Z".parse()?;
@@ -944,6 +945,7 @@ mod tests {
             declared_bound: None,
             members: Vec::new(),
             pinned: false,
+            hold_edges: Vec::new(),
         }
     }
 

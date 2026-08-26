@@ -89,5 +89,6 @@ fn dependency_of(
         declared_bound: None,
         members: Vec::new(),
         pinned: false,
+        hold_edges: Vec::new(),
     })
 }

@@ -22,7 +22,7 @@ use crate::CARGO_ID;
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
-use crate::lockfile::{CargoLock, SlotKey, SourcedSlotKey};
+use crate::lockfile::{CargoLock, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes};
 use crate::manifest;
 use crate::native::parse_native;
 use crate::version;
@@ -218,6 +218,7 @@ impl ToolRead for CargoTool {
                     graph.reaching_members(id)
                 },
                 pinned,
+                hold_edges: graph.node_hold_edges(&info.name, &info.version).to_vec(),
             });
         }
         Ok(deps)
@@ -783,7 +784,104 @@ impl CargoTool {
                 }
             }
         }
+        self.land_rejected_group_atomically(project, plan, journal, &mut rejections)
+            .await?;
         Ok(rejections)
+    }
+
+    /// Lands the co-planned changes the per-package pin passes could not: a family whose members'
+    /// requirements only admit each other's *source* era (icu's `~2.3.0` tilde web between
+    /// libraries and their data crates) rejects every single-package `--precise` step no matter
+    /// the order — each step leaves a sibling's requirement unsatisfied. Seeding the staged lock
+    /// with every still-short rejected change at its target and running one unlocked resolve
+    /// reconciles the family as a unit: the resolver refills each seeded node's dependencies and
+    /// checksum from its real manifest, resolves era-mates the seeds newly require, and drops
+    /// nodes only the source era referenced.
+    ///
+    /// The attempt is strictly additive to the pin passes and all-or-nothing. It runs only over
+    /// changes already rejected and still short of their target, needs at least two of them (a
+    /// lone rejection was already expressed exactly by its pin), abstains rather than seed a
+    /// partial group, and restores the pre-attempt lock byte-for-byte unless *every* seeded
+    /// member landed at its exact target — a partially-landed reconcile left some member's
+    /// unanchored slot to the live index's preference, and keeping that would be a silent
+    /// drive-by move. A restored group's members keep their recorded per-pin rejections.
+    async fn land_rejected_group_atomically(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        rejections: &mut PinRejections,
+    ) -> Result<()> {
+        if rejections.is_empty() {
+            return Ok(());
+        }
+        let lock_path = project.root.join("Cargo.lock");
+        let lock_text = std::fs::read_to_string(&lock_path)?;
+        let lock = read_lock(project)?;
+        let mut moves: Vec<PlannedNodeMove> = Vec::new();
+        let mut keys: Vec<(String, String, String)> = Vec::new();
+        for change in &plan.changes {
+            let key = rejection_key(change);
+            // A stale rejection whose change a later pin pass still landed keeps its map entry;
+            // membership here is decided by the lock, not the map.
+            if !rejections.contains_key(&key)
+                || keys.contains(&key)
+                || !lock.has_crates_io_package(&change.package.name, change.from.as_str())
+                || lock.has_crates_io_package(&change.package.name, change.to.as_str())
+            {
+                continue;
+            }
+            moves.push(PlannedNodeMove {
+                name: change.package.name.clone(),
+                from: change.from.as_str().to_string(),
+                to: change.to.as_str().to_string(),
+            });
+            keys.push(key);
+        }
+        if moves.len() < 2 {
+            return Ok(());
+        }
+        let Some(seeded) = rewrite_planned_nodes(&lock_text, &moves) else {
+            return Ok(());
+        };
+        tracing::debug!(
+            group = moves.len(),
+            "seeding rejected co-planned changes for one atomic reconcile"
+        );
+        journal.validate_project(&project.root)?;
+        std::fs::write(&lock_path, &seeded)?;
+        match self.cargo.metadata(&project.root).await {
+            Ok(_) => {}
+            Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
+                std::fs::write(&lock_path, &lock_text)?;
+                return Err(err);
+            }
+            // The joint seed is unsatisfiable as a whole: restore the lock and let each change
+            // keep the per-pin rejection cargo already explained.
+            Err(_) => {
+                std::fs::write(&lock_path, &lock_text)?;
+                return Ok(());
+            }
+        }
+        // All-or-nothing: the seed removed every `from` node, so a member the reconcile did NOT
+        // land at its target has an unanchored slot the resolver filled from the live index —
+        // possibly with a version fresher than the member started at, which later rounds cannot
+        // always mature back down (the only in-range candidate may be the still-fresh original).
+        // Keeping a partial landing would trade the group's progress for a silent drive-by
+        // upgrade; restoring keeps the spec's "verify every planned target landed" contract, and
+        // each member then still holds the per-pin rejection cargo explained.
+        let landed = read_lock(project)?;
+        let all_landed = moves
+            .iter()
+            .all(|planned| landed.has_crates_io_package(&planned.name, &planned.to));
+        if all_landed {
+            for key in &keys {
+                rejections.remove(key);
+            }
+        } else {
+            std::fs::write(&lock_path, &lock_text)?;
+        }
+        Ok(())
     }
 
     /// Applies all `changes` as one logical unit, driving each to its exact target.
@@ -1331,6 +1429,7 @@ mod tests {
             declared_bound: None,
             members: Vec::new(),
             pinned: false,
+            hold_edges: Vec::new(),
         };
         let releases = [Release {
             version: dep.current.clone(),
@@ -2117,6 +2216,270 @@ mod tests {
             exclude_newer: None,
         };
         Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    const ATOMIC_MANIFEST: &str = indoc! {r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2024"
+
+        [dependencies]
+        alpha = "2"
+        beta = "2"
+    "#};
+
+    /// A two-member tilde family at its fresh era: the shape whose per-package pins all reject.
+    #[cfg(unix)]
+    const ATOMIC_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["alpha", "beta"]
+
+        [[package]]
+        name = "alpha"
+        version = "2.3.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "aa"
+
+        [[package]]
+        name = "beta"
+        version = "2.3.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "bb"
+    "#};
+
+    /// The reconciled lock the scripted `cargo metadata` writes when the atomic seed satisfies it:
+    /// both family members at their matured targets.
+    #[cfg(unix)]
+    const ATOMIC_LOCK_RECONCILED: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["alpha", "beta"]
+
+        [[package]]
+        name = "alpha"
+        version = "2.2.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "cc"
+
+        [[package]]
+        name = "beta"
+        version = "2.2.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        checksum = "dd"
+    "#};
+
+    /// An atomic-fallback fixture driven by a scripted `cargo` stand-in: every `update --precise`
+    /// is rejected (the mutually-held tilde family), and `metadata` — the fallback's reconcile —
+    /// behaves per `metadata_behavior`, a shell fragment run with the project root as cwd (it
+    /// must write `Cargo.lock` and print metadata JSON on success). The script drops a
+    /// `metadata-ran` marker so tests can assert whether the reconcile was reached.
+    #[cfg(unix)]
+    fn atomic_fixture(
+        root: &Utf8Path,
+        metadata_behavior: &str,
+    ) -> eyre::Result<(Project, CargoTool)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("Cargo.toml"), ATOMIC_MANIFEST)?;
+        std::fs::write(root.join("Cargo.lock"), ATOMIC_LOCK)?;
+        std::fs::write(root.join("Cargo.lock.reconciled"), ATOMIC_LOCK_RECONCILED)?;
+        std::fs::write(
+            root.join("metadata.json"),
+            r#"{"packages": [], "workspace_members": [], "workspace_root": "", "resolve": null}"#,
+        )?;
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            formatdoc! {r#"
+                #!/bin/sh
+                case "$1" in
+                  metadata)
+                    touch metadata-ran
+                    {metadata_behavior}
+                    ;;
+                esac
+                echo 'error: failed to select a version for the requirement `beta = "~2.3.0"`' >&2
+                echo 'required by package `alpha v2.3.0`' >&2
+                exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cargo = Cargo::with_bin(script.as_str());
+        let project = Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+        };
+        Ok((project, tool))
+    }
+
+    #[cfg(unix)]
+    fn atomic_plan() -> Plan {
+        Plan {
+            changes: vec![
+                change("alpha", "2.3.0", "2.2.0", true),
+                change("beta", "2.3.0", "2.2.0", true),
+            ],
+            ..Plan::default()
+        }
+    }
+
+    /// The icu shape end-to-end in miniature: every pin rejected, then the atomic seed lands both
+    /// members through one reconcile — rejections cleared, reconciled lock kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_fallback_lands_a_mutually_held_group() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = atomic_fixture(
+            root,
+            indoc! {"
+                cp Cargo.lock.reconciled Cargo.lock
+                cat metadata.json
+                exit 0
+            "},
+        )?;
+        let plan = atomic_plan();
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert!(
+            rejections.is_empty(),
+            "landed members must not keep stale rejections: {rejections:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            ATOMIC_LOCK_RECONCILED,
+            "the reconciled lock is kept"
+        );
+        Ok(())
+    }
+
+    /// A reconcile the seed cannot satisfy restores the lock byte-for-byte and keeps every
+    /// member's recorded per-pin rejection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_fallback_restores_the_lock_when_the_reconcile_fails() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        // The metadata case falls through to the script's rejection tail (resolver-style error).
+        let (project, tool) = atomic_fixture(root, "")?;
+        let plan = atomic_plan();
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert!(
+            root.join("metadata-ran").exists(),
+            "the reconcile was attempted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            ATOMIC_LOCK,
+            "a failed reconcile restores the pre-attempt lock byte-for-byte"
+        );
+        assert_eq!(rejections.len(), 2, "both members keep their rejections");
+        Ok(())
+    }
+
+    /// All-or-nothing: a reconcile that lands one member while the other's slot ends somewhere
+    /// else entirely is restored whole — keeping it would commit an unplanned version for the
+    /// missed member.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_fallback_restores_a_partial_landing() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = atomic_fixture(
+            root,
+            indoc! {"
+                cp Cargo.lock.partial Cargo.lock
+                cat metadata.json
+                exit 0
+            "},
+        )?;
+        // alpha lands at its 2.2.0 target, but beta's slot ends at an unplanned 9.9.9 — the
+        // live-index preference a real unanchored reconcile can produce.
+        let partial = ATOMIC_LOCK_RECONCILED.replace(
+            "name = \"beta\"\nversion = \"2.2.0\"",
+            "name = \"beta\"\nversion = \"9.9.9\"",
+        );
+        assert_ne!(
+            partial, ATOMIC_LOCK_RECONCILED,
+            "the partial fixture must differ"
+        );
+        std::fs::write(root.join("Cargo.lock.partial"), partial)?;
+        let plan = atomic_plan();
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            ATOMIC_LOCK,
+            "a partial landing is restored whole"
+        );
+        assert_eq!(rejections.len(), 2, "both members keep their rejections");
+        Ok(())
+    }
+
+    /// A lone rejection never triggers the fallback: its pin already expressed exactly this move,
+    /// so there is no atomicity to gain and no reconcile to risk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_fallback_abstains_for_a_single_rejection() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = atomic_fixture(
+            root,
+            indoc! {"
+                cp Cargo.lock.reconciled Cargo.lock
+                cat metadata.json
+                exit 0
+            "},
+        )?;
+        let plan = Plan {
+            changes: vec![change("alpha", "2.3.0", "2.2.0", true)],
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
+            .await?;
+
+        assert!(
+            !root.join("metadata-ran").exists(),
+            "no reconcile may run for a single rejection"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            ATOMIC_LOCK,
+            "the lock stays untouched"
+        );
+        assert_eq!(rejections.len(), 1, "the rejection is kept");
+        Ok(())
     }
 
     #[cfg(unix)]

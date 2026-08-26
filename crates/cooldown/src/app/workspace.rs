@@ -258,6 +258,10 @@ pub struct RunOpts {
     pub progress: Progress,
     /// Concurrency for registry fan-out.
     pub concurrency: usize,
+    /// Round budget for the `fix`/reconcile fixpoint loops; `None` uses the built-in default.
+    /// No CLI flag sets this — it exists so tests (and embedders) can exercise the budget-
+    /// exhaustion path without driving a dozen productive rounds.
+    pub fix_round_budget: Option<usize>,
 }
 
 impl RunOpts {
@@ -1327,6 +1331,7 @@ mod tests {
                 path: member_path.to_string(),
             }],
             pinned: false,
+            hold_edges: Vec::new(),
         }
     }
 
@@ -1485,6 +1490,7 @@ mod tests {
                     },
                 ],
                 pinned: false,
+                hold_edges: Vec::new(),
             }],
         };
 

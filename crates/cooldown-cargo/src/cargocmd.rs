@@ -39,6 +39,14 @@ pub struct ResolvedGraph {
     /// single-major pin. A node may have several requirers all pinning the same version; the consumer
     /// names one. Keyed by the same `(name, version)` as [`graph_ceilings`](Self::graph_ceilings).
     pub ceiling_requirers: HashMap<(String, String), Vec<String>>,
+    /// The attributed constraint edges per resolved `(crate, version)` node: for each node, every
+    /// active non-root requirer whose requirement contributes a floor on it and every requirer
+    /// whose exact `=` pin caps it, with the requirer's own resolved name and version. The
+    /// collapsed [`graph_floors`](Self::graph_floors)/[`graph_ceilings`](Self::graph_ceilings)
+    /// stay authoritative for the gate; this attribution exists so `fix` planning can discount
+    /// holds contributed by requirers that are themselves too-fresh violations (a circular hold)
+    /// and name the compliant requirer behind a genuine one.
+    pub hold_edges: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>>,
     /// The graph floor per resolved `(crate, version)` node: the highest lower bound any active
     /// non-root requirer's version requirement imposes on it. Cargo picks the *newest* version
     /// satisfying every requirer's range, so a resolved node can sit far above the floor the ranges
@@ -223,6 +231,20 @@ impl ResolvedGraph {
         self.graph_floors
             .get(&(crate_name.to_string(), version.to_string()))
             .map(String::as_str)
+    }
+
+    /// The attributed floor and ceiling edges constraining the `crate_name`@`version` node, or an
+    /// empty slice when no active non-root requirer constrains it. See
+    /// [`hold_edges`](Self::hold_edges) for what the attribution is for.
+    #[must_use]
+    pub fn node_hold_edges(
+        &self,
+        crate_name: &str,
+        version: &str,
+    ) -> &[cooldown_core::GraphHoldEdge] {
+        self.hold_edges
+            .get(&(crate_name.to_string(), version.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The workspace requirement that explicitly upper-bounds `crate_name` at `version`.
@@ -424,6 +446,9 @@ struct ExactEdge {
     requirer: String,
     dependency: String,
     version: String,
+    /// The verbatim declared requirement, carried for hold-edge attribution (so a held-dependency
+    /// warning can quote the pin as written).
+    requirement: String,
 }
 
 /// One lower-bound requirement, as a *candidate* floor edge: the requirer's package id and the
@@ -439,11 +464,103 @@ struct FloorEdge {
     floor: String,
 }
 
+/// Accumulates the per-dependency edge candidates [`build_graph`](Cargo::build_graph) harvests
+/// from each package's declarations, before the activated-graph joins distill them into
+/// constraints.
+#[derive(Default)]
+struct EdgeCandidates {
+    exact_pins: HashSet<(String, String)>,
+    /// Every non-dev `=x.y.z` requirement, as a candidate list — not the final ceiling set.
+    exact_edges: Vec<ExactEdge>,
+    /// Every non-root, non-dev requirement with a parseable lower bound.
+    /// Like `exact_edges`, this is a candidate list resolved against the activated graph later: a
+    /// requirement behind a disabled feature or non-matching `target` is not a real edge and
+    /// demands no floor.
+    /// Root requirements are intentionally excluded because they are direct project constraints
+    /// cooldown may rewrite, not structural third-party graph floors.
+    floor_edges: Vec<FloorEdge>,
+    declared_bound_edges: Vec<DeclaredBoundEdge>,
+    declared_requirement_edges: Vec<DeclaredEdge>,
+}
+
+impl EdgeCandidates {
+    fn record(&mut self, p: &RawPkg, is_root: bool) {
+        for dep in &p.dependencies {
+            // A dev dependency of a transitive crate is not in the resolved build graph and caps
+            // nothing; normal and build dependencies do, once confirmed active below.
+            let is_dev = dep.kind.as_deref() == Some("dev");
+            if let Some(version) = exact_req_version(&dep.req) {
+                // A workspace member's own exact pin is the project's choice: it surfaces as
+                // `pinned` (held, but with an adoptable target showing what it could be repinned
+                // to).
+                if is_root {
+                    self.exact_pins.insert((dep.name.clone(), version.clone()));
+                }
+                if !is_dev {
+                    self.exact_edges.push(ExactEdge {
+                        requirer: p.id.clone(),
+                        dependency: dep.name.clone(),
+                        version,
+                        requirement: dep.req.clone(),
+                    });
+                }
+            }
+            if !is_dev
+                && !is_root
+                && let Some(floor) = req_floor(&dep.req)
+            {
+                self.floor_edges.push(FloorEdge {
+                    requirer: p.id.clone(),
+                    dependency: dep.name.clone(),
+                    requirement: dep.req.clone(),
+                    floor,
+                });
+            }
+            // A member's dev-dependency bound is as deliberate as its normal one, and dev deps
+            // are resolved and upgradeable — the same reasoning that keeps dev pins in
+            // `exact_pins` above.
+            if is_root && let Some(upper) = explicit_upper_bound(&dep.req) {
+                self.declared_bound_edges.push(DeclaredBoundEdge {
+                    declaration: DeclaredEdge {
+                        requirer: p.id.clone(),
+                        rename: dep.rename.clone(),
+                        package_name: dep.name.clone(),
+                        requirement: dep.req.clone(),
+                    },
+                    upper,
+                });
+            }
+            // A non-member's dev dependency gets the same treatment as in the exact/floor edges
+            // above: it is not in the resolved build graph, yet its requirement would join by
+            // *name* onto the crate's one active normal edge and veto edge rewrites the real
+            // requirement admits. A member's dev requirement stays, mirroring the dev-pin and
+            // dev-bound reasoning above.
+            if !is_dev || is_root {
+                self.declared_requirement_edges.push(DeclaredEdge {
+                    requirer: p.id.clone(),
+                    rename: dep.rename.clone(),
+                    package_name: dep.name.clone(),
+                    requirement: dep.req.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// The activated `=`-pin ceilings [`resolved_graph_ceilings`] distills from the candidates: which
-/// `(name, version)` nodes are capped, and by which requirer package ids.
+/// `(name, version)` nodes are capped, by which requirer package ids, and the attributed ceiling
+/// edges (requirer name and version) for hold discounting.
 struct ResolvedCeilings {
     ceilings: HashSet<(String, String)>,
     requirers: HashMap<(String, String), Vec<String>>,
+    edges: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>>,
+}
+
+/// The activated floors [`resolved_graph_floors`] distills from the candidates: the collapsed
+/// per-node maximum floor beside the attributed floor edges behind it.
+struct ResolvedFloors {
+    floors: HashMap<(String, String), String>,
+    edges: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>>,
 }
 
 /// The resolved dependency edges per package id, in the two projections the graph builder needs.
@@ -689,10 +806,15 @@ fn resolved_graph_floors(
     floor_edges: Vec<FloorEdge>,
     edges: &HashMap<String, Vec<String>>,
     packages: &HashMap<String, PkgInfo>,
-) -> HashMap<(String, String), String> {
+) -> ResolvedFloors {
     let mut graph_floors: HashMap<(String, String), String> = HashMap::new();
+    let mut attributed: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>> =
+        HashMap::new();
     for candidate in floor_edges {
         let Some(dep_ids) = edges.get(&candidate.requirer) else {
+            continue;
+        };
+        let Some(requirer_info) = packages.get(&candidate.requirer) else {
             continue;
         };
         for id in dep_ids {
@@ -712,25 +834,90 @@ fn resolved_graph_floors(
             }
             let key = (info.name.clone(), info.version.clone());
             graph_floors
-                .entry(key)
+                .entry(key.clone())
                 .and_modify(|current| {
                     if crate::version::compare(&candidate.floor, current).is_gt() {
                         current.clone_from(&candidate.floor);
                     }
                 })
                 .or_insert_with(|| candidate.floor.clone());
+            attributed
+                .entry(key)
+                .or_default()
+                .push(cooldown_core::GraphHoldEdge {
+                    requirer: requirer_info.name.clone(),
+                    requirer_version: cooldown_core::Version::new(requirer_info.version.clone()),
+                    requirement: candidate.requirement.clone(),
+                    bound: cooldown_core::Version::new(candidate.floor.clone()),
+                    kind: cooldown_core::GraphHoldKind::Floor,
+                });
         }
     }
-    graph_floors
+    ResolvedFloors {
+        floors: graph_floors,
+        edges: attributed,
+    }
+}
+
+/// The per-node graph constraints [`resolved_graph_constraints`] distills from the candidate
+/// edges: the collapsed ceilings and floors [`ResolvedGraph`] gates with, plus the merged
+/// attributed hold edges behind them.
+struct GraphConstraints {
+    graph_ceilings: HashSet<(String, String)>,
+    ceiling_requirers: HashMap<(String, String), Vec<String>>,
+    graph_floors: HashMap<(String, String), String>,
+    hold_edges: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>>,
+}
+
+/// Joins the exact-pin and floor candidates against the activated graph and merges their
+/// attributed edges into one per-node hold-edge index.
+///
+/// A `=x.y.z` requirement caps a node only when its edge is actually in the resolved graph: an
+/// inactive (optional/target-gated) pin is declared but absent from `resolve.nodes`, so it
+/// contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate. A
+/// non-root requirement floors a node only at the version its edge actually resolved to, the same
+/// active-edge intersection.
+fn resolved_graph_constraints(
+    exact_edges: Vec<ExactEdge>,
+    floor_edges: Vec<FloorEdge>,
+    roots: &HashSet<String>,
+    edges: &HashMap<String, Vec<String>>,
+    packages: &HashMap<String, PkgInfo>,
+) -> GraphConstraints {
+    let ResolvedCeilings {
+        ceilings: graph_ceilings,
+        requirers: ceiling_requirers,
+        edges: ceiling_hold_edges,
+    } = resolved_graph_ceilings(exact_edges, roots, edges, packages);
+    let ResolvedFloors {
+        floors: graph_floors,
+        edges: floor_hold_edges,
+    } = resolved_graph_floors(floor_edges, edges, packages);
+    let mut hold_edges = floor_hold_edges;
+    for (key, mut ceiling_edges) in ceiling_hold_edges {
+        hold_edges
+            .entry(key)
+            .or_default()
+            .append(&mut ceiling_edges);
+    }
+    GraphConstraints {
+        graph_ceilings,
+        ceiling_requirers,
+        graph_floors,
+        hold_edges,
+    }
 }
 
 fn resolved_graph_ceilings(
     candidates: Vec<ExactEdge>,
+    roots: &HashSet<String>,
     edges: &HashMap<String, Vec<String>>,
     packages: &HashMap<String, PkgInfo>,
 ) -> ResolvedCeilings {
     let mut ceilings = HashSet::new();
     let mut requirers: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut attributed: HashMap<(String, String), Vec<cooldown_core::GraphHoldEdge>> =
+        HashMap::new();
     for candidate in candidates {
         let active = edges.get(&candidate.requirer).is_some_and(|dep_ids| {
             dep_ids.iter().any(|id| {
@@ -744,16 +931,38 @@ fn resolved_graph_ceilings(
         }
         let key = (candidate.dependency, candidate.version);
         ceilings.insert(key.clone());
-        if let Some(requirer_name) = packages
-            .get(&candidate.requirer)
-            .map(|info| info.name.clone())
-        {
-            requirers.entry(key).or_default().push(requirer_name);
+        if let Some(requirer_info) = packages.get(&candidate.requirer) {
+            requirers
+                .entry(key.clone())
+                .or_default()
+                .push(requirer_info.name.clone());
+            // A workspace member's own exact pin surfaces as `pinned`, not as a ceiling (the
+            // adapter masks `graph_ceiling` for pinned nodes), so attributing it here would let
+            // effective-hold recomputation resurrect a cap the collapsed view deliberately
+            // withholds. Attribution mirrors the floors: third-party requirers only.
+            if !roots.contains(&candidate.requirer) {
+                // An active exact pin's ceiling is the pinned node's own version (the adapter
+                // invariant `graph_ceiling == current` documented on the core model).
+                let bound = cooldown_core::Version::new(key.1.clone());
+                attributed
+                    .entry(key)
+                    .or_default()
+                    .push(cooldown_core::GraphHoldEdge {
+                        requirer: requirer_info.name.clone(),
+                        requirer_version: cooldown_core::Version::new(
+                            requirer_info.version.clone(),
+                        ),
+                        requirement: candidate.requirement,
+                        bound,
+                        kind: cooldown_core::GraphHoldKind::Ceiling,
+                    });
+            }
         }
     }
     ResolvedCeilings {
         ceilings,
         requirers,
+        edges: attributed,
     }
 }
 
@@ -1088,80 +1297,11 @@ impl Cargo {
         let workspace_root = raw.workspace_root.clone();
         let roots: HashSet<String> = raw.workspace_members.iter().cloned().collect();
         let mut packages = HashMap::new();
-        let mut exact_pins = HashSet::new();
-        // Every non-dev `=x.y.z` requirement, as a candidate list — not the final ceiling set.
-        let mut exact_edges: Vec<ExactEdge> = Vec::new();
-        // Every non-root, non-dev requirement with a parseable lower bound.
-        // Like `exact_edges`, this is a candidate list resolved against the activated graph below:
-        // a requirement behind a disabled feature or non-matching `target` is not a real edge and
-        // demands no floor.
-        // Root requirements are intentionally excluded because they are direct project constraints
-        // cooldown may rewrite, not structural third-party graph floors.
-        let mut floor_edges: Vec<FloorEdge> = Vec::new();
-        let mut declared_bound_edges: Vec<DeclaredBoundEdge> = Vec::new();
-        let mut declared_requirement_edges: Vec<DeclaredEdge> = Vec::new();
+        let mut candidates = EdgeCandidates::default();
         let mut msrv = MsrvIndex::default();
         for p in raw.packages {
             msrv.record(&p, roots.contains(&p.id));
-            for dep in &p.dependencies {
-                // A dev dependency of a transitive crate is not in the resolved build graph and caps
-                // nothing; normal and build dependencies do, once confirmed active below.
-                let is_dev = dep.kind.as_deref() == Some("dev");
-                if let Some(version) = exact_req_version(&dep.req) {
-                    // A workspace member's own exact pin is the project's choice: it surfaces as
-                    // `pinned` (held, but with an adoptable target showing what it could be repinned to).
-                    if roots.contains(&p.id) {
-                        exact_pins.insert((dep.name.clone(), version.clone()));
-                    }
-                    if !is_dev {
-                        exact_edges.push(ExactEdge {
-                            requirer: p.id.clone(),
-                            dependency: dep.name.clone(),
-                            version,
-                        });
-                    }
-                }
-                if !is_dev
-                    && !roots.contains(&p.id)
-                    && let Some(floor) = req_floor(&dep.req)
-                {
-                    floor_edges.push(FloorEdge {
-                        requirer: p.id.clone(),
-                        dependency: dep.name.clone(),
-                        requirement: dep.req.clone(),
-                        floor,
-                    });
-                }
-                // A member's dev-dependency bound is as deliberate as its normal one, and dev deps
-                // are resolved and upgradeable — the same reasoning that keeps dev pins in
-                // `exact_pins` above.
-                if roots.contains(&p.id)
-                    && let Some(upper) = explicit_upper_bound(&dep.req)
-                {
-                    declared_bound_edges.push(DeclaredBoundEdge {
-                        declaration: DeclaredEdge {
-                            requirer: p.id.clone(),
-                            rename: dep.rename.clone(),
-                            package_name: dep.name.clone(),
-                            requirement: dep.req.clone(),
-                        },
-                        upper,
-                    });
-                }
-                // A non-member's dev dependency gets the same treatment as in the exact/floor
-                // edges above: it is not in the resolved build graph, yet its requirement would
-                // join by *name* onto the crate's one active normal edge and veto edge rewrites
-                // the real requirement admits. A member's dev requirement stays, mirroring the
-                // dev-pin and dev-bound reasoning above.
-                if !is_dev || roots.contains(&p.id) {
-                    declared_requirement_edges.push(DeclaredEdge {
-                        requirer: p.id.clone(),
-                        rename: dep.rename.clone(),
-                        package_name: dep.name.clone(),
-                        requirement: dep.req.clone(),
-                    });
-                }
-            }
+            candidates.record(&p, roots.contains(&p.id));
             packages.insert(
                 p.id.clone(),
                 PkgInfo {
@@ -1176,25 +1316,29 @@ impl Cargo {
             by_package: edges,
             named: active_edges,
         } = resolved_edges(raw.resolve);
-        // A `=x.y.z` requirement caps a node only when its edge is actually in the resolved graph:
-        // keep an exact pin only if the requirer resolves an edge to a node of that name and version.
-        // An inactive (optional/target-gated) edge is declared but absent from `resolve.nodes`, so it
-        // contributes no ceiling — the consumer would otherwise over-hold a freely upgradable crate.
-        let ResolvedCeilings {
-            ceilings: graph_ceilings,
-            requirers: ceiling_requirers,
-        } = resolved_graph_ceilings(exact_edges, &edges, &packages);
-        // A non-root requirement floors a node only at the version its edge actually resolved to;
-        // an inactive (optional/target-gated) edge is absent from `resolve.nodes`, so it
-        // contributes no floor — mirroring the ceiling's active-edge intersection above.
-        let graph_floors = resolved_graph_floors(floor_edges, &edges, &packages);
+        let GraphConstraints {
+            graph_ceilings,
+            ceiling_requirers,
+            graph_floors,
+            hold_edges,
+        } = resolved_graph_constraints(
+            candidates.exact_edges,
+            candidates.floor_edges,
+            &roots,
+            &edges,
+            &packages,
+        );
         // Indexed from the requirement candidates rather than the bound candidates: only the
         // former list every edge-owning declaration (see [`RenameIndex::from_declarations`]).
-        let renames = RenameIndex::from_declarations(&declared_requirement_edges);
-        let declared_bounds =
-            resolved_declared_bounds(declared_bound_edges, &active_edges, &packages, &renames);
+        let renames = RenameIndex::from_declarations(&candidates.declared_requirement_edges);
+        let declared_bounds = resolved_declared_bounds(
+            candidates.declared_bound_edges,
+            &active_edges,
+            &packages,
+            &renames,
+        );
         let declared_requirements = resolved_declared_requirements(
-            declared_requirement_edges,
+            candidates.declared_requirement_edges,
             &active_edges,
             &packages,
             &renames,
@@ -1203,9 +1347,10 @@ impl Cargo {
             packages,
             roots,
             edges,
-            exact_pins,
+            exact_pins: candidates.exact_pins,
             graph_ceilings,
             ceiling_requirers,
+            hold_edges,
             graph_floors,
             declared_bounds,
             declared_requirements,
@@ -1983,6 +2128,67 @@ mod tests {
     }
 
     #[test]
+    fn hold_edges_attribute_floors_and_third_party_ceilings_but_not_member_pins() {
+        // syn floors quote (a third-party floor edge) and pins serde exactly (a third-party
+        // ceiling edge); the workspace root pins itoa exactly, which surfaces as `pinned`, not as
+        // an attributed ceiling — attribution must mirror what the collapsed view exposes, or
+        // effective-hold recomputation could resurrect a cap the adapter deliberately masks.
+        let json = r#"{
+            "packages": [
+                {"id": "root", "name": "root", "version": "0.1.0",
+                 "dependencies": [{"name": "syn", "req": "^2.0"}, {"name": "itoa", "req": "=1.0.11"}]},
+                {"id": "syn", "name": "syn", "version": "2.0.50",
+                 "dependencies": [{"name": "quote", "req": "^1.0"}, {"name": "serde", "req": "=1.0.200"}]},
+                {"id": "quote", "name": "quote", "version": "1.0.46", "dependencies": []},
+                {"id": "serde", "name": "serde", "version": "1.0.200", "dependencies": []},
+                {"id": "itoa", "name": "itoa", "version": "1.0.11", "dependencies": []}
+            ],
+            "workspace_members": ["root"],
+            "workspace_root": "",
+            "resolve": {"nodes": [
+                {"id": "root", "deps": [{"pkg": "syn"}, {"pkg": "itoa"}]},
+                {"id": "syn", "deps": [{"pkg": "quote"}, {"pkg": "serde"}]},
+                {"id": "quote", "deps": []},
+                {"id": "serde", "deps": []},
+                {"id": "itoa", "deps": []}
+            ]}
+        }"#;
+        let graph = Cargo::build_graph_from_json(json);
+
+        let quote_edges = graph.node_hold_edges("quote", "1.0.46");
+        assert_eq!(quote_edges.len(), 1);
+        assert_eq!(quote_edges[0].requirer, "syn");
+        assert_eq!(quote_edges[0].requirer_version.as_str(), "2.0.50");
+        assert_eq!(quote_edges[0].bound.as_str(), "1.0.0");
+        assert_eq!(quote_edges[0].kind, cooldown_core::GraphHoldKind::Floor);
+
+        // An exact pin bounds from both sides, so it contributes a floor edge (its lower bound)
+        // beside the ceiling edge — mirroring how the collapsed floors already include `=` pins.
+        let serde_edges = graph.node_hold_edges("serde", "1.0.200");
+        assert_eq!(serde_edges.len(), 2);
+        assert!(serde_edges.iter().all(|edge| {
+            edge.requirer == "syn"
+                && edge.requirer_version.as_str() == "2.0.50"
+                && edge.bound.as_str() == "1.0.200"
+        }));
+        assert!(
+            serde_edges
+                .iter()
+                .any(|edge| edge.kind == cooldown_core::GraphHoldKind::Ceiling)
+        );
+        assert!(
+            serde_edges
+                .iter()
+                .any(|edge| edge.kind == cooldown_core::GraphHoldKind::Floor)
+        );
+
+        // The root's exact pin still caps the collapsed view (masked behind `pinned` by the
+        // dependency builder) but contributes no attributed edge.
+        assert!(graph.is_graph_capped("itoa", "1.0.11"));
+        assert!(graph.node_hold_edges("itoa", "1.0.11").is_empty());
+    }
+
+    #[test]
     fn graph_floor_ignores_workspace_member_requirements() {
         // Root lower bounds and exact pins are project-owned constraints: direct deps can be
         // rewritten by cooldown, so they must not become immutable graph floors that make
@@ -2105,6 +2311,7 @@ mod tests {
             exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            hold_edges: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
             declared_requirements: HashMap::new(),
@@ -2127,6 +2334,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
             ceiling_requirers: HashMap::new(),
+            hold_edges: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
             declared_requirements: HashMap::new(),
@@ -2213,6 +2421,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            hold_edges: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
             declared_requirements: HashMap::new(),
@@ -2437,6 +2646,7 @@ mod tests {
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),
             ceiling_requirers: HashMap::new(),
+            hold_edges: HashMap::new(),
             graph_floors: HashMap::new(),
             declared_bounds: HashMap::new(),
             declared_requirements: HashMap::new(),

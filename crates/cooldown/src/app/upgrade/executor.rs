@@ -9,8 +9,8 @@ use self::batch::{
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    candidate_scope, dep_resolve_ctx, fix_change, is_downgrade, plan_baseline_violations,
-    sort_planned_changes,
+    candidate_scope, dep_resolve_ctx, effective_hold, fix_change, is_downgrade,
+    plan_baseline_violations, sort_planned_changes,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
@@ -24,9 +24,9 @@ use crate::app::{
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, LockStatus, PackageId, Plan, ProjectMutationJournal, ProjectMutationState,
-    Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status, UpdateKind, Version,
-    check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
+    DiagnosticKind, FixVerdict, LockStatus, PackageId, Plan, ProjectMutationJournal,
+    ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
+    UpdateKind, Version, check_pin, evaluate, evaluate_ceiling_hold, evaluate_fix,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -1141,22 +1141,29 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         );
     }
 
-    /// Plan downgrades for `fix`: every dependency whose locked version is too fresh moves to the
-    /// newest matured version older than it. A pin is left in place with a warning unless
-    /// `downgrade_pinned`; a violation with no matured older version is reported as a warning too.
-    /// Warnings are returned (not emitted) so the fixpoint caller surfaces only the final round's —
-    /// a dep held now may become fixable once an umbrella module ahead of it is downgraded.
-    async fn plan_fix_changes(
+    /// Pass one of [`plan_fix_changes`](Self::plan_fix_changes): fetch releases, evaluate every
+    /// candidate against the *current* resolution, and collect the round's violation set. The set
+    /// keys the circular-hold discount in pass two: a graph hold contributed by a requirer that
+    /// is itself in this set is conditioned on the resolution being fixed, not a real obstacle.
+    ///
+    /// Only *movable* violations enter the set: a too-fresh transitive `--transitive allow`
+    /// leaves in place, or a pin left alone without `--downgrade-pinned`, holds its dependents
+    /// exactly like a compliant requirer — discounting its edges would plan changes whose only
+    /// landing path is the atomic reconcile moving the very node the flag promised not to touch.
+    /// A violation with no matured target stays in the set: whether it can move is for the
+    /// resolver to decide (the `icu_locale_fallback` shape — a fresh-era-only crate that simply
+    /// drops out once its family moves — depends on discounting it).
+    async fn evaluate_fix_candidates(
         &mut self,
         deps: &[Dependency],
         transitive: TransitiveGate,
         downgrade_pinned: bool,
-    ) -> FixPlan {
-        self.ctx.opts.progress.phase(format!(
-            "fetching metadata for {} cooldown fix candidates",
-            deps.len()
-        ));
-        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        rctx: &ResolveContext<'_>,
+        errors: &mut Vec<Diagnostic>,
+    ) -> (
+        Vec<(Dependency, Vec<Release>, FixVerdict)>,
+        HashSet<(String, String)>,
+    ) {
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
         let fetched = self
             .ws
@@ -1169,9 +1176,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.fanout(),
             )
             .await;
-        let mut planned = Vec::new();
-        let mut warnings = Vec::new();
-        let mut errors = Vec::new();
+        let mut evaluated = Vec::new();
+        let mut violations: HashSet<(String, String)> = HashSet::new();
         for FetchedRelease {
             dependency: dep,
             result,
@@ -1188,9 +1194,44 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &dep,
                 &releases,
                 &self.ctx.pctx.policy.layers,
-                &dep_resolve_ctx(&rctx, &dep),
+                &dep_resolve_ctx(rctx, &dep),
                 self.ws.now(),
             );
+            // The two immovable shapes, spelled positively for the lint: an allow-gated
+            // transitive, and a pin without --downgrade-pinned.
+            let movable = (dep.direct || transitive != TransitiveGate::Allow)
+                && (downgrade_pinned || !dep.pinned);
+            if fix.current.status == Status::CurrentInCooldown && movable {
+                violations.insert((dep.package.name.clone(), dep.current.as_str().to_string()));
+            }
+            evaluated.push((dep, releases, fix));
+        }
+        (evaluated, violations)
+    }
+
+    /// Plan downgrades for `fix`: every dependency whose locked version is too fresh moves to the
+    /// newest matured version older than it. A pin is left in place with a warning unless
+    /// `downgrade_pinned`; a violation with no matured older version is reported as a warning too.
+    /// Warnings are returned (not emitted) so the fixpoint caller surfaces only the final round's —
+    /// a dep held now may become fixable once an umbrella module ahead of it is downgraded.
+    async fn plan_fix_changes(
+        &mut self,
+        deps: &[Dependency],
+        transitive: TransitiveGate,
+        downgrade_pinned: bool,
+    ) -> FixPlan {
+        self.ctx.opts.progress.phase(format!(
+            "fetching metadata for {} cooldown fix candidates",
+            deps.len()
+        ));
+        let rctx = Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts);
+        let mut planned = Vec::new();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let (evaluated, violations) = self
+            .evaluate_fix_candidates(deps, transitive, downgrade_pinned, &rctx, &mut errors)
+            .await;
+        for (dep, releases, fix) in evaluated {
             // Only a too-fresh pin needs fixing; a compliant (or exempt / unknown-age) dep is left
             // alone, so `fix` only ever touches what `check` would reject.
             if fix.current.status != Status::CurrentInCooldown {
@@ -1208,13 +1249,41 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 });
                 continue;
             }
+            // Pass two: re-judge the violation with circular holds discounted, so a family of
+            // too-fresh versions holding each other in place is planned as a whole instead of
+            // being reported graph-held member by member.
+            let effective = effective_hold(&dep, &releases, &violations);
+            let fix = if effective.discounted {
+                evaluate_fix(
+                    &effective.dep,
+                    &releases,
+                    &self.ctx.pctx.policy.layers,
+                    &dep_resolve_ctx(&rctx, &dep),
+                    self.ws.now(),
+                )
+            } else {
+                fix
+            };
             if fix.current.graph_held {
-                warnings.push(FixWarning {
-                    package: dep.package.name.clone(),
-                    message: format!(
+                let message = match &effective.compliant_holder {
+                    // Attribution names the genuine obstacle: a *compliant* requirer whose
+                    // requirement demands the too-fresh version.
+                    Some(holder) => format!(
+                        "{}@{} is younger than its cooldown, but {} {} requires `{}`; baseline it or relax that dependency",
+                        dep.package.name,
+                        dep.current,
+                        holder.requirer,
+                        holder.requirer_version,
+                        holder.requirement
+                    ),
+                    None => format!(
                         "{}@{} is younger than its cooldown, but the resolved graph requires that version; baseline it or relax the dependency forcing it",
                         dep.package.name, dep.current
                     ),
+                };
+                warnings.push(FixWarning {
+                    package: dep.package.name.clone(),
+                    message,
                 });
                 continue;
             }
@@ -1285,7 +1354,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         downgrade_pinned: bool,
         state: &mut TrialState,
     ) -> MutationFlow {
-        for _ in 0..MAX_FIX_ROUNDS {
+        let budget = self.ctx.opts.fix_round_budget.unwrap_or(MAX_FIX_ROUNDS);
+        for _ in 0..budget {
             let FixPlan {
                 changes,
                 warnings,
@@ -1319,6 +1389,31 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             };
             deps = next;
         }
+        // The round budget ran out with the final round still applying changes, so the re-plan
+        // that normally surfaces residual violations never ran — and a round's apply can itself
+        // float fresh collateral (the atomic reconcile resolves new era-mates against the live
+        // registry). Without this pass those residuals would exit silently as a clean success
+        // while the very next `check` fails. One plan-only pass turns them into warnings (each
+        // marking the run incomplete); its still-plannable changes are deliberately not applied —
+        // the budget is spent.
+        let FixPlan {
+            changes,
+            mut warnings,
+            errors,
+        } = self
+            .plan_fix_changes(&deps, transitive, downgrade_pinned)
+            .await;
+        self.acc.errors.extend(errors);
+        for change in &changes {
+            warnings.push(FixWarning {
+                package: change.package.name.clone(),
+                message: format!(
+                    "{}@{} is still younger than its cooldown after {budget} fix rounds; rerun fix",
+                    change.package.name, change.from
+                ),
+            });
+        }
+        self.emit_fix_warnings(warnings);
         ControlFlow::Continue(())
     }
 
@@ -1342,7 +1437,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcomes;
         }
         state.reconcile_needed = false;
-        for _ in 0..MAX_FIX_ROUNDS {
+        let budget = self.ctx.opts.fix_round_budget.unwrap_or(MAX_FIX_ROUNDS);
+        for _ in 0..budget {
             self.ctx
                 .opts
                 .progress

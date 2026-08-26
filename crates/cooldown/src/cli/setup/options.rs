@@ -167,6 +167,8 @@ pub(super) fn resolve_invocation(
                 .or(merged.concurrency)
                 .unwrap_or(16)
                 .max(1),
+            // No CLI flag: the built-in fix-round budget always applies to real invocations.
+            fix_round_budget: None,
         },
         offline: merged.offline.unwrap_or(false),
         fresh: merged.fresh.unwrap_or(false),

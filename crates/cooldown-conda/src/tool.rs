@@ -247,6 +247,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
                 declared_bound: None,
                 members: Vec::new(),
                 pinned: false,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)

@@ -213,6 +213,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
                 declared_bound: None,
                 members: Vec::new(),
                 pinned: false,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)

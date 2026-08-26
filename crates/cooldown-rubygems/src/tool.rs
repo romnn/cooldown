@@ -129,6 +129,7 @@ impl ToolRead for BundlerTool {
                 declared_bound: None,
                 members: Vec::new(),
                 pinned: false,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)

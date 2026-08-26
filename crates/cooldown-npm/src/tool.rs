@@ -335,6 +335,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 declared_bound,
                 members,
                 pinned,
+                hold_edges: Vec::new(),
             });
         }
         Ok(deps)
