@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.15
+
 - **Nested cargo workspaces the enclosing workspace excludes are projects of their own.** Cargo
   project detection kept only the topmost `Cargo.lock` directory, so an excluded nested workspace
   (a monorepo's incubator workspace, a cargo-fuzz project, a nested wasm guest workspace) was
@@ -185,6 +187,35 @@
   tool-qualified lease independent of project discovery. User-visible source identities redact
   credentials, non-provenance query values, and non-commit fragments. Config follows the
   per-project repository cascade, and the closed JSON contract is schema v4.
+
+## v0.0.14
+
+- **Interactive progress reports candidate work honestly.** A candidate counted as done whenever a
+  resolver operation touched it, so a bisected batch showed work finished before it settled and the
+  display could complete while decisions were still pending. Progress now tracks decided candidates
+  as its own determinate measure and shows resolver operations and policy passes separately.
+- **Cargo constraint widening no longer rewrites an already-widened requirement.** A requirement
+  that already carries the normalized target constraint is reported unchanged instead of counting
+  as an edit, so a repeated run stops rewriting the same manifest — and a member match that needed
+  no change no longer falls through to the workspace-root fallback and widened a root declaration
+  the member never inherits from.
+
+## v0.0.13
+
+- **npm-family upgrades respect the registry's `latest` dist-tag.** A stable release published
+  above the maintainer's own `latest` pointer (a premature or abandoned major kept above a
+  continuing line) is held with `dist-tag latest <version>` rather than proposed, since it is not
+  what a default `npm install` resolves to. A project already pinned above the tag is unaffected,
+  and `--no-respect-dist-tags` (config `respect-dist-tags = false`) is the deliberate opt-out —
+  the right choice for a private registry or mirror whose tags diverge from the public one.
+- **npm-family upgrades respect recorded peer contracts.** A target a still-present dependent's
+  `peerDependencies` range excludes is reported `blocked`/`peer_held` naming the dependent instead
+  of adoptable: pnpm's resolver only warns on that break and npm commits it under relaxed
+  enforcement such as `legacy-peer-deps`. On pnpm both packages can move in one run — the joint
+  move is the whole-graph resolve's decision, and a landing that provably breaks a contract between
+  workspace-declared packages is rejected and rolled back. `peerDependencies` is never rewritten by
+  constraint widening, `--rewrite` included: that range is a contract published to consumers, not a
+  declaration of what the package installs.
 
 ## v0.0.12
 
