@@ -14,26 +14,83 @@
 //! still satisfy the declared range.
 
 use super::{EdgeRewrite, LockEdgeView, RequirementIndex};
+use crate::version;
 
 /// Whether the lock pair contains an addressable crates.io rebind that might need restoration.
 ///
 /// This source-only preflight deliberately does not decide whether the earlier target still
 /// satisfies the declared requirement; metadata is fetched only after a potential move exists.
+/// Beside the both-versions-coexist churn shape, it also admits the vanished-target shape
+/// [`line_successor`] restores: the earlier binding is gone from the later lock while the edge
+/// landed on a different release line that still coexists with the vanished line's successor.
 pub(crate) fn has_potential_restoration(before: &LockEdgeView, after: &LockEdgeView) -> bool {
     after.bindings().any(|binding| {
         let Some(earlier) = before.binding(binding.dependent, binding.dependency) else {
             return false;
         };
-        earlier != binding.bound
-            && after
+        if earlier == binding.bound
+            || after
                 .dependency_source(binding.dependency, binding.bound)
                 .as_deref()
-                == Some(crate::cargocmd::CRATES_IO_SOURCE)
-            && after
-                .dependency_source(binding.dependency, earlier)
-                .as_deref()
-                == Some(crate::cargocmd::CRATES_IO_SOURCE)
+                != Some(crate::cargocmd::CRATES_IO_SOURCE)
+        {
+            return false;
+        }
+        if after
+            .dependency_source(binding.dependency, earlier)
+            .as_deref()
+            == Some(crate::cargocmd::CRATES_IO_SOURCE)
+        {
+            return true;
+        }
+        line_successor(before, after, binding.dependency, earlier, binding.bound).is_some()
     })
+}
+
+/// The unique surviving same-line successor of a vanished binding target, when the edge crossed
+/// release lines.
+///
+/// `earlier` (the before-lock binding) must have been a crates.io version and be absent from
+/// `after`; the successor is the one crates.io version in `after` sharing `earlier`'s
+/// compatibility line ([`version::major_key`]) while `bound` (the post-apply binding) sits on a
+/// different line. A genuine replacement is new to the after-lock — it could not have coexisted
+/// with `earlier` on the same cargo line — so a candidate already present in the before-lock is
+/// rejected as a bystander. That guard carries the `0.0.x` corner: [`version::major_key`] maps
+/// every `0.0.z` to the one key `"0.0"` although cargo treats each `0.0.z` as its own line and
+/// may lock several side by side, so a pre-existing `0.0.z` node (kept alive by some other
+/// dependent) could otherwise masquerade as the successor. More than one surviving candidate
+/// (again only possible under `"0.0"`) is ambiguous, and restoration abstains.
+fn line_successor(
+    before: &LockEdgeView,
+    after: &LockEdgeView,
+    dependency: &str,
+    earlier: &str,
+    bound: &str,
+) -> Option<String> {
+    if before.dependency_source(dependency, earlier).as_deref()
+        != Some(crate::cargocmd::CRATES_IO_SOURCE)
+    {
+        return None;
+    }
+    let earlier_line = version::major_key(earlier);
+    if version::major_key(bound) == earlier_line {
+        // The edge stayed on the vanished target's own line: that is the planned move landing,
+        // not a cross-line collapse.
+        return None;
+    }
+    let mut successors = after
+        .crates_io_versions(dependency)
+        .filter(|candidate| version::major_key(candidate) == earlier_line)
+        .filter(|candidate| {
+            !before
+                .crates_io_versions(dependency)
+                .any(|existing| existing == *candidate)
+        });
+    let successor = successors.next()?;
+    if successors.next().is_some() {
+        return None;
+    }
+    Some(successor.to_string())
 }
 
 /// The corrective rewrites that restore churned bindings of `after` back to their `before` state.
@@ -64,13 +121,34 @@ pub(crate) fn restorations(
                 return None;
             }
             // The pre-apply binding must still be a locked crates.io version — a vanished version
-            // means the slot legitimately moved (a planned or collateral version change), not churn.
+            // means the slot legitimately moved (a planned or collateral version change), not
+            // churn. But the slot's move does not license a *line* change: when several versions
+            // of the name still coexist, cargo's incremental resolver can land the dependent's
+            // edge on a different release line than the vanished target's replacement (diesel's
+            // `uuid >=0.7, <2` rebound from the vanished `1.25.0` onto the surviving `0.8.2`
+            // while `1.24.0` took the slot). Rebinding to the unique same-line successor keeps
+            // the downgrade line-continuous; the requirement guard below still applies.
             if after
                 .dependency_source(binding.dependency, earlier)
                 .as_deref()
                 != Some(crate::cargocmd::CRATES_IO_SOURCE)
             {
-                return None;
+                let successor =
+                    line_successor(before, after, binding.dependency, earlier, binding.bound)?;
+                if !requirements.admits(
+                    binding.dependent,
+                    binding.dependency,
+                    binding.bound,
+                    &successor,
+                ) {
+                    return None;
+                }
+                return Some(EdgeRewrite {
+                    dependent: binding.dependent.clone(),
+                    dependency: binding.dependency.to_string(),
+                    from: binding.bound.to_string(),
+                    to: successor,
+                });
             }
             // And it must still satisfy every requirement the dependent declares (post-widen
             // metadata): a cross-major planned move changed the requirement, and restoring the old
@@ -102,10 +180,20 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn graph_with(requirements: &[(&str, &str, &str, &str)]) -> ResolvedGraph {
+        graph_with_resolved(requirements, &["0.8.2", "1.24.0"])
+    }
+
+    /// [`graph_with`] with explicit resolved-edge versions, for fixtures whose current binding is
+    /// not one of the uuid fixture's two: `admits` matches a declaration only when it resolves to
+    /// the edge's *current* bound, so the versions here must include it.
+    fn graph_with_resolved(
+        requirements: &[(&str, &str, &str, &str)],
+        resolved_versions: &[&str],
+    ) -> ResolvedGraph {
         let mut declared_requirements: HashMap<LockPackageId, Vec<DeclaredRequirement>> =
             HashMap::new();
         for (name, version, dependency, requirement) in requirements {
-            for resolved_version in ["0.8.2", "1.24.0"] {
+            for resolved_version in resolved_versions.iter().copied() {
                 declared_requirements
                     .entry(LockPackageId::new(
                         *name,
@@ -197,6 +285,262 @@ mod tests {
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
 
         // diesel's binding moved 1.20.0 → 1.24.0, but 1.20.0 is gone from the lock: not churn.
+        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+    }
+
+    /// The luup fix-collapse shape: diesel's wide `uuid >=0.7,<2.0` edge was bound to `1.25.0`, a
+    /// planned downgrade replaced that node with `1.24.0`, and cargo's incremental re-resolve
+    /// rebound the edge onto the coexisting `0.8.2` line instead of the successor.
+    /// The vanished target licenses no line change: preserve rebinds to the `1.x` successor.
+    #[test]
+    fn a_vanished_downgrade_target_rebinds_to_its_line_successor() {
+        // Before: diesel bound to the 1.x line at 1.25.0 (the 1.x node then in the lock).
+        let before_text = CHURNED_LOCK
+            .replace(
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 0.8.2\",",
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 1.24.0\",",
+            )
+            .replace("1.24.0", "1.25.0");
+        let before = view(&before_text);
+        // After: the downgrade landed 1.24.0 in the slot and the edge collapsed onto 0.8.2.
+        let after = view(CHURNED_LOCK);
+        let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
+
+        assert!(has_potential_restoration(&before, &after));
+        let rewrites = restorations(&before, &after, &RequirementIndex::new(&graph));
+
+        assert_eq!(
+            rewrites,
+            vec![EdgeRewrite {
+                dependent: key("diesel", "2.3.11"),
+                dependency: "uuid".to_string(),
+                from: "0.8.2".to_string(),
+                to: "1.24.0".to_string(),
+            }]
+        );
+    }
+
+    /// The vanished line has no surviving successor (the downgrade removed the 1.x node
+    /// entirely): the edge legitimately collapsed onto the only remaining version.
+    #[test]
+    fn a_vanished_line_without_a_successor_is_left_alone() {
+        let before_text = CHURNED_LOCK
+            .replace(
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 0.8.2\",",
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 1.24.0\",",
+            )
+            .replace("1.24.0", "1.25.0");
+        let before = view(&before_text);
+        let after_text = CHURNED_LOCK.replace(" \"uuid 1.24.0\",\n", "").replace(
+            indoc! {r#"
+
+                    [[package]]
+                    name = "uuid"
+                    version = "1.24.0"
+                    source = "registry+https://github.com/rust-lang/crates.io-index"
+                    checksum = "dd"
+                "#},
+            "\n",
+        );
+        assert!(!after_text.contains("1.24.0"));
+        let after = view(&after_text);
+        let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
+
+        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+    }
+
+    /// The `0.0.x` corner: [`version::major_key`] collapses every `0.0.z` to one `"0.0"` key,
+    /// but cargo treats each `0.0.z` as its own line and can lock several side by side — so a
+    /// pre-existing `0.0.z` bystander (kept alive by another dependent) must never be chosen as
+    /// the vanished target's "successor". A genuine replacement is new to the after-lock.
+    #[test]
+    fn a_pre_existing_zero_zero_bystander_is_not_a_successor() {
+        // Before: widget bound to nano 0.0.5; nano 0.0.3 coexists as another dependent's node.
+        let before = view(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "widget"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "aa"
+            dependencies = [
+             "nano 0.0.5",
+            ]
+
+            [[package]]
+            name = "nano"
+            version = "0.0.3"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "bb"
+
+            [[package]]
+            name = "nano"
+            version = "0.0.5"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "cc"
+
+            [[package]]
+            name = "nano"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "dd"
+        "#});
+        // After: 0.0.5 vanished, widget's edge collapsed onto the 1.x line; the surviving 0.0.3
+        // is the untouched bystander, not a replacement.
+        let after_bystander = view(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "widget"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "aa"
+            dependencies = [
+             "nano 1.0.0",
+            ]
+
+            [[package]]
+            name = "nano"
+            version = "0.0.3"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "bb"
+
+            [[package]]
+            name = "nano"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "dd"
+        "#});
+        // The dependent's declared range admits every nano version in play, so a rewrite the
+        // guard failed to veto would pass `admits` — the restorations assertion below is only
+        // meaningful with this requirement in the graph (an empty graph rejects everything).
+        let graph = graph_with_resolved(&[("widget", "1.0.0", "nano", ">=0.0.3, <2")], &["1.0.0"]);
+
+        assert!(!has_potential_restoration(&before, &after_bystander));
+        assert!(restorations(&before, &after_bystander, &RequirementIndex::new(&graph)).is_empty());
+
+        // Counterfactual guarding against a vacuous pass: the same shape with a genuinely new
+        // `0.0.z` node (0.0.4, absent from the before-lock) is a real successor candidate.
+        let after_replacement = view(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "widget"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "aa"
+            dependencies = [
+             "nano 1.0.0",
+            ]
+
+            [[package]]
+            name = "nano"
+            version = "0.0.4"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "ee"
+
+            [[package]]
+            name = "nano"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "dd"
+        "#});
+        assert!(has_potential_restoration(&before, &after_replacement));
+        assert_eq!(
+            restorations(&before, &after_replacement, &RequirementIndex::new(&graph)),
+            vec![EdgeRewrite {
+                dependent: key("widget", "1.0.0"),
+                dependency: "nano".to_string(),
+                from: "1.0.0".to_string(),
+                to: "0.0.4".to_string(),
+            }],
+            "the genuinely new same-key node is restored — proving the bystander case above \
+             abstained on the guard, not on the requirement"
+        );
+    }
+
+    /// Two surviving `"0.0"`-key candidates are ambiguous (only reachable in the `0.0.x` corner,
+    /// where cargo locks several `0.0.z` versions side by side): restoration abstains.
+    #[test]
+    fn two_zero_zero_survivors_are_ambiguous_and_abstain() {
+        let before = view(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "widget"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "aa"
+            dependencies = [
+             "nano 0.0.5",
+            ]
+
+            [[package]]
+            name = "nano"
+            version = "0.0.5"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "cc"
+
+            [[package]]
+            name = "nano"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "dd"
+        "#});
+        // After: 0.0.5 vanished and TWO new 0.0.z nodes appeared beside the 1.x landing.
+        let after = view(indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "widget"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "aa"
+            dependencies = [
+             "nano 1.0.0",
+            ]
+
+            [[package]]
+            name = "nano"
+            version = "0.0.3"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "bb"
+
+            [[package]]
+            name = "nano"
+            version = "0.0.4"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "ee"
+
+            [[package]]
+            name = "nano"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "dd"
+        "#});
+        // As in the bystander test: the requirement admits both survivors, so the emptiness
+        // below can only come from the ambiguity abstention itself.
+        let graph = graph_with_resolved(&[("widget", "1.0.0", "nano", ">=0.0.3, <2")], &["1.0.0"]);
+
+        assert!(!has_potential_restoration(&before, &after));
+        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+    }
+
+    /// The successor no longer satisfies the dependent's requirement (a narrowed range that only
+    /// admits the old line): the collapse is the resolver's only valid answer.
+    #[test]
+    fn a_successor_outside_the_requirement_is_not_forced() {
+        let before_text = CHURNED_LOCK
+            .replace(
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 0.8.2\",",
+                "checksum = \"aa\"\ndependencies = [\n \"itoa\",\n \"uuid 1.24.0\",",
+            )
+            .replace("1.24.0", "1.25.0");
+        let before = view(&before_text);
+        let after = view(CHURNED_LOCK);
+        let graph = graph_with(&[("diesel", "2.3.11", "uuid", "^0.8")]);
+
         assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
     }
 

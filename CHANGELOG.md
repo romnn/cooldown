@@ -16,6 +16,13 @@
   the recorded rejections. A genuine hold — a *compliant* requirer demanding the too-fresh version — is still
   left in place, and its warning now names that requirer and its requirement instead of the generic
   graph-held text. Applies to `fix` and to `upgrade`'s transitive reconcile alike.
+- **A downgrade no longer strands a dependent's lock edge on an old coexisting release line.**
+  When a planned downgrade replaced a node (`uuid 1.25.0` → `1.24.0`) beside a surviving old line
+  (`0.8.2`, kept alive by other dependents), cargo's incremental re-resolve could rebind a
+  wide-ranged dependent's edge (diesel's `uuid >=0.7, <2`) onto the old line — a build-affecting
+  move `cargo metadata --locked` accepts silently. The `preserve` edge policy (the default) now
+  restores line continuity: an edge whose binding target vanished is rebound to the unique
+  surviving same-line successor whenever the dependent's declared requirement admits it.
 
 ## v0.0.15
 
