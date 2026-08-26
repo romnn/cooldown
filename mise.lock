@@ -313,26 +313,26 @@ url = "https://github.com/est31/cargo-udeps/releases/download/v0.1.61/cargo-udep
 url_api = "https://api.github.com/repos/est31/cargo-udeps/releases/assets/407804338"
 
 [[tools."github:romnn/bumpversion"]]
-version = "0.0.10"
+version = "0.0.12"
 backend = "github:romnn/bumpversion"
 
 [tools."github:romnn/bumpversion".options]
 matching = "bumpversion"
 
 [tools."github:romnn/bumpversion"."platforms.linux-x64"]
-checksum = "sha256:1bf039d01350bfffc0e1ceb82faefd84988497cdbe81020f5de058da2622a032"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005099"
+checksum = "sha256:7201ff20bbbf448edf215c635d207e3439cb2e21e3a264421fd65c470a793e7e"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.12/bumpversion_0.0.12_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/520989854"
 
 [tools."github:romnn/bumpversion"."platforms.macos-arm64"]
-checksum = "sha256:3542d246cba084211ac8af5ef8664a3bf85b5658756f3cc1d47201600fb130d4"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005100"
+checksum = "sha256:056c6747b769a2d0c7e09bb82126127ba6f70ed74b10bd0423485771d8fead7f"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.12/bumpversion_0.0.12_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/520989837"
 
 [tools."github:romnn/bumpversion"."platforms.windows-x64"]
-checksum = "sha256:31b1fdc42584b619b528fd732c401330c39ef905f1c4f178eb0d653eae79ced3"
-url = "https://github.com/romnn/bumpversion/releases/download/v0.0.10/bumpversion_0.0.10_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/496005090"
+checksum = "sha256:d079322ba0e01c096f3985a374889ada22c83262bd71efb67241a81e597bc576"
+url = "https://github.com/romnn/bumpversion/releases/download/v0.0.12/bumpversion_0.0.12_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/bumpversion/releases/assets/520989840"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
 version = "0.7.0"
@@ -648,21 +648,21 @@ provenance = "github-attestations"
 version = "6.3.2"
 backend = "core:swift"
 
-[tools.swift.options]
-swift_platform = "ubuntu24.04"
-
-[tools.swift."platforms.linux-x64"]
-url = "https://download.swift.org/swift-6.3.2-release/ubuntu2404/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE-ubuntu24.04.tar.gz"
-
-[[tools.swift]]
-version = "6.3.2"
-backend = "core:swift"
-
 [tools.swift."platforms.macos-arm64"]
 url = "https://download.swift.org/swift-6.3.2-release/xcode/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE-osx.pkg"
 
 [tools.swift."platforms.windows-x64"]
 url = "https://download.swift.org/swift-6.3.2-release/windows10/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE-windows10.exe"
+
+[[tools.swift]]
+version = "6.3.2"
+backend = "core:swift"
+
+[tools.swift.options]
+swift_platform = "ubuntu24.04"
+
+[tools.swift."platforms.linux-x64"]
+url = "https://download.swift.org/swift-6.3.2-release/ubuntu2404/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE-ubuntu24.04.tar.gz"
 
 [[tools.task]]
 version = "3.53.1"
