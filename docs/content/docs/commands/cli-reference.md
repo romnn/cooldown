@@ -23,6 +23,16 @@ Global flags may appear before or after the subcommand: `cooldown --dry-run upgr
 
 `--min-age`, `--latest`, and `--freeze` are mutually exclusive. Every escape hatch shows up in [`explain`]({{< relref "other.md" >}}).
 
+## Advisories
+
+The [advisory feed]({{< relref "../configuration/advisories.md" >}}) flags (usually set once in `cooldown.toml` instead):
+
+| Flag | Effect |
+|---|---|
+| `--advisories` / `--no-advisories` | Enable/disable the OSV advisory feed for this run. |
+| `--advisory-min-age <DUR>` | The security window for exact fix versions of a qualifying advisory. Setting it also enables the feed and selects the `shorten` mode. |
+| `--advisory-severity <SEV>` | Minimum severity that earns the security window: `low`, `moderate`, `high`, `critical`. Setting it also enables the feed. |
+
 ## Scope and selection
 
 | Flag | Effect |
@@ -87,6 +97,9 @@ Several flags mirror an environment variable, so CI can set policy once:
 | `COOLDOWN_OFFLINE` | `--offline` |
 | `COOLDOWN_CONCURRENCY` | `--concurrency` |
 | `COOLDOWN_ALLOW_STALE_LOCK` | `--allow-stale-lock` |
+| `COOLDOWN_ADVISORIES` | `--advisories` / `--no-advisories` |
+| `COOLDOWN_ADVISORY_MIN_AGE` | `--advisory-min-age` |
+| `COOLDOWN_ADVISORY_SEVERITY` | `--advisory-severity` |
 | `COOLDOWN_LOG` | `--log-level` |
 | `RUST_LOG` | overrides `--log-level` |
 

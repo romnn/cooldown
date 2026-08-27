@@ -77,6 +77,9 @@ fn dependency_of(
     let version = module.effective_version()?.to_string();
     let graph_floor = floors.get(&path).map(|v| Version::new(v.clone()));
     Some(Dependency {
+        // A Go module's path *is* its global identity — OSV's `Go` ecosystem keys on it — so
+        // origin is provable by construction, whatever proxy served the bytes.
+        advisory_identity: Some(path.clone()),
         package: PackageId::new(GO_ID, path, registry.map(str::to_owned)),
         current: Version::new(version.clone()),
         current_quality: classify_quality(&version),

@@ -607,6 +607,8 @@ dependencies = [
  "async-trait",
  "camino",
  "cooldown-core",
+ "cvss",
+ "futures",
  "jiff",
  "reqwest",
  "serde",
@@ -796,6 +798,12 @@ dependencies = [
  "generic-array",
  "typenum",
 ]
+
+[[package]]
+name = "cvss"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7fb220d3ce1b565af39cee5b89e47fd8dd1dab162900ee4363c8ee4169ee8a2"
 
 [[package]]
 name = "defmt"

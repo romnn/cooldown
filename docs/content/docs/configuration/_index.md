@@ -20,6 +20,7 @@ From there you can shape policy along two axes — **which layer** a value comes
 - **[Precedence]({{< relref "precedence.md" >}})** — how layers and selectors combine, field by field.
 - **[Selectors]({{< relref "selectors.md" >}})** — per-tool, per-registry, and per-package policy.
 - **[Exclusions]({{< relref "excludes.md" >}})** — trim folders and packages out of a run.
+- **[Advisories]({{< relref "advisories.md" >}})** — the OSV feed: flag security fixes, or give them a shorter window.
 
 > [!NOTE]
 > Run [`cooldown config`]({{< relref "../commands/other.md" >}}) to print the fully-resolved policy with the origin of each value, and [`cooldown explain <pkg>`]({{< relref "../commands/other.md" >}}) to see the derivation for one package. When behavior surprises you, those two commands are the answer.

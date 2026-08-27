@@ -82,6 +82,7 @@ impl ToolRead for HexTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("Hex"),
         }
     }
 
@@ -110,8 +111,12 @@ impl ToolRead for HexTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // Only a hexpm-repo entry is the package OSV's `Hex` ecosystem describes; a private
+            // Hex repo's package merely shares the name.
+            let advisory_identity = resolved.hexpm.then(|| resolved.name.clone());
             deps.push(Dependency {
                 package: PackageId::new(HEX_ID, resolved.name.clone(), Some(HEXPM.to_string())),
+                advisory_identity,
                 current: Version::new(resolved.version.clone()),
                 current_quality: classify_quality(&resolved.version),
                 direct: is_direct,
@@ -228,6 +233,15 @@ impl ToolWrite for HexTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = HexTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("Hex"));
+    }
 
     #[tokio::test]
     async fn dependencies_split_uses_mix_exs() {

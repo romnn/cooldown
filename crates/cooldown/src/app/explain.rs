@@ -90,9 +90,14 @@ impl<'a> ExplainService<'a> {
         };
         let res = resolve(&pctx.policy.layers, &q, self.ws.now());
 
+        // The `[advisories]` policy steps join the trace when the feed is configured anywhere
+        // in the stack, so the security window's provenance is as auditable as the ordinary
+        // one's.
+        let advisory_policy = cooldown_core::resolve_advisory_policy(&pctx.policy.layers);
         let steps = res
             .trace
             .iter()
+            .chain(advisory_policy.trace.iter())
             .map(|step| ExplainStep {
                 layer: step.layer.token(),
                 field: step.field.clone(),
@@ -153,6 +158,7 @@ impl<'a> ExplainService<'a> {
                 source: res.window.source(),
                 strict_native: pctx.policy.strict_native,
                 layers,
+                advisories: self.advisory_config(pctx),
             });
         }
 
@@ -162,6 +168,27 @@ impl<'a> ExplainService<'a> {
             },
             items,
             exit: Exit::Ok,
+        }
+    }
+
+    /// The resolved `[advisories]` policy plus the project tool's feed coverage.
+    ///
+    /// Coverage is reported here rather than only as a run-time warning: a project whose tool
+    /// has no safe project-wide database mapping can enable the feed and see nothing happen, and
+    /// `config` is where one looks to find out why.
+    fn advisory_config(&self, pctx: &ProjectCtx) -> crate::app::AdvisoryConfigInfo {
+        let policy = cooldown_core::resolve_advisory_policy(&pctx.policy.layers);
+        crate::app::AdvisoryConfigInfo {
+            enabled: policy.enabled,
+            source: policy.source,
+            mode: policy.mode,
+            min_age_days: round2(cooldown_core::duration::duration_as_days(policy.min_age)),
+            severity: policy.severity,
+            ecosystem: self
+                .ws
+                .adapter(pctx.tool)
+                .and_then(|adapter| adapter.capabilities().advisory_ecosystem)
+                .map(ToString::to_string),
         }
     }
 

@@ -42,6 +42,12 @@ pub struct Capabilities {
     pub can_sync: bool,
     /// Releases are artifact-granular (a universal lock with per-file upload times, e.g. uv).
     pub artifact_granular: bool,
+    /// The advisory database's ecosystem string for this tool's packages (`Go`, `crates.io`,
+    /// `PyPI`, `npm`, `Maven`, `RubyGems`, `Hex`, `SwiftURL`), or `None` when the tool's mixed
+    /// package graph has no safe single project-wide mapping (conda, pixi, Deno). The feature is
+    /// then inert there, and any run with the feed enabled says so with an
+    /// `advisory_ecosystem_unsupported` warning rather than pretending coverage.
+    pub advisory_ecosystem: Option<&'static str>,
 }
 
 /// The run's clock — the single source of the evaluation instant ("now").
@@ -131,6 +137,32 @@ pub trait ToolRead: Send + Sync {
     /// the original leg's kind.
     fn classify_update_kind(&self, _from: &str, _to: &str) -> Option<UpdateKind> {
         None
+    }
+
+    /// Translates an advisory database's version spelling into this tool's display spelling, so
+    /// advisory range boundaries can be matched against the tool's release list (see
+    /// [`classify_advisory`](crate::advisory::classify_advisory)).
+    ///
+    /// The identity default is correct for most tools; Go overrides it because OSV's `Go`
+    /// ecosystem omits the `v` prefix the Go adapter displays.
+    fn advisory_version(&self, version: &str) -> String {
+        version.to_string()
+    }
+
+    /// Confirms the advisory identities [`dependencies`](Self::dependencies) granted, with
+    /// evidence only worth gathering when the advisory feed is about to be consulted — for npm,
+    /// the package manager's *effective* registry routing, whose global and builtin layers no
+    /// enumerable file walk can locate (they live at prefix-relative paths behind
+    /// version-manager shims).
+    ///
+    /// The application calls this before identities are consumed — sent to the feed, matched
+    /// against fetched advisories, or counted as withheld — and never on feed-disabled runs.
+    /// An implementation may only *withhold* identities (set them to `None`), never grant or
+    /// alter one, and handles its own failures by withholding — unknown routing must not pass
+    /// as none. It should memoize per project: the residual gate re-reads the graph every
+    /// pass. The default keeps the identities exactly as granted.
+    async fn confirm_advisory_identities(&self, project: &Project, deps: &mut [Dependency]) {
+        let _ = (project, deps);
     }
 
     /// Returns the **raw, unscoped** resolved dependencies for `project`.

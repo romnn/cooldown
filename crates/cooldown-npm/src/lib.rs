@@ -13,6 +13,7 @@ pub mod lock;
 mod manifest;
 mod native;
 pub mod nodecmd;
+mod npmrc;
 mod peers;
 pub mod registry;
 pub mod tool;

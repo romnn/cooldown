@@ -365,6 +365,7 @@ mod tests {
                 etag: None,
                 status: 200,
                 body: "v1.0.0\n".into(),
+                request_body: None,
             },
         )
         .expect("cache entry");

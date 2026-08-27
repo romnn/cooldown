@@ -288,6 +288,13 @@ pub(in crate::cli) enum Command {
         /// Fail (not just warn) on deps with no publish time.
         #[arg(long = "fail-on-unknown-age")]
         fail_on_unknown_age: bool,
+        /// Fail (not just warn) when the enabled advisory feed yields no usable evidence: it is
+        /// unreachable, no wired source implements it, or its data is too stale to shorten.
+        ///
+        /// A tool with no safe single advisory-database ecosystem mapping stays a warning.
+        /// By default all of these fail open: the ordinary, stricter window stands.
+        #[arg(long = "fail-on-advisory-source")]
+        fail_on_advisory_source: bool,
         /// Refresh lockfiles before checking them. Mutates lockfiles and is ignored under `--dry-run`.
         #[arg(long)]
         lock: bool,
@@ -373,6 +380,29 @@ pub(in crate::cli) struct GlobalArgs {
     /// Exempt matching packages from the cooldown (repeatable, audited).
     #[arg(long, global = true, value_name = "GLOB")]
     pub(in crate::cli) allow: Vec<String>,
+    /// Consult the advisory feed (OSV): a candidate that fixes an advisory affecting the
+    /// current pin renders as a flagged row ("fixes GHSA-…").
+    ///
+    /// Config: `[advisories] enabled`.
+    #[arg(long, global = true)]
+    pub(in crate::cli) advisories: bool,
+    /// Don't consult the advisory feed (the inverse of `--advisories`).
+    #[arg(long = "no-advisories", global = true, conflicts_with = "advisories")]
+    pub(in crate::cli) no_advisories: bool,
+    /// The SECURITY window replacing the ordinary one for advisory-fixing versions —
+    /// min-clamped, so it only ever shortens.
+    ///
+    /// Setting it selects the shorten mode and enables the feed.
+    /// Config: `[advisories] min-age` + `mode = "shorten"`.
+    #[arg(long = "advisory-min-age", global = true, value_name = "DUR")]
+    pub(in crate::cli) advisory_min_age: Option<String>,
+    /// The minimum normalized advisory severity that earns the security window:
+    /// low|moderate|high|critical (default high).
+    ///
+    /// Setting it enables the feed.
+    /// Config: `[advisories] severity`.
+    #[arg(long = "advisory-severity", global = true, value_name = "SEV")]
+    pub(in crate::cli) advisory_severity: Option<String>,
     /// Allow major version changes. Default: ON for `outdated` (so a new major is discoverable),
     /// OFF for `upgrade`/`check`/etc. (a major bump is usually breaking work you opt into). For
     /// `upgrade`/`fix` it applies to every eligible dependency; narrow it with `--package`.
@@ -559,6 +589,8 @@ pub struct CliOverrides {
     pub(crate) all_artifacts: Option<bool>,
     pub(crate) allow_stale_lock: Option<bool>,
     pub(crate) fail_on_unknown_age: Option<bool>,
+    /// `check --fail-on-advisory-source` — refuse to certify without the advisory feed.
+    pub(crate) fail_on_advisory_source: Option<bool>,
     pub(crate) strict: Option<bool>,
     pub(crate) build: Option<bool>,
     /// `outdated --transitive` — list indirect deps in the report (a bool; outdated-only).
@@ -623,6 +655,8 @@ impl CliOverrides {
             all: set_on_subcommand(matches, "outdated", "all").then_some(true),
             all_artifacts: set_on_subcommand(matches, "check", "all_artifacts").then_some(true),
             fail_on_unknown_age: set_on_subcommand(matches, "check", "fail_on_unknown_age")
+                .then_some(true),
+            fail_on_advisory_source: set_on_subcommand(matches, "check", "fail_on_advisory_source")
                 .then_some(true),
             build: set_on_subcommand(matches, "upgrade", "build").then_some(true),
             hide_pinned: set_on_subcommand(matches, "outdated", "hide_pinned").then_some(true),
@@ -738,6 +772,7 @@ mod tests {
             all_artifacts,
             allow_stale_lock,
             fail_on_unknown_age,
+            fail_on_advisory_source,
             strict,
             build,
             transitive,
@@ -764,6 +799,7 @@ mod tests {
             all_artifacts,
             allow_stale_lock,
             fail_on_unknown_age,
+            fail_on_advisory_source,
             strict,
             build,
             transitive,
@@ -894,6 +930,10 @@ mod tests {
         );
         assert_eq!(
             overrides(&["cooldown", "check", "--fail-on-unknown-age"]).fail_on_unknown_age,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "check", "--fail-on-advisory-source"]).fail_on_advisory_source,
             Some(true)
         );
         assert_eq!(

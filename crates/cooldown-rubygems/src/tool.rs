@@ -81,6 +81,7 @@ impl ToolRead for BundlerTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: false,
+            advisory_ecosystem: Some("RubyGems"),
         }
     }
 
@@ -107,12 +108,16 @@ impl ToolRead for BundlerTool {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
+            // Only a gem served by the public rubygems.org remote is the gem OSV's `RubyGems`
+            // ecosystem describes; a private remote's gem merely shares the name.
+            let advisory_identity = resolved.rubygems.then(|| resolved.name.clone());
             deps.push(Dependency {
                 package: PackageId::new(
                     BUNDLER_ID,
                     resolved.name.clone(),
                     Some(RUBYGEMS.to_string()),
                 ),
+                advisory_identity,
                 current: Version::new(resolved.version.clone()),
                 current_quality: classify_quality(&resolved.version),
                 direct: is_direct,
@@ -237,6 +242,15 @@ impl ToolWrite for BundlerTool {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = BundlerTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("RubyGems"));
+    }
 
     #[tokio::test]
     async fn dependencies_split_direct_from_transitive() {

@@ -172,23 +172,77 @@ pub struct ResolvedPin {
     pub name: String,
     /// The exact version the file pins the distribution to.
     pub version: String,
+    /// Whether the pin's origin is provably PyPI, given everything the file records: a
+    /// requirements pin in a file without custom index/location directives, or a poetry entry
+    /// without a `[package.source]` table (poetry records one exactly when the package did
+    /// *not* come from the default PyPI source).
+    pub pypi: bool,
 }
 
 /// Parses pinned `name==version` requirements. Unpinned (`>=`, `~=`), options (`-r`, `-e`,
 /// `--hash`), environment markers (`; python_version < …`), extras (`pkg[extra]`), and comments are
 /// handled or skipped, leaving the exact-pinned distributions cooldown can reason about.
+///
+/// pip records no per-distribution source, so one custom index or location directive anywhere
+/// in the file makes every pin's origin unprovable — the whole file parses `pypi: false`.
 #[must_use]
 pub fn parse_requirements(content: &str) -> Vec<ResolvedPin> {
+    let pypi = !declares_custom_index(content);
     let mut out = Vec::new();
     for raw in content.lines() {
         if let Some(pin) = parse_requirement_pin(raw) {
             out.push(ResolvedPin {
                 name: pin.name.to_string(),
                 version: pin.version.to_string(),
+                pypi,
             });
         }
     }
     out
+}
+
+/// Whether the requirements file routes installation somewhere other than the default index.
+/// Single-file testimony only; the adapter's `ambient` module follows `-r`/`-c` includes and the
+/// out-of-file configuration surfaces a bare content parse cannot see.
+fn declares_custom_index(content: &str) -> bool {
+    content.lines().any(|raw| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        line_routes_custom(line)
+    })
+}
+
+/// Whether one comment-stripped, trimmed requirements line routes installation somewhere other
+/// than the default index: a custom index (`--index-url`/`-i`, `--extra-index-url`), direct
+/// archive locations (`--find-links`/`-f`), or index suppression (`--no-index`).
+pub(crate) fn line_routes_custom(line: &str) -> bool {
+    [
+        "--index-url",
+        "--extra-index-url",
+        "--find-links",
+        "--no-index",
+        "-i",
+        "-f",
+    ]
+    .iter()
+    .any(|directive| matches_directive(line, directive))
+}
+
+/// The file a `-r`/`--requirement`/`-c`/`--constraint` line includes, when it names one.
+/// pip resolves the target relative to the file containing the line — the caller's business.
+pub(crate) fn line_include_target(line: &str) -> Option<&str> {
+    ["--requirement", "--constraint", "-r", "-c"]
+        .iter()
+        .find_map(|directive| {
+            line.strip_prefix(directive)
+                .and_then(|rest| rest.strip_prefix([' ', '\t', '=']))
+                .map(str::trim)
+        })
+        .filter(|target| !target.is_empty())
+}
+
+fn matches_directive(line: &str, directive: &str) -> bool {
+    line.strip_prefix(directive)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '=']))
 }
 
 /// An exact `name==version` pin found on one requirements line, borrowing from that line.
@@ -242,6 +296,10 @@ pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
     struct Package {
         name: String,
         version: String,
+        /// Present exactly when the package did not come from the default PyPI source: a
+        /// `legacy` (custom index), `git`, `directory`, or `url` table.
+        #[serde(default)]
+        source: Option<toml::Value>,
     }
     toml::from_str::<Lock>(content)
         .map(|lock| {
@@ -250,6 +308,7 @@ pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
                 .map(|p| ResolvedPin {
                     name: p.name,
                     version: p.version,
+                    pypi: p.source.is_none(),
                 })
                 .collect()
         })
@@ -317,6 +376,7 @@ mod tests {
         ResolvedPin {
             name: name.to_string(),
             version: version.to_string(),
+            pypi: true,
         }
     }
 

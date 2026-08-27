@@ -13,6 +13,40 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 
+/// Normalizes a Python distribution name per PEP 503: lowercase, with every run of `-`, `_`, and
+/// `.` collapsed to a single `-`.
+///
+/// Lockfiles may preserve the author's spelling (`Django`, `jupyter_server`) while advisory
+/// databases (OSV's `PyPI` ecosystem) store the normalized form — matching either side
+/// unnormalized silently loses every advisory for such a package.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_adapter_util::pep503_normalize;
+///
+/// assert_eq!(pep503_normalize("Django"), "django");
+/// assert_eq!(pep503_normalize("jupyter_server"), "jupyter-server");
+/// assert_eq!(pep503_normalize("ruamel.yaml.clib"), "ruamel-yaml-clib");
+/// ```
+#[must_use]
+pub fn pep503_normalize(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_separator = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !previous_separator {
+                normalized.push('-');
+            }
+            previous_separator = true;
+        } else {
+            normalized.extend(ch.to_lowercase());
+            previous_separator = false;
+        }
+    }
+    normalized
+}
+
 /// The workspace `roots` that reach `target` through the resolved dependency graph — directly or
 /// transitively — for attributing a transitive dependency to the members that pull it in.
 ///

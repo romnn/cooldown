@@ -18,6 +18,16 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[test]
+fn advisory_mapping_matches_osv() {
+    let cache = tempfile::tempdir().expect("cache");
+    let tool =
+        GoTool::from_http(SharedHttp::new(cache.path(), HttpOptions::default()).expect("http"));
+    assert_eq!(tool.capabilities().advisory_ecosystem, Some("Go"));
+    assert_eq!(tool.advisory_version("0.31.0"), "v0.31.0");
+    assert_eq!(tool.advisory_version("v0.31.0"), "v0.31.0");
+}
+
 struct TestServer {
     base_url: String,
     stop: Arc<AtomicBool>,
@@ -318,6 +328,7 @@ fn old_import_path_for_cross_major_downgrade() {
 fn dep(name: &str, current: &str) -> Dependency {
     Dependency {
         package: PackageId::new(GO_ID, name, None),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(current),
         current_quality: classify_quality(current),
         direct: true,

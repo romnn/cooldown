@@ -3,6 +3,7 @@
 //! re-resolve/apply a chosen window. `[tool.uv]` `exclude-newer`/`exclude-newer-package` is read as
 //! a native config layer.
 
+mod ambient;
 mod artifact;
 mod build_requires;
 pub mod lock;

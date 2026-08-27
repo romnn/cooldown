@@ -27,6 +27,21 @@ When there are violations, each is rolled back to a matured version:
  left-pad  app            3.1.0     3.0.9     downgraded    too fresh (2d/7d)
 ```
 
+## Rolling back a security bump
+
+With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enabled, a pin that is itself an advisory's fix version resolves against the shorter security window — so most security bumps never reach `fix` at all. One that is younger than even *that* window still fails `check`, and `fix` still rolls it back to the newest matured version, which the same advisory may mark affected.
+
+The verdict is deliberately unchanged: `fix` exists to make `check` pass, and cooldown is not a vulnerability gate. What the feed adds is that the trade is stated rather than made silently:
+
+```text
+warning [advisory_rollback]  left-pad@3.1.0 is younger than its cooldown; rolling it back to
+3.0.9 re-enters GHSA-wcg3-cvx6-7396 — `baseline` the current pin instead to keep the fix
+```
+
+The warning describes a rollback that actually happened: it is attached to the batch that landed the downgrade, so a batch the apply rejects or the post-apply gate rolls back takes the warning down with it. Under `--dry-run` it speaks in the conditional instead (`would roll it back to 3.0.9, re-entering …`), like the rest of a dry run's report.
+
+[`baseline`]({{< relref "other.md" >}}) is the way to keep the fix and still pass the gate: it acknowledges the young pin instead of undoing it.
+
 ## The whole-graph default
 
 By default `fix` works on the **whole resolved graph** — the same surface `check` gates. A too-fresh **transitive** dependency is rolled back to the newest matured version the graph still allows, not just direct dependencies.

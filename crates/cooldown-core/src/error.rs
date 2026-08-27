@@ -388,6 +388,22 @@ diagnostic_kinds! {
     /// The user can downgrade it manually, opt into pinned downgrades, acknowledge it in the
     /// baseline, or wait.
     Held = "held",
+    /// The advisory feed could not be reached or its response could not be parsed.
+    ///
+    /// Fail-open on the window: the ordinary, stricter window stands; only the
+    /// security-relevant annotation and shortening are unavailable (`--fail-on-advisory-source`
+    /// escalates this to an error).
+    AdvisorySourceUnavailable = "advisory_source_unavailable",
+    /// The advisory feed is enabled but this tool has no advisory-database ecosystem mapping,
+    /// so the feed cannot cover its packages.
+    AdvisoryEcosystemUnsupported = "advisory_ecosystem_unsupported",
+    /// A `fix` rollback moves a pin back into a version an advisory the pin currently escapes
+    /// marks affected.
+    ///
+    /// The verdict is unchanged — `fix` makes `check` pass and the feed is not a vulnerability
+    /// gate — so this reports the trade rather than blocking it: `baseline` the pin to keep the
+    /// fix instead.
+    AdvisoryRollback = "advisory_rollback",
 }
 
 impl Diagnostic {

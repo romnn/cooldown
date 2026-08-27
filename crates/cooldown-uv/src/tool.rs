@@ -136,6 +136,20 @@ fn project_member(project: &Project, lock: &UvLock) -> Result<Vec<MemberRef>> {
         .unwrap_or_default())
 }
 
+/// Whether the manifest routes resolution through a custom index or location (`[[tool.uv.index]]`,
+/// `tool.uv.index-url`/`extra-index-url`/`find-links`/`no-index`).
+fn manifest_declares_custom_index(manifest: &Utf8Path) -> Result<bool> {
+    let Some(value) =
+        cooldown_toml_util::read_toml_file::<toml::Value>(manifest, "pyproject.toml")?
+    else {
+        return Ok(false);
+    };
+    let Some(uv) = value.get("tool").and_then(|tool| tool.get("uv")) else {
+        return Ok(false);
+    };
+    Ok(crate::ambient::declares_index_keys(uv))
+}
+
 /// The `[project].name` declared in a `pyproject.toml`, or `None` when absent.
 fn project_name(manifest: &Utf8Path) -> Result<Option<String>> {
     let Some(value) =
@@ -163,6 +177,7 @@ impl ToolRead for UvTool {
             has_dist_tags: false,
             can_sync: true,
             artifact_granular: true,
+            advisory_ecosystem: Some("PyPI"),
         }
     }
 
@@ -193,6 +208,11 @@ impl ToolRead for UvTool {
         let exact_pins = crate::native::exact_pinned_names(&project.manifest);
         // A uv project is a single package, so it is the source for every dependency it declares.
         let project_member = project_member(project, &lock)?;
+        // The manifest's own `[tool.uv]` index keys are as much a reroute as a `uv.toml`: the
+        // lock's per-package URLs predate whatever was added there, and the resolve a shortened
+        // window triggers honors the manifest.
+        let index_rerouted = crate::ambient::reroutes(&project.root)
+            || manifest_declares_custom_index(&project.manifest)?;
 
         let mut deps = Vec::new();
         for pkg in &lock.packages {
@@ -224,8 +244,24 @@ impl ToolRead for UvTool {
                         .any(|pin| crate::version::compare(pin, version).is_eq())
                 })
                 .map(|_| Version::new(version.clone()));
+            // The lock records which index served each package. Only the canonical PyPI index
+            // proves membership in OSV's `PyPI` ecosystem; any other URL (private registry,
+            // mirror, proxy) may shadow a public name, so the package carries no advisory
+            // identity. Index configuration (`[tool.uv]` in the manifest or an ancestor
+            // `pyproject.toml`, project/ancestor/user/system `uv.toml`, `UV_*` variables)
+            // vetoes on top: adopting a shortened window means a future resolve, and that
+            // resolve honors routing the lock predates.
+            // `uv.lock` names are normalized already in practice, but PEP 503 normalization is
+            // idempotent and OSV's `PyPI` documents only match that form.
+            let advisory_identity = source
+                .registry
+                .as_deref()
+                .filter(|url| crate::pypi::is_pypi_index(url))
+                .filter(|_| !index_rerouted)
+                .map(|_| cooldown_adapter_util::pep503_normalize(&pkg.name));
             deps.push(Dependency {
                 package: PackageId::new(UV_ID, pkg.name.clone(), Some(PYPI.to_string())),
+                advisory_identity,
                 current: Version::new(version.clone()),
                 current_quality: classify_quality(version),
                 direct: is_direct,
@@ -263,6 +299,15 @@ impl ToolRead for UvTool {
             .map(|pkg| crate::native::normalize_name(&pkg.name))
             .collect();
         let members = project_member(project, &lock)?;
+        // A build requirement has no lock entry recording which index served it, so its origin
+        // is the project's configured default: PyPI, unless the manifest — or any ambient
+        // config surface (project/ancestor/user/system `uv.toml`, ancestor `pyproject.toml`
+        // `[tool.uv]` tables, `UV_*` variables) — routes resolution
+        // through a custom index; then no build requirement's origin is provable and none
+        // carries an advisory identity. The lock-backed path above stays the per-package
+        // authority.
+        let custom_index = manifest_declares_custom_index(&project.manifest)?
+            || crate::ambient::reroutes(&project.root);
         let deps = build_requires
             .into_iter()
             .filter(|req| !locked.contains(&req.name))
@@ -273,8 +318,11 @@ impl ToolRead for UvTool {
                     pinned,
                     bound,
                 } = req;
+                let advisory_identity =
+                    (!custom_index).then(|| cooldown_adapter_util::pep503_normalize(&name));
                 Dependency {
                     package: PackageId::new(UV_ID, name, Some(PYPI.to_string())),
+                    advisory_identity,
                     current_quality: classify_quality(&floor),
                     current: Version::new(floor),
                     direct: true,
@@ -991,6 +1039,15 @@ mod tests {
     use indoc::indoc;
     use jiff::Timestamp;
 
+    #[test]
+    fn advisory_ecosystem_matches_osv() {
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = UvTool::from_http(
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
+        );
+        assert_eq!(tool.capabilities().advisory_ecosystem, Some("PyPI"));
+    }
+
     fn lock_with(packages: &[(&str, &str)]) -> UvLock {
         use std::fmt::Write as _;
         let mut content = String::from("version = 1\nrevision = 3\n");
@@ -1249,6 +1306,7 @@ mod tests {
         };
         let dep = Dependency {
             package: PackageId::new(UV_ID, "requests", Some(PYPI.to_string())),
+            advisory_identity: Some("requests".to_string()),
             current: Version::new("2.32.0"),
             current_quality: ReleaseQuality::Stable,
             direct: true,
@@ -1372,6 +1430,226 @@ mod tests {
         assert!(
             transitive.members.is_empty(),
             "transitive dependencies are not declared by the project member"
+        );
+    }
+
+    /// A private-index package sharing a public PyPI package's name must not inherit the public
+    /// package's advisories (or their shortened security windows): only a pin the lock proves
+    /// came from pypi.org carries an advisory identity.
+    #[tokio::test]
+    async fn advisory_identity_requires_the_canonical_pypi_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "Requests"
+            version = "2.34.2"
+            source = { registry = "https://pypi.org/simple/" }
+
+            [[package]]
+            name = "internal-utils"
+            version = "2.0.0"
+            source = { registry = "https://pypi.corp.example/simple" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let tool = UvTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest,
+            exclude_newer: None,
+        };
+
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        let identity = |name: &str| {
+            graph
+                .iter()
+                .find(|dep| dep.package.name == name)
+                .expect("dep")
+                .advisory_identity
+                .clone()
+        };
+        assert_eq!(
+            identity("Requests").as_deref(),
+            Some("requests"),
+            "canonical index (trailing slash tolerated), PEP 503-normalized identity"
+        );
+        assert_eq!(
+            identity("internal-utils"),
+            None,
+            "a private index proves nothing about the public namesake"
+        );
+
+        // The manifest's own `[tool.uv]` index keys veto even the lock-proven pins: the lock's
+        // URLs predate the manifest change, and the resolve a shortened window triggers honors
+        // the manifest.
+        std::fs::write(
+            &project.manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[tool.uv]\nindex-url = \"https://pypi.corp.example/simple\"\n",
+        )
+        .expect("write manifest");
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        assert!(
+            graph.iter().all(|dep| dep.advisory_identity.is_none()),
+            "a manifest index override withholds every identity"
+        );
+        std::fs::write(
+            &project.manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("restore manifest");
+
+        // A project `uv.toml` routing resolution through another index vetoes the same way.
+        std::fs::write(
+            root.join("uv.toml"),
+            "index-url = \"https://pypi.corp.example/simple\"\n",
+        )
+        .expect("write uv.toml");
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        assert!(
+            graph.iter().all(|dep| dep.advisory_identity.is_none()),
+            "ambient index routing withholds every identity"
+        );
+    }
+
+    /// uv discovers `uv.toml` in the nearest parent directory too, so an ancestor's index
+    /// routing governs a project that has none of its own — and must veto its identities.
+    #[tokio::test]
+    async fn an_ancestor_uv_toml_index_override_withholds_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            outer.join("uv.toml"),
+            "index-url = \"https://pypi.corp.example/simple\"\n",
+        )
+        .expect("write ancestor uv.toml");
+        let root = outer.join("proj");
+        std::fs::create_dir(&root).expect("mkdir");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("uv.lock"),
+            indoc! {r#"
+                version = 1
+                revision = 3
+
+                [[package]]
+                name = "requests"
+                version = "2.34.2"
+                source = { registry = "https://pypi.org/simple" }
+            "#},
+        )
+        .expect("write lock");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let tool = UvTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let project = Project {
+            root,
+            kind: UV_ID,
+            manifest,
+            exclude_newer: None,
+        };
+
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        assert!(
+            graph.iter().all(|dep| dep.advisory_identity.is_none()),
+            "the ancestor's routing governs this project"
+        );
+    }
+
+    /// uv's config discovery skips a `pyproject.toml` without a `[tool.uv]` table and keeps
+    /// searching upward — so with the project manifest silent, an ancestor manifest's
+    /// `[tool.uv]` index keys govern the future resolve, and the lock's PyPI URLs prove
+    /// nothing about it.
+    #[tokio::test]
+    async fn an_ancestor_pyproject_tool_uv_index_withholds_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        std::fs::write(
+            outer.join("pyproject.toml"),
+            "[tool.uv]\nindex-url = \"https://pypi.corp.example/simple\"\n",
+        )
+        .expect("write ancestor pyproject.toml");
+        let root = outer.join("proj");
+        std::fs::create_dir(&root).expect("mkdir");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("uv.lock"),
+            indoc! {r#"
+                version = 1
+                revision = 3
+
+                [[package]]
+                name = "requests"
+                version = "2.34.2"
+                source = { registry = "https://pypi.org/simple" }
+            "#},
+        )
+        .expect("write lock");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let tool = UvTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache_dir.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http"),
+        );
+        let project = Project {
+            root,
+            kind: UV_ID,
+            manifest,
+            exclude_newer: None,
+        };
+
+        let graph = tool
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        assert!(
+            graph.iter().all(|dep| dep.advisory_identity.is_none()),
+            "the ancestor manifest's [tool.uv] routing governs this project"
         );
     }
 

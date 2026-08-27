@@ -1,6 +1,7 @@
 //! `outdated` — what could update, split into "adoptable now" vs "in cooldown". Reasons over the
 //! candidate set; informational, so per-dep failures never change the exit code.
 
+use super::advisories::{ClassifiedAdvisories, ProjectAdvisories};
 use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
 use super::lock::ProjectAccessWriteGuard;
 use super::{
@@ -10,7 +11,7 @@ use super::{
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
     Change, DepScope, Dependency, Diagnostic, LockVerifyReport, PackageId, Release, ResolveKind,
-    ResolveQuery, UpdateKind, Version, evaluate, resolve,
+    ResolveQuery, UpdateKind, Version, evaluate_advised, resolve,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -153,45 +154,43 @@ impl<'a> OutdatedRunner<'a> {
                 return;
             }
         };
-        // Build-backend requirements (`[build-system].requires`, e.g. hatchling) the lockfile never
-        // records: merge them in so `outdated` surfaces a build-backend update the same way Dependabot
-        // does. They are direct, so they belong in both the direct and the transitive view. A failure
-        // to read them is a non-fatal warning — the resolved deps still report.
-        let mut manifest_only = HashSet::new();
-        match self
-            .ws
-            .manifest_constraints_in_scope(read.adapter, pctx, self.opts)
-            .await
-        {
-            Ok(constraints) => {
-                manifest_only.extend(constraints.iter().map(|dep| dep.package.clone()));
-                deps.extend(constraints);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    project = read.project_label,
-                    tool = pctx.tool.as_str(),
-                    error = %error,
-                    "could not read build-system requirements"
-                );
-                self.warnings.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    &read.project_label,
-                    None,
-                ));
-            }
-        }
+        let manifest_only = self
+            .merge_manifest_constraints(read.adapter, pctx, &read.project_label, &mut deps)
+            .await;
         drop(read_guard);
         drop(refresh_guard);
-        let fetched = self
-            .fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch)
-            .await;
+        // Identities must be adapter-confirmed before they are queried, matched, or counted
+        // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
+        if super::advisories::advisory_fetch_policy(pctx).is_some() {
+            read.adapter
+                .confirm_advisory_identities(&pctx.project, &mut deps)
+                .await;
+        }
+        let advisory_fetch = self.ws.fetch_project_advisories(
+            read.adapter,
+            pctx,
+            &read.project_label,
+            super::advisories::AdvisoryPackages::from_deps(&deps),
+            self.opts,
+        );
+        let release_fetch =
+            self.fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch);
+        let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
+        let advisories = advisory_fetch
+            .record(&mut self.warnings, &mut self.errors)
+            .map(std::sync::Arc::new);
 
         let ClassifiedProject {
             items: mut project_items,
             verification_candidates,
-        } = self.classify_fetched(pctx, &read.project_label, &read.resolve, fetched);
+        } = self.classify_fetched(
+            pctx,
+            &read.project_label,
+            read.adapter,
+            advisories.as_deref(),
+            &read.resolve,
+            fetched,
+        );
 
         // Reconcile the per-package "adoptable" verdicts with what the whole-graph upgrade resolve would
         // actually land. A matured candidate the resolve cannot place (a conflicting requirement wins) is
@@ -203,15 +202,56 @@ impl<'a> OutdatedRunner<'a> {
             &mut project_items,
             verification_candidates,
             manifest_only,
+            advisories,
         )
         .await;
         self.items.extend(project_items);
+    }
+
+    /// Merges the build-backend requirements (`[build-system].requires`, e.g. hatchling) the
+    /// lockfile never records into `deps`, so `outdated` surfaces a build-backend update the
+    /// same way Dependabot does.
+    ///
+    /// They are direct, so they belong in both the direct and the transitive view.
+    /// A failure to read them is a non-fatal warning — the resolved deps still report.
+    /// Returns the merged packages so downstream verification can batch them separately.
+    async fn merge_manifest_constraints(
+        &mut self,
+        adapter: &dyn cooldown_core::ToolRead,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+        deps: &mut Vec<Dependency>,
+    ) -> HashSet<PackageId> {
+        let mut manifest_only = HashSet::new();
+        match self
+            .ws
+            .manifest_constraints_in_scope(adapter, pctx, self.opts)
+            .await
+        {
+            Ok(constraints) => {
+                manifest_only.extend(constraints.iter().map(|dep| dep.package.clone()));
+                deps.extend(constraints);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project = project_label,
+                    tool = pctx.tool.as_str(),
+                    error = %error,
+                    "could not read build-system requirements"
+                );
+                self.warnings
+                    .push(diag_from_error(&error, pctx.tool, project_label, None));
+            }
+        }
+        manifest_only
     }
 
     fn classify_fetched(
         &mut self,
         pctx: &super::ProjectCtx,
         project_label: &str,
+        adapter: &dyn cooldown_core::ToolRead,
+        advisories: Option<&ProjectAdvisories>,
         rctx: &cooldown_core::ResolveContext<'_>,
         fetched: Vec<FetchedRelease<Vec<Release>>>,
     ) -> ClassifiedProject {
@@ -228,7 +268,17 @@ impl<'a> OutdatedRunner<'a> {
                         self.warnings
                             .push(yanked_warning(pctx, project_label, &dep));
                     }
-                    let item = self.outdated_item(pctx, project_label, &dep, &releases, rctx);
+                    let advised =
+                        advisories.and_then(|project| project.classify(adapter, &dep, &releases));
+                    let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+                    let item = self.outdated_item(
+                        pctx,
+                        project_label,
+                        &dep,
+                        &releases,
+                        advisory_ctx.as_ref(),
+                        rctx,
+                    );
                     if item.status == OutdatedStatus::Adoptable
                         && let Some(change) = adoptable_change(&dep, &releases, &item)
                     {
@@ -265,6 +315,7 @@ impl<'a> OutdatedRunner<'a> {
         items: &mut [OutdatedItem],
         candidates: Vec<VerificationCandidate>,
         manifest_only: HashSet<PackageId>,
+        advisories: Option<std::sync::Arc<ProjectAdvisories>>,
     ) {
         if candidates.is_empty() {
             return;
@@ -291,7 +342,7 @@ impl<'a> OutdatedRunner<'a> {
             .candidates(&changes, "adoptable updates against upgrade policy");
         let preview = self
             .ws
-            .preview_project_upgrade(pctx, self.opts, changes, manifest_only)
+            .preview_project_upgrade(pctx, self.opts, changes, manifest_only, advisories)
             .await;
         let mut verification_errors = preview.errors;
         verification_errors.extend(preview.items.iter().filter_map(|item| item.error.clone()));
@@ -450,9 +501,17 @@ impl<'a> OutdatedRunner<'a> {
         project_label: &str,
         dep: &Dependency,
         releases: &[Release],
+        advisory: Option<&cooldown_core::AdvisoryContext<'_>>,
         rctx: &cooldown_core::ResolveContext<'_>,
     ) -> OutdatedItem {
-        let verdict = evaluate(dep, releases, &pctx.policy.layers, rctx, self.ws.now());
+        let verdict = evaluate_advised(
+            dep,
+            releases,
+            advisory,
+            &pctx.policy.layers,
+            rctx,
+            self.ws.now(),
+        );
 
         // The candidate whose cooldown the report displays: the newest by default, or the soonest to
         // mature under `--countdown soonest`. Both the `window` and `candidate_age_days` below read
@@ -509,6 +568,28 @@ impl<'a> OutdatedRunner<'a> {
                 age_days: published.map(|p| age_days(p, self.ws.now())),
             }
         });
+        // The row's security note.
+        // A candidate the security window actually fast-tracked wins: only exact fix versions
+        // earn the window, so the newest one that did is the actionable "adoptable now BECAUSE
+        // it fixes GHSA-…" evidence, even when a newer candidate is merely annotated.
+        // With none applied, prefer the shown candidate's relevance (its window is the one the
+        // row renders), else the newest security-relevant candidate.
+        // The block carries the candidate's version so JSON stays self-describing when that
+        // candidate is not `shown`.
+        let with_version = |candidate: &'_ cooldown_core::Candidate| {
+            candidate
+                .security
+                .as_ref()
+                .map(|security| (security.clone(), candidate.version.clone()))
+        };
+        let applied =
+            verdict.candidates.iter().rev().find_map(|candidate| {
+                with_version(candidate).filter(|(security, _)| security.applied)
+            });
+        let security = applied
+            .or_else(|| shown.and_then(with_version))
+            .or_else(|| verdict.candidates.iter().rev().find_map(with_version))
+            .map(|(security, version)| super::security_info(&security, &version));
         OutdatedItem {
             name: dep.package.name.clone(),
             tool: pctx.tool.as_str().to_string(),
@@ -525,6 +606,7 @@ impl<'a> OutdatedRunner<'a> {
             blocked_by: None,
             held_by: verdict.held_reason.map(Into::into),
             latest,
+            security,
             error: None,
         }
     }
@@ -566,6 +648,7 @@ fn error_item(
             min_age_days: 0.0,
             source: "n/a".into(),
             clamped_by: None,
+            shortened_by: None,
         },
         candidate_age_days: None,
         cooldown_version: None,
@@ -574,6 +657,7 @@ fn error_item(
         blocked_by: None,
         held_by: None,
         latest: None,
+        security: None,
         error: Some(diag),
     }
 }
@@ -756,6 +840,7 @@ mod tests {
                 min_age_days: 14.0,
                 source: "default".into(),
                 clamped_by: None,
+                shortened_by: None,
             },
             candidate_age_days: Some(40.0),
             cooldown_version: None,
@@ -764,6 +849,7 @@ mod tests {
             blocked_by: None,
             held_by: None,
             latest: None,
+            security: None,
             error: None,
         }
     }
@@ -788,12 +874,14 @@ mod tests {
             }),
             error: None,
             edge: None,
+            security: None,
         }
     }
 
     fn dependency(item: &OutdatedItem) -> Dependency {
         Dependency {
             package: PackageId::new(UV, item.name.clone(), item.registry.clone()),
+            advisory_identity: Some(item.name.clone()),
             current: Version::new(item.current.clone()),
             current_quality: ReleaseQuality::Stable,
             direct: item.direct,

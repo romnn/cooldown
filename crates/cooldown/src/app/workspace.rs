@@ -151,6 +151,22 @@ pub enum TransitiveGate {
     Hide,
 }
 
+/// How an unusable enabled advisory feed affects a command's diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdvisoryFailureMode {
+    /// Keep the ordinary, stricter window and surface a warning.
+    #[default]
+    Warn,
+    /// Refuse to certify the run without usable advisory evidence.
+    Error,
+}
+
+impl AdvisoryFailureMode {
+    pub(crate) const fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
 /// Per-run invocation controls (the non-policy flags). Policy lives in each project's
 /// [`PolicyStack`].
 #[derive(Debug, Clone, Default)]
@@ -225,6 +241,11 @@ pub struct RunOpts {
     pub allow_stale_lock: bool,
     /// `--fail-on-unknown-age`: make `check` fail on deps with no publish time.
     pub fail_on_unknown_age: bool,
+    /// How an unusable enabled advisory feed is surfaced.
+    ///
+    /// Only `check` selects [`AdvisoryFailureMode::Error`]; other commands fail open because an
+    /// outage can only fail to shorten a window, never loosen a verdict.
+    pub advisory_failure: AdvisoryFailureMode,
     /// `--lock` (check/outdated): refresh the lock before reading it. No-op under `--dry-run`.
     pub lock: bool,
     /// `--strict` (upgrade/fix): fail if the mutation could not complete cleanly.
@@ -402,6 +423,10 @@ pub struct Workspace {
     /// Held as the [`ReleaseResolver`] port (not the concrete cache) so it is swappable and
     /// mockable. See [`release_cache`](super::release_cache).
     release_cache: Box<dyn ReleaseResolver>,
+    /// The advisory feed, when one is wired (see [`Workspace::with_advisory_source`]).
+    ///
+    /// `None` keeps the feature inert — tests and embedded callers need not care.
+    pub(crate) advisory_source: Option<Arc<dyn cooldown_core::AdvisorySource>>,
 }
 
 struct RegisteredAdapter {
@@ -547,7 +572,19 @@ impl Workspace {
             repo_layers,
             baseline,
             release_cache: Box::new(ReleaseCache::new()),
+            advisory_source: None,
         }
+    }
+
+    /// Wires an advisory feed into the run.
+    ///
+    /// Without one nothing is fetched, no row is flagged, and no window is shortened — but a
+    /// policy that *enabled* the feed still reports that no source implements it rather than
+    /// certifying silently, so the absence is inert only when the policy asked for nothing.
+    #[must_use]
+    pub fn with_advisory_source(mut self, source: Arc<dyn cooldown_core::AdvisorySource>) -> Self {
+        self.advisory_source = Some(source);
+        self
     }
 
     /// The single `now` snapshotted once for the whole run.
@@ -946,6 +983,32 @@ pub(crate) fn render_window(window: &ResolvedWindow, now: Timestamp) -> Window {
         min_age_days: round2(window.effective_min_age_days(now)),
         source: window.source(),
         clamped_by: window.clamped_by(now).map(cooldown_core::Origin::token),
+        shortened_by: window
+            .shortened_by
+            .as_ref()
+            .map(|advisory| advisory.as_str().to_string()),
+    }
+}
+
+/// Map a core [`SecurityRelevance`](cooldown_core::SecurityRelevance) to its JSON/TTY view.
+///
+/// `version` is the release the relevance describes — the locked pin on a `check` row, the
+/// security-relevant candidate on an `outdated` row — so the block is self-describing even when
+/// it belongs to a different candidate than the row's displayed cooldown.
+pub(crate) fn security_info(
+    security: &cooldown_core::SecurityRelevance,
+    version: &cooldown_core::Version,
+) -> super::SecurityInfo {
+    super::SecurityInfo {
+        version: version.to_string(),
+        fixes: security
+            .fixes
+            .iter()
+            .map(|advisory| advisory.as_str().to_string())
+            .collect(),
+        severity: security.severity,
+        source: security.source,
+        applied: security.applied,
     }
 }
 
@@ -1319,6 +1382,7 @@ mod tests {
     fn dep(name: &str, member_name: &str, member_path: &str) -> Dependency {
         Dependency {
             package: PackageId::new(PNPM, name.to_string(), Some("registry.example".to_string())),
+            advisory_identity: Some(name.to_string()),
             current: Version::new("1.0.0"),
             current_quality: ReleaseQuality::Stable,
             direct: true,
@@ -1472,6 +1536,7 @@ mod tests {
             id: CARGO,
             deps: vec![Dependency {
                 package: PackageId::new(CARGO, "shared-dep".to_string(), None),
+                advisory_identity: Some("shared-dep".to_string()),
                 current: Version::new("1.0.0"),
                 current_quality: ReleaseQuality::Stable,
                 direct: true,

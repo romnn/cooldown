@@ -47,7 +47,7 @@ pub(super) fn adapter_set(
     fresh: bool,
     concurrency: usize,
     revalidate_npm_listings: bool,
-) -> Result<AdapterSet, CoreError> {
+) -> Result<(AdapterSet, SharedHttp), CoreError> {
     let http = SharedHttp::new(
         discovery::cache_dir().into_std_path_buf(),
         HttpOptions {
@@ -90,7 +90,9 @@ pub(super) fn adapter_set(
     adapters.register_target_verified_mutator(Arc::new(CondaTool::from_http(http.clone())))?;
     adapters.register_target_verified_mutator(Arc::new(PixiTool::from_http(http.clone())))?;
     adapters.register_target_verified_mutator(Arc::new(SwiftTool::from_http(http.clone())))?;
-    Ok(adapters)
+    // Returned beside the adapters so the advisory feed (OSV) can share the same client — one
+    // cache, one per-host budget, the same offline/fresh modes.
+    Ok((adapters, http))
 }
 
 pub(super) fn detect_projects(

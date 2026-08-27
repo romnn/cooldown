@@ -220,6 +220,7 @@ fn rel(version: &str, order: u8) -> Release {
 fn dep(name: &str, version: &str) -> Dependency {
     Dependency {
         package: PackageId::new(ToolId("mock"), name, None),
+        advisory_identity: Some(name.to_string()),
         current: Version::new(version),
         current_quality: ReleaseQuality::Stable,
         direct: true,
@@ -616,6 +617,7 @@ fn applied_item(name: &str, from: &str, to: &str, downgrade: bool) -> UpgradeIte
         skipped: None,
         error: None,
         edge: None,
+        security: None,
     }
 }
 
@@ -881,6 +883,42 @@ fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
     assert!(
         !items[0].downgrade,
         "the net move (1.0.44 → 1.0.45) is forward"
+    );
+}
+
+/// The security block describes the row's *target*, so the collapsed row must carry the final
+/// leg's — the first leg's names a version the row no longer reports.
+#[test]
+fn collapse_carries_the_final_legs_security_block() {
+    let security = |id: &str, version: &str| {
+        Some(crate::app::SecurityInfo {
+            version: version.to_string(),
+            fixes: vec![id.to_string()],
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
+            applied: true,
+        })
+    };
+    let mut items = vec![
+        applied_item("quote", "1.0.44", "1.0.46", false),
+        applied_item("quote", "1.0.46", "1.0.45", true),
+    ];
+    items[0].security = security("GHSA-first", "1.0.46");
+    items[1].security = security("GHSA-net", "1.0.45");
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].to, "1.0.45");
+    assert_eq!(
+        items[0].security.as_ref().map(|security| &security.version),
+        Some(&"1.0.45".to_string()),
+        "the block must describe the net target"
     );
 }
 

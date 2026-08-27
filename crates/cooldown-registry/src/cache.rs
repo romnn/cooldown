@@ -29,6 +29,14 @@ pub struct CacheEntry {
     pub status: u16,
     /// The response body as text.
     pub body: String,
+    /// For a cached `POST` response, the verbatim request body that produced it.
+    ///
+    /// The reader validates it against the outgoing body, so the response is never reused for a
+    /// different request — the digest folded into the cache key is only a filename
+    /// discriminator, and a 64-bit collision cannot alias two queries.
+    /// `None` for `GET` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
 }
 
 impl CacheEntry {
@@ -255,6 +263,7 @@ mod tests {
             etag: Some("\"abc\"".into()),
             status: 200,
             body: "hello".into(),
+            request_body: None,
         };
         write_entry(dir.path(), &e).unwrap();
         let got = read_entry(dir.path(), "https://example.com/x").unwrap();
@@ -274,6 +283,7 @@ mod tests {
             etag: None,
             status: 200,
             body: "poison".into(),
+            request_body: None,
         };
         std::fs::write(&path, serde_json::to_vec(&e).unwrap()).unwrap();
 

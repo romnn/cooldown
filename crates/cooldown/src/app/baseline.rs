@@ -161,22 +161,25 @@ impl Baseline {
 
 impl crate::app::Workspace {
     /// The currently-young pins across the resolved graph, as baseline entries (the set
-    /// `cooldown baseline` records as acknowledged).
+    /// `cooldown baseline` records as acknowledged), plus the advisory diagnostics gathered on
+    /// the way.
+    ///
+    /// The diagnostics are returned rather than dropped: a failed feed means the pins were
+    /// evaluated against their ordinary windows, so an acknowledgement may be persisted for a
+    /// security fix the advised gate would have passed — the caller must say so.
     ///
     /// Per-dependency registry/release failures are skipped silently; only a project-level
     /// dependency-enumeration failure aborts.
     ///
     /// # Errors
     ///
-    /// Returns the [`CoreError`] from an tool adapter if a project's dependency graph cannot
-    /// be enumerated.
-    pub async fn baseline_entries(
-        &self,
-        opts: &super::RunOpts,
-    ) -> Result<Vec<AckEntry>, CoreError> {
-        use cooldown_core::{DepScope, Status, check_pin};
+    /// Returns the [`CoreError`] from a tool adapter if a project's dependency graph cannot be
+    /// enumerated.
+    pub async fn baseline_entries(&self, opts: &super::RunOpts) -> Result<BaselineScan, CoreError> {
+        use cooldown_core::{DepScope, Status, check_pin_advised};
 
         let mut entries = Vec::new();
+        let mut diagnostics = Vec::new();
         for pctx in self.scoped_projects(opts) {
             let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
             opts.progress.phase("resolving dependency graph");
@@ -184,17 +187,37 @@ impl crate::app::Workspace {
                 continue;
             };
             let read_guard = self.project_read_guard(pctx).await?;
-            let deps = self
+            let mut deps = self
                 .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
                 .await?;
             drop(read_guard);
+            // Identities must be adapter-confirmed before they are queried, matched, or
+            // counted (see `ToolRead::confirm_advisory_identities`) — only when the feed runs.
+            if super::advisories::advisory_fetch_policy(pctx).is_some() {
+                adapter
+                    .confirm_advisory_identities(&pctx.project, &mut deps)
+                    .await;
+            }
             let fctx = Self::fetch_context(pctx, opts);
             let rctx = Self::resolve_ctx(pctx, opts);
+            // Advised like `check`: a pin the advised gate passes (a security fix under its
+            // shortened window) must not be baselined — the baseline would outlive the
+            // shortened hold for no reason.
+            // A feed failure therefore changes what gets written, so its diagnostics travel
+            // back to the caller instead of being dropped.
             // Route through the cache-backed fetch — the only locked-release path — so a package
             // shared with other commands/projects this run is not re-fetched.
-            let fetched = self
-                .fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout())
-                .await;
+            let advisory_fetch = self.fetch_project_advisories(
+                adapter,
+                pctx,
+                pctx.rel_path.as_str(),
+                super::advisories::AdvisoryPackages::from_deps(&deps),
+                opts,
+            );
+            let release_fetch =
+                self.fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout());
+            let (outcome, fetched) = tokio::join!(advisory_fetch, release_fetch);
+            let advisories = outcome.record_flat(&mut diagnostics);
 
             for FetchedRelease {
                 dependency: dep,
@@ -202,7 +225,20 @@ impl crate::app::Workspace {
             } in fetched
             {
                 let Ok(locked) = result else { continue };
-                let pv = check_pin(&dep, &locked, &pctx.policy.layers, &rctx, self.now());
+                let advised = advisories.as_ref().and_then(|project| {
+                    project.classify(adapter, &dep, std::slice::from_ref(&locked))
+                });
+                let advisory_ctx = advised
+                    .as_ref()
+                    .map(super::advisories::ClassifiedAdvisories::context);
+                let pv = check_pin_advised(
+                    &dep,
+                    &locked,
+                    advisory_ctx.as_ref(),
+                    &pctx.policy.layers,
+                    &rctx,
+                    self.now(),
+                );
                 if pv.status == Status::CurrentInCooldown {
                     entries.push(AckEntry {
                         tool: pctx.tool.as_str().to_string(),
@@ -228,8 +264,24 @@ impl crate::app::Workspace {
                 .then_with(|| a.package.cmp(&b.package))
                 .then_with(|| a.version.cmp(&b.version))
         });
-        Ok(entries)
+        Ok(BaselineScan {
+            entries,
+            diagnostics,
+        })
     }
+}
+
+/// The result of scanning for young pins: the entries to acknowledge plus the advisory
+/// diagnostics gathered while evaluating them.
+///
+/// An advisory failure is reported as a warning rather than swallowed: the pins were then
+/// evaluated against their ordinary windows, so the written baseline can acknowledge a pin the
+/// advised `check` gate would have passed on its own.
+pub struct BaselineScan {
+    /// The young pins, sorted for a stable file.
+    pub entries: Vec<AckEntry>,
+    /// Advisory-feed diagnostics gathered during the scan (surfaced as warnings).
+    pub diagnostics: Vec<cooldown_core::Diagnostic>,
 }
 
 #[cfg(test)]

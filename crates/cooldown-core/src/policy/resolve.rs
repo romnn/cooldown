@@ -141,6 +141,7 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         Some(floor) => (Some(floor.duration), Some(floor.origin.clone())),
         None => (None, None),
     };
+    let advisory_floor = resolve_advisory_floor(layers, &allow.residual_floors, &mut trace);
     // Provenance: when an allow applied, point at the highest-layer matching allow; else the pick.
     let (decided_by, decided_selector, exempt_origin) = match allow.provenance {
         Some((origin, selector)) => (origin.clone(), selector, Some(origin)),
@@ -155,9 +156,79 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         floor_origin,
         exempt,
         exempt_origin,
+        // Only the advisory shorten mode ever sets this, downstream of ordinary resolution.
+        shortened_by: None,
+        advisory_floor: advisory_floor.as_ref().map(|floor| floor.duration),
+        advisory_floor_origin: advisory_floor.map(|floor| floor.origin),
     };
 
     Resolution { window, trace }
+}
+
+/// The floor that would still clamp the advisory *security* window: `bypass-floor` is resolved
+/// against every residual floor candidate **by exact layer** — the same per-candidate mechanism
+/// `allow` uses — so a repo bypass co-declared with a repo floor still cannot escape a separate
+/// org (global) floor, and one repo-cascade file cannot lift another cascade file's floor.
+///
+/// `advisories.bypass-floor` is traced *here* rather than during
+/// [`resolve_advisory_policy`](crate::resolve_advisory_policy), because only this pass knows
+/// what a declaration actually did: a bypass that lifts no floor of its own layer changed
+/// nothing, however the rest of the stack resolved.
+fn resolve_advisory_floor(
+    layers: &[PolicyLayer],
+    residual_floors: &[FloorCandidate],
+    trace: &mut Vec<TraceStep>,
+) -> Option<FloorCandidate> {
+    let bypass_declared = |layer_index: usize| -> bool {
+        layers.get(layer_index).is_some_and(|layer| {
+            layer
+                .advisories
+                .as_ref()
+                .is_some_and(|advisories| advisories.bypass_floor == Some(true))
+        })
+    };
+    // One step per floor candidate the declaration lifts, not one per layer: a layer can declare
+    // several matching floors (a bare `floor` beside a `[package."x"] floor`), and a single step
+    // could name only one of their durations.
+    for (layer_index, layer) in layers.iter().enumerate() {
+        if !bypass_declared(layer_index) {
+            continue;
+        }
+        let mut lifted = residual_floors
+            .iter()
+            .filter(|floor| floor.layer_index == layer_index)
+            .peekable();
+        if lifted.peek().is_none() {
+            trace.push(TraceStep {
+                layer: layer.origin.clone(),
+                field: "advisories.bypass-floor".into(),
+                selector: None,
+                min_age_days: None,
+                applied: false,
+                // Not necessarily "declares no floor": an `allow` in this layer may already have
+                // removed the one it declared, leaving this nothing to lift either way.
+                note: "bypass-floor = true considered; no residual floor of this layer remains \
+                       for it to lift"
+                    .into(),
+            });
+            continue;
+        }
+        for floor in lifted {
+            trace.push(TraceStep {
+                layer: layer.origin.clone(),
+                field: "advisories.bypass-floor".into(),
+                selector: Some(floor.selector.clone()),
+                min_age_days: Some(duration_as_days(floor.duration)),
+                applied: true,
+                note: "bypass-floor = true lifts this floor for the security window only".into(),
+            });
+        }
+    }
+    residual_floors
+        .iter()
+        .filter(|floor| !bypass_declared(floor.layer_index))
+        .max_by(|a, b| (a.duration, a.layer_index).cmp(&(b.duration, b.layer_index)))
+        .cloned()
 }
 
 /// The `package` selector globs the policy marks fully exempt from the cooldown — a `latest = true`
@@ -367,6 +438,8 @@ struct FloorCandidate {
     duration: SignedDuration,
     /// The declaring layer's origin, for attribution.
     origin: Origin,
+    /// The rule's selector, so a trace step can name *which* of a layer's floors it means.
+    selector: Selector,
 }
 
 /// Collects every matching `floor` rule, tracing each as a floor candidate.
@@ -394,6 +467,7 @@ fn collect_floor_candidates(
                     layer_index,
                     duration: floor,
                     origin: layer.origin.clone(),
+                    selector: rule.selector.clone(),
                 });
             }
         }
@@ -406,6 +480,12 @@ fn collect_floor_candidates(
 struct AllowOutcome {
     matched: bool,
     effective_floor: Option<FloorCandidate>,
+    /// Every floor the matched allows could *not* bypass
+    /// ([`effective_floor`](Self::effective_floor) is their maximum).
+    ///
+    /// The advisory `bypass-floor` interaction resolves against this full list, again per
+    /// candidate, so lifting one layer's floor never erases another layer's.
+    residual_floors: Vec<FloorCandidate>,
     provenance: Option<(Origin, Selector)>,
 }
 
@@ -445,9 +525,13 @@ fn resolve_allows(
     let bypassed = |floor_layer_index: usize| -> bool {
         allow_matched && (has_env_cli_allow || allow_layers.contains(&floor_layer_index))
     };
-    let effective_floor = floors
+    let residual_floors: Vec<FloorCandidate> = floors
         .iter()
         .filter(|floor| !bypassed(floor.layer_index))
+        .cloned()
+        .collect();
+    let effective_floor = residual_floors
+        .iter()
         .max_by(|a, b| (a.duration, a.layer_index).cmp(&(b.duration, b.layer_index)))
         .cloned();
 
@@ -489,6 +573,7 @@ fn resolve_allows(
     AllowOutcome {
         matched: allow_matched,
         effective_floor,
+        residual_floors,
         provenance,
     }
 }

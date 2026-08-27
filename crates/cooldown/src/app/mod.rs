@@ -6,6 +6,7 @@
 //! are common, but the native layer and the repo cascade (root → this project's dir) are scoped to
 //! each project, so sibling projects never leak policy into one another.
 
+mod advisories;
 pub mod baseline;
 mod change_key;
 mod check;
@@ -26,18 +27,20 @@ mod workspace;
 pub use baseline::Baseline;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use cooldown_render::{
-    BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigSummary,
-    EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem, OutdatedStatus,
-    OutdatedSummary, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary,
-    Window,
+    AdvisoryConfigInfo, BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem,
+    ConfigSummary, EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem,
+    OutdatedStatus, OutdatedSummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem,
+    UpgradeMeta, UpgradeSummary, Window,
 };
 pub use progress::Progress;
 pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
-pub use workspace::{AdapterSet, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace};
+pub use workspace::{
+    AdapterSet, AdvisoryFailureMode, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace,
+};
 
 pub(crate) use recover::{RecoveryTarget, recover_targets};
 pub(crate) use workspace::{
     FetchedRelease, LockReportAction, age_days, diag_from_error, lock_report_outcome,
-    recovery_diagnostics, render_window, round2,
+    recovery_diagnostics, render_window, round2, security_info,
 };

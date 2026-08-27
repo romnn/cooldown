@@ -80,6 +80,13 @@ pub struct HttpResponse {
     pub body: String,
     /// `true` if served from cache (a fresh hit, a 304 revalidation, or a stale fallback).
     pub from_cache: bool,
+    /// `true` if the served cached copy was past its TTL — an offline hit on an aged entry, or
+    /// the stale fallback after a network failure.
+    ///
+    /// Consumers whose data may only *loosen* a decision while fresh (the advisory feed) key
+    /// off this; registry consumers can ignore it (their hardening is the monotonic
+    /// publish-time floor instead).
+    pub stale: bool,
 }
 
 impl HttpResponse {
@@ -237,37 +244,78 @@ impl SharedHttp {
     /// network failure has no stale cache to fall back on, or if the host keeps rate-limiting past
     /// the retry budget.
     pub async fn get(&self, url: &str, ttl: Duration) -> Result<HttpResponse, CoreError> {
-        let cached = read_entry(&self.inner.cache_dir, url);
+        self.request(url, url, ttl, RequestKind::Get).await
+    }
 
-        // Offline: serve cache or fail (never a false success).
+    /// Performs a `POST` of a JSON `body` to `url`, cached like [`get`](Self::get) under a key
+    /// derived from the URL *and* the request body.
+    ///
+    /// The cached entry stores the verbatim request body and is served only when it matches the
+    /// outgoing one, so two different queries to one endpoint never alias — not even on a
+    /// digest collision (querybatch responses match requests by index, so an aliased response
+    /// would misattribute advisories across packages).
+    /// Same offline/fresh semantics, per-host cap and pacing, 429/5xx backoff, and stale-cache
+    /// fallback; no `ETag` revalidation (conditional requests are a `GET` concept).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::OfflineMiss`] for an offline cache miss; [`CoreError::Transient`]
+    /// if a network failure has no cached copy to fall back on, or if the host keeps
+    /// rate-limiting past the retry budget.
+    pub async fn post_json(
+        &self,
+        url: &str,
+        body: &str,
+        ttl: Duration,
+    ) -> Result<HttpResponse, CoreError> {
+        let cache_key = format!(
+            "{url}#{:016x}",
+            cooldown_core::fs::fnv1a_64(&format!("{url}\n{body}"))
+        );
+        self.request(url, &cache_key, ttl, RequestKind::PostJson { body })
+            .await
+    }
+
+    async fn request(
+        &self,
+        url: &str,
+        cache_key: &str,
+        ttl: Duration,
+        request: RequestKind<'_>,
+    ) -> Result<HttpResponse, CoreError> {
+        let cached = read_entry(&self.inner.cache_dir, cache_key).filter(|entry| {
+            request
+                .body()
+                .is_none_or(|body| entry.request_body.as_deref() == Some(body))
+        });
+
         if self.inner.opts.offline {
             return match cached {
-                Some(e) if e.status < 400 => Ok(HttpResponse {
-                    status: e.status,
-                    body: e.body,
-                    from_cache: true,
-                }),
+                Some(entry) if entry.status < 400 => {
+                    let stale = !cache_is_fresh(&entry, ttl);
+                    Ok(cached_response(entry, stale))
+                }
                 _ => Err(CoreError::OfflineMiss(url.to_string())),
             };
         }
 
-        // Fresh cache hit (and not forced fresh): serve it.
         if !self.inner.opts.fresh
-            && let Some(e) = &cached
-            && e.status < 400
-            && cache_is_fresh(e, ttl)
+            && let Some(entry) = &cached
+            && entry.status < 400
+            && cache_is_fresh(entry, ttl)
         {
-            tracing::trace!(url, status = e.status, "cache hit");
-            return Ok(HttpResponse {
-                status: e.status,
-                body: e.body.clone(),
-                from_cache: true,
-            });
+            tracing::trace!(
+                url,
+                method = request.method(),
+                status = entry.status,
+                "cache hit"
+            );
+            return Ok(cached_response(entry.clone(), false));
         }
 
         let host = reqwest::Url::parse(url)
             .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
             .unwrap_or_else(|| "unknown".to_string());
         // Pace a strict host before taking a concurrency permit, so the wait never occupies an
         // in-flight slot. Hosts with no configured interval skip this entirely.
@@ -281,42 +329,43 @@ impl SharedHttp {
         let _permit = sem
             .acquire()
             .await
-            .map_err(|e| CoreError::transient(e.to_string()))?;
+            .map_err(|error| CoreError::transient(error.to_string()))?;
 
-        let etag = cached.as_ref().and_then(|e| e.etag.clone());
         let mut attempt = 0;
         loop {
             attempt += 1;
-            tracing::debug!(url, host, attempt, "http request");
-            match self.fetch_once(url, etag.as_deref(), cached.as_ref()).await {
-                Ok(resp) => {
-                    tracing::trace!(url, status = resp.status, "http response");
-                    return Ok(resp);
+            tracing::debug!(
+                url,
+                host,
+                method = request.method(),
+                attempt,
+                "http request"
+            );
+            match self
+                .fetch_once(url, cache_key, cached.as_ref(), request)
+                .await
+            {
+                Ok(response) => {
+                    tracing::trace!(url, status = response.status, "http response");
+                    return Ok(response);
                 }
                 Err(FetchError::Backoff(delay)) if attempt <= self.inner.opts.max_retries => {
                     tokio::time::sleep(delay).await;
                 }
-                // One bounded retry for a transport failure (connection reset, DNS blip): these
-                // index GETs are idempotent, and a lone flicker otherwise fails a whole gate run
-                // with a transient-error row. The fail-closed path below still holds when the
-                // retry also fails.
-                Err(FetchError::Transient(e)) if attempt == 1 => {
-                    tracing::debug!(url, host, error = %e, "transient transport failure; retrying once");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Both registry GETs and advisory query POSTs are safe to retry because the latter
+                // is a read-only query despite its transport verb.
+                Err(FetchError::Transient(error)) if attempt == 1 => {
+                    tracing::debug!(url, host, error = %error, "transient transport failure; retrying once");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                Err(FetchError::Transient(e)) => {
-                    // Fall back to a stale cached copy if we have one; else propagate.
+                Err(FetchError::Transient(error)) => {
                     if !self.inner.opts.fresh
-                        && let Some(c) = &cached
-                        && c.status < 400
+                        && let Some(entry) = &cached
+                        && entry.status < 400
                     {
-                        return Ok(HttpResponse {
-                            status: c.status,
-                            body: c.body.clone(),
-                            from_cache: true,
-                        });
+                        return Ok(cached_response(entry.clone(), true));
                     }
-                    return Err(CoreError::transient(e));
+                    return Err(CoreError::transient(error));
                 }
                 Err(FetchError::Fatal(error)) => return Err(error),
                 Err(FetchError::Backoff(_)) => {
@@ -335,55 +384,68 @@ impl SharedHttp {
     async fn fetch_once(
         &self,
         url: &str,
-        etag: Option<&str>,
+        cache_key: &str,
         cached: Option<&CacheEntry>,
+        request: RequestKind<'_>,
     ) -> Result<HttpResponse, FetchError> {
-        let mut req = self.inner.client.get(url);
-        if let Some(tag) = etag {
-            req = req.header(reqwest::header::IF_NONE_MATCH, tag);
+        let mut outgoing = match request {
+            RequestKind::Get => self.inner.client.get(url),
+            RequestKind::PostJson { body } => self
+                .inner
+                .client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string()),
+        };
+        if request.uses_etag()
+            && let Some(etag) = cached.and_then(|entry| entry.etag.as_deref())
+        {
+            outgoing = outgoing.header(reqwest::header::IF_NONE_MATCH, etag);
         }
-        let resp = req
+        let response = outgoing
             .send()
             .await
-            .map_err(|e| FetchError::Transient(e.to_string()))?;
-        let status = resp.status().as_u16();
+            .map_err(|error| FetchError::Transient(error.to_string()))?;
+        let status = response.status().as_u16();
 
-        if status == 304
-            && let Some(c) = cached
+        if request.uses_etag()
+            && status == 304
+            && let Some(entry) = cached
         {
-            let mut refreshed = c.clone();
+            let mut refreshed = entry.clone();
             refreshed.fetched_at = Timestamp::now().to_string();
             let _ = write_entry(&self.inner.cache_dir, &refreshed);
-            return Ok(HttpResponse {
-                status: c.status,
-                body: c.body.clone(),
-                from_cache: true,
-            });
+            return Ok(cached_response(refreshed, false));
         }
 
         if status == 429 || (500..600).contains(&status) {
             let delay = retry_after_delay(
-                resp.headers()
+                response
+                    .headers()
                     .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|h| h.to_str().ok()),
+                    .and_then(|header| header.to_str().ok()),
             );
             return Err(FetchError::Backoff(delay));
         }
 
-        let new_etag = resp
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_string);
-        let body = read_limited_body(resp, url).await?;
-
+        let etag = if request.uses_etag() {
+            response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|header| header.to_str().ok())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let body = read_limited_body(response, url).await?;
         if (200..300).contains(&status) {
             let entry = CacheEntry {
-                url: url.to_string(),
+                url: cache_key.to_string(),
                 fetched_at: Timestamp::now().to_string(),
-                etag: new_etag,
+                etag,
                 status,
                 body: body.clone(),
+                request_body: request.body().map(str::to_string),
             };
             let _ = write_entry(&self.inner.cache_dir, &entry);
         }
@@ -392,7 +454,43 @@ impl SharedHttp {
             status,
             body,
             from_cache: false,
+            stale: false,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind<'a> {
+    Get,
+    PostJson { body: &'a str },
+}
+
+impl<'a> RequestKind<'a> {
+    const fn body(self) -> Option<&'a str> {
+        match self {
+            Self::Get => None,
+            Self::PostJson { body } => Some(body),
+        }
+    }
+
+    const fn method(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::PostJson { .. } => "POST",
+        }
+    }
+
+    const fn uses_etag(self) -> bool {
+        matches!(self, Self::Get)
+    }
+}
+
+fn cached_response(entry: CacheEntry, stale: bool) -> HttpResponse {
+    HttpResponse {
+        status: entry.status,
+        body: entry.body,
+        from_cache: true,
+        stale,
     }
 }
 
@@ -456,6 +554,7 @@ mod tests {
             etag: None,
             status: 200,
             body: "cached".into(),
+            request_body: None,
         }
     }
 
@@ -547,6 +646,43 @@ mod tests {
         // The built-in default paces GitHub (strict budget) but leaves CDN-backed registries free.
         assert!(http.pacer_for("api.github.com").is_some());
         assert!(http.pacer_for("index.crates.io").is_none());
+    }
+
+    /// The POST cache never serves a response for a *different* request body, even when the
+    /// digest in the cache key collides — the stored verbatim body is the identity check, so a
+    /// forged or colliding entry is a miss, not a hit.
+    #[tokio::test]
+    async fn post_cache_validates_the_request_body_not_just_the_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "http://127.0.0.1:1/v1/querybatch";
+        let body = r#"{"queries":[{"package":{"name":"a"}}]}"#;
+        let cache_key = format!(
+            "{url}#{:016x}",
+            cooldown_core::fs::fnv1a_64(&format!("{url}\n{body}"))
+        );
+        // An entry filed under this request's key but recording a different request body — the
+        // shape a 64-bit digest collision (or a tampered file) would produce.
+        let mut entry = cache_entry(&cache_key);
+        entry.request_body = Some("something else".to_string());
+        write_entry(dir.path(), &entry).expect("cache entry");
+        let offline = HttpOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let http = SharedHttp::new(dir.path(), offline.clone()).expect("shared http");
+        let miss = http.post_json(url, body, Duration::from_hours(1)).await;
+        std::assert_matches!(miss, Err(CoreError::OfflineMiss(_)));
+
+        // The genuine entry (matching request body) is served.
+        entry.request_body = Some(body.to_string());
+        write_entry(dir.path(), &entry).expect("cache entry");
+        let http = SharedHttp::new(dir.path(), offline).expect("shared http");
+        let hit = http
+            .post_json(url, body, Duration::from_hours(1))
+            .await
+            .expect("cache hit");
+        assert!(hit.from_cache);
+        assert_eq!(hit.body, "cached");
     }
 
     #[test]

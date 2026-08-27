@@ -5,6 +5,7 @@
 //! Concrete package-manager commands, network clients, clocks, and ecosystem-specific version
 //! parsing remain outside the core.
 
+pub mod advisory;
 pub mod config;
 pub mod duration;
 pub mod error;
@@ -16,10 +17,17 @@ pub mod policy;
 pub mod ports;
 pub mod redact;
 
+pub use advisory::{
+    Advisory, AdvisoryContext, AdvisoryFetch, AdvisoryId, AdvisoryMode, AdvisoryPolicy,
+    AdvisorySeverity, AdvisorySource, AdvisorySourceId, AdvisorySourceKind, AffectedRange,
+    PackageAdvisories, RawAdvisory, RawAffectedRange, RawRangeEvent, ResolvedAdvisoryPolicy,
+    SecurityRelevance, apply_security_window, classify_advisory, resolve_advisory_policy,
+};
 pub use error::{CoreError, Diagnostic, DiagnosticKind, Result, ToolTermination, failure_detail};
 pub use evaluate::{
-    CeilingHold, CeilingReason, FixVerdict, ResolveContext, check_pin, evaluate,
-    evaluate_ceiling_hold, evaluate_fix,
+    CeilingHold, CeilingReason, FixVerdict, ResolveContext, advisories_reintroduced_by, check_pin,
+    check_pin_advised, evaluate, evaluate_advised, evaluate_ceiling_hold,
+    evaluate_ceiling_hold_advised, evaluate_fix, evaluate_fix_advised,
 };
 pub use model::*;
 pub use mutation::{

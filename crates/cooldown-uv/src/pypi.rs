@@ -16,6 +16,18 @@ const DEFAULT_BASE: &str = "https://pypi.org";
 /// The registry name used to tag PyPI-sourced [`PackageId`]s.
 pub const PYPI: &str = "pypi";
 
+/// Whether `index_url` is the canonical PyPI index — the registry behind OSV's `PyPI` ecosystem.
+///
+/// A package resolved from any other index (a private registry, a devpi proxy, even a plain
+/// PyPI mirror) merely *shares a name* with the pypi.org package an OSV document describes, and
+/// a mirror is indistinguishable from a shadowing private index. Advisory data may only loosen
+/// policy, so unproven origin gets no advisory identity at all.
+pub(crate) fn is_pypi_index(index_url: &str) -> bool {
+    let url = index_url.trim_end_matches('/');
+    url.eq_ignore_ascii_case("https://pypi.org/simple")
+        || url.eq_ignore_ascii_case("https://pypi.python.org/simple")
+}
+
 /// A client for the [PyPI JSON API], implementing [`PackageRegistry`].
 ///
 /// It fetches the full version list and, per release, the newest per-file upload

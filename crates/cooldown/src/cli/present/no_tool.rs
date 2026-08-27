@@ -80,6 +80,7 @@ fn no_tool_check(generated_at: String, error: Diagnostic) -> Result<String, Core
                 unknown_age: 0,
                 errors: 0,
                 violations: 0,
+                security_relevant: 0,
                 skipped_stale_projects: 0,
             },
             Vec::<render::CheckItem>::new(),
@@ -100,6 +101,7 @@ fn no_tool_mutation(
             generated_at,
             render::UpgradeMeta {
                 applied: false,
+                dry_run: false,
                 lock_status: None,
                 build: render::BuildInfo {
                     requested: false,

@@ -5,7 +5,7 @@ weight: 2
 
 # `upgrade`
 
-`upgrade` moves dependencies **forward** to the newest version that has already matured past its cooldown, then re-locks. It never adopts a too-fresh version — only versions that have cleared the window are proposed.
+`upgrade` moves dependencies **forward** to the newest version that has already matured past its cooldown, then re-locks. It never adopts a too-fresh version — only versions that have cleared the window are proposed. With the [advisory feed]({{< relref "../configuration/advisories.md" >}})'s `shorten` mode enabled, a candidate that fixes a qualifying advisory clears the shorter security window instead, so a security fix is adopted earlier than a routine bump.
 
 ```bash
 cooldown upgrade
@@ -16,6 +16,8 @@ Preview the plan without touching anything with `--dry-run`:
 {{< terminal name="upgrade" >}}
 
 The **From → To** columns show the move; a row can be a `downgraded` as well as an `upgraded` when a re-lock would otherwise pull a too-fresh transitive in and it has to be reconciled back down (see [Transitive dependencies](#transitive-dependencies)).
+
+A row that moved for security reasons says so in **Reason** — `⚠ fixes GHSA-… (high); adopted on the security window` — and carries the same `security` object in `--json`, so a fast-tracked adoption is never indistinguishable from a routine bump. A row the security window made eligible but that did not land (a skip, an error) says `eligible on the security window` instead, and a `--dry-run` row that would land says `would adopt on the security window`: the block describes the window, not the outcome.
 
 ## Lock versus manifest
 
@@ -170,4 +172,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
-`upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with `--json` to feed the plan into other tooling.
+`upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with
+`--json` to feed the plan into other tooling. The JSON envelope sets its top-level `dryRun` field
+to `true` for a preview and `false` for a real mutation, independently of whether every proposed
+item ultimately lands.

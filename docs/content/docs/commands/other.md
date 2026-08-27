@@ -47,6 +47,8 @@ cooldown config
 
 Where `explain` answers "why this one package," `config` answers "what is the effective policy here, and which layers produced it." It is the first thing to run when a repo's behavior surprises you.
 
+Each project also reports its resolved [`[advisories]`]({{< relref "../configuration/advisories.md" >}}) policy and the advisory-database ecosystem covering its tool — the place to look when an enabled feed annotates nothing. Mixed-registry tools such as conda, pixi, and Deno currently have no single project-wide ecosystem mapping, even though individual PyPI or npm packages in their locks may be covered by OSV.
+
 ## `init`
 
 Scaffold a documented starter `cooldown.toml`:

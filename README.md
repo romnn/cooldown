@@ -161,6 +161,36 @@ floor = "3d"                    # a hard minimum no nearer config can weaken
 `latest = true` is sugar for `min-age = "0d"`; `freeze = "2026-06-01"` pins an absolute cutoff.
 Durations accept `"7d"`, `"2 weeks"`, ISO-8601 `"P7D"`.
 
+### The advisory feed (security-relevant signal)
+
+Age alone cannot tell a routine bump from a patch for a known CVE: a candidate that fixes a
+published advisory waits out its window as a silent hold, and the pin a security bot's PR just gave
+you fails the very next `check` for being two days old. Opt into the [OSV](https://osv.dev) feed
+and both rows change:
+
+```toml
+[advisories]
+enabled  = true       # off by default: a new network dependency and a new thing to trust
+mode     = "flag"     # "flag" (annotate only, default) | "shorten" (also apply min-age below)
+min-age  = "1d"       # the SECURITY window — min-clamped, so it only ever shortens
+severity = "high"     # minimum normalized severity that earns it: low|moderate|high|critical
+```
+
+Under `flag` (the default) a candidate that fixes an advisory affecting the current pin renders as
+`in cooldown ⚠ fixes GHSA-… (high)` — annotated, verdict unchanged. Under `shorten` a version the
+feed explicitly lists as the fix (a candidate, or on the `check` side the locked version itself)
+resolves against the security window instead of the ordinary one, so `upgrade` adopts the fix
+earlier and merging a security bump stops failing the next gate run. The feed never *fails*
+`check` for a vulnerable pin — that stays with `govulncheck`/`cargo audit`, so exit 1 keeps one
+meaning — and a feed that yields no usable evidence (unreachable, unimplemented, or too stale to
+shorten) only fails to shorten: a warning, or an error under `check --fail-on-advisory-source`.
+Every floor is resolved separately, so `bypass-floor = true` lifts only the floors its own layer
+declared and the largest one left standing still clamps the security window, which bounds a
+poisoned feed's blast radius. CLI/env:
+`--advisories`/`--no-advisories`, `--advisory-min-age` (implies shorten and enables the feed),
+`--advisory-severity`, and `COOLDOWN_ADVISORIES` / `COOLDOWN_ADVISORY_MIN_AGE` /
+`COOLDOWN_ADVISORY_SEVERITY`.
+
 ### Precedence — authority-first
 
 Two orthogonal axes. **Layers** (low → high authority): built-in default → global config → native
@@ -258,9 +288,11 @@ the core, render, the config schema, or any other adapter.
   re-lock leaves a new too-fresh non-acknowledged dependency in the graph, restore the lock snapshot
   and skip that change — a passing mutation never leaves a lock a subsequent `check` would reject.
 - **Cache hardening:** a cached publish time may never move _earlier_ on refresh (monotonic floor);
-  a backdated upstream timestamp is rejected, not trusted.
+  a backdated upstream timestamp is rejected, not trusted. The advisory feed inverts the rule — it
+  is a *loosening* input, so stale cached advisory data still annotates but never shortens.
 - **Escape hatches are explicit and audited** (`--latest`/`--allow`/config `allow`, all in
-  `explain`); a `floor` bounds config-level loosening.
+  `explain`); a `floor` bounds config-level loosening — including the advisory security window,
+  unless `bypass-floor` is declared in the floor's own layer.
 
 ## License
 

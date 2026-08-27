@@ -693,7 +693,7 @@ pub(crate) fn proven_peer_violations<L: NodeLock>(
     let members = L::member_sources(content);
     let install = L::install_paths(content);
     let mut resolved: HashMap<String, HashSet<String>> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version, .. } in L::parse(content).unwrap_or_default() {
         resolved.entry(name).or_default().insert(version);
     }
     let resolved_splits: HashSet<String> = resolved
@@ -823,7 +823,7 @@ pub(crate) fn first_new_peer_violation<L: NodeLock>(
 /// that trigger the query parse from the same document.
 fn resolved_multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
     let mut versions: HashMap<String, HashSet<String>> = HashMap::new();
-    for NameVersion { name, version } in L::parse(content).unwrap_or_default() {
+    for NameVersion { name, version, .. } in L::parse(content).unwrap_or_default() {
         versions.entry(name).or_default().insert(version);
     }
     versions
