@@ -4,6 +4,14 @@
 
 ## v0.0.17
 
+- **Cargo's lock-currency probe no longer fails on a checkout whose crates are not cached.** The
+  probe behind `check`/`outdated` ran `cargo metadata --locked --offline`, but `cargo metadata`
+  reads every package's manifest, so on a fresh checkout (a CI runner that had not built yet) it
+  failed to download the crates and reported a tool failure, and in offline mode cargo narrows
+  the resolver to cached versions, which turned a genuinely stale lock into a resolver conflict
+  instead of the stale-lock diagnostic. The probe now runs the same `cargo metadata --locked` the
+  graph read uses, so a stale lock is reported as stale and a current one is read after cargo
+  fetches what it needs.
 - **Running from an excluded directory scans it instead of reporting nothing.**
   `cooldown -C incubator check` (or `cd incubator && cooldown check`) under a repo-root config that
   lists `incubator` in `exclude-folders` pruned the directory during detection, scoped the

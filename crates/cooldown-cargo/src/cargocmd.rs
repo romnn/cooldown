@@ -1215,8 +1215,8 @@ impl Cargo {
 
     /// Reads the lock-generation graph without allowing Cargo to update `Cargo.lock`.
     ///
-    /// Unlike [`Self::verify_locked`], this command may access the registry and therefore does not
-    /// require every resolved package to be available offline.
+    /// The command may access the registry: `cargo metadata` reads every package's manifest, so
+    /// it must be free to download the crates a fresh checkout has not cached.
     ///
     /// # Errors
     ///
@@ -1370,42 +1370,22 @@ impl Cargo {
 
     /// Verifies `Cargo.lock` and returns the authoritative resolved graph when it is current.
     ///
-    /// Runs `cargo metadata --all-features --locked --offline`; a stale lock exits 101 and yields
-    /// `Ok(None)`.
+    /// Runs the same `cargo metadata --all-features --locked` as [`Self::metadata_locked`]; a
+    /// stale lock exits 101 with cargo's `--locked` message and yields `Ok(None)`.
+    /// The probe deliberately does not pass `--offline`: `cargo metadata` reads every package's
+    /// manifest, so on a checkout whose crates are not cached it would fail to download them,
+    /// and offline cargo also narrows the resolver to cached versions, which turns a stale lock
+    /// into a spurious resolver conflict instead of the `--locked` message.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if it
-    /// fails for a reason other than a stale lock (e.g. a missing offline index).
+    /// fails for a reason other than a stale lock.
     pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<Option<ResolvedGraph>, CoreError> {
-        let out = self
-            .output(
-                dir,
-                &[
-                    "metadata",
-                    "--all-features",
-                    "--locked",
-                    "--offline",
-                    "--format-version",
-                    "1",
-                ],
-            )
-            .await?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return Self::parse_graph(&stdout).map(Some);
-        }
-        // `--locked` on a stale lock exits 101 with a clear message. A different failure (e.g.
-        // missing offline index) is reported as a tool error.
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stale_lock_diagnostic(&stderr) {
-            Ok(None)
-        } else {
-            Err(CoreError::Tool {
-                tool: self.bin.clone(),
-                termination: ToolTermination::from_exit_status(out.status),
-                stderr: failure_detail(&out),
-            })
+        match self.run_locked_metadata(dir).await {
+            Ok(stdout) => Self::parse_graph(&stdout).map(Some),
+            Err(CoreError::StaleLock(_)) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
