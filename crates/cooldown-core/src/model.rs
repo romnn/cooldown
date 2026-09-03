@@ -882,9 +882,12 @@ pub struct Declaration {
 /// adapter commits it with a `duplicate_copy` warning, since that copy is the resolver's legitimate
 /// answer to the dependent's range.
 /// For a runtime with instance-level state (`solid-js`, `react`) two copies break silently, so a
-/// gated name turns the warning into a refusal: the adapter rejects the settlement, the lock is
-/// restored, and candidate isolation holds the responsible candidate with the copy named, exactly
-/// as a partial landing is treated.
+/// gated name turns the warning into a refusal: when a resolve leaves the name at several resolved
+/// versions where the graph had at most one before, the adapter rejects the settlement, the lock is
+/// restored, and candidate isolation holds the responsible candidate with the copies and their
+/// requirers named, exactly as a partial landing is treated.
+/// A name already at several copies before the run is nobody's landing to refuse, so it is
+/// reported rather than refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SingleCopyPolicy {
     /// The names configured to stay single-copy (`[tool.pnpm] single-copy`).

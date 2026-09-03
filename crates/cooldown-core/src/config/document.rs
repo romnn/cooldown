@@ -1,3 +1,4 @@
+use super::ExcludeList;
 use super::layers::policy_layer_from_config;
 use super::scan::{ScanConfig, scan_config_from_config};
 use super::schema::{ConfigToml, SelectorToml};
@@ -124,9 +125,10 @@ impl ConfigDocument {
             .and_then(|cargo| cargo.edge_policy)
     }
 
-    /// Returns the document's pnpm single-copy list, if `[tool.pnpm]` sets one.
+    /// Returns the document's pnpm single-copy list with its merge mode, if `[tool.pnpm]` sets
+    /// one.
     #[must_use]
-    pub fn pnpm_single_copy(&self) -> Option<Vec<String>> {
+    pub fn pnpm_single_copy(&self) -> Option<ExcludeList> {
         self.raw
             .tool
             .as_ref()
@@ -172,8 +174,11 @@ mod tests {
         )
         .expect("single-copy belongs under [tool.pnpm]");
         assert_eq!(
-            accepted.pnpm_single_copy(),
-            Some(vec!["solid-js".to_string()])
+            accepted
+                .pnpm_single_copy()
+                .as_ref()
+                .map(ExcludeList::patterns),
+            Some(["solid-js".to_string()].as_slice())
         );
         for src in [
             "[tool.npm]\nsingle-copy = [\"react\"]\n",

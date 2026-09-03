@@ -1272,9 +1272,20 @@ pub fn render_explain(
             Some(target) => format!("{} → {target}", verdict.current),
             None => verdict.current.clone(),
         };
+        // A row still cooling names the release it is cooling towards, which the versions alone
+        // do not show.
+        let latest = verdict
+            .latest
+            .as_ref()
+            .filter(|latest| {
+                latest.version != verdict.current
+                    && verdict.adoptable_target.as_deref() != Some(latest.version.as_str())
+            })
+            .map(|latest| format!("latest {}, ", latest.version))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "verdict: {versions} {} (cooldown {})",
+            "verdict: {versions} {} ({latest}cooldown {})",
             outdated_status_cell(verdict),
             outdated_cooldown_cell(verdict)
         );

@@ -84,10 +84,11 @@ pub struct ProjectConfig {
     pub policy_layers: Vec<PolicyLayer>,
     /// The resolved Cargo edge policy from the config documents applicable to this project.
     pub cargo_edge_policy: Option<EdgePolicy>,
-    /// The `[tool.pnpm] single-copy` list from the nearest config document that sets one — the
-    /// nearest file's list replaces a farther one's, like `edge-policy`, so a nested workspace
-    /// states its own invariant in full.
-    pub pnpm_single_copy: Option<Vec<String>>,
+    /// The `[tool.pnpm] single-copy` names folded across the config documents applicable to this
+    /// project, farthest first, with the exclude lists' merge modes: a nested file's plain array
+    /// adds to the root's, so listing one runtime of its own never un-gates the root's, and `[]`
+    /// or `{ replace = [...] }` are the explicit ways to drop inherited names.
+    pub pnpm_single_copy: Vec<String>,
 }
 
 impl ConfigSources {
@@ -224,7 +225,8 @@ impl ConfigSources {
         let mut pnpm_single_copy = self
             .global
             .as_ref()
-            .and_then(|config| config.document.pnpm_single_copy());
+            .and_then(|config| config.document.pnpm_single_copy())
+            .unwrap_or_default();
         let repo_root_config = repo_root.join(CONFIG_FILE);
         for dir in dirs {
             let path = dir.join(CONFIG_FILE);
@@ -235,7 +237,9 @@ impl ConfigSources {
             };
             if let Some(config) = maybe_doc {
                 cargo_edge_policy = config.document.cargo_edge_policy().or(cargo_edge_policy);
-                pnpm_single_copy = config.document.pnpm_single_copy().or(pnpm_single_copy);
+                if let Some(layer) = config.document.pnpm_single_copy() {
+                    pnpm_single_copy = pnpm_single_copy.merge(layer);
+                }
                 policy_layers.push(config.policy_layer(Origin::Repo(config.path.clone()))?);
             }
         }
@@ -244,15 +248,17 @@ impl ConfigSources {
             .as_ref()
             .and_then(|config| config.document.cargo_edge_policy())
             .or(cargo_edge_policy);
-        pnpm_single_copy = self
+        if let Some(layer) = self
             .explicit
             .as_ref()
             .and_then(|config| config.document.pnpm_single_copy())
-            .or(pnpm_single_copy);
+        {
+            pnpm_single_copy = pnpm_single_copy.merge(layer);
+        }
         Ok(ProjectConfig {
             policy_layers,
             cargo_edge_policy,
-            pnpm_single_copy,
+            pnpm_single_copy: pnpm_single_copy.patterns().to_vec(),
         })
     }
 
@@ -406,10 +412,11 @@ mod tests {
         );
     }
 
-    /// `single-copy` cascades like `edge-policy`: the nearest config that sets it wins, and one
-    /// that does not inherits the enclosing list.
+    /// `single-copy` folds like the exclude lists: a nested plain array adds to the root's names,
+    /// a nested `{ replace = [...] }` starts over, and a project with no list of its own inherits
+    /// the enclosing one.
     #[test]
-    fn pnpm_single_copy_resolves_per_project_from_the_nearest_config() {
+    fn pnpm_single_copy_folds_across_the_config_cascade() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
         std::fs::create_dir(root.join(".git")).expect("git dir");
@@ -421,34 +428,39 @@ mod tests {
             "#},
         )
         .expect("root config");
-        let own = root.join("apps/own");
+        let extending = root.join("apps/extending");
+        let replacing = root.join("apps/replacing");
         let inherited = root.join("apps/inherited");
-        std::fs::create_dir_all(&own).expect("own project");
-        std::fs::create_dir_all(&inherited).expect("inherited project");
+        for dir in [&extending, &replacing, &inherited] {
+            std::fs::create_dir_all(dir).expect("project dir");
+        }
         std::fs::write(
-            own.join(CONFIG_FILE),
+            extending.join(CONFIG_FILE),
             indoc! {r#"
                 [tool.pnpm]
                 single-copy = ["typescript"]
             "#},
         )
-        .expect("nested config");
+        .expect("extending config");
+        std::fs::write(
+            replacing.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.pnpm]
+                single-copy = { replace = ["typescript"] }
+            "#},
+        )
+        .expect("replacing config");
 
         let configs = ConfigSources::load(root, None, true).expect("config sources");
-        assert_eq!(
+        let names = |dir: &Utf8Path| {
             configs
-                .project_config(root, &own)
-                .expect("own config")
-                .pnpm_single_copy,
-            Some(vec!["typescript".to_string()])
-        );
-        assert_eq!(
-            configs
-                .project_config(root, &inherited)
-                .expect("inherited config")
-                .pnpm_single_copy,
-            Some(vec!["solid-js".to_string(), "react".to_string()])
-        );
+                .project_config(root, dir)
+                .expect("project config")
+                .pnpm_single_copy
+        };
+        assert_eq!(names(&extending), ["solid-js", "react", "typescript"]);
+        assert_eq!(names(&replacing), ["typescript"]);
+        assert_eq!(names(&inherited), ["solid-js", "react"]);
     }
 
     #[test]

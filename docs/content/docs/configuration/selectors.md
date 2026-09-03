@@ -44,9 +44,17 @@ A second copy a dependent's own requirement pulls into the graph is ordinarily c
 reported as a `duplicate_copy` warning. For a listed name the settlement is refused instead: the
 lock is restored and the candidate whose landing added the copy is held with the copy and its
 requirer named (see [upgrade]({{< relref "../commands/upgrade.md" >}}#whole-workspace-landings-pnpm)).
-`--fail-on-new-duplicate` gates every package for one run. The key is pnpm-specific and accepted
-only here (like `edge-policy` under `[tool.cargo]`), and the nearest `cooldown.toml` that sets it
-wins outright — a nested workspace states its own list in full. Names in `pnpm-workspace.yaml`'s
+The gate judges what a resolve *adds*: a listed name the graph held at one copy (or not at all)
+before the run and at several after it. A listed name that is *already* at several copies before a
+run is reported (as a `duplicate_copy` warning) rather than refused — refusing would hold every
+upgrade forever — so converge it for the listing to hold. A `--lock` refresh (`check --lock`,
+`outdated --lock`) is pnpm's own `install --lockfile-only` against the manifests as written and is
+not gated. `--fail-on-new-duplicate` gates every package for one run; on a tool without pnpm's
+settlement guard it has no effect and the run says so. The key is pnpm-specific and accepted only
+here (like `edge-policy` under `[tool.cargo]`). It merges across config files the way
+`exclude-folders` does: a plain array adds to the list inherited from a farther file, `[]` clears
+it, and `{ replace = ["…"] }` replaces it — so a nested workspace that lists one runtime of its own
+does not un-gate the root's. Names in `pnpm-workspace.yaml`'s
 `overrides` are *not* gated by default: an override pins a version for every request that matches
 its range, which already keeps a copy single where the range is exact, and a ranged override is
 often about forcing a patched transitive rather than about running the package once — list the

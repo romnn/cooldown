@@ -5762,6 +5762,49 @@ async fn dry_run_leaves_the_real_lock_and_manifest_byte_identical() {
     assert_eq!(digest(&lock), lock_before, "dry-run modified the real lock");
 }
 
+/// `--fail-on-new-duplicate` is honored only by pnpm's whole-graph settlement; on any other tool
+/// the run says so with a usage note instead of letting a CI job believe its graph is gated.
+#[tokio::test]
+async fn the_duplicate_gate_flag_is_reported_inert_on_a_tool_without_the_guard() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let fake = fake(
+        root,
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    let ws = workspace(fake, Baseline::default());
+
+    let out = ws
+        .upgrade(&RunOpts {
+            fail_on_new_duplicate: true,
+            ..opts()
+        })
+        .await;
+
+    let note = out
+        .warnings
+        .iter()
+        .find(|warning| {
+            warning
+                .message
+                .starts_with("--fail-on-new-duplicate: go has no duplicate-copy guard")
+        })
+        .expect("the inert flag is reported");
+    assert_eq!(note.kind, DiagnosticKind::Config);
+    // Without the flag nothing is said: the note is about a request that cannot be honored.
+    let silent = ws.upgrade(&opts()).await;
+    assert!(
+        silent
+            .warnings
+            .iter()
+            .all(|warning| !warning.message.contains("--fail-on-new-duplicate")),
+        "{:?}",
+        silent.warnings
+    );
+}
+
 /// `explain` leads with the decision: the same blocked verdict `outdated` reaches for the package,
 /// carrying the blocker and the reason `upgrade` prints — so "why is this blocked?" is answered
 /// without a whole-graph `upgrade --dry-run`.

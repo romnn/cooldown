@@ -40,11 +40,14 @@ pub(crate) struct SelectorToml {
     /// so the tool-scoped placement is explicit rather than a global key that only one tool reads.
     #[serde(rename = "edge-policy")]
     pub(crate) edge_policy: Option<crate::EdgePolicy>,
-    /// The packages a resolve must never leave at a second resolved copy: `upgrade`/`fix` refuse
-    /// a settlement that adds one instead of committing it with a warning.
+    /// The packages a resolve must not add a second resolved copy of: `upgrade`/`fix` refuse a
+    /// settlement that adds one instead of committing it with a warning.
     /// pnpm-specific, like `edge-policy` is cargo-specific: accepted only under `[tool.pnpm]`.
+    /// Merges across config files like the exclude lists (a plain array adds to the inherited
+    /// list, `[]` clears it, `{ replace = [...] }` replaces it), so a nested workspace cannot
+    /// un-gate the root's runtimes by listing one name of its own.
     #[serde(rename = "single-copy")]
-    pub(crate) single_copy: Option<Vec<String>>,
+    pub(crate) single_copy: Option<ExcludeList>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]

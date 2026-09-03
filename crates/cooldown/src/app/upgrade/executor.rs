@@ -449,6 +449,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.pctx.tool,
             self.ctx.pctx.rel_path.as_str(),
         ));
+        // The duplicate-copy gate lives in pnpm's whole-graph settlement; anywhere else the flag
+        // would be silently inert, so a run that asked for it is told, as a usage note a script
+        // can see (the same shape `--lock` uses for an adapter without a refresh).
+        if self.ctx.opts.fail_on_new_duplicate && !self.ctx.writer.guards_duplicate_copies() {
+            self.acc.warnings.push(
+                Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "--fail-on-new-duplicate: {} has no duplicate-copy guard (only pnpm's whole-graph resolve judges the settled lock), so the flag has no effect here",
+                        self.ctx.pctx.tool.as_str()
+                    ),
+                )
+                .with_tool(self.ctx.tool_name())
+                .with_project(self.project_label.clone()),
+            );
+        }
         self.ctx.opts.progress.phase("resolving dependency graph");
         let Some(deps) = self.scoped_deps().await else {
             return ProjectRunStatus::Terminated;

@@ -33,9 +33,14 @@
   the severity wrong for such packages. `[tool.pnpm] single-copy = ["solid-js", "react"]` now
   names the packages that must stay single-copy: a settlement that adds a second copy of one is
   refused, the lock restored, and the candidate whose landing added it held with the copy named,
-  exactly as a partial landing is — even when the second copy is the one an exclusion asked for.
-  `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for a run without
-  naming any. The warning for an ungated copy now names the requirer from the settled lock's own
+  exactly as a partial landing is — even when the second copy is the one an exclusion asked for,
+  and when the name was absent before the run and arrives at two copies at once. A listed name
+  already at several copies before the run is reported rather than refused, since no candidate
+  introduced it. `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for
+  a run without naming any, and says so when the run's tool has no settlement guard to honor it.
+  The list merges across config files like `exclude-folders` (a plain array adds, `[]` clears,
+  `{ replace = […] }` replaces), so a nested workspace listing one runtime of its own cannot
+  un-gate the root's. The warning for an ungated copy now names the requirer from the settled lock's own
   edges (`required at 1.9.15 by vite-plugin-solid@2.11.14`) instead of `pulled in by another
   package's requirement`, which had forced a hand-grep of the `snapshots:` section. Names in
   `pnpm-workspace.yaml`'s `overrides` are deliberately not gated by default: an exact override

@@ -631,6 +631,19 @@ pub(crate) struct PnpmLockDocument {
     lockfile_version: Option<LockfileVersion>,
     importers: YamlEntries<Tolerant<PnpmImporter>>,
     packages: YamlEntries<Tolerant<PnpmPackage>>,
+    /// Only the keys are consumed ([`PnpmLockDocument::package_and_snapshot_keys`]); the edges
+    /// under them are read by [`PnpmSnapshotsDocument`] on demand, since this document is parsed
+    /// a dozen times per apply and the `snapshots:` section is the bulk of a large lock.
+    snapshots: YamlEntries<IgnoredAny>,
+}
+
+/// The `snapshots:` section alone, typed for the requirement edges — parsed only when a duplicate
+/// copy needs its requirer named ([`parse_pnpm_graph_dependents`]), so the per-entry cost of the
+/// untagged [`Tolerant`] buffering is paid once per apply at most rather than on every read of the
+/// shared document.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PnpmSnapshotsDocument {
     snapshots: YamlEntries<Tolerant<PnpmSnapshot>>,
 }
 
@@ -879,25 +892,7 @@ impl PnpmResolution {
 /// Returns [`CoreError::LockUnreadable`] naming the YAML failure or the unsupported
 /// `lockfileVersion` (and the supported one).
 pub(crate) fn parse_pnpm_document_strict(content: &str) -> Result<PnpmLockDocument> {
-    if content.trim().is_empty() {
-        return Ok(PnpmLockDocument::default());
-    }
-    let mut options = serde_saphyr::Options::default();
-    // pnpm never writes duplicate keys, but a hand-edited lock may carry them; `LastWins` passes
-    // duplicate pairs through to the map visitor, so [`YamlEntries`] keeps each of them (the
-    // default policy errors out instead).
-    options.duplicate_keys = serde_saphyr::options::DuplicateKeyPolicy::LastWins;
-    // The default budget caps events/nodes/scalar bytes at totals a large monorepo lock can
-    // legitimately exceed, and a breach would surface as a spurious parse failure.
-    // Lift the size-proportional caps — the input is a project-local file — while keeping the
-    // structural guards (nesting depth, alias amplification).
-    if let Some(budget) = options.budget.as_mut() {
-        budget.max_events = usize::MAX;
-        budget.max_nodes = usize::MAX;
-        budget.max_total_scalar_bytes = usize::MAX;
-    }
-    let doc: PnpmLockDocument = serde_saphyr::from_str_with_options(content, options)
-        .map_err(|error| CoreError::LockUnreadable(format!("pnpm-lock.yaml: {error}")))?;
+    let doc: PnpmLockDocument = parse_pnpm_yaml(content)?;
     // Only a *parsable* major below 9 is rejected: an absent field tolerates hand-crafted
     // fixtures, an unparsable one falls through to whatever the structure yields (every real
     // pre-9 pnpm lock carries a numeric version), and a future major is left to prove itself
@@ -914,6 +909,32 @@ pub(crate) fn parse_pnpm_document_strict(content: &str) -> Result<PnpmLockDocume
         )));
     }
     Ok(doc)
+}
+
+/// Parses `pnpm-lock.yaml` into any typed view of it under the one set of parser options every
+/// reader shares: duplicate keys kept, the size-proportional budget lifted, the structural guards
+/// kept.
+/// An empty or whitespace-only document is a legitimately empty lock and reads as the default.
+fn parse_pnpm_yaml<T: serde::de::DeserializeOwned + Default>(content: &str) -> Result<T> {
+    if content.trim().is_empty() {
+        return Ok(T::default());
+    }
+    let mut options = serde_saphyr::Options::default();
+    // pnpm never writes duplicate keys, but a hand-edited lock may carry them; `LastWins` passes
+    // duplicate pairs through to the map visitor, so [`YamlEntries`] keeps each of them (the
+    // default policy errors out instead).
+    options.duplicate_keys = serde_saphyr::options::DuplicateKeyPolicy::LastWins;
+    // The default budget caps events/nodes/scalar bytes at totals a large monorepo lock can
+    // legitimately exceed, and a breach would surface as a spurious parse failure.
+    // Lift the size-proportional caps — the input is a project-local file — while keeping the
+    // structural guards (nesting depth, alias amplification).
+    if let Some(budget) = options.budget.as_mut() {
+        budget.max_events = usize::MAX;
+        budget.max_nodes = usize::MAX;
+        budget.max_total_scalar_bytes = usize::MAX;
+    }
+    serde_saphyr::from_str_with_options(content, options)
+        .map_err(|error| CoreError::LockUnreadable(format!("pnpm-lock.yaml: {error}")))
 }
 
 /// [`parse_pnpm_document_strict`] with the failure collapsed to `None`, for the auxiliary readers
@@ -2043,7 +2064,8 @@ fn parse_pnpm_importer_members(
 /// `link:`/`file:`/`workspace:` values and URL resolutions bind no registry version and are left
 /// out; a value under an aliased key (`real@1.2.3`) is credited to the real package.
 fn parse_pnpm_graph_dependents(content: &str) -> HashMap<(String, String), Vec<String>> {
-    let Some(doc) = parse_pnpm_document(content) else {
+    // A pre-v9 lock has no `snapshots:` section and reads as no edges, like the auxiliary readers.
+    let Ok(doc) = parse_pnpm_yaml::<PnpmSnapshotsDocument>(content) else {
         return HashMap::new();
     };
     let mut dependents: HashMap<(String, String), BTreeSet<String>> = HashMap::new();

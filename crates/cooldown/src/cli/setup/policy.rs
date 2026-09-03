@@ -119,7 +119,7 @@ async fn assemble_ctx(
         .edge_policy_override()
         .or(project_config.cargo_edge_policy)
         .unwrap_or_default();
-    let single_copy = project_config.pnpm_single_copy.unwrap_or_default();
+    let single_copy = project_config.pnpm_single_copy;
 
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &assembly.shared.global {

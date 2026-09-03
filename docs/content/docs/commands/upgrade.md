@@ -234,7 +234,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
-| `--fail-on-new-duplicate` | pnpm: refuse a resolve that gives *any* package a second resolved copy — the candidate whose landing added it is held with the copy and its requirer named and the lock restored — instead of committing it with a `duplicate_copy` warning. Config: `[global]`/`[upgrade] fail-on-new-duplicate`; `[tool.pnpm] single-copy` gates named packages permanently. |
+| `--fail-on-new-duplicate` | pnpm: refuse a resolve that gives *any* package a second resolved copy — the candidate whose landing added it is held with the copy and its requirer named and the lock restored — instead of committing it with a `duplicate_copy` warning. Config: `[global]`/`[upgrade] fail-on-new-duplicate`; `[tool.pnpm] single-copy` gates named packages on every run. On a tool without pnpm's settlement guard the flag has no effect and the run says so. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
 `upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with

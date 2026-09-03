@@ -762,6 +762,15 @@ pub trait ToolWrite: Send + Sync {
         MutationExecution::InPlace
     }
 
+    /// Whether this tool's apply engine judges the settled lock for a package left at several
+    /// resolved copies (pnpm's whole-graph settlement guard), so that
+    /// [`Plan::single_copy`](crate::Plan::single_copy) and `--fail-on-new-duplicate` have an
+    /// effect. An engine without the guard leaves the policy inert, and the run says so rather
+    /// than letting a CI job believe its graph is gated.
+    fn guards_duplicate_copies(&self) -> bool {
+        false
+    }
+
     /// Whether this tool's apply engine can move a *transitive* planned change — pin a package no
     /// manifest declares to an exact lock version (cargo's per-spec `--precise` pins, pnpm's
     /// temporary qualified overrides, `go get`, uv's `--upgrade-package`). `upgrade` plans
