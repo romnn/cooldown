@@ -18,11 +18,12 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use color_eyre::eyre;
 use cooldown::app::{
-    AdapterSet, Baseline, CheckStatus, Exit, OutdatedStatus, ProjectCtx, RunOpts, Workspace,
+    AdapterSet, Baseline, CheckStatus, Exit, MemberExcludes, OutdatedStatus, ProjectCtx, RunOpts,
+    RunScope, Workspace,
 };
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1804,12 +1805,19 @@ async fn per_tool_exclude_prunes_workspace_member_dependencies() {
         build_fails_after_apply: false,
         confirm_strips: None,
         state: Mutex::default(),
-        root,
+        root: root.clone(),
     };
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
-    opts.exclude_folders_by_tool
-        .insert(GO.as_str().to_string(), vec!["apps/dropped".to_string()]);
+    // Folder globs are matched against member locations relative to the scan root.
+    opts.scope = RunScope::new(&root, &root);
+    opts.excludes = MemberExcludes::compile(
+        &[],
+        &[],
+        &BTreeMap::from([(GO.as_str().to_string(), vec!["apps/dropped".to_string()])]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
 
     let out = ws.outdated(&opts).await;
 
@@ -1875,8 +1883,13 @@ async fn per_tool_exclude_packages_prunes_workspace_member_dependencies() {
     // `@internal/*` matches the member's package NAME (`@internal/dropped`); it does NOT match the
     // member's path (`apps/dropped`), so this proves exclusion is name-based, not path-based. Keyed
     // by the canonical tool id.
-    opts.exclude_packages_by_tool
-        .insert(GO.as_str().to_string(), vec!["@internal/*".to_string()]);
+    opts.excludes = MemberExcludes::compile(
+        &[],
+        &[],
+        &BTreeMap::new(),
+        &BTreeMap::from([(GO.as_str().to_string(), vec!["@internal/*".to_string()])]),
+    )
+    .unwrap();
 
     let out = ws.outdated(&opts).await;
 
@@ -1942,7 +1955,13 @@ async fn global_exclude_packages_prunes_workspace_member_dependencies() {
     };
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
-    opts.exclude_packages = vec!["@internal/*".to_string()];
+    opts.excludes = MemberExcludes::compile(
+        &[],
+        &["@internal/*".to_string()],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
 
     let out = ws.outdated(&opts).await;
 
@@ -5158,7 +5177,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
 
     let out = ws
         .sync(&RunOpts {
-            source_dir: Some(root.join("a")),
+            scope: RunScope::new(&root, &root.join("a")),
             ..opts()
         })
         .await;

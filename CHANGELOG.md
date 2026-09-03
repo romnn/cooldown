@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- **Running from an excluded directory scans it instead of reporting nothing.**
+  `cooldown -C incubator check` (or `cd incubator && cooldown check`) under a repo-root config that
+  lists `incubator` in `exclude-folders` pruned the directory during detection, scoped the
+  enclosing project to zero members, and exited clean having checked no dependency at all. Naming
+  a directory now outranks an exclude glob: the selected path and the directories leading to it
+  (dot-directories included) are never pruned, the workspace member containing it is exempt from
+  `exclude-folders` and `exclude-packages`, members below it (`-C crates`) are in scope unless a
+  glob matches them below the selection, and dependencies the tool attributes to no member (a Go
+  module's, or the transitive rows of tools that attribute only direct dependencies) stay in scope
+  for every command, so a selection never hides a transitive from the gate and `fix`/`upgrade`
+  under `-C <member>` may move one only a sibling member needs. A selection the run cannot
+  honor is a usage error instead of an empty result: one the run's own `--exclude-folders` names,
+  one a `.gitignore`/`.ignore` rule hides (the error names `--no-gitignore`), or a `-C` path that
+  is not a directory. A selection nothing covers evaluates zero dependencies and says so with a
+  config warning.
+- **Exclude lists can be cleared or replaced by a nearer config.** A plain
+  `exclude-folders`/`exclude-packages` array still adds to the list it inherits from a
+  lower-precedence file or from `[global]`; an explicit `[]` now clears that list (it was a silent
+  no-op), and `{ replace = [...] }` swaps it for the given patterns (`{ extend = [...] }` is the
+  explicit spelling of the plain array; an empty `extend` is rejected as a likely mistake). Each
+  key merges on its own — a `[tool.cargo]` replacement affects only the inherited `[tool.cargo]`
+  list, and a `[outdated]` replacement shadows `[global]` for `outdated` alone — and the sections
+  resolve within each file before the files fold, so a repo-root `[outdated]` replacement drops
+  everything the global config contributed for `outdated`. Two alias tables of one tool that both
+  set the same exclude list, and an exclude list in a nested `cooldown.toml` (which sets policy
+  only), are config errors now instead of one table silently winning or the list being silently
+  ignored.
+- **`check --lock` and `outdated --lock` refresh `Cargo.lock`.** The cargo adapter had no
+  standalone lock refresh, so the flag was a silent no-op for Rust projects and a stale lock still
+  failed closed. It now runs `cargo update --workspace`, the minimal refresh: a missing lock is
+  generated and the workspace members' own requirements re-resolved, while a locked version the
+  manifests still admit stays where it is — the refresh never floats the existing graph; what a
+  manifest change invalidates is re-resolved or dropped, and what it adds is gated like everything
+  else. Only the projects the run evaluates are
+  refreshed (`-C incubator` leaves the enclosing workspace's lock alone). A refresh cargo rejects
+  is an error even under `--allow-stale-lock`, `--lock --offline` is rejected up front as a usage
+  error, the flag remains a no-op under `--dry-run`, and a tool without a standalone refresh now
+  says so with a warning instead of silently reading the existing lock.
+
 ## v0.0.16
 
 - **`fix` plans co-moving families instead of reporting them graph-held.** A family of too-fresh

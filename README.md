@@ -207,8 +207,9 @@ prints the field-by-field derivation.
 ### Excluding folders and packages
 
 Two independent knobs trim what a run looks at. Both live under the flag-default sections —
-`[global]`, a `[<command>]` override, or `[tool.<name>]` for one ecosystem — and **concatenate**
-across them (a prune set; order is irrelevant). Every pattern is compiled when the config is
+`[global]`, a `[<command>]` override, or `[tool.<name>]` for one ecosystem — and a plain array
+**adds** to what the other sections and files contribute (a prune set; order is irrelevant). Every
+pattern is compiled when the config is
 loaded, so a bad glob is a config error (exit 2), not a surprise mid-scan.
 
 ```toml
@@ -243,6 +244,15 @@ registry permits `*` in a package name, so nothing needs escaping) and crosses `
 covers a whole npm scope and `serde_*` a crate family. Because names differ per ecosystem (`my-pkg`
 vs `@scope/my-pkg`), reach for `[tool.<name>].exclude-packages` when a pattern is ecosystem-specific;
 a `[global]` entry applies to every tool.
+
+A plain array **adds** to the list it inherits (the global config → the repo `cooldown.toml` →
+`--config`; `[global]` → `[<command>]`). An explicit `[]` **clears** the inherited list and
+`{ replace = [...] }` **replaces** it, so a repo can undo an org-wide default; each key merges on its
+own, so a `[tool.cargo]` replacement leaves the `[global]` list alone. Naming a directory outranks
+an exclude: `cooldown -C incubator check` scans `incubator` even when the repo root excludes it,
+rather than checking nothing and reporting a clean result; members below the selection stay in
+scope with the excludes applying, and a selection the scan cannot reach (a gitignored directory, or
+one the run's own `--exclude-folders` names) is an error rather than an empty result.
 
 Both have a CLI form — `--exclude-folders <glob>` and `--exclude-packages <glob>` (repeatable) — that
 **replaces** the `[global]`/`[<command>]` config lists for that run (per-tool `[tool.*]` excludes still

@@ -169,14 +169,26 @@ impl Fixture {
     /// Run the built `cooldown` binary against the fixture with the given args, capturing output.
     /// `CARGO_BIN_EXE_cooldown` is injected by Cargo for integration tests.
     pub fn cooldown(&self, args: &[&str]) -> CapturedOutput {
+        self.cooldown_in(None, args)
+    }
+
+    /// Runs `cooldown` pinned to the project-root-relative `dir` (the root itself when `None`) —
+    /// what a `-C <dir>` or a `cd <dir>` invocation sees.
+    /// The harness always pins `--dir` last so detection is deterministic regardless of ambient
+    /// state, which is also why a caller cannot pass its own `-C`: this is the way to run from a
+    /// subdirectory.
+    pub fn cooldown_in(&self, dir: Option<&str>, args: &[&str]) -> CapturedOutput {
         let exe = env!("CARGO_BIN_EXE_cooldown");
+        let pinned = dir.map_or_else(
+            || self.dir.path().to_path_buf(),
+            |dir| self.dir.path().join(dir),
+        );
         let output = Command::new(exe)
             .current_dir(self.dir.path())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
-            // Pin tool/dir explicitly so detection is deterministic regardless of ambient state.
             .arg("--dir")
-            .arg(self.dir.path())
+            .arg(pinned)
             .output()
             .expect("spawn cooldown binary");
         CapturedOutput::from("cooldown", args, output)
@@ -205,13 +217,19 @@ impl Fixture {
     /// Run a `cooldown` subcommand with `--json` and parse the envelope. Panics with the captured
     /// stderr if the binary did not emit valid JSON, so a resolver/setup failure is legible.
     pub fn cooldown_json(&self, args: &[&str]) -> Envelope {
+        self.cooldown_json_in(None, args)
+    }
+
+    /// [`cooldown_json`](Self::cooldown_json) pinned to the project-root-relative `dir`; see
+    /// [`cooldown_in`](Self::cooldown_in).
+    pub fn cooldown_json_in(&self, dir: Option<&str>, args: &[&str]) -> Envelope {
         let mut full: Vec<&str> = args.to_vec();
         full.push("--json");
-        let captured = self.cooldown(&full);
+        let captured = self.cooldown_in(dir, &full);
         let value: serde_json::Value =
             serde_json::from_slice(&captured.stdout).unwrap_or_else(|err| {
                 panic!(
-                    "cooldown {args:?} did not emit JSON: {err}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    "cooldown {args:?} (in {dir:?}) did not emit JSON: {err}\n--- stdout ---\n{}\n--- stderr ---\n{}",
                     captured.stdout_str(),
                     captured.stderr_str(),
                 )
@@ -523,6 +541,17 @@ impl Envelope {
             })
             .count();
         u64::try_from(count).unwrap_or(u64::MAX)
+    }
+
+    /// Names of every reported item, whatever its status — what a run's scope covered.
+    pub fn item_names(&self) -> BTreeSet<String> {
+        self.filter_names(|_| true)
+    }
+
+    /// `summary.checked`: how many locked dependencies `check` actually evaluated (its items list
+    /// only the flagged ones).
+    pub fn summary_checked(&self) -> u64 {
+        self.summary_u64("checked")
     }
 
     /// Names of items the mutation actually moved (`applied == true`).
@@ -851,6 +880,26 @@ pub fn toml_lock_pins(lock: &[u8]) -> BTreeMap<String, String> {
         }
     }
     pins
+}
+
+/// Every `(name, version)` node of a TOML lockfile, as a set.
+/// Unlike [`toml_lock_pins`] this keeps a crate that is locked at two versions as two entries, so
+/// a set difference between two locks names exactly the nodes that were added, removed, or moved.
+pub fn toml_lock_entries(lock: &[u8]) -> BTreeSet<(String, String)> {
+    let text = String::from_utf8_lossy(lock);
+    let mut entries = BTreeSet::new();
+    let mut current_name: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = toml_field(trimmed, "name") {
+            current_name = Some(value);
+        } else if let Some(value) = toml_field(trimmed, "version")
+            && let Some(name) = current_name.take()
+        {
+            entries.insert((name, value));
+        }
+    }
+    entries
 }
 
 /// A [`PinParser`] for `go.mod`: the `module path → version` map of every `require` directive,

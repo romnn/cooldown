@@ -341,8 +341,11 @@ fn cargo_recovery_discovery(
             },
             validation_marker: "Cargo.toml",
         }],
-        respect_gitignore,
-        &[],
+        scan::WalkPolicy {
+            respect_gitignore,
+            exclude: &[],
+            selected: None,
+        },
     )?
     .into_iter()
     .next()

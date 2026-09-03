@@ -539,11 +539,16 @@ pub fn render_check(
     } = *opts;
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() && summary.skipped_stale_projects == 0 {
-        let _ = writeln!(
-            out,
-            "✓ {} dependencies pass the cooldown gate ({} scope).",
-            summary.checked, meta.scope
-        );
+        // A gate that evaluated nothing has nothing to vouch for, so it does not claim a pass.
+        if summary.checked == 0 {
+            let _ = writeln!(out, "no dependencies to evaluate ({} scope).", meta.scope);
+        } else {
+            let _ = writeln!(
+                out,
+                "✓ {} dependencies pass the cooldown gate ({} scope).",
+                summary.checked, meta.scope
+            );
+        }
     } else if !items.is_empty() {
         let used_by = has_attribution(items, |it| &it.members);
         let project = project_column_needed(

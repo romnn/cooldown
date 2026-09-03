@@ -58,6 +58,8 @@ pub struct CheckOutcome {
 struct CheckAccum {
     checked: usize,
     skipped_stale_projects: usize,
+    /// Whether a project already explained an empty selection, so the run-level note is redundant.
+    empty_selection_noted: bool,
     direct: usize,
     exempt: usize,
     acknowledged: usize,
@@ -169,6 +171,18 @@ impl<'a> CheckRunner<'a> {
             },
         };
         let exit = check_exit(&self.acc, err_count, self.opts);
+        // An error already explains an empty run; otherwise a selection that evaluated nothing
+        // must say so, or the gate passes on zero dependencies without a word.
+        if err_count == 0
+            && !self.acc.empty_selection_noted
+            && let Some(note) = super::empty_selection_diagnostic(
+                self.opts,
+                self.acc.checked,
+                self.acc.skipped_stale_projects,
+            )
+        {
+            self.acc.warnings.push(note);
+        }
 
         CheckOutcome {
             meta,
@@ -177,6 +191,15 @@ impl<'a> CheckRunner<'a> {
             warnings: self.acc.warnings,
             errors: self.acc.errors,
             exit,
+        }
+    }
+
+    /// Records a project that encloses the selection yet contributed no row, which also makes
+    /// the run-level empty-selection note redundant.
+    fn note_empty_project(&mut self, pctx: &super::ProjectCtx, evaluated: usize) {
+        if let Some(note) = self.ws.empty_project_note(pctx, self.opts, evaluated) {
+            self.acc.warnings.push(note);
+            self.acc.empty_selection_noted = true;
         }
     }
 
@@ -238,6 +261,7 @@ impl<'a> CheckRunner<'a> {
         };
         drop(read_guard);
         drop(refresh_guard);
+        self.note_empty_project(pctx, deps.len());
 
         // Identities must be adapter-confirmed before they are queried, matched, or counted
         // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
@@ -297,7 +321,7 @@ impl<'a> CheckRunner<'a> {
     ) -> (Option<LockProbe>, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(refresh) => {
-                self.acc.warnings.extend(refresh.recovery);
+                self.acc.warnings.extend(refresh.warnings);
                 let probe = match refresh.report {
                     Ok(report) => {
                         report.map(|report| self.handle_lock_report(report, pctx, project_label))

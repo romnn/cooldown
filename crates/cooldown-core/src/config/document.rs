@@ -137,7 +137,7 @@ mod tests {
         let scan = doc.scan_config(&Origin::Global).expect("scan config");
 
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
-        assert_eq!(scan.global.major, Some(true));
+        assert_eq!(scan.resolved("outdated").major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
     }
 

@@ -33,9 +33,9 @@ use std::collections::BTreeSet;
 ///   A `Cargo.lock`/`uv.lock`
 ///   marks a workspace root that already owns its members, so nested lockfiles below it are skipped.
 ///
-/// Hidden directories (dotfiles such as `.git`, `.venv`) are always skipped.
-/// Unreadable
-/// directories are skipped rather than failing the whole scan.
+/// Hidden directories (dotfiles such as `.git`, `.venv`) are skipped unless the selection lies
+/// in or below one (see [`WalkPolicy`]).
+/// Unreadable directories are skipped rather than failing the whole scan.
 ///
 /// # Errors
 ///
@@ -86,19 +86,40 @@ pub(crate) fn find_project_marker_dirs(
     )
 }
 
+/// Which directories one marker walk may enter.
+#[derive(Clone, Copy)]
+pub(crate) struct WalkPolicy<'a> {
+    /// Honor `.gitignore`/`.ignore` files (the default); off, only the exclude globs prune.
+    pub(crate) respect_gitignore: bool,
+    /// `exclude-folders` globs with `.gitignore` semantics (see [`compile_folder_globset`]).
+    pub(crate) exclude: &'a [String],
+    /// A directory under the root the invocation named explicitly (`-C`/`--dir`, or its own
+    /// working directory below the scan root).
+    ///
+    /// The walk always enters it and the ancestors leading to it, hidden or excluded as they may
+    /// be: the excludes trim the default scan, and naming a path outranks a glob.
+    /// Inside an excluded ancestor entered only for that reason, the walk stays on the path to
+    /// the selection and within the selection's own subtree, so lifting an ancestor never brings
+    /// back the siblings the exclude meant to prune.
+    /// Excludes below the selection apply as usual.
+    /// Gitignore rules are not lifted (that is `--no-gitignore`), but a selection they hide is
+    /// reported as an error instead of yielding an empty scan.
+    pub(crate) selected: Option<&'a Utf8Path>,
+}
+
 /// Finds several adapters' marker sets during one filesystem traversal.
 ///
-/// Every detection must use the same gitignore and folder-exclusion policy.
+/// Every detection must use the same [`WalkPolicy`].
 /// Results preserve the input order.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Config`] if an `exclude` entry is not a valid glob.
+/// Returns [`CoreError::Config`] if an exclude entry is not a valid glob, or if the walk never
+/// reached the selected directory (a gitignore rule hides it, or it is unreadable).
 pub(crate) fn find_project_marker_dirs_batch(
     root: &Utf8Path,
     detections: &[ProjectDetection],
-    respect_gitignore: bool,
-    exclude: &[String],
+    policy: WalkPolicy<'_>,
 ) -> Result<Vec<ProjectMarkerDirs>, CoreError> {
     let scans = detections
         .iter()
@@ -111,7 +132,7 @@ pub(crate) fn find_project_marker_dirs_batch(
             }
         })
         .collect::<Vec<_>>();
-    scan_marker_groups(root, &scans, respect_gitignore, exclude)
+    scan_marker_groups(root, &scans, policy)
 }
 
 #[derive(Clone, Copy)]
@@ -135,20 +156,87 @@ fn scan_marker_dirs(
         validation: validation_marker,
         topmost_only,
     };
-    scan_marker_groups(root, &[scan], respect_gitignore, exclude)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| CoreError::System("marker scan produced no result".to_string()))
+    scan_marker_groups(
+        root,
+        &[scan],
+        WalkPolicy {
+            respect_gitignore,
+            exclude,
+            selected: None,
+        },
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| CoreError::System("marker scan produced no result".to_string()))
+}
+
+/// The directory filter of one scan walk.
+///
+/// Files always pass because the markers are matched per walked directory, never as yielded
+/// files.
+/// Hidden directories are pruned unless they lie on the spine, the selected directory and every
+/// ancestor the walk must enter to reach it.
+/// Excluded directories follow the same rule as a workspace member (see
+/// [`FolderExcludeSet::excludes_path`]): on the spine and below the selection a glob matching at
+/// or above the selection never counts, while beside the spine every glob counts, so a lifted
+/// ancestor's other children stay pruned.
+struct DirFilter {
+    root: Utf8PathBuf,
+    excludes: FolderExcludeSet,
+    /// The selection relative to `root`.
+    selected: Option<Utf8PathBuf>,
+}
+
+impl DirFilter {
+    fn admits(&self, entry: &ignore::DirEntry) -> bool {
+        // Only directories are pruned; files always pass so we can match the marker on them.
+        if entry.file_type().is_none_or(|t| !t.is_dir()) {
+            return true;
+        }
+        let Some(path) = Utf8Path::from_path(entry.path()) else {
+            return true;
+        };
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        if rel.as_str().is_empty() {
+            return true;
+        }
+        let selected = self.selected.as_deref();
+        // The spine is the selection and every ancestor the walk must enter to reach it.
+        let on_spine = selected.is_some_and(|selected| selected.starts_with(rel));
+        // Dot-directories (`.git`, `.venv`) are never scanned unless the invocation named one, or
+        // a path through one.
+        if is_hidden(path) && !on_spine {
+            return false;
+        }
+        // Naming a directory outranks a glob that would prune it or a directory above it, so the
+        // globs are lifted on the spine and below the selection; beside the spine nothing is
+        // lifted, which keeps a lifted ancestor's other children pruned (a broken config in one
+        // of them must not fail a run that never asked for it).
+        let lifted = selected.filter(|selected| on_spine || rel.starts_with(selected));
+        if self.excludes.excludes_path(rel, lifted) {
+            return false;
+        }
+        if on_spine && self.excludes.excludes_path(rel, None) {
+            tracing::debug!(dir = %path, "entering an excluded directory on the selected path");
+        }
+        true
+    }
 }
 
 fn scan_marker_groups(
     root: &Utf8Path,
     scans: &[MarkerScan<'_>],
-    respect_gitignore: bool,
-    exclude: &[String],
+    policy: WalkPolicy<'_>,
 ) -> Result<Vec<ProjectMarkerDirs>, CoreError> {
-    let excludes = compile_folder_globset(exclude)?;
-    let root_owned = root.to_owned();
+    let excludes = FolderExcludeSet::compile(policy.exclude)?;
+    // A selection outside the root has nothing to lift and nothing to reach.
+    let selected = policy
+        .selected
+        .filter(|selected| selected.starts_with(root))
+        .map(Utf8Path::to_owned);
+    let respect_gitignore = policy.respect_gitignore;
     let markers = scans
         .iter()
         .flat_map(|scan| std::iter::once(scan.primary).chain(scan.validation))
@@ -156,7 +244,9 @@ fn scan_marker_groups(
 
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(true)
+        // Hidden directories are pruned in `filter_entry` below, where the selection can lift
+        // the rule, rather than by the walker, which offers no exception.
+        .hidden(false)
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
@@ -169,13 +259,15 @@ fn scan_marker_groups(
         // inside a walked directory is never missed.
         .ignore(respect_gitignore)
         .require_git(true);
-    builder.filter_entry(move |entry| {
-        // Only directories are pruned; files always pass so we can match the marker on them.
-        if entry.file_type().is_none_or(|t| !t.is_dir()) {
-            return true;
-        }
-        !is_excluded(entry.path(), &root_owned, &excludes)
-    });
+    let filter = DirFilter {
+        root: root.to_owned(),
+        excludes,
+        selected: selected
+            .as_deref()
+            .and_then(|selected| selected.strip_prefix(root).ok())
+            .map(Utf8Path::to_owned),
+    };
+    builder.filter_entry(move |entry| filter.admits(entry));
 
     let mut found = scans
         .iter()
@@ -185,6 +277,7 @@ fn scan_marker_groups(
             nested: Vec::new(),
         })
         .collect::<Vec<_>>();
+    let mut reached_selected = false;
     for result in builder.build() {
         let entry = match result {
             Ok(entry) => entry,
@@ -200,6 +293,9 @@ fn scan_marker_groups(
         if entry.file_type().is_some_and(|t| t.is_dir())
             && let Some(dir) = Utf8Path::from_path(entry.path())
         {
+            if selected.as_deref() == Some(dir) {
+                reached_selected = true;
+            }
             let present = present_markers(dir, &markers);
             for (scan, result) in scans.iter().zip(&mut found) {
                 if present.contains(scan.primary) {
@@ -213,6 +309,23 @@ fn scan_marker_groups(
                 }
             }
         }
+    }
+
+    // The excludes and hidden-directory rule were lifted along the selected path, so a
+    // selection the walk still never reached sits under a gitignore rule (or an unreadable
+    // directory); say so instead of returning an empty scan the run would report as clean.
+    if let Some(selected) = &selected
+        && !reached_selected
+    {
+        let selected = selected.strip_prefix(root).unwrap_or(selected);
+        return Err(CoreError::Config(if respect_gitignore {
+            format!(
+                "{selected} was not scanned: a .gitignore/.ignore rule ignores it or a directory \
+                 above it; pass --no-gitignore to scan ignored directories"
+            )
+        } else {
+            format!("{selected} was not scanned: it or a directory above it could not be read")
+        }));
     }
 
     for (scan, result) in scans.iter().zip(&mut found) {
@@ -351,13 +464,9 @@ fn present_markers<'a>(dir: &Utf8Path, markers: &BTreeSet<&'a str>) -> BTreeSet<
 /// Matching the relative path (rather than the bare name) is what lets a leading
 /// slash anchor to the root: a bare name still prunes at any depth because
 /// [`compile_folder_globset`] gives it the `**/` variant.
-fn is_excluded(path: &std::path::Path, root: &Utf8Path, excludes: &GlobSet) -> bool {
-    if excludes.is_empty() {
-        return false;
-    }
-    Utf8Path::from_path(path)
-        .and_then(|p| p.strip_prefix(root).ok())
-        .is_some_and(|rel| !rel.as_str().is_empty() && excludes.is_match(rel.as_std_path()))
+/// Whether `path` names a dot-directory (`.git`, `.venv`).
+fn is_hidden(path: &Utf8Path) -> bool {
+    path.file_name().is_some_and(|name| name.starts_with('.'))
 }
 
 /// Split the set into topmost directories and those with an ancestor already in the set (sorted
@@ -382,6 +491,13 @@ fn split_topmost(dirs: Vec<Utf8PathBuf>) -> (Vec<Utf8PathBuf>, Vec<Utf8PathBuf>)
 #[derive(Debug, Clone)]
 pub(crate) struct FolderExcludeSet(GlobSet);
 
+impl Default for FolderExcludeSet {
+    /// The empty set, which excludes nothing.
+    fn default() -> Self {
+        Self(GlobSet::empty())
+    }
+}
+
 impl FolderExcludeSet {
     /// Compile the folder-exclude globs (an empty set matches nothing).
     ///
@@ -393,14 +509,18 @@ impl FolderExcludeSet {
     }
 
     /// Whether a member living at `path` (or under an excluded ancestor) is excluded.
+    /// Directories at or above `lifted` never count: the invocation named that directory, which
+    /// outranks a glob, and the scan walk lifted the same globs to reach it.
     #[must_use]
-    pub(crate) fn excludes_path(&self, path: &Utf8Path) -> bool {
+    pub(crate) fn excludes_path(&self, path: &Utf8Path, lifted: Option<&Utf8Path>) -> bool {
         if self.0.is_empty() {
             return false;
         }
-        path.ancestors().any(|ancestor| {
-            !ancestor.as_str().is_empty() && self.0.is_match(ancestor.as_std_path())
-        })
+        path.ancestors()
+            .take_while(|ancestor| !lifted.is_some_and(|lifted| lifted.starts_with(ancestor)))
+            .any(|ancestor| {
+                !ancestor.as_str().is_empty() && self.0.is_match(ancestor.as_std_path())
+            })
     }
 }
 
@@ -410,6 +530,13 @@ impl FolderExcludeSet {
 /// [`compile_package_globset`]).
 #[derive(Debug, Clone)]
 pub(crate) struct PackageExcludeSet(GlobSet);
+
+impl Default for PackageExcludeSet {
+    /// The empty set, which excludes nothing.
+    fn default() -> Self {
+        Self(GlobSet::empty())
+    }
+}
 
 impl PackageExcludeSet {
     /// Compile the package-exclude globs (an empty set matches nothing).
@@ -441,12 +568,33 @@ mod tests {
     fn folder_exclude_set_matches_member_by_path_prefix() {
         let set = FolderExcludeSet::compile(&["packages/ts/luup".to_string()]).expect("compile");
         // A path under an excluded directory is excluded (ancestor match).
-        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup/api")));
-        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup")));
+        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup/api"), None));
+        assert!(set.excludes_path(Utf8Path::new("packages/ts/luup"), None));
         // A sibling path is kept.
-        assert!(!set.excludes_path(Utf8Path::new("apps/admin")));
+        assert!(!set.excludes_path(Utf8Path::new("apps/admin"), None));
         // The root importer (`.`) is never matched by a sub-path exclude.
-        assert!(!set.excludes_path(Utf8Path::new(".")));
+        assert!(!set.excludes_path(Utf8Path::new("."), None));
+    }
+
+    /// Selecting a directory lifts the globs at and above it, but not below it.
+    #[test]
+    fn folder_exclude_set_lifts_the_selection_and_its_ancestors() {
+        let set = FolderExcludeSet::compile(&["incubator".to_string(), "lab".to_string()])
+            .expect("compile");
+        let selected = Some(Utf8Path::new("incubator"));
+        // The selection itself, and a member below it whose only excluded ancestor is the
+        // selection, are kept.
+        assert!(!set.excludes_path(Utf8Path::new("incubator"), selected));
+        assert!(!set.excludes_path(Utf8Path::new("incubator/tools"), selected));
+        // A glob matching below the selection still applies.
+        assert!(set.excludes_path(Utf8Path::new("incubator/lab"), selected));
+        assert!(set.excludes_path(Utf8Path::new("incubator/lab/api"), selected));
+        // A member above the selection (the owner) is never excluded, whatever matches it.
+        assert!(!set.excludes_path(
+            Utf8Path::new("incubator"),
+            Some(Utf8Path::new("incubator/lab"))
+        ));
+        assert!(!set.excludes_path(Utf8Path::new(""), selected));
     }
 
     #[test]
@@ -465,7 +613,7 @@ mod tests {
         assert!(
             !FolderExcludeSet::compile(&[])
                 .expect("compile")
-                .excludes_path(Utf8Path::new("apps/admin"))
+                .excludes_path(Utf8Path::new("apps/admin"), None)
         );
         assert!(
             !PackageExcludeSet::compile(&[])
@@ -575,7 +723,15 @@ mod tests {
             }),
         ];
 
-        let found = find_project_marker_dirs_batch(&root, &detections, false, &[])?;
+        let found = find_project_marker_dirs_batch(
+            &root,
+            &detections,
+            WalkPolicy {
+                respect_gitignore: false,
+                exclude: &[],
+                selected: None,
+            },
+        )?;
 
         assert_eq!(found[0].primary, vec![root.join("rust")]);
         assert!(found[0].validation_only.is_empty());
@@ -669,6 +825,176 @@ mod tests {
         let excludes = vec!["third_party".to_string()];
         let found = find_marker_dirs(&root, "uv.lock", false, &excludes, false).expect("scan");
         assert_eq!(found, vec![root]);
+    }
+
+    fn cargo_detection() -> ProjectDetection {
+        ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "Cargo.lock",
+                manifest: "Cargo.toml",
+                alternate_manifests: &[],
+                workspace_root: true,
+            },
+            validation_marker: "Cargo.toml",
+        }
+    }
+
+    fn policy<'a>(exclude: &'a [String], selected: Option<&'a Utf8Path>) -> WalkPolicy<'a> {
+        WalkPolicy {
+            respect_gitignore: false,
+            exclude,
+            selected,
+        }
+    }
+
+    /// The scenario behind `cooldown -C incubator …`: the repo root excludes `incubator`, so the
+    /// default scan never enters it.
+    /// Naming it lifts the prune for that path (and the ancestors leading to it) — the nested
+    /// lockfile root is found and carried for the adapter's nested-workspace appeal — while the
+    /// same glob still prunes everywhere else, including below the selection.
+    #[test]
+    fn explicitly_selected_directory_is_not_pruned_by_exclude_folders() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = utf8(tmp.path());
+        touch(&root.join("Cargo.lock"));
+        touch(&root.join("Cargo.toml"));
+        touch(&root.join("labs/incubator/Cargo.lock"));
+        touch(&root.join("labs/incubator/Cargo.toml"));
+        touch(&root.join("labs/incubator/vendor/incubator/Cargo.lock"));
+        touch(&root.join("other/incubator/Cargo.lock"));
+        let excludes = vec!["incubator".to_string()];
+
+        let pruned =
+            find_project_marker_dirs_batch(&root, &[cargo_detection()], policy(&excludes, None))?
+                .remove(0);
+        assert_eq!(pruned.primary, vec![root.clone()]);
+        assert!(
+            pruned.nested.is_empty(),
+            "the default scan prunes every `incubator`"
+        );
+
+        let selected = root.join("labs/incubator");
+        let found = find_project_marker_dirs_batch(
+            &root,
+            &[cargo_detection()],
+            policy(&excludes, Some(&selected)),
+        )?
+        .remove(0);
+        assert_eq!(found.primary, vec![root.clone()]);
+        assert_eq!(
+            found.nested,
+            vec![selected],
+            "only the selected `incubator` is entered; the sibling and the nested one stay pruned"
+        );
+        Ok(())
+    }
+
+    fn uv_detection() -> ProjectDetection {
+        ProjectDetection::PrimaryWithValidation {
+            primary: cooldown_core::ProjectMarker {
+                lockfile: "uv.lock",
+                manifest: "pyproject.toml",
+                alternate_manifests: &[],
+                workspace_root: false,
+            },
+            validation_marker: "pyproject.toml",
+        }
+    }
+
+    /// Lifting an excluded ancestor opens only the path to the selection and the selection's own
+    /// subtree: the ancestor's other children stay pruned, so a broken sibling can never fail a
+    /// run that never asked for it.
+    /// A selection outside the root lifts nothing.
+    #[test]
+    fn a_lifted_ancestor_admits_only_the_selected_path() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = utf8(tmp.path());
+        touch(&root.join("apps/web/uv.lock"));
+        touch(&root.join("apps/web/tools/uv.lock"));
+        touch(&root.join("apps/api/uv.lock"));
+        let excludes = vec!["apps".to_string()];
+
+        let scan = |selected: Option<&Utf8Path>| -> eyre::Result<Vec<Utf8PathBuf>> {
+            Ok(find_project_marker_dirs_batch(
+                &root,
+                &[uv_detection()],
+                policy(&excludes, selected),
+            )?
+            .remove(0)
+            .primary)
+        };
+
+        assert!(scan(None)?.is_empty());
+        assert_eq!(
+            scan(Some(&root.join("apps/web")))?,
+            vec![root.join("apps/web"), root.join("apps/web/tools")],
+            "the selection and what lies below it are found; the sibling `apps/api` is not"
+        );
+        assert!(scan(Some(Utf8Path::new("/elsewhere")))?.is_empty());
+        Ok(())
+    }
+
+    /// A dot-directory is never scanned by default, but naming one (or a path through one) enters
+    /// it like any other selection.
+    #[test]
+    fn a_hidden_selection_is_entered() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = utf8(tmp.path());
+        touch(&root.join("uv.lock"));
+        touch(&root.join(".scratch/proj/uv.lock"));
+        touch(&root.join(".other/uv.lock"));
+
+        let found =
+            find_project_marker_dirs_batch(&root, &[uv_detection()], policy(&[], None))?.remove(0);
+        assert_eq!(found.primary, vec![root.clone()]);
+
+        let selected = root.join(".scratch/proj");
+        let found =
+            find_project_marker_dirs_batch(&root, &[uv_detection()], policy(&[], Some(&selected)))?
+                .remove(0);
+        assert_eq!(found.primary, vec![root.clone(), selected]);
+        Ok(())
+    }
+
+    /// Gitignore rules are not lifted, but a selection they hide is an error naming the escape
+    /// hatch rather than an empty scan the run would report as clean.
+    #[test]
+    fn a_gitignored_selection_is_an_error() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = utf8(tmp.path());
+        std::fs::create_dir(root.join(".git"))?;
+        std::fs::write(root.join(".gitignore"), "vendor/\n")?;
+        touch(&root.join("uv.lock"));
+        touch(&root.join("vendor/proj/uv.lock"));
+        let selected = root.join("vendor/proj");
+
+        let error = find_project_marker_dirs_batch(
+            &root,
+            &[uv_detection()],
+            WalkPolicy {
+                respect_gitignore: true,
+                exclude: &[],
+                selected: Some(&selected),
+            },
+        )
+        .expect_err("a gitignored selection must not scan to nothing");
+        assert!(
+            error.to_string().contains("--no-gitignore"),
+            "the error names the escape hatch: {error}"
+        );
+
+        let found = find_project_marker_dirs_batch(
+            &root,
+            &[uv_detection()],
+            WalkPolicy {
+                respect_gitignore: false,
+                exclude: &[],
+                selected: Some(&selected),
+            },
+        )?
+        .remove(0);
+        assert_eq!(found.primary, vec![root.clone(), selected]);
+        Ok(())
     }
 
     #[test]

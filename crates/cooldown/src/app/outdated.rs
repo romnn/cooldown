@@ -40,6 +40,10 @@ struct OutdatedRunner<'a> {
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
     skipped_stale_projects: usize,
+    /// Whether a project already explained an empty selection, so the run-level note is redundant.
+    empty_selection_noted: bool,
+    /// Dependencies evaluated across every project, whether or not they became an item.
+    evaluated: usize,
 }
 
 impl Workspace {
@@ -67,6 +71,8 @@ impl<'a> OutdatedRunner<'a> {
             warnings: Vec::new(),
             errors: Vec::new(),
             skipped_stale_projects: 0,
+            empty_selection_noted: false,
+            evaluated: 0,
         }
     }
 
@@ -91,12 +97,33 @@ impl<'a> OutdatedRunner<'a> {
         });
         let mut summary = summarize(&self.items);
         summary.skipped_stale_projects = self.skipped_stale_projects;
+        // An error already explains an empty run; otherwise a selection that evaluated nothing
+        // must say so, or the report is indistinguishable from "everything is current".
+        if self.errors.is_empty()
+            && !self.empty_selection_noted
+            && let Some(note) = super::empty_selection_diagnostic(
+                self.opts,
+                self.evaluated,
+                self.skipped_stale_projects,
+            )
+        {
+            self.warnings.push(note);
+        }
         OutdatedOutcome {
             summary,
             items: self.items,
             warnings: self.warnings,
             errors: self.errors,
             exit: Exit::Ok,
+        }
+    }
+
+    /// Records a project that encloses the selection yet contributed no row, which also makes
+    /// the run-level empty-selection note redundant.
+    fn note_empty_project(&mut self, pctx: &super::ProjectCtx, evaluated: usize) {
+        if let Some(note) = self.ws.empty_project_note(pctx, self.opts, evaluated) {
+            self.warnings.push(note);
+            self.empty_selection_noted = true;
         }
     }
 
@@ -157,8 +184,10 @@ impl<'a> OutdatedRunner<'a> {
         let manifest_only = self
             .merge_manifest_constraints(read.adapter, pctx, &read.project_label, &mut deps)
             .await;
+        self.evaluated += deps.len();
         drop(read_guard);
         drop(refresh_guard);
+        self.note_empty_project(pctx, deps.len());
         // Identities must be adapter-confirmed before they are queried, matched, or counted
         // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
         if super::advisories::advisory_fetch_policy(pctx).is_some() {
@@ -369,7 +398,7 @@ impl<'a> OutdatedRunner<'a> {
     ) -> (bool, Option<ProjectAccessWriteGuard>) {
         match self.ws.refresh_project_lock(pctx, self.opts).await {
             Ok(refresh) => {
-                self.warnings.extend(refresh.recovery);
+                self.warnings.extend(refresh.warnings);
                 let continue_run = match refresh.report {
                     Ok(report) => report
                         .is_none_or(|report| self.handle_lock_report(report, pctx, project_label)),

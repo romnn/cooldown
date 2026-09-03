@@ -6,10 +6,13 @@ mod recovery;
 pub(in crate::cli) use recovery::{PreparedRecovery, configure_recovery_help, prepare_recovery};
 
 use super::{CliOverrides, Command, GlobalArgs};
-use crate::app::{Baseline, Clock, FixedClock, SystemClock, Workspace};
+use crate::app::{
+    Baseline, Clock, FixedClock, MemberExcludes, Progress, RunScope, SystemClock, Workspace,
+};
 use crate::discovery;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::CoreError;
+use std::collections::BTreeMap;
 
 pub(crate) struct PreparedRun {
     pub(crate) repo_root: Utf8PathBuf,
@@ -79,6 +82,12 @@ pub(crate) async fn prepare_run(
     let workdir = detect::workdir(global)?;
     let repo_root = discovery::find_repo_root(&workdir);
     let scan_root = scan_root_for(&workdir, &repo_root);
+    // A workdir below the scan root — `-C <dir>`, or simply running from inside a subdirectory —
+    // is the run's selection: detection never prunes it (a config `exclude-folders` trims the
+    // default scan, and naming a path outranks a glob), and the dependency rows are scoped to it.
+    // Otherwise a run would report an empty, healthy-looking result because an ancestor config
+    // excluded the very directory it was pointed at.
+    let scope = RunScope::new(&scan_root, &workdir);
     let configs =
         discovery::ConfigSources::load(&repo_root, global.config.as_deref(), global.no_global)?;
     let scan = configs.scan_config()?;
@@ -88,8 +97,21 @@ pub(crate) async fn prepare_run(
     // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
+    if let Some(selected) = scope.selected() {
+        reject_excluded_selection(selected, &global.exclude_folders)?;
+    }
     let invocation = options::resolve_invocation(global, overrides, &cfg, command)?;
     options::reject_offline_dry_run(command, invocation.dry_run(), invocation.offline())?;
+    options::reject_offline_lock(invocation.lock(), invocation.offline())?;
+    if let Some(selected) = scope.selected() {
+        note_overridden_excludes(
+            invocation.progress(),
+            selected,
+            cfg.exclude_folders.patterns(),
+            &scan.tool_exclude_folder_patterns(),
+            invocation.tools(),
+        )?;
+    }
     invocation.progress().phase("discovering projects");
     // Version-adopting commands revalidate npm package documents so the mutable `latest`
     // dist-tag ceiling reflects the registry's current state (read-only commands accept the
@@ -105,11 +127,13 @@ pub(crate) async fn prepare_run(
         invocation.concurrency(),
         adopting && invocation.respect_dist_tags(),
     )?;
+    let selected_dir = scope.selected_dir();
     let projects = detect::detect_projects(
         &adapters,
         &scan_root,
+        selected_dir.as_deref(),
         &scan,
-        &cfg.exclude_folders,
+        cfg.exclude_folders.patterns(),
         invocation.tools(),
         invocation.respect_gitignore(),
     )?;
@@ -128,6 +152,7 @@ pub(crate) async fn prepare_run(
     let assembly = policy::ProjectAssembly {
         adapters: &adapters,
         repo_root: &repo_root,
+        scan_root: &scan_root,
         configs: &configs,
         shared: &shared,
         invocation: &invocation,
@@ -157,21 +182,72 @@ pub(crate) async fn prepare_run(
     // `[advisories]` policy enables the feed.
     .with_advisory_source(std::sync::Arc::new(cooldown_registry::OsvSource::new(http)));
     let mut opts = invocation.into_run_opts();
-    if workdir != scan_root {
-        opts.source_dir = Some(workdir);
-    }
-    // The scan-exclude globs also filter workspace-member dependencies (folders by member path,
-    // packages by member name), so carry both global/command and per-tool excludes into the run.
-    opts.exclude_folders = cfg.exclude_folders;
-    opts.exclude_packages = cfg.exclude_packages;
-    opts.exclude_folders_by_tool = scan.tool_exclude_folders;
-    opts.exclude_packages_by_tool = scan.tool_exclude_packages;
-    opts.compile_excludes()?;
+    opts.scope = scope;
+    // The scan-exclude globs also filter workspace-member dependencies (folders by member
+    // location, packages by member name), so the same resolved lists travel into the run.
+    opts.excludes = MemberExcludes::compile(
+        cfg.exclude_folders.patterns(),
+        cfg.exclude_packages.patterns(),
+        &scan.tool_exclude_folder_patterns(),
+        &scan.tool_exclude_package_patterns(),
+    )?;
     Ok(PreparedRun {
         repo_root,
         ws,
         opts,
     })
+}
+
+/// A `--exclude-folders` glob typed on the same command line as the selection it would prune is
+/// a contradiction, not a precedence question: refuse it rather than pick a winner.
+/// Config excludes are ambient defaults the selection outranks; a CLI exclude is the same kind of
+/// explicit request as the selection itself.
+fn reject_excluded_selection(
+    rel: &Utf8Path,
+    cli_exclude_folders: &[String],
+) -> Result<(), CoreError> {
+    let cli = crate::scan::FolderExcludeSet::compile(cli_exclude_folders)?;
+    if cli.excludes_path(rel, None) {
+        return Err(CoreError::Config(format!(
+            "{rel} is selected (by --dir or the working directory) but --exclude-folders \
+             excludes it; drop one of the two"
+        )));
+    }
+    Ok(())
+}
+
+/// Tells the user, on the progress channel, when the selection is scanned despite an
+/// `exclude-folders` entry that names it or a directory above it, so a report from an excluded
+/// tree is never a mystery.
+/// The base list is the effective one, after a CLI `--exclude-folders` replaced the config's,
+/// and only the per-tool lists of tools the run selected count (all of them when `tools` is
+/// empty), since a list for a tool the run never detects prunes nothing.
+fn note_overridden_excludes(
+    progress: &Progress,
+    rel: &Utf8Path,
+    base_folders: &[String],
+    tool_folders: &BTreeMap<String, Vec<String>>,
+    tools: &[cooldown_core::ToolId],
+) -> Result<(), CoreError> {
+    let selected_tool =
+        |tool: &String| tools.is_empty() || tools.iter().any(|t| t.as_str() == tool);
+    let overridden = std::iter::once(base_folders)
+        .chain(
+            tool_folders
+                .iter()
+                .filter(|(tool, _)| selected_tool(tool))
+                .map(|(_, patterns)| patterns.as_slice()),
+        )
+        .map(crate::scan::FolderExcludeSet::compile)
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|set| set.excludes_path(rel, None));
+    if overridden {
+        progress.phase(format!(
+            "scanning {rel}: it was selected explicitly, although exclude-folders lists it"
+        ));
+    }
+    Ok(())
 }
 
 fn repo_root_is_anchored(repo_root: &camino::Utf8Path) -> bool {

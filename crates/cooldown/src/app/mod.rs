@@ -36,11 +36,12 @@ pub use progress::Progress;
 pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{
-    AdapterSet, AdvisoryFailureMode, Exit, ProjectCtx, RunOpts, TransitiveGate, Workspace,
+    AdapterSet, AdvisoryFailureMode, Exit, MemberExcludes, ProjectCtx, RunOpts, RunScope,
+    TransitiveGate, Workspace,
 };
 
 pub(crate) use recover::{RecoveryTarget, recover_targets};
 pub(crate) use workspace::{
-    FetchedRelease, LockReportAction, age_days, diag_from_error, lock_report_outcome,
-    recovery_diagnostics, render_window, round2, security_info,
+    FetchedRelease, LockReportAction, age_days, diag_from_error, empty_selection_diagnostic,
+    lock_report_outcome, recovery_diagnostics, render_window, round2, security_info,
 };

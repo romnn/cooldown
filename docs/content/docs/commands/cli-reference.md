@@ -68,7 +68,7 @@ See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder a
 | `--config <PATH>` | Load one extra, highest-precedence file layer (still below env / flags). |
 | `--no-native` | Ignore the native config layer (reproducibility / debugging). |
 | `--no-global` | Ignore the global config layer. |
-| `-C, --dir <PATH>` | Run as if from `<path>`. |
+| `-C, --dir <PATH>` | Run as if from `<path>`. Below the repo root this scopes the run to the workspace member containing it, or the members below it, plus every dependency the tool attributes to no member (so `fix`/`upgrade` under `-C <member>` can move a transitive only a sibling needs), and outranks an `exclude-folders` entry naming it; a directory `.gitignore` hides is an error unless `--no-gitignore` is passed (see [Exclusions]({{< relref "../configuration/excludes.md" >}})). |
 
 See [Precedence]({{< relref "../configuration/precedence.md" >}}) for how the layers combine.
 

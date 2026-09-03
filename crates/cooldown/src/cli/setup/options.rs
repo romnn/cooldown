@@ -1,10 +1,9 @@
-use crate::app::{Progress, RunOpts};
+use crate::app::{MemberExcludes, Progress, RunOpts, RunScope};
 use crate::cli::setup::SetupCommand;
 use crate::cli::{CliOverrides, GlobalArgs, LogLevel};
 use cooldown_cargo::CARGO_ID;
-use cooldown_core::config::{CommandConfig, WindowFields};
+use cooldown_core::config::{CommandConfig, ExcludeList, WindowFields};
 use cooldown_core::{CoreError, PatternGlob, ToolId, recognized_tool_names, tool_id};
-use std::collections::BTreeMap;
 
 pub(super) struct ResolvedInvocation {
     run: RunOpts,
@@ -35,6 +34,10 @@ impl ResolvedInvocation {
 
     pub(super) fn dry_run(&self) -> bool {
         self.run.dry_run
+    }
+
+    pub(super) fn lock(&self) -> bool {
+        self.run.lock
     }
 
     pub(super) fn fresh(&self) -> bool {
@@ -96,6 +99,21 @@ pub(super) fn reject_offline_dry_run(
     Ok(())
 }
 
+/// `--lock` hands the lock to the package manager's resolver, which reads the registry, while
+/// `--offline` promises no network.
+/// Reject the pair instead of refreshing anyway or silently skipping the refresh the user asked
+/// for.
+pub(super) fn reject_offline_lock(lock: bool, offline: bool) -> Result<(), CoreError> {
+    if lock && offline {
+        return Err(CoreError::Config(
+            "--lock refreshes the lock with the package manager's resolver, which needs the \
+             network; it cannot be combined with --offline"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_invocation(
     global: &GlobalArgs,
     overrides: &CliOverrides,
@@ -115,13 +133,9 @@ pub(super) fn resolve_invocation(
         run: RunOpts {
             tool: tools,
             package,
-            source_dir: None,
+            scope: RunScope::default(),
             // Populated in `setup` from the scan config, which owns the exclude globs.
-            exclude_folders: Vec::new(),
-            exclude_folders_by_tool: BTreeMap::default(),
-            exclude_packages: Vec::new(),
-            exclude_packages_by_tool: BTreeMap::default(),
-            compiled_excludes: None,
+            excludes: MemberExcludes::default(),
             allow_major: merged.major.unwrap_or(default_major),
             ignore_dist_tags: !merged.respect_dist_tags.unwrap_or(true),
             // A display filter, read straight from the CLI (not config-file backed).
@@ -196,8 +210,8 @@ fn advisory_failure_mode(
 
 fn builtin_command_config(default_major: bool) -> CommandConfig {
     CommandConfig {
-        exclude_folders: Vec::new(),
-        exclude_packages: Vec::new(),
+        exclude_folders: ExcludeList::default(),
+        exclude_packages: ExcludeList::default(),
         tool: Vec::new(),
         package: Vec::new(),
         gitignore: Some(true),
@@ -228,8 +242,8 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         global.tool.clone()
     };
     CommandConfig {
-        exclude_folders: Vec::new(),
-        exclude_packages: Vec::new(),
+        exclude_folders: ExcludeList::default(),
+        exclude_packages: ExcludeList::default(),
         tool,
         package: global.package.clone(),
         gitignore: overrides.gitignore,
@@ -370,7 +384,9 @@ fn env_window_fields() -> Result<WindowFields, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advisory_failure_mode, builtin_command_config, reject_offline_dry_run};
+    use super::{
+        advisory_failure_mode, builtin_command_config, reject_offline_dry_run, reject_offline_lock,
+    };
     use crate::app::AdvisoryFailureMode;
     use crate::cli::setup::SetupCommand;
     use cooldown_core::CoreError;
@@ -405,6 +421,15 @@ mod tests {
         assert_eq!(resolved.package, vec!["serde"]);
         assert_eq!(resolved.major, Some(true));
         assert_eq!(resolved.transitive, Some(true));
+    }
+
+    #[test]
+    fn offline_lock_refresh_is_rejected() {
+        let err =
+            reject_offline_lock(true, true).expect_err("offline refresh must be a usage error");
+        std::assert_matches!(err, CoreError::Config(_));
+        assert!(reject_offline_lock(true, false).is_ok());
+        assert!(reject_offline_lock(false, true).is_ok());
     }
 
     #[test]

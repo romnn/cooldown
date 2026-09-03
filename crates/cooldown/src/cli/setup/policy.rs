@@ -20,6 +20,9 @@ pub(super) struct SharedLayers {
 pub(super) struct ProjectAssembly<'a> {
     pub(super) adapters: &'a AdapterSet,
     pub(super) repo_root: &'a Utf8Path,
+    /// The root every project location is measured from: the repo root in an anchored checkout,
+    /// the working directory otherwise.
+    pub(super) scan_root: &'a Utf8Path,
     pub(super) configs: &'a ConfigSources,
     pub(super) shared: &'a SharedLayers,
     pub(super) invocation: &'a ResolvedInvocation,
@@ -139,7 +142,7 @@ async fn assemble_ctx(
     let strict_native = compute_strict_native(&layers, assembly.invocation);
     let rel_path = project
         .root
-        .strip_prefix(assembly.repo_root)
+        .strip_prefix(assembly.scan_root)
         .ok()
         .map_or_else(
             || project.root.clone(),

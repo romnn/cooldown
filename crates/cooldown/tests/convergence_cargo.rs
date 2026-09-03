@@ -35,7 +35,8 @@
 mod support;
 
 use indoc::indoc;
-use support::{ChangeVersions, Fixture, changed_packages, toml_lock_pins};
+use std::collections::BTreeSet;
+use support::{ChangeVersions, Fixture, changed_packages, toml_lock_entries, toml_lock_pins};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
 /// the matured-version set — and the precise targets cooldown computes — reproduce forever.
@@ -525,6 +526,31 @@ fn upgrade_dry_run_agrees_with_real_upgrade() {
     );
 }
 
+/// The mutating commands scope their rows against a staged copy of the project, which keeps the
+/// project's location, so `-C <member> upgrade` still plans that member's rows instead of
+/// dropping every attributed row and reporting nothing to do.
+#[test]
+fn selected_upgrade_dry_run_plans_the_selected_members_rows() {
+    skip_if_missing!("cargo");
+    let fixture = conflict_fixture();
+    let root = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
+    let scoped = fixture.cooldown_json_in(
+        Some("crates/app"),
+        &["upgrade", "--freeze", FREEZE, "--dry-run"],
+    );
+    assert!(scoped.ok(), "{:?}", scoped.error_messages());
+    let scoped_names = scoped.item_names();
+    assert!(
+        !scoped_names.is_empty(),
+        "the selected member's rows are planned, not dropped"
+    );
+    assert!(
+        scoped_names.is_subset(&root.item_names()),
+        "{scoped_names:?} is not within the root plan {:?}",
+        root.item_names()
+    );
+}
+
 #[test]
 fn upgrade_skip_only_batch_rolls_back_manifest_and_lock() {
     skip_if_missing!("cargo");
@@ -639,6 +665,442 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "explain must fail closed on a stale lock"
     );
     assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+}
+
+/// A monorepo whose root config excludes both a nested incubator workspace and one of its own
+/// members, each workspace seeded with its own lock by the real cargo.
+fn excluded_subtrees_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "cooldown.toml",
+            indoc! {r#"
+                [global]
+                exclude-folders = ["incubator", "crates/app"]
+            "#},
+        )
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["crates/app", "crates/core"]
+                exclude = ["incubator"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "crates/app/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                log = "0.4"
+            "#},
+        )
+        .write("crates/app/src/lib.rs", "")
+        .write(
+            "crates/core/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "core-lib"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                cfg-if = "1"
+            "#},
+        )
+        .write("crates/core/src/lib.rs", "")
+        // A nested workspace root the enclosing workspace excludes: a project of its own.
+        .write(
+            "incubator/Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["lab"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "incubator/lab/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "lab"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bytes = "1"
+            "#},
+        )
+        .write("incubator/lab/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &[
+                "generate-lockfile",
+                "--manifest-path",
+                "incubator/Cargo.toml",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// The default scan honors both excludes; pointing the run at either excluded directory (`-C`)
+/// scans it anyway, rather than pruning the directory during detection, scoping the root project
+/// to zero members, and exiting clean having checked nothing.
+#[test]
+fn selecting_an_excluded_directory_scans_it_instead_of_reporting_nothing() {
+    skip_if_missing!("cargo");
+    let fixture = excluded_subtrees_fixture();
+
+    // `outdated --all` names every dependency in scope, so it shows exactly what a run covered.
+    // The harness pins `--dir` itself, so the subdirectory runs go through `cooldown_json_in`.
+    let listed = |dir: Option<&str>| {
+        let out = fixture.cooldown_json_in(dir, &["outdated", "--all", "--freeze", FREEZE]);
+        assert!(out.ok(), "{dir:?}: {:?}", out.error_messages());
+        out.item_names()
+    };
+    let names = |items: &[&str]| {
+        items
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // The default scan honors both excludes: the member and the nested workspace are absent.
+    assert_eq!(listed(None), names(&["cfg-if"]));
+    // Selecting the excluded nested workspace scans it: its dependencies are the whole report.
+    assert_eq!(
+        listed(Some("incubator")),
+        names(&["bytes"]),
+        "-C into an excluded nested workspace reports that workspace, not an empty result"
+    );
+    // Selecting the excluded member of the root workspace reports that member's dependencies.
+    assert_eq!(
+        listed(Some("crates/app")),
+        names(&["log"]),
+        "-C into an excluded member reports that member's dependencies"
+    );
+    // Selecting a non-excluded member changes nothing about the excludes elsewhere.
+    assert_eq!(listed(Some("crates/core")), names(&["cfg-if"]));
+
+    // The gate evaluates the selection too, instead of passing on zero dependencies.
+    let checked = fixture.cooldown_json_in(Some("incubator"), &["check", "--latest"]);
+    assert!(checked.ok(), "{:?}", checked.error_messages());
+    assert_eq!(
+        checked.summary_checked(),
+        1,
+        "check -C incubator must evaluate the incubator's dependency"
+    );
+}
+
+/// `--lock` brings a stale `Cargo.lock` current before the read-only commands evaluate it.
+/// The refresh is the minimal one (`cargo update --workspace`): the new requirement is resolved
+/// into the lock, and every version the stale lock already held and the manifests still admit
+/// stays put — a refresh that floated the graph would itself introduce the too-fresh versions the
+/// gate then flags.
+#[test]
+fn lock_flag_refreshes_a_stale_cargo_lock_before_reading_it() {
+    skip_if_missing!("cargo");
+    let fixture = conflict_fixture();
+
+    fixture.write(
+        "crates/app/Cargo.toml",
+        &format!("{APP_MANIFEST}regex = \"1\"\n"),
+    );
+    let stale_lock = fixture.read_bytes("Cargo.lock");
+    let before = toml_lock_entries(&stale_lock);
+    assert!(
+        !before.iter().any(|(name, _)| name == "regex"),
+        "the seed lock predates the new requirement"
+    );
+
+    let checked = fixture.cooldown_json(&["check", "--latest", "--lock"]);
+    assert!(
+        checked.ok(),
+        "check --lock must gate the refreshed lock cleanly: {:?} {:?}",
+        checked.error_kinds(),
+        checked.error_messages()
+    );
+    assert_eq!(checked.summary_errors(), 0);
+    assert!(
+        !checked.warning_kinds().contains("stale_lock"),
+        "a refreshed lock is current, not stale: {:?}",
+        checked.warning_kinds()
+    );
+    let refreshed_lock = fixture.read_bytes("Cargo.lock");
+    assert_ne!(
+        stale_lock, refreshed_lock,
+        "--lock must rewrite the stale lock"
+    );
+    // Compare whole `(name, version)` nodes: a crate moved to another version, or locked at a second
+    // one, shows up as a node the stale lock had (or lacked), which a name-keyed map would hide.
+    let after = toml_lock_entries(&refreshed_lock);
+    let moved = before.difference(&after).collect::<Vec<_>>();
+    assert!(
+        moved.is_empty(),
+        "a refresh must leave every existing pin where it was, but these changed: {moved:?}"
+    );
+    let added = after.difference(&before).collect::<BTreeSet<_>>();
+    assert!(
+        added.iter().any(|(name, _)| name == "regex"),
+        "the new requirement is resolved into the lock: {added:?}"
+    );
+    // The gate read the refreshed graph, new nodes included, not the stale one it started from.
+    assert!(
+        usize::try_from(checked.summary_checked()).expect("checked count") >= added.len(),
+        "check --lock evaluated {} dependencies, fewer than the {} nodes the refresh added",
+        checked.summary_checked(),
+        added.len()
+    );
+
+    // A current lock refreshes to itself, and `outdated --lock` takes the same path.
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--lock"]);
+    assert!(outdated.ok(), "outdated --lock stays informational");
+    assert!(!outdated.warning_kinds().contains("stale_lock"));
+    assert_eq!(refreshed_lock, fixture.read_bytes("Cargo.lock"));
+
+    // `--dry-run` never mutates, so `--lock` is inert and the stale lock fails closed as usual.
+    fixture.write(
+        "crates/app/Cargo.toml",
+        &format!("{APP_MANIFEST}regex = \"1\"\nbytes = \"1\"\n"),
+    );
+    let stale_again = fixture.read_bytes("Cargo.lock");
+    let dry = fixture.cooldown_json(&["check", "--latest", "--lock", "--dry-run"]);
+    assert!(
+        !dry.ok(),
+        "a dry run must not refresh, so the stale lock still fails closed"
+    );
+    assert!(
+        dry.error_kinds().contains("stale_lock"),
+        "{:?}",
+        dry.error_kinds()
+    );
+    assert_eq!(stale_again, fixture.read_bytes("Cargo.lock"));
+}
+
+/// `--lock` refreshes only the locks the run evaluates.
+/// Selecting the excluded nested workspace leaves the enclosing workspace's `Cargo.lock` untouched
+/// even though that workspace also encloses the selection, and a root run leaves the excluded
+/// nested lock alone in turn.
+#[test]
+fn lock_refresh_touches_only_the_locks_in_scope() {
+    skip_if_missing!("cargo");
+    let fixture = excluded_subtrees_fixture();
+    // Make both locks stale, so a refresh reaching either one would rewrite it.
+    fixture.write(
+        "crates/core/Cargo.toml",
+        indoc! {r#"
+            [package]
+            name = "core-lib"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            cfg-if = "1"
+            log = "0.4"
+        "#},
+    );
+    fixture.write(
+        "incubator/lab/Cargo.toml",
+        indoc! {r#"
+            [package]
+            name = "lab"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            bytes = "1"
+            cfg-if = "1"
+        "#},
+    );
+    let root_lock = fixture.read_bytes("Cargo.lock");
+    let nested_lock = fixture.read_bytes("incubator/Cargo.lock");
+
+    let nested = fixture.cooldown_json_in(Some("incubator"), &["check", "--latest", "--lock"]);
+    assert!(
+        nested.ok(),
+        "{:?} {:?}",
+        nested.error_kinds(),
+        nested.error_messages()
+    );
+    assert!(!nested.warning_kinds().contains("stale_lock"));
+    // Both of the nested workspace's dependencies are gated from the refreshed lock.
+    assert_eq!(nested.summary_checked(), 2);
+    assert_ne!(
+        nested_lock,
+        fixture.read_bytes("incubator/Cargo.lock"),
+        "the selected workspace's lock is refreshed"
+    );
+    assert_eq!(
+        root_lock,
+        fixture.read_bytes("Cargo.lock"),
+        "the enclosing workspace's lock is not refreshed by a run inside the nested one"
+    );
+
+    // From the root, the excluded nested workspace is out of scope, and so is its lock.
+    let refreshed_nested = fixture.read_bytes("incubator/Cargo.lock");
+    let root = fixture.cooldown_json(&["check", "--latest", "--lock"]);
+    assert!(
+        root.ok(),
+        "{:?} {:?}",
+        root.error_kinds(),
+        root.error_messages()
+    );
+    assert_ne!(
+        root_lock,
+        fixture.read_bytes("Cargo.lock"),
+        "the root run refreshes the root lock"
+    );
+    assert_eq!(refreshed_nested, fixture.read_bytes("incubator/Cargo.lock"));
+}
+
+/// A refresh needs the resolver's network access, so `--lock --offline` is rejected up front as
+/// a usage error instead of failing, or silently skipping, per project.
+#[test]
+fn lock_with_offline_is_a_usage_error() {
+    skip_if_missing!("cargo");
+    let fixture = conflict_fixture();
+    fixture.write(
+        "crates/app/Cargo.toml",
+        &format!("{APP_MANIFEST}regex = \"1\"\n"),
+    );
+    let stale_lock = fixture.read_bytes("Cargo.lock");
+
+    let rejected = fixture.cooldown(&["check", "--latest", "--lock", "--offline"]);
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "a usage error, not a refresh failure: {}",
+        rejected.stderr_str()
+    );
+    assert!(
+        rejected.stderr_str().contains("--offline"),
+        "{}",
+        rejected.stderr_str()
+    );
+    assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"), "nothing ran");
+}
+
+/// Selecting a directory that holds members rather than sitting inside one (`-C crates`) scopes
+/// the run to the members below it, and the excludes still apply to those.
+/// A nested workspace of the same tool below the selection is in scope as well, and does not
+/// push the enclosing workspace's members out of it.
+#[test]
+fn selecting_a_directory_above_members_scopes_to_the_members_below_it() {
+    skip_if_missing!("cargo");
+    let fixture = excluded_subtrees_fixture();
+    let names = |items: &[&str]| {
+        items
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+    let listed = |dir: Option<&str>| {
+        let out = fixture.cooldown_json_in(dir, &["outdated", "--all", "--freeze", FREEZE]);
+        assert!(out.ok(), "{dir:?}: {:?}", out.error_messages());
+        out.item_names()
+    };
+    // `crates/core` lies below the selection and is reported; `crates/app` lies below it too but
+    // stays excluded, because only the selected path itself outranks the excludes.
+    assert_eq!(listed(Some("crates")), names(&["cfg-if"]));
+
+    // An independent nested workspace below the selection: its own project, evaluated alongside
+    // the enclosing workspace's members rather than instead of them.
+    fixture
+        .write(
+            "crates/nested/Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["tool"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "crates/nested/tool/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "nested-tool"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("crates/nested/tool/src/lib.rs", "");
+    fixture
+        .run_tool(
+            "cargo",
+            &[
+                "generate-lockfile",
+                "--manifest-path",
+                "crates/nested/Cargo.toml",
+            ],
+            &[],
+        )
+        .expect_success();
+    assert_eq!(
+        listed(Some("crates")),
+        names(&["cfg-if", "itoa"]),
+        "a nested workspace below the selection joins the enclosing members, not replaces them"
+    );
+    assert_eq!(listed(Some("crates/nested")), names(&["itoa"]));
+    assert_eq!(listed(None), names(&["cfg-if", "itoa"]));
+}
+
+/// A selection the run cannot honor is an error, and one that evaluates nothing is reported: the
+/// two ways a `-C` run could otherwise pass on zero dependencies.
+#[test]
+fn contradictory_or_empty_selections_are_reported() {
+    skip_if_missing!("cargo");
+    let fixture = excluded_subtrees_fixture();
+
+    // The run's own `--exclude-folders` names the selected directory.
+    let conflict = fixture.cooldown_in(
+        Some("incubator"),
+        &["check", "--latest", "--exclude-folders", "incubator"],
+    );
+    assert_eq!(conflict.status.code(), Some(2), "{}", conflict.stderr_str());
+    assert!(
+        conflict.stderr_str().contains("--exclude-folders excludes"),
+        "{}",
+        conflict.stderr_str()
+    );
+
+    // No project or member covers the selected directory.
+    std::fs::create_dir_all(fixture.root().join("docs")).expect("docs dir");
+    let empty = fixture.cooldown_json_in(Some("docs"), &["check", "--latest"]);
+    assert!(empty.ok(), "{:?}", empty.error_messages());
+    assert_eq!(empty.summary_checked(), 0);
+    assert!(
+        empty.warning_kinds().contains("config"),
+        "an empty selection is called out, not passed silently: {:?}",
+        empty.warning_kinds()
+    );
+
+    // A gitignored selection is never reached by the scan; the error names the flag that lifts the
+    // rule, and with it the selection is evaluated.
+    fixture.write(".gitignore", "incubator/\n");
+    let ignored = fixture.cooldown_in(Some("incubator"), &["check", "--latest"]);
+    assert_eq!(ignored.status.code(), Some(2), "{}", ignored.stderr_str());
+    assert!(
+        ignored.stderr_str().contains("--no-gitignore"),
+        "{}",
+        ignored.stderr_str()
+    );
+    let lifted =
+        fixture.cooldown_json_in(Some("incubator"), &["check", "--latest", "--no-gitignore"]);
+    assert!(lifted.ok(), "{:?}", lifted.error_messages());
+    assert_eq!(lifted.summary_checked(), 1);
 }
 
 #[test]

@@ -28,12 +28,17 @@ pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
         None => Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(CoreError::from)?)
             .map_err(|_| CoreError::PathEncoding("current dir is not valid UTF-8".into()))?,
     };
-    std::fs::canonicalize(&dir)
-        .map_err(CoreError::from)
+    let canonical = std::fs::canonicalize(&dir)
+        .map_err(|error| CoreError::Config(format!("--dir {dir}: {error}")))
         .and_then(|path| {
             Utf8PathBuf::from_path_buf(path)
                 .map_err(|_| CoreError::PathEncoding(format!("{dir} is not valid UTF-8")))
-        })
+        })?;
+    // A file canonicalizes fine, but selecting one would scope the run to nothing and pass.
+    if !canonical.is_dir() {
+        return Err(CoreError::Config(format!("--dir {dir} is not a directory")));
+    }
+    Ok(canonical)
 }
 
 /// `revalidate_npm_listings` is set for version-adopting commands that honor the dist-tag ceiling:
@@ -95,9 +100,16 @@ pub(super) fn adapter_set(
     Ok((adapters, http))
 }
 
+/// Detects every project under `workdir` for the selected tools.
+///
+/// `selected_dir` is the directory an explicit `-C`/`--dir` (or the invocation's own working
+/// directory) named below the scan root, when there is one: the `exclude-folders` globs never
+/// prune it or the ancestors leading to it, so a run pointed at an excluded subtree still finds
+/// the projects there.
 pub(super) fn detect_projects(
     adapters: &AdapterSet,
     workdir: &camino::Utf8Path,
+    selected_dir: Option<&camino::Utf8Path>,
     scan: &ScanConfig,
     exclude_folders_base: &[String],
     tools: &[ToolId],
@@ -144,8 +156,11 @@ pub(super) fn detect_projects(
         let found = crate::scan::find_project_marker_dirs_batch(
             workdir,
             &detections,
-            respect_gitignore,
-            &exclude,
+            crate::scan::WalkPolicy {
+                respect_gitignore,
+                exclude: &exclude,
+                selected: selected_dir,
+            },
         )?;
         for (index, found) in indices.into_iter().zip(found) {
             let slot = found_by_adapter.get_mut(index).ok_or_else(|| {
