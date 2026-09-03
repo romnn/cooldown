@@ -27,7 +27,9 @@ use serde::Serialize;
 /// # Examples
 ///
 /// ```
-/// use cooldown_render::{to_json, Envelope, OutdatedMeta, OutdatedSummary, OutdatedItem};
+/// use cooldown_render::{
+///     to_json, Envelope, OutdatedMeta, OutdatedSummary, OutdatedItem, SCHEMA_VERSION,
+/// };
 ///
 /// let env = Envelope::new(
 ///     "outdated",
@@ -49,7 +51,7 @@ use serde::Serialize;
 ///     Vec::<OutdatedItem>::new(),
 /// );
 /// let json = to_json(&env)?;
-/// assert!(json.contains("\"schemaVersion\": 5"));
+/// assert!(json.contains(&format!("\"schemaVersion\": {SCHEMA_VERSION}")));
 /// # Ok::<(), serde_json::Error>(())
 /// ```
 pub fn to_json<M: Serialize, S: Serialize, I: Serialize>(
