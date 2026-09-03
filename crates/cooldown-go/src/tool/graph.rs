@@ -57,9 +57,14 @@ pub(super) async fn verify_lock_current(go: &Go, project: &Project) -> Result<Lo
             status: LockStatus::Current,
             detail: "go.mod/go.sum are tidy".to_string(),
         }),
+        // The detail names the module so a repository with several go modules says which one to
+        // tidy (the diagnostic's own path field is not printed on the TTY).
         Ok(false) => Ok(LockVerifyReport {
             status: LockStatus::Stale,
-            detail: "go.mod/go.sum are stale; run `go mod tidy`".to_string(),
+            detail: format!(
+                "go.mod/go.sum are stale in {}; run `go mod tidy`",
+                project.root
+            ),
         }),
         Err(error) => Err(error),
     }

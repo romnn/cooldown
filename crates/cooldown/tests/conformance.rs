@@ -375,7 +375,12 @@ impl ToolRead for FakeEco {
             } else {
                 LockStatus::Current
             },
-            detail: if stale { "stale".into() } else { "tidy".into() },
+            // Like the real adapters, the stale detail names the directory it was probed in.
+            detail: if stale {
+                format!("fake.lock is stale in {}", p.root)
+            } else {
+                "tidy".into()
+            },
         })
     }
 }
@@ -2318,6 +2323,60 @@ async fn upgrade_honors_allow_stale_lock_after_apply() {
         out.warnings
             .iter()
             .any(|diag| diag.kind == DiagnosticKind::StaleLock)
+    );
+}
+
+/// A dry run probes the lock in a throwaway copy, whose temp path is gone by the time the report
+/// prints; the stale-lock detail must name the source project the reader can act on.
+#[tokio::test]
+async fn a_dry_run_stale_lock_names_the_source_project_not_the_copy() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let mut locked = HashMap::new();
+    locked.insert(
+        "a".to_string(),
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+    );
+    let fake = FakeEco {
+        stale_lock_after_apply: true,
+        ..fake(
+            root.clone(),
+            vec![dep("a", "v1.0.0", true)],
+            Vec::new(),
+            releases,
+            locked,
+        )
+    };
+    let ws = workspace(fake, Baseline::default());
+
+    let out = ws
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..opts()
+        })
+        .await;
+
+    let stale = out
+        .errors
+        .iter()
+        .find(|diag| diag.kind == DiagnosticKind::StaleLock)
+        .expect("the post-apply probe reports the stale lock");
+    assert_eq!(
+        stale.message,
+        format!("fake.lock is stale in {root}"),
+        "the detail names the source root, not the copy the dry run resolved in"
     );
 }
 

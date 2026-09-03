@@ -65,6 +65,10 @@ pub(super) struct UpgradeCtx<'a> {
     pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
+    /// The root of the project the run is about, which is `pctx.project.root` only when the run
+    /// mutates the source: a dry run, an `outdated` preview, and an isolated trial hand the
+    /// executor a throwaway copy whose temp path would otherwise leak into diagnostics.
+    source_root: &'a camino::Utf8Path,
     repo_root: &'a camino::Utf8Path,
     access: ProjectExecution,
     defer_build: bool,
@@ -88,6 +92,7 @@ impl<'a> UpgradeCtx<'a> {
         writer: &'a dyn ToolWrite,
         pctx: &'a super::ProjectCtx,
         opts: &'a RunOpts,
+        source_root: &'a camino::Utf8Path,
         repo_root: &'a camino::Utf8Path,
         access: ProjectExecution,
         defer_build: bool,
@@ -97,6 +102,7 @@ impl<'a> UpgradeCtx<'a> {
             writer,
             pctx,
             opts,
+            source_root,
             repo_root,
             access,
             defer_build,
@@ -105,6 +111,18 @@ impl<'a> UpgradeCtx<'a> {
 
     pub(super) fn tool_name(&self) -> &'static str {
         self.pctx.tool.as_str()
+    }
+
+    /// `detail` with the throwaway copy's root spelled as the source project's, for tool output
+    /// that names the directory it ran in (a stale-lock or build detail): a temp path that is gone
+    /// by the time the report prints tells the reader nothing.
+    pub(super) fn relabel_copy_paths(&self, detail: &str) -> String {
+        let copy = self.pctx.project.root.as_str();
+        if copy == self.source_root.as_str() {
+            detail.to_string()
+        } else {
+            detail.replace(copy, self.source_root.as_str())
+        }
     }
 
     fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
@@ -248,6 +266,7 @@ impl Workspace {
                     writer,
                     effective_pctx,
                     opts,
+                    &pctx.project.root,
                     self.repo_root(),
                     access,
                     false,
@@ -344,6 +363,7 @@ impl Workspace {
                 writer,
                 &copied_pctx,
                 &preview_opts,
+                &pctx.project.root,
                 self.repo_root(),
                 prepared.execution(),
                 false,
@@ -422,6 +442,7 @@ impl Workspace {
                 writer,
                 &copied_pctx,
                 &trial_opts,
+                &pctx.project.root,
                 self.repo_root(),
                 execution,
                 true,

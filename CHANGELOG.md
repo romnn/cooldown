@@ -72,9 +72,11 @@
   /repo/incubator; run …` while `check` said only `Cargo.lock is stale; run …` for the same
   condition — in a repository with five Cargo locks (a parked nested workspace, standalone fuzz
   and wasm projects) the one to refresh had to be inferred from the dependency count dropping
-  between runs. The lock-currency probe's detail now names the project root for cargo, uv, and
-  the npm family (`pnpm-lock.yaml is stale in /repo/apps: <pnpm's own reason>`), in the error, in
-  the `--allow-stale-lock` warning, and in `outdated`.
+  between runs. The lock-currency probe's detail now names the project root for cargo, go, uv,
+  and the npm family (`pnpm-lock.yaml is stale in /repo/apps: <pnpm's own reason>`), in the
+  error, in the `--allow-stale-lock` warning, and in `outdated`. A detail probed in a throwaway
+  copy (`--dry-run`, the `outdated` preview) names the source project, not the temp directory the
+  copy lived in.
 
 ## v0.0.18
 

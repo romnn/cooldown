@@ -2619,7 +2619,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     // diagnostic, matching `diag_from_error`.
                     let diag = Diagnostic::new(
                         DiagnosticKind::StaleLock,
-                        cooldown_core::redact::url_secrets(&report.detail),
+                        cooldown_core::redact::url_secrets(
+                            &self.ctx.relabel_copy_paths(&report.detail),
+                        ),
                     )
                     .with_tool(self.ctx.tool_name())
                     .with_project(self.project_label())
@@ -2639,7 +2641,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         self.acc.warnings.push(
                             Diagnostic::new(
                                 DiagnosticKind::LockUnknown,
-                                cooldown_core::redact::url_secrets(&report.detail),
+                                cooldown_core::redact::url_secrets(
+                                    &self.ctx.relabel_copy_paths(&report.detail),
+                                ),
                             )
                             .with_tool(self.ctx.tool_name())
                             .with_project(self.project_label())
@@ -2669,7 +2673,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         self.acc.errors.push(
                             Diagnostic::new(
                                 DiagnosticKind::ToolFailed,
-                                cooldown_core::redact::url_secrets(&report.detail),
+                                cooldown_core::redact::url_secrets(
+                                    &self.ctx.relabel_copy_paths(&report.detail),
+                                ),
                             )
                             .with_tool(self.ctx.tool_name())
                             .with_project(self.project_label()),
