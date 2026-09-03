@@ -889,7 +889,7 @@ fn report_importer_splits(
         }
         report.warnings.push(
             Diagnostic::new(
-                DiagnosticKind::Held,
+                DiagnosticKind::DuplicateCopy,
                 format!(
                     "{}; the importer(s) still at {} are excluded from this run and were left in place",
                     split.describe(),
@@ -935,7 +935,7 @@ fn report_graph_duplicates<L: NodeLock>(
         }
         report.warnings.push(
             Diagnostic::new(
-                DiagnosticKind::Held,
+                DiagnosticKind::DuplicateCopy,
                 format!(
                     "{name} resolved at one version ({single}) across the graph before the run and at several after it ({}): a copy no importer declares, pulled in by another package's requirement",
                     now.iter().cloned().collect::<Vec<_>>().join(", ")
@@ -4544,7 +4544,7 @@ mod whole_graph_tests {
                 report.warnings
             );
         };
-        assert_eq!(warning.kind, DiagnosticKind::Held);
+        assert_eq!(warning.kind, DiagnosticKind::DuplicateCopy);
         assert_eq!(warning.package.as_deref(), Some("mongoose"));
         assert!(warning.message.contains("legacy"), "{}", warning.message);
         assert!(warning.message.contains("excluded"), "{}", warning.message);
@@ -5098,6 +5098,10 @@ mod whole_graph_tests {
             panic!("the new copy is reported once: {:?}", report.warnings);
         };
         assert_eq!(warning.package.as_deref(), Some("stateful"));
+        // The copy was added, not held back, so the warning must not read as a `held` one — the
+        // `outdated` summary's `held` count is about held rows and would otherwise never
+        // reconcile with the warning block.
+        assert_eq!(warning.kind, DiagnosticKind::DuplicateCopy);
         assert!(
             warning.message.contains("(1.9.14)") && warning.message.contains("1.8.0, 1.9.14"),
             "{}",

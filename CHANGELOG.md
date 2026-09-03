@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A second copy the resolve adds is a `duplicate_copy` warning, not a `held` one.** An
+  `outdated` run summarized `8 held` while its warning block held thirty `warning [held]` lines,
+  and a reader reconciling the two could not: the summary counts rows whose status is `held`
+  (pins, bounds, ceilings), while every one of those warnings was a new duplicate copy the
+  preview's resolve had committed (the `@rollup/rollup-*` platform packages at two versions after
+  `rollup` was rolled back) — nothing held, a copy added. Those warnings, and the one for an
+  excluded importer left on the old copy, now carry their own `duplicate_copy` kind. The
+  diagnostic-kind set is part of the JSON contract, so `schemaVersion` is now `6`.
+
 - **`check`'s stale-lock error names the project.** `upgrade` reported `Cargo.lock is stale in
   /repo/incubator; run …` while `check` said only `Cargo.lock is stale; run …` for the same
   condition — in a repository with five Cargo locks (a parked nested workspace, standalone fuzz

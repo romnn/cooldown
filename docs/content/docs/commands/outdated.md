@@ -25,7 +25,7 @@ cooldown outdated
 | **Cooldown** | `age/window` for the relevant candidate — how old it is versus the window it must clear. A shortened advisory window appends `(security GHSA-…)`; a stricter clamp appends `(≥source)`. |
 | **Status** | `adoptable`, `in cooldown`, `exempt`, `held`, or `up-to-date`; held rows show the reason. With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enabled, a candidate that fixes an advisory affecting the current pin is annotated `⚠ fixes GHSA-… (high)`. |
 
-The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default.
+The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default. Its `held` figure counts the rows whose status is `held` (exact pins, commit pins, declared bounds, ceilings); the `warning [held]` lines under the table are a different thing — per-package holds the verification preview reports — and a second copy the preview's resolve added is a `duplicate_copy` warning, not a `held` one.
 
 ## What it shows by default
 

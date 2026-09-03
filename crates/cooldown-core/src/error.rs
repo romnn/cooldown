@@ -399,6 +399,13 @@ diagnostic_kinds! {
     /// The user can downgrade it manually, opt into pinned downgrades, acknowledge it in the
     /// baseline, or wait.
     Held = "held",
+    /// A resolve gave a package a second resolved copy beside the one the graph had before the
+    /// run — pulled in by another package's own requirement, or left behind in an importer the
+    /// run excludes — and the lock was committed with both.
+    ///
+    /// Distinct from [`Held`](DiagnosticKind::Held): nothing was held back, a copy was added.
+    /// `[tool.pnpm] single-copy` and `--fail-on-new-duplicate` turn the addition into a refusal.
+    DuplicateCopy = "duplicate_copy",
     /// The advisory feed could not be reached or its response could not be parsed.
     ///
     /// Fail-open on the window: the ordinary, stricter window stands; only the

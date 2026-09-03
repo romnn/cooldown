@@ -112,7 +112,7 @@ mod tests {
         );
         let json = to_json(&env).expect("envelope serializes");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schemaVersion"], 5);
+        assert_eq!(v["schemaVersion"], 6);
         assert_eq!(v["command"], "outdated");
         assert_eq!(v["ok"], true);
         assert_eq!(v["items"][0]["adoptableTarget"], "v0.18.0");

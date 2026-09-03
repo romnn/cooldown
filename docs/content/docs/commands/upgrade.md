@@ -80,8 +80,9 @@ to pin, floated in only some importers — is never committed: the batch is refu
 named, and candidate isolation holds the candidate whose landing caused it (a resolver-conflict row
 carrying that detail) while the rest of the batch lands. A split whose managed
 importers all agree on one version, with only importers the run excludes left behind on the old
-one, is what the exclusion asked for; it is committed and reported as a warning naming those
-importers. Managed importers ending up on two versions fail the batch however many excluded
+one, is what the exclusion asked for; it is committed and reported as a `duplicate_copy` warning
+naming those importers, the same kind that names a second copy a dependent's own requirement pulls
+in below the importers' view. Managed importers ending up on two versions fail the batch however many excluded
 importers stayed behind, and so does a settlement that *re-declares* an excluded importer's
 dependency — a changed specifier, an entry appearing or disappearing, a version its own range
 provably excludes — which pnpm never does on its own: cooldown never re-resolves an importer it was

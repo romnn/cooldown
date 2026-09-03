@@ -11,7 +11,7 @@ use cooldown_core::{
 use serde::{Serialize, Serializer};
 
 /// The JSON schema version.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
