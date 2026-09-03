@@ -217,6 +217,7 @@ impl Workspace {
                             rel_path: pctx.rel_path.clone(),
                             policy: pctx.policy.clone(),
                             edge_policy: pctx.edge_policy,
+                            single_copy: pctx.single_copy.clone(),
                         };
                         _dry_copy = copy;
                         &dry_pctx
@@ -326,6 +327,7 @@ impl Workspace {
             rel_path: pctx.rel_path.clone(),
             policy: pctx.policy.clone(),
             edge_policy: pctx.edge_policy,
+            single_copy: pctx.single_copy.clone(),
         };
         let mut preview_opts = opts.clone();
         preview_opts.build = false;
@@ -407,6 +409,7 @@ impl Workspace {
             rel_path: pctx.rel_path.clone(),
             policy: pctx.policy.clone(),
             edge_policy: pctx.edge_policy,
+            single_copy: pctx.single_copy.clone(),
         };
         let mut trial_opts = opts.clone();
         trial_opts.build = false;

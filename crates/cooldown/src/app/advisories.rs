@@ -879,6 +879,7 @@ mod tests {
                 strict_native: false,
             },
             edge_policy: cooldown_core::EdgePolicy::default(),
+            single_copy: Vec::new(),
         }
     }
 

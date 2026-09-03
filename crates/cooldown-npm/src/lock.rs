@@ -11,7 +11,7 @@
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to refresh the lock after a manifest edit.
@@ -105,6 +105,15 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn catalog_managed_names(_content: &str, _excluded: &HashSet<String>) -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// Every requirement edge between resolved packages, keyed by the required `(name, version)`
+    /// and listing the dependents as `name@version` — what names the package whose own
+    /// requirement pulled a second copy of a name into the graph.
+    /// Default: empty (only pnpm's lock records per-package edges in a form worth reading).
+    #[must_use]
+    fn graph_dependents(_content: &str) -> HashMap<(String, String), Vec<String>> {
+        HashMap::new()
     }
 
     /// Every workspace member directory the lock records, whatever it declares — pnpm's
@@ -622,8 +631,7 @@ pub(crate) struct PnpmLockDocument {
     lockfile_version: Option<LockfileVersion>,
     importers: YamlEntries<Tolerant<PnpmImporter>>,
     packages: YamlEntries<Tolerant<PnpmPackage>>,
-    /// Only the keys are consumed ([`PnpmLockDocument::package_and_snapshot_keys`]).
-    snapshots: YamlEntries<IgnoredAny>,
+    snapshots: YamlEntries<Tolerant<PnpmSnapshot>>,
 }
 
 /// The lock's `lockfileVersion` scalar, normalized to its textual spelling. pnpm writes it as a
@@ -798,6 +806,17 @@ impl PnpmImporter {
 struct PnpmImporterEntry {
     specifier: Option<String>,
     version: Option<String>,
+}
+
+/// One `snapshots:` entry (lockfileVersion 9): the resolved package's own requirement edges, each
+/// value the required package's resolved version — peer suffix included — or, under an aliased
+/// key, the real package's `name@version`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PnpmSnapshot {
+    dependencies: YamlEntries<Tolerant<String>>,
+    #[serde(rename = "optionalDependencies")]
+    optional_dependencies: YamlEntries<Tolerant<String>>,
 }
 
 /// One `packages:` entry: its resolution record and declared peer ranges.
@@ -1386,6 +1405,10 @@ impl NodeLock for Pnpm {
 
     fn local_package_consumers(content: &str) -> HashMap<String, Vec<String>> {
         parse_pnpm_local_package_consumers(content)
+    }
+
+    fn graph_dependents(content: &str) -> HashMap<(String, String), Vec<String>> {
+        parse_pnpm_graph_dependents(content)
     }
 
     fn relock_args(_before: Option<&str>) -> Vec<String> {
@@ -2012,6 +2035,64 @@ fn parse_pnpm_importer_members(
         }
     });
     map
+}
+
+/// Every requirement edge in the lock's `snapshots:` section, keyed by the required
+/// `(name, version)` and listing the dependents as `name@version`, sorted and deduplicated — the
+/// index that names which package's own requirement pulled a second copy into the graph.
+/// `link:`/`file:`/`workspace:` values and URL resolutions bind no registry version and are left
+/// out; a value under an aliased key (`real@1.2.3`) is credited to the real package.
+fn parse_pnpm_graph_dependents(content: &str) -> HashMap<(String, String), Vec<String>> {
+    let Some(doc) = parse_pnpm_document(content) else {
+        return HashMap::new();
+    };
+    let mut dependents: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
+    for (key, snapshot) in doc.snapshots.entries() {
+        let Some(snapshot) = snapshot.known() else {
+            continue;
+        };
+        let Some(dependent) = split_name_version(strip_pnpm_peer_suffixes(key)) else {
+            continue;
+        };
+        let dependent = format!("{}@{}", dependent.name, dependent.version);
+        for group in [&snapshot.dependencies, &snapshot.optional_dependencies] {
+            for (name, value) in group.entries() {
+                let Some(value) = value.known() else {
+                    continue;
+                };
+                if let Some(required) = snapshot_edge_target(name, value) {
+                    dependents
+                        .entry(required)
+                        .or_default()
+                        .insert(dependent.clone());
+                }
+            }
+        }
+    }
+    dependents
+        .into_iter()
+        .map(|(required, names)| (required, names.into_iter().collect()))
+        .collect()
+}
+
+/// The `(name, version)` one snapshot edge `name: value` binds, or `None` for a value that is no
+/// registry version.
+/// An alias value carries the real package (`real@1.2.3`, told from a URL by its digit-led
+/// version); anything else is the named package at the value's version, peer suffix stripped.
+fn snapshot_edge_target(name: &str, value: &str) -> Option<(String, String)> {
+    if value.starts_with("link:") || value.starts_with("file:") || value.starts_with("workspace:") {
+        return None;
+    }
+    let value = strip_pnpm_peer_suffixes(value);
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(real) = split_name_version(value)
+        .filter(|real| real.version.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Some((real.name, real.version));
+    }
+    (!is_url_resolution(value)).then(|| (name.to_string(), value.to_string()))
 }
 
 /// Whether an importer's resolved `version:` is a URL rather than a registry version: pnpm records
@@ -2982,6 +3063,65 @@ packages:
     /// A git or tarball resolution in one importer is not a version line: the name keeps its one
     /// registry line, so a target every plain range admits still lands, and the line stays visible
     /// to the resolver-introduced-split guard.
+    /// The dependents index reads the v9 `snapshots:` edges: a peer-suffixed key and value are
+    /// reduced to `name@version`, an aliased edge is credited to the real package, and
+    /// `link:` and URL values bind nothing.
+    #[test]
+    fn graph_dependents_read_the_snapshot_edges() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  vite-plugin-solid:
+                    specifier: ^2.11.0
+                    version: 2.11.14(solid-js@1.9.15)
+
+            packages:
+
+              solid-js@1.9.15:
+                resolution: {integrity: sha512-a}
+
+              vite-plugin-solid@2.11.14:
+                resolution: {integrity: sha512-b}
+
+            snapshots:
+
+              solid-js@1.9.15:
+                dependencies:
+                  seroval: 1.3.2
+
+              vite-plugin-solid@2.11.14(solid-js@1.9.15):
+                dependencies:
+                  solid-js: 1.9.15
+                  my-lodash: lodash@4.17.21
+                  local: link:../local
+                  patched: https://codeload.github.com/x/y/tar.gz/abc
+                optionalDependencies:
+                  fsevents: 2.3.3
+        "};
+        let dependents = Pnpm::graph_dependents(lock);
+        let of = |name: &str, version: &str| {
+            dependents
+                .get(&(name.to_string(), version.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(of("solid-js", "1.9.15"), vec!["vite-plugin-solid@2.11.14"]);
+        assert_eq!(of("seroval", "1.3.2"), vec!["solid-js@1.9.15"]);
+        assert_eq!(of("lodash", "4.17.21"), vec!["vite-plugin-solid@2.11.14"]);
+        assert_eq!(of("fsevents", "2.3.3"), vec!["vite-plugin-solid@2.11.14"]);
+        assert!(of("my-lodash", "lodash@4.17.21").is_empty());
+        assert!(
+            !dependents
+                .keys()
+                .any(|(name, _)| name == "local" || name == "patched"),
+            "layout facts and URL resolutions bind no version: {dependents:?}"
+        );
+    }
+
     #[test]
     fn a_url_resolved_importer_entry_is_not_a_version_line() {
         let lock = indoc! {"

@@ -31,6 +31,27 @@ Scope policy to one package manager. Every supported tool is its own name — `c
 min-age = "21d"       # a longer window for Python deps only
 ```
 
+### `[tool.pnpm] single-copy`
+
+The packages a pnpm resolve must never leave at two resolved copies:
+
+```toml
+[tool.pnpm]
+single-copy = ["solid-js", "react", "typescript"]
+```
+
+A second copy a dependent's own requirement pulls into the graph is ordinarily committed and
+reported as a `duplicate_copy` warning. For a listed name the settlement is refused instead: the
+lock is restored and the candidate whose landing added the copy is held with the copy and its
+requirer named (see [upgrade]({{< relref "../commands/upgrade.md" >}}#whole-workspace-landings-pnpm)).
+`--fail-on-new-duplicate` gates every package for one run. The key is pnpm-specific and accepted
+only here (like `edge-policy` under `[tool.cargo]`), and the nearest `cooldown.toml` that sets it
+wins outright — a nested workspace states its own list in full. Names in `pnpm-workspace.yaml`'s
+`overrides` are *not* gated by default: an override pins a version for every request that matches
+its range, which already keeps a copy single where the range is exact, and a ranged override is
+often about forcing a patched transitive rather than about running the package once — list the
+names you mean.
+
 ## `[registry."<host>"]` — per registry
 
 Scope policy to a registry or index by host. The natural home for "our own registry is trusted":

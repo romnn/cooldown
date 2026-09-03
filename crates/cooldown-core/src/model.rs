@@ -856,6 +856,40 @@ pub struct BaselineViolation {
     pub version: Version,
 }
 
+/// The packages a settled resolve must not leave at a second resolved copy.
+///
+/// A joint resolve can give a package a second copy beside the one the graph had before the run —
+/// a dependent's own requirement pulling in another version below the importers' view — and the
+/// adapter commits it with a `duplicate_copy` warning, since that copy is the resolver's legitimate
+/// answer to the dependent's range.
+/// For a runtime with instance-level state (`solid-js`, `react`) two copies break silently, so a
+/// gated name turns the warning into a refusal: the adapter rejects the settlement, the lock is
+/// restored, and candidate isolation holds the responsible candidate with the copy named, exactly
+/// as a partial landing is treated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SingleCopyPolicy {
+    /// The names configured to stay single-copy (`[tool.pnpm] single-copy`).
+    pub names: std::collections::BTreeSet<String>,
+    /// Whether every name must stay single-copy (`--fail-on-new-duplicate`).
+    pub every_name: bool,
+}
+
+impl SingleCopyPolicy {
+    /// The option that gates `name` — spelled for the refusal's row — or `None` when a second copy
+    /// of it is reported rather than refused.
+    /// The configured list is named ahead of the flag because it is the more specific statement.
+    #[must_use]
+    pub fn gate_of(&self, name: &str) -> Option<&'static str> {
+        if self.names.contains(name) {
+            Some("`[tool.pnpm] single-copy`")
+        } else if self.every_name {
+            Some("`--fail-on-new-duplicate`")
+        } else {
+            None
+        }
+    }
+}
+
 /// A set of planned changes handed to an adapter's `apply`.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
@@ -882,6 +916,9 @@ pub struct Plan {
     /// veto an update in an included one by declaring the package on another line.
     /// Empty when nothing is excluded or the adapter attributes no members.
     pub excluded_members: Vec<MemberRef>,
+    /// The packages the resolve must not leave at a second resolved copy (`[tool.pnpm]
+    /// single-copy`, `--fail-on-new-duplicate`); see [`SingleCopyPolicy`].
+    pub single_copy: SingleCopyPolicy,
 }
 
 /// Declares [`SkipReason`] together with its [`ALL`](SkipReason::ALL) enumeration and per-variant

@@ -1055,6 +1055,159 @@ fn upgrade_names_a_peer_only_declaration_behind_a_partial_landing() {
     );
 }
 
+/// A root importer pinning `chalk` exactly beside `log-symbols`, whose next major (6.0.0) requires
+/// the chalk v5 line: upgrading `log-symbols` gives the graph a second `chalk` below the importer's
+/// view — the copy `single-copy` exists to refuse.
+const SINGLE_COPY_PACKAGE_JSON: &str = r#"{
+  "name": "cooldown-pnpm-single-copy-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "chalk": "4.1.2",
+    "log-symbols": "^4.1.0"
+  }
+}
+"#;
+
+const SINGLE_COPY_CONFIG: &str = "[tool.pnpm]\nsingle-copy = [\"chalk\"]\n";
+
+fn single_copy_fixture(config: Option<&str>) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", SINGLE_COPY_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    if let Some(config) = config {
+        fixture.write("cooldown.toml", config);
+    }
+    seed_lock(&fixture, FREEZE);
+    fixture
+}
+
+/// The `chalk@<version>` keys of the lock's `packages:` section, in lock order — one per resolved
+/// copy (the `snapshots:` section repeats each key per peer context and is skipped).
+fn chalk_package_keys(lock: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(lock);
+    let packages = text
+        .split("\npackages:\n")
+        .nth(1)
+        .map(|rest| rest.split("\nsnapshots:\n").next().unwrap_or(rest))
+        .unwrap_or_default();
+    packages
+        .lines()
+        .filter_map(|line| line.strip_prefix("  chalk@"))
+        .filter_map(|rest| rest.strip_suffix(':'))
+        .map(|version| format!("chalk@{version}"))
+        .collect()
+}
+
+/// `[tool.pnpm] single-copy` turns the second copy into a refusal: the candidate whose landing
+/// added it is held with the copy and its requirer named, and the lock is restored — byte for
+/// byte, since nothing else in the batch lands.
+#[test]
+fn single_copy_refuses_a_second_copy_and_restores_the_lock() {
+    skip_if_missing!("pnpm");
+    for (config, flag, gate) in [
+        (Some(SINGLE_COPY_CONFIG), None, "`[tool.pnpm] single-copy`"),
+        (
+            None,
+            Some("--fail-on-new-duplicate"),
+            "`--fail-on-new-duplicate`",
+        ),
+    ] {
+        let fixture = single_copy_fixture(config);
+        let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+        assert_eq!(
+            chalk_package_keys(&lock_before),
+            vec!["chalk@4.1.2"],
+            "the seed holds one chalk copy"
+        );
+        let mut args = vec!["upgrade", "--major", "--freeze", FREEZE];
+        args.extend(flag);
+
+        let upgrade = fixture.cooldown_json(&args);
+        assert!(
+            upgrade.ok(),
+            "upgrade should succeed: {}",
+            fixture.cooldown(&args).stderr_str()
+        );
+        assert!(
+            !upgrade.applied_names().contains("log-symbols"),
+            "the candidate that adds the copy must not land\napplied={:?}",
+            upgrade.applied_names()
+        );
+        let reasons = upgrade.skipped_reasons_for("log-symbols");
+        assert!(
+            reasons.contains("resolver_conflict"),
+            "gate {gate}: the refusal is a held row, got {reasons:?}"
+        );
+        let detail = upgrade
+            .skip_detail_for("log-symbols")
+            .expect("the refusal explains itself");
+        assert!(
+            detail.contains("second copy of chalk") && detail.contains(gate),
+            "the copy and the option responsible are named: {detail}"
+        );
+        assert!(
+            detail.contains("required at 5.") && detail.contains("by log-symbols@6."),
+            "the requirer is named: {detail}"
+        );
+        assert!(
+            !upgrade.warning_kinds().contains("duplicate_copy"),
+            "a refused copy is not also reported as committed: {:?}",
+            upgrade.warning_messages()
+        );
+        assert_eq!(
+            lock_before,
+            fixture.read_bytes("pnpm-lock.yaml"),
+            "gate {gate}: the refused settlement is restored byte for byte"
+        );
+    }
+}
+
+/// Without a gate the second copy is the resolver's legitimate answer to `log-symbols`' range: it
+/// is committed and reported as a `duplicate_copy` warning that names the requirer, so the reader
+/// need not grep the `snapshots:` section for it.
+#[test]
+fn a_second_copy_is_committed_with_a_warning_naming_its_requirer() {
+    skip_if_missing!("pnpm");
+    let fixture = single_copy_fixture(None);
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--major", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    assert!(
+        upgrade.applied_names().contains("log-symbols"),
+        "log-symbols lands\napplied={:?}\nheld={:?}",
+        upgrade.applied_names(),
+        upgrade.held_conflict_names()
+    );
+    let keys = chalk_package_keys(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert!(
+        keys.len() == 2
+            && keys.contains(&"chalk@4.1.2".to_string())
+            && keys.iter().any(|key| key.starts_with("chalk@5.")),
+        "the lock gained a chalk v5 copy beside the pinned v4: {keys:?}"
+    );
+    assert!(
+        upgrade.warning_kinds().contains("duplicate_copy"),
+        "the second copy is reported under its own kind: {:?}",
+        upgrade.warning_kinds()
+    );
+    assert!(
+        upgrade.warning_messages().iter().any(|message| {
+            message.starts_with("chalk resolved at one version (4.1.2)")
+                && message.contains("required at 5.")
+                && message.contains("by log-symbols@6.")
+        }),
+        "the warning names the copy and its requirer: {:?}",
+        upgrade.warning_messages()
+    );
+}
+
 /// Two members that declare the SAME dependency at DIFFERENT majors. pnpm keeps both lines (like
 /// cargo, unlike uv's single flat environment), so the whole-graph resolve must preserve them:
 /// exact-pinning one target across the workspace would collapse every other copy onto it.

@@ -688,6 +688,7 @@ fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLa
             strict_native: false,
         },
         edge_policy: EdgePolicy::default(),
+        single_copy: Vec::new(),
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -789,6 +790,7 @@ fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
             strict_native: false,
         },
         edge_policy: EdgePolicy::default(),
+        single_copy: Vec::new(),
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -4969,6 +4971,7 @@ async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
             strict_native: false,
         },
         edge_policy: EdgePolicy::default(),
+        single_copy: Vec::new(),
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -5159,6 +5162,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
                 strict_native: false,
             },
             edge_policy: EdgePolicy::default(),
+            single_copy: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5227,6 +5231,7 @@ async fn repo_sync_preserves_earlier_recovery_notice_when_later_access_fails() -
                 strict_native: false,
             },
             edge_policy: EdgePolicy::default(),
+            single_copy: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5389,6 +5394,7 @@ async fn sync_project_scope_writes_native_per_project() -> eyre::Result<()> {
                 strict_native: false,
             },
             edge_policy: EdgePolicy::default(),
+            single_copy: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5573,6 +5579,7 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
             strict_native: false,
         },
         edge_policy: EdgePolicy::default(),
+        single_copy: Vec::new(),
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(

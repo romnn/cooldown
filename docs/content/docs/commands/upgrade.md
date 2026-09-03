@@ -93,6 +93,19 @@ dependency — a changed specifier, an entry appearing or disappearing, a versio
 provably excludes — which pnpm never does on its own: cooldown never re-resolves an importer it was
 told to ignore. Either refusal leaves the lock as it was and names what the resolve did.
 
+A second copy a *dependent's own requirement* pulls in below the importers' view
+(`vite-plugin-solid@2.11` requiring `solid-js@^1.9.15` beside the apps' `1.9.14`) is the
+resolver's legitimate answer to that range, so it is committed — and reported as a
+`duplicate_copy` warning naming the copy and its requirer (`required at 1.9.15 by
+vite-plugin-solid@2.11.14`). For a package that must never run twice — a reactive runtime, a
+type checker — list it under [`[tool.pnpm] single-copy`]({{< relref
+"../configuration/selectors.md" >}}#toolpnpm-single-copy) and the warning becomes a refusal: the
+settlement is rejected, the lock restored, and the candidate whose landing added the copy is held
+with the copy and its requirer named, exactly as a partial landing is. `--fail-on-new-duplicate`
+gates every package for one run without naming any. A gated name is refused even when the second
+copy is the one an exclusion asked for (an excluded importer left on the old version): the lock
+the workspace installs would still hold two copies.
+
 ## Transitive dependencies
 
 By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent, a name resolved at several graph copies) is reported held rather than forced. `--transitive` relaxes the default:
@@ -221,6 +234,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
+| `--fail-on-new-duplicate` | pnpm: refuse a resolve that gives *any* package a second resolved copy — the candidate whose landing added it is held with the copy and its requirer named and the lock restored — instead of committing it with a `duplicate_copy` warning. Config: `[global]`/`[upgrade] fail-on-new-duplicate`; `[tool.pnpm] single-copy` gates named packages permanently. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
 `upgrade` always re-locks. Use `--dry-run` whenever you want to see the plan first; combine it with

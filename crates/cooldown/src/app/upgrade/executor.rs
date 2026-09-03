@@ -2044,6 +2044,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
             excluded_members: self.excluded_members.clone(),
+            single_copy: cooldown_core::SingleCopyPolicy {
+                names: self.ctx.pctx.single_copy.iter().cloned().collect(),
+                every_name: self.ctx.opts.fail_on_new_duplicate,
+            },
         }
     }
 

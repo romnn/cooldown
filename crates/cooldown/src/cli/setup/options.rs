@@ -164,6 +164,7 @@ pub(super) fn resolve_invocation(
             advisory_failure: advisory_failure_mode(command, merged.fail_on_advisory_source),
             // A CLI-only mutating convenience for read-only commands; intentionally not config-backed.
             lock: overrides.lock.unwrap_or(false),
+            fail_on_new_duplicate: merged.fail_on_new_duplicate.unwrap_or(false),
             strict: merged.strict.unwrap_or(false),
             build: merged.build.unwrap_or(false),
             dry_run: merged.dry_run.unwrap_or(false),
@@ -222,6 +223,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         allow_stale_lock: Some(false),
         fail_on_unknown_age: Some(false),
         fail_on_advisory_source: Some(false),
+        fail_on_new_duplicate: Some(false),
         strict: Some(false),
         build: Some(false),
         transitive: Some(false),
@@ -254,6 +256,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         allow_stale_lock: overrides.allow_stale_lock,
         fail_on_unknown_age: overrides.fail_on_unknown_age,
         fail_on_advisory_source: overrides.fail_on_advisory_source,
+        fail_on_new_duplicate: overrides.fail_on_new_duplicate,
         strict: overrides.strict,
         build: overrides.build,
         transitive: overrides.transitive,

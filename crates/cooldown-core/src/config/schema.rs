@@ -40,6 +40,11 @@ pub(crate) struct SelectorToml {
     /// so the tool-scoped placement is explicit rather than a global key that only one tool reads.
     #[serde(rename = "edge-policy")]
     pub(crate) edge_policy: Option<crate::EdgePolicy>,
+    /// The packages a resolve must never leave at a second resolved copy: `upgrade`/`fix` refuse
+    /// a settlement that adds one instead of committing it with a warning.
+    /// pnpm-specific, like `edge-policy` is cargo-specific: accepted only under `[tool.pnpm]`.
+    #[serde(rename = "single-copy")]
+    pub(crate) single_copy: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -110,6 +115,9 @@ pub struct CommandConfig {
     ///
     /// An uncovered ecosystem stays a warning.
     pub fail_on_advisory_source: Option<bool>,
+    /// Make `upgrade`/`fix` refuse a resolve that gives any package a second resolved copy
+    /// (`--fail-on-new-duplicate`), without naming the packages in `[tool.pnpm] single-copy`.
+    pub fail_on_new_duplicate: Option<bool>,
     /// Fail `upgrade`/`fix` if a mutation cannot complete cleanly (`--strict`).
     pub strict: Option<bool>,
     /// Compile/sync after re-locking in `upgrade` (`--build`).
@@ -154,6 +162,7 @@ impl CommandConfig {
             allow_stale_lock,
             fail_on_unknown_age,
             fail_on_advisory_source,
+            fail_on_new_duplicate,
             strict,
             build,
             transitive,
@@ -178,6 +187,7 @@ impl CommandConfig {
         self.allow_stale_lock = allow_stale_lock.or(self.allow_stale_lock);
         self.fail_on_unknown_age = fail_on_unknown_age.or(self.fail_on_unknown_age);
         self.fail_on_advisory_source = fail_on_advisory_source.or(self.fail_on_advisory_source);
+        self.fail_on_new_duplicate = fail_on_new_duplicate.or(self.fail_on_new_duplicate);
         self.strict = strict.or(self.strict);
         self.build = build.or(self.build);
         self.transitive = transitive.or(self.transitive);
@@ -213,6 +223,7 @@ impl CommandConfig {
             allow_stale_lock,
             fail_on_unknown_age,
             fail_on_advisory_source,
+            fail_on_new_duplicate,
             strict,
             build,
             transitive,
@@ -239,6 +250,7 @@ impl CommandConfig {
         self.allow_stale_lock = (*allow_stale_lock).or(self.allow_stale_lock);
         self.fail_on_unknown_age = (*fail_on_unknown_age).or(self.fail_on_unknown_age);
         self.fail_on_advisory_source = (*fail_on_advisory_source).or(self.fail_on_advisory_source);
+        self.fail_on_new_duplicate = (*fail_on_new_duplicate).or(self.fail_on_new_duplicate);
         self.strict = (*strict).or(self.strict);
         self.build = (*build).or(self.build);
         self.transitive = (*transitive).or(self.transitive);

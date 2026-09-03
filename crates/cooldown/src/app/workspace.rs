@@ -32,6 +32,9 @@ pub struct ProjectCtx {
     pub policy: PolicyStack,
     /// The Cargo edge policy resolved for this project's config cascade.
     pub edge_policy: cooldown_core::EdgePolicy,
+    /// The `[tool.pnpm] single-copy` names resolved for this project's config cascade: the
+    /// packages a resolve must never leave at a second resolved copy.
+    pub single_copy: Vec<String>,
 }
 
 pub(crate) struct LockRefresh {
@@ -237,6 +240,9 @@ pub struct RunOpts {
     pub advisory_failure: AdvisoryFailureMode,
     /// `--lock` (check/outdated): refresh the lock before reading it. No-op under `--dry-run`.
     pub lock: bool,
+    /// `--fail-on-new-duplicate` (upgrade/fix): refuse a resolve that gives any package a second
+    /// resolved copy, without naming the packages in `[tool.pnpm] single-copy`.
+    pub fail_on_new_duplicate: bool,
     /// `--strict` (upgrade/fix): fail if the mutation could not complete cleanly.
     pub strict: bool,
     /// `--build` (upgrade): compile/sync after re-locking.
@@ -1656,6 +1662,7 @@ mod tests {
                 strict_native: false,
             },
             edge_policy: cooldown_core::EdgePolicy::default(),
+            single_copy: Vec::new(),
         }
     }
 

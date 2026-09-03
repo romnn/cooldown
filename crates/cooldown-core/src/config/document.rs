@@ -33,6 +33,11 @@ fn reject_tool_only_fields(selector: &SelectorToml, ctx: &str) -> Result<(), Cor
             "{ctx}: `edge-policy` is cargo-specific; move it to [tool.cargo]"
         )));
     }
+    if selector.single_copy.is_some() {
+        return Err(CoreError::Config(format!(
+            "{ctx}: `single-copy` is pnpm-specific; move it to [tool.pnpm]"
+        )));
+    }
     Ok(())
 }
 
@@ -42,6 +47,12 @@ fn validate_structure(config: &ConfigToml, origin: &Origin) -> Result<(), CoreEr
             if name != "cargo" && selector.edge_policy.is_some() {
                 return Err(CoreError::Config(format!(
                     "{}: `edge-policy` in [tool.{name}] is cargo-specific; move it to [tool.cargo]",
+                    origin.token()
+                )));
+            }
+            if name != "pnpm" && selector.single_copy.is_some() {
+                return Err(CoreError::Config(format!(
+                    "{}: `single-copy` in [tool.{name}] is pnpm-specific; move it to [tool.pnpm]",
                     origin.token()
                 )));
             }
@@ -112,6 +123,16 @@ impl ConfigDocument {
             .and_then(|tools| tools.get("cargo"))
             .and_then(|cargo| cargo.edge_policy)
     }
+
+    /// Returns the document's pnpm single-copy list, if `[tool.pnpm]` sets one.
+    #[must_use]
+    pub fn pnpm_single_copy(&self) -> Option<Vec<String>> {
+        self.raw
+            .tool
+            .as_ref()
+            .and_then(|tools| tools.get("pnpm"))
+            .and_then(|pnpm| pnpm.single_copy.clone())
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +160,33 @@ mod tests {
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
         assert_eq!(scan.resolved("outdated").major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
+    }
+
+    /// The pnpm-only `single-copy` key is rejected everywhere but `[tool.pnpm]`, so a list under
+    /// another tool or a policy-only selector is a config error instead of a silent no-op.
+    #[test]
+    fn single_copy_is_accepted_only_under_the_pnpm_tool_table() {
+        let accepted = ConfigDocument::parse(
+            "[tool.pnpm]\nsingle-copy = [\"solid-js\"]\n",
+            &Origin::Global,
+        )
+        .expect("single-copy belongs under [tool.pnpm]");
+        assert_eq!(
+            accepted.pnpm_single_copy(),
+            Some(vec!["solid-js".to_string()])
+        );
+        for src in [
+            "[tool.npm]\nsingle-copy = [\"react\"]\n",
+            "[registry.\"npmjs.com\"]\nsingle-copy = [\"react\"]\n",
+            "[project.\"apps/*\"]\nsingle-copy = [\"react\"]\n",
+        ] {
+            let err = ConfigDocument::parse(src, &Origin::Global)
+                .expect_err("a misplaced single-copy must be rejected");
+            assert!(
+                err.to_string().contains("[tool.pnpm]"),
+                "the error points at the correct placement: {err}"
+            );
+        }
     }
 
     /// The cargo-only `edge-policy` key is rejected under registry/project selectors (which are

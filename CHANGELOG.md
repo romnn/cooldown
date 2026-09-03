@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **A new duplicate copy can be refused, and its requirer is named.** After `solid-js` was
+  correctly rolled back, upgrading `vite-plugin-solid` pulled a *second* `solid-js` into the graph
+  and the run committed the lock with only a warning: `@solidjs/start`, used by four production
+  apps, bound 1.9.15 while the apps bound 1.9.14 — two Solid runtimes with separate owner/observer
+  registries, breaking reactivity with `tsc` and the test suite green. The detection was right and
+  the severity wrong for such packages. `[tool.pnpm] single-copy = ["solid-js", "react"]` now
+  names the packages that must stay single-copy: a settlement that adds a second copy of one is
+  refused, the lock restored, and the candidate whose landing added it held with the copy named,
+  exactly as a partial landing is — even when the second copy is the one an exclusion asked for.
+  `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for a run without
+  naming any. The warning for an ungated copy now names the requirer from the settled lock's own
+  edges (`required at 1.9.15 by vite-plugin-solid@2.11.14`) instead of `pulled in by another
+  package's requirement`, which had forced a hand-grep of the `snapshots:` section. Names in
+  `pnpm-workspace.yaml`'s `overrides` are deliberately not gated by default: an exact override
+  already keeps its copy single, and a ranged one is as often about forcing a patched transitive
+  as about running a package once — the default is unchanged, list the names you mean.
+
 - **A partial pnpm landing names its structural cause.** Three rollbacks in one workspace shared
   one cause the row did not name: an importer declared the package only in `peerDependencies`,
   which pnpm auto-installs and records in that importer's lock entry, but `pnpm update` has no
