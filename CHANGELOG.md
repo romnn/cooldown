@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Every blocked `outdated` row carries its reason.** In one table five rows were `blocked` and
+  only `typescript` said why (`blocked by eslint-config-next`); `pdfjs-dist`, `solid-js`,
+  `tailwind-merge`, and `zustand` were blocked for four different reasons `upgrade` states
+  precisely, and the bare status read as "no known reason". Each blocked row now carries the
+  reason the upgrade resolve gave — the same sentence its skip row prints — as `blockedReason`
+  in `--json`, and `outdated --why` prints it below the table. The status column keeps naming the
+  blocker when one was named; the reasons are sentences too wide for it, so the flag is the
+  answer on the terminal.
+
 - **A new duplicate copy can be refused, and its requirer is named.** After `solid-js` was
   correctly rolled back, upgrading `vite-plugin-solid` pulled a *second* `solid-js` into the graph
   and the run committed the lock with only a warning: `@solidjs/start`, used by four production

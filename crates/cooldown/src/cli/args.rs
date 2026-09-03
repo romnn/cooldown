@@ -225,6 +225,11 @@ pub(in crate::cli) enum Command {
         /// Mutates lockfiles; ignored under `--dry-run`, rejected with `--offline`.
         #[arg(long)]
         lock: bool,
+        /// Print, below the table, why each blocked row is blocked — the reason the upgrade
+        /// resolve gives, as `upgrade --dry-run` would (`blockedReason` in `--json` always
+        /// carries it). Off by default because the reasons are sentences too wide for the table.
+        #[arg(long)]
+        why: bool,
     },
     /// Move direct deps to the newest version older than the cooldown; always re-locks.
     Upgrade {
@@ -614,6 +619,9 @@ pub struct CliOverrides {
     pub(crate) exit_code: Option<u8>,
     /// `outdated --hide-pinned` — CLI-only display filter (not config-backed).
     pub(crate) hide_pinned: Option<bool>,
+    /// `outdated --why` — CLI-only display control (not config-backed): print each blocked row's
+    /// reason below the table.
+    pub(crate) why: Option<bool>,
     /// `outdated --countdown <latest|soonest>` — CLI-only display control (not config-backed);
     /// `None` falls back to [`Countdown::Soonest`].
     pub(crate) countdown: Option<Countdown>,
@@ -671,6 +679,7 @@ impl CliOverrides {
                 .then_some(true),
             build: set_on_subcommand(matches, "upgrade", "build").then_some(true),
             hide_pinned: set_on_subcommand(matches, "outdated", "hide_pinned").then_some(true),
+            why: set_on_subcommand(matches, "outdated", "why").then_some(true),
             // `--countdown <latest|soonest>` carries an enum value under `outdated`; absent, the
             // report keeps its `soonest` default.
             countdown: matches
@@ -796,6 +805,7 @@ mod tests {
             transitive_mode,
             exit_code,
             hide_pinned,
+            why,
             countdown,
             rewrite,
             edge_policy,
@@ -824,6 +834,7 @@ mod tests {
             transitive_mode,
             exit_code,
             hide_pinned,
+            why,
             countdown,
             rewrite,
             edge_policy,
@@ -921,6 +932,28 @@ mod tests {
         );
     }
 
+    /// The duplicate-copy gate rides on the flattened mutation args of both mutating commands, and
+    /// `--why` is `outdated`'s own; each must be captured from its subcommand.
+    #[test]
+    fn duplicate_gate_and_why_flags_are_captured_from_their_subcommands() {
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--fail-on-new-duplicate"]).fail_on_new_duplicate,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "fix", "--fail-on-new-duplicate"]).fail_on_new_duplicate,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated", "--why"]).why,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "outdated"]).fail_on_new_duplicate,
+            None
+        );
+    }
+
     #[test]
     fn every_override_field_is_captured_when_its_flag_is_passed() {
         exhaustively_destructure_overrides(CliOverrides::default());
@@ -961,14 +994,7 @@ mod tests {
             overrides(&["cooldown", "upgrade", "--build"]).build,
             Some(true)
         );
-        assert_eq!(
-            overrides(&["cooldown", "upgrade", "--fail-on-new-duplicate"]).fail_on_new_duplicate,
-            Some(true)
-        );
-        assert_eq!(
-            overrides(&["cooldown", "fix", "--fail-on-new-duplicate"]).fail_on_new_duplicate,
-            Some(true)
-        );
+
         assert_eq!(
             overrides(&["cooldown", "outdated", "--transitive"]).transitive,
             Some(true)
@@ -989,6 +1015,7 @@ mod tests {
             overrides(&["cooldown", "outdated", "--hide-pinned"]).hide_pinned,
             Some(true)
         );
+
         assert_eq!(
             overrides(&["cooldown", "outdated", "--countdown", "latest"]).countdown,
             Some(super::Countdown::Latest)

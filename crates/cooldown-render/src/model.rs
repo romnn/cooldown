@@ -244,6 +244,12 @@ pub struct OutdatedItem {
     /// named. Omitted for every other status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
+    /// When `status` is [`OutdatedStatus::Blocked`], the reason the upgrade resolve gave for holding
+    /// the target — the same message its skip row carries (a partial landing and its remedy, a
+    /// workspace split and the flag that converges it, a refused duplicate copy) — so the row
+    /// explains itself without a full `upgrade --dry-run`. Omitted for every other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
     /// Why a held dependency cannot move automatically.
     ///
     /// JSON serializes this as the human-readable `heldBy` string.

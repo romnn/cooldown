@@ -208,6 +208,9 @@ pub struct RunOpts {
     /// graph, and `max-major` holds remain because they require a different action. This is purely a
     /// display filter; JSON and summary counts retain every dependency.
     pub hide_pinned: bool,
+    /// `--why` (outdated): print each blocked row's reason — the one the upgrade resolve gives —
+    /// below the table. Display-only; `blockedReason` is always in the JSON.
+    pub why: bool,
     /// `--rewrite` (upgrade): how to treat the manifest's version constraint. By default,
     /// [`RewriteMode::Auto`] preserves an in-range constraint where the adapter supports lock-only
     /// updates, widens implicit ceilings when required, and holds explicit upper bounds.

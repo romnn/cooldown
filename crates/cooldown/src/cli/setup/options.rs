@@ -140,6 +140,8 @@ pub(super) fn resolve_invocation(
             ignore_dist_tags: !merged.respect_dist_tags.unwrap_or(true),
             // A display filter, read straight from the CLI (not config-file backed).
             hide_pinned: overrides.hide_pinned.unwrap_or(false),
+            // A display control, read straight from the CLI (not config-file backed).
+            why: overrides.why.unwrap_or(false),
             // Read straight from the CLI (not config-file backed).
             rewrite: if overrides.rewrite.unwrap_or(false) {
                 cooldown_core::RewriteMode::Always

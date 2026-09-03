@@ -1160,6 +1160,30 @@ fn single_copy_refuses_a_second_copy_and_restores_the_lock() {
             fixture.read_bytes("pnpm-lock.yaml"),
             "gate {gate}: the refused settlement is restored byte for byte"
         );
+
+        // `outdated` predicts the refusal: the row is blocked and carries the same reason.
+        if config.is_some() {
+            let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
+            assert!(
+                outdated
+                    .outdated_with_status("blocked")
+                    .contains("log-symbols"),
+                "outdated must predict the refusal, got adoptable={:?}",
+                outdated.outdated_with_status("adoptable")
+            );
+            let reason = outdated
+                .item_field_str("log-symbols", "blockedReason")
+                .expect("the blocked row carries its reason");
+            assert!(
+                reason.contains("second copy of chalk") && reason.contains(gate),
+                "{reason}"
+            );
+            assert_eq!(
+                lock_before,
+                fixture.read_bytes("pnpm-lock.yaml"),
+                "outdated never writes the lock"
+            );
+        }
     }
 }
 

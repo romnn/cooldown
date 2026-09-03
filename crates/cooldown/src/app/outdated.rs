@@ -640,6 +640,7 @@ impl<'a> OutdatedRunner<'a> {
             status: verdict.status.into(),
             adoptable_target: verdict.adoptable_target.map(|v| v.to_string()),
             blocked_by: None,
+            blocked_reason: None,
             held_by: verdict.held_reason.map(Into::into),
             latest,
             security,
@@ -691,6 +692,7 @@ fn error_item(
         status: OutdatedStatus::Error,
         adoptable_target: None,
         blocked_by: None,
+        blocked_reason: None,
         held_by: None,
         latest: None,
         security: None,
@@ -773,9 +775,17 @@ fn held_key_for_upgrade(item: &UpgradeItem) -> ChangeTargetKey {
     )
 }
 
-/// The preview's held set: every skipped row keyed by change identity, mapped to the named
-/// blocker (`None` when the row blames itself — the generic "resolver rejected" form).
-fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Option<String>> {
+/// What the preview's skip row says about one held candidate: the named blocker (`None` when the
+/// row blames itself — the generic "resolver rejected" form) and the row's own message, which is
+/// the reason `upgrade` would print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockedVerdict {
+    blocker: Option<String>,
+    reason: String,
+}
+
+/// The preview's held set: every skipped row keyed by change identity, with its verdict.
+fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, BlockedVerdict> {
     let mut held = HashMap::new();
     for item in preview {
         let key = held_key_for_upgrade(&item);
@@ -783,31 +793,39 @@ fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Opti
             continue;
         };
         let blocker = skipped.offending.filter(|offender| *offender != item.name);
-        held.insert(key, blocker);
+        held.insert(
+            key,
+            BlockedVerdict {
+                blocker,
+                reason: skipped.message,
+            },
+        );
     }
     held
 }
 
 /// Re-classify every `adoptable` item the upgrade resolve could not land (`held`) as `blocked`,
-/// carrying the blocker the resolve named. An item the resolve landed (absent from `held`) keeps its
-/// `adoptable` verdict, so `outdated`'s blocked set is exactly `upgrade`'s held set. A held
-/// cross-path move is reported under its source identity (the require that still exists) rather
-/// than the planned target identity, so the lookup accepts either spelling of the same change.
+/// carrying the blocker the resolve named and the reason its row gives. An item the resolve landed
+/// (absent from `held`) keeps its `adoptable` verdict, so `outdated`'s blocked set is exactly
+/// `upgrade`'s held set. A held cross-path move is reported under its source identity (the
+/// require that still exists) rather than the planned target identity, so the lookup accepts
+/// either spelling of the same change.
 fn apply_held(
     items: &mut [OutdatedItem],
     candidates: &[VerificationCandidate],
-    held: &HashMap<ChangeTargetKey, Option<String>>,
+    held: &HashMap<ChangeTargetKey, BlockedVerdict>,
 ) {
     for candidate in candidates {
-        let blocker = held
+        let verdict = held
             .get(&change_target_key(&candidate.change))
             .or_else(|| candidate.source_key.as_ref().and_then(|key| held.get(key)));
-        if let Some(blocker) = blocker
+        if let Some(verdict) = verdict
             && let Some(item) = items.get_mut(candidate.item_index)
             && item.status == OutdatedStatus::Adoptable
         {
             item.status = OutdatedStatus::Blocked;
-            item.blocked_by = blocker.clone();
+            item.blocked_by = verdict.blocker.clone();
+            item.blocked_reason = Some(verdict.reason.clone());
         }
     }
 }
@@ -883,6 +901,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some(target.to_string()),
             blocked_by: None,
+            blocked_reason: None,
             held_by: None,
             latest: None,
             security: None,
@@ -1025,6 +1044,13 @@ mod tests {
         assert_eq!(items[0].status, OutdatedStatus::Blocked);
         // Self-blame collapses to the generic "resolver rejected" form: no named blocker.
         assert_eq!(items[0].blocked_by, None);
+        // A self-blaming row still carries its reason: `blocked` without a blocker is not
+        // `blocked` without a cause.
+        assert!(
+            items[0].blocked_reason.is_some(),
+            "{:?}",
+            items[0].blocked_reason
+        );
     }
 
     #[test]
@@ -1089,8 +1115,9 @@ mod tests {
         )]);
 
         assert_eq!(
-            held.get(&change_target_key(&candidates[0].change)),
-            Some(&Some("huggingface-hub".to_string()))
+            held.get(&change_target_key(&candidates[0].change))
+                .map(|verdict| verdict.blocker.as_deref()),
+            Some(Some("huggingface-hub"))
         );
         assert!(!held.contains_key(&change_target_key(&candidates[1].change)));
 
@@ -1099,6 +1126,11 @@ mod tests {
         assert_eq!(typer.status, OutdatedStatus::Blocked);
         assert_eq!(typer.adoptable_target.as_deref(), Some("0.26.7"));
         assert_eq!(typer.blocked_by.as_deref(), Some("huggingface-hub"));
+        // The row carries the reason `upgrade` would print, so it explains itself.
+        assert_eq!(
+            typer.blocked_reason.as_deref(),
+            Some("conflicts with huggingface-hub")
+        );
 
         let requests = items
             .iter()

@@ -13,6 +13,7 @@ fn render_options(ctx: &CommandContext<'_>) -> render::tty::RenderOptions {
         paths: ctx.opts.paths,
         show_projects: ctx.opts.show_projects,
         no_suggestions: ctx.opts.no_suggestions,
+        why: ctx.opts.why,
     }
 }
 

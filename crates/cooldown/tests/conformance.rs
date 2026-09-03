@@ -5743,6 +5743,40 @@ async fn dry_run_leaves_the_real_lock_and_manifest_byte_identical() {
     assert_eq!(digest(&lock), lock_before, "dry-run modified the real lock");
 }
 
+/// `outdated`'s blocked row carries the reason `upgrade` would print for the same candidate, so
+/// the row explains itself without a full `upgrade --dry-run` — every blocked row, not only the
+/// ones with a named blocker.
+#[tokio::test]
+async fn an_outdated_blocked_row_carries_the_reason_upgrade_gives() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let out = held_conflict_workspace(root).outdated(&opts()).await;
+
+    let typer = out
+        .items
+        .iter()
+        .find(|item| item.name == "typer")
+        .expect("typer row");
+    assert_eq!(typer.status, OutdatedStatus::Blocked);
+    assert_eq!(
+        typer.blocked_by.as_deref(),
+        Some("huggingface-hub from proxy.example")
+    );
+    // The same sentence the upgrade skip row prints.
+    assert_eq!(
+        typer.blocked_reason.as_deref(),
+        Some("held: conflicts with huggingface-hub from proxy.example")
+    );
+    // The reason belongs to the blocked status alone: no other row carries one.
+    assert!(
+        out.items
+            .iter()
+            .filter(|item| item.status != OutdatedStatus::Blocked)
+            .all(|item| item.blocked_reason.is_none()),
+        "{:?}",
+        out.items
+    );
+}
+
 /// A feed that answers the first query and fails from then on, counting the queries it saw.
 ///
 /// The shape a top-up hits when the feed goes down after the initial fetch: every later round

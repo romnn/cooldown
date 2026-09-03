@@ -100,6 +100,7 @@ mod tests {
                 status: OutdatedStatus::Adoptable,
                 adoptable_target: Some("v0.18.0".into()),
                 blocked_by: None,
+                blocked_reason: None,
                 held_by: None,
                 latest: Some(LatestInfo {
                     version: "v0.18.0".into(),

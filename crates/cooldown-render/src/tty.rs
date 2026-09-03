@@ -37,6 +37,10 @@ pub struct RenderOptions {
     pub show_projects: bool,
     /// Suppress actionable tips (e.g. the `--major` command after an `upgrade` holds a major back).
     pub no_suggestions: bool,
+    /// `outdated --why`: print, below the table, the reason the upgrade resolve gives for each
+    /// blocked row. The reasons are sentences (a partial landing and its remedy, a split and the
+    /// flag that converges it), too wide for the status column, so they are opt-in.
+    pub why: bool,
 }
 
 /// Whether the "Used by" column should appear: at least one row attributes a source package.
@@ -410,6 +414,7 @@ pub fn render_outdated(
         show_projects,
         // Tips only appear in the mutation reports (`upgrade`/`fix`).
         no_suggestions: _,
+        why,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() {
@@ -488,9 +493,33 @@ pub fn render_outdated(
         out.push_str(&dim_borders(&t.to_string(), use_color));
         out.push('\n');
     }
+    if why {
+        push_blocked_reasons(&mut out, items);
+    }
     push_outdated_summary(&mut out, summary);
     push_diagnostics(&mut out, warnings, errors, use_color);
     out
+}
+
+/// The `--why` block: one line per blocked row with the reason the upgrade resolve gave, in table
+/// order, so the reader gets `upgrade --dry-run`'s explanation without running it.
+fn push_blocked_reasons(out: &mut String, items: &[OutdatedItem]) {
+    let blocked: Vec<&OutdatedItem> = items
+        .iter()
+        .filter(|item| item.status == OutdatedStatus::Blocked)
+        .collect();
+    if blocked.is_empty() {
+        return;
+    }
+    out.push_str("why blocked:\n");
+    for item in blocked {
+        let target = item.adoptable_target.as_deref().unwrap_or("—");
+        let reason = item
+            .blocked_reason
+            .as_deref()
+            .unwrap_or("the resolver rejected this change");
+        let _ = writeln!(out, "  {} {} → {target}: {reason}", item.name, item.current);
+    }
 }
 
 fn push_outdated_summary(out: &mut String, summary: &OutdatedSummary) {
@@ -536,6 +565,7 @@ pub fn render_check(
         show_projects,
         // Tips only appear in the mutation reports (`upgrade`/`fix`).
         no_suggestions: _,
+        why: _,
     } = *opts;
     let mut out = String::new();
     if items.is_empty() && errors.is_empty() && summary.skipped_stale_projects == 0 {
@@ -1014,6 +1044,8 @@ fn render_mutation(
         paths,
         show_projects: _,
         no_suggestions,
+        // The `--why` block belongs to the outdated table alone.
+        why: _,
     } = opts;
     let mut out = String::new();
     if items.is_empty() {
@@ -1713,6 +1745,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
             blocked_by: None,
+            blocked_reason: None,
             held_by: None,
             latest: Some(LatestInfo {
                 version: "0.15.18".into(),
@@ -1726,6 +1759,73 @@ mod tests {
         assert!(
             out.contains("4d/7d (0.15.17)"),
             "cooldown cell should label the soonest version:\n{out}"
+        );
+    }
+
+    /// `--why` prints each blocked row's reason below the table; without it the status cell alone
+    /// carries the verdict, since the reasons are sentences the column cannot hold.
+    #[test]
+    fn outdated_why_lists_each_blocked_rows_reason() {
+        let summary = OutdatedSummary {
+            total: 2,
+            skipped_stale_projects: 0,
+            adoptable: 0,
+            blocked: 2,
+            in_cooldown: 0,
+            up_to_date: 0,
+            exempt: 0,
+            held: 0,
+            unknown_age: 0,
+            errors: 0,
+        };
+        let mut named = project_outdated_item("zustand", ".");
+        named.status = OutdatedStatus::Blocked;
+        named.current = "5.0.14".into();
+        named.adoptable_target = Some("5.0.15".into());
+        named.blocked_reason = Some(
+            "the resolve landed 5.0.15 in 1 of 2 importers (@x/pdf-view) and left @x/pdf-view-solid at 5.0.14; rolled back rather than split zustand across importers".into(),
+        );
+        let mut blamed = project_outdated_item("typescript", ".");
+        blamed.status = OutdatedStatus::Blocked;
+        blamed.blocked_by = Some("eslint-config-next".into());
+        blamed.blocked_reason = Some("held: conflicts with eslint-config-next".into());
+        let items = [named, blamed];
+
+        let plain = render_outdated(&summary, &items, &[], &[], &RenderOptions::default());
+        assert!(
+            !plain.contains("why blocked:") && !plain.contains("rolled back"),
+            "the reasons stay opt-in:\n{plain}"
+        );
+        assert!(
+            plain.contains("blocked by eslint-config-next"),
+            "the status cell keeps naming the blocker:\n{plain}"
+        );
+
+        let why = render_outdated(
+            &summary,
+            &items,
+            &[],
+            &[],
+            &RenderOptions {
+                why: true,
+                ..RenderOptions::default()
+            },
+        );
+        let block = why
+            .split("why blocked:\n")
+            .nth(1)
+            .expect("the why block follows the table");
+        // One line per blocked row, in table order, each with its versions and the full reason.
+        assert!(
+            block.starts_with(
+                "  zustand 5.0.14 → 5.0.15: the resolve landed 5.0.15 in 1 of 2 importers"
+            ),
+            "{why}"
+        );
+        assert!(block.contains("  typescript "), "{why}");
+        assert!(
+            block.contains(": held: conflicts with eslint-config-next\n"),
+            "{why}"
         );
     }
 
@@ -1765,6 +1865,7 @@ mod tests {
             status: OutdatedStatus::UpToDate,
             adoptable_target: None,
             blocked_by: None,
+            blocked_reason: None,
             held_by: None,
             latest: Some(LatestInfo {
                 version: "1.21.4".into(),
@@ -1801,6 +1902,7 @@ mod tests {
             status: OutdatedStatus::Adoptable,
             adoptable_target: Some("0.15.16".into()),
             blocked_by: None,
+            blocked_reason: None,
             held_by: None,
             latest: None,
             security: None,
@@ -2116,6 +2218,7 @@ mod tests {
             &[],
             &[],
             &RenderOptions {
+                why: false,
                 show_projects: true,
                 ..RenderOptions::default()
             },
@@ -2148,6 +2251,7 @@ mod tests {
             &[],
             &[],
             &RenderOptions {
+                why: false,
                 use_color: false,
                 list_packages: false,
                 paths: false,
@@ -2320,6 +2424,7 @@ mod tests {
             &[],
             &[],
             &RenderOptions {
+                why: false,
                 no_suggestions: true,
                 ..RenderOptions::default()
             },
@@ -2402,6 +2507,7 @@ mod tests {
             &[],
             &[],
             &RenderOptions {
+                why: false,
                 use_color: true,
                 ..RenderOptions::default()
             },
@@ -2476,6 +2582,7 @@ mod tests {
             &[],
             &errors,
             &RenderOptions {
+                why: false,
                 use_color: false,
                 list_packages: false,
                 paths: false,
