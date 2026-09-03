@@ -86,29 +86,7 @@ impl ProjectExecution {
     }
 }
 
-impl<'a> UpgradeCtx<'a> {
-    fn new(
-        reader: &'a dyn ToolRead,
-        writer: &'a dyn ToolWrite,
-        pctx: &'a super::ProjectCtx,
-        opts: &'a RunOpts,
-        source_root: &'a camino::Utf8Path,
-        repo_root: &'a camino::Utf8Path,
-        access: ProjectExecution,
-        defer_build: bool,
-    ) -> Self {
-        UpgradeCtx {
-            reader,
-            writer,
-            pctx,
-            opts,
-            source_root,
-            repo_root,
-            access,
-            defer_build,
-        }
-    }
-
+impl UpgradeCtx<'_> {
     pub(super) fn tool_name(&self) -> &'static str {
         self.pctx.tool.as_str()
     }
@@ -261,16 +239,16 @@ impl Workspace {
             };
             ProjectUpgradeExecutor::new(
                 self,
-                UpgradeCtx::new(
+                UpgradeCtx {
                     reader,
                     writer,
-                    effective_pctx,
+                    pctx: effective_pctx,
                     opts,
-                    &pctx.project.root,
-                    self.repo_root(),
+                    source_root: &pctx.project.root,
+                    repo_root: self.repo_root(),
                     access,
-                    false,
-                ),
+                    defer_build: false,
+                },
                 mode,
                 &mut acc,
             )
@@ -358,16 +336,16 @@ impl Workspace {
 
         ProjectUpgradeExecutor::new(
             self,
-            UpgradeCtx::new(
+            UpgradeCtx {
                 reader,
                 writer,
-                &copied_pctx,
-                &preview_opts,
-                &pctx.project.root,
-                self.repo_root(),
-                prepared.execution(),
-                false,
-            ),
+                pctx: &copied_pctx,
+                opts: &preview_opts,
+                source_root: &pctx.project.root,
+                repo_root: self.repo_root(),
+                access: prepared.execution(),
+                defer_build: false,
+            },
             PlanMode::Upgrade {
                 transitive: preview_opts.transitive_mode,
             },
@@ -437,16 +415,16 @@ impl Workspace {
         let mut project_acc = UpgradeAccum::default();
         let status = ProjectUpgradeExecutor::new(
             self,
-            UpgradeCtx::new(
+            UpgradeCtx {
                 reader,
                 writer,
-                &copied_pctx,
-                &trial_opts,
-                &pctx.project.root,
-                self.repo_root(),
-                execution,
-                true,
-            ),
+                pctx: &copied_pctx,
+                opts: &trial_opts,
+                source_root: &pctx.project.root,
+                repo_root: self.repo_root(),
+                access: execution,
+                defer_build: true,
+            },
             mode,
             &mut project_acc,
         )
