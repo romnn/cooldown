@@ -2,7 +2,10 @@
 
 use camino::Utf8Path;
 use cooldown_adapter_util::resolve_program;
-use cooldown_core::{CoreError, MemberRef, ToolTermination, VerifyReport, failure_detail};
+use cooldown_core::{
+    CoreError, LockStatus, LockVerifyReport, MemberRef, ToolTermination, VerifyReport,
+    failure_detail,
+};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
@@ -1453,6 +1456,32 @@ impl Cargo {
             },
         })
     }
+
+    /// Brings `Cargo.lock` current with the manifests via `cargo update --workspace`, the minimal
+    /// refresh (the `--lock` step before a read-only command evaluates the lock).
+    ///
+    /// `--workspace` re-resolves only the workspace members' own entries: a missing lock is
+    /// generated, a requirement the lock no longer satisfies is re-resolved, and a new dependency
+    /// is added — while every locked version the manifests still admit stays exactly where it is.
+    /// A plain `cargo update` (or `generate-lockfile`) would instead float the whole graph to the
+    /// newest versions, and a refresh that itself drags in the too-fresh releases the gate then
+    /// flags would defeat the point of the flag.
+    ///
+    /// A refresh cargo rejects is a tool failure, not a stale lock: the lock's currency was never
+    /// established, so the read-only command must fail closed even under `--allow-stale-lock`,
+    /// exactly as it does when the currency probe itself cannot run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if the `cargo` process cannot be spawned, or
+    /// [`CoreError::Tool`] with cargo's own detail if it exits non-zero.
+    pub async fn refresh_lock(&self, dir: &Utf8Path) -> Result<LockVerifyReport, CoreError> {
+        self.run(dir, &["update", "--workspace"]).await?;
+        Ok(LockVerifyReport {
+            status: LockStatus::Current,
+            detail: "Cargo.lock refreshed (cargo update --workspace)".into(),
+        })
+    }
 }
 
 fn stale_lock_diagnostic(stderr: &str) -> bool {
@@ -1465,7 +1494,7 @@ fn stale_lock_diagnostic(stderr: &str) -> bool {
 mod tests {
     use super::*;
     use color_eyre::eyre;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     #[tokio::test]
     async fn locked_metadata_rejects_a_stale_lock_without_rewriting_it() -> eyre::Result<()> {
@@ -1510,6 +1539,81 @@ mod tests {
         let staging_error = cargo.staging_metadata(root).await.err();
         std::assert_matches!(staging_error, Some(CoreError::StaleLock(_)));
         assert_eq!(std::fs::read(root.join("Cargo.lock"))?, before);
+        Ok(())
+    }
+
+    /// The `--lock` refresh generates a missing lock and brings a stale one current, while a
+    /// refresh cargo rejects is a tool failure carrying cargo's detail, never a stale-lock report.
+    /// A dependency-free workspace keeps the real `cargo` off the network.
+    #[tokio::test]
+    async fn refresh_lock_generates_a_missing_lock_and_brings_a_stale_one_current()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+        let manifest = |version: &str| {
+            formatdoc! {r#"
+                [package]
+                name = "app"
+                version = "{version}"
+                edition = "2024"
+            "#}
+        };
+        std::fs::write(root.join("Cargo.toml"), manifest("0.1.0"))?;
+        std::fs::write(root.join("src/lib.rs"), "pub fn app() {}\n")?;
+        let cargo = Cargo::new();
+
+        let generated = cargo.refresh_lock(root).await?;
+        assert_eq!(
+            generated.status,
+            LockStatus::Current,
+            "{}",
+            generated.detail
+        );
+        assert!(
+            root.join("Cargo.lock").is_file(),
+            "a missing lock is generated"
+        );
+        assert!(cargo.verify_locked(root).await?.is_some());
+
+        std::fs::write(root.join("Cargo.toml"), manifest("0.2.0"))?;
+        std::assert_matches!(
+            cargo.metadata_locked(root).await.err(),
+            Some(CoreError::StaleLock(_)),
+            "the version bump staled the lock"
+        );
+        let refreshed = cargo.refresh_lock(root).await?;
+        assert_eq!(
+            refreshed.status,
+            LockStatus::Current,
+            "{}",
+            refreshed.detail
+        );
+        assert!(
+            cargo.verify_locked(root).await?.is_some(),
+            "the refreshed lock is current again"
+        );
+
+        // A manifest cargo cannot resolve (a path dependency that does not exist) is a tool
+        // failure carrying cargo's own detail, never a stale-lock report `--allow-stale-lock`
+        // could wave through.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            formatdoc! {r#"
+                {}
+                [dependencies]
+                missing = {{ path = "missing" }}
+            "#, manifest("0.2.0")},
+        )?;
+        let rejected = cargo
+            .refresh_lock(root)
+            .await
+            .expect_err("cargo rejects the manifest");
+        std::assert_matches!(
+            &rejected,
+            CoreError::Tool { stderr, .. } if stderr.contains("missing")
+        );
         Ok(())
     }
 

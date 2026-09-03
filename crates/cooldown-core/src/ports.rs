@@ -833,8 +833,12 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned. A resolver
-    /// failure is represented as a non-current [`LockVerifyReport`].
+    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned or
+    /// rejects the refresh — a failed refresh establishes nothing about the lock, so it must stay
+    /// fatal even where a *stale* lock may be waved through (`--allow-stale-lock`), exactly like
+    /// a [`verify_lock_current`](ToolRead::verify_lock_current) probe that cannot run.
+    /// A non-current [`LockVerifyReport`] is reserved for a refresh that ran and still left the
+    /// lock out of date.
     async fn refresh_lock(&self, _project: &Project) -> Result<Option<LockVerifyReport>> {
         Ok(None)
     }

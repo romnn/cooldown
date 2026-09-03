@@ -30,10 +30,11 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
-    FetchContext, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
-    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SkipReason,
-    Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    FetchContext, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId,
+    PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal,
+    RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result,
+    RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -1748,10 +1749,13 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         let Some(args) = L::refresh_lock_args(window_minutes) else {
             return Ok(None);
         };
-        self.cmd
-            .lock_report(&project.root, &args, &format!("{} refreshed", L::LOCKFILE))
-            .await
-            .map(Some)
+        // A refresh the package manager rejects is a tool failure, not a stale lock: it proves
+        // nothing about the lock, so it must not be waved through with `--allow-stale-lock`.
+        self.cmd.run(&project.root, &args).await?;
+        Ok(Some(LockVerifyReport {
+            status: LockStatus::Current,
+            detail: format!("{} refreshed", L::LOCKFILE),
+        }))
     }
 
     fn supports_lock_refresh(&self) -> bool {

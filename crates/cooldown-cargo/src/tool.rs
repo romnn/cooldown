@@ -1249,6 +1249,18 @@ impl ToolWrite for CargoTool {
         self.cargo.build(&project.root).await
     }
 
+    async fn refresh_lock(&self, project: &Project) -> Result<Option<LockVerifyReport>> {
+        // The same preconditions as every other read of the lock: a custom lockfile name is not
+        // ours to rewrite, and pending edge-normalization state must be settled first.
+        crate::staging::reject_custom_lockfile(&project.root)?;
+        edges::enforce::ensure_no_pending(project)?;
+        self.cargo.refresh_lock(&project.root).await.map(Some)
+    }
+
+    fn supports_lock_refresh(&self) -> bool {
+        true
+    }
+
     async fn recover_pending_mutation(
         &self,
         project: &Project,

@@ -221,7 +221,8 @@ pub(in crate::cli) enum Command {
             default_missing_value = "1"
         )]
         exit_code: Option<u8>,
-        /// Refresh lockfiles before reading them. Mutates lockfiles and is ignored under `--dry-run`.
+        /// Refresh lockfiles before reading them (cargo, pnpm; other tools read the existing lock).
+        /// Mutates lockfiles; ignored under `--dry-run`, rejected with `--offline`.
         #[arg(long)]
         lock: bool,
     },
@@ -295,7 +296,8 @@ pub(in crate::cli) enum Command {
         /// By default all of these fail open: the ordinary, stricter window stands.
         #[arg(long = "fail-on-advisory-source")]
         fail_on_advisory_source: bool,
-        /// Refresh lockfiles before checking them. Mutates lockfiles and is ignored under `--dry-run`.
+        /// Refresh lockfiles before checking them (cargo, pnpm; other tools read the existing lock).
+        /// Mutates lockfiles; ignored under `--dry-run`, rejected with `--offline`.
         #[arg(long)]
         lock: bool,
         #[command(flatten)]

@@ -5,7 +5,7 @@ weight: 1
 
 # `outdated`
 
-`outdated` reports what could update, split into what is **adoptable now** versus what is **still in cooldown**. It never mutates anything — it is the read-only "what's going on" view.
+`outdated` reports what could update, split into what is **adoptable now** versus what is **still in cooldown**. It never mutates anything (`--lock` is the one opt-in exception) — it is the read-only "what's going on" view.
 
 ```bash
 cooldown outdated
@@ -86,7 +86,7 @@ Two npm-family safeguards refine what counts as adoptable:
 | `--hide-pinned` | Hide held rows (exact pins, commit pins) that have no actionable update. |
 | `--countdown <which>` | Which still-cooling upgrade the **Cooldown** column counts down to when several newer versions exist. |
 | `--exit-code[=N]` | Exit non-zero when adoptable updates exist, for CI gating. Bare `--exit-code` means `1`. |
-| `--lock` | Refresh lockfiles before reading them (mutates lockfiles; ignored under `--dry-run`). |
+| `--lock` | Refresh lockfiles before reading them (mutates lockfiles; ignored under `--dry-run`). Cargo runs `cargo update --workspace` (a locked version the manifests still admit stays put; one they no longer admit is re-resolved or dropped) and pnpm runs `pnpm install --lockfile-only`; the other tools have no standalone refresh, say so with a warning, and read the existing lock as-is. Only the projects the run evaluates are refreshed (`-C incubator` refreshes the nested workspace's lock, not the enclosing one's), and every such project is refreshed before `--package` narrows the rows. A refresh the tool rejects is an error even under `--allow-stale-lock`, and `--offline` rejects the flag outright because the refresh needs the resolver's network access. |
 
 ### `--countdown`
 
