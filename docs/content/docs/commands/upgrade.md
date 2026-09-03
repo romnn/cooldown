@@ -68,7 +68,12 @@ subtree whose peers bind the old copy), which would split a package the workspac
 single version — a runtime break for anything with instance-level state, and one no row would
 account for. Such a partial landing is rolled back: the candidate is reported as a resolver
 conflict whose row names the importers that took the target and the ones that kept the old
-version, and the rest of the batch is re-resolved without it. Importers the run excludes are not
+version, and the rest of the batch is re-resolved without it. When the importer left behind
+declares the package only in `peerDependencies` — pnpm auto-installs such a peer and records it
+in the importer's lock entry, but `pnpm update` has no install field to advance, and `--rewrite`
+cannot help because the declared range already admits the target — the row says so and names the
+change that lets it move: a library adds the package to `devDependencies` as well, an application
+(`private: true`) moves the entry to `dependencies`. Importers the run excludes are not
 part of that contract: `pnpm update <name>@<target>` re-resolves the named package in *every*
 importer whose range admits a newer version, whatever `--filter` it carried — the filtered importers
 get the exact target, every other one the newest version its own range admits under the release-age

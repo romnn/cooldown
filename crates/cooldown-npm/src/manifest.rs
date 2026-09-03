@@ -178,6 +178,75 @@ pub fn declarations(root: &Utf8Path, members: &[MemberRef], name: &str) -> Resul
     Ok(out)
 }
 
+/// The `package.json` of the workspace member at `path` (`.` or empty for the root).
+#[must_use]
+pub fn member_manifest(root: &Utf8Path, path: &str) -> Utf8PathBuf {
+    if path.is_empty() || path == "." {
+        root.join("package.json")
+    } else {
+        root.join(path).join("package.json")
+    }
+}
+
+/// How one member manifest declares a package: the fields naming it, and whether the package is
+/// private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDeclaration {
+    /// The manifest fields naming the package, in [`DEPENDENCY_FIELDS`] order.
+    pub fields: Vec<&'static str>,
+    /// The manifest's `private: true` — an application nobody consumes, whose `peerDependencies`
+    /// publish a contract to no one.
+    pub private: bool,
+}
+
+impl MemberDeclaration {
+    /// Whether the package is declared only as a published peer contract.
+    /// pnpm auto-installs such a peer and records it in the importer's lock entry, but
+    /// `pnpm update` has no install field to advance, so the importer's copy never moves.
+    #[must_use]
+    pub fn is_peer_only(&self) -> bool {
+        self.fields == ["peerDependencies"]
+    }
+}
+
+/// Reads how the member at `path` declares `name`: `None` when the manifest is absent or does not
+/// declare it in any field.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] if the manifest exists but cannot be read or is not valid JSON.
+pub fn member_declaration(
+    root: &Utf8Path,
+    path: &str,
+    name: &str,
+) -> Result<Option<MemberDeclaration>> {
+    let manifest = member_manifest(root, path);
+    let content = match std::fs::read_to_string(&manifest) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let doc: Value =
+        serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
+    let fields: Vec<&'static str> = DEPENDENCY_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| {
+            doc.get(field)
+                .and_then(|section| section.get(name))
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        .collect();
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MemberDeclaration {
+        fields,
+        private: doc.get("private").and_then(Value::as_bool).unwrap_or(false),
+    }))
+}
+
 /// Finds the most restrictive explicit upper bound among the manifests declaring this resolved
 /// dependency line.
 ///
@@ -189,22 +258,17 @@ pub fn declared_bound(
     members: &[MemberRef],
     name: &str,
 ) -> Result<Option<String>> {
-    let rels = if members.is_empty() {
-        vec![Utf8PathBuf::from("package.json")]
+    let manifests: BTreeSet<Utf8PathBuf> = if members.is_empty() {
+        BTreeSet::from([member_manifest(root, ".")])
     } else {
-        let mut rels = BTreeSet::new();
-        for member in members {
-            rels.insert(if member.path.is_empty() || member.path == "." {
-                Utf8PathBuf::from("package.json")
-            } else {
-                Utf8Path::new(&member.path).join("package.json")
-            });
-        }
-        rels.into_iter().collect()
+        members
+            .iter()
+            .map(|member| member_manifest(root, &member.path))
+            .collect()
     };
     let mut ranges = Vec::new();
-    for rel in rels {
-        if let Some(range) = declared_range(&root.join(rel), name)? {
+    for manifest in manifests {
+        if let Some(range) = declared_range(&manifest, name)? {
             ranges.push(range);
         }
     }

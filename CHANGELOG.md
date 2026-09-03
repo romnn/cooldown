@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A partial pnpm landing names its structural cause.** Three rollbacks in one workspace shared
+  one cause the row did not name: an importer declared the package only in `peerDependencies`,
+  which pnpm auto-installs and records in that importer's lock entry, but `pnpm update` has no
+  install field to advance, so its copy stayed at 5.0.14 while every sibling took 5.0.15 — and
+  `--rewrite` was inert, correctly, since the declared range already admitted the target. The
+  row now checks the importers left behind and says `` @airtype/pdf-view-solid declares zustand
+  only in `peerDependencies`, which `pnpm update` cannot advance; declare it in `devDependencies`
+  as well to let it move `` (an application, `private: true`, is told to move the entry to
+  `dependencies` instead). The rollback itself is unchanged.
+
 - **A second copy the resolve adds is a `duplicate_copy` warning, not a `held` one.** An
   `outdated` run summarized `8 held` while its warning block held thirty `warning [held]` lines,
   and a reader reconciling the two could not: the summary counts rows whose status is `held`

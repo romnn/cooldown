@@ -967,6 +967,94 @@ fn outdated_does_not_falsely_block_a_member_declared_dependency() {
     );
 }
 
+/// An application importer installing `chalk` beside a library importer that declares it only in
+/// `peerDependencies`: pnpm auto-installs the peer and records it in the library's lock entry, so
+/// both importers declare the name, but `pnpm update` has no install field to advance in the
+/// library and leaves it behind.
+const PEER_ONLY_APP_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/app",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "chalk": "^4.1.0"
+  }
+}
+"#;
+
+const PEER_ONLY_LIB_PACKAGE_JSON: &str = r#"{
+  "name": "@cooldown/lib",
+  "version": "0.1.0",
+  "peerDependencies": {
+    "chalk": "^4.1.0"
+  }
+}
+"#;
+
+/// A seed between chalk 4.1.0 (2020-11) and 4.1.1 (2021-04), so both importers start on 4.1.0 and
+/// the 4.1.2 (2021-07) matured under [`FREEZE`] is a forward move the shared range admits.
+const PEER_ONLY_SEED: &str = "2021-01-01T00:00:00Z";
+
+fn peer_only_fixture() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write("pkgs/app/package.json", PEER_ONLY_APP_PACKAGE_JSON);
+    fixture.write("pkgs/lib/package.json", PEER_ONLY_LIB_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, PEER_ONLY_SEED);
+    fixture
+}
+
+/// The joint pin lands in the application and leaves the peer-only library behind — a partial
+/// landing the adapter rolls back. The row must name the structural cause and its remedy, not only
+/// the importer: `--rewrite` is inert here (the range already admits the target), so without the
+/// sentence the row is a dead end.
+#[test]
+fn upgrade_names_a_peer_only_declaration_behind_a_partial_landing() {
+    skip_if_missing!("pnpm");
+    let fixture = peer_only_fixture();
+    let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        pnpm_lock_pins(&lock_before)
+            .get("chalk")
+            .map(String::as_str),
+        Some("4.1.0"),
+        "the seed holds both importers on chalk 4.1.0"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    let reasons = upgrade.skipped_reasons_for("chalk");
+    assert!(
+        reasons.contains("resolver_conflict"),
+        "the partial landing is rolled back as a resolver conflict, got {reasons:?}"
+    );
+    let detail = upgrade
+        .skip_detail_for("chalk")
+        .expect("the rollback explains itself");
+    assert!(
+        detail.contains("left @cooldown/lib at 4.1.0"),
+        "the importer left behind is named: {detail}"
+    );
+    assert!(
+        detail.contains(
+            "@cooldown/lib declares chalk only in `peerDependencies`, which `pnpm update` cannot advance; declare it in `devDependencies` as well to let it move"
+        ),
+        "the cause and the remedy are named: {detail}"
+    );
+    assert_eq!(
+        lock_before,
+        fixture.read_bytes("pnpm-lock.yaml"),
+        "the rollback restores the lock byte for byte"
+    );
+}
+
 /// Two members that declare the SAME dependency at DIFFERENT majors. pnpm keeps both lines (like
 /// cargo, unlike uv's single flat environment), so the whole-graph resolve must preserve them:
 /// exact-pinning one target across the workspace would collapse every other copy onto it.

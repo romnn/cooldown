@@ -696,7 +696,7 @@ struct PartialLanding {
     landed: Vec<String>,
     /// The in-scope importers that did not, with the version each sits at (`None`: no longer
     /// declared).
-    stayed: Vec<(String, Option<String>)>,
+    stayed: Vec<(MemberRef, Option<String>)>,
 }
 
 /// Judges every exact-pinned candidate of `active` against the post-resolve importer index (see
@@ -722,7 +722,7 @@ fn partial_landings(
                 Some(version) if satisfies_target(change, version) => {
                     landed.push(member.name.clone());
                 }
-                version => stayed.push((member.name.clone(), version.map(str::to_string))),
+                version => stayed.push((member.clone(), version.map(str::to_string))),
             }
         }
         if !landed.is_empty() && !stayed.is_empty() {
@@ -740,11 +740,15 @@ fn partial_landings(
 /// that did and did not take the target, so the rollback is never mistaken for a plain rejection.
 /// Blame goes to the peer-suffixed sibling that held the importer back when one is uniquely
 /// identifiable, else to the candidate itself.
+/// An importer that declares the package only in `peerDependencies` is the one structural cause
+/// cooldown can name ([`peer_only_remedy`]), so the row then says what would let it move instead of
+/// ending at the importer's name.
 fn partial_landing_skip<L: NodeLock>(
+    root: &Utf8Path,
     change: &Change,
     partial: &PartialLanding,
     after_content: &str,
-) -> Skipped {
+) -> Result<Skipped> {
     let name = change.package.name.as_str();
     let target = change.to.as_str();
     let stayed = partial
@@ -752,24 +756,88 @@ fn partial_landing_skip<L: NodeLock>(
         .iter()
         .map(|(member, version)| {
             format!(
-                "{member} at {}",
+                "{} at {}",
+                member.name,
                 version.as_deref().unwrap_or("no resolved copy")
             )
         })
         .collect::<Vec<_>>();
     let offender = peer_conflict_blocker(after_content, name).unwrap_or_else(|| name.to_string());
-    Skipped {
+    let mut detail = format!(
+        "the resolve landed {target} in {} of {} importers ({}) and left {}; rolled back rather than split {name} across importers",
+        partial.landed.len(),
+        partial.landed.len() + partial.stayed.len(),
+        list_members(&partial.landed),
+        list_members(&stayed),
+    );
+    if let Some(remedy) = peer_only_remedy(root, name, &partial.stayed)? {
+        detail.push_str("; ");
+        detail.push_str(&remedy);
+    }
+    Ok(Skipped {
         change: change.clone(),
         reason: SkipReason::ResolverConflict,
         offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
-        detail: Some(format!(
-            "the resolve landed {target} in {} of {} importers ({}) and left {}; rolled back rather than split {name} across importers",
-            partial.landed.len(),
-            partial.landed.len() + partial.stayed.len(),
-            list_members(&partial.landed),
-            list_members(&stayed),
-        )),
+        detail: Some(detail),
+    })
+}
+
+/// Why a partial landing is a dead end, when cooldown can tell: the importers among `stayed` that
+/// declare `name` only in `peerDependencies`, each group with the change that lets it move.
+///
+/// pnpm auto-installs a workspace package's own peer and records it in that importer's lock entry,
+/// so the importer counts as declaring the name — but `pnpm update` rewrites install fields only,
+/// so its copy never advances while every sibling's does (verified against pnpm 11: an importer
+/// with `chalk` only under `peerDependencies` kept 4.1.0 while the joint update landed 4.1.2 in
+/// the importer beside it).
+/// `--rewrite` does not help either, since the declared range already admits the target, so
+/// without this sentence the row names the importer and no action.
+/// A library keeps its published contract and adds a `devDependencies` entry for the install; an
+/// application (`private: true`) publishes a contract to no one and moves the entry to
+/// `dependencies`.
+/// `None` when no stayed importer is peer-only.
+fn peer_only_remedy(
+    root: &Utf8Path,
+    name: &str,
+    stayed: &[(MemberRef, Option<String>)],
+) -> Result<Option<String>> {
+    let mut libraries = Vec::new();
+    let mut applications = Vec::new();
+    for (member, _) in stayed {
+        let Some(declaration) = manifest::member_declaration(root, &member.path, name)? else {
+            continue;
+        };
+        if !declaration.is_peer_only() {
+            continue;
+        }
+        if declaration.private {
+            applications.push(member.name.clone());
+        } else {
+            libraries.push(member.name.clone());
+        }
     }
+    let sentence = |members: &[String], remedy: &str| {
+        let declares = if members.len() == 1 {
+            "declares"
+        } else {
+            "declare"
+        };
+        format!(
+            "{} {declares} {name} only in `peerDependencies`, which `pnpm update` cannot advance; {remedy} to let it move",
+            list_members(members)
+        )
+    };
+    let mut sentences = Vec::new();
+    if !libraries.is_empty() {
+        sentences.push(sentence(
+            &libraries,
+            "declare it in `devDependencies` as well",
+        ));
+    }
+    if !applications.is_empty() {
+        sentences.push(sentence(&applications, "move it to `dependencies`"));
+    }
+    Ok((!sentences.is_empty()).then(|| sentences.join("; ")))
 }
 
 /// `a, b, c` for a short list, `a, b, c (+N others)` past three, so a detail line stays readable on
@@ -1534,7 +1602,7 @@ impl<L: NodeLock> NpmTool<L> {
                         peer_held_skip::<L>(&change, &rejection.violation, rejection.offending)
                     }
                     Rejection::Partial(landing) => {
-                        partial_landing_skip::<L>(&change, &landing, &after_content)
+                        partial_landing_skip::<L>(&project.root, &change, &landing, &after_content)?
                     }
                 });
             }
@@ -4236,6 +4304,12 @@ mod whole_graph_tests {
             "the importer left behind: {detail}"
         );
         assert!(detail.contains("rolled back"), "{detail}");
+        // pdf-view installs solid-js through `dependencies`, so the row has no structural cause
+        // to name and must not invent the peer-only one.
+        assert!(
+            !detail.contains("peerDependencies"),
+            "an install declaration earns no peer-only advice: {detail}"
+        );
         let final_lock = read(&root, "pnpm-lock.yaml")?;
         assert!(
             final_lock.contains("solid-js@1.9.14:") && !final_lock.contains("solid-js@1.9.15"),
@@ -4254,6 +4328,70 @@ mod whole_graph_tests {
             "the rejected pin is not retried: {legs:?}"
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        Ok(())
+    }
+
+    /// The structural cause behind the luup partial landings: the importer left behind declares
+    /// the package only in `peerDependencies`, which pnpm auto-installs and records in the lock
+    /// but `pnpm update` has no install field to advance.
+    /// The row names the importer and the remedy — a library adds a `devDependencies` entry, an
+    /// application (`private: true`) moves the entry to `dependencies`.
+    #[tokio::test]
+    async fn a_partial_landing_names_a_peer_only_declaration_and_its_remedy() -> eyre::Result<()> {
+        for (private, remedy) in [
+            (
+                false,
+                "declare it in `devDependencies` as well to let it move",
+            ),
+            (true, "move it to `dependencies` to let it move"),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            let tool = tool_with(&solid_js_fixture(&root)?)?;
+            // The fixture's manifests install solid-js; only pdf-view's is rewritten to the
+            // peer-only shape, so the advice must single it out.
+            std::fs::write(
+                root.join("packages/pdf-view/package.json"),
+                format!(
+                    r#"{{ "name": "@x/pdf-view", "private": {private}, "peerDependencies": {{ "solid-js": "^1.9.14" }} }}"#
+                ),
+            )?;
+            let members = [
+                ("@x/admin", "apps/admin"),
+                ("@x/web", "apps/web"),
+                ("@x/pdf-view", "packages/pdf-view"),
+            ];
+            let plan = Plan {
+                changes: vec![change("solid-js", "1.9.14", "1.9.15", &members)],
+                ..Plan::default()
+            };
+
+            let report = apply(&tool, &project(&root), plan).await?;
+
+            let [held] = report.skipped.as_slice() else {
+                panic!("the partial candidate is held: {:?}", report.skipped);
+            };
+            let detail = held
+                .detail
+                .as_deref()
+                .expect("the rollback explains itself");
+            // The rollback itself is unchanged; the sentence after it names the cause and the
+            // one change that would let the importer move.
+            assert!(
+                detail.contains("rolled back rather than split solid-js"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(
+                    "@x/pdf-view declares solid-js only in `peerDependencies`, which `pnpm update` cannot advance; "
+                ),
+                "{detail}"
+            );
+            assert!(detail.ends_with(remedy), "private = {private}: {detail}");
+            assert!(
+                !detail.contains("@x/admin declares") && !detail.contains("@x/web declares"),
+                "the importers that took the target are not blamed: {detail}"
+            );
+        }
         Ok(())
     }
 
