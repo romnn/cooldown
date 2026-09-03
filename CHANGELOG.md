@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.17
+
 - **Running from an excluded directory scans it instead of reporting nothing.**
   `cooldown -C incubator check` (or `cd incubator && cooldown check`) under a repo-root config that
   lists `incubator` in `exclude-folders` pruned the directory during detection, scoped the
