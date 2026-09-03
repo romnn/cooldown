@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.18
+
 - **A pnpm pin that lands in only some importers is rolled back, never committed half-applied.**
   The joint `pnpm update` could land a candidate in most importers and leave a peer-bound one on
   the old version, then report the candidate as a resolver rejection while committing a lock that
