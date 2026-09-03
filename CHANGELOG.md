@@ -24,7 +24,8 @@
   `~7.3.0` beside `^7.0.0` still holds `7.4.0` and `^3.4.19` beside `^4.3.3` still holds the v4
   line. The hold's row now names the ranges that exclude the target and the action that converges
   them. A line declared through a `catalog:` specifier is held with the catalog row while a sibling
-  line on a plain range that admits the target still lands. A second copy the resolve adds below
+  line on a plain range that admits the target still lands, and a git or tarball resolution in one
+  importer no longer counts as a version line beside a registry one. A second copy the resolve adds below
   the importers' view — a transitive requirement pulling an older line — is now named by a warning
   instead of passing silently.
 - **`exclude-folders`/`exclude-packages` reach the pnpm split evidence.** An excluded importer's

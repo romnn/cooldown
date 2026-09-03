@@ -5174,6 +5174,92 @@ mod whole_graph_tests {
         Ok(())
     }
 
+    /// An `npm:` alias in an excluded importer is compared under its own declared name, so its
+    /// re-resolution is seen like any other entry: its specifier is no range cooldown can judge,
+    /// which proves nothing, so the move is reported as re-resolved rather than refused as drift.
+    #[tokio::test]
+    async fn an_alias_in_an_excluded_importer_is_reported_when_it_moves() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let alias = ("npm:lodash@^4.17.0", "lodash@4.17.21");
+        // pnpm keys the alias's package by the real name; the fixture helper keys it by the
+        // declared name, so the package keys are corrected on both locks.
+        let real_keys = |lock: String| {
+            lock.replace("my-lodash@lodash@4.17.21:", "lodash@4.17.21:")
+                .replace("my-lodash@lodash@4.17.22:", "lodash@4.17.22:")
+        };
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "app",
+                    name: "app",
+                    deps: vec![("bar", "^1.0.0", "1.0.0")],
+                },
+                Importer {
+                    path: "legacy",
+                    name: "legacy",
+                    deps: vec![("my-lodash", alias.0, alias.1)],
+                },
+            ],
+        )?;
+        let settled = moved(
+            &lock,
+            "app",
+            "bar",
+            ("^1.0.0", "1.0.0"),
+            ("^1.0.0", "1.1.0"),
+        );
+        let settled = moved(
+            &settled,
+            "legacy",
+            "my-lodash",
+            alias,
+            ("npm:lodash@^4.17.0", "lodash@4.17.22"),
+        );
+        std::fs::write(root.join("pnpm-lock.yaml"), real_keys(lock))?;
+        std::fs::write(root.join("settled.yaml"), real_keys(settled))?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *" update "*)
+                    cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("bar", "1.0.0", "1.1.0", &[("app", "app")])],
+            excluded_members: vec![member("legacy", "legacy")],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // The real package's move also surfaces as a collateral row under its own name, so the
+        // report shows both the package that moved and the excluded declaration that carried it.
+        assert_eq!(applied_names(&report), vec!["bar", "lodash"]);
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|change| change.package.name == "lodash" && !change.direct),
+            "{:?}",
+            report.applied
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let [warning] = report.warnings.as_slice() else {
+            panic!("the alias move is reported once: {:?}", report.warnings);
+        };
+        assert_eq!(warning.package.as_deref(), Some("my-lodash"));
+        assert!(
+            warning
+                .message
+                .contains("my-lodash in legacy (lodash@4.17.21 → lodash@4.17.22)"),
+            "{}",
+            warning.message
+        );
+        Ok(())
+    }
+
     /// The manifest facts of a row follow its managed members once the excluded ones are dropped:
     /// an excluded importer's plain range no longer cancels a managed exact pin, and its explicit
     /// upper bound no longer holds a managed range that admits the target.

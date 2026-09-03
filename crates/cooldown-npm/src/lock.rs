@@ -480,12 +480,15 @@ impl MemberIndex {
     /// Every distinct resolved version of `name` across the workspace's importer declarations,
     /// ascending — the divergent lines a multi-version hold keeps apart. Empty for the name-only
     /// (npm) index, which records no per-importer version.
+    /// A URL-resolved entry (a git or tarball dependency) is not a version line: it is no registry
+    /// candidate, and counting it made a name with one registry line look split and hid the line
+    /// from the resolver-introduced-split guard, which skips names already at several versions.
     #[must_use]
     pub fn resolved_versions_of(&self, name: &str) -> Vec<&str> {
         let mut versions: Vec<&str> = self
             .by_version
             .keys()
-            .filter(|(entry, _)| entry == name)
+            .filter(|(entry, version)| entry == name && !is_url_resolution(version))
             .map(|(_, version)| version.as_str())
             .collect();
         // The string tiebreak keeps the order total: two versions `compare` cannot rank (build
@@ -2011,6 +2014,13 @@ fn parse_pnpm_importer_members(
     map
 }
 
+/// Whether an importer's resolved `version:` is a URL rather than a registry version: pnpm records
+/// a git or tarball dependency as the fetch location (`https://codeload.github.com/…`,
+/// `github.com/user/repo/<sha>`), which a semver version never contains.
+fn is_url_resolution(version: &str) -> bool {
+    version.contains(':') || version.contains('/')
+}
+
 /// Each importer's (those not in `excluded`) registry-resolved direct entries by name, as
 /// `pnpm-lock.yaml` records them: the declared `specifier:` and the resolved `version:` with its
 /// peer suffix stripped.
@@ -2966,6 +2976,45 @@ packages:
         assert!(
             !index.splits_for("foo", "1.4.0"),
             "foo is declared at one version by importers; its transitive 2.0.0 copy must not split it"
+        );
+    }
+
+    /// A git or tarball resolution in one importer is not a version line: the name keeps its one
+    /// registry line, so a target every plain range admits still lands, and the line stays visible
+    /// to the resolver-introduced-split guard.
+    #[test]
+    fn a_url_resolved_importer_entry_is_not_a_version_line() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              pkgs/a:
+                dependencies:
+                  foo:
+                    specifier: ^1.2.0
+                    version: 1.2.3
+
+              pkgs/b:
+                dependencies:
+                  foo:
+                    specifier: github:x/foo#abc
+                    version: https://codeload.github.com/x/foo/tar.gz/abc
+
+            packages:
+
+              foo@1.2.3:
+                resolution: {integrity: sha512-a}
+              foo@https://codeload.github.com/x/foo/tar.gz/abc:
+                resolution: {tarball: https://codeload.github.com/x/foo/tar.gz/abc}
+        "};
+        let index = Pnpm::member_sources(lock);
+        assert_eq!(index.resolved_versions_of("foo"), vec!["1.2.3"]);
+        assert!(!index.splits_for("foo", "1.2.4"));
+        // The URL-resolved importer still has its attribution; only the line count ignores it.
+        assert_eq!(
+            index.resolved_version("pkgs/b", "foo"),
+            Some("https://codeload.github.com/x/foo/tar.gz/abc")
         );
     }
 
