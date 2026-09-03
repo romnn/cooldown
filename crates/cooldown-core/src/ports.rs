@@ -183,6 +183,28 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
+    /// Re-derives the manifest-owned facts of `deps` after the orchestrator dropped the members at
+    /// `excluded` from their attribution: [`pinned`](Dependency::pinned) and
+    /// [`declared_bound`](Dependency::declared_bound) must reflect only the members that still own
+    /// a row, or an excluded member's exact pin or explicit bound would keep holding — or start
+    /// loosening — a dependency the run manages.
+    /// Called with the already-pruned rows; a row with no member left is not the run's and is gone
+    /// before this runs.
+    /// The default does nothing, for adapters whose rows carry no member-level facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if a lock or manifest cannot be re-read.
+    async fn rescope_members(
+        &self,
+        project: &Project,
+        deps: &mut [Dependency],
+        excluded: &[crate::MemberRef],
+    ) -> Result<()> {
+        let _ = (project, deps, excluded);
+        Ok(())
+    }
+
     /// Returns direct dependency-like requirements that exist only as manifest constraints, with no
     /// entry in the resolved lock graph. These are opt-in command inputs for flows that can evaluate
     /// and mutate a manifest floor directly (`outdated`/`upgrade`), not lock-gate inputs: commands

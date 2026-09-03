@@ -80,7 +80,10 @@ impl<'a> ExplainService<'a> {
         self.opts
             .progress
             .phase(format!("resolving dependency context for {pkg}"));
-        let registry = self.registry_of(pctx, pkg).await?;
+        let ExplainedDependency {
+            registry,
+            excluded_members,
+        } = self.dependency_context(pctx, pkg).await?;
         let q = ResolveQuery {
             tool: pctx.tool,
             package: pkg,
@@ -118,6 +121,7 @@ impl<'a> ExplainService<'a> {
                 min_age_days: round2(res.window.effective_min_age_days(self.ws.now())),
                 decided_by: res.window.source(),
             },
+            excluded_members,
         };
 
         Ok(ExplainOutcome {
@@ -192,31 +196,46 @@ impl<'a> ExplainService<'a> {
         }
     }
 
-    /// The registry a package resolves to within a project, if it is a known dependency.
-    async fn registry_of(
+    /// What the project's dependency graph says about `pkg`, if it is a known dependency: the
+    /// registry it resolves to, and the declaring members the run's scope and exclude policy ignore
+    /// — the declarations that no longer count as workspace evidence, which the trace must show
+    /// rather than drop silently.
+    async fn dependency_context(
         &self,
         pctx: &ProjectCtx,
         pkg: &str,
-    ) -> cooldown_core::Result<Option<String>> {
+    ) -> cooldown_core::Result<ExplainedDependency> {
         let Some(adapter) = self.ws.adapter(pctx.tool) else {
-            return Ok(None);
+            return Ok(ExplainedDependency::default());
         };
         let _guard = self.ws.project_read_guard(pctx).await?;
-        // The raw graph on purpose: this finds one package's registry by name (never displayed and
-        // not list output), so `exclude`/`-p` scoping is irrelevant and would only hide the target.
+        // The raw graph on purpose: this finds one package by name (never displayed and not list
+        // output), so `exclude`/`-p` scoping would only hide the target — the exclusions are
+        // reported beside it instead.
         let deps = match adapter.dependencies(&pctx.project, DepScope::Graph).await {
             Ok(deps) => deps,
             Err(
                 error @ (cooldown_core::CoreError::StaleLock(_)
                 | cooldown_core::CoreError::LockConflict(_)),
             ) => return Err(error),
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(ExplainedDependency::default()),
         };
-        Ok(deps
-            .into_iter()
-            .find(|dep| dep.package.name == pkg)
-            .and_then(|dep| dep.package.registry))
+        Ok(ExplainedDependency {
+            registry: deps
+                .iter()
+                .find(|dep| dep.package.name == pkg)
+                .and_then(|dep| dep.package.registry.clone()),
+            excluded_members: Workspace::excluded_members_of(pctx, self.opts, &deps, pkg),
+        })
     }
+}
+
+/// The dependency-graph context of the explained package (see
+/// [`ExplainService::dependency_context`]).
+#[derive(Default)]
+struct ExplainedDependency {
+    registry: Option<String>,
+    excluded_members: Vec<cooldown_core::MemberRef>,
 }
 
 fn empty_meta() -> ExplainMeta {
@@ -227,5 +246,6 @@ fn empty_meta() -> ExplainMeta {
             min_age_days: 0.0,
             decided_by: "default".into(),
         },
+        excluded_members: Vec::new(),
     }
 }

@@ -133,6 +133,14 @@ pub enum CoreError {
     #[error("stale or absent lock: {0}")]
     StaleLock(String),
 
+    /// The package manager resolved successfully, but the lock it produced is one cooldown refuses
+    /// to commit: a workspace split the resolve introduced, or a move in a member the run excludes.
+    /// Candidate isolation treats it like a resolver rejection — the responsible candidate is held
+    /// with this detail and the rest of the batch lands — rather than as a failure that aborts the
+    /// run, since the lock on disk is restored and nothing about the environment is broken.
+    #[error("the resolved lock cannot be committed: {0}")]
+    UnacceptableResolve(String),
+
     /// A local filesystem read/write/create/remove failure.
     #[error("filesystem error: {0}")]
     Filesystem(String),
@@ -230,6 +238,9 @@ impl CoreError {
             CoreError::Parse(_) => DiagnosticKind::Parse,
             CoreError::LockUnreadable(_) => DiagnosticKind::LockfileUnreadable,
             CoreError::StaleLock(_) => DiagnosticKind::StaleLock,
+            // A refused resolve holds the responsible candidate; the closed kind set is a JSON
+            // contract, and `Held` is what such a row already reports as.
+            CoreError::UnacceptableResolve(_) => DiagnosticKind::Held,
             CoreError::Filesystem(_) => DiagnosticKind::Filesystem,
             CoreError::PathEncoding(_) => DiagnosticKind::PathEncoding,
             CoreError::Serialization(_) => DiagnosticKind::Serialization,

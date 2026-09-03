@@ -29,7 +29,7 @@ use crate::app::{
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, FixVerdict, LockStatus, PackageId, Plan, ProjectMutationJournal,
+    DiagnosticKind, FixVerdict, LockStatus, MemberRef, PackageId, Plan, ProjectMutationJournal,
     ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
     UpdateKind, Version, check_pin_advised, evaluate_advised, evaluate_ceiling_hold_advised,
     evaluate_fix_advised,
@@ -321,6 +321,10 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// Their floor raise has no lock interaction, so they are applied in their own batch — a lock
     /// conflict elsewhere in the same run must not roll back (and mislabel) an independent adoption.
     manifest_only: HashSet<PackageId>,
+    /// The workspace members the scope and exclude policy dropped from this project's rows, handed
+    /// to every batch as [`Plan::excluded_members`] so the adapter neither moves them nor counts
+    /// their declarations as workspace evidence.
+    excluded_members: Vec<MemberRef>,
     /// `acc.items` length at each batch merge — the batch boundaries the leg collapse needs:
     /// chronological legs of one copy can only span batches (one report emits one row per copy),
     /// so two same-batch rows sharing a name are coexisting version lines that must not chain.
@@ -402,6 +406,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             initial_edge_snapshot: None,
             committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
+            excluded_members: Vec::new(),
             batch_item_offsets: Vec::new(),
             security_by_change: HashMap::new(),
             pin_security: HashMap::new(),
@@ -563,6 +568,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mut changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
         advisories: Option<std::sync::Arc<ProjectAdvisories>>,
+        excluded_members: Vec<MemberRef>,
     ) {
         let guard = match self.ctx.write_guard() {
             Ok(guard) => guard,
@@ -595,6 +601,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.pctx.rel_path.as_str(),
         ));
         self.manifest_only = manifest_only;
+        self.excluded_members = excluded_members;
         sort_planned_changes(&mut changes);
         // The caller's snapshot when it has one: the trial must judge from the same feed data
         // that selected these targets, or it could hold a candidate on a newer snapshot's
@@ -1235,7 +1242,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .dependencies_in_scope(self.ctx.reader, self.ctx.pctx, scope, self.ctx.opts)
             .await
         {
-            Ok(deps) => deps,
+            Ok(scoped) => {
+                self.excluded_members = scoped.excluded_members;
+                scoped.deps
+            }
             Err(error) => {
                 self.record_project_error(&error, None);
                 return None;
@@ -2033,6 +2043,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             rewrite: self.ctx.opts.rewrite,
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
+            excluded_members: self.excluded_members.clone(),
         }
     }
 
@@ -2530,11 +2541,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn read_reconcile_deps(&self) -> cooldown_core::Result<Vec<Dependency>> {
         // A scoped upgrade can float transitives that do not match `--package`; reconcile is the
         // safety pass over the post-apply graph, so it must see the raw graph like `graph_violations`.
+        // Excluded members still leave the rows: a reconcile change built from them would hand the
+        // adapter an excluded importer as a pin target, which it must never move.
         let mut deps = self
             .ctx
             .reader
             .dependencies(&self.ctx.pctx.project, DepScope::Graph)
             .await?;
+        crate::app::workspace::prune_excluded_members(&mut deps, &self.excluded_members);
+        if !self.excluded_members.is_empty() {
+            self.ctx
+                .reader
+                .rescope_members(&self.ctx.pctx.project, &mut deps, &self.excluded_members)
+                .await?;
+        }
         deps.sort_by(|a, b| {
             a.package
                 .name

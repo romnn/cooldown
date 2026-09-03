@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+- **A pnpm pin that lands in only some importers is rolled back, never committed half-applied.**
+  The joint `pnpm update` could land a candidate in most importers and leave a peer-bound one on
+  the old version, then report the candidate as a resolver rejection while committing a lock that
+  held both copies — a duplicate `solid-js` no row accounted for, invisible to `lock re-verified`
+  and to `check`. The apply now judges every exact pin per importer: a partial landing rejects
+  the candidate, restores the lock, and
+  re-resolves the rest of the batch, with the skip row naming the importers that took the target
+  and those that did not. A package the resolver splits on its own — floated in only some
+  importers without being pinned — is refused with the split named, so candidate isolation holds
+  the responsible candidate instead of certifying a lock with a new duplicate copy; a
+  split whose managed importers agree on one version, with only excluded importers left behind on
+  the old one, is committed and reported as a warning naming them. A candidate now counts as
+  landed only when *every* declaring importer reached the target.
+- **pnpm workspace splits are judged against the target.** Two importers declaring a package under
+  different ranges (`^2.11.12` and `^2.11.13`), or resolving one range at two versions, were held
+  as "declared with incompatible ranges" even when every range admitted the matured target — seven
+  in-range updates in one sweep, two of them with open Dependabot PRs. A name now splits only when
+  some declared range provably excludes the target or cannot be judged (a `||` union, a hyphen
+  range, a dist tag, a bare exact version): `^4.17.20` beside `^4.17.21` takes `4.17.22`, while
+  `~7.3.0` beside `^7.0.0` still holds `7.4.0` and `^3.4.19` beside `^4.3.3` still holds the v4
+  line. The hold's row now names the ranges that exclude the target and the action that converges
+  them. A line declared through a `catalog:` specifier is held with the catalog row while a sibling
+  line on a plain range that admits the target still lands. A second copy the resolve adds below
+  the importers' view — a transitive requirement pulling an older line — is now named by a warning
+  instead of passing silently.
+- **`exclude-folders`/`exclude-packages` reach the pnpm split evidence.** An excluded importer's
+  declaration still counted toward the workspace split (two excluded importers on `mongoose@9.8.0`
+  vetoed the one managed importer's `9.9.3`), and could still be reached by a pin. Excluded
+  members now travel with every mutation plan: they contribute neither a range nor a resolved
+  version to the split judgment, are never named in the update, their manifests are never
+  rewritten (the workspace root's included, which the widen path used to treat as an owner of
+  every declaration), and their exact pins and declared bounds no longer hold or loosen a managed
+  row. `pnpm update` itself re-resolves the named package in every importer whose range admits a
+  newer version whatever the filter (verified against pnpm 10: the filtered importers get the exact
+  target, every other one the newest version its own range admits under the release-age floor), so
+  an excluded importer's copy can move too; that move is committed and reported as a warning naming
+  the importer and the package rather than blocking the upgrade, which would reinstate the veto. A
+  settlement that changes an excluded importer's entry beyond that (a changed specifier, an entry
+  appearing or disappearing, a version its range provably excludes) is refused and the responsible
+  candidate held with the drift named.
+  `explain <pkg>` lists the
+  excluded members declaring the package (`excludedMembers` in `--json`) instead of dropping them
+  silently. With the target-aware split rule above, removing the exclusion no longer restores the
+  hold either: an importer on the same range resolved at another version converges with the rest.
+- **`--rewrite` converges a genuine pnpm split.** The split hold ran before the rewrite mode was
+  consulted, so `--rewrite --major` on a `^2.6.0`/`^3.6.0` split was byte-for-byte identical to
+  the run without it and the row named no way forward. Under `--rewrite` a split name is now
+  pinned to its target and every declaring importer's range widened to admit it; without it the
+  hold stands and its row names `--rewrite`. A name planned at two targets (a `^22` and a `^25`
+  line each advancing within itself without `--major`) cannot be pinned by one joint update — even
+  when one permissive range admits both targets — and stays held with a row saying what would
+  converge it rather than blaming the ranges.
+- **The advisory feed covers pnpm workspaces.** Every pnpm package was withheld from the feed
+  because `pnpm-lock.yaml` records no per-entry `resolved` URL. A lock entry served from the
+  configured registry by name carries only `resolution: {integrity: …}` (a `tarball`, `repo`/
+  `commit`, or `directory` field marks anything else), and `pnpm config list` states the effective
+  registry, so pnpm identities are now granted from that pair: the entry must be registry-shaped,
+  no readable `.npmrc` or `pnpm-workspace.yaml` routing key may reroute it (the workspace file
+  ranks above the project `.npmrc`, as pnpm ranks them), and at feed time pnpm's
+  effective `registry` must be stated and public — an unstated registry or a failing query
+  withholds every package, an `@scope:registry` override only its scope, all through the existing
+  `advisory_ecosystem_unsupported` warning.
+
 ## v0.0.17
 
 - **Cargo's lock-currency probe no longer fails on a checkout whose crates are not cached.** The

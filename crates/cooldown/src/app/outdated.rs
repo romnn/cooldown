@@ -155,12 +155,12 @@ impl<'a> OutdatedRunner<'a> {
         };
 
         self.opts.progress.phase("resolving dependency graph");
-        let mut deps = match self
+        let (mut deps, excluded_members) = match self
             .ws
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
         {
-            Ok(deps) => deps,
+            Ok(scoped) => (scoped.deps, scoped.excluded_members),
             Err(error) => {
                 tracing::warn!(
                     project = read.project_label,
@@ -227,11 +227,11 @@ impl<'a> OutdatedRunner<'a> {
         // upgrade that would silently be held. Runs only when there is something to verify.
         self.verify_blocked(
             pctx,
-            &read.project_label,
             &mut project_items,
             verification_candidates,
             manifest_only,
             advisories,
+            excluded_members,
         )
         .await;
         self.items.extend(project_items);
@@ -340,18 +340,18 @@ impl<'a> OutdatedRunner<'a> {
     async fn verify_blocked(
         &mut self,
         pctx: &'a super::ProjectCtx,
-        project_label: &str,
         items: &mut [OutdatedItem],
         candidates: Vec<VerificationCandidate>,
         manifest_only: HashSet<PackageId>,
         advisories: Option<std::sync::Arc<ProjectAdvisories>>,
+        excluded_members: Vec<cooldown_core::MemberRef>,
     ) {
         if candidates.is_empty() {
             return;
         }
         if self.opts.offline {
             tracing::debug!(
-                project = project_label,
+                project = pctx.rel_path.as_str(),
                 tool = pctx.tool.as_str(),
                 "skipping upgrade-resolve verification in offline mode"
             );
@@ -371,7 +371,14 @@ impl<'a> OutdatedRunner<'a> {
             .candidates(&changes, "adoptable updates against upgrade policy");
         let preview = self
             .ws
-            .preview_project_upgrade(pctx, self.opts, changes, manifest_only, advisories)
+            .preview_project_upgrade(
+                pctx,
+                self.opts,
+                changes,
+                manifest_only,
+                advisories,
+                excluded_members,
+            )
             .await;
         let mut verification_errors = preview.errors;
         verification_errors.extend(preview.items.iter().filter_map(|item| item.error.clone()));
@@ -379,7 +386,7 @@ impl<'a> OutdatedRunner<'a> {
         if !verification_errors.is_empty() {
             // An incomplete probe cannot turn an adoptable candidate into a false `blocked` row.
             tracing::warn!(
-                project = project_label,
+                project = pctx.rel_path.as_str(),
                 tool = pctx.tool.as_str(),
                 errors = verification_errors.len(),
                 "could not verify adoptable updates against the complete upgrade policy"

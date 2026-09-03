@@ -136,6 +136,7 @@ fn no_tool_explain(generated_at: String, error: Diagnostic) -> Result<String, Co
                     min_age_days: 0.0,
                     decided_by: "default".into(),
                 },
+                excluded_members: Vec::new(),
             },
             render::ExplainSummary {},
             Vec::<render::ExplainStep>::new(),

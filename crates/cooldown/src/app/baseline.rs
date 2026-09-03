@@ -189,7 +189,8 @@ impl crate::app::Workspace {
             let read_guard = self.project_read_guard(pctx).await?;
             let mut deps = self
                 .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
-                .await?;
+                .await?
+                .deps;
             drop(read_guard);
             // Identities must be adapter-confirmed before they are queried, matched, or
             // counted (see `ToolRead::confirm_advisory_identities`) — only when the feed runs.

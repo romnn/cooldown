@@ -348,20 +348,22 @@ pub struct Dependency {
     /// repository-URL identity; identity is correct for most tools).
     ///
     /// `None` withholds the identity entirely: the package is never sent to the feed and never
-    /// matched against its advisories. Advisory data can only *loosen* policy (annotate rows,
-    /// shorten windows), so a package from a private or alternate registry that merely shares a
-    /// public package's name must not inherit the public package's advisories — OSV's `PyPI`
-    /// ecosystem identifies pypi.org packages, not arbitrary Python indexes. The proof must be
-    /// *positive*, in one of three forms: a per-package resolution record naming the public
-    /// registry; a fully enumerable configuration surface shown clean (pip's requirements
-    /// tree, rooted at the file and followed through its `-r`/`-c` includes); or the package
-    /// manager itself confirming its effective routing at feed time
-    /// ([`ToolRead::confirm_advisory_identities`](crate::ToolRead::confirm_advisory_identities)
-    /// — npm's and pip's `config list`). The absence of *unenumerable* configuration is never
-    /// proof — npm's global and builtin layers, pip's interpreter-prefix site config behind a
-    /// shim, Maven's parent poms — and configuration can only veto a grant, never substitute
-    /// for one. The adapter is the only side that sees the lock's source records, so it
-    /// decides here, at construction.
+    /// matched against its advisories.
+    /// Advisory data can only *loosen* policy (annotate rows, shorten windows), so a package from a
+    /// private or alternate registry that merely shares a public package's name must not inherit
+    /// the public package's advisories — OSV's `PyPI` ecosystem identifies pypi.org packages, not
+    /// arbitrary Python indexes.
+    /// The proof must be *positive*, in one of three forms: a per-package resolution record naming
+    /// the public registry; a fully enumerable configuration surface shown clean (pip's
+    /// requirements tree, rooted at the file and followed through its `-r`/`-c` includes); or the
+    /// package manager itself confirming its effective routing at feed time
+    /// ([`ToolRead::confirm_advisory_identities`](crate::ToolRead::confirm_advisory_identities) —
+    /// npm's, pnpm's, and pip's `config list`).
+    /// The absence of *unenumerable* configuration is never proof — npm's global and builtin
+    /// layers, pip's interpreter-prefix site config behind a shim, Maven's parent poms — and
+    /// configuration can only veto a grant, never substitute for one.
+    /// The adapter is the only side that sees the lock's source records, so it decides here, at
+    /// construction.
     pub advisory_identity: Option<String>,
     /// The currently-locked version, or the declared floor for an explicit manifest-only candidate.
     pub current: Version,
@@ -872,6 +874,14 @@ pub struct Plan {
     /// Adapters may authorize these exact starting versions while resolving a repair, but must not
     /// treat the set as permission for newly selected versions to bypass the policy.
     pub baseline_violations: Vec<BaselineViolation>,
+    /// The workspace members the run's `exclude-folders`/`exclude-packages` policy dropped from
+    /// every dependency's attribution — outside the request, not merely unattributed.
+    ///
+    /// An adapter must neither move, pin, nor rewrite a declaration these members own, and must not
+    /// count their declarations as workspace evidence: a pnpm importer the user excluded cannot
+    /// veto an update in an included one by declaring the package on another line.
+    /// Empty when nothing is excluded or the adapter attributes no members.
+    pub excluded_members: Vec<MemberRef>,
 }
 
 /// Declares [`SkipReason`] together with its [`ALL`](SkipReason::ALL) enumeration and per-variant
@@ -934,11 +944,14 @@ skip_reasons! {
     /// the peer contract even where the native resolver only warns. The offending dependent is
     /// named on the [`Skipped`] row.
     PeerHeld = "peer_held",
-    /// The dependency is declared at multiple versions across the workspace, so it is range-floated
-    /// (each importer kept on its own line) rather than pinned to one target. A candidate whose target
-    /// is out of this importer's line — a cross-line bump, e.g. one member on `@types/node@^22` while
-    /// the target is `25`, or a peer-only dependency the resolver will not move — is deliberately held
-    /// in range. Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
+    /// The workspace declares the dependency under ranges that do not all admit the target (one
+    /// member on `@types/node@^22` while the target is `25`), so it is range-floated (each importer
+    /// kept on its own line) rather than pinned to one target; `--rewrite` widens the ranges and
+    /// converges it.
+    /// The same reason holds a name the plan targets at several versions at once (a `^22` line and
+    /// a `^25` line each advancing within itself), which one joint pin cannot land whatever the
+    /// ranges admit; there only `--major`, admitting one line for every importer, converges it.
+    /// Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
     /// upgrade, so it never fails a `--strict` run.
     MultiVersionHeld = "multi_version_held",
 }

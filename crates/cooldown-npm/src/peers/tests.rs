@@ -54,7 +54,7 @@ fn plan_of(changes: Vec<Change>) -> Plan {
 /// Gathers lock-only peer evidence (no workspace root, so no manifest source) and partitions —
 /// the shape most gate tests exercise.
 fn peer_partition<L: NodeLock>(plan: &Plan, lock: Option<&str>) -> PeerPartition {
-    partition_peer_held::<L>(plan, &PeerEvidence::gather::<L>(None, lock))
+    partition_peer_held::<L>(plan, &PeerEvidence::gather::<L>(None, lock, plan))
 }
 
 /// The trap itself: a cross-major target a still-present dependent's peer range excludes is
@@ -567,7 +567,8 @@ fn workspace_manifest_peer_holds_a_same_line_move_its_narrow_bound_excludes() {
         }
     }"#};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock), &Plan::default());
     let plan = plan_of(vec![change("chalk", "5.6.0", "5.6.2")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
@@ -635,7 +636,8 @@ fn workspace_manifest_peer_floor_rejects_a_downgrade_below_it() {
         }}"#}
     };
     let before = lock("5.6.2");
-    let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(&before));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(&before), &Plan::default());
 
     // The pre-gate lets the downgrade through — `fix` must be able to roll back.
     let mut downgrade = change("chalk", "5.6.2", "5.6.0");
@@ -707,7 +709,8 @@ fn workspace_manifest_peer_violations_are_post_verified() {
 
           packages/shim: {}
     "};
-    let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(before));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(before), &Plan::default());
     assert!(
         proven_peer_violations::<crate::lock::Pnpm>(before, &evidence.workspace).is_empty(),
         "the pre-apply graph satisfies the shim's contract"
@@ -771,7 +774,8 @@ fn workspace_manifest_peer_holds_the_root_projects_own_contract() {
         }
     }"#};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock), &Plan::default());
     let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Npm>(&plan, &evidence);
@@ -861,7 +865,8 @@ fn workspace_manifest_peer_ignores_a_same_name_registry_decoy() {
         }
     }"#};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Npm>(Some(&root), Some(lock), &Plan::default());
     assert!(
         evidence
             .workspace
@@ -925,7 +930,8 @@ fn workspace_manifest_peer_holds_a_cross_major_move() {
           packages/shim: {}
     "};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock), &Plan::default());
     assert_eq!(
         evidence.workspace.len(),
         1,
@@ -1011,7 +1017,8 @@ fn workspace_manifest_peer_holds_an_injected_cross_major_move() {
               eslint: ^8.0.0
     "};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock), &Plan::default());
     assert_eq!(
         evidence
             .workspace
@@ -1069,7 +1076,8 @@ fn workspace_manifest_peer_holds_across_a_parenthesized_injected_path() {
           'packages/shim(foo@bar)': {}
     "};
 
-    let evidence = PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock));
+    let evidence =
+        PeerEvidence::gather::<crate::lock::Pnpm>(Some(&root), Some(lock), &Plan::default());
     let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);

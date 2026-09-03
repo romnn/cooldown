@@ -434,6 +434,39 @@ impl SelectionRelation {
     }
 }
 
+/// Drops the members at `excluded` paths from every row, and then every row left with no member:
+/// the pruning a raw graph read needs before it plans a mutation, so a change never carries an
+/// excluded importer as a pin target.
+/// A row only excluded importers declared goes with them: any violation on that copy is the
+/// excluded importer's business, and a fix for it could land only by moving that importer.
+/// A copy an in-scope package pulls in transitively is a separate, memberless row, which stays, so
+/// the residual gate can still reconcile it through the override leg.
+pub(crate) fn prune_excluded_members(
+    deps: &mut Vec<Dependency>,
+    excluded: &[cooldown_core::MemberRef],
+) {
+    if excluded.is_empty() {
+        return;
+    }
+    deps.retain_mut(|dep| {
+        if dep.members.is_empty() {
+            return true;
+        }
+        dep.members
+            .retain(|member| !excluded.iter().any(|dropped| dropped.path == member.path));
+        !dep.members.is_empty()
+    });
+}
+
+/// One project's dependency rows after scoping (see [`Workspace::dependencies_in_scope`]): the rows
+/// that stay, and every member the scope or exclude policy dropped from them — handed to a mutation
+/// as [`Plan::excluded_members`](cooldown_core::Plan::excluded_members) so an adapter never treats
+/// a dropped member's declarations as its own to move or as workspace evidence.
+pub(crate) struct ScopedDependencies {
+    pub(crate) deps: Vec<Dependency>,
+    pub(crate) excluded_members: Vec<cooldown_core::MemberRef>,
+}
+
 /// How the selection scopes one project's dependency rows.
 enum MemberScope {
     /// Every row not excluded stays: there is no selection.
@@ -467,6 +500,28 @@ impl MemberScope {
             sel: sel.to_owned(),
             owner,
         }
+    }
+
+    /// Drops the members of `dep` the scope or exclude policy removes and returns them.
+    fn prune_members(
+        &self,
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        dep: &mut Dependency,
+    ) -> Vec<cooldown_core::MemberRef> {
+        let tool = pctx.tool.as_str();
+        let (kept, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut dep.members)
+            .into_iter()
+            .partition(|member| {
+                self.keeps(
+                    &opts.excludes,
+                    tool,
+                    &member_location(pctx, member),
+                    &member.name,
+                )
+            });
+        dep.members = kept;
+        dropped
     }
 
     /// Whether the member of a `tool` project at the scan-root-relative `location`, named
@@ -955,20 +1010,29 @@ impl Workspace {
         }
     }
 
-    /// The scoped dependency list for reporting: the adapter's raw deps with `--package` scoping and
-    /// the `exclude` policy applied (excluded members dropped, then deps with no member left removed).
-    /// This is the single chokepoint every list/report command (`outdated`/`check`/`upgrade`/
-    /// `baseline`) reads through, so excluded packages never reach a report. Whole-graph reads that
-    /// must see everything (the upgrade graph-violation check, `explain`) call the adapter directly.
+    /// The scoped dependency list for reporting: the adapter's raw deps with `--package` scoping
+    /// and the `exclude` policy applied (excluded members dropped, then deps with no member left
+    /// removed), beside the members that policy dropped.
+    /// This is the single chokepoint every list/report command
+    /// (`outdated`/`check`/`upgrade`/`baseline`) reads through, so excluded packages never reach a
+    /// report.
+    /// Whole-graph reads that must see everything (the upgrade graph-violation check, `explain`)
+    /// call the adapter directly.
     pub(crate) async fn dependencies_in_scope(
         &self,
         adapter: &dyn ToolRead,
         pctx: &ProjectCtx,
         scope: DepScope,
         opts: &RunOpts,
-    ) -> cooldown_core::Result<Vec<Dependency>> {
+    ) -> cooldown_core::Result<ScopedDependencies> {
         let deps = adapter.dependencies(&pctx.project, scope).await?;
-        Ok(Self::scope_dependencies(pctx, opts, deps))
+        let mut scoped = Self::scope_dependencies(pctx, opts, deps);
+        if !scoped.excluded_members.is_empty() {
+            adapter
+                .rescope_members(&pctx.project, &mut scoped.deps, &scoped.excluded_members)
+                .await?;
+        }
+        Ok(scoped)
     }
 
     /// The build-backend requirements (`[build-system].requires`) the lockfile never records, scoped
@@ -982,7 +1046,7 @@ impl Workspace {
         opts: &RunOpts,
     ) -> cooldown_core::Result<Vec<Dependency>> {
         let deps = adapter.manifest_constraints(&pctx.project).await?;
-        Ok(Self::scope_dependencies(pctx, opts, deps))
+        Ok(Self::scope_dependencies(pctx, opts, deps).deps)
     }
 
     /// Apply `--package` scoping and the `exclude` policy (excluded members dropped, then deps with no
@@ -992,34 +1056,30 @@ impl Workspace {
         pctx: &ProjectCtx,
         opts: &RunOpts,
         deps: Vec<Dependency>,
-    ) -> Vec<Dependency> {
+    ) -> ScopedDependencies {
         let scope = MemberScope::resolve(pctx, opts, &deps);
-        let mut deps: Vec<Dependency> = deps
-            .into_iter()
-            .filter(|dep| Self::package_in_scope(opts, &dep.package.name))
-            .collect();
-        // Drop out-of-scope and excluded members from each dependency first, then drop a
-        // dependency with no member left.
+        // Drop out-of-scope and excluded members from each dependency first, then drop a dependency
+        // with no member left.
         // Pruning the members before anything reads them means a kept dep is attributed only to
         // in-scope, non-excluded packages, so its "used by" representative is never one of those.
         // A row no member claims (a Go module's rows, or the transitive rows of an adapter that
         // attributes only direct dependencies) stays under any selection: dropping it would let a
         // too-fresh transitive slip past the gate, and no member can vouch for it either way.
-        let tool = pctx.tool.as_str();
+        // The members are pruned over every row, before `--package` narrows the rows: the set of
+        // members the run excludes is a property of the run, and an adapter judging a package the
+        // filter left out (a collateral move) must see the same excluded set as one it kept.
+        let mut deps = deps;
+        let mut excluded: BTreeMap<String, cooldown_core::MemberRef> = BTreeMap::new();
         deps.retain_mut(|dep| {
             if dep.members.is_empty() {
                 return true;
             }
-            dep.members.retain(|member| {
-                scope.keeps(
-                    &opts.excludes,
-                    tool,
-                    &member_location(pctx, member),
-                    &member.name,
-                )
-            });
+            for member in scope.prune_members(pctx, opts, dep) {
+                excluded.entry(member.path.clone()).or_insert(member);
+            }
             !dep.members.is_empty()
         });
+        deps.retain(|dep| Self::package_in_scope(opts, &dep.package.name));
         // Adapters yield deps in registry/HashMap order; sort so every command — most importantly
         // `upgrade`, which applies one change at a time — is deterministic when re-run back to back.
         deps.sort_by(|a, b| {
@@ -1028,7 +1088,33 @@ impl Workspace {
                 .cmp(&b.package.name)
                 .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
         });
-        deps
+        ScopedDependencies {
+            deps,
+            excluded_members: excluded.into_values().collect(),
+        }
+    }
+
+    /// The members declaring `name` that the scope and exclude policy drop, judged over the raw
+    /// `deps` exactly as [`scope_dependencies`](Self::scope_dependencies) would — for `explain`,
+    /// which reads the raw graph and must still say which declarations the run ignores.
+    pub(crate) fn excluded_members_of(
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        deps: &[Dependency],
+        name: &str,
+    ) -> Vec<cooldown_core::MemberRef> {
+        let scope = MemberScope::resolve(pctx, opts, deps);
+        let mut excluded: Vec<cooldown_core::MemberRef> = deps
+            .iter()
+            .filter(|dep| dep.package.name == name)
+            .flat_map(|dep| {
+                let mut dep = dep.clone();
+                scope.prune_members(pctx, opts, &mut dep)
+            })
+            .collect();
+        excluded.sort_by(|a, b| a.path.cmp(&b.path));
+        excluded.dedup_by(|a, b| a.path == b.path);
+        excluded
     }
 
     pub(crate) fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
@@ -1633,6 +1719,7 @@ mod tests {
         )
         .await
         .expect("dependencies")
+        .deps
         .into_iter()
         .map(|dep| dep.package.name)
         .collect()
@@ -1722,7 +1809,8 @@ mod tests {
                 &opts_for(Some("/repo/services")),
             )
             .await
-            .expect("dependencies");
+            .expect("dependencies")
+            .deps;
 
         let names: Vec<String> = deps.into_iter().map(|dep| dep.package.name).collect();
         assert_eq!(names, vec!["left-dep", "right-dep"]);
@@ -1766,6 +1854,7 @@ mod tests {
         ws.dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
             .await
             .expect("dependencies")
+            .deps
             .into_iter()
             .map(|dep| dep.package.name)
             .collect()
@@ -1787,6 +1876,121 @@ mod tests {
         assert_eq!(
             scoped_names_with_excludes(Some("/repo/packages/left"), &[], &["left"]).await,
             vec!["left-dep"]
+        );
+    }
+
+    /// The members the exclude policy drops travel beside the scoped rows — the adapter needs them
+    /// to keep an excluded importer's declarations out of its workspace evidence — and `explain`
+    /// can name the excluded declarers of one package from the raw graph.
+    #[tokio::test]
+    async fn scoping_reports_the_members_it_excludes() {
+        let pctx = project_ctx(PNPM, "/repo");
+        let ws = test_workspace(Utf8PathBuf::from("/repo"), pctx);
+        let reader = FakeReader {
+            id: PNPM,
+            deps: vec![
+                dep("mongoose", "app", "app"),
+                dep("mongoose", "legacy", "legacy"),
+                dep("only-legacy", "legacy", "legacy"),
+            ],
+        };
+        let opts = RunOpts {
+            excludes: excludes(&["legacy"], &[]),
+            ..opts_for(None)
+        };
+
+        let scoped = ws
+            .dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
+            .await
+            .expect("dependencies");
+
+        assert_eq!(
+            scoped
+                .deps
+                .iter()
+                .map(|dep| dep.package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mongoose"],
+            "a row only the excluded member declares is dropped with it"
+        );
+        assert_eq!(
+            scoped.excluded_members,
+            vec![MemberRef {
+                name: "legacy".to_string(),
+                path: "legacy".to_string(),
+            }],
+            "the excluded member is reported once, however many rows it declared"
+        );
+        assert_eq!(
+            Workspace::excluded_members_of(&ws.projects()[0], &opts, &reader.deps, "mongoose"),
+            scoped.excluded_members
+        );
+        // The excluded set is a property of the run, not of `--package`: a member that only
+        // declares packages the filter drops is still reported, so an adapter judging a collateral
+        // move sees the same excluded importers as one judging a planned one.
+        let filtered = RunOpts {
+            package: vec![PatternGlob::new("only-*").expect("glob")],
+            ..RunOpts {
+                excludes: excludes(&["legacy"], &[]),
+                ..opts_for(None)
+            }
+        };
+        let scoped = ws
+            .dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &filtered)
+            .await
+            .expect("dependencies");
+        assert!(
+            scoped.deps.is_empty(),
+            "only-legacy's sole declarer is excluded"
+        );
+        assert_eq!(scoped.excluded_members.len(), 1);
+        assert!(
+            Workspace::excluded_members_of(
+                &ws.projects()[0],
+                &opts_for(None),
+                &reader.deps,
+                "mongoose"
+            )
+            .is_empty(),
+            "nothing is excluded without an exclude list"
+        );
+    }
+
+    /// A raw graph read pruned by an already-resolved excluded set: excluded members leave every
+    /// row, a row they alone declared leaves with them, and a memberless transitive row stays.
+    #[test]
+    fn prune_excluded_members_drops_rows_they_alone_declared() {
+        let mut transitive = dep("ms", "app", "app");
+        transitive.direct = false;
+        transitive.members.clear();
+        let mut shared = dep("mongoose", "app", "app");
+        shared.members.push(MemberRef {
+            name: "legacy".to_string(),
+            path: "legacy".to_string(),
+        });
+        let mut deps = vec![shared, dep("only-legacy", "legacy", "legacy"), transitive];
+
+        prune_excluded_members(
+            &mut deps,
+            &[MemberRef {
+                name: "legacy".to_string(),
+                path: "legacy".to_string(),
+            }],
+        );
+
+        let rows: Vec<(&str, bool, Vec<&str>)> = deps
+            .iter()
+            .map(|dep| {
+                (
+                    dep.package.name.as_str(),
+                    dep.direct,
+                    dep.members.iter().map(|m| m.path.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("mongoose", true, vec!["app"]), ("ms", false, vec![])]
         );
     }
 
@@ -1875,6 +2079,7 @@ mod tests {
             )
             .await
             .expect("dependencies")
+            .deps
             .into_iter()
             .map(|dep| dep.package.name)
             .collect::<Vec<_>>()
@@ -1913,6 +2118,7 @@ mod tests {
                 ws.dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
                     .await
                     .expect("dependencies")
+                    .deps
                     .into_iter()
                     .map(|dep| dep.package.name)
                     .collect::<Vec<_>>()
@@ -1953,6 +2159,7 @@ mod tests {
                 ws.dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
                     .await
                     .expect("dependencies")
+                    .deps
                     .into_iter()
                     .map(|dep| dep.package.name)
                     .collect::<Vec<_>>()
@@ -2124,7 +2331,8 @@ mod tests {
                 &opts_for(Some("/repo/packages/right")),
             )
             .await
-            .expect("dependencies");
+            .expect("dependencies")
+            .deps;
 
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].members.len(), 1);
@@ -2148,7 +2356,8 @@ mod tests {
         let deps = ws
             .dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
             .await
-            .expect("dependencies");
+            .expect("dependencies")
+            .deps;
 
         assert!(deps.is_empty());
 
@@ -2165,7 +2374,8 @@ mod tests {
         let deps = ws
             .dependencies_in_scope(&reader, &ws.projects()[0], DepScope::Direct, &opts)
             .await
-            .expect("dependencies");
+            .expect("dependencies")
+            .deps;
         assert!(deps.is_empty());
     }
 

@@ -11,7 +11,7 @@
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to refresh the lock after a manifest edit.
@@ -33,12 +33,12 @@ pub trait NodeLock: Send + Sync + 'static {
     /// not-eligible skips for them.
     const SUPPORTS_TRANSITIVE_ADVANCE: bool = false;
 
-    /// Whether this manager's *effective* registry routing can be confirmed by asking the
-    /// binary itself (`npm config list --json` merges builtin, global, user, project, and
-    /// environment layers). `false` means it cannot be — yarn classic merges `.yarnrc` files up
-    /// the directory tree with no reliably parseable query, and pnpm/bun grant no identities in
-    /// the first place — so every advisory identity is withheld at feed time.
-    const CONFIRMS_EFFECTIVE_REGISTRY: bool = false;
+    /// What the manager's own effective-configuration query (`<bin> config list --json`, every
+    /// layer merged — builtin, global, user, project, environment) contributes to advisory identity
+    /// at feed time.
+    /// See [`EffectiveRegistryQuery`]; the default is the manager with no reliably parseable query
+    /// (yarn classic, bun), whose identities never survive the feed.
+    const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Unavailable;
 
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
@@ -47,11 +47,23 @@ pub trait NodeLock: Send + Sync + 'static {
     /// Returns a [`CoreError`] if the lockfile cannot be parsed.
     fn parse(content: &str) -> Result<Vec<NameVersion>>;
 
-    /// The workspace member package(s) that declare each dependency, for attributing a dependency to
-    /// its source package(s) in reports. Default: empty (yarn classic and bun record no per-member
-    /// data in their locks, so their `members` column stays blank).
+    /// The workspace member package(s) that declare each dependency, for attributing a dependency
+    /// to its source package(s) in reports.
+    /// Empty for yarn classic and bun, which record no per-member data in their locks, so their
+    /// `members` column stays blank.
     #[must_use]
-    fn member_sources(_content: &str) -> MemberIndex {
+    fn member_sources(content: &str) -> MemberIndex {
+        Self::member_sources_excluding(content, &HashSet::new())
+    }
+
+    /// [`member_sources`](NodeLock::member_sources) with the members at `excluded` paths left out
+    /// entirely, as if the lock never recorded them — the index the whole-graph resolve derives its
+    /// workspace-split evidence from, so an importer the run's exclude policy dropped
+    /// ([`Plan::excluded_members`](cooldown_core::Plan::excluded_members)) contributes neither a
+    /// declared range nor a resolved version.
+    /// Default: empty (no per-member data).
+    #[must_use]
+    fn member_sources_excluding(_content: &str, _excluded: &HashSet<String>) -> MemberIndex {
         MemberIndex::default()
     }
 
@@ -80,15 +92,18 @@ pub trait NodeLock: Send + Sync + 'static {
         HashMap::new()
     }
 
-    /// The dependency names whose *every* declaring importer manages them through a pnpm catalog
-    /// (a `catalog:` / `catalog:<name>` specifier). Their version pins live in
-    /// `pnpm-workspace.yaml`'s catalog definitions, which cooldown does not edit: the manifest
-    /// widen refuses protocol specifiers and `pnpm update <name>@<target>` re-resolves the
-    /// importer back to the catalog pin, so the apply engine holds these candidates up front with
-    /// a truthful skip instead of letting them surface as an eternal resolver conflict. Default:
-    /// empty (only pnpm has catalogs).
+    /// The dependency names whose *every* declaring importer outside `excluded` manages them
+    /// through a pnpm catalog (a `catalog:` / `catalog:<name>` specifier).
+    /// Their version pins live in `pnpm-workspace.yaml`'s catalog definitions, which cooldown does
+    /// not edit: the manifest widen refuses protocol specifiers and `pnpm update <name>@<target>`
+    /// re-resolves the importer back to the catalog pin, so the apply engine holds these
+    /// candidates up front with a truthful skip instead of letting them surface as an eternal
+    /// resolver conflict.
+    /// An excluded importer's plain-range declaration is not the run's to land, so it must not talk
+    /// an included catalog-only candidate out of that hold.
+    /// Default: empty (only pnpm has catalogs).
     #[must_use]
-    fn catalog_managed_names(_content: &str) -> HashSet<String> {
+    fn catalog_managed_names(_content: &str, _excluded: &HashSet<String>) -> HashSet<String> {
         HashSet::new()
     }
 
@@ -311,12 +326,25 @@ pub struct MemberIndex {
     exact_version: HashSet<(String, String)>,
     /// Names pinned exactly by every declaring member manifest (npm, which records ranges per name).
     exact_name: HashSet<String>,
-    /// The distinct declared *range specifiers* per name across importers (pnpm records a `specifier:`
-    /// per importer). A name two members declare with different ranges (`~7.3.0` vs `^7.0.0`, `<4` vs
-    /// `^4`) is a version split even when the lock happens to resolve both to one version, so cooldown
-    /// must not exact-pin it across the workspace.
+    /// The distinct declared *range specifiers* per name across importers (pnpm records a
+    /// `specifier:` per importer).
+    /// Whether disagreeing ranges (`~7.3.0` vs `^7.0.0`, `<4` vs `^4`) split a name depends on the
+    /// target being pinned — see [`splits_for`](MemberIndex::splits_for).
     declared_specifiers: HashMap<String, HashSet<String>>,
+    /// Each importer's registry-resolved direct entries by name (pnpm records a `specifier:` and a
+    /// `version:` per importer), the baseline the excluded-importer guard diffs.
+    importer_entries: HashMap<String, BTreeMap<String, ImporterEntry>>,
     authoritative: bool,
+}
+
+/// One importer's record of one direct dependency in `pnpm-lock.yaml`: the declared range and the
+/// version it resolved to (peer suffix stripped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImporterEntry {
+    /// The `specifier:` line — the manifest's declared range, verbatim; `None` when the lock omits it.
+    pub specifier: Option<String>,
+    /// The resolved `version:`.
+    pub version: String,
 }
 
 impl MemberIndex {
@@ -351,6 +379,14 @@ impl MemberIndex {
         self
     }
 
+    fn with_importer_entries(
+        mut self,
+        entries: HashMap<String, BTreeMap<String, ImporterEntry>>,
+    ) -> Self {
+        self.importer_entries = entries;
+        self
+    }
+
     /// Whether `name`@`version` is exact-pinned by every member that declares it, so it is held: it
     /// cannot move without editing a manifest.
     #[must_use]
@@ -378,43 +414,39 @@ impl MemberIndex {
             .collect()
     }
 
-    /// Names that workspace importers DECLARE at more than one distinct line — a genuine split that
-    /// must be held out of the joint update, NOT a transitive duplicate. A name splits when importers
-    /// either resolve it to different versions (one member on `chalk@4.1.2`, another on `chalk@5.3.0`)
-    /// OR declare it with different *range specifiers* (`semver@~7.3.0` vs `semver@^7.0.0`,
-    /// `tailwindcss@"<4"` vs `@^4`) — the latter even when the lock happens to resolve both to one
-    /// version. Either way an exact pin would collapse every copy onto a single target, dragging the
-    /// narrower member off its own declared range; the whole-graph resolve skips these and exact-pins
-    /// the rest.
+    /// Whether exact-pinning `name` to `target` across every declaring importer would drag some
+    /// importer off its own declared range — the genuine workspace split the whole-graph resolve
+    /// must hold out of the joint update, NOT a transitive duplicate.
     ///
-    /// Derived from per-importer declarations only, so a direct dependency that merely shares a name
-    /// with a transitive copy resolved at another version is single-declared and excluded. Only the
-    /// version-keyed (pnpm) index carries per-importer data; the name-only (npm) index has none and
-    /// yields nothing.
+    /// Importers that resolve the name to different versions (one member on `chalk@4.1.2`, another
+    /// on `chalk@5.3.0`) or declare it under different range specifiers (`~7.3.0` vs `^7.0.0`) are
+    /// only a split *relative to the target*: when every distinct declared range provably admits
+    /// it, pinning the whole name there is exactly what a plain `pnpm update` does and no manifest
+    /// needs rewriting, so two importers on `^4.17.20` and `^4.17.21` both take `4.17.22`.
+    /// The split is held whenever any declared range excludes the target — or cannot be judged at
+    /// all.
+    /// Node-semver forms the Rust parser cannot represent (`||` unions, hyphen ranges, dist tags)
+    /// fail [`version_in_range`](crate::version::version_in_range) and so keep the split: the
+    /// question is answered only on proof, never by default, since the alternative writes an
+    /// out-of-range lock entry while `--no-save` leaves the manifest untouched.
+    /// A name whose only declarations carry protocol specifiers (`catalog:`, `npm:` aliases)
+    /// records no range at all, so several resolved versions of it stay split.
+    ///
+    /// Derived from per-importer declarations only, so a direct dependency that merely shares a
+    /// name with a transitive copy resolved at another version is single-declared and never splits.
+    /// Only the version-keyed (pnpm) index carries per-importer data; the name-only (npm) index has
+    /// none and never splits.
     #[must_use]
-    pub fn names_declared_at_multiple_versions(&self) -> HashSet<String> {
-        let mut split: HashSet<String> = HashSet::new();
-        let mut versions: HashMap<&str, HashSet<&str>> = HashMap::new();
-        for (name, version) in self.by_version.keys() {
-            versions
-                .entry(name.as_str())
-                .or_default()
-                .insert(version.as_str());
+    pub fn splits_for(&self, name: &str, target: &str) -> bool {
+        let lines = self.resolved_versions_of(name).len();
+        let specifiers = self.declared_specifiers_of(name);
+        if lines <= 1 && specifiers.len() <= 1 {
+            return false;
         }
-        for (name, set) in versions {
-            if set.len() > 1 {
-                split.insert(name.to_string());
-            }
-        }
-        // A name whose importers declare DIFFERENT range specifiers is a split too, even if the lock
-        // currently resolves them to the same version: an exact pin to one member's target would force
-        // the narrower-ranged sibling off its own range (the `~7.3.0`/`^7.0.0` and `<4`/`^4` cases).
-        for (name, specifiers) in &self.declared_specifiers {
-            if specifiers.len() > 1 {
-                split.insert(name.clone());
-            }
-        }
-        split
+        specifiers.is_empty()
+            || specifiers
+                .iter()
+                .any(|specifier| !crate::version::version_in_range(specifier, target))
     }
 
     /// The version `member` (an importer path) resolves `name` to, if this index carries per-importer
@@ -456,7 +488,10 @@ impl MemberIndex {
             .filter(|(entry, _)| entry == name)
             .map(|(_, version)| version.as_str())
             .collect();
-        versions.sort_by(|a, b| crate::version::compare(a, b));
+        // The string tiebreak keeps the order total: two versions `compare` cannot rank (build
+        // metadata, unparsable strings) would otherwise fall in map order and make the hold detail
+        // and the split verdict nondeterministic.
+        versions.sort_by(|a, b| crate::version::compare(a, b).then_with(|| a.cmp(b)));
         versions.dedup();
         versions
     }
@@ -526,6 +561,20 @@ impl MemberIndex {
         members.sort();
         members.dedup();
         members
+    }
+
+    /// One importer's registry-resolved direct entries by name (pnpm's per-importer records); empty
+    /// for a lock without per-importer records or an importer the lock does not list.
+    /// `link:`/`workspace:`/`file:` entries are not versions and are absent, like everywhere in the
+    /// index.
+    #[must_use]
+    pub fn entries_of(&self, member: &str) -> BTreeMap<&str, &ImporterEntry> {
+        self.importer_entries
+            .get(member)
+            .into_iter()
+            .flatten()
+            .map(|(name, entry)| (name.as_str(), entry))
+            .collect()
     }
 }
 
@@ -760,14 +809,36 @@ struct PnpmPackage {
     peer_dependencies: YamlEntries<Tolerant<String>>,
 }
 
-/// A package's `resolution:` record; only injected-directory resolutions
-/// (`{directory: …, type: directory}`) are consumed.
+/// A package's `resolution:` record: the injected-directory shape (`{directory: …, type:
+/// directory}`) for local-package recovery, and the exact key set for origin evidence.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct PnpmResolution {
+    integrity: Option<String>,
     directory: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
+    /// Every key the model does not name — `tarball` (a registry entry served from a tarball URL
+    /// pnpm could not derive from the *default* registry, or a plain URL dependency), `repo` and
+    /// `commit` (git), `path`, and anything a future format adds.
+    /// Any of them marks a resolution that did not come from the configured registry by name.
+    /// Only the keys' presence matters; the values ride along as opaque JSON because flattening
+    /// needs a sized value type.
+    #[serde(flatten)]
+    other: BTreeMap<String, serde_json::Value>,
+}
+
+impl PnpmResolution {
+    /// Whether this is the shape pnpm writes for an artifact fetched from the configured registry
+    /// by package name: the integrity hash and nothing else.
+    /// pnpm names no registry per entry; the manager's effective `registry` setting for the
+    /// package's scope says which one served it.
+    fn is_registry(&self) -> bool {
+        self.integrity.is_some()
+            && self.directory.is_none()
+            && self.kind.is_none()
+            && self.other.is_empty()
+    }
 }
 
 /// Parses `pnpm-lock.yaml` once into the typed document, failing closed on a document cooldown
@@ -1076,11 +1147,51 @@ pub struct NameVersion {
     pub name: String,
     /// The version — everything after the specifier's last `@`.
     pub version: String,
-    /// The URL the lock records this entry as fetched from, when the format records one per
-    /// entry (`package-lock.json`'s and yarn classic's `resolved`). `None` for formats that
-    /// keep no per-entry origin (pnpm, bun) and for entries without one — advisory identity
-    /// then has no positive origin evidence and is withheld.
-    pub resolved: Option<String>,
+    /// Where the lock records this entry as coming from — the positive origin evidence advisory
+    /// identity requires.
+    pub origin: LockOrigin,
+}
+
+/// What a lock records about where one resolved entry came from.
+///
+/// Advisory identity needs *positive* origin evidence: an OSV ecosystem names the packages of one
+/// public registry, and a same-named package from another registry is a different package.
+/// Each lock format proves origin as far as it can, and the adapter grants identity only from
+/// proof.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LockOrigin {
+    /// No per-entry record: a format that keeps none (bun), or an entry without one (a link or
+    /// bundled entry, an injected workspace copy, a git or tarball resolution).
+    /// Nothing is proven, so no identity is granted.
+    Unrecorded,
+    /// The URL the artifact was fetched from — npm's and yarn classic's `resolved`, which name the
+    /// registry per entry (the integrity hash pins the artifact to what that registry served).
+    Url(String),
+    /// A registry entry whose registry the lock does not name: pnpm's `resolution: {integrity: …}`
+    /// shape, written only for an artifact fetched from the *configured* registry by package name
+    /// (anything else carries a `tarball`, `repo`, `directory`, or URL field).
+    /// Which registry is the manager's effective `registry` setting for the package's scope, so the
+    /// identity is granted provisionally and the feed-time confirmation
+    /// ([`EffectiveRegistryQuery::Proves`]) supplies the other half of the proof.
+    ConfiguredRegistry,
+}
+
+/// How a manager's effective-configuration query bears on advisory identity when the feed runs (see
+/// [`confirm_advisory_identities`](cooldown_core::ToolRead::confirm_advisory_identities)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveRegistryQuery {
+    /// No reliably parseable query exists — yarn classic merges `.yarnrc` files up the directory
+    /// tree — so every identity is withheld at feed time.
+    Unavailable,
+    /// The lock names each entry's registry itself ([`LockOrigin::Url`]); the query can only *veto*
+    /// an identity whose package the effective routing sends elsewhere (npm).
+    Vetoes,
+    /// The lock only says "the configured registry" ([`LockOrigin::ConfiguredRegistry`]); the query
+    /// must *state* the effective `registry` and it must be the public one, and no scope override
+    /// may reroute the package.
+    /// Failing that — a failed query, an unstated registry, an unreadable value — withholds every
+    /// identity, never grants one (pnpm).
+    Proves,
 }
 
 impl NameVersion {
@@ -1089,7 +1200,7 @@ impl NameVersion {
         Self {
             name: name.into(),
             version: version.into(),
-            resolved: None,
+            origin: LockOrigin::Unrecorded,
         }
     }
 }
@@ -1099,11 +1210,7 @@ impl NameVersion {
 pub(crate) fn split_name_version(spec: &str) -> Option<NameVersion> {
     let at = spec.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = spec.split_at(at);
-    Some(NameVersion {
-        name: name.to_string(),
-        version: version[1..].to_string(),
-        resolved: None,
-    })
+    Some(NameVersion::new(name, &version[1..]))
 }
 
 /// Undoes the quoting of one YAML scalar.
@@ -1158,16 +1265,17 @@ impl NodeLock for Npm {
     const ID: ToolId = ToolId("npm");
     const LOCKFILE: &'static str = "package-lock.json";
     const BIN: &'static str = "npm";
-    const CONFIRMS_EFFECTIVE_REGISTRY: bool = true;
+    const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Vetoes;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_npm(content)
     }
 
-    fn member_sources(content: &str) -> MemberIndex {
-        parse_npm_member_sources(content)
+    fn member_sources_excluding(content: &str, excluded: &HashSet<String>) -> MemberIndex {
+        parse_npm_member_sources(content, excluded)
             .map(|by_name| {
-                MemberIndex::name_only(by_name).with_exact_names(parse_npm_exact_pins(content))
+                MemberIndex::name_only(by_name)
+                    .with_exact_names(parse_npm_exact_pins(content, excluded))
             })
             .unwrap_or_default()
     }
@@ -1248,23 +1356,25 @@ impl NodeLock for Pnpm {
     const BIN: &'static str = "pnpm";
     const NATIVE_MIN_AGE_FILE: Option<&'static str> = Some("pnpm-workspace.yaml");
     const SUPPORTS_TRANSITIVE_ADVANCE: bool = true;
+    const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Proves;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_pnpm(content)
     }
 
-    fn member_sources(content: &str) -> MemberIndex {
-        MemberIndex::version_exact(parse_pnpm_importer_members(content))
-            .with_exact_versions(parse_pnpm_exact_pins(content))
-            .with_declared_specifiers(parse_pnpm_importer_specifiers(content))
+    fn member_sources_excluding(content: &str, excluded: &HashSet<String>) -> MemberIndex {
+        MemberIndex::version_exact(parse_pnpm_importer_members(content, excluded))
+            .with_exact_versions(parse_pnpm_exact_pins(content, excluded))
+            .with_declared_specifiers(parse_pnpm_importer_specifiers(content, excluded))
+            .with_importer_entries(parse_pnpm_importer_entries(content, excluded))
     }
 
     fn peer_requirements(content: &str) -> Vec<PeerRequirement> {
         parse_pnpm_peer_requirements(content)
     }
 
-    fn catalog_managed_names(content: &str) -> HashSet<String> {
-        parse_pnpm_catalog_only_names(content)
+    fn catalog_managed_names(content: &str, excluded: &HashSet<String>) -> HashSet<String> {
+        parse_pnpm_catalog_only_names(content, excluded)
     }
 
     fn member_paths(content: &str) -> HashSet<String> {
@@ -1459,7 +1569,7 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
                 out.push(NameVersion {
                     name: name.to_string(),
                     version: version.to_string(),
-                    resolved: lock_entry_resolved(val),
+                    origin: lock_entry_origin(val),
                 });
             }
         }
@@ -1469,7 +1579,7 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
                 out.push(NameVersion {
                     name: name.clone(),
                     version: version.to_string(),
-                    resolved: lock_entry_resolved(val),
+                    origin: lock_entry_origin(val),
                 });
             }
         }
@@ -1480,25 +1590,37 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
 /// The `resolved` URL of one `package-lock.json` entry — npm's record of where the tarball was
 /// actually fetched from. Absent for link/bundled entries (and `false` in v1 locks installed
 /// with `--no-save`), which therefore carry no origin evidence.
-fn lock_entry_resolved(val: &serde_json::Value) -> Option<String> {
+fn lock_entry_origin(val: &serde_json::Value) -> LockOrigin {
     val.get("resolved")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .map_or(LockOrigin::Unrecorded, |url| {
+            LockOrigin::Url(url.to_string())
+        })
 }
 
 /// Parses `pnpm-lock.yaml` (v9, enforced by [`parse_pnpm_document_strict`]): the top-level
-/// `packages:` section keys every resolved package by its `name@version(...peers)` identity — the
-/// keys are the only field this reader needs.
+/// `packages:` section keys every resolved package by its `name@version(...peers)` identity, and
+/// each entry's `resolution:` record says whether the configured registry served it
+/// ([`LockOrigin::ConfiguredRegistry`]) or something else did.
+/// An entry whose shape the model does not recognize proves nothing and reads as unrecorded.
 fn parse_pnpm(content: &str) -> Result<Vec<NameVersion>> {
     let doc = parse_pnpm_document_strict(content)?;
     Ok(doc
         .packages
-        .keys()
-        .filter_map(|key| {
+        .entries()
+        .filter_map(|(key, package)| {
             // Drop the `(peer@x)` suffixes pnpm appends to disambiguate peer resolutions — as a
             // balanced trailing-group strip, since an injected key's `file:` path may itself
             // contain parenthesized directory segments.
-            split_name_version(strip_pnpm_peer_suffixes(key))
+            let mut entry = split_name_version(strip_pnpm_peer_suffixes(key))?;
+            let registry = package
+                .known()
+                .and_then(|package| package.resolution.as_ref())
+                .is_some_and(PnpmResolution::is_registry);
+            if registry {
+                entry.origin = LockOrigin::ConfiguredRegistry;
+            }
+            Some(entry)
         })
         .collect())
 }
@@ -1526,6 +1648,20 @@ fn walk_pnpm_importer_entries(
     if let Some(doc) = parse_pnpm_document(content) {
         walk_pnpm_document_importers(&doc, visit);
     }
+}
+
+/// [`walk_pnpm_importer_entries`] with the importers at `excluded` paths skipped entirely, so a
+/// consumer building workspace evidence never sees a declaration the run's exclude policy dropped.
+fn walk_pnpm_importer_entries_excluding(
+    content: &str,
+    excluded: &HashSet<String>,
+    mut visit: impl FnMut(&str, &str, Option<&str>, Option<&str>),
+) {
+    walk_pnpm_importer_entries(content, |member, name, specifier, version| {
+        if !excluded.contains(member) {
+            visit(member, name, specifier, version);
+        }
+    });
 }
 
 /// [`walk_pnpm_importer_entries`] over an already-parsed document, for callers that read further
@@ -1843,14 +1979,19 @@ fn trailing_group_start(value: &str) -> Option<usize> {
     None
 }
 
-/// Maps each resolved `(name, version)` dependency to the workspace member importers that declare it,
-/// read from `pnpm-lock.yaml`'s `importers:` section. The resolved `version:` line under each
-/// dependency gives the exact version (its `(peer)` suffix stripped to match the `packages:` keys);
-/// internal `link:`/`file:`/`workspace:` versions are skipped — they are not registry packages.
-/// Importer paths (the workspace root is `.`) name the source packages.
-fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<String>> {
+/// Maps each resolved `(name, version)` dependency to the workspace member importers that declare
+/// it, read from `pnpm-lock.yaml`'s `importers:` section.
+/// The resolved `version:` line under each dependency gives the exact version (its `(peer)` suffix
+/// stripped to match the `packages:` keys); internal `link:`/`file:`/`workspace:` versions are
+/// skipped — they are not registry packages.
+/// Importer paths (the workspace root is `.`) name the source packages; those in `excluded` are
+/// left out.
+fn parse_pnpm_importer_members(
+    content: &str,
+    excluded: &HashSet<String>,
+) -> HashMap<(String, String), Vec<String>> {
     let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
-    walk_pnpm_importer_entries(content, |member, name, _specifier, version| {
+    walk_pnpm_importer_entries_excluding(content, excluded, |member, name, _specifier, version| {
         let Some(value) = version else {
             return;
         };
@@ -1870,11 +2011,49 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
     map
 }
 
-/// Maps each dependency name to the set of distinct range *specifiers* its workspace-member importers
-/// declare, read from `pnpm-lock.yaml`'s `importers:` section (each dependency records a `specifier:`
-/// line — the declared range). A name two importers declare with different specifiers (`~7.3.0` vs
-/// `^7.0.0`, `"<4"` vs `^4`) is a version split that must be held out of the joint update, even when
-/// both currently resolve to the same version.
+/// Each importer's (those not in `excluded`) registry-resolved direct entries by name, as
+/// `pnpm-lock.yaml` records them: the declared `specifier:` and the resolved `version:` with its
+/// peer suffix stripped.
+/// `link:`/`file:`/`workspace:` versions are layout facts, not versions, and are left out like
+/// everywhere in the index.
+/// An importer listing one name in two dependency groups keeps the first group's record, so the
+/// map never depends on hash order.
+fn parse_pnpm_importer_entries(
+    content: &str,
+    excluded: &HashSet<String>,
+) -> HashMap<String, BTreeMap<String, ImporterEntry>> {
+    let mut entries: HashMap<String, BTreeMap<String, ImporterEntry>> = HashMap::new();
+    walk_pnpm_importer_entries_excluding(content, excluded, |member, name, specifier, version| {
+        let Some(value) = version else {
+            return;
+        };
+        if value.starts_with("link:")
+            || value.starts_with("file:")
+            || value.starts_with("workspace:")
+        {
+            return;
+        }
+        let version = value.split('(').next().unwrap_or(value);
+        if version.is_empty() {
+            return;
+        }
+        entries
+            .entry(member.to_string())
+            .or_default()
+            .entry(name.to_string())
+            .or_insert_with(|| ImporterEntry {
+                specifier: specifier.map(str::to_string),
+                version: version.to_string(),
+            });
+    });
+    entries
+}
+
+/// Maps each dependency name to the set of distinct range *specifiers* its workspace-member
+/// importers (those not in `excluded`) declare, read from `pnpm-lock.yaml`'s `importers:` section
+/// (each dependency records a `specifier:` line — the declared range).
+/// Whether disagreeing specifiers (`~7.3.0` vs `^7.0.0`, `"<4"` vs `^4`) hold a name out of the
+/// joint update depends on the target ([`MemberIndex::splits_for`]).
 ///
 /// Only plain registry ranges count. A specifier carrying a protocol (`link:`, `file:`, `workspace:`,
 /// `catalog:`, `npm:` aliases, `git+…`, a URL) is skipped — a semver range never contains a `:`, so
@@ -1886,10 +2065,13 @@ fn parse_pnpm_importer_members(content: &str) -> HashMap<(String, String), Vec<S
 /// name in two groups (e.g. `dependencies` and `peerDependencies`) with different ranges is one
 /// declaration, not a split — only the first group's specifier is kept, so a lone importer can never
 /// split itself.
-fn parse_pnpm_importer_specifiers(content: &str) -> HashMap<String, HashSet<String>> {
+fn parse_pnpm_importer_specifiers(
+    content: &str,
+    excluded: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     let mut recorded: HashSet<(String, String)> = HashSet::new();
-    walk_pnpm_importer_entries(content, |member, name, specifier, _version| {
+    walk_pnpm_importer_entries_excluding(content, excluded, |member, name, specifier, _version| {
         let Some(specifier) = specifier else {
             return;
         };
@@ -1911,24 +2093,29 @@ fn parse_pnpm_importer_specifiers(content: &str) -> HashMap<String, HashSet<Stri
 /// `catalog:<name>` specifier), read from the lock's `importers:` section (the lock copies each
 /// manifest's verbatim specifier).
 ///
-/// A name any importer also declares with a non-catalog specifier is excluded: the joint update
-/// can still land that importer's copy, so the candidate keeps the normal resolve path. Only the
-/// registry-candidate protocol needs this: a `workspace:`-declared dependency resolves to a
-/// `link:`/`file:` version, which the resolved-package readers already skip, so it never becomes
+/// A name any importer outside `excluded` also declares with a non-catalog specifier is left out:
+/// the joint update can still land that importer's copy, so the candidate keeps the normal resolve
+/// path.
+/// Only the registry-candidate protocol needs this: a `workspace:`-declared dependency resolves to
+/// a `link:`/`file:` version, which the resolved-package readers already skip, so it never becomes
 /// an upgrade candidate in the first place.
-fn parse_pnpm_catalog_only_names(content: &str) -> HashSet<String> {
+fn parse_pnpm_catalog_only_names(content: &str, excluded: &HashSet<String>) -> HashSet<String> {
     let mut catalog: HashSet<String> = HashSet::new();
     let mut otherwise: HashSet<String> = HashSet::new();
-    walk_pnpm_importer_entries(content, |_member, name, specifier, _version| {
-        let Some(specifier) = specifier else {
-            return;
-        };
-        if specifier.starts_with("catalog:") {
-            catalog.insert(name.to_string());
-        } else {
-            otherwise.insert(name.to_string());
-        }
-    });
+    walk_pnpm_importer_entries_excluding(
+        content,
+        excluded,
+        |_member, name, specifier, _version| {
+            let Some(specifier) = specifier else {
+                return;
+            };
+            if specifier.starts_with("catalog:") {
+                catalog.insert(name.to_string());
+            } else {
+                otherwise.insert(name.to_string());
+            }
+        },
+    );
     catalog.retain(|name| !otherwise.contains(name));
     catalog
 }
@@ -1983,11 +2170,16 @@ fn pnpm_importer_entry_error(
 }
 
 /// Maps each dependency name to the workspace member packages that declare it, read from
-/// `package-lock.json`'s `packages` map. Member entries — the root `""` and any key not under
-/// `node_modules/` — list their direct deps as ranges, not resolved versions, so attribution is by
-/// name (applied to every resolved version of that name). Members are keyed by their workspace path
-/// (the root as `.`), matching pnpm's importer paths.
-fn parse_npm_member_sources(content: &str) -> Option<HashMap<String, Vec<String>>> {
+/// `package-lock.json`'s `packages` map.
+/// Member entries — the root `""` and any key not under `node_modules/` — list their direct deps as
+/// ranges, not resolved versions, so attribution is by name (applied to every resolved version of
+/// that name).
+/// Members are keyed by their workspace path (the root as `.`), matching pnpm's importer paths;
+/// those in `excluded` are left out.
+fn parse_npm_member_sources(
+    content: &str,
+    excluded: &HashSet<String>,
+) -> Option<HashMap<String, Vec<String>>> {
     let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let packages = doc.get("packages")?.as_object()?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -1998,7 +2190,7 @@ fn parse_npm_member_sources(content: &str) -> Option<HashMap<String, Vec<String>
         let member = if key.is_empty() { "." } else { key.as_str() };
         // Member keys are workspace paths that consumers join onto the project root; reject a
         // crafted or stale key that could address a manifest outside the workspace.
-        if !is_workspace_relative(member) {
+        if !is_workspace_relative(member) || excluded.contains(member) {
             continue;
         }
         for field in DIRECT_GROUPS {
@@ -2026,14 +2218,15 @@ fn is_exact_npm_specifier(specifier: &str) -> bool {
     semver::Version::parse(specifier).is_ok()
 }
 
-/// The `(name, version)` pairs every declaring importer pins exactly in `pnpm-lock.yaml`. The
-/// importer records both the `specifier:` (the declared range) and the resolved `version:`; a
+/// The `(name, version)` pairs every declaring importer (outside `excluded`) pins exactly in
+/// `pnpm-lock.yaml`.
+/// The importer records both the `specifier:` (the declared range) and the resolved `version:`; a
 /// `(name, version)` is exact-pinned only when *every* importer that declares it used an exact
 /// specifier (otherwise some importer's range could still move it).
-fn parse_pnpm_exact_pins(content: &str) -> HashSet<(String, String)> {
+fn parse_pnpm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<(String, String)> {
     let mut total: HashMap<(String, String), usize> = HashMap::new();
     let mut exact: HashMap<(String, String), usize> = HashMap::new();
-    walk_pnpm_importer_entries(content, |_member, name, specifier, version| {
+    walk_pnpm_importer_entries_excluding(content, excluded, |_member, name, specifier, version| {
         let Some(value) = version else {
             return;
         };
@@ -2058,10 +2251,11 @@ fn parse_pnpm_exact_pins(content: &str) -> HashSet<(String, String)> {
         .collect()
 }
 
-/// The dependency names every declaring member pins exactly in `package-lock.json`. npm records a
-/// range (not a resolved version) per member, so this is name-keyed: a name is pinned only when
-/// every member entry that declares it used an exact specifier.
-fn parse_npm_exact_pins(content: &str) -> HashSet<String> {
+/// The dependency names every declaring member (outside `excluded`) pins exactly in
+/// `package-lock.json`.
+/// npm records a range (not a resolved version) per member, so this is name-keyed: a name is pinned
+/// only when every member entry that declares it used an exact specifier.
+fn parse_npm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<String> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
         return HashSet::new();
     };
@@ -2072,6 +2266,10 @@ fn parse_npm_exact_pins(content: &str) -> HashSet<String> {
     let mut exact: HashMap<String, usize> = HashMap::new();
     for (key, entry) in packages {
         if key.contains("node_modules/") {
+            continue;
+        }
+        let member = if key.is_empty() { "." } else { key.as_str() };
+        if excluded.contains(member) {
             continue;
         }
         for field in DIRECT_GROUPS {
@@ -2114,7 +2312,7 @@ fn parse_yarn(content: &str) -> Vec<NameVersion> {
             let url = rest.trim().trim_matches('"');
             let url = url.split('#').next().unwrap_or(url);
             for entry in out.get_mut(flushed_at..).unwrap_or_default() {
-                entry.resolved = Some(url.to_string());
+                entry.origin = LockOrigin::Url(url.to_string());
             }
         } else if !line.starts_with([' ', '#']) && line.trim_end().ends_with(':') {
             flushed_at = out.len();
@@ -2234,7 +2432,7 @@ mod tests {
             Some(NameVersion {
                 name: "lodash".into(),
                 version: "4.17.15".into(),
-                resolved: None
+                origin: LockOrigin::Unrecorded,
             })
         );
         assert_eq!(
@@ -2242,7 +2440,7 @@ mod tests {
             Some(NameVersion {
                 name: "@babel/core".into(),
                 version: "7.1.0".into(),
-                resolved: None
+                origin: LockOrigin::Unrecorded,
             })
         );
         assert_eq!(split_name_version("no-version"), None);
@@ -2285,23 +2483,23 @@ mod tests {
                 }
             }"#};
         let entries = parse_npm(lock).expect("parse");
-        let resolved_of = |name: &str| {
+        let origin_of = |name: &str| {
             entries
                 .iter()
                 .find(|entry| entry.name == name)
                 .expect("entry")
-                .resolved
+                .origin
                 .clone()
         };
         assert_eq!(
-            resolved_of("lodash").as_deref(),
-            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz")
+            origin_of("lodash"),
+            LockOrigin::Url("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz".into())
         );
         assert_eq!(
-            resolved_of("private-api").as_deref(),
-            Some("https://npm.corp.example/private-api/-/private-api-1.0.0.tgz")
+            origin_of("private-api"),
+            LockOrigin::Url("https://npm.corp.example/private-api/-/private-api-1.0.0.tgz".into())
         );
-        assert_eq!(resolved_of("unrecorded"), None);
+        assert_eq!(origin_of("unrecorded"), LockOrigin::Unrecorded);
 
         let v1 = indoc! {r#"
             {
@@ -2312,8 +2510,8 @@ mod tests {
             }"#};
         let entries = parse_npm(v1).expect("parse v1");
         assert_eq!(
-            entries[0].resolved.as_deref(),
-            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz")
+            entries[0].origin,
+            LockOrigin::Url("https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz".into())
         );
     }
 
@@ -2337,24 +2535,32 @@ mod tests {
               version "2.0.0"
         "#};
         let entries = parse_yarn(lock);
-        let resolved_of = |name: &str| {
+        let origin_of = |name: &str| {
             entries
                 .iter()
                 .find(|entry| entry.name == name)
                 .expect("entry")
-                .resolved
+                .origin
                 .clone()
         };
         assert_eq!(
-            resolved_of("lodash").as_deref(),
-            Some("https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"),
+            origin_of("lodash"),
+            LockOrigin::Url("https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz".into()),
             "the checksum fragment is not part of the origin"
         );
         assert_eq!(
-            resolved_of("@corp/api").as_deref(),
-            Some("https://npm.corp.example/@corp/api/-/api-1.0.0.tgz")
+            origin_of("@corp/api"),
+            LockOrigin::Url("https://npm.corp.example/@corp/api/-/api-1.0.0.tgz".into())
         );
-        assert_eq!(resolved_of("unrecorded"), None);
+        assert_eq!(origin_of("unrecorded"), LockOrigin::Unrecorded);
+    }
+
+    fn registry_entry(name: &str, version: &str) -> NameVersion {
+        NameVersion {
+            name: name.into(),
+            version: version.into(),
+            origin: LockOrigin::ConfiguredRegistry,
+        }
     }
 
     #[test]
@@ -2363,10 +2569,70 @@ mod tests {
         assert_eq!(
             sorted(parse_pnpm(lock).unwrap()),
             sorted(vec![
-                NameVersion::new("lodash", "4.17.15"),
-                NameVersion::new("@babel/core", "7.1.0"),
-                NameVersion::new("chalk", "4.0.0"),
+                registry_entry("lodash", "4.17.15"),
+                registry_entry("@babel/core", "7.1.0"),
+                registry_entry("chalk", "4.0.0"),
             ])
+        );
+    }
+
+    /// pnpm names no registry per entry, but the *shape* of `resolution:` says whether the
+    /// configured registry served the artifact by name — only its integrity hash — or something
+    /// else did: a tarball URL (a custom registry, or a plain URL dependency), a git repo and
+    /// commit, an injected directory.
+    /// Only the former is origin evidence; every other shape, an unmodeled key included, reads as
+    /// unrecorded.
+    #[test]
+    fn pnpm_origin_is_the_configured_registry_only_for_an_integrity_only_resolution() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            packages:
+
+              lodash@4.17.21:
+                resolution: {integrity: sha512-a}
+
+              private-api@1.0.0:
+                resolution: {integrity: sha512-b, tarball: https://npm.corp.example/private-api/-/private-api-1.0.0.tgz}
+
+              pinned-git@1.2.0:
+                resolution: {commit: abc123, repo: https://github.com/user/pinned-git.git, type: git}
+
+              local-shim@file:packages/shim:
+                resolution: {directory: packages/shim, type: directory}
+
+              future@2.0.0:
+                resolution: {integrity: sha512-c, mirror: https://mirror.example/}
+
+              bare@3.0.0:
+                engines: {node: '>=18'}
+        "};
+        let entries = parse_pnpm(lock).expect("parse");
+        let origin_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("entry")
+                .origin
+                .clone()
+        };
+        assert_eq!(origin_of("lodash"), LockOrigin::ConfiguredRegistry);
+        assert_eq!(
+            origin_of("private-api"),
+            LockOrigin::Unrecorded,
+            "a tarball URL names another source"
+        );
+        assert_eq!(origin_of("pinned-git"), LockOrigin::Unrecorded);
+        assert_eq!(origin_of("local-shim"), LockOrigin::Unrecorded);
+        assert_eq!(
+            origin_of("future"),
+            LockOrigin::Unrecorded,
+            "an unmodeled resolution key is not proof of a registry fetch"
+        );
+        assert_eq!(
+            origin_of("bare"),
+            LockOrigin::Unrecorded,
+            "no resolution record, no evidence"
         );
     }
 
@@ -2465,7 +2731,7 @@ mod tests {
                   react: ^18
         "};
         assert!(parse_pnpm_peer_requirements(lock).is_empty());
-        assert!(parse_pnpm_importer_members(lock).is_empty());
+        assert!(parse_pnpm_importer_members(lock, &HashSet::new()).is_empty());
     }
 
     /// Only names *every* declaring importer manages through the catalog count as
@@ -2500,12 +2766,16 @@ mod tests {
               chalk@4.1.2:
                 resolution: {integrity: sha512-y}
         "};
-        let names = parse_pnpm_catalog_only_names(lock);
+        let names = parse_pnpm_catalog_only_names(lock, &HashSet::new());
         assert!(names.contains("react"), "catalog-only name detected");
         assert!(
             !names.contains("chalk"),
             "a plain-range declaration keeps the name off the catalog hold"
         );
+        // With `apps/web` excluded its plain range is not the run's to land, so the root's
+        // catalog-only `chalk` gets its truthful hold instead of an eternal resolver conflict.
+        let excluded = HashSet::from(["apps/web".to_string()]);
+        assert!(parse_pnpm_catalog_only_names(lock, &excluded).contains("chalk"));
     }
 
     #[test]
@@ -2566,12 +2836,12 @@ mod tests {
                 NameVersion {
                     name: "lodash".into(),
                     version: "4.17.15".into(),
-                    resolved: Some("https://x".into()),
+                    origin: LockOrigin::Url("https://x".into()),
                 },
                 NameVersion {
                     name: "@babel/core".into(),
                     version: "7.1.0".into(),
-                    resolved: Some("https://y".into()),
+                    origin: LockOrigin::Url("https://y".into()),
                 },
             ])
         );
@@ -2638,7 +2908,7 @@ packages:
   vite@6.0.0:
     resolution: {integrity: sha512-x}
 ";
-        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
+        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock, &HashSet::new()));
         assert_eq!(
             index.members_for("vite", "6.0.0"),
             vec!["apps/a", "packages/x"]
@@ -2649,12 +2919,13 @@ packages:
     }
 
     #[test]
-    fn names_declared_at_multiple_versions_ignores_transitive_duplicates() {
-        // `bar` is a genuine workspace split: apps/b declares 2.0.0, apps/c declares 3.0.0 — it must be
-        // flagged, so neither line is collapsed. `foo` is declared at a SINGLE version
-        // by importers but ALSO appears as a transitive copy at 2.0.0 in `packages:` — it must NOT be
-        // flagged, so it stays exact-pinned and keeps its per-package window and any out-of-range
-        // widen. Counting the whole resolved graph (the old behavior) would wrongly float `foo`.
+    fn a_split_ignores_transitive_duplicates() {
+        // `bar` is a genuine workspace split: apps/b declares `^2.0.0`, apps/c `^3.0.0`, and no
+        // single target satisfies both — neither line may be collapsed.
+        // `foo` is declared at a SINGLE version by importers but ALSO appears as a transitive copy
+        // at 2.0.0 in `packages:` — it must NOT split, so it stays exact-pinned and keeps its
+        // per-package window and any out-of-range widen.
+        // Counting the whole resolved graph (the old behavior) would wrongly float `foo`.
         let lock = "\
 importers:
 
@@ -2687,15 +2958,114 @@ packages:
   bar@3.0.0:
     resolution: {integrity: sha512-d}
 ";
-        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
-        let split = index.names_declared_at_multiple_versions();
+        let index = Pnpm::member_sources(lock);
         assert!(
-            split.contains("bar"),
-            "bar is declared at 2.0.0 and 3.0.0 across importers — a genuine split"
+            index.splits_for("bar", "3.1.0"),
+            "bar is declared at ^2.0.0 and ^3.0.0 across importers — a genuine split for a v3 target"
         );
         assert!(
-            !split.contains("foo"),
-            "foo is declared at one version by importers; its transitive 2.0.0 copy must not flag it"
+            !index.splits_for("foo", "1.4.0"),
+            "foo is declared at one version by importers; its transitive 2.0.0 copy must not split it"
+        );
+    }
+
+    /// The acceptance matrix for target-aware splits: disagreeing ranges or several resolved lines
+    /// split a name only when some declared range excludes (or cannot be judged against) the target
+    /// being pinned.
+    #[test]
+    fn a_split_is_judged_against_the_target() {
+        let lock = indoc! {"
+            importers:
+
+              pkgs/a:
+                dependencies:
+                  lodash:
+                    specifier: ^4.17.20
+                    version: 4.17.21
+                  mongoose:
+                    specifier: ^9.8.0
+                    version: 9.8.0
+                  semver:
+                    specifier: ~7.3.0
+                    version: 7.3.8
+                  tailwindcss:
+                    specifier: ^3.4.19
+                    version: 3.4.19
+                  react:
+                    specifier: ^18.0.0 || ^19.0.0
+                    version: 18.3.1
+                  pinned:
+                    specifier: 2.11.13
+                    version: 2.11.13
+
+              pkgs/b:
+                dependencies:
+                  lodash:
+                    specifier: ^4.17.21
+                    version: 4.17.21
+                  mongoose:
+                    specifier: ^9.8.0
+                    version: 9.9.1
+                  semver:
+                    specifier: ^7.0.0
+                    version: 7.3.8
+                  tailwindcss:
+                    specifier: ^4.3.3
+                    version: 4.3.3
+                  react:
+                    specifier: ^18.0.0
+                    version: 18.3.1
+                  pinned:
+                    specifier: ^2.11.12
+                    version: 2.11.13
+
+            packages:
+
+              lodash@4.17.21:
+                resolution: {integrity: sha512-a}
+              mongoose@9.8.0:
+                resolution: {integrity: sha512-b}
+              mongoose@9.9.1:
+                resolution: {integrity: sha512-c}
+              semver@7.3.8:
+                resolution: {integrity: sha512-d}
+              tailwindcss@3.4.19:
+                resolution: {integrity: sha512-e}
+              tailwindcss@4.3.3:
+                resolution: {integrity: sha512-f}
+              react@18.3.1:
+                resolution: {integrity: sha512-g}
+              pinned@2.11.13:
+                resolution: {integrity: sha512-h}
+        "};
+        let index = Pnpm::member_sources(lock);
+        assert!(
+            !index.splits_for("lodash", "4.17.22"),
+            "two ranges that both admit the target are no split: the pin lands and no manifest changes"
+        );
+        assert!(
+            !index.splits_for("mongoose", "9.9.3"),
+            "one range resolved at two versions with the target in range lands"
+        );
+        assert!(
+            index.splits_for("semver", "7.4.0"),
+            "~7.3.0 excludes 7.4.0, so the tilde member would be dragged off its range"
+        );
+        assert!(
+            !index.splits_for("semver", "7.3.8"),
+            "the same ranges both admit 7.3.8"
+        );
+        assert!(
+            index.splits_for("tailwindcss", "4.3.3"),
+            "^3.4.19 excludes the v4 target"
+        );
+        assert!(
+            index.splits_for("react", "18.3.2"),
+            "a `||` union the range parser cannot represent keeps the split (fail closed)"
+        );
+        assert!(
+            index.splits_for("pinned", "2.11.14"),
+            "a bare version is an exact npm specifier; it excludes every other target"
         );
     }
 
@@ -2739,12 +3109,14 @@ packages:
     }
 
     #[test]
-    fn names_declared_at_multiple_specifiers_are_a_split_even_at_one_resolved_version() {
-        // `semver` is declared with DIFFERENT ranges (`~7.3.0` and `^7.0.0`) by two importers that the
-        // lock resolves to the SAME `7.3.8` — a specifier split that exact-pinning would collapse,
-        // dragging the `~7.3.0` member off its own range. It must be flagged as a split even
-        // though `by_version` sees a single resolved version. `chalk` is the control: both importers
-        // declare the SAME `^5.0.0` at the same resolved version, so it stays exact-pinnable.
+    fn a_specifier_split_at_one_resolved_version_is_held_only_off_the_narrower_range() {
+        // `semver` is declared with DIFFERENT ranges (`~7.3.0` and `^7.0.0`) by two importers that
+        // the lock resolves to the SAME `7.3.8`.
+        // Exact-pinning a target outside `~7.3.0` would drag that member off its own range, so such
+        // a target splits the name even though `by_version` sees a single resolved version; a
+        // target both ranges admit does not.
+        // `chalk` is the control: both importers declare the SAME `^5.0.0` at the same resolved
+        // version.
         let lock = indoc! {"
             importers:
 
@@ -2774,13 +3146,16 @@ packages:
                 resolution: {integrity: sha512-b}
         "};
         let index = Pnpm::member_sources(lock);
-        let split = index.names_declared_at_multiple_versions();
         assert!(
-            split.contains("semver"),
-            "semver is declared at ~7.3.0 and ^7.0.0 — a specifier split even at one resolved version"
+            index.splits_for("semver", "7.4.0"),
+            "semver is declared at ~7.3.0 and ^7.0.0 — a specifier split for a target the tilde excludes"
         );
         assert!(
-            !split.contains("chalk"),
+            !index.splits_for("semver", "7.3.9"),
+            "both ranges admit 7.3.9, so the pin lands everywhere with no manifest change"
+        );
+        assert!(
+            !index.splits_for("chalk", "5.6.0"),
             "chalk is declared with the same ^5.0.0 range at one version — not a split, stays exact-pinnable"
         );
         // The hold's report detail needs the disagreeing declarations themselves: with a single
@@ -2835,14 +3210,67 @@ packages:
               next@14.2.0:
                 resolution: {integrity: sha512-b}
         "};
-        let split = Pnpm::member_sources(lock).names_declared_at_multiple_versions();
+        let index = Pnpm::member_sources(lock);
         assert!(
-            !split.contains("react"),
+            !index.splits_for("react", "18.3.1"),
             "react's catalog: reference is not a range; with one real specifier it must not split"
         );
         assert!(
-            !split.contains("next"),
+            !index.splits_for("next", "14.3.0"),
             "next is declared by a single importer (deps + peer); one importer cannot split itself"
+        );
+    }
+
+    /// An importer the run excludes contributes nothing to the split evidence: with `legacy` left
+    /// out, `mongoose` is declared once and resolved once, so the included importer's update is no
+    /// longer vetoed by a copy cooldown was told to ignore — and with nothing excluded the second
+    /// line still counts.
+    #[test]
+    fn member_sources_excluding_drops_the_excluded_importers_declarations() {
+        let lock = indoc! {"
+            importers:
+
+              app:
+                dependencies:
+                  mongoose:
+                    specifier: ^9.8.0
+                    version: 9.9.1
+                  tailwindcss:
+                    specifier: ^4.3.3
+                    version: 4.3.3
+
+              legacy:
+                dependencies:
+                  mongoose:
+                    specifier: ^9.8.0
+                    version: 9.8.0
+                  tailwindcss:
+                    specifier: ^3.4.19
+                    version: 3.4.19
+
+            packages:
+
+              mongoose@9.8.0:
+                resolution: {integrity: sha512-a}
+              mongoose@9.9.1:
+                resolution: {integrity: sha512-b}
+              tailwindcss@3.4.19:
+                resolution: {integrity: sha512-c}
+              tailwindcss@4.3.3:
+                resolution: {integrity: sha512-d}
+        "};
+        let excluded = HashSet::from(["legacy".to_string()]);
+        let index = Pnpm::member_sources_excluding(lock, &excluded);
+        assert_eq!(index.resolved_versions_of("mongoose"), ["9.9.1"]);
+        assert_eq!(index.declared_specifiers_of("tailwindcss"), ["^4.3.3"]);
+        assert!(index.members_for("mongoose", "9.8.0").is_empty());
+        assert!(
+            !index.splits_for("tailwindcss", "4.3.5"),
+            "the excluded importer's v3 line no longer holds the included one"
+        );
+        assert!(
+            Pnpm::member_sources(lock).splits_for("tailwindcss", "4.3.5"),
+            "with nothing excluded the v3 line still splits the name"
         );
     }
 
@@ -2862,7 +3290,7 @@ packages:
   '@scope/pkg@1.2.3':
     resolution: {integrity: sha512-x}
 ";
-        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock));
+        let index = MemberIndex::version_exact(parse_pnpm_importer_members(lock, &HashSet::new()));
 
         assert_eq!(index.members_for("@scope/pkg", "1.2.3"), vec!["'apps/a"]);
         assert_eq!(
@@ -2882,8 +3310,9 @@ packages:
                     "node_modules/zod": { "version": "3.22.0" }
                 }
             }"#};
-        let index =
-            MemberIndex::name_only(parse_npm_member_sources(lock).expect("v3 lock has members"));
+        let index = MemberIndex::name_only(
+            parse_npm_member_sources(lock, &HashSet::new()).expect("v3 lock has members"),
+        );
         // The root is keyed as `.`; a member by its workspace path. Range-only locks attribute by
         // name, so any resolved version of `zod` maps to its declaring member.
         assert_eq!(index.members_for("turbo", "2.9.16"), vec!["."]);
@@ -2895,7 +3324,7 @@ packages:
         // A v1 lock has no `packages` map, so direct-ness falls back to the root manifest.
         let lock =
             r#"{ "lockfileVersion": 1, "dependencies": { "lodash": { "version": "4.17.15" } } }"#;
-        assert!(parse_npm_member_sources(lock).is_none());
+        assert!(parse_npm_member_sources(lock, &HashSet::new()).is_none());
         assert!(!Npm::member_sources(lock).is_authoritative());
     }
 
@@ -2959,7 +3388,7 @@ packages:
   pinned@2.11.0:
     resolution: {integrity: sha512-x}
 ";
-        let pins = parse_pnpm_exact_pins(lock);
+        let pins = parse_pnpm_exact_pins(lock, &HashSet::new());
         assert!(pins.contains(&("pinned".to_string(), "2.11.0".to_string())));
         assert!(!pins.contains(&("loose".to_string(), "1.0.0".to_string())));
     }
@@ -2980,7 +3409,7 @@ packages:
   '@scope/pkg@2.11.0':
     resolution: {integrity: sha512-x}
 ";
-        let pins = parse_pnpm_exact_pins(lock);
+        let pins = parse_pnpm_exact_pins(lock, &HashSet::new());
 
         assert!(pins.contains(&("@scope/pkg".to_string(), "2.11.0".to_string())));
     }

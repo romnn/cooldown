@@ -203,8 +203,10 @@ pub(crate) async fn apply_resilient_with_observer(
 
     // Every candidate the subset excluded is accounted for, split by *why* its singleton trial
     // failed: a tool rejection (the resolver could not place it) stays a held skip carrying the
-    // tool's own first stderr line, while any other failure — verification, stale lock — is a
-    // per-candidate error the caller reports as such, never a policy skip.
+    // tool's own first stderr line, and so does a resolve cooldown itself refused to commit (its
+    // detail names the split or the excluded member it moved), while any other failure —
+    // verification, stale lock — is a per-candidate error the caller reports as such, never a
+    // policy skip.
     let mut rejection_errors: std::collections::HashMap<ChangeTargetKey, cooldown_core::CoreError> =
         dropped
             .into_iter()
@@ -217,7 +219,7 @@ pub(crate) async fn apply_resilient_with_observer(
             continue;
         }
         match rejection_errors.remove(&key) {
-            Some(error @ cooldown_core::CoreError::Tool { .. }) => {
+            Some(error) if is_resolver_rejection(&error) => {
                 report.skipped.push(held(change, Some(&error)));
             }
             Some(error) => rejected.push(RejectedChange {
@@ -334,6 +336,16 @@ fn push_halves(work: &mut Vec<Vec<Change>>, mut group: Vec<Change>) {
 /// held — elaborated with the tool's own first stderr line when the singleton trial's rejection is
 /// available, since that line carries the fact the generic message lacks (which requirement, held
 /// by whom).
+/// A failure that means the resolver could not (or cooldown would not) place the candidate, as
+/// opposed to a broken environment or a verification failure: the tool's own non-zero exit, or a
+/// resolve cooldown refused to commit.
+fn is_resolver_rejection(error: &cooldown_core::CoreError) -> bool {
+    matches!(
+        error,
+        cooldown_core::CoreError::Tool { .. } | cooldown_core::CoreError::UnacceptableResolve(_)
+    )
+}
+
 fn held(change: &Change, rejection: Option<&cooldown_core::CoreError>) -> Skipped {
     Skipped {
         change: change.clone(),
@@ -347,7 +359,11 @@ fn held(change: &Change, rejection: Option<&cooldown_core::CoreError>) -> Skippe
 /// non-tool errors and empty stderr, falling back to the generic reason message. The line reaches
 /// the TTY and JSON reports verbatim, so embedded URLs are stripped of credentials here, at
 /// construction.
+/// A resolve cooldown itself refused carries a detail it wrote, so that one passes through whole.
 fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
+    if let cooldown_core::CoreError::UnacceptableResolve(detail) = error {
+        return Some(detail.clone());
+    }
     let cooldown_core::CoreError::Tool { stderr, .. } = error else {
         return None;
     };
@@ -512,6 +528,7 @@ mod tests {
     enum RejectError {
         Tool,
         StaleLock,
+        Refused,
     }
 
     /// A `ToolWrite` whose joint resolve (`apply`) is unsatisfiable iff the plan contains any package
@@ -540,6 +557,13 @@ mod tests {
         fn stale_lock(resolves: impl Fn(&[String]) -> bool + Send + Sync + 'static) -> Self {
             MockWriter {
                 reject_error: RejectError::StaleLock,
+                ..MockWriter::new(resolves)
+            }
+        }
+
+        fn refusing(resolves: impl Fn(&[String]) -> bool + Send + Sync + 'static) -> Self {
+            MockWriter {
+                reject_error: RejectError::Refused,
                 ..MockWriter::new(resolves)
             }
         }
@@ -606,6 +630,9 @@ mod tests {
                     },
                     RejectError::StaleLock => CoreError::StaleLock(
                         "pnpm-lock.yaml importer apps/admin dependency vite: version 7.3.5 does not satisfy range ^6".into(),
+                    ),
+                    RejectError::Refused => CoreError::UnacceptableResolve(
+                        "the resolve split a workspace dependency: vite resolved at 6.4.3 across the workspace before the run and at several versions after it".into(),
                     ),
                 })
             }
@@ -894,6 +921,48 @@ mod tests {
         assert!(
             writer.apply_calls() > 1,
             "stale lock must be bisected, not propagated as a local fault"
+        );
+    }
+
+    /// A resolve cooldown itself refused to commit (a split it introduced, an excluded importer it
+    /// moved) is a property of the candidate set, like a resolver rejection: it is bisected to the
+    /// responsible candidate, which is held with cooldown's own detail — never an error that would
+    /// abort the run, since the lock was restored and nothing is broken.
+    #[tokio::test]
+    async fn refused_resolve_candidate_is_isolated_and_held_with_its_detail() {
+        let writer = MockWriter::refusing(|names| !names.iter().any(|name| name == "vite"));
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        let plan = plan(&["a", "vite", "b"]);
+        let mutation = apply_resilient_full(&writer, &project, &plan)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            names(&mutation.report.applied),
+            ["a", "b"].iter().map(ToString::to_string).collect()
+        );
+        assert!(
+            mutation.rejected.is_empty(),
+            "a refusal is a hold, not an error"
+        );
+        let [held] = mutation.report.skipped.as_slice() else {
+            panic!("{:?}", mutation.report.skipped);
+        };
+        assert_eq!(held.change.package.name, "vite");
+        assert_eq!(held.reason, cooldown_core::SkipReason::ResolverConflict);
+        assert!(
+            held.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("split a workspace dependency")),
+            "cooldown's own detail passes through whole: {:?}",
+            held.detail
+        );
+        assert!(
+            writer.apply_calls() > 1,
+            "a refusal is bisected, not propagated"
         );
     }
 

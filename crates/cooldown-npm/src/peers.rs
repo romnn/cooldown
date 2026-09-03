@@ -29,8 +29,10 @@ pub(crate) struct PeerEvidence {
     requirements: Vec<crate::lock::PeerRequirement>,
     /// Importer attribution: which member declares which `(name, version)`.
     members: crate::lock::MemberIndex,
-    /// Names *declared* at multiple versions across importers.
-    multi_version: HashSet<String>,
+    /// The planned names the whole-graph resolve will not exact-pin: their workspace declarations
+    /// split under the planned target ([`crate::tool::held_split_names`]).
+    /// The gate treats them as staying in place — never as moving, never as a candidate to reject.
+    pub(crate) multi_version: HashSet<String>,
     /// Names *resolved* at multiple versions anywhere in the graph.
     resolved_splits: HashSet<String>,
     /// Peer contracts read from workspace member manifests (empty without a project root).
@@ -43,28 +45,33 @@ pub(crate) struct PeerEvidence {
 }
 
 impl PeerEvidence {
-    /// Gathers the gate's evidence from the journaled pre-apply lock.
-    /// `root` locates the member
-    /// manifests for the workspace source; `None` (lock-only contexts) leaves that source empty.
-    /// The multi-version sets are computed only when some contract could hold, so the common
-    /// no-peers apply skips those lock walks entirely.
-    pub(crate) fn gather<L: NodeLock>(root: Option<&Utf8Path>, lock: Option<&str>) -> Self {
+    /// Gathers the gate's evidence from the journaled pre-apply lock for `plan`.
+    /// `root` locates the member manifests for the workspace source; `None` (lock-only contexts)
+    /// leaves that source empty.
+    /// The held-split set is the one the whole-graph resolve itself pins by, so the gate and the
+    /// resolve agree on which names stay in place; the graph-wide resolved splits and the install
+    /// layout are computed only when some contract could hold, so the common no-peers apply skips
+    /// those lock walks entirely.
+    pub(crate) fn gather<L: NodeLock>(
+        root: Option<&Utf8Path>,
+        lock: Option<&str>,
+        plan: &Plan,
+    ) -> Self {
         let requirements = lock.map(L::peer_requirements).unwrap_or_default();
         let members = L::member_sources(lock.unwrap_or_default());
         let workspace = match (root, lock) {
             (Some(root), Some(lock)) => workspace_peer_requirements::<L>(root, lock, &members),
             _ => Vec::new(),
         };
-        let (multi_version, resolved_splits, install) =
-            if requirements.is_empty() && workspace.is_empty() {
-                (HashSet::new(), HashSet::new(), None)
-            } else {
-                (
-                    members.names_declared_at_multiple_versions(),
-                    resolved_multi_version_names::<L>(lock.unwrap_or_default()),
-                    lock.and_then(L::install_paths),
-                )
-            };
+        let multi_version = crate::tool::held_split_names::<L>(lock, plan);
+        let (resolved_splits, install) = if requirements.is_empty() && workspace.is_empty() {
+            (HashSet::new(), None)
+        } else {
+            (
+                resolved_multi_version_names::<L>(lock.unwrap_or_default()),
+                lock.and_then(L::install_paths),
+            )
+        };
         Self {
             requirements,
             members,
@@ -815,11 +822,11 @@ pub(crate) fn first_new_peer_violation<L: NodeLock>(
 }
 
 /// Names the lock resolves at more than one distinct version — the whole resolved graph, nested
-/// copies included, unlike [`multi_version_names`], which counts importer *declarations* only.
+/// copies included, unlike [`held_split_names`](crate::tool::held_split_names), which judges
+/// importer *declarations* only.
 /// Tells the gate when npm's name-only importer attribution is ambiguous — consulted only when no
 /// physical layout can resolve the split instance-exactly (see [`direct_dependent_members`]).
-/// An
-/// unparsable lock yields the empty set; unreachable in practice, since the peer requirements
+/// An unparsable lock yields the empty set; unreachable in practice, since the peer requirements
 /// that trigger the query parse from the same document.
 fn resolved_multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
     let mut versions: HashMap<String, HashSet<String>> = HashMap::new();

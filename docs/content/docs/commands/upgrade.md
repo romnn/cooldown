@@ -31,7 +31,9 @@ inherited `dep = { workspace = true }` is widened in the root `[workspace.depend
 
 An explicit upper comparator written by the author, such as `<6` or `>=5,<6`, is different: it
 holds under the default behavior, even with `--major`. Pass `--rewrite` to cross and rewrite that
-bound. The same flag still always rewrites an in-range constraint (so `^1.4` becomes `^1.5`).
+bound. The same flag still always rewrites an in-range constraint (so `^1.4` becomes `^1.5`), and
+on pnpm it is also what converges a workspace *split* — see `multi_version_held` under
+[Major versions](#major-versions).
 
 One field is never rewritten, by any flag: **`peerDependencies`** (npm family). That range is not a
 declaration of what the package installs but a contract it publishes to *its* consumers, and
@@ -57,6 +59,33 @@ under one owner-only recovery record. On Unix its directory transitions are dura
 platforms use their best available atomic replacement without promising parent-directory
 durability. An interrupted publication can therefore recover the complete
 old or accepted state without treating a rejected resolver trial as source-project state.
+
+## Whole-workspace landings (pnpm)
+
+pnpm re-resolves the whole importer graph jointly, and an exact pin is a request for *every*
+importer that declares the package. pnpm can land it in some importers and leave one behind (a
+subtree whose peers bind the old copy), which would split a package the workspace resolved at a
+single version — a runtime break for anything with instance-level state, and one no row would
+account for. Such a partial landing is rolled back: the candidate is reported as a resolver
+conflict whose row names the importers that took the target and the ones that kept the old
+version, and the rest of the batch is re-resolved without it. Importers the run excludes are not
+part of that contract: `pnpm update <name>@<target>` re-resolves the named package in *every*
+importer whose range admits a newer version, whatever `--filter` it carried — the filtered importers
+get the exact target, every other one the newest version its own range admits under the release-age
+floor (verified against pnpm 10). That is the resolver's doing, not a pin cooldown placed — the
+excluded importer's manifest is never rewritten and it is never named in the update — and refusing
+it would let the excluded subtree veto the upgrade, so the move is committed and reported as a
+warning naming the importer and the package. A package the resolver itself splits — one it was not asked
+to pin, floated in only some importers — is never committed: the batch is refused with the split
+named, and candidate isolation holds the candidate whose landing caused it (a resolver-conflict row
+carrying that detail) while the rest of the batch lands. A split whose managed
+importers all agree on one version, with only importers the run excludes left behind on the old
+one, is what the exclusion asked for; it is committed and reported as a warning naming those
+importers. Managed importers ending up on two versions fail the batch however many excluded
+importers stayed behind, and so does a settlement that *re-declares* an excluded importer's
+dependency — a changed specifier, an entry appearing or disappearing, a version its own range
+provably excludes — which pnpm never does on its own: cooldown never re-resolves an importer it was
+told to ignore. Either refusal leaves the lock as it was and names what the resolve did.
 
 ## Transitive dependencies
 
@@ -131,6 +160,22 @@ When `upgrade` holds a cross-major update back, it explains the required action:
   live reads everywhere). Pass
   `--no-respect-dist-tags` (or set `respect-dist-tags = false` under `[global]` or a command
   section in `cooldown.toml`) to adopt it deliberately.
+- `multi_version_held` (pnpm) means the workspace declares the package under ranges that do not
+  all admit the target (`~7.3.0` beside `^7.0.0` for a `7.4.0` target, `^3.4.19` beside `^4.3.3`
+  for a v4 one), so pinning every importer to it would drag the narrower one off its own declared
+  range; each importer is kept on its own line instead. Only a range that provably *excludes* the
+  target — or one cooldown cannot judge (a `||` union, a hyphen range, a dist tag) — holds: two
+  importers on `^4.17.20` and `^4.17.21` both take `4.17.22`, and one range resolved at two
+  versions converges on a target it admits. An importer the run excludes (`exclude-folders`,
+  `exclude-packages`, a `-C` selection) contributes no range and no version to this judgment, so
+  a copy cooldown was told to ignore cannot hold an update in an included importer; the report
+  says when such a copy is left behind on its old version, or re-resolved within its own range
+  because pnpm's update reaches every importer whose range admits a newer version. Pass `--rewrite`
+  to converge a genuine
+  split: every declaring importer's range is widened to admit the target and the name is pinned
+  there. A name planned at two targets (a `^22` and a `^25` line each advancing within itself
+  without `--major`) cannot be pinned by one joint update — even when one permissive range such as
+  `>=22` admits both — and stays held until `--major` admits one line for every importer.
 - `peer_held` (npm family) means a still-present dependent's recorded peer range excludes the
   target (`held: fumadocs-mdx@15.1.1 requires fumadocs-core@^16.0.0`) — pnpm's resolver only
   warns on that break, and npm, which rejects it by default (`ERESOLVE`), commits it under
@@ -164,7 +209,7 @@ produce an action that cannot yet be taken. Suppress command tips with `--no-sug
 | Flag | Effect |
 |---|---|
 | `--transitive <mode>` | `allow` or `hide` — how to treat transitive dependencies (see above). |
-| `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound. |
+| `--rewrite` | Always rewrite the manifest constraint; also the only way to cross an explicit `<`/`<=` bound, and (pnpm) to converge a workspace split onto one line. |
 | `--cargo-edge-policy <policy>` | cargo: `preserve` (default), `canonicalize`, or `none` — how lock edge bindings are treated after the re-resolve (see above). Config: `[tool.cargo] edge-policy`. |
 | `--build` | Also compile / sync after re-locking. |
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |

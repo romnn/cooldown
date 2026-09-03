@@ -1226,6 +1226,20 @@ pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool
     if let Some(r) = &meta.registry {
         let _ = writeln!(out, "registry: {r}");
     }
+    if !meta.excluded_members.is_empty() {
+        // The declarations the run ignores, so an update the excluded members would otherwise veto
+        // (a pnpm importer on another line) is explained rather than silently allowed.
+        let excluded: Vec<String> = meta
+            .excluded_members
+            .iter()
+            .map(|member| format!("{} ({})", member.name, member.path))
+            .collect();
+        let _ = writeln!(
+            out,
+            "excluded members: {} (declarations ignored by exclude-folders/exclude-packages or the selection)",
+            excluded.join(", ")
+        );
+    }
     out.push('\n');
     let mut t = base_table(use_color);
     t.set_header(vec![

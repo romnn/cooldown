@@ -274,6 +274,7 @@ impl Workspace {
         changes: Vec<Change>,
         manifest_only: HashSet<PackageId>,
         advisories: Option<std::sync::Arc<crate::app::advisories::ProjectAdvisories>>,
+        excluded_members: Vec<cooldown_core::MemberRef>,
     ) -> UpgradeAccum {
         let mut acc = UpgradeAccum::default();
         let Some(reader) = self.adapter(pctx.tool) else {
@@ -350,7 +351,7 @@ impl Workspace {
             },
             &mut acc,
         )
-        .run_policy(changes, manifest_only, advisories)
+        .run_policy(changes, manifest_only, advisories, excluded_members)
         .await;
         acc
     }

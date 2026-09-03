@@ -35,6 +35,12 @@ cooldown explain <package>     # alias: cooldown why <package>
 
 Each row is one layer/selector that was considered; the `Applied` column marks the ones that won, and the `Note` explains why. This is the tool for answering "why is this dependency exempt?" or "which `cooldown.toml` set this window?" — see [Precedence]({{< relref "../configuration/precedence.md" >}}) for the model it renders.
 
+When workspace members that declare the package are excluded from the run (`exclude-folders`,
+`exclude-packages`, or a `-C` selection), the header lists them as `excluded members`, and
+`--json` carries them as `excludedMembers`: their declarations are neither evaluated nor moved,
+and on pnpm they no longer count as workspace evidence — a copy on another line in an excluded
+importer cannot hold an update in an included one.
+
 ## `config`
 
 Print the **fully-resolved** configuration, with the origin of each value:

@@ -248,7 +248,7 @@ impl<'a> CheckRunner<'a> {
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
         {
-            Ok(deps) => deps,
+            Ok(scoped) => scoped.deps,
             Err(error) => {
                 self.acc.errors.push(diag_from_error(
                     &error,

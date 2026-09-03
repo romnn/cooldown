@@ -685,6 +685,12 @@ pub struct ExplainMeta {
     pub registry: Option<String>,
     /// The resolved effective window.
     pub effective: EffectiveInfo,
+    /// The workspace members declaring the dependency that the run's scope and exclude policy
+    /// ignore (`exclude-folders`/`exclude-packages`, a `-C` selection): their declarations are
+    /// neither evaluated, moved, nor counted as workspace evidence.
+    /// Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_members: Vec<MemberRef>,
 }
 
 /// The `summary` for `explain`. The command has no aggregate counts.

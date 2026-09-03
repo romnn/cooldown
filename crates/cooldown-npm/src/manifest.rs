@@ -213,13 +213,19 @@ pub fn declared_bound(
 
 /// The manifests that may declare a dependency change, as project-root-relative paths.
 ///
-/// The root manifest is always included for legacy locks without workspace attribution and for root
-/// importers (`.`). Member manifests are then appended in attribution order, deduplicated.
+/// With member attribution these are exactly the declaring members' manifests, in attribution
+/// order and deduplicated, the root's among them only when the root importer (`.`) is one of them:
+/// a run that excludes or does not select the root must never rewrite its manifest, so the root is
+/// not a fallback owner.
+/// Without attribution (a legacy lock, a single-package project) the root manifest is the only
+/// candidate.
 #[must_use]
 pub fn manifest_rels(members: &[MemberRef]) -> Vec<Utf8PathBuf> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    push_manifest_rel(&mut out, &mut seen, Utf8PathBuf::from("package.json"));
+    if members.is_empty() {
+        push_manifest_rel(&mut out, &mut seen, Utf8PathBuf::from("package.json"));
+    }
     for member in members {
         let rel = if member.path.is_empty() || member.path == "." {
             Utf8PathBuf::from("package.json")
@@ -745,6 +751,28 @@ mod tests {
         assert_eq!(bump_range("3.0.0", "3.3.0+build.7"), "3.3.0");
         assert_eq!(bump_range("<4.0.0", "5.0.0+build.7"), "^5.0.0");
         assert_eq!(bump_range("3.0.0", "2.0.0-rc1+build.5"), "2.0.0-rc1");
+    }
+
+    /// The root manifest is an owner only when the root importer is attributed: with members
+    /// present it is exactly the members' manifests, without any it is the root alone.
+    #[test]
+    fn manifest_rels_include_the_root_only_when_attributed() {
+        let member = |path: &str| MemberRef {
+            name: path.to_string(),
+            path: path.to_string(),
+        };
+        assert_eq!(manifest_rels(&[]), vec![Utf8PathBuf::from("package.json")]);
+        assert_eq!(
+            manifest_rels(&[member("apps/a")]),
+            vec![Utf8PathBuf::from("apps/a/package.json")]
+        );
+        assert_eq!(
+            manifest_rels(&[member("."), member("apps/a"), member("apps/a")]),
+            vec![
+                Utf8PathBuf::from("package.json"),
+                Utf8PathBuf::from("apps/a/package.json")
+            ]
+        );
     }
 
     #[test]

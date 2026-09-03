@@ -531,7 +531,8 @@ pub fn json_schema() -> Value {
                 map(&[
                     ("project", json!({ "type": "string" })),
                     ("registry", json!({ "type": "string" })),
-                    ("effective", json!({ "$ref": "#/$defs/effectiveInfo" }))
+                    ("effective", json!({ "$ref": "#/$defs/effectiveInfo" })),
+                    ("excludedMembers", members.clone())
                 ]),
                 vec!["project", "effective"],
                 "#/$defs/explainSummary",
@@ -1216,6 +1217,7 @@ mod tests {
             project: ".".to_string(),
             registry: Some("crates.io".to_string()),
             effective: effective_info(),
+            excluded_members: vec![member()],
         }
     }
 
