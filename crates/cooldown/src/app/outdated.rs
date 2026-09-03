@@ -46,6 +46,15 @@ struct OutdatedRunner<'a> {
     evaluated: usize,
 }
 
+/// The rows `outdated` would show for one package in one project, with the diagnostics the
+/// evaluation raised — `explain`'s verdict.
+pub(crate) struct PackageVerdict {
+    /// One row per resolved version of the package, ascending by current version.
+    pub(crate) items: Vec<OutdatedItem>,
+    pub(crate) warnings: Vec<Diagnostic>,
+    pub(crate) errors: Vec<Diagnostic>,
+}
+
 impl Workspace {
     /// Report what could update, split into "adoptable now" vs "in cooldown".
     ///
@@ -53,6 +62,38 @@ impl Workspace {
     /// Surfaces a yanked locked version as a warning.
     pub async fn outdated(&self, opts: &RunOpts) -> OutdatedOutcome {
         OutdatedRunner::new(self, opts).run().await
+    }
+
+    /// The `outdated` verdict for `package` alone in `pctx`: the same fetch, evaluation, and
+    /// upgrade-policy verification `outdated` runs, scoped to the one name so the whole-graph
+    /// preview resolves only that candidate — seconds where a full `upgrade --dry-run` over a
+    /// large workspace takes minutes.
+    /// Transitive rows are in scope, so a package no member declares directly is still judged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`](cooldown_core::CoreError::Config) if `package` is not a
+    /// valid scoping pattern.
+    pub(crate) async fn package_verdict(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        package: &str,
+    ) -> cooldown_core::Result<PackageVerdict> {
+        let mut scoped = opts.clone();
+        scoped.package = vec![cooldown_core::PatternGlob::new(package)?];
+        scoped.transitive = true;
+        let mut runner = OutdatedRunner::new(self, &scoped);
+        runner.run_project(pctx).await;
+        // The scoping glob is the literal name, but a name that happens to be a pattern could
+        // match siblings; the rows are the package's own either way.
+        runner.items.retain(|item| item.name == package);
+        runner.items.sort_by(|a, b| a.current.cmp(&b.current));
+        Ok(PackageVerdict {
+            items: runner.items,
+            warnings: runner.warnings,
+            errors: runner.errors,
+        })
     }
 }
 

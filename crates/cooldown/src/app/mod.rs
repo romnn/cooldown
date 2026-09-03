@@ -28,9 +28,9 @@ pub use baseline::Baseline;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use cooldown_render::{
     AdvisoryConfigInfo, BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, ConfigItem,
-    ConfigSummary, EffectiveInfo, ExplainMeta, ExplainStep, LatestInfo, OutdatedItem,
-    OutdatedStatus, OutdatedSummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem,
-    UpgradeMeta, UpgradeSummary, Window,
+    ConfigSummary, EffectiveInfo, ExplainDeclaration, ExplainMeta, ExplainStep, LatestInfo,
+    OutdatedItem, OutdatedStatus, OutdatedSummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo,
+    UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 pub use progress::Progress;
 pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};

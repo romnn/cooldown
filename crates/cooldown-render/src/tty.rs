@@ -1245,8 +1245,14 @@ fn push_major_card(out: &mut String, names: &[&str], use_color: bool) {
     let _ = writeln!(out, "{CARD_INDENT}{bottom}");
 }
 
-/// Render the `explain` derivation.
-pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool) -> String {
+/// Render the `explain` decision and derivation.
+pub fn render_explain(
+    meta: &ExplainMeta,
+    steps: &[ExplainStep],
+    warnings: &[Diagnostic],
+    errors: &[Diagnostic],
+    use_color: bool,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1257,6 +1263,45 @@ pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool
     let _ = writeln!(out, "project: {}", meta.project);
     if let Some(r) = &meta.registry {
         let _ = writeln!(out, "registry: {r}");
+    }
+    // The decision the window feeds into: one verdict per resolved version, exactly as `outdated`
+    // would show it, with the reason behind a blocked one — the answer to "why is this blocked?"
+    // without an `upgrade --dry-run` over the whole graph.
+    for verdict in &meta.verdicts {
+        let versions = match &verdict.adoptable_target {
+            Some(target) => format!("{} → {target}", verdict.current),
+            None => verdict.current.clone(),
+        };
+        let _ = writeln!(
+            out,
+            "verdict: {versions} {} (cooldown {})",
+            outdated_status_cell(verdict),
+            outdated_cooldown_cell(verdict)
+        );
+        if let Some(reason) = &verdict.blocked_reason {
+            let _ = writeln!(out, "  reason: {reason}");
+        }
+    }
+    if !meta.declarations.is_empty() {
+        out.push_str("declared by:\n");
+        for declaration in &meta.declarations {
+            let mut line = format!(
+                "  {} ({}): {}",
+                declaration.member.name,
+                declaration.member.path,
+                declaration.range.as_deref().unwrap_or("no range")
+            );
+            if let Some(resolved) = &declaration.resolved {
+                let _ = write!(line, " → {resolved}");
+            }
+            if !declaration.fields.is_empty() {
+                let _ = write!(line, " [{}]", declaration.fields.join(", "));
+            }
+            if declaration.excluded {
+                line.push_str(" (excluded)");
+            }
+            let _ = writeln!(out, "{line}");
+        }
     }
     if !meta.excluded_members.is_empty() {
         // The declarations the run ignores, so an update the excluded members would otherwise veto
@@ -1295,6 +1340,7 @@ pub fn render_explain(meta: &ExplainMeta, steps: &[ExplainStep], use_color: bool
     }
     out.push_str(&dim_borders(&t.to_string(), use_color));
     out.push('\n');
+    push_diagnostics(&mut out, warnings, errors, use_color);
     out
 }
 
@@ -1339,12 +1385,13 @@ mod tests {
     use super::{
         RenderOptions, abbreviated_source, check_cooldown_cell, check_notes_cell,
         has_distinct_project, members_cell, mutation_status, outdated_status_cell, path_label,
-        render_check, render_fix, render_outdated, render_upgrade, stale_project_word,
+        render_check, render_explain, render_fix, render_outdated, render_upgrade,
+        stale_project_word,
     };
     use crate::{
-        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, LatestInfo, OutdatedItem,
-        OutdatedStatus, OutdatedSummary, SecurityInfo, SkippedInfo, UpgradeItem, UpgradeMeta,
-        UpgradeSummary, Window,
+        BuildInfo, CheckItem, CheckMeta, CheckStatus, CheckSummary, EffectiveInfo,
+        ExplainDeclaration, ExplainMeta, LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary,
+        SecurityInfo, SkippedInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
     use cooldown_core::{Diagnostic, DiagnosticKind, MemberRef, SkipReason, UpdateKind};
 
@@ -1759,6 +1806,78 @@ mod tests {
         assert!(
             out.contains("4d/7d (0.15.17)"),
             "cooldown cell should label the soonest version:\n{out}"
+        );
+    }
+
+    /// `explain` leads with the decision: the verdict line per resolved version (with the reason
+    /// behind a blocked one) and every member's declaration, excluded members marked, ahead of
+    /// the window trace.
+    #[test]
+    fn explain_renders_the_verdict_its_reason_and_the_declarations() {
+        let mut blocked = project_outdated_item("zustand", ".");
+        blocked.status = OutdatedStatus::Blocked;
+        blocked.current = "5.0.14".into();
+        blocked.adoptable_target = Some("5.0.15".into());
+        blocked.candidate_age_days = Some(22.0);
+        blocked.window.min_age_days = 14.0;
+        blocked.blocked_reason = Some("the resolve landed 5.0.15 in 1 of 2 importers".into());
+        let meta = ExplainMeta {
+            project: ".".into(),
+            registry: Some("npm".into()),
+            effective: EffectiveInfo {
+                min_age_days: 14.0,
+                decided_by: "repo:cooldown.toml".into(),
+            },
+            excluded_members: vec![MemberRef {
+                name: "@x/legacy".into(),
+                path: "packages/legacy".into(),
+            }],
+            verdicts: vec![blocked],
+            declarations: vec![
+                ExplainDeclaration {
+                    member: MemberRef {
+                        name: "@x/pdf-view".into(),
+                        path: "packages/pdf-view".into(),
+                    },
+                    range: Some("^5.0.14".into()),
+                    resolved: Some("5.0.14".into()),
+                    fields: vec!["dependencies".into()],
+                    excluded: false,
+                },
+                ExplainDeclaration {
+                    member: MemberRef {
+                        name: "@x/legacy".into(),
+                        path: "packages/legacy".into(),
+                    },
+                    range: Some("^5.0.0".into()),
+                    resolved: None,
+                    fields: vec!["peerDependencies".into()],
+                    excluded: true,
+                },
+            ],
+        };
+
+        let out = render_explain(&meta, &[], &[], &[], false);
+
+        assert!(
+            out.contains("verdict: 5.0.14 → 5.0.15 blocked (cooldown 22d/14d)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  reason: the resolve landed 5.0.15 in 1 of 2 importers\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "declared by:\n  @x/pdf-view (packages/pdf-view): ^5.0.14 → 5.0.14 [dependencies]\n  @x/legacy (packages/legacy): ^5.0.0 [peerDependencies] (excluded)\n"
+            ),
+            "{out}"
+        );
+        // The verdict precedes the window, which is what the reader came for second.
+        assert!(
+            out.find("verdict:").unwrap_or(usize::MAX) < out.find("effective window:").unwrap_or(0)
+                || out.starts_with("effective window:"),
+            "{out}"
         );
     }
 

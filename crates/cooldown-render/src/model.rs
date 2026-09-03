@@ -680,7 +680,28 @@ pub struct EffectiveInfo {
     pub decided_by: String,
 }
 
-/// The flattened top-level `meta` for `explain`: the subject and its effective window.
+/// One member's declaration of the explained package (see [`ExplainMeta::declarations`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainDeclaration {
+    /// The declaring member.
+    pub member: MemberRef,
+    /// The declared range or specifier, verbatim, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    /// The version the member's own lock entry resolves to, when the lock records it per member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Whether the run's scope and exclude policy ignore this member's declaration: it is neither
+    /// evaluated, moved, nor counted as workspace evidence.
+    pub excluded: bool,
+}
+
+/// The flattened top-level `meta` for `explain`: the subject, its effective window, and the
+/// decision the window feeds into.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainMeta {
@@ -697,6 +718,17 @@ pub struct ExplainMeta {
     /// Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_members: Vec<MemberRef>,
+    /// The rows `outdated` produces for the package in this project — one per resolved version —
+    /// with the status, the adoptable target, the blocker and the reason when blocked, the held
+    /// reason, and the declaring members: the decision the window feeds into, from the same
+    /// evaluation and upgrade-policy verification `outdated` runs. Omitted when the project does
+    /// not resolve the package.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub verdicts: Vec<OutdatedItem>,
+    /// Every member's declaration of the package, excluded members included and marked. Omitted
+    /// when the adapter records no per-member declarations.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<ExplainDeclaration>,
 }
 
 /// The `summary` for `explain`. The command has no aggregate counts.

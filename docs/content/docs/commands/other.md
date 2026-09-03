@@ -25,7 +25,9 @@ cooldown baseline --prune
 
 ## `explain`
 
-Show **why** a package has the window it has — every layer and rule that applied, in precedence order:
+Show **why** a package is where it is: the decision — the same verdict `outdated` reaches for it,
+with the reason behind a blocked one — and the window that decision was made under, every layer
+and rule that applied, in precedence order:
 
 ```bash
 cooldown explain <package>     # alias: cooldown why <package>
@@ -33,7 +35,20 @@ cooldown explain <package>     # alias: cooldown why <package>
 
 {{< terminal name="explain" >}}
 
-Each row is one layer/selector that was considered; the `Applied` column marks the ones that won, and the `Note` explains why. This is the tool for answering "why is this dependency exempt?" or "which `cooldown.toml` set this window?" — see [Precedence]({{< relref "../configuration/precedence.md" >}}) for the model it renders.
+The header leads with the decision. One `verdict:` line per resolved version of the package
+shows what `outdated` shows — the current and adoptable versions, the status (`blocked by …`,
+`held (declared bound <6)`, `in cooldown`), and the candidate's age against its window — and a
+blocked verdict is followed by `reason:`, the sentence `upgrade` prints for that row (a partial
+landing and the importer it left behind, a workspace split and the flag that converges it, a
+refused duplicate copy and its requirer). The verdict runs the same evaluation and upgrade-policy
+verification `outdated` runs, scoped to the one package, so it answers in seconds where a
+whole-graph `upgrade --dry-run` takes minutes. `declared by:` then lists every workspace member's
+declaration — the declared range, the version that member's own lock entry resolves to, and the
+manifest fields naming it (`[peerDependencies]` is how a peer-only declaration shows) — with
+`(excluded)` on the members the run ignores. `--json` carries these as `verdicts` (the
+`outdated` rows) and `declarations`.
+
+Each row of the table below is one layer/selector that was considered; the `Applied` column marks the ones that won, and the `Note` explains why. This is the tool for answering "why is this dependency exempt?" or "which `cooldown.toml` set this window?" — see [Precedence]({{< relref "../configuration/precedence.md" >}}) for the model it renders.
 
 When workspace members that declare the package are excluded from the run (`exclude-folders`,
 `exclude-packages`, or a `-C` selection), the header lists them as `excluded members`, and

@@ -29,9 +29,9 @@ use cooldown_adapter_util::{
     verify_current_unknown,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef, NativePolicyLayer,
-    PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
+    ApplyReport, CandidateScope, Capabilities, Change, CoreError, Declaration, DepScope,
+    Dependency, Diagnostic, DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef,
+    NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
     ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy, SkipReason, Skipped, SyncReport,
     SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
@@ -278,6 +278,52 @@ fn push_journal_rel(
 impl<L: NodeLock> ToolRead for NpmTool<L> {
     fn id(&self) -> ToolId {
         L::ID
+    }
+
+    async fn declarations(&self, project: &Project, name: &str) -> Result<Vec<Declaration>> {
+        let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let index = L::member_sources(&content);
+        // Every importer the lock lists, whatever it declares, so a manifest-only declaration (a
+        // peer pnpm did not auto-install) is still found; a single-package lock lists no
+        // importers, and its one manifest is the root's.
+        let mut paths: BTreeSet<String> = L::member_paths(&content).into_iter().collect();
+        paths.extend(index.all_paths());
+        if paths.is_empty() {
+            paths.insert(".".to_string());
+        }
+        let names = member_names(&project.root, &paths.iter().cloned().collect());
+        let mut declarations = Vec::new();
+        for path in paths {
+            let entry = index
+                .entries_of(&path)
+                .get(name)
+                .map(|entry| (*entry).clone());
+            let declared = manifest::member_declaration(&project.root, &path, name)?;
+            if entry.is_none() && declared.is_none() {
+                continue;
+            }
+            // The lock's specifier is the manifest's range as pnpm read it; only a member the lock
+            // does not record for the name falls back to reading the manifest's own range.
+            let range = match entry.as_ref().and_then(|entry| entry.specifier.clone()) {
+                Some(specifier) => Some(specifier),
+                None => manifest::declared_range(
+                    &manifest::member_manifest(&project.root, &path),
+                    name,
+                )?,
+            };
+            declarations.push(Declaration {
+                member: MemberRef {
+                    name: names.get(&path).cloned().unwrap_or_else(|| path.clone()),
+                    path,
+                },
+                range,
+                resolved: entry.map(|entry| entry.version),
+                fields: declared
+                    .map(|declared| declared.fields.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(declarations)
     }
 
     async fn rescope_members(
@@ -4376,6 +4422,80 @@ mod whole_graph_tests {
             "the rejected pin is not retried: {legs:?}"
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        Ok(())
+    }
+
+    /// `explain` reads every member's declaration of a name: the lock's specifier and resolved
+    /// version where the importer records it, the manifest's range where only the manifest does,
+    /// and the manifest fields in either case — so a peer-only importer and a manifest-only peer
+    /// are both visible beside the installing one.
+    #[tokio::test]
+    async fn declarations_read_every_member_from_the_lock_and_its_manifest() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "apps/app",
+                    name: "@x/app",
+                    deps: vec![
+                        ("solid-js", "^1.9.14", "1.9.14"),
+                        ("lodash", "^4.17.20", "4.17.20"),
+                    ],
+                },
+                Importer {
+                    path: "packages/lib",
+                    name: "@x/lib",
+                    deps: vec![("solid-js", "^1.9.14", "1.9.14")],
+                },
+                Importer {
+                    path: "packages/tool",
+                    name: "@x/tool",
+                    deps: vec![],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), lock)?;
+        // The lock records lib's auto-installed peer under `dependencies:`; only the manifest says
+        // it is a peer contract. tool declares the name in its manifest alone.
+        std::fs::write(
+            root.join("packages/lib/package.json"),
+            r#"{ "name": "@x/lib", "peerDependencies": { "solid-js": "^1.9.14" } }"#,
+        )?;
+        std::fs::write(
+            root.join("packages/tool/package.json"),
+            r#"{ "name": "@x/tool", "devDependencies": { "solid-js": "^1.9.0" } }"#,
+        )?;
+        let tool = tool_with(&fake_pnpm(&root, "")?)?;
+
+        let declarations = tool.declarations(&project(&root), "solid-js").await?;
+
+        // Each row as `name path range resolved [fields]`, ascending by path.
+        let rows: Vec<String> = declarations
+            .iter()
+            .map(|declaration| {
+                format!(
+                    "{} {} {} {} [{}]",
+                    declaration.member.name,
+                    declaration.member.path,
+                    declaration.range.as_deref().unwrap_or("-"),
+                    declaration.resolved.as_deref().unwrap_or("-"),
+                    declaration.fields.join(", ")
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "@x/app apps/app ^1.9.14 1.9.14 [dependencies]",
+                "@x/lib packages/lib ^1.9.14 1.9.14 [peerDependencies]",
+                "@x/tool packages/tool ^1.9.0 - [devDependencies]",
+            ]
+        );
+        assert!(
+            tool.declarations(&project(&root), "lodash").await?.len() == 1,
+            "a name one importer declares yields one declaration"
+        );
         Ok(())
     }
 

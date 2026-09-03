@@ -1,20 +1,28 @@
-//! `explain <pkg>` — the field-by-field derivation of a package's window (every layer and rule
-//! that applied), and `config` — the fully-resolved policy with the origin of each value. Together
-//! they keep the override system from being a black box.
+//! `explain <pkg>` — the decision for a package (the `outdated` verdict with the reason behind a
+//! blocked one, and every member's declaration) beside the field-by-field derivation of its window
+//! (every layer and rule that applied), and `config` — the fully-resolved policy with the origin
+//! of each value. Together they keep the override system from being a black box.
 
 use super::{
     ConfigItem, ConfigSummary, EffectiveInfo, Exit, ExplainMeta, ExplainStep, ProjectCtx, RunOpts,
     Workspace, round2,
 };
-use cooldown_core::{DepScope, ResolveKind, ResolveQuery, resolve};
+use cooldown_core::{Declaration, DepScope, Diagnostic, ResolveKind, ResolveQuery, resolve};
 
-/// The result of `explain <pkg>`: the package's effective window plus the ordered derivation steps.
+/// The result of `explain <pkg>`: the package's verdict and declarations, its effective window,
+/// and the ordered derivation steps.
 #[derive(Debug)]
 pub struct ExplainOutcome {
-    /// The resolved window and the project/registry it was derived for.
+    /// The verdict, the declarations, the resolved window, and the project/registry it was
+    /// derived for.
     pub meta: ExplainMeta,
     /// Each layer-and-rule step that contributed to (or was shadowed in) the derivation.
     pub steps: Vec<ExplainStep>,
+    /// Non-fatal diagnostics the verdict's evaluation raised (a yanked pin, a preview note).
+    pub warnings: Vec<Diagnostic>,
+    /// Errors the verdict's evaluation raised; the window trace stands regardless, so they do not
+    /// change the exit.
+    pub errors: Vec<Diagnostic>,
     /// The process exit (`Ok`, or `NoTool` when no project is in scope).
     pub exit: Exit,
 }
@@ -35,7 +43,8 @@ struct ExplainService<'a> {
 }
 
 impl Workspace {
-    /// Explains the window for `pkg` in the first in-scope project.
+    /// Explains `pkg` in the first in-scope project: the `outdated` verdict (with the reason behind
+    /// a blocked one), every member's declaration, and the window's derivation.
     ///
     /// A resolved dependency's registry participates in registry-scoped rules.
     /// Missing dependency data falls back to registry-less resolution, but a conflicting project
@@ -69,6 +78,8 @@ impl<'a> ExplainService<'a> {
             return Ok(ExplainOutcome {
                 meta: empty_meta(),
                 steps: Vec::new(),
+                warnings: Vec::new(),
+                errors: Vec::new(),
                 exit: Exit::NoTool,
             });
         };
@@ -83,7 +94,11 @@ impl<'a> ExplainService<'a> {
         let ExplainedDependency {
             registry,
             excluded_members,
+            declarations,
         } = self.dependency_context(pctx, pkg).await?;
+        // The decision itself, after the read guard is released: the verdict runs `outdated`'s
+        // evaluation for this one package, whose upgrade-policy preview takes its own guard.
+        let verdict = self.ws.package_verdict(pctx, self.opts, pkg).await?;
         let q = ResolveQuery {
             tool: pctx.tool,
             package: pkg,
@@ -114,6 +129,21 @@ impl<'a> ExplainService<'a> {
             })
             .collect();
 
+        let declarations = declarations
+            .into_iter()
+            .map(|declaration| {
+                let excluded = excluded_members
+                    .iter()
+                    .any(|member| member.path == declaration.member.path);
+                super::ExplainDeclaration {
+                    member: declaration.member,
+                    range: declaration.range,
+                    resolved: declaration.resolved,
+                    fields: declaration.fields,
+                    excluded,
+                }
+            })
+            .collect();
         let meta = ExplainMeta {
             project: pctx.rel_path.to_string(),
             registry,
@@ -122,11 +152,15 @@ impl<'a> ExplainService<'a> {
                 decided_by: res.window.source(),
             },
             excluded_members,
+            verdicts: verdict.items,
+            declarations,
         };
 
         Ok(ExplainOutcome {
             meta,
             steps,
+            warnings: verdict.warnings,
+            errors: verdict.errors,
             exit: Exit::Ok,
         })
     }
@@ -197,9 +231,9 @@ impl<'a> ExplainService<'a> {
     }
 
     /// What the project's dependency graph says about `pkg`, if it is a known dependency: the
-    /// registry it resolves to, and the declaring members the run's scope and exclude policy ignore
+    /// registry it resolves to, the declaring members the run's scope and exclude policy ignore
     /// — the declarations that no longer count as workspace evidence, which the trace must show
-    /// rather than drop silently.
+    /// rather than drop silently — and every member's declaration as the adapter reads it.
     async fn dependency_context(
         &self,
         pctx: &ProjectCtx,
@@ -226,6 +260,7 @@ impl<'a> ExplainService<'a> {
                 .find(|dep| dep.package.name == pkg)
                 .and_then(|dep| dep.package.registry.clone()),
             excluded_members: Workspace::excluded_members_of(pctx, self.opts, &deps, pkg),
+            declarations: adapter.declarations(&pctx.project, pkg).await?,
         })
     }
 }
@@ -236,6 +271,7 @@ impl<'a> ExplainService<'a> {
 struct ExplainedDependency {
     registry: Option<String>,
     excluded_members: Vec<cooldown_core::MemberRef>,
+    declarations: Vec<Declaration>,
 }
 
 fn empty_meta() -> ExplainMeta {
@@ -247,5 +283,7 @@ fn empty_meta() -> ExplainMeta {
             decided_by: "default".into(),
         },
         excluded_members: Vec::new(),
+        verdicts: Vec::new(),
+        declarations: Vec::new(),
     }
 }

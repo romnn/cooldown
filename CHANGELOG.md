@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **`explain <pkg>` explains the decision, not only the window.** `explain` printed the
+  min-age layer table and nothing else, so four packages blocked for four different reasons
+  produced byte-identical output, and the only way to learn why one was blocked was a full
+  `upgrade --dry-run` over the whole graph — four minutes on a 2100-package workspace — to read
+  one row. `explain` now leads with the decision: one `verdict:` line per resolved version (the
+  `outdated` row — status, current and adoptable versions, blocker, cooldown position) and, for a
+  blocked one, `reason:` with the sentence `upgrade` prints, computed by the same evaluation and
+  upgrade-policy verification `outdated` runs, scoped to the one package so it takes seconds;
+  then `declared by:`, every member's declared range, resolved version, and manifest fields
+  (`[peerDependencies]` shows a peer-only declaration), with the excluded members marked; then
+  the window trace as before. `--json` carries `verdicts` and `declarations` beside
+  `excludedMembers`, which 0.0.18 already emitted as a top-level key — the verification's
+  "appears for none of them" was run with the 0.0.17 binary on `PATH`.
+
 - **Every blocked `outdated` row carries its reason.** In one table five rows were `blocked` and
   only `typescript` said why (`blocked by eslint-config-next`); `pdfjs-dist`, `solid-js`,
   `tailwind-merge`, and `zustand` were blocked for four different reasons `upgrade` states

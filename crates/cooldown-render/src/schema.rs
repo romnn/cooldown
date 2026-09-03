@@ -379,6 +379,18 @@ pub fn json_schema() -> Value {
             "properties": {},
             "additionalProperties": false
         },
+        "explainDeclaration": {
+            "type": "object",
+            "required": ["member", "excluded"],
+            "properties": {
+                "member": { "$ref": "#/$defs/memberRef" },
+                "range": { "type": "string" },
+                "resolved": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" } },
+                "excluded": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        },
         "explainStep": {
             "type": "object",
             "required": ["layer", "field", "applied", "note"],
@@ -533,7 +545,18 @@ pub fn json_schema() -> Value {
                     ("project", json!({ "type": "string" })),
                     ("registry", json!({ "type": "string" })),
                     ("effective", json!({ "$ref": "#/$defs/effectiveInfo" })),
-                    ("excludedMembers", members.clone())
+                    ("excludedMembers", members.clone()),
+                    (
+                        "verdicts",
+                        json!({ "type": "array", "items": { "$ref": "#/$defs/outdatedItem" } })
+                    ),
+                    (
+                        "declarations",
+                        json!({
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/explainDeclaration" }
+                        })
+                    )
                 ]),
                 vec!["project", "effective"],
                 "#/$defs/explainSummary",
@@ -642,10 +665,10 @@ mod tests {
     use crate::model::{
         AdvisoryConfigInfo, BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem,
         CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo,
-        Envelope, ExplainMeta, ExplainStep, ExplainSummary, LatestInfo, OutdatedItem, OutdatedMeta,
-        OutdatedStatus, OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus,
-        RecoverySummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta,
-        UpgradeSummary, Window,
+        Envelope, ExplainDeclaration, ExplainMeta, ExplainStep, ExplainSummary, LatestInfo,
+        OutdatedItem, OutdatedMeta, OutdatedStatus, OutdatedSummary, RecoveryItem, RecoveryMeta,
+        RecoveryStatus, RecoverySummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem,
+        UpgradeMeta, UpgradeSummary, Window,
     };
     use color_eyre::eyre;
     use cooldown_core::{
@@ -832,6 +855,7 @@ mod tests {
         assert_def_keys(schema, "upgradeEdgeInfo", upgrade_edge_info());
         assert_def_keys(schema, "explainSummary", ExplainSummary {});
         assert_def_keys(schema, "explainStep", explain_step());
+        assert_def_keys(schema, "explainDeclaration", explain_declaration());
         assert_def_keys(schema, "configSummary", config_summary());
         assert_def_keys(schema, "configItem", config_item());
         assert_def_keys(schema, "advisoryConfigInfo", advisory_config_info());
@@ -1220,6 +1244,18 @@ mod tests {
             registry: Some("crates.io".to_string()),
             effective: effective_info(),
             excluded_members: vec![member()],
+            verdicts: vec![outdated_item()],
+            declarations: vec![explain_declaration()],
+        }
+    }
+
+    fn explain_declaration() -> ExplainDeclaration {
+        ExplainDeclaration {
+            member: member(),
+            range: Some("^1.0.0".to_string()),
+            resolved: Some("1.0.0".to_string()),
+            fields: vec!["dependencies".to_string()],
+            excluded: false,
         }
     }
 

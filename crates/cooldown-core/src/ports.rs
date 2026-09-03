@@ -188,6 +188,22 @@ pub trait ToolRead: Send + Sync {
     /// [`declared_bound`](Dependency::declared_bound) must reflect only the members that still own
     /// a row, or an excluded member's exact pin or explicit bound would keep holding — or start
     /// loosening — a dependency the run manages.
+    /// Every workspace member's declaration of `name`, for `explain`: the declared range, the
+    /// version the member's own lock entry resolves to, and the manifest fields naming it —
+    /// members the run excludes included, since the caller marks those.
+    /// The default is empty, for adapters whose lock records no per-member declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the lock or a manifest cannot be read.
+    async fn declarations(
+        &self,
+        _project: &Project,
+        _name: &str,
+    ) -> Result<Vec<crate::Declaration>> {
+        Ok(Vec::new())
+    }
+
     /// Called with the already-pruned rows; a row with no member left is not the run's and is gone
     /// before this runs.
     /// The default does nothing, for adapters whose rows carry no member-level facts.

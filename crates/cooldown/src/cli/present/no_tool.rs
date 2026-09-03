@@ -137,6 +137,8 @@ fn no_tool_explain(generated_at: String, error: Diagnostic) -> Result<String, Co
                     decided_by: "default".into(),
                 },
                 excluded_members: Vec::new(),
+                verdicts: Vec::new(),
+                declarations: Vec::new(),
             },
             render::ExplainSummary {},
             Vec::<render::ExplainStep>::new(),

@@ -177,16 +177,21 @@ pub(super) async fn run_explain(
     let out = ctx.ws.explain(package, ctx.opts).await?;
     let meta = out.meta.clone();
     let steps = out.steps.clone();
-    let env = render::Envelope::new(
-        "explain",
-        out.exit.is_ok(),
-        ctx.generated_at.to_owned(),
-        meta.clone(),
-        render::ExplainSummary {},
-        steps.clone(),
+    let warnings = command_warnings(ctx, &out.warnings);
+    let env = with_diags(
+        render::Envelope::new(
+            "explain",
+            out.exit.is_ok(),
+            ctx.generated_at.to_owned(),
+            meta.clone(),
+            render::ExplainSummary {},
+            steps.clone(),
+        ),
+        warnings.clone(),
+        out.errors.clone(),
     );
     emit_envelope(ctx.opts.json, &env, || {
-        render::tty::render_explain(&meta, &steps, ctx.color)
+        render::tty::render_explain(&meta, &steps, &warnings, &out.errors, ctx.color)
     })?;
     Ok(out.exit)
 }

@@ -264,6 +264,25 @@ fn apply_versions(
 
 #[async_trait]
 impl ToolRead for FakeEco {
+    /// One declaration per attributed member, as an adapter reading a lock with per-member records
+    /// would report it: the range is the caret of the current pin, the resolved version the pin.
+    async fn declarations(&self, _project: &Project, name: &str) -> Result<Vec<Declaration>> {
+        Ok(self
+            .direct
+            .iter()
+            .chain(&self.transitive)
+            .filter(|dep| dep.package.name == name)
+            .flat_map(|dep| {
+                dep.members.iter().map(move |member| Declaration {
+                    member: member.clone(),
+                    range: Some(format!("^{}", dep.current)),
+                    resolved: Some(dep.current.to_string()),
+                    fields: vec!["dependencies".to_string()],
+                })
+            })
+            .collect())
+    }
+
     fn id(&self) -> ToolId {
         GO
     }
@@ -5741,6 +5760,106 @@ async fn dry_run_leaves_the_real_lock_and_manifest_byte_identical() {
         "dry-run modified the real manifest",
     );
     assert_eq!(digest(&lock), lock_before, "dry-run modified the real lock");
+}
+
+/// `explain` leads with the decision: the same blocked verdict `outdated` reaches for the package,
+/// carrying the blocker and the reason `upgrade` prints — so "why is this blocked?" is answered
+/// without a whole-graph `upgrade --dry-run`.
+#[tokio::test]
+async fn explain_reports_the_upgrade_verdict_with_its_reason() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let out = held_conflict_workspace(root)
+        .explain("typer", &opts())
+        .await?;
+
+    assert_eq!(out.exit, Exit::Ok);
+    let [verdict] = out.meta.verdicts.as_slice() else {
+        panic!("one verdict per resolved version: {:?}", out.meta.verdicts);
+    };
+    assert_eq!(verdict.name, "typer");
+    assert_eq!(verdict.current, "0.25.1");
+    assert_eq!(verdict.adoptable_target.as_deref(), Some("0.26.7"));
+    assert_eq!(verdict.status, OutdatedStatus::Blocked);
+    assert_eq!(
+        verdict.blocked_by.as_deref(),
+        Some("huggingface-hub from proxy.example")
+    );
+    assert_eq!(
+        verdict.blocked_reason.as_deref(),
+        Some("held: conflicts with huggingface-hub from proxy.example")
+    );
+    // The window trace is still there beside the decision.
+    assert!(out.steps.iter().any(|step| step.applied));
+    Ok(())
+}
+
+/// `explain` lists every member's declaration of the package as the adapter reads it, and marks
+/// the ones the run's exclude policy ignores — the same members it reports as `excludedMembers`.
+#[tokio::test]
+async fn explain_lists_every_declaration_and_marks_the_excluded_members() -> eyre::Result<()> {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut a = dep("a", "v1.0.0", true);
+    a.members = vec![
+        MemberRef {
+            name: "kept".into(),
+            path: "apps/kept".into(),
+        },
+        MemberRef {
+            name: "dropped".into(),
+            path: "apps/dropped".into(),
+        },
+    ];
+    let fake = fake(
+        root.clone(),
+        vec![a],
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    let ws = workspace(fake, Baseline::default());
+    let mut opts = opts();
+    // Folder globs are matched against member locations relative to the scan root.
+    opts.scope = RunScope::new(&root, &root);
+    opts.excludes = MemberExcludes::compile(
+        &[],
+        &[],
+        &BTreeMap::from([(GO.as_str().to_string(), vec!["apps/dropped".to_string()])]),
+        &BTreeMap::new(),
+    )?;
+
+    let out = ws.explain("a", &opts).await?;
+
+    assert_eq!(
+        out.meta
+            .excluded_members
+            .iter()
+            .map(|member| member.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["apps/dropped"]
+    );
+    let declarations: Vec<(&str, Option<&str>, Option<&str>, bool)> = out
+        .meta
+        .declarations
+        .iter()
+        .map(|declaration| {
+            (
+                declaration.member.path.as_str(),
+                declaration.range.as_deref(),
+                declaration.resolved.as_deref(),
+                declaration.excluded,
+            )
+        })
+        .collect();
+    // Both declarations are listed with the range and resolved version the fake records, and only
+    // the excluded member is marked.
+    assert_eq!(
+        declarations,
+        vec![
+            ("apps/kept", Some("^v1.0.0"), Some("v1.0.0"), false),
+            ("apps/dropped", Some("^v1.0.0"), Some("v1.0.0"), true),
+        ]
+    );
+    Ok(())
 }
 
 /// `outdated`'s blocked row carries the reason `upgrade` would print for the same candidate, so

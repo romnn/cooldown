@@ -856,6 +856,25 @@ pub struct BaselineViolation {
     pub version: Version,
 }
 
+/// One workspace member's declaration of a package, as an adapter reads it for `explain`.
+///
+/// Together with the member's resolved version this is what turns a bare `blocked` into "which
+/// importer, on which line, declared how" — the facts a reader otherwise digs out of the lock and
+/// each manifest by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// The declaring member.
+    pub member: MemberRef,
+    /// The declared range or specifier, verbatim (`^5.0.14`, `catalog:`), when a manifest or the
+    /// lock records one.
+    pub range: Option<String>,
+    /// The version the member's own lock entry resolves to, when the lock records it per member.
+    pub resolved: Option<String>,
+    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …), in manifest
+    /// order; empty when only the lock records the declaration.
+    pub fields: Vec<String>,
+}
+
 /// The packages a settled resolve must not leave at a second resolved copy.
 ///
 /// A joint resolve can give a package a second copy beside the one the graph had before the run —
