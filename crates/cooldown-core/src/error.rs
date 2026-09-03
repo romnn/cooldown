@@ -406,6 +406,13 @@ diagnostic_kinds! {
     /// Distinct from [`Held`](DiagnosticKind::Held): nothing was held back, a copy was added.
     /// `[tool.pnpm] single-copy` and `--fail-on-new-duplicate` turn the addition into a refusal.
     DuplicateCopy = "duplicate_copy",
+    /// A dependency of a workspace member the run excludes moved anyway: pnpm re-resolves the
+    /// named package in every importer whose range admits a newer version, whatever the update's
+    /// filter, so the excluded importer's copy followed within its own range. The move is
+    /// committed and reported, never rolled back — refusing it would let the excluded subtree veto
+    /// every shared upgrade. Nothing was held, so this is not a [`Held`](DiagnosticKind::Held)
+    /// diagnostic either.
+    ExcludedMoved = "excluded_moved",
     /// The advisory feed could not be reached or its response could not be parsed.
     ///
     /// Fail-open on the window: the ordinary, stricter window stands; only the

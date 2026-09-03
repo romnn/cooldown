@@ -63,8 +63,10 @@
   (pins, bounds, ceilings), while every one of those warnings was a new duplicate copy the
   preview's resolve had committed (the `@rollup/rollup-*` platform packages at two versions after
   `rollup` was rolled back) — nothing held, a copy added. Those warnings, and the one for an
-  excluded importer left on the old copy, now carry their own `duplicate_copy` kind. The
-  diagnostic-kind set is part of the JSON contract, so `schemaVersion` is now `6`.
+  excluded importer left on the old copy, now carry their own `duplicate_copy` kind, and the
+  warning for an excluded importer whose copy pnpm re-resolved within its own range carries
+  `excluded_moved` — a move, not a hold. The diagnostic-kind set is part of the JSON contract, so
+  `schemaVersion` is now `6`.
 
 - **`check`'s stale-lock error names the project.** `upgrade` reported `Cargo.lock is stale in
   /repo/incubator; run …` while `check` said only `Cargo.lock is stale; run …` for the same

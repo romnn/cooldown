@@ -79,8 +79,8 @@ importer whose range admits a newer version, whatever `--filter` it carried — 
 get the exact target, every other one the newest version its own range admits under the release-age
 floor (verified against pnpm 10). That is the resolver's doing, not a pin cooldown placed — the
 excluded importer's manifest is never rewritten and it is never named in the update — and refusing
-it would let the excluded subtree veto the upgrade, so the move is committed and reported as a
-warning naming the importer and the package. A package the resolver itself splits — one it was not asked
+it would let the excluded subtree veto the upgrade, so the move is committed and reported as an
+`excluded_moved` warning naming the importer and the package. A package the resolver itself splits — one it was not asked
 to pin, floated in only some importers — is never committed: the batch is refused with the split
 named, and candidate isolation holds the candidate whose landing caused it (a resolver-conflict row
 carrying that detail) while the rest of the batch lands. A split whose managed

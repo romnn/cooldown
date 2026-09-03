@@ -1260,7 +1260,7 @@ fn report_excluded_moves(
     for moved in &moves.re_resolved {
         report.warnings.push(
             Diagnostic::new(
-                DiagnosticKind::Held,
+                DiagnosticKind::ExcludedMoved,
                 format!(
                     "pnpm re-resolved {} to the newest version its own range admits, as its update does in every importer whatever the filter; the excluded manifest was not touched",
                     moved.describe()
@@ -4950,6 +4950,9 @@ mod whole_graph_tests {
                 report.warnings
             );
         };
+        // A move of an excluded importer's copy is neither a hold nor a duplicate: it has its own
+        // kind, so the `outdated` summary's `held` count never has to reconcile with it.
+        assert_eq!(warning.kind, DiagnosticKind::ExcludedMoved);
         assert_eq!(warning.package.as_deref(), Some("mongoose"));
         assert!(
             warning
