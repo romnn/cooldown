@@ -183,11 +183,6 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
-    /// Re-derives the manifest-owned facts of `deps` after the orchestrator dropped the members at
-    /// `excluded` from their attribution: [`pinned`](Dependency::pinned) and
-    /// [`declared_bound`](Dependency::declared_bound) must reflect only the members that still own
-    /// a row, or an excluded member's exact pin or explicit bound would keep holding — or start
-    /// loosening — a dependency the run manages.
     /// Every workspace member's declaration of `name`, for `explain`: the declared range, the
     /// version the member's own lock entry resolves to, and the manifest fields naming it —
     /// members the run excludes included, since the caller marks those.
@@ -204,6 +199,11 @@ pub trait ToolRead: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Re-derives the manifest-owned facts of `deps` after the orchestrator dropped the members at
+    /// `excluded` from their attribution: [`pinned`](Dependency::pinned) and
+    /// [`declared_bound`](Dependency::declared_bound) must reflect only the members that still own
+    /// a row, or an excluded member's exact pin or explicit bound would keep holding — or start
+    /// loosening — a dependency the run manages.
     /// Called with the already-pruned rows; a row with no member left is not the run's and is gone
     /// before this runs.
     /// The default does nothing, for adapters whose rows carry no member-level facts.

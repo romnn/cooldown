@@ -95,10 +95,12 @@ impl<'a> ExplainService<'a> {
             registry,
             excluded_members,
             declarations,
+            warnings: mut context_warnings,
         } = self.dependency_context(pctx, pkg).await?;
         // The decision itself, after the read guard is released: the verdict runs `outdated`'s
         // evaluation for this one package, whose upgrade-policy preview takes its own guard.
-        let verdict = self.ws.package_verdict(pctx, self.opts, pkg).await?;
+        let mut verdict = self.ws.package_verdict(pctx, self.opts, pkg).await?;
+        context_warnings.append(&mut verdict.warnings);
         let q = ResolveQuery {
             tool: pctx.tool,
             package: pkg,
@@ -159,7 +161,7 @@ impl<'a> ExplainService<'a> {
         Ok(ExplainOutcome {
             meta,
             steps,
-            warnings: verdict.warnings,
+            warnings: context_warnings,
             errors: verdict.errors,
             exit: Exit::Ok,
         })
@@ -254,13 +256,34 @@ impl<'a> ExplainService<'a> {
             ) => return Err(error),
             Err(_) => return Ok(ExplainedDependency::default()),
         };
+        // The declarations are diagnostic evidence beside the graph, so one unreadable member
+        // manifest degrades to a warning rather than costing the window trace that already stood
+        // — the same fail-open rule the graph read above follows.
+        let mut warnings = Vec::new();
+        let declarations = match adapter.declarations(&pctx.project, pkg).await {
+            Ok(declarations) => declarations,
+            Err(error) => {
+                warnings.push(
+                    super::diag_from_error(&error, pctx.tool, pctx.rel_path.as_str(), Some(pkg))
+                        .with_path(pctx.project.manifest.as_str()),
+                );
+                Vec::new()
+            }
+        };
+        let declared: Vec<cooldown_core::MemberRef> = declarations
+            .iter()
+            .map(|declaration| declaration.member.clone())
+            .collect();
         Ok(ExplainedDependency {
             registry: deps
                 .iter()
                 .find(|dep| dep.package.name == pkg)
                 .and_then(|dep| dep.package.registry.clone()),
-            excluded_members: Workspace::excluded_members_of(pctx, self.opts, &deps, pkg),
-            declarations: adapter.declarations(&pctx.project, pkg).await?,
+            excluded_members: Workspace::excluded_members_of(
+                pctx, self.opts, &deps, pkg, &declared,
+            ),
+            declarations,
+            warnings,
         })
     }
 }
@@ -272,6 +295,8 @@ struct ExplainedDependency {
     registry: Option<String>,
     excluded_members: Vec<cooldown_core::MemberRef>,
     declarations: Vec<Declaration>,
+    /// What went wrong reading the declarations, if anything; the trace stands regardless.
+    warnings: Vec<Diagnostic>,
 }
 
 fn empty_meta() -> ExplainMeta {

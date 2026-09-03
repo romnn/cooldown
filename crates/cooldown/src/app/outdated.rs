@@ -10,8 +10,8 @@ use super::{
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, LockVerifyReport, PackageId, Release, ResolveKind,
-    ResolveQuery, UpdateKind, Version, evaluate_advised, resolve,
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, PackageId, Release,
+    ResolveKind, ResolveQuery, UpdateKind, Version, evaluate_advised, resolve,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +42,10 @@ struct OutdatedRunner<'a> {
     skipped_stale_projects: usize,
     /// Whether a project already explained an empty selection, so the run-level note is redundant.
     empty_selection_noted: bool,
+    /// Whether a project that contributes no row under a `-C` selection is noted: `outdated`
+    /// evaluates a selection, `explain`'s one-package verdict does not, so the note's advice
+    /// ("run from the workspace root") would be wrong there.
+    selection_notes: bool,
     /// Dependencies evaluated across every project, whether or not they became an item.
     evaluated: usize,
 }
@@ -84,6 +88,7 @@ impl Workspace {
         scoped.package = vec![cooldown_core::PatternGlob::new(package)?];
         scoped.transitive = true;
         let mut runner = OutdatedRunner::new(self, &scoped);
+        runner.selection_notes = false;
         runner.run_project(pctx).await;
         // The scoping glob is the literal name, but a name that happens to be a pattern could
         // match siblings; the rows are the package's own either way.
@@ -113,6 +118,7 @@ impl<'a> OutdatedRunner<'a> {
             errors: Vec::new(),
             skipped_stale_projects: 0,
             empty_selection_noted: false,
+            selection_notes: true,
             evaluated: 0,
         }
     }
@@ -228,7 +234,9 @@ impl<'a> OutdatedRunner<'a> {
         self.evaluated += deps.len();
         drop(read_guard);
         drop(refresh_guard);
-        self.note_empty_project(pctx, deps.len());
+        if self.selection_notes {
+            self.note_empty_project(pctx, deps.len());
+        }
         // Identities must be adapter-confirmed before they are queried, matched, or counted
         // (see `ToolRead::confirm_advisory_identities`) — and only when the feed will run.
         if super::advisories::advisory_fetch_policy(pctx).is_some() {
@@ -391,10 +399,18 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
         if self.opts.offline {
-            tracing::debug!(
-                project = pctx.rel_path.as_str(),
-                tool = pctx.tool.as_str(),
-                "skipping upgrade-resolve verification in offline mode"
+            // The whole-graph resolve needs the registry, so the verdicts stay per-package; saying
+            // so keeps an unverified `adoptable` from reading as a verified one.
+            self.warnings.push(
+                Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "--offline: {} adoptable row(s) were not verified against the upgrade resolve, which needs the registry; a row `upgrade` would hold can read adoptable here",
+                        candidates.len()
+                    ),
+                )
+                .with_tool(pctx.tool.as_str())
+                .with_project(pctx.rel_path.as_str()),
             );
             return;
         }

@@ -266,8 +266,11 @@ fn apply_versions(
 impl ToolRead for FakeEco {
     /// One declaration per attributed member, as an adapter reading a lock with per-member records
     /// would report it: the range is the caret of the current pin, the resolved version the pin.
+    /// The `manifest-only-declarations` marker (`<package> <member name> <member path>` per line)
+    /// adds members that declare the package in their manifest alone, with no lock entry — the
+    /// shape of a peer pnpm did not auto-install.
     async fn declarations(&self, _project: &Project, name: &str) -> Result<Vec<Declaration>> {
-        Ok(self
+        let mut declarations: Vec<Declaration> = self
             .direct
             .iter()
             .chain(&self.transitive)
@@ -280,7 +283,27 @@ impl ToolRead for FakeEco {
                     fields: vec!["dependencies".to_string()],
                 })
             })
-            .collect())
+            .collect();
+        let manifest_only = std::fs::read_to_string(self.root.join("manifest-only-declarations"))
+            .unwrap_or_default();
+        for line in manifest_only.lines() {
+            let mut parts = line.split_whitespace();
+            if let (Some(package), Some(member), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+                && package == name
+            {
+                declarations.push(Declaration {
+                    member: MemberRef {
+                        name: member.to_string(),
+                        path: path.to_string(),
+                    },
+                    range: Some("^1.0.0".to_string()),
+                    resolved: None,
+                    fields: vec!["peerDependencies".to_string()],
+                });
+            }
+        }
+        Ok(declarations)
     }
 
     fn id(&self) -> ToolId {
@@ -5895,6 +5918,64 @@ async fn explain_reports_the_upgrade_verdict_with_its_reason() -> eyre::Result<(
     Ok(())
 }
 
+/// `--offline` skips the upgrade-resolve verification the adoptable verdicts normally get (the
+/// whole-graph resolve needs the registry), so the run says so instead of letting an unverified
+/// `adoptable` read as a verified one; the online run carries no such note.
+#[tokio::test]
+async fn outdated_offline_says_the_adoptable_rows_are_unverified() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut releases = HashMap::new();
+    // One matured minor, so the row is adoptable and would be verified online.
+    releases.insert(
+        "a".to_string(),
+        vec![
+            rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+            rel(
+                "v1.1.0",
+                1,
+                Some("2026-06-01T00:00:00Z"),
+                Some(UpdateKind::Minor),
+            ),
+        ],
+    );
+    let fake = fake(
+        root,
+        vec![dep("a", "v1.0.0", true)],
+        Vec::new(),
+        releases,
+        HashMap::new(),
+    );
+    let ws = workspace(fake, Baseline::default());
+    let mut offline = opts();
+    offline.offline = true;
+
+    let out = ws.outdated(&offline).await;
+
+    // The row keeps its per-package verdict, and a config note says it went unverified.
+    let a = out.items.iter().find(|item| item.name == "a").expect("a");
+    assert_eq!(a.status, OutdatedStatus::Adoptable);
+    let note = out
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == DiagnosticKind::Config)
+        .expect("an offline note");
+    assert!(
+        note.message.contains("--offline") && note.message.contains("not verified"),
+        "{}",
+        note.message
+    );
+    // Online, the verification runs and nothing claims otherwise.
+    let online = ws.outdated(&opts()).await;
+    assert!(
+        online
+            .warnings
+            .iter()
+            .all(|warning| !warning.message.contains("--offline")),
+        "{:?}",
+        online.warnings
+    );
+}
+
 /// `explain` lists every member's declaration of the package as the adapter reads it, and marks
 /// the ones the run's exclude policy ignores — the same members it reports as `excludedMembers`.
 #[tokio::test]
@@ -5918,6 +5999,12 @@ async fn explain_lists_every_declaration_and_marks_the_excluded_members() -> eyr
         HashMap::new(),
         HashMap::new(),
     );
+    // A member that declares `a` in its manifest alone: no dependency row attributes it, so its
+    // exclusion can only be judged from the declaration itself.
+    std::fs::write(
+        root.join("manifest-only-declarations"),
+        "a peer-only apps/peer-only\n",
+    )?;
     let ws = workspace(fake, Baseline::default());
     let mut opts = opts();
     // Folder globs are matched against member locations relative to the scan root.
@@ -5925,19 +6012,23 @@ async fn explain_lists_every_declaration_and_marks_the_excluded_members() -> eyr
     opts.excludes = MemberExcludes::compile(
         &[],
         &[],
-        &BTreeMap::from([(GO.as_str().to_string(), vec!["apps/dropped".to_string()])]),
+        &BTreeMap::from([(
+            GO.as_str().to_string(),
+            vec!["apps/dropped".to_string(), "apps/peer-only".to_string()],
+        )]),
         &BTreeMap::new(),
     )?;
 
     let out = ws.explain("a", &opts).await?;
 
+    // Both excluded members are reported, the manifest-only one included.
     assert_eq!(
         out.meta
             .excluded_members
             .iter()
             .map(|member| member.path.as_str())
             .collect::<Vec<_>>(),
-        vec!["apps/dropped"]
+        vec!["apps/dropped", "apps/peer-only"]
     );
     let declarations: Vec<(&str, Option<&str>, Option<&str>, bool)> = out
         .meta
@@ -5952,13 +6043,15 @@ async fn explain_lists_every_declaration_and_marks_the_excluded_members() -> eyr
             )
         })
         .collect();
-    // Both declarations are listed with the range and resolved version the fake records, and only
-    // the excluded member is marked.
+    // Every declaration is listed with the range and resolved version the fake records, and the
+    // excluded members are marked — the manifest-only one from its declaration, since no row
+    // attributes it.
     assert_eq!(
         declarations,
         vec![
             ("apps/kept", Some("^v1.0.0"), Some("v1.0.0"), false),
             ("apps/dropped", Some("^v1.0.0"), Some("v1.0.0"), true),
+            ("apps/peer-only", Some("^1.0.0"), None, true),
         ]
     );
     Ok(())

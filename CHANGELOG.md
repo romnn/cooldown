@@ -9,10 +9,13 @@
   one row. `explain` now leads with the decision: one `verdict:` line per resolved version (the
   `outdated` row — status, current and adoptable versions, blocker, cooldown position) and, for a
   blocked one, `reason:` with the sentence `upgrade` prints, computed by the same evaluation and
-  upgrade-policy verification `outdated` runs, scoped to the one package so it takes seconds;
-  then `declared by:`, every member's declared range, resolved version, and manifest fields
-  (`[peerDependencies]` shows a peer-only declaration), with the excluded members marked; then
-  the window trace as before. `--json` carries `verdicts` and `declarations` beside
+  upgrade-policy verification `outdated` runs (the resolver against a throwaway copy), scoped to
+  the one package so it takes seconds rather than minutes — judged on its own, so a hold that only
+  arises between two candidates of one batch shows in `outdated` but not here, and skipped under
+  `--offline` with a note saying so (`outdated` now says so too); then `declared by:`, every
+  member's declared range, resolved version, and manifest fields (`[peerDependencies]` shows a
+  peer-only declaration), with the excluded members marked, manifest-only declarations included;
+  then the window trace as before. `--json` carries `verdicts` and `declarations` beside
   `excludedMembers`, which 0.0.18 already emitted as a top-level key — the verification's
   "appears for none of them" was run with the 0.0.17 binary on `PATH`.
 

@@ -314,7 +314,8 @@ pub(in crate::cli) enum Command {
         #[arg(long)]
         prune: bool,
     },
-    /// Why a package has the window it has — every layer and rule that applied.
+    /// Why a package is where it is: its verdict (the outdated row, with the reason behind a
+    /// blocked one), every member's declaration, and every layer and rule that set its window.
     #[command(visible_alias = "why")]
     Explain {
         /// The package to explain.

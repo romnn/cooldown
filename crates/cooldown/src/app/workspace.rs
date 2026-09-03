@@ -1106,24 +1106,36 @@ impl Workspace {
     /// The members declaring `name` that the scope and exclude policy drop, judged over the raw
     /// `deps` exactly as [`scope_dependencies`](Self::scope_dependencies) would — for `explain`,
     /// which reads the raw graph and must still say which declarations the run ignores.
+    /// `declared` adds the members the adapter reports as declaring the name without a lock entry
+    /// of their own (a peer pnpm did not auto-install), which no dependency row attributes.
     pub(crate) fn excluded_members_of(
         pctx: &ProjectCtx,
         opts: &RunOpts,
         deps: &[Dependency],
         name: &str,
+        declared: &[cooldown_core::MemberRef],
     ) -> Vec<cooldown_core::MemberRef> {
         let scope = MemberScope::resolve(pctx, opts, deps);
-        let mut excluded: Vec<cooldown_core::MemberRef> = deps
+        let tool = pctx.tool.as_str();
+        let mut members: Vec<cooldown_core::MemberRef> = deps
             .iter()
             .filter(|dep| dep.package.name == name)
-            .flat_map(|dep| {
-                let mut dep = dep.clone();
-                scope.prune_members(pctx, opts, &mut dep)
-            })
+            .flat_map(|dep| dep.members.iter().cloned())
+            .chain(declared.iter().cloned())
             .collect();
-        excluded.sort_by(|a, b| a.path.cmp(&b.path));
-        excluded.dedup_by(|a, b| a.path == b.path);
-        excluded
+        members.sort_by(|a, b| a.path.cmp(&b.path));
+        members.dedup_by(|a, b| a.path == b.path);
+        members
+            .into_iter()
+            .filter(|member| {
+                !scope.keeps(
+                    &opts.excludes,
+                    tool,
+                    &member_location(pctx, member),
+                    &member.name,
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
@@ -1932,7 +1944,7 @@ mod tests {
             "the excluded member is reported once, however many rows it declared"
         );
         assert_eq!(
-            Workspace::excluded_members_of(&ws.projects()[0], &opts, &reader.deps, "mongoose"),
+            Workspace::excluded_members_of(&ws.projects()[0], &opts, &reader.deps, "mongoose", &[]),
             scoped.excluded_members
         );
         // The excluded set is a property of the run, not of `--package`: a member that only
@@ -1959,10 +1971,32 @@ mod tests {
                 &ws.projects()[0],
                 &opts_for(None),
                 &reader.deps,
-                "mongoose"
+                "mongoose",
+                &[]
             )
             .is_empty(),
             "nothing is excluded without an exclude list"
+        );
+        // A member the adapter reports as declaring the package without a row of its own (a peer
+        // pnpm did not auto-install) is judged by the same exclude policy as the attributed ones.
+        let declared = vec![MemberRef {
+            name: "legacy-peer".to_string(),
+            path: "legacy/peer".to_string(),
+        }];
+        let excluded = Workspace::excluded_members_of(
+            &ws.projects()[0],
+            &opts,
+            &reader.deps,
+            "mongoose",
+            &declared,
+        );
+        assert_eq!(
+            excluded
+                .iter()
+                .map(|member| member.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy", "legacy/peer"],
+            "the manifest-only declaration under the excluded folder is reported beside the row's"
         );
     }
 
