@@ -623,6 +623,22 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         stale.error_kinds(),
         stale.error_messages()
     );
+    // A repository can hold several Cargo locks, so the error must say which project's lock is
+    // stale rather than only that one is.
+    let root_name = fixture
+        .root()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the fixture root has a name");
+    assert!(
+        stale
+            .error_messages()
+            .iter()
+            .any(|message| message.contains("Cargo.lock is stale in ")
+                && message.contains(root_name)),
+        "the stale-lock error must name the project whose lock is stale, got {:?}",
+        stale.error_messages()
+    );
 
     let allowed = fixture.cooldown_json(&[
         "check",

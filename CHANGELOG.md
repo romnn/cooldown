@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`check`'s stale-lock error names the project.** `upgrade` reported `Cargo.lock is stale in
+  /repo/incubator; run …` while `check` said only `Cargo.lock is stale; run …` for the same
+  condition — in a repository with five Cargo locks (a parked nested workspace, standalone fuzz
+  and wasm projects) the one to refresh had to be inferred from the dependency count dropping
+  between runs. The lock-currency probe's detail now names the project root for cargo, uv, and
+  the npm family (`pnpm-lock.yaml is stale in /repo/apps: <pnpm's own reason>`), in the error, in
+  the `--allow-stale-lock` warning, and in `outdated`.
+
 ## v0.0.18
 
 - **A pnpm pin that lands in only some importers is rolled back, never committed half-applied.**

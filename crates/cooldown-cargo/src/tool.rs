@@ -236,10 +236,17 @@ impl ToolRead for CargoTool {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
         match self.cargo.verify_locked(&project.root).await {
+            // The stale detail names the project: a repository can hold several Cargo locks (a
+            // parked nested workspace, standalone fuzz targets), and `check` prints the detail
+            // without the path, so a bare "Cargo.lock is stale" leaves the reader to guess which
+            // one to refresh.
             Ok(graph) => Ok(verify_current_report(
                 graph.is_some(),
                 "Cargo.lock is current",
-                "Cargo.lock is stale; run `cargo update` or `cargo generate-lockfile`",
+                &format!(
+                    "Cargo.lock is stale in {}; run `cargo update` or `cargo generate-lockfile`",
+                    project.root
+                ),
             )),
             Err(e) => Err(e),
         }

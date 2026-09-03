@@ -351,10 +351,12 @@ impl ToolRead for UvTool {
             .verify_check(&project.root, project.exclude_newer.as_deref())
             .await
         {
+            // The stale detail names the project so a repository with several uv locks says which
+            // one to refresh (the diagnostic's own path field is not printed on the TTY).
             Ok(ok) => Ok(verify_current_report(
                 ok,
                 "uv.lock is current",
-                "uv.lock is stale; run `uv lock`",
+                &format!("uv.lock is stale in {}; run `uv lock`", project.root),
             )),
             Err(e) => Err(e),
         }

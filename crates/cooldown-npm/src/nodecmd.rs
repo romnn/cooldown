@@ -120,9 +120,12 @@ impl NodeCmd {
         &self,
         dir: &Utf8Path,
         args: &[String],
-        ok_detail: &str,
+        lockfile: &str,
     ) -> Result<LockVerifyReport> {
         let out = self.output(dir, args).await?;
+        // The stale detail leads with the lockfile and its project, ahead of the manager's own
+        // failure text: the diagnostic's path field is not printed on the TTY, and a repository
+        // with several locks needs to know which one the manager rejected.
         Ok(LockVerifyReport {
             status: if out.status.success() {
                 LockStatus::Current
@@ -130,9 +133,9 @@ impl NodeCmd {
                 LockStatus::Stale
             },
             detail: if out.status.success() {
-                ok_detail.to_string()
+                format!("{lockfile} is current")
             } else {
-                failure_detail(&out)
+                format!("{lockfile} is stale in {dir}: {}", failure_detail(&out))
             },
         })
     }

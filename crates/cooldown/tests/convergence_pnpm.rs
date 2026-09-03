@@ -180,6 +180,16 @@ fn check_reports_a_stale_pnpm_lock_from_frozen_verification() {
         !check.error_kinds().contains("lock_unknown"),
         "pnpm should prove staleness, not report unknown lock currency"
     );
+    // The error names the lockfile and its project ahead of pnpm's own failure text, so a
+    // repository with several locks knows which one pnpm rejected.
+    assert!(
+        check
+            .error_messages()
+            .iter()
+            .any(|message| message.contains("pnpm-lock.yaml is stale in ")),
+        "the stale-lock error must name the project whose lock is stale, got {:?}",
+        check.error_messages()
+    );
 }
 
 #[test]

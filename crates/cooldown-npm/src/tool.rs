@@ -458,7 +458,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             return Ok(verify_current_unknown(L::LOCKFILE));
         };
         self.cmd
-            .lock_report(&project.root, &args, &format!("{} is current", L::LOCKFILE))
+            .lock_report(&project.root, &args, L::LOCKFILE)
             .await
     }
 }
