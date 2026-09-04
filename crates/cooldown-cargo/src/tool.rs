@@ -505,17 +505,25 @@ fn classify_planned_changes(
                     blocking_requirer(graph, &change.package.name, change.to.as_str())
                 })
                 .unwrap_or_else(|| change.package.name.clone());
+            // Cargo's own rejection sentence (which requirement, declared by whom) beats
+            // both the generic reason and the `=`-pin-only graph offender.
+            let detail = pin_rejections.get(&rejection_key(change)).cloned();
             report.skipped.push(Skipped {
                 change: change.clone(),
-                reason: SkipReason::ResolverConflict,
+                // A pin cargo itself refused is the resolver's rejection, and its sentence says
+                // why; a candidate the resolve merely left short is capped by another crate's
+                // requirement, a hold with a different way forward.
+                reason: if detail.is_some() {
+                    SkipReason::ResolverConflict
+                } else {
+                    SkipReason::GraphCeilingHeld
+                },
                 offending: Some(PackageId::new(
                     CARGO_ID,
                     offender,
                     Some(CRATES_IO.to_string()),
                 )),
-                // Cargo's own rejection sentence (which requirement, declared by whom) beats
-                // both the generic reason and the `=`-pin-only graph offender.
-                detail: pin_rejections.get(&rejection_key(change)).cloned(),
+                detail,
             });
         }
     }
@@ -614,7 +622,7 @@ fn summarize_pin_rejection(error: &CoreError) -> Option<String> {
 /// an exact pin on a shared single-major node (cargo coexists distinct majors, so an open caret
 /// range rarely conflicts): some *other* crate's `graph_ceiling` (an active `=` edge) caps the
 /// shared node below the candidate's target. Returns the requirer that caps `held`, or `None` so the
-/// caller falls back to the generic "the resolver rejected this change".
+/// caller falls back to the unattributed graph-ceiling message.
 fn blocking_requirer(
     graph: &crate::cargocmd::ResolvedGraph,
     held: &str,

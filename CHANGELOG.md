@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Held rows say why.** A candidate the whole-graph resolve kept below its target and one the
+  resolve rejected outright shared one sentence, `the resolver rejected this change`, and the
+  rejected one's explanation was cut at the resolver's first line, so a `--json` `blockedReason`
+  ended at `No solution found when resolving dependencies:`. The two outcomes are now distinct
+  skip reasons: `graph_ceiling_held` (the resolve succeeded; another package's requirement caps
+  the candidate, and the way forward is that package maturing or moving) and `resolver_conflict`
+  (the resolve failed with the candidate in it). A rejection carries the resolver's whole
+  explanation from its failure sentence on, folded onto one line, so uv's `Because
+  litellm==1.91.5 depends on openai>=2.20.0,<3.0.0 … your project's requirements are
+  unsatisfiable` reaches the row and `blockedReason`. A uv ceiling names the capping package
+  with the requirement and marker it declares, read from the lock for a workspace source and
+  from the release's PyPI metadata for a registry package, since a modern `uv.lock` records only
+  the resolved edge for those; a cap two packages share no longer falls back to an unattributed
+  message, and a cap the candidate's own release creates names the sibling it cannot have. When
+  one of the capping package's next releases lifts the cap, the row says which release and where
+  it stands against the window. The ceiling reason applies to every whole-graph adapter (cargo,
+  go, pnpm, deno, and the app-side landing check), so a JSON consumer that keyed the held set on
+  `resolver_conflict` alone must accept `graph_ceiling_held` too.
+
 ## v0.0.19
 
 - **Ecosystems run in parallel.** `outdated`, `check`, `upgrade`, `fix`, and `baseline` drove

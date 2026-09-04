@@ -178,6 +178,29 @@ fn conflict_skip_message_names_a_different_offender() {
 }
 
 #[test]
+fn conflict_skip_message_names_a_graph_ceilings_capping_package() {
+    // A ceiling the adapter attributed reads like a conflict, since the named package is what
+    // holds the candidate; an unattributed one keeps the reason's own held sentence, which is
+    // distinct from the rejection message so the two outcomes never read alike.
+    assert_eq!(
+        conflict_skip_message(
+            SkipReason::GraphCeilingHeld,
+            Some("typer"),
+            "huggingface-hub"
+        ),
+        "held: conflicts with typer"
+    );
+    assert_eq!(
+        conflict_skip_message(SkipReason::GraphCeilingHeld, Some("foo"), "foo"),
+        SkipReason::GraphCeilingHeld.message()
+    );
+    assert_ne!(
+        SkipReason::GraphCeilingHeld.message(),
+        SkipReason::ResolverConflict.message()
+    );
+}
+
+#[test]
 fn conflict_skip_message_keeps_generic_message_when_offender_is_self() {
     // The resolver rejected the pin itself (no other package to blame): keep the generic message.
     assert_eq!(
@@ -443,7 +466,8 @@ fn verify_applied_targets_turns_unreached_planned_success_into_skip() {
 
     assert!(verified.applied.is_empty());
     assert_eq!(verified.skipped.len(), 1);
-    assert_eq!(verified.skipped[0].reason, SkipReason::ResolverConflict);
+    // The resolve ran and the graph does not hold the target: a ceiling, not a rejection.
+    assert_eq!(verified.skipped[0].reason, SkipReason::GraphCeilingHeld);
     assert_eq!(verified.skipped[0].change.package.name, "serde");
 }
 

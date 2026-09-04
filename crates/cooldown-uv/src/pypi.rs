@@ -64,6 +64,20 @@ struct VersionJson {
     urls: Vec<PyFile>,
 }
 
+/// The `info` block of a release document, read for the release's declared requirements.
+#[derive(serde::Deserialize)]
+struct VersionInfoJson {
+    #[serde(default)]
+    info: VersionInfo,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct VersionInfo {
+    /// PyPI serializes an absent requirement list as `null`, which is "unknown", not "none".
+    #[serde(default)]
+    requires_dist: Option<Vec<String>>,
+}
+
 fn all_yanked(files: &[PyFile]) -> bool {
     !files.is_empty() && files.iter().all(|f| f.yanked)
 }
@@ -107,6 +121,38 @@ impl PyPi {
     #[must_use]
     pub fn registry_name(&self) -> String {
         PYPI.to_string()
+    }
+
+    /// The declared requirements of `name` at `version` as PyPI records them from the release's
+    /// core metadata: PEP 508 strings, extras and markers included.
+    ///
+    /// `None` when PyPI does not know the release or its metadata carries no requirement list,
+    /// which a caller must read as "unknown", never as "requires nothing".
+    /// Release metadata is immutable, so the document is cached for as long as a publish time is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Transient`] for a non-success response other than 404, and
+    /// [`CoreError::Parse`] when the document is not the release JSON PyPI publishes.
+    pub async fn requires_dist(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Vec<String>>, CoreError> {
+        let url = format!(
+            "{}/pypi/{name}/{version}/json",
+            self.base.trim_end_matches('/')
+        );
+        let resp = self.http.get(&url, ttl::IMMUTABLE).await?;
+        if resp.is_not_found() {
+            return Ok(None);
+        }
+        if !resp.is_success() {
+            return Err(CoreError::transient(format!("{url}: HTTP {}", resp.status)));
+        }
+        let parsed: VersionInfoJson = serde_json::from_str(&resp.body)
+            .map_err(|e| CoreError::Parse(format!("{name}@{version}: {e}")))?;
+        Ok(parsed.info.requires_dist)
     }
 
     fn guard(&self, name: &str, vers: &str, t: Option<Timestamp>) -> Option<Timestamp> {

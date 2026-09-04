@@ -175,7 +175,7 @@ fn collateral_change(registry: &'static str, name: &str, from: &str, to: &str) -
 /// The held skip for a candidate the joint resolve could not place at its target. Deno's resolver
 /// imposes no transitive `==` ceiling (the npm family floats a transitive up unless a manifest pins
 /// it), so there is no structural blocker to attribute — the candidate names itself, yielding the
-/// generic "the resolver rejected this change" message.
+/// unattributed graph-ceiling message.
 /// The net version changes of the before/after lock diff that `applied` does not already report,
 /// as sorted collateral rows.
 ///
@@ -208,10 +208,10 @@ fn collateral_changes(
     changes
 }
 
-fn resolver_conflict(change: &Change) -> Skipped {
+fn graph_ceiling_hold(change: &Change) -> Skipped {
     Skipped {
         change: change.clone(),
-        reason: SkipReason::ResolverConflict,
+        reason: SkipReason::GraphCeilingHeld,
         offending: Some(change.package.clone()),
         detail: None,
     }
@@ -585,7 +585,7 @@ impl ToolWrite for DenoTool {
                     report.applied.push(change.clone());
                 }
             } else {
-                report.skipped.push(resolver_conflict(change));
+                report.skipped.push(graph_ceiling_hold(change));
             }
         }
 

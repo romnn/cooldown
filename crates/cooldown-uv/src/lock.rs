@@ -100,6 +100,10 @@ pub struct DepSpec {
     /// The declared version specifier (e.g. `"==6.33.5"`, `">=1,<2"`); `None` when unconstrained.
     #[serde(default)]
     pub specifier: Option<String>,
+    /// The environment marker gating the requirement (`sys_platform == 'darwin'`), verbatim, when
+    /// the author wrote one.
+    #[serde(default)]
+    pub marker: Option<String>,
 }
 
 /// A package's `[package.metadata]` table. Carries `requires-dist`, the declared requirements whose

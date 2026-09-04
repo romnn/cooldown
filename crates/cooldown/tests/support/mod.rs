@@ -576,9 +576,10 @@ impl Envelope {
         })
     }
 
-    /// Names of items `upgrade`/`fix` held back because the whole-graph re-resolve rejected the move
-    /// (skipped with reason `resolver_conflict`). This is the "held" set the agreement invariants
-    /// compare against `outdated`'s `blocked` set.
+    /// Names of items `upgrade`/`fix` held back because the whole-graph re-resolve rejected the
+    /// move or capped it below its target (skipped with reason `resolver_conflict` or
+    /// `graph_ceiling_held`).
+    /// This is the "held" set the agreement invariants compare against `outdated`'s `blocked` set.
     pub fn held_conflict_names(&self) -> BTreeSet<String> {
         self.filter_names(|item| {
             let not_applied = !item
@@ -589,7 +590,7 @@ impl Envelope {
                 .get("skipped")
                 .and_then(|skipped| skipped.get("reason"))
                 .and_then(serde_json::Value::as_str);
-            not_applied && reason == Some("resolver_conflict")
+            not_applied && matches!(reason, Some("resolver_conflict" | "graph_ceiling_held"))
         })
     }
 

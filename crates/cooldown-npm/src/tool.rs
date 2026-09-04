@@ -1558,10 +1558,13 @@ impl<L: NodeLock> NpmTool<L> {
                     )?;
                 }
                 Ok(()) => {
+                    // The install ran but the target did not land: a dependent's range holds
+                    // the package where it is, a ceiling the resolver imposed rather than a
+                    // rejection it raised.
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
                     report.skipped.push(Skipped {
                         change: change.clone(),
-                        reason: SkipReason::ResolverConflict,
+                        reason: SkipReason::GraphCeilingHeld,
                         offending: Some(change.package.clone()),
                         detail: None,
                     });
@@ -1774,11 +1777,9 @@ impl<L: NodeLock> NpmTool<L> {
                     advance.get(&advance_key(change)),
                     Some(TransitiveAdvance::Pin(_))
                 );
-                report.skipped.push(resolver_conflict_hold::<L>(
-                    change,
-                    &after_content,
-                    advanced,
-                )?);
+                report
+                    .skipped
+                    .push(graph_ceiling_hold::<L>(change, &after_content, advanced)?);
             }
         }
 
@@ -2449,11 +2450,13 @@ fn multi_version_hold(change: &Change, after_members: &MemberIndex, plan: &Plan)
 
 /// The held verdict for a candidate the joint resolve left short of its target: a
 /// mutually-exclusive peer won, so the row names the sibling whose peer choice excluded it (the
-/// candidate itself absent a unique blocker). For an attempted transitive advance (`advanced`)
-/// the generic message hides the real cause — whether the qualified override never matched (an
-/// exact or sub-line dependent range) or the override-free settlement reverted the pin, the
-/// target sits outside some dependent's declared range — so the detail says that instead.
-fn resolver_conflict_hold<L: NodeLock>(
+/// candidate itself absent a unique blocker).
+/// The resolve succeeded, so this is a graph ceiling, never a rejection.
+/// For an attempted transitive advance (`advanced`) the unattributed message hides the real
+/// cause — whether the qualified override never matched (an exact or sub-line dependent range)
+/// or the override-free settlement reverted the pin, the target sits outside some dependent's
+/// declared range — so the detail says that instead.
+fn graph_ceiling_hold<L: NodeLock>(
     change: &Change,
     after_content: &str,
     advanced: bool,
@@ -2483,7 +2486,7 @@ fn resolver_conflict_hold<L: NodeLock>(
     };
     Ok(Skipped {
         change: change.clone(),
-        reason: SkipReason::ResolverConflict,
+        reason: SkipReason::GraphCeilingHeld,
         offending: Some(PackageId::new(L::ID, offender, Some(NPM.to_string()))),
         detail,
     })
@@ -3741,7 +3744,7 @@ packages:
                 resolution: {integrity: sha512-a}
         "};
 
-        let hold = resolver_conflict_hold::<Pnpm>(&advance, after, true)
+        let hold = graph_ceiling_hold::<Pnpm>(&advance, after, true)
             .expect("a parsable settlement lock yields the hold");
         let detail = hold.detail.expect("advanced holds carry a detail");
         assert!(
@@ -3752,7 +3755,7 @@ packages:
         // An empty document is a legitimately empty lock, not a parse failure: the name is simply
         // absent, so the pre-apply version is the honest fallback.
         let unresolvable =
-            resolver_conflict_hold::<Pnpm>(&advance, "", true).expect("an empty lock is parsable");
+            graph_ceiling_hold::<Pnpm>(&advance, "", true).expect("an empty lock is parsable");
         let detail = unresolvable.detail.expect("advanced holds carry a detail");
         assert!(
             detail.contains("holds it at 3.4.8"),
@@ -3773,7 +3776,7 @@ packages:
               debug@3.4.9: [unclosed
         "};
 
-        let error = resolver_conflict_hold::<Pnpm>(&advance, malformed, true)
+        let error = graph_ceiling_hold::<Pnpm>(&advance, malformed, true)
             .expect_err("an unparsable lock is an error, not a stale-from fallback");
         assert!(
             matches!(error, CoreError::LockUnreadable(_)),

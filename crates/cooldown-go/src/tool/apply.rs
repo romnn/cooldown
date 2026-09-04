@@ -90,7 +90,7 @@ pub(super) async fn apply(
         if reached(&after, change) {
             report.applied.push(change.clone());
         } else {
-            report.skipped.push(resolver_conflict(change));
+            report.skipped.push(graph_ceiling_hold(change));
         }
     }
 
@@ -127,7 +127,7 @@ fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
     })
 }
 
-fn resolver_conflict(change: &Change) -> Skipped {
+fn graph_ceiling_hold(change: &Change) -> Skipped {
     // A cross-major candidate is planned under its *target* path (`…/vN` — `go get` needs it), but
     // a skip means the tree still holds the from-major module, so the row reports the identity
     // that actually exists; the target path stays visible in the To column's major.
@@ -138,7 +138,7 @@ fn resolver_conflict(change: &Change) -> Skipped {
     Skipped {
         offending: Some(reported.package.clone()),
         change: reported,
-        reason: SkipReason::ResolverConflict,
+        reason: SkipReason::GraphCeilingHeld,
         detail: None,
     }
 }
@@ -293,7 +293,7 @@ mod tests {
             direct: true,
             members: Vec::new(),
         };
-        let skipped = resolver_conflict(&change);
+        let skipped = graph_ceiling_hold(&change);
         assert_eq!(skipped.change.package.name, "example.com/foo");
         // Self-blame stays consistent with the rewritten identity so the renderer's self check
         // (which falls back to the generic resolver message) still recognizes it.
@@ -315,7 +315,7 @@ mod tests {
             members: Vec::new(),
         };
         assert_eq!(
-            resolver_conflict(&minor).change.package.name,
+            graph_ceiling_hold(&minor).change.package.name,
             "example.com/foo"
         );
     }
@@ -334,7 +334,7 @@ mod tests {
             direct: true,
             members: Vec::new(),
         };
-        let skipped = resolver_conflict(&change);
+        let skipped = graph_ceiling_hold(&change);
         assert_eq!(skipped.change.package.name, "example.com/foo");
         assert_eq!(
             skipped
@@ -354,7 +354,7 @@ mod tests {
             members: Vec::new(),
         };
         assert_eq!(
-            resolver_conflict(&within_line).change.package.name,
+            graph_ceiling_hold(&within_line).change.package.name,
             "github.com/docker/cli"
         );
     }

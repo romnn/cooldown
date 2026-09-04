@@ -981,8 +981,17 @@ skip_reasons! {
     GraphHeld = "graph_held",
     /// Applying it would drag a too-fresh, non-acknowledged transitive into the lock.
     TransitiveInCooldown = "transitive_in_cooldown",
-    /// The resolver/MVS rejected the change.
+    /// The resolver/MVS rejected the change outright: the joint resolve failed with this candidate
+    /// in it and the tool's own explanation, when it gave one, travels on the [`Skipped`] row.
     ResolverConflict = "resolver_conflict",
+    /// The joint resolve succeeded but left the candidate below its target: another package's
+    /// requirement caps it there, so the resolver kept the current version rather than regress
+    /// that package.
+    /// The capping package is named on the [`Skipped`] row when the adapter can attribute it.
+    /// This is a different situation from [`ResolverConflict`](Self::ResolverConflict): a
+    /// solution exists, and the way forward is the capping package maturing or moving, not a
+    /// constraint of your own.
+    GraphCeilingHeld = "graph_ceiling_held",
     /// The dependency has no editable version requirement to retarget — it is transitive-only or a
     /// path/git source — so `upgrade` cannot move it by rewriting a constraint.
     NotEligible = "not_eligible",
@@ -1038,6 +1047,9 @@ impl SkipReason {
                 "would introduce a transitive dependency younger than its window"
             }
             SkipReason::ResolverConflict => "the resolver rejected this change",
+            SkipReason::GraphCeilingHeld => {
+                "held: another package's requirement caps it below the target"
+            }
             SkipReason::NotEligible => {
                 "no editable requirement to change (transitive-only or path/git dependency)"
             }

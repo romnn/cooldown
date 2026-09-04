@@ -224,7 +224,7 @@ pub(crate) async fn apply_resilient_with_observer(
 
     // Every candidate the subset excluded is accounted for, split by *why* its singleton trial
     // failed: a tool rejection (the resolver could not place it) stays a held skip carrying the
-    // tool's own first stderr line, and so does a resolve cooldown itself refused to commit (its
+    // tool's own explanation, and so does a resolve cooldown itself refused to commit (its
     // detail names the split or the excluded member it moved), while any other failure —
     // verification, stale lock — is a per-candidate error the caller reports as such, never a
     // policy skip.
@@ -355,9 +355,9 @@ fn push_halves(work: &mut Vec<Vec<Change>>, mut group: Vec<Change>) {
 
 /// A held skip for a candidate the resolve could not place. It blames itself (the generic "resolver
 /// rejected this change" form), matching what each adapter emitted when it marked the whole batch
-/// held — elaborated with the tool's own first stderr line when the singleton trial's rejection is
-/// available, since that line carries the fact the generic message lacks (which requirement, held
-/// by whom).
+/// held — elaborated with the tool's own explanation when the singleton trial's rejection is
+/// available, since that text carries the facts the generic message lacks (which requirement
+/// conflicts, and who declares it).
 /// A failure that means the resolver could not (or cooldown would not) place the candidate, as
 /// opposed to a broken environment or a verification failure: the tool's own non-zero exit, or a
 /// resolve cooldown refused to commit.
@@ -377,10 +377,16 @@ fn held(change: &Change, rejection: Option<&cooldown_core::CoreError>) -> Skippe
     }
 }
 
-/// The first non-empty stderr line of a tool rejection, bounded for the report table. `None` for
-/// non-tool errors and empty stderr, falling back to the generic reason message. The line reaches
-/// the TTY and JSON reports verbatim, so embedded URLs are stripped of credentials here, at
-/// construction.
+/// The longest rejection explanation a skip row carries, in characters.
+/// uv's derivation for a real conflict runs several sentences, and the JSON report has no width
+/// to respect; the cap only bounds tool-controlled stderr that could be arbitrarily long.
+const REJECTION_DETAIL_CHARS: usize = 1500;
+
+/// The tool's own explanation of a rejection, from its failure sentence to the end of its
+/// stderr, folded onto one line and bounded for the report.
+/// `None` for non-tool errors and empty stderr, falling back to the generic reason message.
+/// The text reaches the TTY and JSON reports verbatim, so embedded URLs are stripped of
+/// credentials here, at construction.
 /// A resolve cooldown itself refused carries a detail it wrote, so that one passes through whole.
 fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
     if let cooldown_core::CoreError::UnacceptableResolve(detail) = error {
@@ -389,11 +395,12 @@ fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
     let cooldown_core::CoreError::Tool { stderr, .. } = error else {
         return None;
     };
-    // Prefer the tool's own failure sentence — cargo/uv/pnpm prefix it `error`, uv's resolver
-    // conflicts prefix it `×` ("× No solution found when resolving dependencies") — over the
-    // progress noise around it ("Updating crates.io index", "Using CPython 3.12.13"), which says
-    // nothing about the rejection. The fallback still skips the known chatter prefixes so a
-    // stderr with no marked sentence yields its first substantive line, not the banner.
+    // Start at the tool's own failure sentence — cargo/uv/pnpm prefix it `error`, uv's resolver
+    // conflicts prefix it `×` ("× No solution found when resolving dependencies") — rather than
+    // at the progress noise around it ("Updating crates.io index", "Using CPython 3.12.13"),
+    // which says nothing about the rejection.
+    // The fallback still skips the known chatter prefixes so a stderr with no marked sentence
+    // starts at its first substantive line, not the banner.
     let noise = |line: &&str| {
         [
             "Using CPython",
@@ -405,30 +412,91 @@ fn rejection_detail(error: &cooldown_core::CoreError) -> Option<String> {
         .iter()
         .any(|prefix| line.starts_with(prefix))
     };
-    let line = stderr
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("error") || line.starts_with('×'))
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("error") || line.starts_with('×'))
         .or_else(|| {
-            stderr
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !noise(line))
+            lines
+                .iter()
+                .position(|line| !line.is_empty() && !noise(line))
         })
-        .or_else(|| stderr.lines().map(str::trim).find(|line| !line.is_empty()))?;
+        .or_else(|| lines.iter().position(|line| !line.is_empty()))?;
+    // The explanation follows the sentence: uv's `╰─▶ Because …` derivation, which names the
+    // requirement that conflicts and who declares it, or cargo's `required by` attribution and
+    // version list.
+    // The sentence alone ("No solution found when resolving dependencies:") says nothing a
+    // reader can act on, so the whole block is kept, folded onto one line with the tree glyphs
+    // dropped.
+    let explanation = lines
+        .iter()
+        .skip(start)
+        .map(|line| without_tree_glyphs(line))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     // Resolver errors quote registry URLs, which can embed credentials on private registries;
-    // redact before the cap bounds the (possibly lengthened) line.
-    let mut line = cooldown_core::redact::url_secrets(line);
+    // redact before the cap bounds the (possibly lengthened) text.
+    let mut explanation = cooldown_core::redact::url_secrets(&explanation);
     // Char-boundary-safe cap: stderr is tool-controlled and can be arbitrarily long.
-    if let Some((cut, _)) = line.char_indices().nth(200) {
-        line.truncate(cut);
-        line.push('…');
+    if let Some((cut, _)) = explanation.char_indices().nth(REJECTION_DETAIL_CHARS) {
+        explanation.truncate(cut);
+        explanation.push('…');
     }
-    Some(format!("the resolver rejected this change: {line}"))
+    Some(format!("the resolver rejected this change: {explanation}"))
+}
+
+/// A stderr line without the box-drawing prefix uv's error tree gives it (`×`, `│`, `╰─▶`), which
+/// only draws a structure the folded text no longer has.
+fn without_tree_glyphs(line: &str) -> &str {
+    line.trim_start_matches(['×', '│', '╰', '├', '─', '▶', ' '])
 }
 
 #[cfg(test)]
 mod tests {
+    /// uv's verdict sentence is followed by the derivation that names the conflicting
+    /// requirement and who declares it; the row must carry that derivation, folded onto one
+    /// line, rather than stop at the colon the sentence ends with.
+    #[test]
+    fn rejection_detail_keeps_the_resolvers_derivation() {
+        // A `uv lock` rejection as uv prints it, wrapped at its own width with the tree glyphs.
+        let stderr = indoc::indoc! {"
+            Using CPython 3.12.13
+              × No solution found when resolving dependencies for split (markers:
+              │ python_full_version == '3.12.*' and sys_platform == 'darwin'):
+              ╰─▶ Because litellm==1.91.5 depends on openai>=2.20.0,<3.0.0 and your
+                  project depends on litellm==1.91.5, we can conclude that your project
+                  depends on openai>=2.20.0,<3.0.0.
+                  And because your project depends on openai>=3.1.0, we can conclude that
+                  your project's requirements are unsatisfiable.
+        "};
+        let conflict = CoreError::Tool {
+            tool: "uv".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: stderr.into(),
+        };
+        let detail = super::rejection_detail(&conflict).expect("tool stderr yields a detail");
+        assert_eq!(
+            detail,
+            "the resolver rejected this change: No solution found when resolving dependencies \
+             for split (markers: python_full_version == '3.12.*' and sys_platform == 'darwin'): \
+             Because litellm==1.91.5 depends on openai>=2.20.0,<3.0.0 and your project depends \
+             on litellm==1.91.5, we can conclude that your project depends on \
+             openai>=2.20.0,<3.0.0. And because your project depends on openai>=3.1.0, we can \
+             conclude that your project's requirements are unsatisfiable."
+        );
+
+        // Tool-controlled stderr is still bounded: a runaway explanation is cut at the cap.
+        let runaway = CoreError::Tool {
+            tool: "uv".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: format!("error: too long\n{}", "x ".repeat(2000)),
+        };
+        let detail = super::rejection_detail(&runaway).expect("stderr yields a detail");
+        assert!(detail.ends_with('…'), "{detail}");
+        assert!(detail.chars().count() <= super::REJECTION_DETAIL_CHARS + 60);
+    }
+
     #[test]
     fn rejection_detail_prefers_the_failure_sentence_over_progress_chatter() {
         // uv prints environment banners before its verdict, and its no-solution sentence carries
@@ -442,8 +510,8 @@ mod tests {
         };
         let detail = super::rejection_detail(&conflict).expect("tool stderr yields a detail");
         assert!(
-            detail.contains("× No solution found"),
-            "the resolver verdict is the detail: {detail}"
+            detail.ends_with(": No solution found when resolving dependencies:"),
+            "the resolver verdict is the detail, without its tree glyph: {detail}"
         );
         assert!(!detail.contains("Using CPython"));
 

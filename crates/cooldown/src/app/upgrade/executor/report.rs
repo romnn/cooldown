@@ -149,8 +149,8 @@ pub(super) const fn combine_lock_status(
 
 /// Builds the user-facing message for a skipped version change.
 ///
-/// A resolver conflict caused by another package names that package because it is the actionable
-/// reason the candidate cannot land.
+/// A graph ceiling, or a resolver conflict an adapter could still pin on another package, names
+/// that package because it is the actionable reason the candidate cannot land.
 /// Other skips retain the message owned by their typed reason.
 pub(super) fn conflict_skip_message(
     reason: SkipReason,
@@ -158,8 +158,10 @@ pub(super) fn conflict_skip_message(
     changed: &str,
 ) -> String {
     match (reason, offending) {
-        // A self-conflict keeps the generic resolver message because it has no distinct blocker.
-        (SkipReason::ResolverConflict, Some(offending)) if offending != changed => {
+        // A self-conflict keeps the reason's own message because it has no distinct blocker.
+        (SkipReason::ResolverConflict | SkipReason::GraphCeilingHeld, Some(offending))
+            if offending != changed =>
+        {
             format!("held: conflicts with {offending}")
         }
         // The adapter normally supplies the peer's verbatim range, making this a fallback.

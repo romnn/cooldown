@@ -5660,7 +5660,7 @@ impl ToolWrite for HeldConflictFake {
             if change.package.name == "typer" {
                 report.skipped.push(Skipped {
                     change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
+                    reason: SkipReason::GraphCeilingHeld,
                     offending: Some(PackageId::new(
                         HELD_TOOL,
                         "huggingface-hub".to_string(),
@@ -5769,7 +5769,7 @@ async fn dry_run_reports_the_truly_held_candidate_matching_the_real_run() {
         .skipped
         .as_ref()
         .expect("typer must be held (skipped), not planned");
-    assert_eq!(skipped.reason, SkipReason::ResolverConflict);
+    assert_eq!(skipped.reason, SkipReason::GraphCeilingHeld);
     assert_eq!(
         skipped.offending.as_deref(),
         Some("huggingface-hub from proxy.example")

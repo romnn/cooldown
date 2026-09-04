@@ -454,126 +454,6 @@ fn locked_versions(lock: &UvLock) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// The package whose requirement structurally holds `held` out of the graph at `target`, checked in
-/// **both** directions so a blocker is named whichever side carries the constraint:
-///
-/// 1. A *requirer* of `held`: a committed package whose `requires-dist` upper bound on `held` excludes
-///    `target` (e.g. `huggingface-hub` at 1.18.0 requiring `typer<0.26.0` keeps `typer` below 0.26.x).
-/// 2. A *sibling* `held` itself constrains: `held`'s own committed `requires-dist` carries an upper
-///    bound on some package whose currently-committed version already sits at or above that bound — so
-///    raising `held` to `target` (which carries the same structural cap) would conflict with that
-///    sibling. This names the counterpart of the mutual exclusion when no requirer of `held` exists
-///    (e.g. the `held` package is the one carrying the `<` requirement, not the one being capped).
-///
-/// Only the upper bound of a specifier is parsed — the form that excludes a *newer* version; an
-/// unbounded or lower-only requirement never holds a candidate down. Skips `held` itself and is
-/// order-stable. Returns `None` when neither direction yields a name, so the caller falls back to the
-/// generic "the resolver rejected this change".
-fn blocking_requirer(lock: &UvLock, held: &str, target: &str) -> Option<String> {
-    if let Some(requirer) = requirer_capping(lock, held, target) {
-        return Some(requirer);
-    }
-    if let Some(sibling) = sibling_held_caps(lock, held) {
-        return Some(sibling);
-    }
-    unique_edge_requirer(lock, held)
-}
-
-/// Last-resort best-effort: the single package whose *resolved* dependency edge reaches `held`. Modern
-/// `uv.lock` files often omit per-package `requires-dist`, so neither version-bound direction can name
-/// the blocker; the resolved edges remain, and a transitive held below its newest is structurally held
-/// by the package that pulls it. Names that package only when it is *unique* — multiple requirers make
-/// the blame ambiguous, so the caller falls back to the generic message rather than guess. Skips
-/// `held` itself.
-fn unique_edge_requirer(lock: &UvLock, held: &str) -> Option<String> {
-    let mut requirers: Vec<&str> = lock
-        .packages
-        .iter()
-        .filter(|pkg| pkg.name != held)
-        .filter(|pkg| pkg.all_direct_dep_names().any(|name| name == held))
-        .map(|pkg| pkg.name.as_str())
-        .collect();
-    requirers.sort_unstable();
-    requirers.dedup();
-    match requirers.as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    }
-}
-
-/// Direction 1: a committed package (other than `held`) whose `requires-dist` upper bound on `held`
-/// excludes `target`. Order-stable across candidate requirers.
-fn requirer_capping(lock: &UvLock, held: &str, target: &str) -> Option<String> {
-    let mut requirers: Vec<&str> = lock
-        .packages
-        .iter()
-        .filter(|pkg| pkg.name != held)
-        .filter(|pkg| {
-            pkg.metadata.as_ref().is_some_and(|metadata| {
-                metadata.requires_dist.iter().any(|req| {
-                    req.name == held
-                        && req
-                            .specifier
-                            .as_deref()
-                            .and_then(specifier_upper_bound)
-                            .is_some_and(|bound| version::compare(target, bound).is_ge())
-                })
-            })
-        })
-        .map(|pkg| pkg.name.as_str())
-        .collect();
-    requirers.sort_unstable();
-    requirers.into_iter().next().map(str::to_string)
-}
-
-/// Direction 2: a sibling that `held`'s own committed requirement caps below the sibling's
-/// currently-committed version. When `held` is the package carrying the `<` bound (rather than the one
-/// being capped), the structural counterpart is the sibling whose committed version that bound
-/// excludes — naming it explains why `held` cannot move up without regressing the sibling. Order-stable
-/// across siblings.
-fn sibling_held_caps(lock: &UvLock, held: &str) -> Option<String> {
-    let committed = |name: &str| -> Option<&str> {
-        lock.packages
-            .iter()
-            .find(|pkg| pkg.name == name)
-            .and_then(|pkg| pkg.version.as_deref())
-    };
-    let held_pkg = lock.packages.iter().find(|pkg| pkg.name == held)?;
-    let metadata = held_pkg.metadata.as_ref()?;
-    let mut siblings: Vec<&str> = metadata
-        .requires_dist
-        .iter()
-        .filter(|req| req.name != held)
-        .filter(|req| {
-            let Some(bound) = req.specifier.as_deref().and_then(specifier_upper_bound) else {
-                return false;
-            };
-            committed(&req.name).is_some_and(|version| version::compare(version, bound).is_ge())
-        })
-        .map(|req| req.name.as_str())
-        .collect();
-    siblings.sort_unstable();
-    siblings.into_iter().next().map(str::to_string)
-}
-
-/// The exclusive/inclusive upper-bound version of a PEP 440 specifier, if it carries one (`<X`,
-/// `<=X`, or a compound `>=A,<X`). A target at or above this bound is excluded by the requirement, so
-/// the requirer is holding the dependency below it. Returns `None` for unbounded or lower-only
-/// specifiers, which never cap a newer target.
-fn specifier_upper_bound(specifier: &str) -> Option<&str> {
-    specifier
-        .split(',')
-        .filter_map(|clause| {
-            let clause = clause.trim();
-            clause
-                .strip_prefix("<=")
-                .or_else(|| clause.strip_prefix('<'))
-                .map(str::trim)
-        })
-        .filter(|bound| !bound.is_empty() && !bound.contains('*'))
-        .min_by(|a, b| version::compare(a, b))
-}
-
 /// A net version change `apply` derived from the before/after lock diff for a package the plan did not
 /// itself name — collateral movement the whole-graph re-resolve forced. Reported so no package's
 /// version change is ever silent: a forced downgrade of a non-candidate (e.g. `typer` regressing
@@ -709,6 +589,30 @@ impl UvTool {
             self.lock_once(project, upgrade, &ceilings).await?;
         }
         Ok(())
+    }
+
+    /// The named blocker and the detail sentence of a held candidate's row: the package whose
+    /// requirement caps `change` below its target, with the requirement and the release that
+    /// lifts it when they can be read, or the candidate itself when nothing attributes the hold.
+    async fn ceiling_row(
+        &self,
+        lock: &UvLock,
+        project: &Project,
+        change: &Change,
+    ) -> (String, Option<String>) {
+        let held = change.package.name.as_str();
+        let target = change.to.as_str();
+        let Some(ceiling) = crate::ceiling::attribute(lock, held, target, &self.pypi).await else {
+            return (held.to_string(), None);
+        };
+        let lift = crate::ceiling::lift(lock, &ceiling, held, target, &self.pypi).await;
+        let detail = ceiling.detail(
+            held,
+            lift.as_ref(),
+            project.exclude_newer.as_deref(),
+            jiff::Timestamp::now(),
+        );
+        (ceiling.blocker, detail)
     }
 
     async fn lock_once(
@@ -961,18 +865,19 @@ impl ToolWrite for UvTool {
             if reached {
                 report.applied.push(change.clone());
             } else {
-                // uv could not place this candidate at its target without breaking the lock — another
-                // requirement won. Name the package whose upper-bound requirement structurally holds it
-                // below the target so the report says "held: conflicts with <pkg>"; absent a known
-                // blocker it falls back to the candidate itself (the generic "resolver rejected" form).
-                let offender =
-                    blocking_requirer(&after_lock, &change.package.name, change.to.as_str())
-                        .unwrap_or_else(|| change.package.name.clone());
+                // uv could not place this candidate at its target without breaking the lock —
+                // another requirement won.
+                // Name the package whose requirement structurally holds it below the target, and
+                // the requirement itself when the lock or PyPI records it, so the report says
+                // "held: conflicts with <pkg> <version>, which requires <requirement>"; absent any
+                // attribution it falls back to the candidate itself (the unattributed
+                // graph-ceiling message).
+                let (offender, detail) = self.ceiling_row(&after_lock, project, change).await;
                 report.skipped.push(Skipped {
                     change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
+                    reason: SkipReason::GraphCeilingHeld,
                     offending: Some(PackageId::new(UV_ID, offender, Some(PYPI.to_string()))),
-                    detail: None,
+                    detail,
                 });
             }
         }
@@ -1142,140 +1047,6 @@ mod tests {
         assert_eq!(collateral_changes(&before, &after, &overshoot).len(), 1);
         let exact = [change("referencing", "0.36.1", "0.36.4")];
         assert!(collateral_changes(&before, &after, &exact).is_empty());
-    }
-
-    #[test]
-    fn specifier_upper_bound_reads_only_the_upper_clause() {
-        assert_eq!(specifier_upper_bound("<0.26.0"), Some("0.26.0"));
-        assert_eq!(specifier_upper_bound("<=1.4"), Some("1.4"));
-        assert_eq!(specifier_upper_bound(">=0.20.0,<0.26.0"), Some("0.26.0"));
-        // Lower-only and unbounded specifiers never cap a newer target.
-        assert_eq!(specifier_upper_bound(">=1.1.5"), None);
-        assert_eq!(specifier_upper_bound("==6.33.5"), None);
-        assert_eq!(specifier_upper_bound("<*"), None);
-    }
-
-    #[test]
-    fn blocking_requirer_names_a_structural_upper_bound_holder() {
-        // `huggingface-hub` (committed at 1.18.0) requires `typer<0.26.0`, which holds the `typer`
-        // candidate at 0.25.1 below its 0.26.7 target. The requirement names the structural blocker so
-        // the held skip can say "held: conflicts with huggingface-hub".
-        let lock = UvLock::parse(indoc! {r#"
-            version = 1
-            revision = 3
-
-            [[package]]
-            name = "huggingface-hub"
-            version = "1.18.0"
-            source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
-
-            [package.metadata]
-            requires-dist = [{ name = "typer", specifier = ">=0.20.0,<0.26.0" }]
-
-            [[package]]
-            name = "typer"
-            version = "0.25.1"
-            source = { registry = "https://pypi.org/simple" }
-        "#})
-        .expect("lock parses");
-        assert_eq!(
-            blocking_requirer(&lock, "typer", "0.26.7"),
-            Some("huggingface-hub".to_string())
-        );
-        // When the target is *within* the requirement's bound, the upper-bound direction names no
-        // blocker (the edge fallback is a last resort the full `blocking_requirer` only applies to a
-        // genuinely-held candidate, so the bound direction is tested directly here).
-        assert_eq!(requirer_capping(&lock, "typer", "0.25.5"), None);
-    }
-
-    #[test]
-    fn blocking_requirer_names_the_sibling_a_held_package_caps() {
-        // Here `huggingface-hub` is the *held* candidate carrying the `<` requirement (`typer<0.26.0`),
-        // and `typer` is committed at 0.25.1 — within the bound, so no requirer caps `huggingface-hub`.
-        // Direction 2 names `typer` as the structural counterpart only when its committed version
-        // already sits at/above the bound `huggingface-hub` declares.
-        let lock = UvLock::parse(indoc! {r#"
-            version = 1
-            revision = 3
-
-            [[package]]
-            name = "huggingface-hub"
-            version = "1.18.0"
-            source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
-
-            [package.metadata]
-            requires-dist = [{ name = "typer", specifier = ">=0.20.0,<0.26.0" }]
-
-            [[package]]
-            name = "typer"
-            version = "0.26.7"
-            source = { registry = "https://pypi.org/simple" }
-        "#})
-        .expect("lock parses");
-        // No package requires `huggingface-hub` with a cap, but its own requirement caps `typer` below
-        // the committed 0.26.7, so the sibling `typer` is named as the structural blocker.
-        assert_eq!(
-            blocking_requirer(&lock, "huggingface-hub", "1.19.0"),
-            Some("typer".to_string())
-        );
-    }
-
-    #[test]
-    fn blocking_requirer_falls_back_to_a_unique_resolved_edge() {
-        // A real `uv.lock` often records only resolved *edges* (no per-package `requires-dist`), so
-        // neither version-bound direction can name the blocker. The unique package whose edge reaches
-        // the held transitive is named as the best-effort structural blocker.
-        let lock = UvLock::parse(indoc! {r#"
-            version = 1
-            revision = 3
-
-            [[package]]
-            name = "huggingface-hub"
-            version = "1.18.0"
-            source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
-
-            [[package]]
-            name = "typer"
-            version = "0.25.1"
-            source = { registry = "https://pypi.org/simple" }
-        "#})
-        .expect("lock parses");
-        assert_eq!(
-            blocking_requirer(&lock, "typer", "0.26.7"),
-            Some("huggingface-hub".to_string())
-        );
-    }
-
-    #[test]
-    fn blocking_requirer_is_generic_when_multiple_edges_make_blame_ambiguous() {
-        // Two packages pull the held transitive via resolved edges and neither carries a nameable
-        // bound: blame is ambiguous, so no blocker is named and the caller keeps the generic message.
-        let lock = UvLock::parse(indoc! {r#"
-            version = 1
-            revision = 3
-
-            [[package]]
-            name = "alpha"
-            version = "1.0.0"
-            source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
-
-            [[package]]
-            name = "beta"
-            version = "1.0.0"
-            source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
-
-            [[package]]
-            name = "typer"
-            version = "0.25.1"
-            source = { registry = "https://pypi.org/simple" }
-        "#})
-        .expect("lock parses");
-        assert_eq!(blocking_requirer(&lock, "typer", "0.26.7"), None);
     }
 
     #[test]

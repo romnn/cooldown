@@ -113,6 +113,39 @@ By default `upgrade` moves the **whole graph**: it advances each dependency — 
 - **`--transitive hide`** — plan direct dependencies only. A re-lock can still move transitives; such moves stay visible as collateral rows.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
 
+## Held candidates
+
+A candidate the whole-graph resolve could not land is reported `skipped`, and its **Reason** says
+which of two things happened, because the way forward differs:
+
+- `graph_ceiling_held` — the resolve **succeeded** and kept the candidate below its target:
+  another package's requirement caps it there, and moving it would regress that package. The row
+  names the capping package with the requirement it declares when cooldown can read it (`held:
+  conflicts with docling-ibm-models 3.14.0, which requires transformers<5.9.0,>=4.42.0 on
+  sys_platform == "darwin"`). uv reads a workspace source's requirement from the lock and a
+  registry package's from the release's PyPI metadata, since a modern `uv.lock` records only the
+  resolved edge for those, so a cap two packages share is still attributed. When one of the
+  capping package's next releases lifts the cap, the row says which and where it stands against
+  the window (`; the cap lifts in docling-ibm-models 4.0.0 (published 2026-09-03, in cooldown
+  until about 2026-09-17)`), so a hold that only waits on another package's cooldown reads as
+  such. A cap the candidate's own target creates — its release requires a sibling under a range
+  the locked sibling violates — names the sibling instead (`held: conflicts with openai 3.1.2:
+  litellm 1.91.5 requires openai>=2.20.0,<3.0.0`). When no requirement can be read, the row
+  names the sole package whose edge reaches the candidate (`held: conflicts with
+  huggingface-hub`), or says `held: another package's requirement caps it below the target`.
+  Wait for the capping package to mature, or move it; the candidate itself is not the thing to
+  force.
+- `resolver_conflict` — the resolve **failed** with this candidate in it, and cooldown isolated
+  it and applied the rest. The row carries the resolver's own explanation from its failure
+  sentence on, folded onto one line (`the resolver rejected this change: No solution found when
+  resolving dependencies … Because litellm==1.91.5 depends on openai>=2.20.0,<3.0.0 and your
+  project depends on litellm==1.91.5, we can conclude that … your project's requirements are
+  unsatisfiable.`), so the requirement that conflicts and who declares it are on the row. This
+  usually means a constraint you own excludes the candidate: change it, or keep the hold.
+
+Both fail a `--strict` run. `outdated` reports the same rows as `blocked`, with the same sentence
+in `blockedReason` and under `--why`.
+
 ## Lock edge bindings (cargo)
 
 A `Cargo.lock` records not only which versions exist but which coexisting version each dependent's

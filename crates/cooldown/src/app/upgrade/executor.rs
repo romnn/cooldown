@@ -2421,10 +2421,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// skip, naming the package that blocks it via [`conflict_skip_message`].
     fn add_batch_skips(&self, outcome: &mut BatchOutcome, skipped: Vec<cooldown_core::Skipped>) {
         for skipped in skipped {
-            // Self-blame (the adapters' generic "resolver rejected" form) must be dropped on the
-            // package identity, before labeling: a registry suffix on the label ("… from
-            // proxy.golang.org") would defeat [`conflict_skip_message`]'s name-based self check and
-            // render "held: conflicts with <itself>".
+            // Self-blame (a ceiling whose capping package the adapter could not name, or a
+            // rejection with nothing to blame) must be dropped on the package identity, before
+            // labeling: a registry suffix on the label ("… from proxy.golang.org") would defeat
+            // [`conflict_skip_message`]'s name-based self check and render "held: conflicts with
+            // <itself>".
             let offending = skipped
                 .offending
                 .filter(|package| *package != skipped.change.package)
@@ -3008,7 +3009,7 @@ fn verify_applied_targets(
         }
 
         if skipped_keys.insert(key) {
-            verified.skipped.push(resolver_conflict(&change));
+            verified.skipped.push(unreached_target_hold(&change));
         }
     }
     verified
@@ -3042,10 +3043,13 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
         .any(|dep| dep.package == change.package && dep.current == change.to)
 }
 
-fn resolver_conflict(change: &Change) -> Skipped {
+/// The hold for a candidate the adapter reported applied whose target the post-apply graph does
+/// not hold: the resolve ran, so the graph capped the candidate short of it rather than rejecting
+/// it, and no requirer can be named from here.
+fn unreached_target_hold(change: &Change) -> Skipped {
     Skipped {
         change: change.clone(),
-        reason: SkipReason::ResolverConflict,
+        reason: SkipReason::GraphCeilingHeld,
         offending: Some(change.package.clone()),
         detail: None,
     }

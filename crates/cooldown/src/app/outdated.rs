@@ -876,8 +876,8 @@ fn held_key_for_upgrade(item: &UpgradeItem) -> ChangeTargetKey {
 }
 
 /// What the preview's skip row says about one held candidate: the named blocker (`None` when the
-/// row blames itself — the generic "resolver rejected" form) and the row's own message, which is
-/// the reason `upgrade` would print.
+/// row blames itself, a ceiling or rejection nothing could be pinned on) and the row's own
+/// message, which is the reason `upgrade` would print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockedVerdict {
     blocker: Option<String>,

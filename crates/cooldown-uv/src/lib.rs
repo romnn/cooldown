@@ -6,10 +6,12 @@
 mod ambient;
 mod artifact;
 mod build_requires;
+mod ceiling;
 pub mod lock;
 mod manifest;
 mod native;
 pub mod pypi;
+mod requirement;
 pub mod tool;
 pub mod uvcmd;
 pub mod version;

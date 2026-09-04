@@ -156,37 +156,19 @@ fn set_string_preserving_decor(value: &mut Value, new: String) {
 /// any extras, and a trailing environment marker. Returns `None` when there is no version specifier
 /// to widen (a bare name or a path/URL source).
 fn bump_requirement(requirement: &str, target: &str) -> Option<String> {
-    let (head, marker) = match requirement.split_once(';') {
-        Some((head, marker)) => (head, Some(marker.trim())),
-        None => (requirement, None),
-    };
-    let head = head.trim();
-    let name_end =
-        head.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))?;
-    let (name, after_name) = head.split_at(name_end);
-    if name.is_empty() {
-        return None; // a specifier with no package name is not a rewritable requirement
-    }
-    let after_name = after_name.trim_start();
-    let (extras, after_extras) = match after_name.strip_prefix('[') {
-        Some(rest) => {
-            let (inside, tail) = rest.split_once(']')?;
-            (Some(inside), tail.trim_start())
-        }
-        None => (None, after_name),
-    };
-    let specifier = after_extras.trim();
-    if specifier.is_empty() {
+    // A specifier with no package name is not a rewritable requirement.
+    let parsed = crate::requirement::parse(requirement)?;
+    if parsed.specifier.is_empty() {
         return None; // bare name / path source: no version specifier to widen
     }
-    let mut rewritten = name.to_string();
-    if let Some(extras) = extras {
+    let mut rewritten = parsed.name.to_string();
+    if let Some(extras) = parsed.extras {
         rewritten.push('[');
         rewritten.push_str(extras);
         rewritten.push(']');
     }
-    rewritten.push_str(&bump_specifier(specifier, target));
-    if let Some(marker) = marker {
+    rewritten.push_str(&bump_specifier(parsed.specifier, target));
+    if let Some(marker) = parsed.marker {
         rewritten.push_str("; ");
         rewritten.push_str(marker);
     }

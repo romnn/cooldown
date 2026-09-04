@@ -1180,8 +1180,8 @@ fn members_overlap(change_members: &[MemberRef], dependent_members: &[String]) -
 /// whose peer
 /// choice excluded `held`.
 /// When blame is ambiguous (no peer-suffixed sibling, or several) it returns
-/// `None`, so the caller falls back to the generic "the resolver rejected this change" message — the
-/// same best-effort contract as uv's `unique_edge_requirer`.
+/// `None`, so the caller falls back to the unattributed graph-ceiling message — the same
+/// best-effort contract as uv's edge-based attribution.
 pub(crate) fn peer_conflict_blocker(lock: &str, held: &str) -> Option<String> {
     let mut blockers: BTreeSet<String> = BTreeSet::new();
     for name in pnpm_peer_suffixed_names(lock) {
