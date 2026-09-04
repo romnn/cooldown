@@ -1086,10 +1086,12 @@ fn report_graph_duplicates<L: NodeLock>(
         let copies = NewCopies::of(name, was, now, after_members, excluded, dependents);
         let described = format!("{name} {}: {}", copies.history(), copies.attribution());
         if let Some(gate) = single_copy.gate_of(name) {
-            let listed = single_copy.names.contains(name);
-            return Err(CoreError::UnacceptableResolve(
-                copies.refusal(name, gate, listed, &described),
-            ));
+            return Err(CoreError::UnacceptableResolve(copies.refusal(
+                name,
+                gate,
+                single_copy,
+                &described,
+            )));
         }
         if copies.undeclared.is_empty() && split_reported.contains(name) {
             continue;
@@ -1121,6 +1123,11 @@ struct NewCopies<'a> {
     /// with the importers and the requirers: lifting the exclusion alone would not converge them,
     /// so the refusal names the requirer instead of promising that it would.
     also_required: Vec<(&'a str, Vec<String>, Vec<String>)>,
+    /// Whether lifting the exclusion on `left_behind`'s importers would leave the name at one
+    /// copy: every other version after the run is a new one the included importers moved onto.
+    /// A stray a dependent retains, a version an excluded importer re-resolved onto, or a
+    /// standing split's other copies would all survive, so the refusal must not promise it.
+    converges_by_inclusion: bool,
 }
 
 impl<'a> NewCopies<'a> {
@@ -1143,30 +1150,37 @@ impl<'a> NewCopies<'a> {
             undeclared: Vec::new(),
             left_behind: Vec::new(),
             also_required: Vec::new(),
+            converges_by_inclusion: true,
         };
         for version in now {
             let new = !was.is_some_and(|was| was.contains(version));
+            let requirers = dependents
+                .get(&(name.to_string(), version.clone()))
+                .cloned()
+                .unwrap_or_default();
             if importer_held.contains(&version.as_str()) {
                 let holders = after_members.members_for(name, version);
-                if !holders.is_empty() && holders.iter().all(|member| excluded.contains(member)) {
-                    match dependents.get(&(name.to_string(), version.clone())) {
-                        Some(requirers) if !requirers.is_empty() => copies.also_required.push((
-                            version.as_str(),
-                            holders.clone(),
-                            requirers.clone(),
-                        )),
-                        _ => copies.left_behind.push((version.as_str(), holders.clone())),
-                    }
+                let only_excluded =
+                    !holders.is_empty() && holders.iter().all(|member| excluded.contains(member));
+                let left_behind = only_excluded && !new && requirers.is_empty();
+                // The copy the included importers moved onto is the one everything would
+                // converge on; any other version would survive lifting the exclusion.
+                copies.converges_by_inclusion &= left_behind || (new && !only_excluded);
+                if left_behind {
+                    copies.left_behind.push((version.as_str(), holders.clone()));
+                } else if only_excluded && !requirers.is_empty() {
+                    copies
+                        .also_required
+                        .push((version.as_str(), holders.clone(), requirers));
                 }
                 if new {
                     copies.held.push((version.as_str(), holders));
                 }
-            } else if new || was_count <= 1 {
-                let requirers = dependents
-                    .get(&(name.to_string(), version.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                copies.undeclared.push((version.as_str(), requirers));
+            } else {
+                copies.converges_by_inclusion = false;
+                if new || was_count <= 1 {
+                    copies.undeclared.push((version.as_str(), requirers));
+                }
             }
         }
         copies
@@ -1244,12 +1258,18 @@ impl<'a> NewCopies<'a> {
         }
     }
 
-    /// The refusal a gated name gets: a copy left only in an excluded importer names the two ways
-    /// out — dropping the gate, spelled for the one that fired (`listed` for the config listing,
-    /// else the flag), or lifting the exclusion — since that importer is never moved by the run
-    /// and the refusal would otherwise recur.
-    fn refusal(&self, name: &str, gate: &str, listed: bool, described: &str) -> String {
-        if !self.left_behind.is_empty() {
+    /// The refusal a gated name gets: a copy left only in an excluded importer, where lifting the
+    /// exclusion would converge the copies, names the two ways out — dropping every gate that
+    /// applies (the listing, the flag, or both), or lifting the exclusion — since that importer is
+    /// never moved by the run and the refusal would otherwise recur.
+    fn refusal(
+        &self,
+        name: &str,
+        gate: &str,
+        single_copy: &SingleCopyPolicy,
+        described: &str,
+    ) -> String {
+        if !self.left_behind.is_empty() && self.converges_by_inclusion {
             let left = self
                 .left_behind
                 .iter()
@@ -1263,10 +1283,14 @@ impl<'a> NewCopies<'a> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let drop_gate = if listed {
-                format!("drop {name} from the listing")
-            } else {
-                format!("run without {gate}")
+            let drop_gate = match (single_copy.names.contains(name), single_copy.every_name) {
+                (true, true) => {
+                    format!(
+                        "drop {name} from the listing and run without `--fail-on-new-duplicate`"
+                    )
+                }
+                (true, false) => format!("drop {name} from the listing"),
+                (false, _) => "run without `--fail-on-new-duplicate`".to_string(),
             };
             return format!(
                 "the resolve left an excluded importer on a second copy of {name}, which {gate} keeps single-copy: {described}, with {left} left behind; {drop_gate}, or bring {} into the run (lift its exclusion) so the copies converge",
@@ -6356,12 +6380,12 @@ mod whole_graph_tests {
     /// left-behind version, which the refusal names instead.
     #[tokio::test]
     async fn a_gated_name_left_in_an_excluded_importer_is_refused() -> eyre::Result<()> {
-        enum Case {
-            Listed,
-            Flag,
-            ListedButRequired,
-        }
-        for case in [Case::Listed, Case::Flag, Case::ListedButRequired] {
+        for case in [
+            Case::Listed,
+            Case::Flag,
+            Case::Both,
+            Case::ListedButRequired,
+        ] {
             let (_dir, root) = tempdir_root()?;
             let lock = mongoose_workspace(&root, "9.8.0")?;
             let mut app_only = moved(
@@ -6392,15 +6416,12 @@ mod whole_graph_tests {
                 "#},
             )?;
             let tool = tool_with(&script)?;
-            let flag = matches!(case, Case::Flag);
+            let (listed, flag) = case.gates();
             let plan = Plan {
                 changes: vec![change("mongoose", "9.8.0", "9.9.3", &[("app", "app")])],
                 excluded_members: vec![member("legacy", "legacy")],
                 single_copy: SingleCopyPolicy {
-                    names: (!flag)
-                        .then(|| "mongoose".to_string())
-                        .into_iter()
-                        .collect(),
+                    names: listed.then(|| "mongoose".to_string()).into_iter().collect(),
                     every_name: flag,
                 },
                 ..Plan::default()
@@ -6418,10 +6439,38 @@ mod whole_graph_tests {
                 "the importers on each side: {detail}"
             );
             // The excluded importer never moves, so the refusal would recur forever without a
-            // way out, spelled for the gate that fired; a copy another package requires gets the
-            // ordinary refusal naming that requirer, since lifting the exclusion would not
+            // way out, spelled for every gate that fired; a copy another package requires gets
+            // the ordinary refusal naming that requirer, since lifting the exclusion would not
             // converge it.
-            let (prefix, suffix) = match case {
+            let (prefix, suffix) = case.expectation();
+            assert!(detail.starts_with(prefix), "{detail}");
+            assert!(detail.ends_with(suffix), "{detail}");
+        }
+        Ok(())
+    }
+
+    /// The gate configurations and lock shapes of
+    /// [`a_gated_name_left_in_an_excluded_importer_is_refused`].
+    enum Case {
+        Listed,
+        Flag,
+        Both,
+        ListedButRequired,
+    }
+
+    impl Case {
+        /// `(listed, flag)`.
+        fn gates(&self) -> (bool, bool) {
+            match self {
+                Case::Listed | Case::ListedButRequired => (true, false),
+                Case::Flag => (false, true),
+                Case::Both => (true, true),
+            }
+        }
+
+        /// The refusal's `(prefix, suffix)`.
+        fn expectation(&self) -> (&'static str, &'static str) {
+            match self {
                 Case::Listed => (
                     "the resolve left an excluded importer on a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: ",
                     "; drop mongoose from the listing, or bring legacy into the run (lift its exclusion) so the copies converge",
@@ -6430,13 +6479,190 @@ mod whole_graph_tests {
                     "the resolve left an excluded importer on a second copy of mongoose, which `--fail-on-new-duplicate` keeps single-copy: ",
                     "; run without `--fail-on-new-duplicate`, or bring legacy into the run (lift its exclusion) so the copies converge",
                 ),
+                Case::Both => (
+                    "the resolve left an excluded importer on a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: ",
+                    "; drop mongoose from the listing and run without `--fail-on-new-duplicate`, or bring legacy into the run (lift its exclusion) so the copies converge",
+                ),
                 Case::ListedButRequired => (
                     "the resolve added a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: ",
                     "; 9.8.0 in legacy is also required by legacy-tool@1.0.0",
                 ),
+            }
+        }
+    }
+
+    /// The way out through the exclusion is promised only when lifting it would leave one copy:
+    /// not beside a standing split whose other copy a dependent still requires, which gets the
+    /// ordinary refusal with that requirer named.
+    #[tokio::test]
+    async fn a_left_behind_copy_beside_a_standing_split_promises_nothing() -> eyre::Result<()> {
+        // A standing split: `legacy-a` at 1.0.0, `legacy-b` and `app` at 2.0.0; `app` moves to
+        // 2.5.0 while `bar@1.0.0` keeps requiring 2.0.0.
+        {
+            let (_dir, root) = tempdir_root()?;
+            let lock = workspace(
+                &root,
+                &[
+                    Importer {
+                        path: "app",
+                        name: "app",
+                        deps: vec![("stateful", "^2.0.0", "2.0.0"), ("bar", "^1.0.0", "1.0.0")],
+                    },
+                    Importer {
+                        path: "legacy-a",
+                        name: "legacy-a",
+                        deps: vec![("stateful", "^1.0.0", "1.0.0")],
+                    },
+                    Importer {
+                        path: "legacy-b",
+                        name: "legacy-b",
+                        deps: vec![("stateful", "^2.0.0", "2.0.0")],
+                    },
+                ],
+            )?;
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            let mut settled = moved(
+                &lock,
+                "app",
+                "stateful",
+                ("^2.0.0", "2.0.0"),
+                ("^2.0.0", "2.5.0"),
+            );
+            settled.push_str(&package_entry("stateful", "2.0.0"));
+            settled.push_str(indoc! {"
+
+                snapshots:
+
+                  bar@1.0.0:
+                    dependencies:
+                      stateful: 2.0.0
+            "});
+            std::fs::write(root.join("settled.yaml"), settled)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *" update "*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = Plan {
+                changes: vec![change("stateful", "2.0.0", "2.5.0", &[("app", "app")])],
+                excluded_members: vec![
+                    member("legacy-a", "legacy-a"),
+                    member("legacy-b", "legacy-b"),
+                ],
+                single_copy: SingleCopyPolicy {
+                    names: ["stateful".to_string()].into_iter().collect(),
+                    every_name: false,
+                },
+                ..Plan::default()
             };
-            assert!(detail.starts_with(prefix), "{detail}");
-            assert!(detail.ends_with(suffix), "{detail}");
+
+            let outcome = apply(&tool, &project(&root), plan).await;
+
+            let Err(CoreError::UnacceptableResolve(detail)) = outcome else {
+                panic!("a third copy beside a standing split is refused: {outcome:?}");
+            };
+            assert!(
+                detail.starts_with(
+                    "the resolve added another copy of stateful, which `[tool.pnpm] single-copy` keeps single-copy: "
+                ),
+                "{detail}"
+            );
+            assert!(
+                detail.ends_with("; 2.0.0 in legacy-b is also required by bar@1.0.0")
+                    && !detail.contains("left behind"),
+                "{detail}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An excluded importer that re-resolved onto the new copy within its range is not "left
+    /// behind": only the excluded `legacy` declares `stateful`, upgrading `bar` in `app` lets
+    /// pnpm move `legacy`'s copy from 1.0.0 to 1.1.0 (an accepted excluded move) while
+    /// `bar@1.1.0` keeps requiring 1.0.0, so the refusal attributes both copies and promises
+    /// nothing about the exclusion.
+    #[tokio::test]
+    async fn an_excluded_importer_on_the_new_copy_is_not_left_behind() -> eyre::Result<()> {
+        {
+            let (_dir, root) = tempdir_root()?;
+            let lock = workspace(
+                &root,
+                &[
+                    Importer {
+                        path: "app",
+                        name: "app",
+                        deps: vec![("bar", "^1.0.0", "1.0.0")],
+                    },
+                    Importer {
+                        path: "legacy",
+                        name: "legacy",
+                        deps: vec![("stateful", "^1.0.0", "1.0.0")],
+                    },
+                ],
+            )?;
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            let moved_bar = moved(
+                &lock,
+                "app",
+                "bar",
+                ("^1.0.0", "1.0.0"),
+                ("^1.0.0", "1.1.0"),
+            );
+            let mut settled = moved(
+                &moved_bar,
+                "legacy",
+                "stateful",
+                ("^1.0.0", "1.0.0"),
+                ("^1.0.0", "1.1.0"),
+            );
+            settled.push_str(&package_entry("stateful", "1.0.0"));
+            settled.push_str(indoc! {"
+
+                snapshots:
+
+                  bar@1.1.0:
+                    dependencies:
+                      stateful: 1.0.0
+            "});
+            std::fs::write(root.join("settled.yaml"), settled)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *" update "*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = Plan {
+                changes: vec![change("bar", "1.0.0", "1.1.0", &[("app", "app")])],
+                excluded_members: vec![member("legacy", "legacy")],
+                single_copy: SingleCopyPolicy {
+                    names: ["stateful".to_string()].into_iter().collect(),
+                    every_name: false,
+                },
+                ..Plan::default()
+            };
+
+            let outcome = apply(&tool, &project(&root), plan).await;
+
+            let Err(CoreError::UnacceptableResolve(detail)) = outcome else {
+                panic!("a gated name at two copies is refused: {outcome:?}");
+            };
+            assert!(
+                detail.starts_with(
+                    "the resolve added a second copy of stateful, which `[tool.pnpm] single-copy` keeps single-copy: "
+                ),
+                "{detail}"
+            );
+            assert!(
+                detail.ends_with(
+                    "held by an importer: 1.1.0 in legacy; a copy no importer declares, required at 1.0.0 by bar@1.1.0"
+                ) && !detail.contains("left behind"),
+                "{detail}"
+            );
         }
         Ok(())
     }
