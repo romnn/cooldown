@@ -291,7 +291,7 @@ impl Workspace {
                 &writer.resolve_inputs(),
                 &writer.external_resolve_roots(&pctx.project),
             )
-            .map(PreparedPreview::Generic),
+            .map(|copy| PreparedPreview::Generic(Box::new(copy))),
             MutationExecution::Isolated(strategy) => strategy
                 .prepare(&pctx.project, guard.coordination())
                 .await
@@ -541,7 +541,8 @@ impl IsolatedAccessGuard {
 }
 
 enum PreparedPreview {
-    Generic(super::project_copy::ProjectCopy),
+    // Boxed: the copy carries its rebase and spelling, far larger than the isolated stage's handle.
+    Generic(Box<super::project_copy::ProjectCopy>),
     Isolated(Box<dyn IsolatedMutation>),
 }
 
