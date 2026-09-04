@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Ecosystems run in parallel.** `outdated`, `check`, `upgrade`, `fix`, and `baseline` drove
+  every project one after another, so a polyglot repository waited on crates.io, then PyPI, then
+  the npm registry in turn. Each detected tool now runs in its own lane and the lanes run
+  concurrently, whether the tools live in different directories or share one; a lane's own
+  projects still run in order, since concurrent invocations of one package manager block on its
+  own cache lock. Only tools that rewrite the same manifest take turns under `upgrade`, `fix`,
+  or `--lock`: uv and poetry both own `pyproject.toml` and every npm-family tool owns
+  `package.json`, so two of them at one root, or one nested in the other's workspace, run in
+  turn (`--dry-run` mutates a throwaway copy and reads side by side too). To make that true the
+  lease that serializes cooldown runs on a project is now held per manifest family rather than
+  per directory, so a cargo run and a uv run at one root never wait on each other, in one
+  process or two, while uv and poetry still do. Each adapter declares the file its lease
+  guards, so pixi, which is detected by `pixi.lock`, takes turns with uv and poetry when its
+  tables live in `pyproject.toml`. The lease file is now named for the directory and the
+  family, so a cooldown older than this release does not see this release's leases, nor the
+  reverse: do not run the two side by side in one repository. `--build` steps run one at a
+  time across ecosystems, in this process and against other cooldown processes at the same
+  directory, since every ecosystem installs into the environment shared there (`node_modules`,
+  `.venv`); so do the upgrades of tools whose native command installs as it pins (`poetry add`,
+  `conda install`, `bundle update`, `mix deps.update`, `swift package update`). `--jobs <N>` (config `jobs`, `COOLDOWN_JOBS`)
+  caps how many tools run at once; `--jobs 1` runs them one after another. Reports, their
+  order, and the exit code are unchanged (`baseline` now evaluates every project before
+  reporting a failing one). The interactive progress display shows one block per live tool,
+  and the plain transcript names the tool and project on every per-project line.
+
 - **`explain <pkg>` explains the decision, not only the window.** `explain` printed the
   min-age layer table and nothing else, so four packages blocked for four different reasons
   produced byte-identical output, and the only way to learn why one was blocked was a full

@@ -59,6 +59,7 @@ See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder a
 | `--offline` | Cache only; a cache miss becomes `unknown-age`, never a false "ok". |
 | `--fresh` | Ignore the local cache and always hit the registry (alias `--no-cache`; use in CI gates). |
 | `--concurrency <N>` | Registry request fan-out width and per-host in-flight cap (default `16`). |
+| `--jobs <N>` | How many ecosystems run at once (default: every detected tool in its own lane; `1` runs them one after another). |
 | `--allow-stale-lock` | Demote a stale/absent lock to a warning and skip that project's dependency evaluation. |
 
 ## Config layers
@@ -96,6 +97,7 @@ Several flags mirror an environment variable, so CI can set policy once:
 | `COOLDOWN_DRY_RUN` | `--dry-run` |
 | `COOLDOWN_OFFLINE` | `--offline` |
 | `COOLDOWN_CONCURRENCY` | `--concurrency` |
+| `COOLDOWN_JOBS` | `--jobs` |
 | `COOLDOWN_ALLOW_STALE_LOCK` | `--allow-stale-lock` |
 | `COOLDOWN_ADVISORIES` | `--advisories` / `--no-advisories` |
 | `COOLDOWN_ADVISORY_MIN_AGE` | `--advisory-min-age` |
