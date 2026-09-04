@@ -40,7 +40,8 @@
   and when the name was absent before the run and arrives at two copies at once, held by
   dependents or by importers. A listed name already at several copies before the run has that
   standing split reported rather than refused, since no candidate introduced it; a copy a run adds
-  beside it is refused like any other. `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for
+  beside it is refused like any other, and a copy that merely moves to another version is not,
+  since the count of distinct copies is what the gate judges. `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for
   a run without naming any, and says so when the run's tool has no settlement guard to honor it.
   The list merges across config files like `exclude-folders` (a plain array adds, `[]` clears,
   `{ replace = […] }` replaces), so a nested workspace listing one runtime of its own cannot

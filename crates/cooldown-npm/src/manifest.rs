@@ -62,7 +62,7 @@ pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>>
     let content = match std::fs::read_to_string(manifest) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(CoreError::Filesystem(format!("{manifest}: {e}"))),
     };
     let doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
@@ -224,7 +224,7 @@ pub fn member_declaration(
     let content = match std::fs::read_to_string(&manifest) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(CoreError::Filesystem(format!("{manifest}: {e}"))),
     };
     let doc: Value =
         serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;

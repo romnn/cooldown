@@ -44,10 +44,11 @@ A second copy a dependent's own requirement pulls into the graph is ordinarily c
 reported as a `duplicate_copy` warning. For a listed name the settlement is refused instead: the
 lock is restored and the candidate whose landing added the copy is held with the copy and its
 requirer named (see [upgrade]({{< relref "../commands/upgrade.md" >}}#whole-workspace-landings-pnpm)).
-The gate judges what a resolve *adds*: a listed name the graph held at one copy (or not at all)
-before the run and at several after it, whether the copies are a dependent's own requirement or
-two importers' own entries, and a copy no importer declares that arrives beside a split the graph
-already had. A listed name that is *already* at several copies before a run has that standing
+The gate judges what a resolve *adds*, counted as distinct resolved versions: a listed name the
+graph held at one copy (or not at all) before the run and at several after it, or one already
+split that gains another — whether the new copy is a dependent's own requirement or an importer's
+own entry. A copy that merely moves to another version leaves the count alone and is not refused.
+A listed name that is *already* at several copies before a run has that standing
 split reported (as a `duplicate_copy` warning) rather than refused — refusing would hold every
 upgrade forever — so converge it for the listing to hold. A `--lock` refresh (`check --lock`,
 `outdated --lock`) is pnpm's own `install --lockfile-only` against the manifests as written and is
