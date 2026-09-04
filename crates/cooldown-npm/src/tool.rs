@@ -1086,8 +1086,9 @@ fn report_graph_duplicates<L: NodeLock>(
         let copies = NewCopies::of(name, was, now, after_members, excluded, dependents);
         let described = format!("{name} {}: {}", copies.history(), copies.attribution());
         if let Some(gate) = single_copy.gate_of(name) {
+            let listed = single_copy.names.contains(name);
             return Err(CoreError::UnacceptableResolve(
-                copies.refusal(name, gate, &described),
+                copies.refusal(name, gate, listed, &described),
             ));
         }
         if copies.undeclared.is_empty() && split_reported.contains(name) {
@@ -1113,9 +1114,13 @@ struct NewCopies<'a> {
     /// graph had at most one version before, the one the importers left behind — with the
     /// packages whose own requirement binds each.
     undeclared: Vec<(&'a str, Vec<String>)>,
-    /// The versions held only by importers the run excludes, with those importers: an exclusion
-    /// asked for them to stay, so a refusal names the way out.
+    /// The versions held only by importers the run excludes and required by no other package,
+    /// with those importers: an exclusion asked for them to stay, so a refusal names the way out.
     left_behind: Vec<(&'a str, Vec<String>)>,
+    /// The versions held only by excluded importers that a package's own requirement also binds,
+    /// with the importers and the requirers: lifting the exclusion alone would not converge them,
+    /// so the refusal names the requirer instead of promising that it would.
+    also_required: Vec<(&'a str, Vec<String>, Vec<String>)>,
 }
 
 impl<'a> NewCopies<'a> {
@@ -1137,13 +1142,21 @@ impl<'a> NewCopies<'a> {
             held: Vec::new(),
             undeclared: Vec::new(),
             left_behind: Vec::new(),
+            also_required: Vec::new(),
         };
         for version in now {
             let new = !was.is_some_and(|was| was.contains(version));
             if importer_held.contains(&version.as_str()) {
                 let holders = after_members.members_for(name, version);
                 if !holders.is_empty() && holders.iter().all(|member| excluded.contains(member)) {
-                    copies.left_behind.push((version.as_str(), holders.clone()));
+                    match dependents.get(&(name.to_string(), version.clone())) {
+                        Some(requirers) if !requirers.is_empty() => copies.also_required.push((
+                            version.as_str(),
+                            holders.clone(),
+                            requirers.clone(),
+                        )),
+                        _ => copies.left_behind.push((version.as_str(), holders.clone())),
+                    }
                 }
                 if new {
                     copies.held.push((version.as_str(), holders));
@@ -1206,18 +1219,36 @@ impl<'a> NewCopies<'a> {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        match (held.is_empty(), undeclared.is_empty()) {
+        let copies = match (held.is_empty(), undeclared.is_empty()) {
             (false, true) => format!("held by an importer: {held}"),
             (true, _) => format!("a copy no importer declares, {undeclared}"),
             (false, false) => {
                 format!("held by an importer: {held}; a copy no importer declares, {undeclared}")
             }
+        };
+        let also_required = self
+            .also_required
+            .iter()
+            .map(|(version, holders, requirers)| {
+                format!(
+                    "{version} in {} is also required by {}",
+                    list_members(holders),
+                    list_members(requirers)
+                )
+            })
+            .collect::<Vec<_>>();
+        if also_required.is_empty() {
+            copies
+        } else {
+            format!("{copies}; {}", also_required.join("; "))
         }
     }
 
     /// The refusal a gated name gets: a copy left only in an excluded importer names the two ways
-    /// out, since that importer is never moved by the run and the refusal would otherwise recur.
-    fn refusal(&self, name: &str, gate: &str, described: &str) -> String {
+    /// out — dropping the gate, spelled for the one that fired (`listed` for the config listing,
+    /// else the flag), or lifting the exclusion — since that importer is never moved by the run
+    /// and the refusal would otherwise recur.
+    fn refusal(&self, name: &str, gate: &str, listed: bool, described: &str) -> String {
         if !self.left_behind.is_empty() {
             let left = self
                 .left_behind
@@ -1232,8 +1263,13 @@ impl<'a> NewCopies<'a> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
+            let drop_gate = if listed {
+                format!("drop {name} from the listing")
+            } else {
+                format!("run without {gate}")
+            };
             return format!(
-                "the resolve left an excluded importer on a second copy of {name}, which {gate} keeps single-copy: {described}, with {left} left behind; drop {name} from the listing, or bring {} into the run (lift its exclusion) so the copies converge",
+                "the resolve left an excluded importer on a second copy of {name}, which {gate} keeps single-copy: {described}, with {left} left behind; {drop_gate}, or bring {} into the run (lift its exclusion) so the copies converge",
                 list_members(&importers)
             );
         }
@@ -6315,61 +6351,93 @@ mod whole_graph_tests {
 
     /// A gated name is refused even when the second copy is the one an exclusion asked for: the
     /// excluded importer left on the old version is still a second copy in the lock the workspace
-    /// installs.
+    /// installs. The way out is spelled for the gate that fired, and only promised when lifting
+    /// the exclusion would converge the copies — not while another package still requires the
+    /// left-behind version, which the refusal names instead.
     #[tokio::test]
     async fn a_gated_name_left_in_an_excluded_importer_is_refused() -> eyre::Result<()> {
-        let (_dir, root) = tempdir_root()?;
-        let lock = mongoose_workspace(&root, "9.8.0")?;
-        let app_only = moved(
-            &lock,
-            "app",
-            "mongoose",
-            ("^9.8.0", "9.8.0"),
-            ("^9.8.0", "9.9.3"),
-        );
-        std::fs::write(root.join("app-only.yaml"), app_only)?;
-        let script = fake_pnpm(
-            &root,
-            indoc! {r#"
-                  *"--filter ./app --fail-if-no-match"*)
-                    cp app-only.yaml pnpm-lock.yaml; exit 0 ;;
-            "#},
-        )?;
-        let tool = tool_with(&script)?;
-        let plan = Plan {
-            changes: vec![change("mongoose", "9.8.0", "9.9.3", &[("app", "app")])],
-            excluded_members: vec![member("legacy", "legacy")],
-            single_copy: SingleCopyPolicy {
-                names: ["mongoose".to_string()].into_iter().collect(),
-                every_name: false,
-            },
-            ..Plan::default()
-        };
+        enum Case {
+            Listed,
+            Flag,
+            ListedButRequired,
+        }
+        for case in [Case::Listed, Case::Flag, Case::ListedButRequired] {
+            let (_dir, root) = tempdir_root()?;
+            let lock = mongoose_workspace(&root, "9.8.0")?;
+            let mut app_only = moved(
+                &lock,
+                "app",
+                "mongoose",
+                ("^9.8.0", "9.8.0"),
+                ("^9.8.0", "9.9.3"),
+            );
+            if matches!(case, Case::ListedButRequired) {
+                // `legacy-tool@1.0.0` requires the version the excluded importer was left on.
+                app_only.push_str(&package_entry("legacy-tool", "1.0.0"));
+                app_only.push_str(indoc! {"
 
-        let error = apply(&tool, &project(&root), plan)
-            .await
-            .expect_err("a gated name split by an exclusion must not be committed");
+                    snapshots:
 
-        let CoreError::UnacceptableResolve(detail) = error else {
-            panic!("a gated split is a non-local rejection for candidate isolation: {error:?}");
-        };
-        assert!(
-            detail.starts_with(
-                "the resolve left an excluded importer on a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: "
-            ),
-            "{detail}"
-        );
-        assert!(
-            detail.contains("9.8.0 in legacy") && detail.contains("9.9.3 in app"),
-            "the importers on each side: {detail}"
-        );
-        // The excluded importer never moves, so the refusal would recur forever without a way out.
-        assert!(
-            detail.ends_with(
-                "; drop mongoose from the listing, or bring legacy into the run (lift its exclusion) so the copies converge"
-            ),
-            "{detail}"
-        );
+                      legacy-tool@1.0.0:
+                        dependencies:
+                          mongoose: 9.8.0
+                "});
+            }
+            std::fs::write(root.join("app-only.yaml"), app_only)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *"--filter ./app --fail-if-no-match"*)
+                        cp app-only.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let flag = matches!(case, Case::Flag);
+            let plan = Plan {
+                changes: vec![change("mongoose", "9.8.0", "9.9.3", &[("app", "app")])],
+                excluded_members: vec![member("legacy", "legacy")],
+                single_copy: SingleCopyPolicy {
+                    names: (!flag)
+                        .then(|| "mongoose".to_string())
+                        .into_iter()
+                        .collect(),
+                    every_name: flag,
+                },
+                ..Plan::default()
+            };
+
+            let error = apply(&tool, &project(&root), plan)
+                .await
+                .expect_err("a gated name split by an exclusion must not be committed");
+
+            let CoreError::UnacceptableResolve(detail) = error else {
+                panic!("a gated split is a non-local rejection for candidate isolation: {error:?}");
+            };
+            assert!(
+                detail.contains("9.8.0 in legacy") && detail.contains("9.9.3 in app"),
+                "the importers on each side: {detail}"
+            );
+            // The excluded importer never moves, so the refusal would recur forever without a
+            // way out, spelled for the gate that fired; a copy another package requires gets the
+            // ordinary refusal naming that requirer, since lifting the exclusion would not
+            // converge it.
+            let (prefix, suffix) = match case {
+                Case::Listed => (
+                    "the resolve left an excluded importer on a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: ",
+                    "; drop mongoose from the listing, or bring legacy into the run (lift its exclusion) so the copies converge",
+                ),
+                Case::Flag => (
+                    "the resolve left an excluded importer on a second copy of mongoose, which `--fail-on-new-duplicate` keeps single-copy: ",
+                    "; run without `--fail-on-new-duplicate`, or bring legacy into the run (lift its exclusion) so the copies converge",
+                ),
+                Case::ListedButRequired => (
+                    "the resolve added a second copy of mongoose, which `[tool.pnpm] single-copy` keeps single-copy: ",
+                    "; 9.8.0 in legacy is also required by legacy-tool@1.0.0",
+                ),
+            };
+            assert!(detail.starts_with(prefix), "{detail}");
+            assert!(detail.ends_with(suffix), "{detail}");
+        }
         Ok(())
     }
 
