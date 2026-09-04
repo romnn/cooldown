@@ -35,6 +35,11 @@ pub(crate) struct ProjectCopy {
     /// How real-tree paths map into the scratch tree, kept so a report can spell the copy's
     /// paths as the source's.
     rebase: StagedRebase,
+    /// What the scratch root is spelled as in a report: the project root exactly as the run
+    /// spells it when nothing is staged above it, since the canonical form the rebase needs can
+    /// differ (`/var` vs `/private/var`) from the path the reader passed and every other row
+    /// shows; the staging ancestor otherwise.
+    source_spelling: camino::Utf8PathBuf,
 }
 
 impl ProjectCopy {
@@ -91,6 +96,11 @@ impl ProjectCopy {
         // target's copy-relative position.
         let ancestor = staging_ancestor(&canonical_root, external_roots)
             .unwrap_or_else(|| canonical_root.clone());
+        let source_spelling = if ancestor == canonical_root {
+            project.root.clone()
+        } else {
+            ancestor.clone()
+        };
         let rebase = StagedRebase {
             ancestor,
             scratch_root,
@@ -137,14 +147,16 @@ impl ProjectCopy {
             scratch,
             project: copied,
             rebase,
+            source_spelling,
         })
     }
 
-    /// The scratch tree and the source ancestor it was staged from: a path under the copy — the
-    /// project's own or a staged sibling's (an out-of-tree path dependency) — is the source path at
-    /// the same offset from the ancestor.
+    /// The scratch tree and what to spell it as in a report: a path under the copy — the
+    /// project's own or a staged sibling's (an out-of-tree path dependency) — is the source path
+    /// at the same offset from the ancestor, spelled as the run spells the project root when
+    /// nothing is staged above it.
     pub(crate) fn relabel_roots(&self) -> (&camino::Utf8Path, &camino::Utf8Path) {
-        (&self.rebase.scratch_root, &self.rebase.ancestor)
+        (&self.rebase.scratch_root, &self.source_spelling)
     }
 }
 

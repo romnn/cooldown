@@ -470,9 +470,12 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
     if copy == source {
         return;
     }
+    // A filesystem-root source (a staging ancestor of `/`) would otherwise double the separator
+    // that follows the copy root in every path.
+    let source = source.as_str().trim_end_matches(std::path::MAIN_SEPARATOR);
     let relabel = |text: &mut String| {
         if text.contains(copy.as_str()) {
-            *text = replace_path_prefix(text, copy.as_str(), source.as_str());
+            *text = replace_path_prefix(text, copy.as_str(), source);
         }
     };
     let relabel_diag = |diag: &mut Diagnostic| {
@@ -501,7 +504,7 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
 /// `text` with every occurrence of the path `from` that ends at a path boundary (the end of the
 /// text, a separator, or punctuation) replaced by `to`; `from` followed by more of a file name is
 /// a different path and stays. A period is a boundary only when it ends a sentence (followed by
-/// whitespace or the end), since `copy.bak` is another file name.
+/// nothing, whitespace, or punctuation), since `copy.bak` is another file name.
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -509,9 +512,10 @@ fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
         let (before, tail) = rest.split_at(at);
         let (matched, after) = tail.split_at(from.len());
         let mut following = after.chars();
+        let file_name_char = |next: char| next.is_alphanumeric() || matches!(next, '-' | '_' | '.');
         let boundary = match following.next() {
             None => true,
-            Some('.') => following.next().is_none_or(char::is_whitespace),
+            Some('.') => following.next().is_none_or(|next| !file_name_char(next)),
             Some(next) => !(next.is_alphanumeric() || matches!(next, '-' | '_')),
         };
         out.push_str(before);
@@ -914,15 +918,29 @@ mod relabel_tests {
             replace_path_prefix(text, "/tmp/copy", "/repo/svc"),
             "Cargo.lock is stale in /repo/svc; see /repo/svc/Cargo.toml (not /tmp/copy-2/x)"
         );
-        // A sentence-ending period is a boundary; a dotted suffix is another file name.
+        // A sentence-ending period is a boundary, before whitespace, the end, or punctuation; a
+        // dotted suffix is another file name.
         assert_eq!(
             replace_path_prefix(
-                "resolved in /tmp/copy. kept /tmp/copy.bak",
+                "resolved in /tmp/copy. kept /tmp/copy.bak (see /tmp/copy.)",
                 "/tmp/copy",
                 "/repo"
             ),
-            "resolved in /repo. kept /tmp/copy.bak"
+            "resolved in /repo. kept /tmp/copy.bak (see /repo.)"
         );
+    }
+
+    /// A staging ancestor of `/` spells the copy root as nothing, so the separator that follows
+    /// is not doubled.
+    #[test]
+    fn a_filesystem_root_source_does_not_double_the_separator() {
+        let mut acc = UpgradeAccum::default();
+        acc.errors.push(Diagnostic::new(
+            DiagnosticKind::StaleLock,
+            "uv.lock is stale in /tmp/copy/app",
+        ));
+        relabel_copy_paths(&mut acc, Utf8Path::new("/tmp/copy"), Utf8Path::new("/"));
+        assert_eq!(acc.errors[0].message, "uv.lock is stale in /app");
     }
 
     /// Every field a copy run can publish a path into is relabeled: a diagnostic's message and
