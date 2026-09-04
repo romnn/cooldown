@@ -1302,8 +1302,21 @@ impl<'a> NewCopies<'a> {
         } else {
             "a second"
         };
+        // Without the promise, the copy an exclusion left in place is still named: the importer
+        // guard's warning that would have named it is discarded with the refused settlement.
+        let left = self
+            .left_behind
+            .iter()
+            .map(|(version, members)| {
+                format!(
+                    "; {version} in {} left behind by its exclusion",
+                    list_members(members)
+                )
+            })
+            .collect::<Vec<_>>()
+            .concat();
         format!(
-            "the resolve added {which} copy of {name}, which {gate} keeps single-copy: {described}"
+            "the resolve added {which} copy of {name}, which {gate} keeps single-copy: {described}{left}"
         )
     }
 }
@@ -6570,9 +6583,11 @@ mod whole_graph_tests {
                 ),
                 "{detail}"
             );
+            // The required copy and the left-behind one are both named; nothing is promised.
             assert!(
-                detail.ends_with("; 2.0.0 in legacy-b is also required by bar@1.0.0")
-                    && !detail.contains("left behind"),
+                detail.ends_with(
+                    "; 2.0.0 in legacy-b is also required by bar@1.0.0; 1.0.0 in legacy-a left behind by its exclusion"
+                ) && !detail.contains("lift its exclusion"),
                 "{detail}"
             );
         }
