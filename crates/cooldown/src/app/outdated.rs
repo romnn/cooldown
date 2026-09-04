@@ -398,6 +398,9 @@ impl<'a> OutdatedRunner<'a> {
         if candidates.is_empty() {
             return;
         }
+        if self.ws.mutator(pctx.tool).is_none() {
+            return;
+        }
         if self.opts.offline {
             // The whole-graph resolve needs the registry, so the verdicts stay per-package; saying
             // so keeps an unverified `adoptable` from reading as a verified one.
@@ -412,9 +415,6 @@ impl<'a> OutdatedRunner<'a> {
                 .with_tool(pctx.tool.as_str())
                 .with_project(pctx.rel_path.as_str()),
             );
-            return;
-        }
-        if self.ws.mutator(pctx.tool).is_none() {
             return;
         }
 

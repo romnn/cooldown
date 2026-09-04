@@ -1832,6 +1832,13 @@ mod tests {
         blocked.candidate_age_days = Some(22.0);
         blocked.window.min_age_days = 14.0;
         blocked.blocked_reason = Some("the resolve landed 5.0.15 in 1 of 2 importers".into());
+        // A newer release still cooling beyond the adoptable target, which the versions alone
+        // would not show.
+        blocked.latest = Some(LatestInfo {
+            version: "5.1.0".into(),
+            published_at: Some("2026-06-10T00:00:00Z".into()),
+            age_days: Some(7.0),
+        });
         let meta = ExplainMeta {
             project: ".".into(),
             registry: Some("npm".into()),
@@ -1871,7 +1878,7 @@ mod tests {
         let out = render_explain(&meta, &[], &[], &[], false);
 
         assert!(
-            out.contains("verdict: 5.0.14 → 5.0.15 blocked (cooldown 22d/14d)\n"),
+            out.contains("verdict: 5.0.14 → 5.0.15 blocked (latest 5.1.0, cooldown 22d/14d)\n"),
             "{out}"
         );
         assert!(

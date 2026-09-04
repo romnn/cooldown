@@ -65,10 +65,6 @@ pub(super) struct UpgradeCtx<'a> {
     pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
-    /// The root of the project the run is about, which is `pctx.project.root` only when the run
-    /// mutates the source: a dry run, an `outdated` preview, and an isolated trial hand the
-    /// executor a throwaway copy whose temp path would otherwise leak into diagnostics.
-    source_root: &'a camino::Utf8Path,
     repo_root: &'a camino::Utf8Path,
     access: ProjectExecution,
     defer_build: bool,
@@ -89,18 +85,6 @@ impl ProjectExecution {
 impl UpgradeCtx<'_> {
     pub(super) fn tool_name(&self) -> &'static str {
         self.pctx.tool.as_str()
-    }
-
-    /// `detail` with the throwaway copy's root spelled as the source project's, for tool output
-    /// that names the directory it ran in (a stale-lock or build detail): a temp path that is gone
-    /// by the time the report prints tells the reader nothing.
-    pub(super) fn relabel_copy_paths(&self, detail: &str) -> String {
-        let copy = self.pctx.project.root.as_str();
-        if copy == self.source_root.as_str() {
-            detail.to_string()
-        } else {
-            detail.replace(copy, self.source_root.as_str())
-        }
     }
 
     fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
@@ -244,7 +228,6 @@ impl Workspace {
                     writer,
                     pctx: effective_pctx,
                     opts,
-                    source_root: &pctx.project.root,
                     repo_root: self.repo_root(),
                     access,
                     defer_build: false,
@@ -254,6 +237,7 @@ impl Workspace {
             )
             .run()
             .await;
+            relabel_copy_paths(&mut acc, &effective_pctx.project.root, &pctx.project.root);
         }
 
         finalize_outcome(opts, acc)
@@ -341,7 +325,6 @@ impl Workspace {
                 writer,
                 pctx: &copied_pctx,
                 opts: &preview_opts,
-                source_root: &pctx.project.root,
                 repo_root: self.repo_root(),
                 access: prepared.execution(),
                 defer_build: false,
@@ -353,6 +336,7 @@ impl Workspace {
         )
         .run_policy(changes, manifest_only, advisories, excluded_members)
         .await;
+        relabel_copy_paths(&mut acc, &copied_pctx.project.root, &pctx.project.root);
         acc
     }
 
@@ -420,7 +404,6 @@ impl Workspace {
                 writer,
                 pctx: &copied_pctx,
                 opts: &trial_opts,
-                source_root: &pctx.project.root,
                 repo_root: self.repo_root(),
                 access: execution,
                 defer_build: true,
@@ -430,6 +413,11 @@ impl Workspace {
         )
         .run()
         .await;
+        relabel_copy_paths(
+            &mut project_acc,
+            &copied_pctx.project.root,
+            &pctx.project.root,
+        );
         if status == ProjectRunStatus::Terminated {
             merge_discarded_trial(acc, project_acc);
             return;
@@ -464,6 +452,65 @@ impl Workspace {
         };
         Ok((guard, recovery_warnings))
     }
+}
+
+/// Spells the throwaway copy's root as the source project's in every diagnostic and row the run
+/// published from the copy — a stale-lock or build detail, a resolver's own error text, a held
+/// row's reason, a diagnostic's path: a temp path that is gone by the time the report prints tells
+/// the reader nothing.
+/// Only a whole path component is replaced, so a sibling temp directory that shares the copy root
+/// as a string prefix is left alone.
+fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &camino::Utf8Path) {
+    if copy == source {
+        return;
+    }
+    let relabel = |text: &mut String| {
+        if text.contains(copy.as_str()) {
+            *text = replace_path_prefix(text, copy.as_str(), source.as_str());
+        }
+    };
+    let relabel_diag = |diag: &mut Diagnostic| {
+        relabel(&mut diag.message);
+        if let Some(path) = &mut diag.path {
+            relabel(path);
+        }
+    };
+    acc.errors
+        .iter_mut()
+        .chain(acc.warnings.iter_mut())
+        .for_each(&relabel_diag);
+    for item in acc.items.iter_mut().chain(acc.edge_items.iter_mut()) {
+        if let Some(skipped) = &mut item.skipped {
+            relabel(&mut skipped.message);
+            if let Some(offending) = &mut skipped.offending {
+                relabel(offending);
+            }
+        }
+        if let Some(error) = &mut item.error {
+            relabel_diag(error);
+        }
+    }
+}
+
+/// `text` with every occurrence of the path `from` that ends at a path boundary (the end of the
+/// text, a separator, or punctuation) replaced by `to`; `from` followed by more of a file name is
+/// a different path and stays.
+fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let (before, tail) = rest.split_at(at);
+        let (matched, after) = tail.split_at(from.len());
+        let boundary = after
+            .chars()
+            .next()
+            .is_none_or(|next| !(next.is_alphanumeric() || matches!(next, '-' | '_' | '.')));
+        out.push_str(before);
+        out.push_str(if boundary { to } else { matched });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 enum IsolatedAccessGuard {
@@ -827,5 +874,67 @@ mod tests {
         assert_eq!(outcome.summary.applied, 0);
         assert_eq!(outcome.summary.edges_rebound, 1);
         assert!(outcome.meta.applied);
+    }
+}
+
+#[cfg(test)]
+mod relabel_tests {
+    use super::{UpgradeAccum, relabel_copy_paths, replace_path_prefix};
+    use camino::Utf8Path;
+    use cooldown_core::{Diagnostic, DiagnosticKind};
+
+    /// The copy root is replaced wherever it ends a path component, and a sibling temp directory
+    /// that merely shares it as a prefix is left alone.
+    #[test]
+    fn a_copy_root_is_replaced_only_at_a_path_boundary() {
+        let text = "Cargo.lock is stale in /tmp/copy; see /tmp/copy/Cargo.toml (not /tmp/copy-2/x)";
+        assert_eq!(
+            replace_path_prefix(text, "/tmp/copy", "/repo/svc"),
+            "Cargo.lock is stale in /repo/svc; see /repo/svc/Cargo.toml (not /tmp/copy-2/x)"
+        );
+    }
+
+    /// Every field a copy run can publish a path into is relabeled: a diagnostic's message and
+    /// path, and a row's skip reason and error.
+    #[test]
+    fn every_published_field_is_relabeled() {
+        let mut acc = UpgradeAccum::default();
+        acc.errors.push(
+            Diagnostic::new(DiagnosticKind::StaleLock, "stale in /tmp/copy")
+                .with_path("/tmp/copy/Cargo.toml"),
+        );
+        acc.items.push(crate::app::UpgradeItem {
+            name: "left-pad".into(),
+            tool: "pnpm".into(),
+            project: ".".into(),
+            direct: true,
+            downgrade: false,
+            members: Vec::new(),
+            registry: None,
+            from: "1.0.0".into(),
+            to: "1.1.0".into(),
+            kind: cooldown_core::UpdateKind::Minor,
+            applied: false,
+            skipped: Some(crate::app::SkippedInfo {
+                reason: cooldown_core::SkipReason::ResolverConflict,
+                message: "resolver failed in /tmp/copy".into(),
+                offending: Some("/tmp/copy/lib".into()),
+            }),
+            error: None,
+            edge: None,
+            security: None,
+        });
+
+        relabel_copy_paths(
+            &mut acc,
+            Utf8Path::new("/tmp/copy"),
+            Utf8Path::new("/repo/svc"),
+        );
+
+        assert_eq!(acc.errors[0].message, "stale in /repo/svc");
+        assert_eq!(acc.errors[0].path.as_deref(), Some("/repo/svc/Cargo.toml"));
+        let skipped = acc.items[0].skipped.as_ref().expect("skipped");
+        assert_eq!(skipped.message, "resolver failed in /repo/svc");
+        assert_eq!(skipped.offending.as_deref(), Some("/repo/svc/lib"));
     }
 }

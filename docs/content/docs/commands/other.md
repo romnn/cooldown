@@ -37,7 +37,8 @@ cooldown explain <package>     # alias: cooldown why <package>
 
 The header leads with the decision. One `verdict:` line per resolved version of the package
 shows what `outdated` shows — the current and adoptable versions, the status (`blocked by …`,
-`held (declared bound <6)`, `in cooldown`), and the candidate's age against its window — and a
+`held (declared bound <6)`, `in cooldown`), the newest release when it is neither the current
+nor the adoptable version (`latest 5.1.0,`), and the candidate's age against its window — and a
 blocked verdict is followed by `reason:`, the sentence `upgrade` prints for that row (a partial
 landing and the importer it left behind, a workspace split and the flag that converges it, a
 refused duplicate copy and its requirer). The verdict runs the same evaluation and upgrade-policy

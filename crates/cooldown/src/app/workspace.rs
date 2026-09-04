@@ -33,7 +33,8 @@ pub struct ProjectCtx {
     /// The Cargo edge policy resolved for this project's config cascade.
     pub edge_policy: cooldown_core::EdgePolicy,
     /// The `[tool.pnpm] single-copy` names resolved for this project's config cascade: the
-    /// packages a resolve must never leave at a second resolved copy.
+    /// packages a settled resolve must not *add* a copy of (a standing split is reported, not
+    /// refused); a `--lock` refresh is pnpm's own install and is not judged.
     pub single_copy: Vec<String>,
 }
 
@@ -496,12 +497,21 @@ impl MemberScope {
     /// Each row list resolves its own scope; the resolved and manifest-constraint lists agree
     /// because every adapter attributes both alike.
     fn resolve(pctx: &ProjectCtx, opts: &RunOpts, deps: &[Dependency]) -> Self {
+        Self::resolve_over(pctx, opts, deps.iter().flat_map(|dep| &dep.members))
+    }
+
+    /// The scope over an explicit member set: `explain` judges declared members that own no row
+    /// (a peer pnpm did not auto-install), and a selected member among them must own the
+    /// selection rather than read as excluded from it.
+    fn resolve_over<'m>(
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        members: impl Iterator<Item = &'m cooldown_core::MemberRef>,
+    ) -> Self {
         let Some(sel) = opts.scope.selected() else {
             return MemberScope::Whole;
         };
-        let owner = deps
-            .iter()
-            .flat_map(|dep| &dep.members)
+        let owner = members
             .map(|member| member_location(pctx, member))
             .filter(|location| sel.starts_with(location))
             .max_by_key(|location| location.components().count());
@@ -1107,7 +1117,8 @@ impl Workspace {
     /// `deps` exactly as [`scope_dependencies`](Self::scope_dependencies) would — for `explain`,
     /// which reads the raw graph and must still say which declarations the run ignores.
     /// `declared` adds the members the adapter reports as declaring the name without a lock entry
-    /// of their own (a peer pnpm did not auto-install), which no dependency row attributes.
+    /// of their own (a peer pnpm did not auto-install), which no dependency row attributes; they
+    /// take part in resolving the scope too, so a selected one owns the selection.
     pub(crate) fn excluded_members_of(
         pctx: &ProjectCtx,
         opts: &RunOpts,
@@ -1115,7 +1126,6 @@ impl Workspace {
         name: &str,
         declared: &[cooldown_core::MemberRef],
     ) -> Vec<cooldown_core::MemberRef> {
-        let scope = MemberScope::resolve(pctx, opts, deps);
         let tool = pctx.tool.as_str();
         let mut members: Vec<cooldown_core::MemberRef> = deps
             .iter()
@@ -1125,6 +1135,13 @@ impl Workspace {
             .collect();
         members.sort_by(|a, b| a.path.cmp(&b.path));
         members.dedup_by(|a, b| a.path == b.path);
+        let scope = MemberScope::resolve_over(
+            pctx,
+            opts,
+            deps.iter()
+                .flat_map(|dep| &dep.members)
+                .chain(declared.iter()),
+        );
         members
             .into_iter()
             .filter(|member| {
@@ -1997,6 +2014,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["legacy", "legacy/peer"],
             "the manifest-only declaration under the excluded folder is reported beside the row's"
+        );
+        // A selected manifest-only member owns the selection like a row's member would: `-C
+        // legacy/peer` must not report the very directory it selects as excluded.
+        let selected = Workspace::excluded_members_of(
+            &ws.projects()[0],
+            &opts_for(Some("/repo/legacy/peer")),
+            &reader.deps,
+            "mongoose",
+            &declared,
+        );
+        assert!(
+            !selected.iter().any(|member| member.path == "legacy/peer"),
+            "{selected:?}"
         );
     }
 

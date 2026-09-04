@@ -256,17 +256,20 @@ impl<'a> ExplainService<'a> {
             ) => return Err(error),
             Err(_) => return Ok(ExplainedDependency::default()),
         };
-        // The declarations are diagnostic evidence beside the graph, so one unreadable member
-        // manifest degrades to a warning rather than costing the window trace that already stood
-        // — the same fail-open rule the graph read above follows.
+        // The declarations are diagnostic evidence beside the graph, so one unreadable lock or
+        // member manifest degrades to a warning rather than costing the window trace that already
+        // stood — the same fail-open rule the graph read above follows. The adapter's error names
+        // the file that failed, which the project manifest would only misname.
         let mut warnings = Vec::new();
         let declarations = match adapter.declarations(&pctx.project, pkg).await {
             Ok(declarations) => declarations,
             Err(error) => {
-                warnings.push(
-                    super::diag_from_error(&error, pctx.tool, pctx.rel_path.as_str(), Some(pkg))
-                        .with_path(pctx.project.manifest.as_str()),
-                );
+                warnings.push(super::diag_from_error(
+                    &error,
+                    pctx.tool,
+                    pctx.rel_path.as_str(),
+                    Some(pkg),
+                ));
                 Vec::new()
             }
         };

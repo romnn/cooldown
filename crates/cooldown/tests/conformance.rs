@@ -2401,6 +2401,15 @@ async fn a_dry_run_stale_lock_names_the_source_project_not_the_copy() {
         format!("fake.lock is stale in {root}"),
         "the detail names the source root, not the copy the dry run resolved in"
     );
+    // The structured path is relabeled like the message: `--json` readers follow it.
+    assert!(
+        stale
+            .path
+            .as_deref()
+            .is_some_and(|path| path.starts_with(root.as_str())),
+        "the path names the source project, not the copy: {:?}",
+        stale.path
+    );
 }
 
 #[tokio::test]
