@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.20
+
 - **Held rows say why.** A candidate the whole-graph resolve kept below its target and one the
   resolve rejected outright shared one sentence, `the resolver rejected this change`, and the
   rejected one's explanation was cut at the resolver's first line, so a `--json` `blockedReason`
