@@ -32,6 +32,9 @@ pub(crate) struct ProjectCopy {
     scratch: tempfile::TempDir,
     /// The copied project, rooted inside the temp directory.
     pub(crate) project: Project,
+    /// How real-tree paths map into the scratch tree, kept so a report can spell the copy's
+    /// paths as the source's.
+    rebase: StagedRebase,
 }
 
 impl ProjectCopy {
@@ -133,7 +136,15 @@ impl ProjectCopy {
         Ok(ProjectCopy {
             scratch,
             project: copied,
+            rebase,
         })
+    }
+
+    /// The scratch tree and the source ancestor it was staged from: a path under the copy — the
+    /// project's own or a staged sibling's (an out-of-tree path dependency) — is the source path at
+    /// the same offset from the ancestor.
+    pub(crate) fn relabel_roots(&self) -> (&camino::Utf8Path, &camino::Utf8Path) {
+        (&self.rebase.scratch_root, &self.rebase.ancestor)
     }
 }
 

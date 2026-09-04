@@ -179,6 +179,7 @@ impl Workspace {
             // `dry_copy` keeps the temp tree alive while the executor borrows `dry_pctx`.
             let _dry_copy;
             let dry_pctx;
+            let mut dry_roots: Option<(camino::Utf8PathBuf, camino::Utf8PathBuf)> = None;
             let effective_pctx = if opts.dry_run {
                 opts.progress.phase("preparing isolated dry-run project");
                 let copy = match self.project_read_guard(pctx).await {
@@ -199,6 +200,8 @@ impl Workspace {
                             edge_policy: pctx.edge_policy,
                             single_copy: pctx.single_copy.clone(),
                         };
+                        let (scratch, ancestor) = copy.relabel_roots();
+                        dry_roots = Some((scratch.to_owned(), ancestor.to_owned()));
                         _dry_copy = copy;
                         &dry_pctx
                     }
@@ -237,7 +240,11 @@ impl Workspace {
             )
             .run()
             .await;
-            relabel_copy_paths(&mut acc, &effective_pctx.project.root, &pctx.project.root);
+            // The whole scratch tree is spelled as the source ancestor it was staged from, so a
+            // staged sibling (an out-of-tree path dependency) is relabeled with the project.
+            if let Some((scratch, ancestor)) = &dry_roots {
+                relabel_copy_paths(&mut acc, scratch, ancestor);
+            }
         }
 
         finalize_outcome(opts, acc)
@@ -336,7 +343,8 @@ impl Workspace {
         )
         .run_policy(changes, manifest_only, advisories, excluded_members)
         .await;
-        relabel_copy_paths(&mut acc, &copied_pctx.project.root, &pctx.project.root);
+        let (copy_root, source_root) = prepared.relabel_roots(pctx);
+        relabel_copy_paths(&mut acc, copy_root, source_root);
         acc
     }
 
@@ -413,16 +421,14 @@ impl Workspace {
         )
         .run()
         .await;
-        relabel_copy_paths(
-            &mut project_acc,
-            &copied_pctx.project.root,
-            &pctx.project.root,
-        );
+        // The pass runs over the whole accumulator after the trial's rows and the publication's
+        // own diagnostics (a capture failure names the staged lock) have all landed in it.
         if status == ProjectRunStatus::Terminated {
             merge_discarded_trial(acc, project_acc);
-            return;
+        } else {
+            publish_isolated_trial(trial.as_ref(), writer, pctx, opts, project_acc, acc).await;
         }
-        publish_isolated_trial(trial.as_ref(), writer, pctx, opts, project_acc, acc).await;
+        relabel_copy_paths(acc, &copied_pctx.project.root, &pctx.project.root);
     }
 
     async fn acquire_isolated_source_access(
@@ -494,17 +500,20 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
 
 /// `text` with every occurrence of the path `from` that ends at a path boundary (the end of the
 /// text, a separator, or punctuation) replaced by `to`; `from` followed by more of a file name is
-/// a different path and stays.
+/// a different path and stays. A period is a boundary only when it ends a sentence (followed by
+/// whitespace or the end), since `copy.bak` is another file name.
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(from) {
         let (before, tail) = rest.split_at(at);
         let (matched, after) = tail.split_at(from.len());
-        let boundary = after
-            .chars()
-            .next()
-            .is_none_or(|next| !(next.is_alphanumeric() || matches!(next, '-' | '_' | '.')));
+        let mut following = after.chars();
+        let boundary = match following.next() {
+            None => true,
+            Some('.') => following.next().is_none_or(char::is_whitespace),
+            Some(next) => !(next.is_alphanumeric() || matches!(next, '-' | '_')),
+        };
         out.push_str(before);
         out.push_str(if boundary { to } else { matched });
         rest = after;
@@ -544,6 +553,19 @@ impl PreparedPreview {
         match self {
             PreparedPreview::Generic(_) => ProjectExecution::Copy,
             PreparedPreview::Isolated(copy) => ProjectExecution::Isolated(copy.mutation_project()),
+        }
+    }
+
+    /// The roots the relabel pass maps onto each other: a generic copy's scratch tree onto the
+    /// source ancestor it was staged from (so a staged sibling is covered), an isolated stage's
+    /// project onto the source project (its staging keeps the rest of its layout to itself).
+    fn relabel_roots<'p>(
+        &'p self,
+        source: &'p super::ProjectCtx,
+    ) -> (&'p camino::Utf8Path, &'p camino::Utf8Path) {
+        match self {
+            PreparedPreview::Generic(copy) => copy.relabel_roots(),
+            PreparedPreview::Isolated(copy) => (&copy.project().root, &source.project.root),
         }
     }
 }
@@ -891,6 +913,15 @@ mod relabel_tests {
         assert_eq!(
             replace_path_prefix(text, "/tmp/copy", "/repo/svc"),
             "Cargo.lock is stale in /repo/svc; see /repo/svc/Cargo.toml (not /tmp/copy-2/x)"
+        );
+        // A sentence-ending period is a boundary; a dotted suffix is another file name.
+        assert_eq!(
+            replace_path_prefix(
+                "resolved in /tmp/copy. kept /tmp/copy.bak",
+                "/tmp/copy",
+                "/repo"
+            ),
+            "resolved in /repo. kept /tmp/copy.bak"
         );
     }
 
