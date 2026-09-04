@@ -45,8 +45,10 @@ reported as a `duplicate_copy` warning. For a listed name the settlement is refu
 lock is restored and the candidate whose landing added the copy is held with the copy and its
 requirer named (see [upgrade]({{< relref "../commands/upgrade.md" >}}#whole-workspace-landings-pnpm)).
 The gate judges what a resolve *adds*: a listed name the graph held at one copy (or not at all)
-before the run and at several after it. A listed name that is *already* at several copies before a
-run is reported (as a `duplicate_copy` warning) rather than refused — refusing would hold every
+before the run and at several after it, whether the copies are a dependent's own requirement or
+two importers' own entries, and a copy no importer declares that arrives beside a split the graph
+already had. A listed name that is *already* at several copies before a run has that standing
+split reported (as a `duplicate_copy` warning) rather than refused — refusing would hold every
 upgrade forever — so converge it for the listing to hold. A `--lock` refresh (`check --lock`,
 `outdated --lock`) is pnpm's own `install --lockfile-only` against the manifests as written and is
 not gated. `--fail-on-new-duplicate` gates every package for one run; on a tool without pnpm's
@@ -58,7 +60,8 @@ does not un-gate the root's. Names in `pnpm-workspace.yaml`'s
 `overrides` are *not* gated by default: an override pins a version for every request that matches
 its range, which already keeps a copy single where the range is exact, and a ranged override is
 often about forcing a patched transitive rather than about running the package once — list the
-names you mean.
+names you mean. Entries are exact package names, not globs: a pattern such as `@scope/*` is a
+config error rather than a gate that silently matches nothing.
 
 ## `[registry."<host>"]` — per registry
 

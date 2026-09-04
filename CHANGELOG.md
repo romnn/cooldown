@@ -37,13 +37,15 @@
   names the packages that must stay single-copy: a settlement that adds a second copy of one is
   refused, the lock restored, and the candidate whose landing added it held with the copy named,
   exactly as a partial landing is — even when the second copy is the one an exclusion asked for,
-  and when the name was absent before the run and arrives at two copies at once. A listed name
-  already at several copies before the run is reported rather than refused, since no candidate
-  introduced it. `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for
+  and when the name was absent before the run and arrives at two copies at once, held by
+  dependents or by importers. A listed name already at several copies before the run has that
+  standing split reported rather than refused, since no candidate introduced it; a copy a run adds
+  beside it is refused like any other. `--fail-on-new-duplicate` (config `fail-on-new-duplicate`) gates every package for
   a run without naming any, and says so when the run's tool has no settlement guard to honor it.
   The list merges across config files like `exclude-folders` (a plain array adds, `[]` clears,
   `{ replace = […] }` replaces), so a nested workspace listing one runtime of its own cannot
-  un-gate the root's. The warning for an ungated copy now names the requirer from the settled lock's own
+  un-gate the root's; entries are exact package names, and a glob such as `@scope/*` is a config
+  error rather than a gate that silently matches nothing. The warning for an ungated copy now names the requirer from the settled lock's own
   edges (`required at 1.9.15 by vite-plugin-solid@2.11.14`) instead of `pulled in by another
   package's requirement`, which had forced a hand-grep of the `snapshots:` section. Names in
   `pnpm-workspace.yaml`'s `overrides` are deliberately not gated by default: an exact override

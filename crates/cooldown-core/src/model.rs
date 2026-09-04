@@ -886,8 +886,9 @@ pub struct Declaration {
 /// versions where the graph had at most one before, the adapter rejects the settlement, the lock is
 /// restored, and candidate isolation holds the responsible candidate with the copies and their
 /// requirers named, exactly as a partial landing is treated.
-/// A name already at several copies before the run is nobody's landing to refuse, so it is
-/// reported rather than refused.
+/// A name already at several copies before the run is nobody's landing to refuse, so its standing
+/// split is reported rather than refused; a copy the run adds beside that split is refused like
+/// any other.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SingleCopyPolicy {
     /// The names configured to stay single-copy (`[tool.pnpm] single-copy`).

@@ -57,6 +57,18 @@ fn validate_structure(config: &ConfigToml, origin: &Origin) -> Result<(), CoreEr
                     origin.token()
                 )));
             }
+            // The gate matches exact names, so a glob would parse, fold, and gate nothing.
+            if let Some(list) = &selector.single_copy
+                && let Some(glob) = list
+                    .patterns()
+                    .iter()
+                    .find(|entry| entry.contains(['*', '?', '[', '{']))
+            {
+                return Err(CoreError::Config(format!(
+                    "{}: `single-copy` lists exact package names, and `{glob}` is a glob; the gate matches names, not patterns",
+                    origin.token()
+                )));
+            }
         }
     }
     if let Some(registries) = &config.registry {
@@ -162,6 +174,23 @@ mod tests {
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
         assert_eq!(scan.resolved("outdated").major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
+    }
+
+    /// `single-copy` matches exact names, so a glob that would silently gate nothing is a config
+    /// error, in either list form.
+    #[test]
+    fn single_copy_rejects_a_glob_entry() {
+        for src in [
+            "[tool.pnpm]\nsingle-copy = [\"react\", \"@scope/*\"]\n",
+            "[tool.pnpm]\nsingle-copy = { replace = [\"solid-?s\"] }\n",
+        ] {
+            let err = ConfigDocument::parse(src, &Origin::Global)
+                .expect_err("a glob cannot gate anything");
+            assert!(
+                err.to_string().contains("exact package names"),
+                "the error says what the list takes: {err}"
+            );
+        }
     }
 
     /// The pnpm-only `single-copy` key is rejected everywhere but `[tool.pnpm]`, so a list under

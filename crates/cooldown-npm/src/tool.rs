@@ -274,6 +274,14 @@ fn push_journal_rel(
     }
 }
 
+/// The lock's content, with the file named in a read failure: the bare `io::Error` says only
+/// "No such file or directory", which a report row cannot act on.
+fn read_lock<L: NodeLock>(project: &Project) -> Result<String> {
+    let path = project.root.join(L::LOCKFILE);
+    std::fs::read_to_string(&path)
+        .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))
+}
+
 #[async_trait]
 impl<L: NodeLock> ToolRead for NpmTool<L> {
     fn id(&self) -> ToolId {
@@ -281,7 +289,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     }
 
     async fn declarations(&self, project: &Project, name: &str) -> Result<Vec<Declaration>> {
-        let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let content = read_lock::<L>(project)?;
         let index = L::member_sources(&content);
         // Every importer the lock lists, whatever it declares, so a manifest-only declaration (a
         // peer pnpm did not auto-install) is still found; a single-package lock lists no
@@ -335,7 +343,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         // The same per-importer records `dependencies` derived these facts from, minus the excluded
         // importers: an excluded importer's exact pin or range must neither hold nor loosen a row
         // the run manages.
-        let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let content = read_lock::<L>(project)?;
         let excluded: HashSet<String> = excluded.iter().map(|member| member.path.clone()).collect();
         let index = L::member_sources_excluding(&content, &excluded);
         for dep in deps
@@ -406,7 +414,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
-        let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+        let content = read_lock::<L>(project)?;
         let entries = L::parse(&content)?;
         // Which workspace member(s) declare each dependency, for source attribution; empty for lock
         // formats without per-member data (yarn classic, bun). Member paths are resolved to package
@@ -589,7 +597,7 @@ fn candidate_moved(
 /// exits 0 yet lands the newest pre-cutoff version when the requested one is newer than the
 /// cutoff, so the landing must be read back from the lock.
 fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Result<bool> {
-    let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
+    let content = read_lock::<L>(project)?;
     let newest = locked_versions::<L>(&content)?;
     let target = change.to.as_str();
     if change.members.is_empty() {
@@ -989,13 +997,16 @@ fn importer_splits(before: &MemberIndex, after: &MemberIndex) -> Vec<ImporterSpl
 /// candidate whose landing caused it.
 /// A name `single_copy` gates fails the batch even when the exclusion asked for the split: the
 /// user said the name must never be at two copies, and an excluded importer's copy is one.
+/// Returns the names whose split was reported, so the graph-level guard does not describe the
+/// same importer copies a second time.
 fn report_importer_splits(
     report: &mut ApplyReport,
     before: &MemberIndex,
     after: &MemberIndex,
     excluded: &HashSet<String>,
     single_copy: &SingleCopyPolicy,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
+    let mut reported = BTreeSet::new();
     for split in importer_splits(before, after) {
         if !split.is_deliberate(excluded) {
             return Err(CoreError::UnacceptableResolve(format!(
@@ -1032,31 +1043,34 @@ fn report_importer_splits(
             )
             .with_package(split.name.clone()),
         );
+        reported.insert(split.name);
     }
-    Ok(())
+    Ok(reported)
 }
 
-/// Reports every name the settled resolve left at several resolved versions across the whole
-/// package graph where it had at most one before, attributing the copies no importer declares to
-/// the packages whose own requirement binds them — named from the settled lock's edges, so the
-/// reader need not grep the `snapshots:` section for the culprit.
+/// Reports every name the settled resolve left at more resolved versions across the whole package
+/// graph than it had before, attributing the copies no importer declares to the packages whose own
+/// requirement binds them — named from the settled lock's edges, so the reader need not grep the
+/// `snapshots:` section for the culprit.
 /// Such a copy is the resolver's legitimate answer to that dependent's range, so it is committed,
-/// but a lock that gained a second copy must never pass silently — the run's own report names the
+/// but a lock that gained a copy must never pass silently — the run's own report names the
 /// versions, whatever the newest-copy diff shows.
-/// The importers' own copies were judged by the importer-level guard, so a name whose versions are
-/// all importer-held is not reported again here; a transitive third copy beside a deliberate
-/// excluded-importer split still is.
+/// A name whose copies are all importers' own was judged by the importer-level guard when it saw
+/// the split, and is not described again here; a split that guard could not see (no importer held
+/// the name before the run) is still a name at several copies where the graph had at most one.
 /// A name `single_copy` gates is refused instead: the batch fails with the copies and their
 /// requirers named, and the caller's candidate isolation holds the candidate whose landing added
 /// them.
 /// A listed name that was already at several versions before the run is not the run's doing and
-/// cannot be refused without blocking every upgrade forever, so it is reported — the listing must
-/// not read as an enforced invariant while it is not one.
+/// cannot be refused without blocking every upgrade forever, so its standing split is reported —
+/// the listing must not read as an enforced invariant while it is not one — while a copy the run
+/// adds beside that split is judged like any other new copy.
 fn report_graph_duplicates<L: NodeLock>(
     report: &mut ApplyReport,
     before_content: &str,
     after_content: &str,
     after_members: &MemberIndex,
+    split_reported: &BTreeSet<String>,
     single_copy: &SingleCopyPolicy,
 ) -> Result<()> {
     let before = resolved_version_lines::<L>(before_content)?;
@@ -1070,43 +1084,69 @@ fn report_graph_duplicates<L: NodeLock>(
             continue;
         };
         let was = before.get(name);
-        if let Some(was) = was.filter(|was| was.len() > 1) {
-            if single_copy.names.contains(name) {
-                report.warnings.push(
-                    Diagnostic::new(
-                        DiagnosticKind::DuplicateCopy,
-                        format!(
-                            "{name} is listed in `[tool.pnpm] single-copy` but was already resolved at several versions before the run ({}); the gate refuses only a copy a resolve adds, so converge it for the listing to hold",
-                            was.iter().cloned().collect::<Vec<_>>().join(", ")
-                        ),
-                    )
-                    .with_package(name.clone()),
-                );
-            }
-            continue;
-        }
         let importer_held = after_members.resolved_versions_of(name);
         let undeclared: Vec<&String> = now
             .iter()
             .filter(|version| !importer_held.contains(&version.as_str()))
             .collect();
-        if undeclared.is_empty() {
+        let listed = |versions: &[&String]| {
+            versions
+                .iter()
+                .map(|version| version.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // Already split before the run: only a copy the run added beside the split is its doing.
+        if let Some(was) = was.filter(|was| was.len() > 1) {
+            let added: Vec<&String> = undeclared
+                .iter()
+                .copied()
+                .filter(|version| !was.contains(*version))
+                .collect();
+            let requirers = if added.is_empty() {
+                String::new()
+            } else {
+                let dependents =
+                    dependents.get_or_insert_with(|| L::graph_dependents(after_content));
+                requirers_of(name, &added, dependents)
+            };
+            report_beside_standing_split(report, name, was, &added, &requirers, single_copy)?;
             continue;
         }
-        let dependents = dependents.get_or_insert_with(|| L::graph_dependents(after_content));
-        let listed = now.iter().cloned().collect::<Vec<_>>().join(", ");
         let history = match was.and_then(|was| was.iter().next()) {
             Some(single) => format!(
-                "resolved at one version ({single}) across the graph before the run and at several after it ({listed})"
+                "resolved at one version ({single}) across the graph before the run and at several after it ({})",
+                listed(&now.iter().collect::<Vec<_>>())
             ),
             None => format!(
-                "was absent from the graph before the run and is at several versions after it ({listed})"
+                "was absent from the graph before the run and is at several versions after it ({})",
+                listed(&now.iter().collect::<Vec<_>>())
             ),
         };
-        let described = format!(
-            "{name} {history}: a copy no importer declares, {}",
-            requirers_of(name, &undeclared, dependents)
-        );
+        // Every copy is an importer's own: the importer guard described the split it saw, and
+        // one it could not see is still a name at several copies where the graph had at most one.
+        let described = if undeclared.is_empty() {
+            if split_reported.contains(name) {
+                continue;
+            }
+            let holders = now
+                .iter()
+                .map(|version| {
+                    format!(
+                        "{version} in {}",
+                        list_members(&after_members.members_for(name, version))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name} {history}: every copy is an importer's own ({holders})")
+        } else {
+            let dependents = dependents.get_or_insert_with(|| L::graph_dependents(after_content));
+            format!(
+                "{name} {history}: a copy no importer declares, {}",
+                requirers_of(name, &undeclared, dependents)
+            )
+        };
         if let Some(gate) = single_copy.gate_of(name) {
             return Err(CoreError::UnacceptableResolve(format!(
                 "the resolve added a second copy of {name}, which {gate} keeps single-copy: {described}"
@@ -1116,6 +1156,52 @@ fn report_graph_duplicates<L: NodeLock>(
             Diagnostic::new(DiagnosticKind::DuplicateCopy, described).with_package(name.clone()),
         );
     }
+    Ok(())
+}
+
+/// Judges a name that was already at several versions before the run (`was`): the copies the run
+/// added beside that split that no importer declares (`added`, attributed by `requirers`) are its
+/// doing and are refused under a gate or reported; with none added, a listed name's standing split
+/// is reported so the listing does not read as an enforced invariant.
+fn report_beside_standing_split(
+    report: &mut ApplyReport,
+    name: &str,
+    was: &BTreeSet<String>,
+    added: &[&String],
+    requirers: &str,
+    single_copy: &SingleCopyPolicy,
+) -> Result<()> {
+    let was_listed = was.iter().cloned().collect::<Vec<_>>().join(", ");
+    if added.is_empty() {
+        if single_copy.names.contains(name) {
+            report.warnings.push(
+                Diagnostic::new(
+                    DiagnosticKind::DuplicateCopy,
+                    format!(
+                        "{name} is listed in `[tool.pnpm] single-copy` but was already resolved at several versions before the run ({was_listed}); the gate refuses only a copy a resolve adds, so converge it for the listing to hold"
+                    ),
+                )
+                .with_package(name.to_string()),
+            );
+        }
+        return Ok(());
+    }
+    let added_listed = added
+        .iter()
+        .map(|version| version.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let described = format!(
+        "{name} was already at several versions before the run ({was_listed}) and gained another after it ({added_listed}): a copy no importer declares, {requirers}"
+    );
+    if let Some(gate) = single_copy.gate_of(name) {
+        return Err(CoreError::UnacceptableResolve(format!(
+            "the resolve added another copy of {name}, which {gate} keeps single-copy: {described}"
+        )));
+    }
+    report.warnings.push(
+        Diagnostic::new(DiagnosticKind::DuplicateCopy, described).with_package(name.to_string()),
+    );
     Ok(())
 }
 
@@ -1289,8 +1375,16 @@ fn guard_settled_lock<L: NodeLock>(
         return Ok(());
     };
     report_excluded_moves(report, before_members, members.1, excluded)?;
-    report_importer_splits(report, before_members, members.1, excluded, single_copy)?;
-    report_graph_duplicates::<L>(report, before_content, lock.1, members.1, single_copy)
+    let split_reported =
+        report_importer_splits(report, before_members, members.1, excluded, single_copy)?;
+    report_graph_duplicates::<L>(
+        report,
+        before_content,
+        lock.1,
+        members.1,
+        &split_reported,
+        single_copy,
+    )
 }
 
 /// The importer paths `plan` excludes.
@@ -5715,6 +5809,203 @@ mod whole_graph_tests {
             "{}",
             warning.message
         );
+        Ok(())
+    }
+
+    /// The importer guard judges a split from one importer version to several; a name no importer
+    /// held before the run that arrives held at two versions is still a name at several copies
+    /// where the graph had at most one, so the graph guard refuses it under the gate and reports
+    /// it without — naming the importers, since no requirement edge binds an importer's own copy.
+    #[tokio::test]
+    async fn a_name_arriving_at_two_importer_held_copies_is_a_duplicate() -> eyre::Result<()> {
+        for gated in [true, false] {
+            let (_dir, root) = tempdir_root()?;
+            let lock = workspace(
+                &root,
+                &[
+                    Importer {
+                        path: "app",
+                        name: "app",
+                        deps: vec![("bar", "^1.0.0", "1.0.0")],
+                    },
+                    Importer {
+                        path: "lib",
+                        name: "lib",
+                        deps: vec![("bar", "^1.0.0", "1.0.0")],
+                    },
+                ],
+            )?;
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            // The settled lock holds `stateful` in both importers at different versions, with no
+            // copy anywhere before the run; `workspace` rewrites the manifests to match.
+            let settled = workspace(
+                &root,
+                &[
+                    Importer {
+                        path: "app",
+                        name: "app",
+                        deps: vec![("bar", "^1.0.0", "1.1.0"), ("stateful", "^1.0.0", "1.0.0")],
+                    },
+                    Importer {
+                        path: "lib",
+                        name: "lib",
+                        deps: vec![("bar", "^1.0.0", "1.1.0"), ("stateful", "^2.0.0", "2.0.0")],
+                    },
+                ],
+            )?;
+            std::fs::write(root.join("settled.yaml"), settled)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *" update "*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = Plan {
+                changes: vec![change(
+                    "bar",
+                    "1.0.0",
+                    "1.1.0",
+                    &[("app", "app"), ("lib", "lib")],
+                )],
+                single_copy: SingleCopyPolicy {
+                    names: BTreeSet::new(),
+                    every_name: gated,
+                },
+                ..Plan::default()
+            };
+
+            let outcome = apply(&tool, &project(&root), plan).await;
+
+            let described = if gated {
+                let Err(CoreError::UnacceptableResolve(detail)) = outcome else {
+                    panic!("two importer-held copies of a new name are refused: {outcome:?}");
+                };
+                assert!(
+                    detail.starts_with(
+                        "the resolve added a second copy of stateful, which `--fail-on-new-duplicate` keeps single-copy: "
+                    ),
+                    "{detail}"
+                );
+                detail
+            } else {
+                let report = outcome?;
+                assert!(applied_names(&report).contains(&"bar"));
+                let warning = report
+                    .warnings
+                    .iter()
+                    .find(|warning| warning.kind == DiagnosticKind::DuplicateCopy)
+                    .unwrap_or_else(|| {
+                        panic!("the new copies are reported: {:?}", report.warnings)
+                    });
+                warning.message.clone()
+            };
+            // The copies are named with their holders rather than a requirer no edge binds.
+            assert!(
+                described.ends_with(
+                    "stateful was absent from the graph before the run and is at several versions after it (1.0.0, 2.0.0): every copy is an importer's own (1.0.0 in app, 2.0.0 in lib)"
+                ),
+                "gated={gated}: {described}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A name already at several copies before the run gets its standing split reported, not
+    /// refused; a copy the run adds beside that split is its doing all the same, so it is refused
+    /// under either gate and reported with its requirer without one.
+    #[tokio::test]
+    async fn a_copy_added_beside_a_standing_split_is_a_duplicate() -> eyre::Result<()> {
+        for gate in [
+            Some("`[tool.pnpm] single-copy`"),
+            Some("`--fail-on-new-duplicate`"),
+            None,
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            let mut lock = workspace(
+                &root,
+                &[Importer {
+                    path: "app",
+                    name: "app",
+                    deps: vec![("bar", "^1.0.0", "1.0.0"), ("stateful", "^2.0.0", "2.0.0")],
+                }],
+            )?;
+            // A transitive `stateful@1.0.0` beside the importer's 2.0.0, before anything runs.
+            lock.push_str(&package_entry("stateful", "1.0.0"));
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            // `bar@1.1.0` requires `stateful@3.0.0`: a third copy the run adds.
+            let mut settled = moved(
+                &lock,
+                "app",
+                "bar",
+                ("^1.0.0", "1.0.0"),
+                ("^1.0.0", "1.1.0"),
+            );
+            settled.push_str(&package_entry("stateful", "3.0.0"));
+            settled.push_str(indoc! {"
+
+                snapshots:
+
+                  bar@1.1.0:
+                    dependencies:
+                      stateful: 3.0.0
+            "});
+            std::fs::write(root.join("settled.yaml"), settled)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *" update "*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = Plan {
+                changes: vec![change("bar", "1.0.0", "1.1.0", &[("app", "app")])],
+                single_copy: SingleCopyPolicy {
+                    names: (gate == Some("`[tool.pnpm] single-copy`"))
+                        .then(|| "stateful".to_string())
+                        .into_iter()
+                        .collect(),
+                    every_name: gate == Some("`--fail-on-new-duplicate`"),
+                },
+                ..Plan::default()
+            };
+
+            let outcome = apply(&tool, &project(&root), plan).await;
+
+            let described = if let Some(gate) = gate {
+                let Err(CoreError::UnacceptableResolve(detail)) = outcome else {
+                    panic!(
+                        "a copy added beside a standing split is refused under {gate}: {outcome:?}"
+                    );
+                };
+                assert!(
+                    detail.starts_with(&format!(
+                        "the resolve added another copy of stateful, which {gate} keeps single-copy: "
+                    )),
+                    "{detail}"
+                );
+                detail
+            } else {
+                let report = outcome?;
+                assert!(applied_names(&report).contains(&"bar"));
+                let [warning] = report.warnings.as_slice() else {
+                    panic!(
+                        "the added copy is reported once, not beside a standing-split note: {:?}",
+                        report.warnings
+                    );
+                };
+                assert_eq!(warning.kind, DiagnosticKind::DuplicateCopy);
+                warning.message.clone()
+            };
+            assert!(
+                described.ends_with(
+                    "stateful was already at several versions before the run (1.0.0, 2.0.0) and gained another after it (3.0.0): a copy no importer declares, required at 3.0.0 by bar@1.1.0"
+                ),
+                "gate={gate:?}: {described}"
+            );
+        }
         Ok(())
     }
 
