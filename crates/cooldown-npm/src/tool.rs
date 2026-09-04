@@ -1124,9 +1124,10 @@ struct NewCopies<'a> {
     /// so the refusal names the requirer instead of promising that it would.
     also_required: Vec<(&'a str, Vec<String>, Vec<String>)>,
     /// Whether lifting the exclusion on `left_behind`'s importers would leave the name at one
-    /// copy: every other version after the run is a new one the included importers moved onto.
-    /// A stray a dependent retains, a version an excluded importer re-resolved onto, or a
-    /// standing split's other copies would all survive, so the refusal must not promise it.
+    /// copy: every other version after the run is the one new version the included importers
+    /// moved onto. A stray a dependent retains, a version an excluded importer re-resolved onto,
+    /// a standing split's other copies, or two included importers on two new versions would all
+    /// survive, so the refusal must not promise it.
     converges_by_inclusion: bool,
 }
 
@@ -1152,6 +1153,7 @@ impl<'a> NewCopies<'a> {
             also_required: Vec::new(),
             converges_by_inclusion: true,
         };
+        let mut included_new = 0;
         for version in now {
             let new = !was.is_some_and(|was| was.contains(version));
             let requirers = dependents
@@ -1166,6 +1168,7 @@ impl<'a> NewCopies<'a> {
                 // The copy the included importers moved onto is the one everything would
                 // converge on; any other version would survive lifting the exclusion.
                 copies.converges_by_inclusion &= left_behind || (new && !only_excluded);
+                included_new += usize::from(new && !only_excluded);
                 if left_behind {
                     copies.left_behind.push((version.as_str(), holders.clone()));
                 } else if only_excluded && !requirers.is_empty() {
@@ -1183,6 +1186,7 @@ impl<'a> NewCopies<'a> {
                 }
             }
         }
+        copies.converges_by_inclusion &= included_new == 1;
         copies
     }
 
@@ -6591,6 +6595,87 @@ mod whole_graph_tests {
                 "{detail}"
             );
         }
+        Ok(())
+    }
+
+    /// Two included importers landing on two different new versions beside a left-behind excluded
+    /// copy would still be at two copies with the exclusion lifted, so nothing is promised: the
+    /// ordinary refusal names both new copies and the left-behind one.
+    #[tokio::test]
+    async fn two_included_importers_on_different_new_copies_promise_nothing() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "app",
+                    name: "app",
+                    deps: vec![("stateful", "^2.0.0", "2.0.0")],
+                },
+                Importer {
+                    path: "web",
+                    name: "web",
+                    deps: vec![("stateful", "^2.0.0", "2.0.0")],
+                },
+                Importer {
+                    path: "legacy",
+                    name: "legacy",
+                    deps: vec![("stateful", "^1.0.0", "1.0.0")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        // `app` lands on the planned 2.5.0; pnpm re-resolves `web` to 2.7.0 within its range.
+        let moved_app = moved(
+            &lock,
+            "app",
+            "stateful",
+            ("^2.0.0", "2.0.0"),
+            ("^2.0.0", "2.5.0"),
+        );
+        let settled = moved(
+            &moved_app,
+            "web",
+            "stateful",
+            ("^2.0.0", "2.0.0"),
+            ("^2.0.0", "2.7.0"),
+        );
+        std::fs::write(root.join("settled.yaml"), settled)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *" update "*)
+                    cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("stateful", "2.0.0", "2.5.0", &[("app", "app")])],
+            excluded_members: vec![member("legacy", "legacy")],
+            single_copy: SingleCopyPolicy {
+                names: ["stateful".to_string()].into_iter().collect(),
+                every_name: false,
+            },
+            ..Plan::default()
+        };
+
+        let outcome = apply(&tool, &project(&root), plan).await;
+
+        let Err(CoreError::UnacceptableResolve(detail)) = outcome else {
+            panic!("a third copy beside a standing split is refused: {outcome:?}");
+        };
+        assert!(
+            detail.starts_with(
+                "the resolve added another copy of stateful, which `[tool.pnpm] single-copy` keeps single-copy: "
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with(
+                "held by an importer: 2.5.0 in app, 2.7.0 in web; 1.0.0 in legacy left behind by its exclusion"
+            ) && !detail.contains("lift its exclusion"),
+            "{detail}"
+        );
         Ok(())
     }
 
