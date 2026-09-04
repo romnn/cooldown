@@ -470,12 +470,9 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
     if copy == source {
         return;
     }
-    // A filesystem-root source (a staging ancestor of `/`) would otherwise double the separator
-    // that follows the copy root in every path.
-    let source = source.as_str().trim_end_matches(std::path::MAIN_SEPARATOR);
     let relabel = |text: &mut String| {
         if text.contains(copy.as_str()) {
-            *text = replace_path_prefix(text, copy.as_str(), source);
+            *text = replace_path_prefix(text, copy.as_str(), source.as_str());
         }
     };
     let relabel_diag = |diag: &mut Diagnostic| {
@@ -506,7 +503,13 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
 /// a different path and stays. A period is a boundary only when it ends a sentence (followed by
 /// nothing, whitespace, or punctuation — an ellipsis included), since `copy.bak` is another file
 /// name.
+/// A `to` that ends in a separator — a filesystem root (`/`, `C:\`) is the case that arises —
+/// keeps it only where the copy root ends the path, since the separator that follows a match
+/// would otherwise be doubled.
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
+    // Both `/` and `\` separate on Windows, so the platform's own predicate decides, not
+    // `MAIN_SEPARATOR`: a `/`-spelled root is a root there too.
+    let trimmed = to.trim_end_matches(std::path::is_separator);
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(from) {
@@ -519,10 +522,10 @@ fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
             Some('.') => following.next().is_none_or(|next| !file_name_char(next)),
             Some(next) => !file_name_char(next),
         };
-        // A filesystem-root source is spelled as nothing before a separator and as the separator
-        // itself where the bare copy root ends the path.
-        let replacement = if to.is_empty() && !after.starts_with(std::path::MAIN_SEPARATOR) {
-            std::path::MAIN_SEPARATOR_STR
+        // What follows the match supplies the separator, except where the copy root ends the
+        // path and `to` must carry its own.
+        let replacement = if after.starts_with(std::path::is_separator) {
+            trimmed
         } else {
             to
         };
@@ -939,8 +942,9 @@ mod relabel_tests {
         );
     }
 
-    /// A staging ancestor of `/` spells the copy root as nothing, so the separator that follows
-    /// is not doubled.
+    /// A staging ancestor that is a filesystem root spells the copy root as nothing, so the
+    /// separator that follows is not doubled — `/` is a root on Windows as well as here, and a
+    /// drive root behaves the same.
     #[test]
     fn a_filesystem_root_source_does_not_double_the_separator() {
         let mut acc = UpgradeAccum::default();
@@ -956,6 +960,13 @@ mod relabel_tests {
         assert_eq!(acc.errors[0].message, "uv.lock is stale in /app");
         // The bare copy root keeps the root separator rather than vanishing.
         assert_eq!(acc.errors[1].message, "resolver failed in / (exit 1)");
+        // A drive root is the shape this takes on Windows, the one platform where a backslash
+        // separates; here it is an ordinary character and the rewrite would keep it.
+        #[cfg(windows)]
+        assert_eq!(
+            replace_path_prefix("stale in C:\\scratch\\app", "C:\\scratch", "D:\\"),
+            "stale in D:\\app"
+        );
     }
 
     /// Every field a copy run can publish a path into is relabeled: a diagnostic's message and
