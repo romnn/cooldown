@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.19
+
 - **Ecosystems run in parallel.** `outdated`, `check`, `upgrade`, `fix`, and `baseline` drove
   every project one after another, so a polyglot repository waited on crates.io, then PyPI, then
   the npm registry in turn. Each detected tool now runs in its own lane and the lanes run
