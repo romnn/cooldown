@@ -7,6 +7,7 @@
 use super::lock::{ProjectReadGuard, ProjectWriteGuard, RepoToolReadGuard, RepoToolWriteGuard};
 use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
 use camino::Utf8Path;
+use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
     Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, SyncScope, ToolId,
     ToolWrite, WindowSpec, resolve,
@@ -185,12 +186,7 @@ impl Workspace {
 
         for tool in tools {
             let Some(writer) = self.mutator(tool) else {
-                let _progress: Vec<_> = self
-                    .scoped_projects(opts)
-                    .filter(|project| project.tool == tool)
-                    .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
-                    .collect();
-                opts.progress.phase("checking native policy support");
+                self.note_projects(opts, tool, "checking native policy support");
                 summary.unsupported += 1;
                 items.push(unsupported_item(tool));
                 continue;
@@ -199,8 +195,8 @@ impl Workspace {
             match writer.sync_scope() {
                 SyncScope::Project => {
                     for pctx in self.scoped_projects(opts).filter(|pctx| pctx.tool == tool) {
-                        let _progress = opts.progress.project(tool, pctx.rel_path.as_str());
-                        opts.progress.phase("syncing native policy");
+                        let project_progress = opts.progress.project(tool, pctx.rel_path.as_str());
+                        project_progress.phase("syncing native policy");
                         items.push(
                             self.sync_project(
                                 writer,
@@ -215,20 +211,22 @@ impl Workspace {
                     }
                 }
                 SyncScope::Repo => {
-                    let scoped_projects: Vec<_> = self
+                    // One write serves every project, so one block stands for it on the
+                    // display; the tool's other projects are counted complete afterwards.
+                    let mut scoped_projects = self
                         .scoped_projects(opts)
-                        .filter(|project| project.tool == tool)
-                        .collect();
-                    let _progress: Vec<_> = scoped_projects
-                        .iter()
-                        .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
-                        .collect();
+                        .filter(|project| project.tool == tool);
+                    let live = scoped_projects.next().map(|project| {
+                        let project_progress =
+                            opts.progress.project(tool, project.rel_path.as_str());
+                        project_progress.phase("syncing repository-native policy");
+                        project_progress
+                    });
                     let protected_projects: Vec<_> = self
                         .projects()
                         .iter()
                         .filter(|project| project.tool == tool)
                         .collect();
-                    opts.progress.phase("syncing repository-native policy");
                     items.push(
                         self.sync_repo(
                             writer,
@@ -240,14 +238,15 @@ impl Workspace {
                         )
                         .await,
                     );
+                    drop(live);
+                    for project in scoped_projects {
+                        opts.progress
+                            .project(tool, project.rel_path.as_str())
+                            .phase("synced repository-native policy");
+                    }
                 }
                 SyncScope::None => {
-                    let _progress: Vec<_> = self
-                        .scoped_projects(opts)
-                        .filter(|project| project.tool == tool)
-                        .map(|project| opts.progress.project(tool, project.rel_path.as_str()))
-                        .collect();
-                    opts.progress.phase("checking native policy support");
+                    self.note_projects(opts, tool, "checking native policy support");
                     summary.unsupported += 1;
                     items.push(unsupported_item(tool));
                 }
@@ -266,6 +265,20 @@ impl Workspace {
             warnings,
             errors: Vec::new(),
             exit,
+        }
+    }
+
+    /// Opens each of `tool`'s in-scope projects in turn with `phase`, so the projects are
+    /// counted complete one by one without stacking a block per project on the display for a
+    /// message that is the same for all of them.
+    fn note_projects(&self, opts: &RunOpts, tool: ToolId, phase: &str) {
+        for project in self
+            .scoped_projects(opts)
+            .filter(|project| project.tool == tool)
+        {
+            opts.progress
+                .project(tool, project.rel_path.as_str())
+                .phase(phase);
         }
     }
 
@@ -299,15 +312,16 @@ impl Workspace {
             // alongside the default window, so a cooldown-exempt package is exempt natively too.
             exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
         };
-        let result = match acquire_sync_access(writer, pctx, opts.dry_run).await {
-            Ok(access) => {
-                warnings.extend(access.recovery);
-                writer
-                    .write_native(&pctx.project, &policy, opts.dry_run)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let result =
+            match acquire_sync_access(writer, pctx, &self.lease_family(pctx), opts.dry_run).await {
+                Ok(access) => {
+                    warnings.extend(access.recovery);
+                    writer
+                        .write_native(&pctx.project, &policy, opts.dry_run)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
         match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
@@ -364,23 +378,17 @@ impl Workspace {
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
         };
-        let result = match acquire_repo_sync_access(
-            writer,
-            self.repo_root(),
-            tool,
-            projects,
-            opts.dry_run,
-            warnings,
-        )
-        .await
-        {
-            Ok(_access) => {
-                writer
-                    .write_repo_native(self.repo_root(), &policy, opts.dry_run)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+        let result =
+            match acquire_repo_sync_access(writer, self, tool, projects, opts.dry_run, warnings)
+                .await
+            {
+                Ok(_access) => {
+                    writer
+                        .write_repo_native(self.repo_root(), &policy, opts.dry_run)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
         match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
@@ -410,20 +418,22 @@ impl Workspace {
     }
 }
 
+/// Takes the project's lease of `family`, the tool's declared lease family, for one sync.
 async fn acquire_sync_access(
     writer: &dyn ToolWrite,
     pctx: &super::ProjectCtx,
+    family: &ManifestFamily,
     dry_run: bool,
 ) -> cooldown_core::Result<SyncAccess> {
     if dry_run {
-        let guard = ProjectReadGuard::acquire(&pctx.project.root)?;
+        let guard = ProjectReadGuard::acquire(&pctx.project.root, family)?;
         writer.ensure_no_pending_mutation(&pctx.project).await?;
         Ok(SyncAccess {
             guard: SyncAccessGuard::Read { guard },
             recovery: Vec::new(),
         })
     } else {
-        let guard = ProjectWriteGuard::acquire(&pctx.project.root)?;
+        let guard = ProjectWriteGuard::acquire(&pctx.project.root, family)?;
         let recovery = writer
             .recover_pending_mutation(&pctx.project, guard.coordination())
             .await?;
@@ -436,7 +446,7 @@ async fn acquire_sync_access(
 
 async fn acquire_repo_sync_access(
     writer: &dyn ToolWrite,
-    repo_root: &Utf8Path,
+    ws: &Workspace,
     tool: ToolId,
     projects: &[&super::ProjectCtx],
     dry_run: bool,
@@ -444,11 +454,11 @@ async fn acquire_repo_sync_access(
 ) -> cooldown_core::Result<RepoSyncAccess> {
     let resource = if dry_run {
         RepoSyncResourceGuard::Read {
-            guard: RepoToolReadGuard::acquire(repo_root, tool)?,
+            guard: RepoToolReadGuard::acquire(ws.repo_root(), tool)?,
         }
     } else {
         RepoSyncResourceGuard::Write {
-            guard: RepoToolWriteGuard::acquire(repo_root, tool)?,
+            guard: RepoToolWriteGuard::acquire(ws.repo_root(), tool)?,
         }
     };
     let mut projects = projects.to_vec();
@@ -456,7 +466,8 @@ async fn acquire_repo_sync_access(
     projects.dedup_by(|left, right| left.project.root == right.project.root);
     let mut guards = Vec::with_capacity(projects.len());
     for project in projects {
-        let access = acquire_sync_access(writer, project, dry_run).await?;
+        let access =
+            acquire_sync_access(writer, project, &ws.lease_family(project), dry_run).await?;
         guards.push(access.guard);
         recovery.extend(access.recovery);
     }
@@ -496,5 +507,61 @@ fn window_display(spec: &WindowSpec) -> String {
         }
         WindowSpec::Freeze(timestamp) => timestamp.to_string(),
         WindowSpec::Latest => "latest".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::workspace::tests::{TestAdapter, project_ctx};
+    use crate::app::{AdapterSet, Baseline, Progress, RunOpts, Workspace};
+    use camino::Utf8PathBuf;
+    use color_eyre::eyre;
+    use cooldown_core::ToolId;
+    use cooldown_core::config::builtin_default_layer;
+    use std::sync::Arc;
+
+    const CARGO: ToolId = ToolId("cargo");
+
+    /// A repository-scoped sync is one write for the tool's every project, so the display
+    /// shows one live block for it and counts the other projects complete afterwards: one
+    /// report row, one finished block per project, and the tool finished once.
+    #[tokio::test]
+    async fn a_repo_scoped_sync_counts_every_project_once() -> eyre::Result<()> {
+        // Real directories, since the sync takes the projects' leases.
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(root.join("nested"))?;
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: false,
+            repo_sync: true,
+        }))?;
+        let ws = Workspace::new(
+            adapters,
+            vec![
+                project_ctx(CARGO, root.as_str()),
+                project_ctx(CARGO, root.join("nested").as_str()),
+            ],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+        let progress = Progress::plain();
+        progress.start_run(&[CARGO, CARGO]);
+        let opts = RunOpts {
+            progress: progress.clone(),
+            ..RunOpts::default()
+        };
+
+        let out = ws.sync(&opts).await;
+
+        assert_eq!(out.summary.errors, 0, "{:?}", out.warnings);
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(progress.finished_blocks(), 2);
+        assert_eq!(progress.completed_tools(), 1);
+        Ok(())
     }
 }

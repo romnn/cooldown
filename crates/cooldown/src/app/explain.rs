@@ -84,13 +84,11 @@ impl<'a> ExplainService<'a> {
             });
         };
 
-        let _progress = self
+        let progress = self
             .opts
             .progress
             .project(pctx.tool, pctx.rel_path.as_str());
-        self.opts
-            .progress
-            .phase(format!("resolving dependency context for {pkg}"));
+        progress.phase(format!("resolving dependency context for {pkg}"));
         let ExplainedDependency {
             registry,
             excluded_members,
@@ -99,7 +97,10 @@ impl<'a> ExplainService<'a> {
         } = self.dependency_context(pctx, pkg).await?;
         // The decision itself, after the read guard is released: the verdict runs `outdated`'s
         // evaluation for this one package, whose upgrade-policy preview takes its own guard.
-        let mut verdict = self.ws.package_verdict(pctx, self.opts, pkg).await?;
+        let mut verdict = self
+            .ws
+            .package_verdict(pctx, self.opts, pkg, &progress)
+            .await?;
         context_warnings.append(&mut verdict.warnings);
         let q = ResolveQuery {
             tool: pctx.tool,
@@ -170,11 +171,11 @@ impl<'a> ExplainService<'a> {
     fn config(&self) -> ConfigOutcome {
         let mut items: Vec<ConfigItem> = Vec::new();
         for pctx in self.ws.scoped_projects(self.opts) {
-            let _progress = self
+            let progress = self
                 .opts
                 .progress
                 .project(pctx.tool, pctx.rel_path.as_str());
-            self.opts.progress.phase("resolving effective policy");
+            progress.phase("resolving effective policy");
             let q = ResolveQuery {
                 tool: pctx.tool,
                 package: "",

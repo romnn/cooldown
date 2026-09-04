@@ -15,6 +15,7 @@
 //! The happy path — the whole set resolves — is a single `apply` with no extra cost, and the
 //! per-package managers (npm/yarn/bun), which never fail atomically, always take it.
 
+use camino::Utf8Path;
 use std::collections::HashSet;
 
 use cooldown_core::{
@@ -23,10 +24,12 @@ use cooldown_core::{
 };
 
 use super::change_key::{ChangeTargetKey, change_target_key};
+use super::lock::EnvironmentWriteGuard;
 
 #[derive(Debug)]
 pub(crate) enum ApplyFailure {
-    /// The native apply failed after its observed state was restored successfully.
+    /// The native apply failed after its observed state was restored successfully, or never
+    /// ran because the environment turn was refused, so the project is as it was.
     Failed(cooldown_core::CoreError),
     /// The native apply may have mutated the project, but its state could not be observed or
     /// restored safely.
@@ -63,7 +66,7 @@ async fn apply_resilient_full(
     plan: &cooldown_core::Plan,
 ) -> Result<AppliedMutation> {
     let mutation = PreparedMutation::prepare(writer, project, plan).await?;
-    apply_resilient_with_observer(writer, &mutation, &())
+    apply_resilient_with_observer(writer, &mutation, &(), &project.root)
         .await
         .map_err(ApplyFailure::into_core_error)
 }
@@ -92,7 +95,19 @@ async fn apply_checked(
     writer: &dyn ToolWrite,
     mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
+    environment: &Utf8Path,
 ) -> ApplyResult<cooldown_core::ApplyAttemptOutcome> {
+    // An apply that installs writes the environment a build writes, so it takes the same turn;
+    // a lease that cannot be taken is a local failure, since no apply ran.
+    let _environment = if writer.mutation_installs() {
+        Some(
+            EnvironmentWriteGuard::acquire_async(environment)
+                .await
+                .map_err(ApplyFailure::Failed)?,
+        )
+    } else {
+        None
+    };
     let attempt = writer
         .apply_with_observer(mutation, observer)
         .await
@@ -114,14 +129,20 @@ async fn apply_checked(
 /// so no partial widen or lock leaks.
 /// Its project identity and writable topology are revalidated before every adapter attempt.
 /// Native candidate work is forwarded to `observer` across the first attempt and recovery trials.
+/// `environment` is the source project's root, whose environment an installing apply writes
+/// even when the mutation runs on a copy of the project.
+/// The environment turn is taken per attempt, so a sibling lane's install may land between two
+/// recovery trials; holding it across the whole search would block every other lane's build
+/// and install for the search's duration.
 pub(crate) async fn apply_resilient_with_observer(
     writer: &dyn ToolWrite,
     mutation: &PreparedMutation,
     observer: &dyn ApplyObserver,
+    environment: &Utf8Path,
 ) -> ApplyResult<AppliedMutation> {
     let plan = mutation.plan();
     let journal = mutation.journal();
-    let first = apply_checked(writer, mutation, observer).await?;
+    let first = apply_checked(writer, mutation, observer, environment).await?;
     let (first_report, first_state) = match first {
         cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => (report, postimage),
         cooldown_core::ApplyAttemptOutcome::PendingRecovery { detail } => {
@@ -155,7 +176,7 @@ pub(crate) async fn apply_resilient_with_observer(
     }
 
     let (accepted, dropped, trial_state) =
-        verified_satisfiable_subset(writer, mutation, first_state, observer).await?;
+        verified_satisfiable_subset(writer, mutation, first_state, observer, environment).await?;
     // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
     // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
     // accepted one. Transitive members remain attribution context, not distinct editable targets.
@@ -176,7 +197,7 @@ pub(crate) async fn apply_resilient_with_observer(
         let committed = mutation
             .subset(accepted)
             .map_err(ApplyFailure::RestoreConflict)?;
-        let result = apply_checked(writer, &committed, observer).await?;
+        let result = apply_checked(writer, &committed, observer, environment).await?;
         let (report, expected) = match result {
             cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => {
                 (report, postimage)
@@ -253,6 +274,7 @@ async fn verified_satisfiable_subset(
     mutation: &PreparedMutation,
     mut current_state: ProjectMutationState,
     observer: &dyn ApplyObserver,
+    environment: &Utf8Path,
 ) -> ApplyResult<(
     Vec<Change>,
     Vec<(Change, cooldown_core::CoreError)>,
@@ -272,7 +294,7 @@ async fn verified_satisfiable_subset(
         let trial = mutation
             .subset(accepted.iter().chain(group.iter()).cloned().collect())
             .map_err(ApplyFailure::RestoreConflict)?;
-        let result = apply_checked(writer, &trial, observer).await?;
+        let result = apply_checked(writer, &trial, observer, environment).await?;
         let report = match result {
             cooldown_core::ApplyAttemptOutcome::Finished { report, postimage } => {
                 current_state = postimage;
@@ -541,6 +563,7 @@ mod tests {
         fault: Option<Fault>,
         reject_error: RejectError,
         apply_calls: AtomicUsize,
+        installs: bool,
     }
 
     impl MockWriter {
@@ -551,6 +574,7 @@ mod tests {
                 fault: None,
                 reject_error: RejectError::Tool,
                 apply_calls: AtomicUsize::new(0),
+                installs: false,
             }
         }
 
@@ -573,6 +597,12 @@ mod tests {
             self
         }
 
+        /// The writer installs as it applies, so every apply takes the environment turn.
+        fn installing(mut self) -> Self {
+            self.installs = true;
+            self
+        }
+
         fn apply_calls(&self) -> usize {
             self.apply_calls.load(Ordering::SeqCst)
         }
@@ -582,6 +612,10 @@ mod tests {
     impl ToolWrite for MockWriter {
         fn mutation_tool(&self) -> ToolId {
             self.tool
+        }
+
+        fn mutation_installs(&self) -> bool {
+            self.installs
         }
 
         async fn mutation_journal(
@@ -699,6 +733,34 @@ mod tests {
         assert_eq!(writer.apply_calls(), 1);
     }
 
+    /// A refused environment turn is a local failure: the apply never ran, so the project is as
+    /// it was and later mutations may still run.
+    #[tokio::test]
+    async fn a_refused_environment_turn_fails_before_any_apply() -> eyre::Result<()> {
+        let writer = MockWriter::new(|_| true).installing();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        std::fs::write(project.root.join("requirements.txt"), "original")?;
+        let plan = plan(&["a"]);
+        let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
+        // The holder is in this process, so the conflict is immediate instead of a wait.
+        let held = cooldown_core::fs::ProjectWriteLease::acquire_environment(
+            cooldown_core::fs::ProjectCoordination::resolve(&project.root)?,
+        )?;
+
+        let result = apply_resilient_with_observer(&writer, &mutation, &(), &project.root).await;
+
+        std::assert_matches!(
+            result,
+            Err(ApplyFailure::Failed(CoreError::LockConflict(_)))
+        );
+        assert_eq!(writer.apply_calls(), 0);
+        drop(held);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn prepared_operation_rejects_another_adapter() -> eyre::Result<()> {
         let writer = MockWriter::new(|_| true);
@@ -781,7 +843,7 @@ mod tests {
         std::fs::remove_file(project.root.join(relative))?;
         symlink(external.join(relative), project.root.join(relative))?;
 
-        let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
+        let result = apply_resilient_with_observer(&writer, &mutation, &(), &project.root).await;
 
         std::assert_matches!(
             result,
@@ -812,7 +874,7 @@ mod tests {
         let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
         std::fs::hard_link(project.root.join(relative), external.join(relative))?;
 
-        let result = apply_resilient_with_observer(&writer, &mutation, &()).await;
+        let result = apply_resilient_with_observer(&writer, &mutation, &(), &project.root).await;
 
         std::assert_matches!(
             result,
@@ -845,7 +907,7 @@ mod tests {
         let plan = plan(&["a", "b", "c"]);
         let mutation = PreparedMutation::prepare(&writer, &project, &plan).await?;
 
-        apply_resilient_with_observer(&writer, &mutation, &observer)
+        apply_resilient_with_observer(&writer, &mutation, &observer, &project.root)
             .await
             .map_err(ApplyFailure::into_core_error)?;
 

@@ -8,6 +8,7 @@
 //! each adapter is built from (constructor-injected, reusable and fakeable in unit tests).
 
 use crate::error::{CoreError, Result};
+use crate::fs::ManifestFamily;
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, Change, DepScope, Dependency, FetchContext,
     LockVerifyReport, Plan, Project, ProjectDetection, Release, ToolId, UpdateKind, VerifyReport,
@@ -94,6 +95,23 @@ pub trait ToolRead: Send + Sync {
     /// validation-only markers.
     /// An adapter neither walks the tree nor decides `.gitignore` or exclude policy itself.
     fn project_detection(&self) -> ProjectDetection;
+
+    /// Names the manifest family whose lease guards `project`: the file this tool rewrites at
+    /// the root, which is the primary marker's manifest unless the adapter says otherwise.
+    ///
+    /// Tools of one family take turns at a root, since they rewrite the same file; tools of
+    /// different families run side by side.
+    /// The lane planner and every lease site read the family from here alone, so an adapter
+    /// whose recorded manifest is not the file it rewrites overrides this to name the rewritten
+    /// file: pixi is detected by `pixi.lock` but rewrites `pixi.toml`, or the `pyproject.toml`
+    /// that hosts its tables and that uv and poetry rewrite too.
+    /// The family is a method rather than marker data because pixi's depends on which manifest
+    /// exists at the root.
+    /// A tool that rewrites either of two spellings (deno's `deno.json` or `deno.jsonc`) keeps
+    /// one family for both, since the family is a lease key rather than a path.
+    fn lease_family(&self, _project: &Project) -> ManifestFamily {
+        ManifestFamily::named(self.project_detection().primary().manifest)
+    }
 
     /// Validates manifest roots found without the adapter's declared lockfile marker.
     ///
@@ -768,6 +786,21 @@ pub trait ToolWrite: Send + Sync {
     /// effect. An engine without the guard leaves the policy inert, and the run says so rather
     /// than letting a CI job believe its graph is gated.
     fn guards_duplicate_copies(&self) -> bool {
+        false
+    }
+
+    /// Whether applying a change installs, fetches, or compiles into an environment rather than
+    /// only rewriting the manifest and lock: poetry's `poetry add` syncs the active virtualenv,
+    /// conda's `conda install` writes the active prefix, bundler's `bundle update` installs the
+    /// gem, and mix's `deps.update` and Swift's `package update` fetch and build dependencies
+    /// into directories a build writes too and an environment variable can share.
+    ///
+    /// Such an apply takes the environment turn a `--build` step takes, so it never overlaps
+    /// another lane's install or build in an environment the lanes share.
+    /// A tool whose apply only rewrites files and its own registry cache, which every package
+    /// manager guards itself (cargo, pip's requirements rewrite, uv's `uv lock`, the npm
+    /// family's `--lockfile-only`), leaves this `false` and applies side by side.
+    fn mutation_installs(&self) -> bool {
         false
     }
 

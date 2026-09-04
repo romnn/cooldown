@@ -12,6 +12,7 @@ use cooldown_adapter_util::{
     Driver, RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
     verify_current_unknown,
 };
+use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
@@ -54,6 +55,16 @@ pub trait CondaLayout: Send + Sync + 'static {
 
     /// The driver args for the opt-in `--build` step.
     fn build_args() -> Vec<String>;
+
+    /// The family of the file the driver rewrites at `root`, which the project lease guards.
+    ///
+    /// conda-lock's driver rewrites no file at the root (`conda install` writes the active
+    /// prefix), so the default names the recorded lock as a stable key of the layout's own; a
+    /// layout whose driver rewrites a source manifest overrides this to name that file.
+    #[must_use]
+    fn lease_family(_root: &Utf8Path) -> ManifestFamily {
+        ManifestFamily::named(Self::LOCKFILE)
+    }
 }
 
 /// conda-lock: `conda-lock.yml`, driven by `conda`.
@@ -114,6 +125,16 @@ impl CondaLayout for Pixi {
 
     fn build_args() -> Vec<String> {
         vec!["install".into()]
+    }
+
+    /// `pixi add` rewrites the manifest it finds: `pixi.toml`, or otherwise the `pyproject.toml`
+    /// hosting a `[tool.pixi]` table, which is uv's and poetry's file too.
+    fn lease_family(root: &Utf8Path) -> ManifestFamily {
+        if root.join("pixi.toml").is_file() {
+            ManifestFamily::named("pixi.toml")
+        } else {
+            ManifestFamily::named("pyproject.toml")
+        }
     }
 }
 
@@ -200,6 +221,10 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             alternate_manifests: &[],
             workspace_root: false,
         })
+    }
+
+    fn lease_family(&self, project: &Project) -> ManifestFamily {
+        L::lease_family(&project.root)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -310,6 +335,11 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
         L::ID
     }
 
+    // `conda install` writes the active prefix and `pixi add` installs into `.pixi/envs`.
+    fn mutation_installs(&self) -> bool {
+        true
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -342,6 +372,43 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+
+    /// A pixi project's lease names the file `pixi add` rewrites, so a pyproject-hosted pixi
+    /// project takes turns with uv and poetry at the root, while conda-lock keeps its own lease.
+    /// The assertions go through the port, so dropping the layout override would fail them.
+    #[test]
+    fn the_lease_family_is_the_rewritten_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8 path");
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+        let pixi = CondaEnvTool::<Pixi>::from_http(http.clone());
+        let conda = CondaEnvTool::<CondaLock>::from_http(http);
+        let project = |lock: &str| Project {
+            root: root.clone(),
+            kind: ToolId("pixi"),
+            manifest: root.join(lock),
+            exclude_newer: None,
+        };
+
+        assert_eq!(
+            pixi.lease_family(&project("pixi.lock")),
+            ManifestFamily::named("pyproject.toml")
+        );
+        std::fs::write(root.join("pixi.toml"), "[project]\n").expect("write pixi.toml");
+        assert_eq!(
+            pixi.lease_family(&project("pixi.lock")),
+            ManifestFamily::named("pixi.toml")
+        );
+        assert_eq!(
+            conda.lease_family(&project("conda-lock.yml")),
+            ManifestFamily::named("conda-lock.yml")
+        );
+        // Both applies install, so both take the environment turn.
+        assert!(pixi.mutation_installs());
+        assert!(conda.mutation_installs());
+    }
 
     #[test]
     fn mixed_registry_graphs_have_no_single_osv_ecosystem() {

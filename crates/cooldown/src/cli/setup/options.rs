@@ -187,6 +187,8 @@ pub(super) fn resolve_invocation(
                 .or(merged.concurrency)
                 .unwrap_or(16)
                 .max(1),
+            // `--jobs` (CLI/env) wins over a `[<command>]`/`[global]` config value.
+            jobs: global.jobs.or(merged.jobs),
             // No CLI flag: the built-in fix-round budget always applies to real invocations.
             fix_round_budget: None,
         },
@@ -236,6 +238,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         json: Some(false),
         exit_code: None,
         concurrency: Some(16),
+        jobs: None,
     }
 }
 
@@ -269,6 +272,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         json: overrides.json,
         exit_code: overrides.exit_code,
         concurrency: None,
+        jobs: None,
     }
 }
 

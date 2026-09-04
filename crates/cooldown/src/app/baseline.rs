@@ -176,86 +176,17 @@ impl crate::app::Workspace {
     /// Returns the [`CoreError`] from a tool adapter if a project's dependency graph cannot be
     /// enumerated.
     pub async fn baseline_entries(&self, opts: &super::RunOpts) -> Result<BaselineScan, CoreError> {
-        use cooldown_core::{DepScope, Status, check_pin_advised};
-
+        // Every project is read under a shared lease, so the tools' lanes overlap freely.
+        let lanes = self.lanes(opts, super::lanes::LaneAccess::Shared);
+        let projects = lanes.run(|pctx| self.baseline_project(pctx, opts)).await;
         let mut entries = Vec::new();
         let mut diagnostics = Vec::new();
-        for pctx in self.scoped_projects(opts) {
-            let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
-            opts.progress.phase("resolving dependency graph");
-            let Some(adapter) = self.adapter(pctx.tool) else {
-                continue;
-            };
-            let read_guard = self.project_read_guard(pctx).await?;
-            let mut deps = self
-                .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
-                .await?
-                .deps;
-            drop(read_guard);
-            // Identities must be adapter-confirmed before they are queried, matched, or
-            // counted (see `ToolRead::confirm_advisory_identities`) — only when the feed runs.
-            if super::advisories::advisory_fetch_policy(pctx).is_some() {
-                adapter
-                    .confirm_advisory_identities(&pctx.project, &mut deps)
-                    .await;
-            }
-            let fctx = Self::fetch_context(pctx, opts);
-            let rctx = Self::resolve_ctx(pctx, opts);
-            // Advised like `check`: a pin the advised gate passes (a security fix under its
-            // shortened window) must not be baselined — the baseline would outlive the
-            // shortened hold for no reason.
-            // A feed failure therefore changes what gets written, so its diagnostics travel
-            // back to the caller instead of being dropped.
-            // Route through the cache-backed fetch — the only locked-release path — so a package
-            // shared with other commands/projects this run is not re-fetched.
-            let advisory_fetch = self.fetch_project_advisories(
-                adapter,
-                pctx,
-                pctx.rel_path.as_str(),
-                super::advisories::AdvisoryPackages::from_deps(&deps),
-                opts,
-            );
-            let release_fetch =
-                self.fetch_locked_releases(adapter, deps, &fctx, &opts.progress, opts.fanout());
-            let (outcome, fetched) = tokio::join!(advisory_fetch, release_fetch);
-            let advisories = outcome.record_flat(&mut diagnostics);
-
-            for FetchedRelease {
-                dependency: dep,
-                result,
-            } in fetched
-            {
-                let Ok(locked) = result else { continue };
-                let advised = advisories.as_ref().and_then(|project| {
-                    project.classify(adapter, &dep, std::slice::from_ref(&locked))
-                });
-                let advisory_ctx = advised
-                    .as_ref()
-                    .map(super::advisories::ClassifiedAdvisories::context);
-                let pv = check_pin_advised(
-                    &dep,
-                    &locked,
-                    advisory_ctx.as_ref(),
-                    &pctx.policy.layers,
-                    &rctx,
-                    self.now(),
-                );
-                if pv.status == Status::CurrentInCooldown {
-                    entries.push(AckEntry {
-                        tool: pctx.tool.as_str().to_string(),
-                        project: pctx.rel_path.to_string(),
-                        package: dep.package.name.clone(),
-                        version: dep.current.to_string(),
-                        registry: dep.package.registry.clone(),
-                        published_at: pv.published_at.map(|p| p.to_string()),
-                        window_days: Some(super::round2(
-                            pv.window.effective_min_age_days(self.now()),
-                        )),
-                        reason: Some("recorded by `cooldown baseline`".to_string()),
-                        until: None,
-                    });
-                }
-            }
+        // Every lane runs to completion; the first failing project in scoped order then decides
+        // the result, so the error a run reports never depends on which lane finished first.
+        for project in projects {
+            let (mut project_entries, mut project_diagnostics) = project?;
+            entries.append(&mut project_entries);
+            diagnostics.append(&mut project_diagnostics);
         }
         // Pins are fetched concurrently (`buffer_unordered`); sort so the written baseline file is
         // stable (no spurious diffs when re-running `cooldown baseline`).
@@ -269,6 +200,93 @@ impl crate::app::Workspace {
             entries,
             diagnostics,
         })
+    }
+
+    /// The young pins of one project, with the advisory diagnostics gathered judging them.
+    async fn baseline_project(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &super::RunOpts,
+    ) -> Result<(Vec<AckEntry>, Vec<cooldown_core::Diagnostic>), CoreError> {
+        use cooldown_core::{DepScope, Status, check_pin_advised};
+
+        let mut entries = Vec::new();
+        let mut diagnostics = Vec::new();
+        let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+        progress.phase("resolving dependency graph");
+        let Some(adapter) = self.adapter(pctx.tool) else {
+            return Ok((entries, diagnostics));
+        };
+        let read_guard = self.project_read_guard(pctx).await?;
+        let mut deps = self
+            .dependencies_in_scope(adapter, pctx, DepScope::Graph, opts)
+            .await?
+            .deps;
+        drop(read_guard);
+        // Identities must be adapter-confirmed before they are queried, matched, or
+        // counted (see `ToolRead::confirm_advisory_identities`) — only when the feed runs.
+        if super::advisories::advisory_fetch_policy(pctx).is_some() {
+            adapter
+                .confirm_advisory_identities(&pctx.project, &mut deps)
+                .await;
+        }
+        let fctx = Self::fetch_context(pctx, opts);
+        let rctx = Self::resolve_ctx(pctx, opts);
+        // Advised like `check`: a pin the advised gate passes (a security fix under its
+        // shortened window) must not be baselined — the baseline would outlive the
+        // shortened hold for no reason.
+        // A feed failure therefore changes what gets written, so its diagnostics travel
+        // back to the caller instead of being dropped.
+        // Route through the cache-backed fetch — the only locked-release path — so a package
+        // shared with other commands/projects this run is not re-fetched.
+        let advisory_fetch = self.fetch_project_advisories(
+            adapter,
+            pctx,
+            pctx.rel_path.as_str(),
+            super::advisories::AdvisoryPackages::from_deps(&deps),
+            opts,
+            &progress,
+        );
+        let release_fetch =
+            self.fetch_locked_releases(adapter, deps, &fctx, &progress, opts.fanout());
+        let (outcome, fetched) = tokio::join!(advisory_fetch, release_fetch);
+        let advisories = outcome.record_flat(&mut diagnostics);
+
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
+            let Ok(locked) = result else { continue };
+            let advised = advisories
+                .as_ref()
+                .and_then(|project| project.classify(adapter, &dep, std::slice::from_ref(&locked)));
+            let advisory_ctx = advised
+                .as_ref()
+                .map(super::advisories::ClassifiedAdvisories::context);
+            let pv = check_pin_advised(
+                &dep,
+                &locked,
+                advisory_ctx.as_ref(),
+                &pctx.policy.layers,
+                &rctx,
+                self.now(),
+            );
+            if pv.status == Status::CurrentInCooldown {
+                entries.push(AckEntry {
+                    tool: pctx.tool.as_str().to_string(),
+                    project: pctx.rel_path.to_string(),
+                    package: dep.package.name.clone(),
+                    version: dep.current.to_string(),
+                    registry: dep.package.registry.clone(),
+                    published_at: pv.published_at.map(|p| p.to_string()),
+                    window_days: Some(super::round2(pv.window.effective_min_age_days(self.now()))),
+                    reason: Some("recorded by `cooldown baseline`".to_string()),
+                    until: None,
+                });
+            }
+        }
+        Ok((entries, diagnostics))
     }
 }
 

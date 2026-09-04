@@ -12,6 +12,7 @@ mod change_key;
 mod check;
 mod clock;
 mod explain;
+mod lanes;
 pub(crate) mod lock;
 mod outdated;
 mod progress;
@@ -33,6 +34,7 @@ pub use cooldown_render::{
     UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
 };
 pub use progress::Progress;
+pub(crate) use progress::ProjectProgress;
 pub use recover::{RecoveryItem, RecoveryOutcome, RecoveryStatus, RecoverySummary};
 pub use sync::{SyncItem, SyncOutcome, SyncStatus, SyncSummary};
 pub use workspace::{

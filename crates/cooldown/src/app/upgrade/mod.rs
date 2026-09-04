@@ -13,14 +13,19 @@ mod executor;
 
 pub(super) use self::executor::target_package_for;
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
+use super::advisories::ProjectAdvisories;
+use super::lanes::LaneAccess;
 use super::{
-    BuildInfo, Exit, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
+    BuildInfo, Exit, ProjectProgress, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace,
+    diag_from_error,
 };
 use cooldown_core::{
     AcceptedPublication, Change, Diagnostic, DiagnosticKind, EdgeBindingAction, IsolatedMutation,
-    IsolatedMutationStrategy, LockStatus, MutationExecution, PackageId, ToolRead, ToolWrite,
+    IsolatedMutationStrategy, LockStatus, MemberRef, MutationExecution, PackageId, ToolRead,
+    ToolWrite,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
 /// be), plus the re-lock/build status and the exit it implies.
@@ -40,7 +45,8 @@ pub struct UpgradeOutcome {
     pub exit: Exit,
 }
 
-/// The mutable state accumulated across all projects in an upgrade run.
+/// The mutable state accumulated by one project's run (or one trial), folded into the run's accumulator in
+/// project order by [`merge_upgrade_accum`].
 #[derive(Default)]
 pub(super) struct UpgradeAccum {
     pub(super) items: Vec<UpgradeItem>,
@@ -59,13 +65,32 @@ pub(super) struct UpgradeAccum {
     pub(super) lock_status: Option<LockStatus>,
 }
 
+/// The evidence a preview's targets were selected from, carried into the trial's policy run so
+/// it judges from exactly the data that selected them.
+pub(super) struct PreviewEvidence {
+    /// The build-backend requirements merged beside the resolved graph, which the lock never
+    /// records (see [`Workspace::manifest_constraints_in_scope`]).
+    pub(super) manifest_only: HashSet<PackageId>,
+    /// The caller's already-fetched feed snapshot: a second fetch could see a newer one and hold
+    /// a candidate the caller just reported adoptable.
+    /// `None` fetches one as usual.
+    pub(super) advisories: Option<Arc<ProjectAdvisories>>,
+    /// The members the run's scope and exclude policy dropped.
+    pub(super) excluded_members: Vec<MemberRef>,
+}
+
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
 pub(super) struct UpgradeCtx<'a> {
     pub(super) reader: &'a dyn ToolRead,
     pub(super) writer: &'a dyn ToolWrite,
     pub(super) pctx: &'a super::ProjectCtx,
     pub(super) opts: &'a RunOpts,
+    /// The project's open progress block.
+    pub(super) progress: &'a ProjectProgress,
     repo_root: &'a camino::Utf8Path,
+    /// The source project's root, whose environment an install or build writes even when
+    /// `pctx` is a copy of the project.
+    pub(super) source_root: &'a camino::Utf8Path,
     access: ProjectExecution,
     defer_build: bool,
 }
@@ -87,14 +112,18 @@ impl UpgradeCtx<'_> {
         self.pctx.tool.as_str()
     }
 
-    fn write_guard(&self) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
+    async fn write_guard(
+        &self,
+    ) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
         match &self.access {
-            ProjectExecution::Source => super::lock::ProjectAccessWriteGuard::acquire(
+            ProjectExecution::Source => super::lock::ProjectAccessWriteGuard::acquire_async(
                 self.repo_root,
                 &self.pctx.project.root,
+                &self.reader.lease_family(&self.pctx.project),
                 self.pctx.tool,
                 self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
             )
+            .await
             .map(Some),
             ProjectExecution::Copy | ProjectExecution::Isolated(_) => Ok(None),
         }
@@ -153,117 +182,130 @@ impl Workspace {
     }
 
     async fn run_plan(&self, opts: &RunOpts, mode: PlanMode) -> UpgradeOutcome {
+        // A source mutation holds an exclusive lease, which decides how far the tools' lanes may
+        // overlap (see `LaneAccess`); a dry run mutates a copy under a shared one.
+        let lanes = self.lanes(opts, LaneAccess::for_mutation(opts));
+        let projects = lanes
+            .run(|pctx| self.run_plan_project(pctx, opts, mode))
+            .await;
         let mut acc = UpgradeAccum {
             build_requested: opts.build,
             ..UpgradeAccum::default()
         };
-
-        for pctx in self.scoped_projects(opts) {
-            let _progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
-            let Some(reader) = self.adapter(pctx.tool) else {
-                continue;
-            };
-            let Some(writer) = self.mutator(pctx.tool) else {
-                acc.errors.push(read_only_mutator_diag(pctx));
-                continue;
-            };
-            if let MutationExecution::Isolated(strategy) = writer.mutation_execution() {
-                self.run_isolated_source_project(pctx, opts, mode, strategy, &mut acc)
-                    .await;
-                continue;
-            }
-
-            // Under `--dry-run`, run the same mutation and verification flow against a throwaway
-            // copy assembled from the adapter's declared preview inputs.
-            // The source lock and manifest are never written.
-            // `dry_copy` keeps the temp tree alive while the executor borrows `dry_pctx`.
-            let _dry_copy;
-            let dry_pctx;
-            let mut dry_roots: Option<(camino::Utf8PathBuf, camino::Utf8PathBuf)> = None;
-            let effective_pctx = if opts.dry_run {
-                opts.progress.phase("preparing isolated dry-run project");
-                let copy = match self.project_read_guard(pctx).await {
-                    Ok(_guard) => super::project_copy::ProjectCopy::create(
-                        &pctx.project,
-                        &writer.resolve_inputs(),
-                        &writer.external_resolve_roots(&pctx.project),
-                    ),
-                    Err(error) => Err(error),
-                };
-                match copy {
-                    Ok(copy) => {
-                        dry_pctx = super::ProjectCtx {
-                            tool: pctx.tool,
-                            project: copy.project.clone(),
-                            rel_path: pctx.rel_path.clone(),
-                            policy: pctx.policy.clone(),
-                            edge_policy: pctx.edge_policy,
-                            single_copy: pctx.single_copy.clone(),
-                        };
-                        let (scratch, ancestor) = copy.relabel_roots();
-                        dry_roots = Some((scratch.to_owned(), ancestor.to_owned()));
-                        _dry_copy = copy;
-                        &dry_pctx
-                    }
-                    Err(error) => {
-                        acc.errors.push(diag_from_error(
-                            &error,
-                            pctx.tool,
-                            pctx.rel_path.as_str(),
-                            None,
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                pctx
-            };
-
-            let access = if opts.dry_run {
-                ProjectExecution::Copy
-            } else {
-                ProjectExecution::Source
-            };
-            ProjectUpgradeExecutor::new(
-                self,
-                UpgradeCtx {
-                    reader,
-                    writer,
-                    pctx: effective_pctx,
-                    opts,
-                    repo_root: self.repo_root(),
-                    access,
-                    defer_build: false,
-                },
-                mode,
-                &mut acc,
-            )
-            .run()
-            .await;
-            // The whole scratch tree is spelled as the source ancestor it was staged from, so a
-            // staged sibling (an out-of-tree path dependency) is relabeled with the project.
-            if let Some((scratch, ancestor)) = &dry_roots {
-                relabel_copy_paths(&mut acc, scratch, ancestor);
-            }
+        for project in projects {
+            merge_upgrade_accum(&mut acc, project);
         }
-
         finalize_outcome(opts, acc)
     }
 
-    /// Runs preselected upgrade targets through the complete policy trial in a project copy.
-    ///
-    /// `advisories` carries the caller's already-fetched feed snapshot, so the trial judges
-    /// from exactly the data that selected the targets — a second fetch here could see a newer
-    /// snapshot and hold a candidate the caller just reported adoptable.
-    /// `None` fetches one as usual.
+    /// Plans and applies one project's changes, reporting into its own accumulator.
+    async fn run_plan_project(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        mode: PlanMode,
+    ) -> UpgradeAccum {
+        let mut acc = UpgradeAccum::default();
+        let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+        let Some(reader) = self.adapter(pctx.tool) else {
+            return acc;
+        };
+        let Some(writer) = self.mutator(pctx.tool) else {
+            acc.errors.push(read_only_mutator_diag(pctx));
+            return acc;
+        };
+        if let MutationExecution::Isolated(strategy) = writer.mutation_execution() {
+            self.run_isolated_source_project(pctx, opts, mode, strategy, &mut acc, &progress)
+                .await;
+            return acc;
+        }
+
+        // Under `--dry-run`, run the same mutation and verification flow against a throwaway
+        // copy assembled from the adapter's declared preview inputs.
+        // The source lock and manifest are never written.
+        // `dry_copy` keeps the temp tree alive while the executor borrows `dry_pctx`.
+        let _dry_copy;
+        let dry_pctx;
+        let mut dry_roots: Option<(camino::Utf8PathBuf, camino::Utf8PathBuf)> = None;
+        let effective_pctx = if opts.mutates_source() {
+            pctx
+        } else {
+            progress.phase("preparing isolated dry-run project");
+            let copy = match self.project_read_guard(pctx).await {
+                Ok(_guard) => super::project_copy::ProjectCopy::create(
+                    &pctx.project,
+                    &writer.resolve_inputs(),
+                    &writer.external_resolve_roots(&pctx.project),
+                ),
+                Err(error) => Err(error),
+            };
+            match copy {
+                Ok(copy) => {
+                    dry_pctx = super::ProjectCtx {
+                        tool: pctx.tool,
+                        project: copy.project.clone(),
+                        rel_path: pctx.rel_path.clone(),
+                        policy: pctx.policy.clone(),
+                        edge_policy: pctx.edge_policy,
+                        single_copy: pctx.single_copy.clone(),
+                    };
+                    let (scratch, ancestor) = copy.relabel_roots();
+                    dry_roots = Some((scratch.to_owned(), ancestor.to_owned()));
+                    _dry_copy = copy;
+                    &dry_pctx
+                }
+                Err(error) => {
+                    acc.errors.push(diag_from_error(
+                        &error,
+                        pctx.tool,
+                        pctx.rel_path.as_str(),
+                        None,
+                    ));
+                    return acc;
+                }
+            }
+        };
+
+        let access = if opts.mutates_source() {
+            ProjectExecution::Source
+        } else {
+            ProjectExecution::Copy
+        };
+        ProjectUpgradeExecutor::new(
+            self,
+            UpgradeCtx {
+                reader,
+                writer,
+                pctx: effective_pctx,
+                opts,
+                progress: &progress,
+                repo_root: self.repo_root(),
+                source_root: &pctx.project.root,
+                access,
+                defer_build: false,
+            },
+            mode,
+            &mut acc,
+        )
+        .run()
+        .await;
+        // The whole scratch tree is spelled as the source ancestor it was staged from, so a
+        // staged sibling (an out-of-tree path dependency) is relabeled with the project.
+        if let Some((scratch, ancestor)) = &dry_roots {
+            relabel_copy_paths(&mut acc, scratch, ancestor);
+        }
+        acc
+    }
+
+    /// Runs preselected upgrade targets through the complete policy trial in a project copy,
+    /// reporting into the caller's open `progress` block.
     pub(super) async fn preview_project_upgrade(
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
+        progress: &ProjectProgress,
         changes: Vec<Change>,
-        manifest_only: HashSet<PackageId>,
-        advisories: Option<std::sync::Arc<crate::app::advisories::ProjectAdvisories>>,
-        excluded_members: Vec<cooldown_core::MemberRef>,
+        evidence: PreviewEvidence,
     ) -> UpgradeAccum {
         let mut acc = UpgradeAccum::default();
         let Some(reader) = self.adapter(pctx.tool) else {
@@ -332,7 +374,9 @@ impl Workspace {
                 writer,
                 pctx: &copied_pctx,
                 opts: &preview_opts,
+                progress,
                 repo_root: self.repo_root(),
+                source_root: &pctx.project.root,
                 access: prepared.execution(),
                 defer_build: false,
             },
@@ -341,7 +385,7 @@ impl Workspace {
             },
             &mut acc,
         )
-        .run_policy(changes, manifest_only, advisories, excluded_members)
+        .run_policy(changes, evidence)
         .await;
         let (copy_root, source_root) = prepared.relabel_roots(pctx);
         relabel_copy_paths(&mut acc, copy_root, source_root);
@@ -355,6 +399,7 @@ impl Workspace {
         mode: PlanMode,
         strategy: &dyn IsolatedMutationStrategy,
         acc: &mut UpgradeAccum,
+        progress: &ProjectProgress,
     ) {
         let Some(reader) = self.adapter(pctx.tool) else {
             return;
@@ -380,7 +425,7 @@ impl Workspace {
                 return;
             }
         };
-        opts.progress.phase("preparing isolated mutation project");
+        progress.phase("preparing isolated mutation project");
         let trial = match strategy.prepare(&pctx.project, guard.coordination()).await {
             Ok(trial) => trial,
             Err(error) => {
@@ -412,7 +457,9 @@ impl Workspace {
                 writer,
                 pctx: &copied_pctx,
                 opts: &trial_opts,
+                progress,
                 repo_root: self.repo_root(),
+                source_root: &pctx.project.root,
                 access: execution,
                 defer_build: true,
             },
@@ -425,8 +472,11 @@ impl Workspace {
         // own diagnostics (a capture failure names the staged lock) have all landed in it.
         if status == ProjectRunStatus::Terminated {
             merge_discarded_trial(acc, project_acc);
-        } else {
-            publish_isolated_trial(trial.as_ref(), writer, pctx, opts, project_acc, acc).await;
+        } else if publish_isolated_trial(trial.as_ref(), pctx, opts, progress, project_acc, acc)
+            .await
+            && opts.build
+        {
+            build_published_project(self, writer, pctx, progress, acc).await;
         }
         relabel_copy_paths(acc, &copied_pctx.project.root, &pctx.project.root);
     }
@@ -437,24 +487,26 @@ impl Workspace {
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
     ) -> cooldown_core::Result<(IsolatedAccessGuard, Vec<Diagnostic>)> {
-        let (guard, recovery_warnings) = if opts.dry_run {
-            (
-                IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?),
-                Vec::new(),
-            )
-        } else {
-            let guard = super::lock::ProjectAccessWriteGuard::acquire(
+        let (guard, recovery_warnings) = if opts.mutates_source() {
+            let guard = super::lock::ProjectAccessWriteGuard::acquire_async(
                 self.repo_root(),
                 &pctx.project.root,
+                &self.lease_family(pctx),
                 pctx.tool,
                 writer.sync_scope() == cooldown_core::SyncScope::Repo,
-            )?;
+            )
+            .await?;
             let recovery = writer
                 .recover_pending_mutation(&pctx.project, guard.coordination())
                 .await?;
             let diagnostics =
                 super::recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
             (IsolatedAccessGuard::Write(guard), diagnostics)
+        } else {
+            (
+                IsolatedAccessGuard::Read(self.project_read_guard(pctx).await?),
+                Vec::new(),
+            )
         };
         Ok((guard, recovery_warnings))
     }
@@ -586,13 +638,29 @@ impl PreparedPreview {
     }
 }
 
+/// Folds `source` (one project's run, or one trial) into `target`.
+///
+/// Every field folds commutatively, so the order projects finish in never shows; the rows and
+/// diagnostics keep the order they are folded in, which is the run's project order.
 fn merge_upgrade_accum(target: &mut UpgradeAccum, mut source: UpgradeAccum) {
     target.items.append(&mut source.items);
     target.edge_items.append(&mut source.edge_items);
     target.errors.append(&mut source.errors);
     target.warnings.append(&mut source.warnings);
     target.strict_incomplete |= source.strict_incomplete;
+    target.build_requested |= source.build_requested;
+    target.build_ok = combine_build_ok(target.build_ok, source.build_ok);
     target.lock_status = combine_lock_status(target.lock_status, source.lock_status);
+}
+
+/// One failed build fails the run; a build that ran and passed is reported only when none
+/// failed; `None` on both sides means no build was attempted.
+const fn combine_build_ok(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, None) => None,
+    }
 }
 
 fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
@@ -602,14 +670,18 @@ fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
         .extend(source.items.into_iter().filter_map(|item| item.error));
 }
 
+/// Publishes the trial's accepted state and folds its rows into `acc`.
+///
+/// Returns whether the published state stands, so the caller may build it: a dry run publishes
+/// nothing, and a publication that failed or left recovery pending must not be built.
 async fn publish_isolated_trial(
     trial: &dyn IsolatedMutation,
-    writer: &dyn ToolWrite,
     pctx: &super::ProjectCtx,
     opts: &RunOpts,
+    progress: &ProjectProgress,
     mut project_acc: UpgradeAccum,
     acc: &mut UpgradeAccum,
-) {
+) -> bool {
     let accepted = match trial.accepted_state() {
         Ok(accepted) => accepted,
         Err(error) => {
@@ -620,14 +692,14 @@ async fn publish_isolated_trial(
                 pctx.rel_path.as_str(),
                 None,
             ));
-            return;
+            return false;
         }
     };
     if opts.dry_run {
         merge_upgrade_accum(acc, project_acc);
-        return;
+        return false;
     }
-    opts.progress.phase("publishing accepted project state");
+    progress.phase("publishing accepted project state");
     let publication = match trial.publish(&accepted).await {
         Ok(publication) => publication,
         Err(error) => {
@@ -638,7 +710,7 @@ async fn publish_isolated_trial(
                 pctx.rel_path.as_str(),
                 None,
             ));
-            return;
+            return false;
         }
     };
     let (warnings, pending_recovery) = match publication {
@@ -662,11 +734,9 @@ async fn publish_isolated_trial(
             pctx.rel_path.as_str(),
             None,
         ));
-        return;
+        return false;
     }
-    if opts.build {
-        build_published_project(writer, pctx, opts, acc).await;
-    }
+    true
 }
 
 const fn combine_lock_status(
@@ -686,14 +756,18 @@ const fn combine_lock_status(
 }
 
 async fn build_published_project(
+    ws: &Workspace,
     writer: &dyn ToolWrite,
     pctx: &super::ProjectCtx,
-    opts: &RunOpts,
+    progress: &ProjectProgress,
     acc: &mut UpgradeAccum,
 ) {
     acc.build_requested = true;
-    opts.progress.phase("building updated project");
-    match writer.build(&pctx.project).await {
+    progress.phase("building updated project");
+    match ws
+        .build_project(writer, &pctx.project, &pctx.project.root)
+        .await
+    {
         Ok(report) => {
             acc.build_ok = Some(acc.build_ok.unwrap_or(true) && report.ok);
             if !report.ok {
@@ -859,10 +933,13 @@ fn upgrade_meta(opts: &RunOpts, acc: &UpgradeAccum, mutations: usize) -> Upgrade
 
 #[cfg(test)]
 mod tests {
-    use super::{UpgradeAccum, UpgradeItem, dedupe_edge_items, finalize_outcome};
+    use super::{
+        UpgradeAccum, UpgradeItem, combine_lock_status, dedupe_edge_items, finalize_outcome,
+        merge_upgrade_accum,
+    };
     use crate::app::RunOpts;
     use crate::app::UpgradeEdgeInfo;
-    use cooldown_core::{EdgeBindingAction, UpdateKind};
+    use cooldown_core::{EdgeBindingAction, LockStatus, UpdateKind};
 
     fn edge_item(registry: &str) -> UpgradeItem {
         UpgradeItem {
@@ -887,6 +964,54 @@ mod tests {
                 detail: None,
             }),
             security: None,
+        }
+    }
+
+    /// Folding projects is order-independent for the run-level flags: one failed build fails
+    /// the run whichever lane reports it, a passed build counts only when none failed, and the
+    /// build request survives a project that never built.
+    #[test]
+    fn merged_projects_fold_build_state_commutatively() {
+        let built = |ok: bool| UpgradeAccum {
+            build_requested: true,
+            build_ok: Some(ok),
+            ..UpgradeAccum::default()
+        };
+        for (first, second) in [(built(true), built(false)), (built(false), built(true))] {
+            let mut run = UpgradeAccum::default();
+            merge_upgrade_accum(&mut run, first);
+            merge_upgrade_accum(&mut run, second);
+            assert_eq!(run.build_ok, Some(false));
+            assert!(run.build_requested);
+        }
+
+        let mut run = UpgradeAccum::default();
+        merge_upgrade_accum(&mut run, UpgradeAccum::default());
+        merge_upgrade_accum(&mut run, built(true));
+        assert_eq!(run.build_ok, Some(true));
+
+        let mut run = UpgradeAccum::default();
+        merge_upgrade_accum(&mut run, UpgradeAccum::default());
+        assert_eq!(run.build_ok, None);
+        assert!(!run.build_requested);
+    }
+
+    /// The lock status folds to the worst side whichever lane reports it: a stale project makes
+    /// the run stale, an unknown outranks current, and a project without a status leaves the
+    /// other's.
+    #[test]
+    fn merged_lock_status_takes_the_worst_side_commutatively() {
+        use LockStatus::{Current, Stale, Unknown};
+        for (left, right, expected) in [
+            (Some(Stale), Some(Current), Some(Stale)),
+            (Some(Stale), Some(Unknown), Some(Stale)),
+            (Some(Unknown), Some(Current), Some(Unknown)),
+            (Some(Current), None, Some(Current)),
+            (Some(Unknown), None, Some(Unknown)),
+            (None, None, None),
+        ] {
+            assert_eq!(combine_lock_status(left, right), expected);
+            assert_eq!(combine_lock_status(right, left), expected);
         }
     }
 

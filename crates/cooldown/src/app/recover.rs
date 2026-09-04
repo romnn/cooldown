@@ -107,8 +107,8 @@ pub(crate) fn recover_targets(
     let mut summary = RecoverySummary::default();
     let mut items = Vec::new();
     for target in targets {
-        let _progress = progress.project(target.tool, &target.project);
-        progress.phase("checking interrupted project state");
+        let project_progress = progress.project(target.tool, &target.project);
+        project_progress.phase("checking interrupted project state");
         let result = (target.recover)(&target.root);
         let (status, error, warnings) = match result {
             Ok(recovery) => {

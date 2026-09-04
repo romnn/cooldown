@@ -531,6 +531,11 @@ pub(in crate::cli) struct GlobalArgs {
     /// registry's rate limit. Defaults to 16; also settable per-section in config as `concurrency`.
     #[arg(long, global = true, value_name = "N", env = "COOLDOWN_CONCURRENCY")]
     pub(in crate::cli) concurrency: Option<usize>,
+    /// How many ecosystems run at once.
+    /// Every detected tool runs in its own lane by default; `1` runs them one after another.
+    /// Also settable per-section in config as `jobs`.
+    #[arg(long, global = true, value_name = "N", env = "COOLDOWN_JOBS")]
+    pub(in crate::cli) jobs: Option<std::num::NonZeroUsize>,
     /// Ignore the native config layer (reproducibility / debugging).
     #[arg(long = "no-native", global = true)]
     pub(in crate::cli) no_native: bool,

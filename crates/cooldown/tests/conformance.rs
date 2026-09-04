@@ -1011,9 +1011,13 @@ async fn non_git_project_coordinates_under_repo_root_cooldown_locks() {
         locks.join(".maintenance.lock").is_file(),
         "the shared maintenance lock lives in the fallback namespace"
     );
-    let project_lease = locks.join(format!(
-        "{:016x}.lock",
-        cooldown_core::fs::fnv1a_64(canonical.as_str())
+    // The lease is the one of the family the fake declares, its marker's manifest rather than
+    // the fixture's recorded `go.mod`, keyed by the canonical root.
+    // This is the one end-to-end check that the run's lease sites read the adapter's family
+    // rather than the recorded manifest's name.
+    let project_lease = locks.join(cooldown_core::fs::project_lease_name(
+        &canonical,
+        &cooldown_core::fs::ManifestFamily::named("fake.toml"),
     ));
     assert!(
         project_lease.is_file(),

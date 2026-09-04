@@ -3,11 +3,13 @@
 //! resolved graph (direct + transitive) by default.
 
 use super::advisories::{ClassifiedAdvisories, ProjectAdvisories};
+use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
+use super::read::ReadProjectCtx;
 use super::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
-    RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error, lock_report_outcome,
-    render_window,
+    ProjectProgress, RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error,
+    lock_report_outcome, render_window,
 };
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, Origin, Resolution,
@@ -52,8 +54,9 @@ pub struct CheckOutcome {
     pub exit: Exit,
 }
 
-/// The mutable state accumulated while gating a run: the per-status tallies, the findings, and the
-/// non-fatal diagnostics. Finalized into a [`CheckOutcome`].
+/// The mutable state accumulated while gating one project, folded into the run's accumulator in project
+/// order: the per-status tallies, the findings, and the non-fatal diagnostics.
+/// Finalized into a [`CheckOutcome`].
 #[derive(Default)]
 struct CheckAccum {
     checked: usize,
@@ -75,6 +78,26 @@ struct CheckAccum {
     errors: Vec<Diagnostic>,
 }
 
+impl CheckAccum {
+    /// Folds one project's tallies and findings into the run's.
+    fn merge(&mut self, mut project: CheckAccum) {
+        self.checked += project.checked;
+        self.skipped_stale_projects += project.skipped_stale_projects;
+        self.empty_selection_noted |= project.empty_selection_noted;
+        self.direct += project.direct;
+        self.exempt += project.exempt;
+        self.acknowledged += project.acknowledged;
+        self.allowed += project.allowed;
+        self.unknown_age += project.unknown_age;
+        self.violations += project.violations;
+        self.security_relevant += project.security_relevant;
+        self.stricter_native_tripped |= project.stricter_native_tripped;
+        self.items.append(&mut project.items);
+        self.warnings.append(&mut project.warnings);
+        self.errors.append(&mut project.errors);
+    }
+}
+
 /// The outcome of the fail-closed lock-currency probe: continue evaluating, or skip this project.
 enum LockProbe {
     /// The lock is current; continue dependency evaluation.
@@ -85,11 +108,22 @@ enum LockProbe {
     Skip,
 }
 
+/// Gates one project, accumulating into its own [`CheckAccum`].
 struct CheckRunner<'a> {
     ws: &'a Workspace,
     opts: &'a RunOpts,
     scope: DepScope,
     acc: CheckAccum,
+}
+
+/// `check --transitive hide` skips evaluating transitive deps; every other mode (including
+/// `allow`) gates the full resolved graph.
+fn check_scope(opts: &RunOpts) -> DepScope {
+    if opts.transitive_mode == TransitiveGate::Hide {
+        DepScope::Direct
+    } else {
+        DepScope::Graph
+    }
 }
 
 impl Workspace {
@@ -100,97 +134,32 @@ impl Workspace {
     /// `--fail-on-unknown-age`) an unknown publish time forces a non-zero [`Exit`]. Evaluates the
     /// full graph by default, or direct deps under `--transitive hide`.
     pub async fn check(&self, opts: &RunOpts) -> CheckOutcome {
-        CheckRunner::new(self, opts).run().await
+        // `--lock` refreshes each project under an exclusive lease, which decides how far the
+        // tools' lanes may overlap (see `LaneAccess`).
+        let lanes = self.lanes(opts, LaneAccess::for_lock_refresh(opts));
+        let projects = lanes
+            .run(|pctx| async move {
+                let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+                let mut runner = CheckRunner::new(self, opts);
+                runner.run_project(pctx, progress).await;
+                runner.acc
+            })
+            .await;
+        let mut acc = CheckAccum::default();
+        for project in projects {
+            acc.merge(project);
+        }
+        finalize_check(opts, acc)
     }
 }
 
 impl<'a> CheckRunner<'a> {
     fn new(ws: &'a Workspace, opts: &'a RunOpts) -> Self {
-        // `check --transitive hide` skips evaluating transitive deps; every other mode (including
-        // `allow`) gates the full resolved graph.
-        let scope = if opts.transitive_mode == TransitiveGate::Hide {
-            DepScope::Direct
-        } else {
-            DepScope::Graph
-        };
         CheckRunner {
             ws,
             opts,
-            scope,
+            scope: check_scope(opts),
             acc: CheckAccum::default(),
-        }
-    }
-
-    async fn run(mut self) -> CheckOutcome {
-        for pctx in self.ws.scoped_projects(self.opts) {
-            let _progress = self
-                .opts
-                .progress
-                .project(pctx.tool, pctx.rel_path.as_str());
-            self.run_project(pctx).await;
-        }
-
-        // Locked-release metadata is fetched concurrently (`buffer_unordered`); sort for a stable
-        // report and `--json`, status-first so gate violations lead.
-        self.acc.items.sort_by(|a, b| {
-            a.project
-                .cmp(&b.project)
-                .then_with(|| a.status.sort_rank().cmp(&b.status.sort_rank()))
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.current.cmp(&b.current))
-        });
-        let err_count = self
-            .acc
-            .items
-            .iter()
-            .filter(|item| item.error.is_some())
-            .count()
-            + self.acc.errors.len();
-        let summary = CheckSummary {
-            checked: self.acc.checked,
-            skipped_stale_projects: self.acc.skipped_stale_projects,
-            direct: self.acc.direct,
-            exempt: self.acc.exempt,
-            acknowledged: self.acc.acknowledged,
-            allowed: self.acc.allowed,
-            unknown_age: self.acc.unknown_age,
-            errors: err_count,
-            violations: self.acc.violations,
-            security_relevant: self.acc.security_relevant,
-        };
-        let meta = CheckMeta {
-            scope: if self.scope == DepScope::Graph {
-                "lockfile-graph".into()
-            } else {
-                "direct-only".into()
-            },
-            artifact_scope: if self.opts.all_artifacts {
-                "all".into()
-            } else {
-                "environment".into()
-            },
-        };
-        let exit = check_exit(&self.acc, err_count, self.opts);
-        // An error already explains an empty run; otherwise a selection that evaluated nothing
-        // must say so, or the gate passes on zero dependencies without a word.
-        if err_count == 0
-            && !self.acc.empty_selection_noted
-            && let Some(note) = super::empty_selection_diagnostic(
-                self.opts,
-                self.acc.checked,
-                self.acc.skipped_stale_projects,
-            )
-        {
-            self.acc.warnings.push(note);
-        }
-
-        CheckOutcome {
-            meta,
-            summary,
-            items: self.acc.items,
-            warnings: self.acc.warnings,
-            errors: self.acc.errors,
-            exit,
         }
     }
 
@@ -203,12 +172,12 @@ impl<'a> CheckRunner<'a> {
         }
     }
 
-    async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
-        let Some(read) = self.ws.read_project_ctx(pctx, self.opts) else {
+    async fn run_project(&mut self, pctx: &'a super::ProjectCtx, progress: ProjectProgress) {
+        let Some(read) = self.ws.read_project_ctx(pctx, self.opts, progress) else {
             return;
         };
 
-        let (refreshed, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
+        let (refreshed, refresh_guard) = self.refresh_lock(pctx, &read).await;
         if matches!(&refreshed, Some(LockProbe::Skip)) {
             return;
         }
@@ -276,15 +245,15 @@ impl<'a> CheckRunner<'a> {
             &read.project_label,
             super::advisories::AdvisoryPackages::from_deps(&deps),
             self.opts,
+            &read.progress,
         );
-        self.opts
-            .progress
+        read.progress
             .phase(format!("checking {} resolved dependencies", deps.len()));
         let release_fetch = self.ws.fetch_locked_releases(
             read.adapter,
             deps,
             &read.fetch,
-            &self.opts.progress,
+            &read.progress,
             self.opts.fanout(),
         );
         let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
@@ -317,9 +286,14 @@ impl<'a> CheckRunner<'a> {
     async fn refresh_lock(
         &mut self,
         pctx: &super::ProjectCtx,
-        project_label: &str,
+        read: &ReadProjectCtx<'_>,
     ) -> (Option<LockProbe>, Option<ProjectAccessWriteGuard>) {
-        match self.ws.refresh_project_lock(pctx, self.opts).await {
+        let project_label = read.project_label.as_str();
+        match self
+            .ws
+            .refresh_project_lock(pctx, self.opts, &read.progress)
+            .await
+        {
             Ok(refresh) => {
                 self.acc.warnings.extend(refresh.warnings);
                 let probe = match refresh.report {
@@ -401,7 +375,7 @@ impl<'a> CheckRunner<'a> {
     fn gate_pin(
         &mut self,
         pctx: &super::ProjectCtx,
-        read: &super::read::ReadProjectCtx<'_>,
+        read: &ReadProjectCtx<'_>,
         advisories: Option<&ProjectAdvisories>,
         dep: &Dependency,
         result: cooldown_core::Result<cooldown_core::Release>,
@@ -546,6 +520,63 @@ impl<'a> CheckRunner<'a> {
     }
 }
 
+/// Sorts the merged findings and folds the tallies into the run's verdict.
+fn finalize_check(opts: &RunOpts, mut acc: CheckAccum) -> CheckOutcome {
+    // Locked-release metadata is fetched concurrently (`buffer_unordered`); sort for a stable
+    // report and `--json`, status-first so gate violations lead.
+    acc.items.sort_by(|a, b| {
+        a.project
+            .cmp(&b.project)
+            .then_with(|| a.status.sort_rank().cmp(&b.status.sort_rank()))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.current.cmp(&b.current))
+    });
+    let err_count = acc.items.iter().filter(|item| item.error.is_some()).count() + acc.errors.len();
+    let summary = CheckSummary {
+        checked: acc.checked,
+        skipped_stale_projects: acc.skipped_stale_projects,
+        direct: acc.direct,
+        exempt: acc.exempt,
+        acknowledged: acc.acknowledged,
+        allowed: acc.allowed,
+        unknown_age: acc.unknown_age,
+        errors: err_count,
+        violations: acc.violations,
+        security_relevant: acc.security_relevant,
+    };
+    let meta = CheckMeta {
+        scope: if check_scope(opts) == DepScope::Graph {
+            "lockfile-graph".into()
+        } else {
+            "direct-only".into()
+        },
+        artifact_scope: if opts.all_artifacts {
+            "all".into()
+        } else {
+            "environment".into()
+        },
+    };
+    let exit = check_exit(&acc, err_count, opts);
+    // An error already explains an empty run; otherwise a selection that evaluated nothing
+    // must say so, or the gate passes on zero dependencies without a word.
+    if err_count == 0
+        && !acc.empty_selection_noted
+        && let Some(note) =
+            super::empty_selection_diagnostic(opts, acc.checked, acc.skipped_stale_projects)
+    {
+        acc.warnings.push(note);
+    }
+
+    CheckOutcome {
+        meta,
+        summary,
+        items: acc.items,
+        warnings: acc.warnings,
+        errors: acc.errors,
+        exit,
+    }
+}
+
 fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
     diagnostic
         .message
@@ -590,5 +621,133 @@ fn error_item(dep: &Dependency, project: &str, tool: &str, diag: Diagnostic) -> 
         graph_floor: None,
         security: None,
         error: Some(diag),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CheckAccum, error_item, finalize_check};
+    use crate::app::{RunOpts, RunScope};
+    use camino::Utf8Path;
+    use cooldown_core::{
+        Dependency, Diagnostic, DiagnosticKind, PackageId, ReleaseQuality, ToolId, Version,
+    };
+
+    fn diagnostic(message: &str) -> Diagnostic {
+        Diagnostic::new(DiagnosticKind::Config, message)
+    }
+
+    fn dependency() -> Dependency {
+        Dependency {
+            package: PackageId::new(ToolId("cargo"), "serde", None),
+            advisory_identity: None,
+            current: Version::new("1.0.0"),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        }
+    }
+
+    /// Folding two projects sums every tally, keeps every flag either project raised, and keeps
+    /// the findings and diagnostics in fold order, so the run reads as the sequential fold
+    /// would.
+    #[test]
+    fn merged_projects_fold_every_tally_flag_and_finding() {
+        let mut first = CheckAccum {
+            checked: 3,
+            skipped_stale_projects: 1,
+            empty_selection_noted: true,
+            direct: 2,
+            exempt: 1,
+            acknowledged: 1,
+            unknown_age: 1,
+            violations: 1,
+            security_relevant: 1,
+            ..CheckAccum::default()
+        };
+        first.warnings.push(diagnostic("first warning"));
+        first.items.push(error_item(
+            &dependency(),
+            ".",
+            "cargo",
+            diagnostic("first item"),
+        ));
+        let mut second = CheckAccum {
+            checked: 4,
+            direct: 1,
+            allowed: 2,
+            violations: 2,
+            stricter_native_tripped: true,
+            ..CheckAccum::default()
+        };
+        second.warnings.push(diagnostic("second warning"));
+        second.errors.push(diagnostic("second error"));
+        second.items.push(error_item(
+            &dependency(),
+            "py",
+            "uv",
+            diagnostic("second item"),
+        ));
+
+        let mut run = CheckAccum::default();
+        run.merge(first);
+        run.merge(second);
+
+        assert_eq!(
+            (
+                run.checked,
+                run.skipped_stale_projects,
+                run.direct,
+                run.exempt,
+                run.acknowledged,
+                run.allowed,
+                run.unknown_age,
+                run.violations,
+                run.security_relevant,
+            ),
+            (7, 1, 3, 1, 1, 2, 1, 3, 1)
+        );
+        assert!(run.empty_selection_noted);
+        assert!(run.stricter_native_tripped);
+        let warnings: Vec<&str> = run
+            .warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(warnings, ["first warning", "second warning"]);
+        assert_eq!(run.errors.len(), 1);
+        let projects: Vec<&str> = run.items.iter().map(|item| item.project.as_str()).collect();
+        assert_eq!(projects, [".", "py"]);
+    }
+
+    /// A project that already explained an empty selection keeps the run-level note away,
+    /// whichever project it was.
+    #[test]
+    fn a_noted_empty_selection_suppresses_the_run_level_note() {
+        let opts = RunOpts {
+            scope: RunScope::new(Utf8Path::new("/repo"), Utf8Path::new("/repo/sub")),
+            ..RunOpts::default()
+        };
+        let mut noted = CheckAccum::default();
+        noted.merge(CheckAccum {
+            empty_selection_noted: true,
+            ..CheckAccum::default()
+        });
+
+        let with_note = finalize_check(&opts, CheckAccum::default());
+        let without_note = finalize_check(&opts, noted);
+
+        assert_eq!(with_note.warnings.len(), 1, "{:?}", with_note.warnings);
+        assert!(
+            without_note.warnings.is_empty(),
+            "{:?}",
+            without_note.warnings
+        );
     }
 }

@@ -191,6 +191,12 @@ impl ToolWrite for SwiftTool {
         SWIFT_ID
     }
 
+    // `swift package update` fetches the dependency into `.build/`, which `swift build` writes
+    // too.
+    fn mutation_installs(&self) -> bool {
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `swift package` COMPILES `Package.swift` (and any version-specific `Package@swift-N.swift`,
         // plus helper files it imports) to resolve, so the throwaway probe copy must carry `.swift`
@@ -249,6 +255,8 @@ mod tests {
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
         );
         assert_eq!(tool.capabilities().advisory_ecosystem, Some("SwiftURL"));
+        // The apply fetches into `.build/`, so it takes the environment turn.
+        assert!(tool.mutation_installs());
     }
 
     /// The OSV query API is case-sensitive and `SwiftURL` entries use the lowercase repository

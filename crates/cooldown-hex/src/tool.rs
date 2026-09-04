@@ -186,6 +186,12 @@ impl ToolWrite for HexTool {
         HEX_ID
     }
 
+    // `mix deps.update` fetches and compiles the dependency into `deps/` and `_build/`, which
+    // `MIX_DEPS_PATH` and `MIX_BUILD_PATH` can point at one shared place.
+    fn mutation_installs(&self) -> bool {
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `mix deps.get`/`deps.update` COMPILES `mix.exs` (Elixir) to resolve, and a project's
         // `mix.exs` frequently reads sibling source (a `@version` from a module, `Code.require_file`,
@@ -240,6 +246,9 @@ mod tests {
         let tool = HexTool::from_http(
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
         );
+        // The apply fetches and compiles into `deps/` and `_build/`, so it takes the environment
+        // turn.
+        assert!(tool.mutation_installs());
         assert_eq!(tool.capabilities().advisory_ecosystem, Some("Hex"));
     }
 

@@ -687,10 +687,12 @@ gitignore = false
 strict = true
 offline = true
 concurrency = 4
+jobs = 2
 
 [upgrade]
 strict = false
 build = true
+jobs = 1
 
 [fix]
 strict = false
@@ -704,6 +706,16 @@ dry-run = true
         assert_eq!(upgrade.build, Some(true));
         assert_eq!(upgrade.offline, Some(true), "inherited from global");
         assert_eq!(upgrade.concurrency, Some(4));
+        assert_eq!(
+            upgrade.jobs,
+            std::num::NonZeroUsize::new(1),
+            "command overrides global"
+        );
+        assert_eq!(
+            cfg.resolved("check").jobs,
+            std::num::NonZeroUsize::new(2),
+            "inherited from global"
+        );
         assert_eq!(
             cfg.resolved("check").strict,
             Some(true),

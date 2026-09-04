@@ -34,6 +34,9 @@ pub trait PyLayout: Send + Sync + 'static {
     const MANIFEST: &'static str;
     /// The driver binary, shelled out to for apply/build.
     const BIN: &'static str;
+    /// Whether the apply installs into the active virtualenv as it pins (`poetry add` does;
+    /// pip's apply only rewrites `requirements.txt`).
+    const INSTALLS: bool;
 
     /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
     fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
@@ -81,6 +84,7 @@ impl PyLayout for Pip {
     const LOCKFILE: &'static str = "requirements.txt";
     const MANIFEST: &'static str = "requirements.txt";
     const BIN: &'static str = "pip";
+    const INSTALLS: bool = false;
 
     fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
         lock::parse_requirements(lock)
@@ -116,6 +120,7 @@ impl PyLayout for Poetry {
     const LOCKFILE: &'static str = "poetry.lock";
     const MANIFEST: &'static str = "pyproject.toml";
     const BIN: &'static str = "poetry";
+    const INSTALLS: bool = true;
 
     fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
         let direct = lock::parse_poetry_direct(manifest);
@@ -353,6 +358,10 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
         L::ID
     }
 
+    fn mutation_installs(&self) -> bool {
+        L::INSTALLS
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // `pip-compile`/`uv pip compile` EXECUTES a project's `setup.py` (and reads any version/readme
         // file it imports) to discover its dependencies, so the throwaway probe copy must carry `.py`
@@ -433,6 +442,18 @@ mod tests {
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
+
+    /// Only poetry's apply installs: `poetry add` syncs the virtualenv, while pip's apply
+    /// rewrites `requirements.txt` and leaves installing to `--build`.
+    #[test]
+    fn only_the_poetry_apply_installs() {
+        let cache = tempfile::tempdir().expect("cache");
+        let http =
+            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
+
+        assert!(!PyTool::<Pip>::from_http(http.clone()).mutation_installs());
+        assert!(PyTool::<Poetry>::from_http(http).mutation_installs());
+    }
 
     #[test]
     fn advisory_ecosystem_matches_osv() {

@@ -1,8 +1,8 @@
 //! Shared read and exclusive write access for project and repository package-manager resources.
 
 use cooldown_core::fs::{
-    ProjectCoordination, ProjectReadLease, ProjectWriteLease, RepositoryResourceReadLease,
-    RepositoryResourceWriteLease,
+    ManifestFamily, ProjectCoordination, ProjectReadLease, ProjectWriteLease,
+    RepositoryResourceReadLease, RepositoryResourceWriteLease,
 };
 use cooldown_core::{CoreError, ToolId};
 #[cfg(unix)]
@@ -42,10 +42,8 @@ impl CoordinationRoot {
 
     #[cfg(test)]
     fn project_lock(&self, project: &camino::Utf8Path) -> PathBuf {
-        self.0.join(format!(
-            "{:016x}.lock",
-            cooldown_core::fs::fnv1a_64(project.as_str())
-        ))
+        self.0
+            .join(cooldown_core::fs::project_lease_name(project, &family()))
     }
 }
 
@@ -92,12 +90,16 @@ pub(crate) struct ProjectAccessWriteGuard {
 }
 
 impl ProjectReadGuard {
-    /// Acquires shared access, waiting per [`LockWait::default`](cooldown_core::fs::LockWait)
-    /// while a writer owns the project.
-    pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
+    /// Acquires shared access to `family`'s state at `root`, waiting per
+    /// [`LockWait::default`](cooldown_core::fs::LockWait) while a writer of that family owns
+    /// the project.
+    pub(crate) fn acquire(
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
+    ) -> Result<Self, CoreError> {
         let coordination = project_coordination(root)?;
         Ok(ProjectReadGuard {
-            lease: ProjectReadLease::acquire_coordination(coordination)?,
+            lease: ProjectReadLease::acquire_coordination(coordination, family)?,
         })
     }
 
@@ -108,12 +110,16 @@ impl ProjectReadGuard {
 }
 
 impl ProjectWriteGuard {
-    /// Acquires exclusive access, waiting per [`LockWait::default`](cooldown_core::fs::LockWait)
-    /// while another reader or writer is active.
-    pub(crate) fn acquire(root: &camino::Utf8Path) -> Result<Self, CoreError> {
+    /// Acquires exclusive access to `family`'s state at `root`, waiting per
+    /// [`LockWait::default`](cooldown_core::fs::LockWait) while another reader or writer of
+    /// that family is active.
+    pub(crate) fn acquire(
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
+    ) -> Result<Self, CoreError> {
         let coordination = project_coordination(root)?;
         Ok(ProjectWriteGuard {
-            lease: ProjectWriteLease::acquire_coordination(coordination)?,
+            lease: ProjectWriteLease::acquire_coordination(coordination, family)?,
         })
     }
 
@@ -143,18 +149,50 @@ impl RepoToolWriteGuard {
     }
 }
 
+/// Runs a lease acquisition in the blocking pool, so a wait for a foreign holder (a sleeping
+/// retry loop, up to `COOLDOWN_LOCK_WAIT`) never stalls the lanes that share the caller's task.
+async fn acquired<T>(
+    acquire: impl FnOnce() -> Result<T, CoreError> + Send + 'static,
+) -> Result<T, CoreError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(acquire)
+        .await
+        .map_err(|error| {
+            CoreError::System(format!("lease acquisition did not complete: {error}"))
+        })?
+}
+
 impl ProjectAccessReadGuard {
+    /// [`acquire`](Self::acquire) off the async runtime: the wait for a foreign holder runs in
+    /// the blocking pool, so sibling lanes keep running and releasing their own leases.
+    pub(crate) async fn acquire_async(
+        repo_root: &camino::Utf8Path,
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
+        tool: ToolId,
+        repo_scoped: bool,
+    ) -> Result<Self, CoreError> {
+        let repo_root = repo_root.to_owned();
+        let root = root.to_owned();
+        let family = family.clone();
+        acquired(move || Self::acquire(&repo_root, &root, &family, tool, repo_scoped)).await
+    }
+
     /// Acquires the repository resource before the project lease to preserve global lock order.
+    /// The project lease is the one of `family`, the tool's declared lease family, at `root`.
     pub(crate) fn acquire(
         repo_root: &camino::Utf8Path,
-        project_root: &camino::Utf8Path,
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
         tool: ToolId,
         repo_scoped: bool,
     ) -> Result<Self, CoreError> {
         let repo = repo_scoped
             .then(|| RepoToolReadGuard::acquire(repo_root, tool))
             .transpose()?;
-        let project = ProjectReadGuard::acquire(project_root)?;
+        let project = ProjectReadGuard::acquire(root, family)?;
         Ok(ProjectAccessReadGuard { repo, project })
     }
 
@@ -165,23 +203,81 @@ impl ProjectAccessReadGuard {
 }
 
 impl ProjectAccessWriteGuard {
+    /// [`acquire`](Self::acquire) off the async runtime; see
+    /// [`ProjectAccessReadGuard::acquire_async`].
+    pub(crate) async fn acquire_async(
+        repo_root: &camino::Utf8Path,
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
+        tool: ToolId,
+        repo_scoped: bool,
+    ) -> Result<Self, CoreError> {
+        let repo_root = repo_root.to_owned();
+        let root = root.to_owned();
+        let family = family.clone();
+        acquired(move || Self::acquire(&repo_root, &root, &family, tool, repo_scoped)).await
+    }
+
     /// Acquires a shared repository-resource lease before exclusive project access.
+    /// The project lease is the one of `family`, the tool's declared lease family, at `root`.
     pub(crate) fn acquire(
         repo_root: &camino::Utf8Path,
-        project_root: &camino::Utf8Path,
+        root: &camino::Utf8Path,
+        family: &ManifestFamily,
         tool: ToolId,
         repo_scoped: bool,
     ) -> Result<Self, CoreError> {
         let repo = repo_scoped
             .then(|| RepoToolReadGuard::acquire(repo_root, tool))
             .transpose()?;
-        let project = ProjectWriteGuard::acquire(project_root)?;
+        let project = ProjectWriteGuard::acquire(root, family)?;
         Ok(ProjectAccessWriteGuard { repo, project })
     }
 
     /// Returns the coordination identity captured by the project write lease.
     pub(crate) fn coordination(&self) -> &ProjectCoordination {
         self.project.coordination()
+    }
+}
+
+/// The process's turn to write an environment: a `--build` step or an apply that installs.
+///
+/// The turn is process-wide rather than per root because the environments such steps write are
+/// shared beyond a root: the active virtualenv or conda prefix is the process's, whichever
+/// project is being built, and the family leases deliberately leave environments open.
+static ENVIRONMENT_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Holds the environment turn and the exclusive lease on the environment at one root; see
+/// [`Workspace::build_project`](super::Workspace::build_project).
+///
+/// Fields drop in declaration order, so the lease is released before the turn: the next holder
+/// of the turn never meets this lease in the held-lock registry, which would fail it at once.
+#[derive(Debug)]
+pub(crate) struct EnvironmentWriteGuard {
+    #[expect(dead_code, reason = "the field keeps the environment lease alive")]
+    lease: ProjectWriteLease,
+    #[expect(dead_code, reason = "the field keeps the turn until the guard drops")]
+    turn: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvironmentWriteGuard {
+    /// Takes the turn, then the lease off the async runtime like
+    /// [`ProjectAccessReadGuard::acquire_async`].
+    ///
+    /// The turn admits one holder, so the lease never meets a holder in this process and only
+    /// ever waits for another cooldown at the root.
+    /// That wait runs under the turn, so builds and installs at other roots in this process
+    /// wait too, as they would in a sequential run; it is bounded by `COOLDOWN_LOCK_WAIT` and
+    /// noted on stderr like every lease wait.
+    pub(crate) async fn acquire_async(root: &camino::Utf8Path) -> Result<Self, CoreError> {
+        let turn = ENVIRONMENT_TURN.lock().await;
+        let root = root.to_owned();
+        let lease = acquired(move || {
+            let coordination = project_coordination(&root)?;
+            ProjectWriteLease::acquire_environment(coordination)
+        })
+        .await?;
+        Ok(EnvironmentWriteGuard { lease, turn })
     }
 }
 
@@ -401,10 +497,36 @@ fn require_single_link(metadata: &std::fs::Metadata, path: &Path) -> Result<(), 
 }
 
 #[cfg(test)]
+fn family() -> ManifestFamily {
+    ManifestFamily::named("Cargo.toml")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::canonical_path;
     use color_eyre::eyre;
+
+    /// Handing the environment turn from one lane to the next never meets the first lane's
+    /// lease: the lease drops before the turn, so on the multi-thread runtime, where the next
+    /// holder runs at once, no acquisition fails fast against this process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_environment_turn_hands_over_after_the_lease_is_released() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        for _ in 0..100 {
+            let lanes = [root.clone(), root.clone()].map(|root| {
+                tokio::spawn(
+                    async move { EnvironmentWriteGuard::acquire_async(&root).await.map(drop) },
+                )
+            });
+            for lane in lanes {
+                lane.await??;
+            }
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -520,9 +642,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = camino::Utf8Path::from_path(dir.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let _first = ProjectReadGuard::acquire(root)?;
+        let _first = ProjectReadGuard::acquire(root, &family())?;
 
-        ProjectReadGuard::acquire(root)?;
+        ProjectReadGuard::acquire(root, &family())?;
         Ok(())
     }
 
@@ -531,10 +653,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = camino::Utf8Path::from_path(dir.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let _reader = ProjectReadGuard::acquire(root)?;
+        let _reader = ProjectReadGuard::acquire(root, &family())?;
 
         std::assert_matches!(
-            ProjectWriteGuard::acquire(root),
+            ProjectWriteGuard::acquire(root, &family()),
             Err(CoreError::LockConflict(_))
         );
         Ok(())
@@ -545,14 +667,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = camino::Utf8Path::from_path(dir.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let _writer = ProjectWriteGuard::acquire(root)?;
+        let _writer = ProjectWriteGuard::acquire(root, &family())?;
 
         std::assert_matches!(
-            ProjectReadGuard::acquire(root),
+            ProjectReadGuard::acquire(root, &family()),
             Err(CoreError::LockConflict(_))
         );
         std::assert_matches!(
-            ProjectWriteGuard::acquire(root),
+            ProjectWriteGuard::acquire(root, &family()),
             Err(CoreError::LockConflict(_))
         );
         Ok(())
@@ -565,10 +687,10 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
 
         {
-            let _guard = ProjectWriteGuard::acquire(root)?;
+            let _guard = ProjectWriteGuard::acquire(root, &family())?;
         }
 
-        ProjectWriteGuard::acquire(root)?;
+        ProjectWriteGuard::acquire(root, &family())?;
         Ok(())
     }
 

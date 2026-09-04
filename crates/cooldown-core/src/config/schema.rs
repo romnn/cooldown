@@ -142,6 +142,10 @@ pub struct CommandConfig {
     /// Concurrency for the registry fan-out — also the per-host in-flight cap (`--concurrency`,
     /// `COOLDOWN_CONCURRENCY`; defaults to 16).
     pub concurrency: Option<usize>,
+    /// How many ecosystems run at once (`--jobs`, `COOLDOWN_JOBS`; every detected tool by
+    /// default, `1` runs them one after another).
+    /// Non-zero like the flag, so `0` is rejected here as well rather than read as no cap.
+    pub jobs: Option<std::num::NonZeroUsize>,
 }
 
 impl CommandConfig {
@@ -176,6 +180,7 @@ impl CommandConfig {
             json,
             exit_code,
             concurrency,
+            jobs,
         } = other;
 
         self.exclude_folders = self.exclude_folders.merge(exclude_folders);
@@ -201,6 +206,7 @@ impl CommandConfig {
         self.json = json.or(self.json);
         self.exit_code = exit_code.or(self.exit_code);
         self.concurrency = concurrency.or(self.concurrency);
+        self.jobs = jobs.or(self.jobs);
         self
     }
 
@@ -237,6 +243,7 @@ impl CommandConfig {
             json,
             exit_code,
             concurrency,
+            jobs,
         } = explicit;
 
         if !tool.is_empty() {
@@ -264,6 +271,7 @@ impl CommandConfig {
         self.json = (*json).or(self.json);
         self.exit_code = (*exit_code).or(self.exit_code);
         self.concurrency = (*concurrency).or(self.concurrency);
+        self.jobs = (*jobs).or(self.jobs);
         self
     }
 

@@ -1,4 +1,13 @@
 //! Human-facing progress for slow dependency operations.
+//!
+//! A run drives its tools in concurrent lanes, so several projects can be live at once.
+//! [`Progress`] owns the run-level display (the tools bar and the per-tool completion counts);
+//! each live project gets its own [`ProjectProgress`] block, which owns that project's rows and
+//! counters and clears them when it drops.
+//! Interactive terminals get a stable multi-line display.
+//! Redirected stderr and diagnostic-log runs get plain, non-colored lines; every per-project
+//! line names its tool and project, so a transcript stays interpretable when lanes interleave.
+//! The default is silent, which keeps library callers and tests free of unsolicited output.
 
 use super::change_key::{ChangeTargetKey, change_target_key};
 use cooldown_core::{Change, ToolId};
@@ -6,14 +15,10 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-/// Run-scoped progress reporting.
-///
-/// Interactive terminals get a stable multi-line display. Redirected stderr and diagnostic-log
-/// runs get plain, non-colored lines so automation retains an interpretable transcript. The
-/// default is silent, which keeps library callers and tests free of unsolicited output.
+/// Run-scoped progress reporting: the run-level rows plus the factory for per-project blocks.
 #[derive(Clone, Default)]
 pub struct Progress {
     inner: Option<Arc<ProgressInner>>,
@@ -30,13 +35,13 @@ impl fmt::Debug for Progress {
 
 struct ProgressInner {
     output: Output,
-    tracker: Mutex<Tracker>,
+    run: Mutex<RunTracker>,
 }
 
 impl Drop for ProgressInner {
     fn drop(&mut self) {
-        let mut tracker = lock_tracker(self);
-        clear_interactive(self, &mut tracker);
+        let mut run = lock(&self.run);
+        clear_interactive(self, &mut run);
     }
 }
 
@@ -49,24 +54,29 @@ struct Interactive {
     multi: MultiProgress,
     colors: bool,
     tools: ProgressBar,
-    tool: ProgressBar,
-    phase: ProgressBar,
-    packages: ProgressBar,
-    candidates: ProgressBar,
 }
 
+/// The run-level counters: how many projects each tool still has to finish, and how many tools
+/// have finished.
 #[derive(Default)]
-struct Tracker {
+struct RunTracker {
     remaining_projects: HashMap<&'static str, usize>,
     completed_tools: u64,
     total_tools: u64,
-    current_tool: &'static str,
-    current_project: String,
+    cleared: bool,
+    /// How many project blocks finished, counted before any guard so a test sees an over-count.
+    #[cfg(test)]
+    finished_blocks: u64,
+}
+
+/// One project's counters, owned by its [`ProjectProgress`] so concurrent projects never share
+/// or reset each other's.
+#[derive(Default)]
+struct ProjectTracker {
     active_packages: BTreeMap<String, usize>,
     completed_packages: u64,
     package_total: u64,
     candidates: CandidateTracker,
-    cleared: bool,
 }
 
 #[derive(Default)]
@@ -126,15 +136,115 @@ impl CandidateTracker {
     }
 }
 
-/// Marks one project as complete even when its command path returns early.
+/// One live project's progress: its rows on the display and its own package and candidate
+/// counters.
+///
+/// Cloning shares the block, so a fetch fan-out can report into it from many tasks.
+/// The block is removed, and the project counted complete for its tool, when the last clone
+/// drops — so a command path that returns early still finishes the project.
+#[derive(Clone, Default)]
 pub(crate) struct ProjectProgress {
-    progress: Progress,
-    tool: &'static str,
+    inner: Option<Arc<ProjectInner>>,
 }
 
-impl Drop for ProjectProgress {
+impl fmt::Debug for ProjectProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectProgress")
+            .field("enabled", &self.inner.is_some())
+            .finish()
+    }
+}
+
+struct ProjectInner {
+    run: Arc<ProgressInner>,
+    tool: &'static str,
+    project: String,
+    rows: Option<ProjectRows>,
+    tracker: Mutex<ProjectTracker>,
+}
+
+impl Drop for ProjectInner {
     fn drop(&mut self) {
-        self.progress.finish_project(self.tool);
+        if let Some(rows) = &self.rows {
+            rows.remove();
+        }
+        self.run.finish_project(self.tool);
+    }
+}
+
+/// The display rows of one project block: a header carrying the tool, project, and phase, then
+/// the packages bar and the candidates row, each inserted only once the project first reports
+/// it.
+/// A block therefore costs one to three rows rather than four, so six live tools still fit a
+/// 24-line terminal; past what the terminal holds, the display drops the newest rows rather
+/// than corrupting the screen.
+struct ProjectRows {
+    multi: MultiProgress,
+    colors: bool,
+    project: String,
+    header: ProgressBar,
+    packages: OnceLock<ProgressBar>,
+    candidates: OnceLock<ProgressBar>,
+}
+
+impl ProjectRows {
+    /// Appends a block below every row already on the display, so concurrent blocks stack in
+    /// the order their projects started.
+    fn add(ui: &Interactive, tool: &'static str, project: &str) -> Self {
+        let header = ui.multi.add(ProgressBar::no_length());
+        header.set_style(status_style("tool", "magenta", ui.colors));
+        header.set_prefix(tool.to_string());
+        let rows = ProjectRows {
+            multi: ui.multi.clone(),
+            colors: ui.colors,
+            project: project.to_string(),
+            header,
+            packages: OnceLock::new(),
+            candidates: OnceLock::new(),
+        };
+        rows.set_phase("starting");
+        rows
+    }
+
+    fn set_phase(&self, phase: &str) {
+        self.header
+            .set_message(format!("{} · {phase}", display_project(&self.project)));
+    }
+
+    /// The packages row, inserted right below the header the first time a fetch starts.
+    fn packages(&self) -> &ProgressBar {
+        self.packages.get_or_init(|| {
+            let bar = self
+                .multi
+                .insert_after(&self.header, ProgressBar::no_length());
+            bar.set_style(status_style("packages", "blue", self.colors));
+            bar.set_prefix("packages");
+            bar
+        })
+    }
+
+    /// The candidates row, inserted below the packages row (or the header) the first time
+    /// candidates are judged.
+    fn candidates(&self) -> &ProgressBar {
+        self.candidates.get_or_init(|| {
+            let anchor = self.packages.get().unwrap_or(&self.header);
+            let bar = self.multi.insert_after(anchor, ProgressBar::no_length());
+            bar.set_style(candidate_style("green", self.colors));
+            bar.set_prefix("candidates");
+            bar.enable_steady_tick(Duration::from_secs(1));
+            bar
+        })
+    }
+
+    fn remove(&self) {
+        let rows = std::iter::once(&self.header)
+            .chain(self.packages.get())
+            .chain(self.candidates.get());
+        for bar in rows {
+            bar.finish_and_clear();
+            self.multi.remove(bar);
+        }
     }
 }
 
@@ -145,29 +255,11 @@ impl Progress {
         console::set_colors_enabled_stderr(colors);
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let tools = multi.add(ProgressBar::no_length());
-        let tool = multi.add(ProgressBar::no_length());
-        let phase = multi.add(ProgressBar::no_length());
-        let packages = multi.add(ProgressBar::no_length());
-        let candidates = multi.add(ProgressBar::no_length());
-
         tools.set_prefix("tools");
-        tool.set_prefix("tool");
-        phase.set_prefix("phase");
-        packages.set_prefix("packages");
-        candidates.set_prefix("candidates");
         tools.set_message("discovering work");
-        tool.set_message("waiting");
-        phase.set_message("waiting");
-        packages.set_message("waiting");
-        candidates.set_message("waiting");
         multi.set_move_cursor(true);
         multi.set_draw_target(ProgressDrawTarget::stderr_with_hz(20));
         tools.set_style(status_style("tools", "cyan", colors));
-        tool.set_style(status_style("tool", "magenta", colors));
-        phase.set_style(status_style("phase", "yellow", colors));
-        packages.set_style(status_style("packages", "blue", colors));
-        candidates.set_style(candidate_style("green", colors));
-        candidates.enable_steady_tick(Duration::from_secs(1));
 
         Self {
             inner: Some(Arc::new(ProgressInner {
@@ -175,12 +267,8 @@ impl Progress {
                     multi,
                     colors,
                     tools,
-                    tool,
-                    phase,
-                    packages,
-                    candidates,
                 }),
-                tracker: Mutex::new(Tracker::default()),
+                run: Mutex::new(RunTracker::default()),
             })),
         }
     }
@@ -191,9 +279,25 @@ impl Progress {
         Self {
             inner: Some(Arc::new(ProgressInner {
                 output: Output::Plain,
-                tracker: Mutex::new(Tracker::default()),
+                run: Mutex::new(RunTracker::default()),
             })),
         }
+    }
+
+    /// How many tools have had every project counted complete; `0` without progress.
+    #[cfg(test)]
+    pub(crate) fn completed_tools(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| lock(&inner.run).completed_tools)
+    }
+
+    /// How many project blocks have finished, guarded or not; `0` without progress.
+    #[cfg(test)]
+    pub(crate) fn finished_blocks(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| lock(&inner.run).finished_blocks)
     }
 
     /// `project_tools` carries one entry per in-scope project (its tool), so per-tool project
@@ -202,74 +306,116 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
-        tracker.remaining_projects.clear();
+        let mut run = lock(&inner.run);
+        run.remaining_projects.clear();
         for tool in project_tools {
-            *tracker.remaining_projects.entry(tool.as_str()).or_default() += 1;
+            *run.remaining_projects.entry(tool.as_str()).or_default() += 1;
         }
-        tracker.completed_tools = 0;
-        tracker.total_tools = u64::try_from(tracker.remaining_projects.len()).unwrap_or(u64::MAX);
-        tracker.cleared = false;
+        run.completed_tools = 0;
+        run.total_tools = u64::try_from(run.remaining_projects.len()).unwrap_or(u64::MAX);
+        run.cleared = false;
         match &inner.output {
             Output::Interactive(ui) => {
                 ui.tools.set_style(bar_style("tools", "cyan", ui.colors));
-                ui.tools.set_length(tracker.total_tools);
+                ui.tools.set_length(run.total_tools);
                 ui.tools.set_position(0);
                 ui.tools.set_message("0 tools complete");
             }
             Output::Plain => write_line(&format!(
                 "progress     {:>3}/{:<3} tools complete",
-                0, tracker.total_tools
+                0, run.total_tools
             )),
         }
     }
 
-    pub(crate) fn project(&self, tool: ToolId, project: &str) -> ProjectProgress {
-        let tool_name = tool.as_str();
-        if let Some(inner) = &self.inner {
-            let mut tracker = lock_tracker(inner);
-            tracker.current_tool = tool_name;
-            tracker.current_project.clear();
-            tracker.current_project.push_str(project);
-            tracker.active_packages.clear();
-            tracker.completed_packages = 0;
-            tracker.package_total = 0;
-            tracker.candidates = CandidateTracker::default();
-            match &inner.output {
-                Output::Interactive(ui) => {
-                    ui.tool.set_prefix(tool_name.to_string());
-                    ui.tool.set_message(project.to_string());
-                    ui.phase.set_message("starting");
-                    ui.packages
-                        .set_style(status_style("packages", "blue", ui.colors));
-                    ui.packages.set_position(0);
-                    ui.packages.set_message("waiting");
-                    ui.candidates.set_style(candidate_style("green", ui.colors));
-                    ui.candidates.set_position(0);
-                    ui.candidates.set_message("waiting");
-                    ui.candidates.reset_elapsed();
-                }
-                Output::Plain => write_line(&format!(
-                    "{tool_name:>12}  {:<20}  starting",
-                    display_project(project)
-                )),
-            }
-        }
-        ProjectProgress {
-            progress: self.clone(),
-            tool: tool_name,
-        }
-    }
-
+    /// A run-level status line (discovery, policy loading) from before any project is live.
     pub(crate) fn phase(&self, message: impl AsRef<str>) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let tracker = lock_tracker(inner);
         let message = message.as_ref();
         match &inner.output {
-            Output::Interactive(ui) => ui.phase.set_message(message.to_string()),
-            Output::Plain => write_line(&plain_status(&tracker, "phase", message)),
+            Output::Interactive(ui) => ui.tools.set_message(message.to_string()),
+            Output::Plain => write_line(&format!("progress     {:<10} {message}", "phase")),
+        }
+    }
+
+    /// Opens one project's block; see [`ProjectProgress`] for its lifetime.
+    pub(crate) fn project(&self, tool: ToolId, project: &str) -> ProjectProgress {
+        let Some(inner) = &self.inner else {
+            return ProjectProgress::default();
+        };
+        let tool_name = tool.as_str();
+        let rows = match &inner.output {
+            Output::Interactive(ui) => Some(ProjectRows::add(ui, tool_name, project)),
+            Output::Plain => {
+                write_line(&plain_status(tool_name, project, "starting", ""));
+                None
+            }
+        };
+        ProjectProgress {
+            inner: Some(Arc::new(ProjectInner {
+                run: Arc::clone(inner),
+                tool: tool_name,
+                project: project.to_string(),
+                rows,
+                tracker: Mutex::new(ProjectTracker::default()),
+            })),
+        }
+    }
+
+    pub(crate) fn finish_run(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut run = lock(&inner.run);
+        clear_interactive(inner, &mut run);
+    }
+}
+
+impl ProgressInner {
+    fn finish_project(&self, tool: &'static str) {
+        let mut run = lock(&self.run);
+        #[cfg(test)]
+        {
+            run.finished_blocks += 1;
+        }
+        let Some(remaining) = run.remaining_projects.get_mut(tool) else {
+            return;
+        };
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        if *remaining != 0 {
+            return;
+        }
+        run.completed_tools = run.completed_tools.saturating_add(1);
+        match &self.output {
+            Output::Interactive(ui) => {
+                ui.tools.set_position(run.completed_tools);
+                ui.tools.set_message(format!("{tool} complete"));
+            }
+            Output::Plain => write_line(&format!(
+                "progress     {:>3}/{:<3} tools complete ({tool})",
+                run.completed_tools, run.total_tools
+            )),
+        }
+        if run.completed_tools == run.total_tools {
+            clear_interactive(self, &mut run);
+        }
+    }
+}
+
+impl ProjectProgress {
+    pub(crate) fn phase(&self, message: impl AsRef<str>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let message = message.as_ref();
+        match &inner.rows {
+            Some(rows) => rows.set_phase(message),
+            None => write_line(&plain_status(inner.tool, &inner.project, "phase", message)),
         }
     }
 
@@ -277,24 +423,25 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         tracker.active_packages.clear();
         tracker.completed_packages = 0;
         tracker.package_total = usize_to_u64(total);
-        match &inner.output {
-            Output::Interactive(ui) => {
-                ui.packages
-                    .set_style(bar_style("packages", "blue", ui.colors));
-                ui.packages.set_length(tracker.package_total);
-                ui.packages.set_position(0);
-                ui.packages.set_message(if total == 0 {
+        match &inner.rows {
+            Some(rows) => {
+                rows.packages()
+                    .set_style(bar_style("packages", "blue", rows.colors));
+                rows.packages().set_length(tracker.package_total);
+                rows.packages().set_position(0);
+                rows.packages().set_message(if total == 0 {
                     "complete".to_string()
                 } else {
                     message.as_ref().to_string()
                 });
             }
-            Output::Plain => write_line(&plain_status(
-                &tracker,
+            None => write_line(&plain_status(
+                inner.tool,
+                &inner.project,
                 "packages",
                 &format!("{} ({total})", message.as_ref()),
             )),
@@ -305,10 +452,10 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         *tracker.active_packages.entry(name.to_string()).or_default() += 1;
-        if let Output::Interactive(ui) = &inner.output {
-            ui.packages
+        if let Some(rows) = &inner.rows {
+            rows.packages()
                 .set_message(active_message(&tracker.active_packages));
         }
     }
@@ -317,7 +464,7 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         let Some(active) = tracker.active_packages.get_mut(name) else {
             return;
         };
@@ -329,25 +476,27 @@ impl Progress {
             .completed_packages
             .saturating_add(1)
             .min(tracker.package_total);
-        if let Output::Interactive(ui) = &inner.output {
-            ui.packages.set_position(tracker.completed_packages);
-            if tracker.completed_packages == tracker.package_total {
-                ui.packages.set_message("complete");
-            } else if tracker.active_packages.is_empty() {
-                ui.packages.set_message("waiting");
-            } else {
-                ui.packages
-                    .set_message(active_message(&tracker.active_packages));
+        match &inner.rows {
+            Some(rows) => {
+                rows.packages().set_position(tracker.completed_packages);
+                if tracker.completed_packages == tracker.package_total {
+                    rows.packages().set_message("complete");
+                } else if tracker.active_packages.is_empty() {
+                    rows.packages().set_message("waiting");
+                } else {
+                    rows.packages()
+                        .set_message(active_message(&tracker.active_packages));
+                }
             }
-        } else {
-            write_line(&plain_status(
-                &tracker,
+            None => write_line(&plain_status(
+                inner.tool,
+                &inner.project,
                 "fetched",
                 &format!(
                     "{}/{} {name}",
                     tracker.completed_packages, tracker.package_total
                 ),
-            ));
+            )),
         }
     }
 
@@ -355,7 +504,7 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         tracker.candidates = CandidateTracker::start(changes);
         let detail = if changes.is_empty() {
             "complete"
@@ -363,13 +512,19 @@ impl Progress {
             message.as_ref()
         };
         let status = tracker.candidates.status(detail);
-        match &inner.output {
-            Output::Interactive(ui) => {
-                ui.candidates.set_style(candidate_style("green", ui.colors));
-                ui.candidates.reset_elapsed();
-                ui.candidates.set_message(status);
+        match &inner.rows {
+            Some(rows) => {
+                rows.candidates()
+                    .set_style(candidate_style("green", rows.colors));
+                rows.candidates().reset_elapsed();
+                rows.candidates().set_message(status);
             }
-            Output::Plain => write_line(&plain_status(&tracker, "candidates", &status)),
+            None => write_line(&plain_status(
+                inner.tool,
+                &inner.project,
+                "candidates",
+                &status,
+            )),
         }
     }
 
@@ -377,13 +532,18 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         tracker.candidates.begin_resolver_operation();
         let detail = format!("{} {} → {}", change.package.name, change.from, change.to);
         let message = tracker.candidates.status(&detail);
-        match &inner.output {
-            Output::Interactive(ui) => ui.candidates.set_message(message),
-            Output::Plain => write_line(&plain_status(&tracker, "candidate", &message)),
+        match &inner.rows {
+            Some(rows) => rows.candidates().set_message(message),
+            None => write_line(&plain_status(
+                inner.tool,
+                &inner.project,
+                "candidate",
+                &message,
+            )),
         }
     }
 
@@ -394,7 +554,7 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         tracker.candidates.begin_policy_pass();
         let detail = if changes.len() == 1 {
             format!("{} {} → {}", first.package.name, first.from, first.to)
@@ -408,9 +568,9 @@ impl Progress {
             )
         };
         let message = tracker.candidates.status(&detail);
-        match &inner.output {
-            Output::Interactive(ui) => ui.candidates.set_message(message),
-            Output::Plain => write_line(&plain_status(&tracker, "pass", &message)),
+        match &inner.rows {
+            Some(rows) => rows.candidates().set_message(message),
+            None => write_line(&plain_status(inner.tool, &inner.project, "pass", &message)),
         }
     }
 
@@ -418,7 +578,7 @@ impl Progress {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut tracker = lock_tracker(inner);
+        let mut tracker = lock(&inner.tracker);
         tracker.candidates.decide(changes);
         let detail = if tracker.candidates.is_complete() {
             "complete"
@@ -426,75 +586,38 @@ impl Progress {
             ""
         };
         let status = tracker.candidates.status(detail);
-        match &inner.output {
-            Output::Interactive(ui) => ui.candidates.set_message(status),
-            Output::Plain => write_line(&plain_status(&tracker, "decided", &status)),
-        }
-    }
-
-    pub(crate) fn finish_run(&self) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let mut tracker = lock_tracker(inner);
-        clear_interactive(inner, &mut tracker);
-    }
-
-    fn finish_project(&self, tool: &'static str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let mut tracker = lock_tracker(inner);
-        let Some(remaining) = tracker.remaining_projects.get_mut(tool) else {
-            return;
-        };
-        if *remaining == 0 {
-            return;
-        }
-        *remaining -= 1;
-        if *remaining != 0 {
-            return;
-        }
-        tracker.completed_tools = tracker.completed_tools.saturating_add(1);
-        match &inner.output {
-            Output::Interactive(ui) => {
-                ui.tools.set_position(tracker.completed_tools);
-                ui.tools.set_message(format!("{tool} complete"));
-                ui.phase.set_message("complete");
-            }
-            Output::Plain => write_line(&format!(
-                "progress     {:>3}/{:<3} tools complete ({tool})",
-                tracker.completed_tools, tracker.total_tools
+        match &inner.rows {
+            Some(rows) => rows.candidates().set_message(status),
+            None => write_line(&plain_status(
+                inner.tool,
+                &inner.project,
+                "decided",
+                &status,
             )),
-        }
-        if tracker.completed_tools == tracker.total_tools {
-            clear_interactive(inner, &mut tracker);
         }
     }
 }
 
-impl cooldown_core::ApplyObserver for Progress {
+impl cooldown_core::ApplyObserver for ProjectProgress {
     fn candidate_started(&self, change: &Change) {
         self.resolver_operation(change);
     }
 }
 
-fn lock_tracker(inner: &ProgressInner) -> MutexGuard<'_, Tracker> {
-    match inner.tracker.lock() {
-        Ok(tracker) => tracker,
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
+    match state.lock() {
+        Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-fn clear_interactive(inner: &ProgressInner, tracker: &mut Tracker) {
-    if tracker.cleared {
+fn clear_interactive(inner: &ProgressInner, run: &mut RunTracker) {
+    if run.cleared {
         return;
     }
-    tracker.cleared = true;
+    run.cleared = true;
     if let Output::Interactive(ui) = &inner.output {
-        for bar in [&ui.tools, &ui.tool, &ui.phase, &ui.packages, &ui.candidates] {
-            bar.finish_and_clear();
-        }
+        ui.tools.finish_and_clear();
         if let Err(error) = ui.multi.clear() {
             tracing::debug!(error = %error, "could not clear progress display");
         }
@@ -553,14 +676,11 @@ fn style_or_default(template: &str, prefix: &str) -> ProgressStyle {
     }
 }
 
-fn plain_status(tracker: &Tracker, kind: &str, message: &str) -> String {
-    if tracker.current_tool.is_empty() {
-        return format!("progress     {kind:<10} {message}");
-    }
+/// One plain transcript line, naming the project it belongs to so interleaved lanes stay legible.
+fn plain_status(tool: &str, project: &str, kind: &str, message: &str) -> String {
     format!(
-        "{:>12}  {:<20}  {kind:<10} {message}",
-        tracker.current_tool,
-        display_project(&tracker.current_project)
+        "{tool:>12}  {:<20}  {kind:<10} {message}",
+        display_project(project)
     )
 }
 
@@ -595,7 +715,7 @@ fn write_line(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::Progress;
+    use super::{Progress, ProjectProgress};
     use cooldown_core::{Change, MemberRef, PackageId, ToolId, UpdateKind, Version};
 
     const CARGO: ToolId = ToolId("cargo");
@@ -618,76 +738,148 @@ mod tests {
     #[test]
     fn duplicate_package_names_remain_active_until_every_fetch_finishes() {
         let progress = Progress::plain();
-        progress.packages(2, "fetching");
+        let project = progress.project(CARGO, ".");
+        project.packages(2, "fetching");
 
-        progress.package_started("shared");
-        progress.package_started("shared");
-        progress.package_finished("shared");
-        assert_eq!(active_packages(&progress), 1);
+        project.package_started("shared");
+        project.package_started("shared");
+        project.package_finished("shared");
+        assert_eq!(active_packages(&project), 1);
 
-        progress.package_finished("shared");
-        assert_eq!(active_packages(&progress), 0);
-        assert_eq!(completed_packages(&progress), 2);
+        project.package_finished("shared");
+        assert_eq!(active_packages(&project), 0);
+        assert_eq!(completed_packages(&project), 2);
     }
 
     #[test]
     fn a_gap_between_package_fetches_is_not_reported_as_completion() {
         let progress = Progress::plain();
-        progress.packages(2, "fetching");
+        let project = progress.project(CARGO, ".");
+        project.packages(2, "fetching");
 
-        progress.package_started("first");
-        progress.package_finished("first");
+        project.package_started("first");
+        project.package_finished("first");
 
-        assert_eq!(completed_packages(&progress), 1);
-        assert_eq!(package_total(&progress), 2);
+        assert_eq!(completed_packages(&project), 1);
+        assert_eq!(package_total(&project), 2);
+    }
+
+    /// Two lanes report into two live blocks at once; each keeps its own counters, and a block
+    /// finishing while its sibling is mid-fetch leaves the sibling's counters alone.
+    #[test]
+    fn concurrent_projects_keep_separate_counters() {
+        let progress = Progress::plain();
+        progress.start_run(&[CARGO, GO]);
+        let cargo = progress.project(CARGO, "crates/app");
+        let go = progress.project(GO, "services/api");
+        cargo.packages(2, "fetching");
+        go.packages(3, "fetching");
+
+        // Interleaved fetches land on their own project.
+        cargo.package_started("serde");
+        go.package_started("golang.org/x/net");
+        go.package_finished("golang.org/x/net");
+        cargo.package_finished("serde");
+        assert_eq!(completed_packages(&cargo), 1);
+        assert_eq!(package_total(&cargo), 2);
+        assert_eq!(completed_packages(&go), 1);
+        assert_eq!(package_total(&go), 3);
+
+        // The cargo lane finishes first; the go lane's block and counters survive it.
+        go.package_started("golang.org/x/text");
+        drop(cargo);
+        assert_eq!(completed_tools(&progress), 1);
+        assert_eq!(active_packages(&go), 1);
+        assert_eq!(completed_packages(&go), 1);
+        drop(go);
+        assert_eq!(completed_tools(&progress), 2);
+    }
+
+    /// A fetch fan-out clones the block; the project is complete only when every clone is gone.
+    #[test]
+    fn a_project_finishes_when_its_last_clone_drops() {
+        let progress = Progress::plain();
+        progress.start_run(&[CARGO]);
+        let project = progress.project(CARGO, ".");
+        let worker = project.clone();
+
+        drop(project);
+        assert_eq!(completed_tools(&progress), 0);
+        drop(worker);
+        assert_eq!(completed_tools(&progress), 1);
     }
 
     #[test]
     fn direct_candidates_for_distinct_members_are_counted_separately() {
         let progress = Progress::plain();
+        let project = progress.project(CARGO, ".");
         let first = member_change("first");
         let second = member_change("second");
-        progress.candidates(&[first.clone(), second.clone()], "checking");
+        project.candidates(&[first.clone(), second.clone()], "checking");
 
-        progress.candidates_decided(&[first, second]);
+        project.candidates_decided(&[first, second]);
 
-        assert_eq!(decided_candidates(&progress), 2);
+        assert_eq!(decided_candidates(&project), 2);
     }
 
     #[test]
     fn candidates_outside_the_current_operation_do_not_change_its_count() {
         let progress = Progress::plain();
+        let project = progress.project(CARGO, ".");
         let expected = member_change("expected");
         let unrelated = member_change("unrelated");
-        progress.candidates(std::slice::from_ref(&expected), "checking");
+        project.candidates(std::slice::from_ref(&expected), "checking");
 
-        progress.candidates_decided(&[unrelated]);
+        project.candidates_decided(&[unrelated]);
 
-        assert_eq!(decided_candidates(&progress), 0);
+        assert_eq!(decided_candidates(&project), 0);
     }
 
     #[test]
     fn resolver_operations_advance_while_candidate_decisions_remain_pending() {
         let progress = Progress::plain();
+        let project = progress.project(CARGO, ".");
         let first = member_change("first");
         let second = member_change("second");
-        progress.candidates(&[first.clone(), second.clone()], "checking");
-        progress.policy_pass(&[first.clone(), second]);
+        project.candidates(&[first.clone(), second.clone()], "checking");
+        project.policy_pass(&[first.clone(), second]);
 
-        cooldown_core::ApplyObserver::candidate_started(&progress, &first);
-        cooldown_core::ApplyObserver::candidate_started(&progress, &first);
+        cooldown_core::ApplyObserver::candidate_started(&project, &first);
+        cooldown_core::ApplyObserver::candidate_started(&project, &first);
 
-        assert_eq!(decided_candidates(&progress), 0);
+        assert_eq!(decided_candidates(&project), 0);
         assert_eq!(
-            candidate_summary(&progress, "shared 1.0.0 → 2.0.0"),
+            candidate_summary(&project, "shared 1.0.0 → 2.0.0"),
             "2 decisions pending · policy pass 1 · resolver op 2 · shared 1.0.0 → 2.0.0"
         );
 
-        progress.candidates_decided(std::slice::from_ref(&first));
+        project.candidates_decided(std::slice::from_ref(&first));
         assert_eq!(
-            candidate_summary(&progress, ""),
+            candidate_summary(&project, ""),
             "1/2 decided · policy pass 1 · resolver op 2"
         );
+    }
+
+    /// A block opens as one header row; the packages and candidates rows appear only once the
+    /// project first reports them, so a command that never judges candidates costs two rows.
+    #[test]
+    fn interactive_rows_appear_on_first_use() {
+        let progress = Progress::interactive(false);
+        let project = progress.project(CARGO, "crates/app");
+        let rows = project
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.rows.as_ref())
+            .expect("interactive progress has rows");
+        assert!(rows.packages.get().is_none());
+        assert!(rows.candidates.get().is_none());
+
+        project.packages(1, "fetching");
+        assert!(rows.packages.get().is_some());
+        assert!(rows.candidates.get().is_none());
+
+        project.candidates(&[], "checking");
+        assert!(rows.candidates.get().is_some());
     }
 
     #[test]
@@ -714,34 +906,46 @@ mod tests {
         assert!(!template.contains("{len"));
     }
 
+    /// A plain transcript line names its tool and project, so interleaved lanes stay legible.
+    #[test]
+    fn plain_lines_name_their_project() {
+        assert_eq!(
+            super::plain_status("cargo", "crates/app", "phase", "resolving"),
+            "       cargo  crates/app            phase      resolving"
+        );
+        assert_eq!(
+            super::plain_status("go", "", "fetched", "1/3 x"),
+            "          go  .                     fetched    1/3 x"
+        );
+    }
+
     fn completed_tools(progress: &Progress) -> u64 {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).completed_tools
+        progress.completed_tools()
     }
 
-    fn active_packages(progress: &Progress) -> usize {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).active_packages.values().sum()
+    fn active_packages(project: &ProjectProgress) -> usize {
+        let inner = project.inner.as_ref().expect("plain progress is enabled");
+        super::lock(&inner.tracker).active_packages.values().sum()
     }
 
-    fn completed_packages(progress: &Progress) -> u64 {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).completed_packages
+    fn completed_packages(project: &ProjectProgress) -> u64 {
+        let inner = project.inner.as_ref().expect("plain progress is enabled");
+        super::lock(&inner.tracker).completed_packages
     }
 
-    fn package_total(progress: &Progress) -> u64 {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).package_total
+    fn package_total(project: &ProjectProgress) -> u64 {
+        let inner = project.inner.as_ref().expect("plain progress is enabled");
+        super::lock(&inner.tracker).package_total
     }
 
-    fn decided_candidates(progress: &Progress) -> usize {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).candidates.decided.len()
+    fn decided_candidates(project: &ProjectProgress) -> usize {
+        let inner = project.inner.as_ref().expect("plain progress is enabled");
+        super::lock(&inner.tracker).candidates.decided.len()
     }
 
-    fn candidate_summary(progress: &Progress, detail: &str) -> String {
-        let inner = progress.inner.as_ref().expect("plain progress is enabled");
-        super::lock_tracker(inner).candidates.status(detail)
+    fn candidate_summary(project: &ProjectProgress, detail: &str) -> String {
+        let inner = project.inner.as_ref().expect("plain progress is enabled");
+        super::lock(&inner.tracker).candidates.status(detail)
     }
 
     fn member_change(member: &str) -> Change {

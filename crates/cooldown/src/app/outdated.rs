@@ -3,10 +3,13 @@
 
 use super::advisories::{ClassifiedAdvisories, ProjectAdvisories};
 use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
+use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
+use super::read::ReadProjectCtx;
+use super::upgrade::PreviewEvidence;
 use super::{
-    Exit, FetchedRelease, LockReportAction, RunOpts, Workspace, age_days, diag_from_error,
-    lock_report_outcome, render_window,
+    Exit, FetchedRelease, LockReportAction, ProjectProgress, RunOpts, Workspace, age_days,
+    diag_from_error, lock_report_outcome, render_window,
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
@@ -32,22 +35,42 @@ pub struct OutdatedOutcome {
     pub exit: Exit,
 }
 
+/// Evaluates one project, accumulating into its own [`OutdatedAccum`].
 struct OutdatedRunner<'a> {
     ws: &'a Workspace,
     opts: &'a RunOpts,
     scope: DepScope,
+    /// Whether a project that contributes no row under a `-C` selection is noted: `outdated`
+    /// evaluates a selection, `explain`'s one-package verdict does not, so the note's advice
+    /// ("run from the workspace root") would be wrong there.
+    selection_notes: bool,
+    acc: OutdatedAccum,
+}
+
+/// The rows and diagnostics of one project's evaluation, folded into the run's accumulator in project
+/// order.
+#[derive(Default)]
+struct OutdatedAccum {
     items: Vec<OutdatedItem>,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
     skipped_stale_projects: usize,
     /// Whether a project already explained an empty selection, so the run-level note is redundant.
     empty_selection_noted: bool,
-    /// Whether a project that contributes no row under a `-C` selection is noted: `outdated`
-    /// evaluates a selection, `explain`'s one-package verdict does not, so the note's advice
-    /// ("run from the workspace root") would be wrong there.
-    selection_notes: bool,
-    /// Dependencies evaluated across every project, whether or not they became an item.
+    /// Dependencies evaluated, whether or not they became an item.
     evaluated: usize,
+}
+
+impl OutdatedAccum {
+    /// Folds one project's rows and diagnostics into the run's.
+    fn merge(&mut self, mut project: OutdatedAccum) {
+        self.items.append(&mut project.items);
+        self.warnings.append(&mut project.warnings);
+        self.errors.append(&mut project.errors);
+        self.skipped_stale_projects += project.skipped_stale_projects;
+        self.empty_selection_noted |= project.empty_selection_noted;
+        self.evaluated += project.evaluated;
+    }
 }
 
 /// The rows `outdated` would show for one package in one project, with the diagnostics the
@@ -65,7 +88,22 @@ impl Workspace {
     /// Scopes to direct deps unless `--transitive` is set, and to packages matching `--package`.
     /// Surfaces a yanked locked version as a warning.
     pub async fn outdated(&self, opts: &RunOpts) -> OutdatedOutcome {
-        OutdatedRunner::new(self, opts).run().await
+        // `--lock` refreshes each project under an exclusive lease, which decides how far the
+        // tools' lanes may overlap (see `LaneAccess`).
+        let lanes = self.lanes(opts, LaneAccess::for_lock_refresh(opts));
+        let projects = lanes
+            .run(|pctx| async move {
+                let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+                let mut runner = OutdatedRunner::new(self, opts);
+                runner.run_project(pctx, progress).await;
+                runner.acc
+            })
+            .await;
+        let mut acc = OutdatedAccum::default();
+        for project in projects {
+            acc.merge(project);
+        }
+        finalize_outdated(opts, acc)
     }
 
     /// The `outdated` verdict for `package` alone in `pctx`: the same fetch, evaluation, and
@@ -73,6 +111,7 @@ impl Workspace {
     /// preview resolves only that candidate — seconds where a full `upgrade --dry-run` over a
     /// large workspace takes minutes.
     /// Transitive rows are in scope, so a package no member declares directly is still judged.
+    /// `progress` is the caller's open block for the project.
     ///
     /// # Errors
     ///
@@ -83,21 +122,28 @@ impl Workspace {
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         package: &str,
+        progress: &ProjectProgress,
     ) -> cooldown_core::Result<PackageVerdict> {
         let mut scoped = opts.clone();
         scoped.package = vec![cooldown_core::PatternGlob::new(package)?];
         scoped.transitive = true;
         let mut runner = OutdatedRunner::new(self, &scoped);
         runner.selection_notes = false;
-        runner.run_project(pctx).await;
+        runner.run_project(pctx, progress.clone()).await;
+        let OutdatedAccum {
+            mut items,
+            warnings,
+            errors,
+            ..
+        } = runner.acc;
         // The scoping glob is the literal name, but a name that happens to be a pattern could
         // match siblings; the rows are the package's own either way.
-        runner.items.retain(|item| item.name == package);
-        runner.items.sort_by(|a, b| a.current.cmp(&b.current));
+        items.retain(|item| item.name == package);
+        items.sort_by(|a, b| a.current.cmp(&b.current));
         Ok(PackageVerdict {
-            items: runner.items,
-            warnings: runner.warnings,
-            errors: runner.errors,
+            items,
+            warnings,
+            errors,
         })
     }
 }
@@ -113,55 +159,8 @@ impl<'a> OutdatedRunner<'a> {
             ws,
             opts,
             scope,
-            items: Vec::new(),
-            warnings: Vec::new(),
-            errors: Vec::new(),
-            skipped_stale_projects: 0,
-            empty_selection_noted: false,
             selection_notes: true,
-            evaluated: 0,
-        }
-    }
-
-    async fn run(mut self) -> OutdatedOutcome {
-        for pctx in self.ws.scoped_projects(self.opts) {
-            let _progress = self
-                .opts
-                .progress
-                .project(pctx.tool, pctx.rel_path.as_str());
-            self.run_project(pctx).await;
-        }
-
-        // Releases are fetched concurrently (`buffer_unordered`), so the items arrive in a
-        // non-deterministic order. Sort by (project, status, name, version) for a stable report
-        // (and stable `--json`); the status rank puts ready-to-adopt updates last.
-        self.items.sort_by(|a, b| {
-            a.project
-                .cmp(&b.project)
-                .then_with(|| a.status.sort_rank().cmp(&b.status.sort_rank()))
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.current.cmp(&b.current))
-        });
-        let mut summary = summarize(&self.items);
-        summary.skipped_stale_projects = self.skipped_stale_projects;
-        // An error already explains an empty run; otherwise a selection that evaluated nothing
-        // must say so, or the report is indistinguishable from "everything is current".
-        if self.errors.is_empty()
-            && !self.empty_selection_noted
-            && let Some(note) = super::empty_selection_diagnostic(
-                self.opts,
-                self.evaluated,
-                self.skipped_stale_projects,
-            )
-        {
-            self.warnings.push(note);
-        }
-        OutdatedOutcome {
-            summary,
-            items: self.items,
-            warnings: self.warnings,
-            errors: self.errors,
-            exit: Exit::Ok,
+            acc: OutdatedAccum::default(),
         }
     }
 
@@ -169,17 +168,17 @@ impl<'a> OutdatedRunner<'a> {
     /// the run-level empty-selection note redundant.
     fn note_empty_project(&mut self, pctx: &super::ProjectCtx, evaluated: usize) {
         if let Some(note) = self.ws.empty_project_note(pctx, self.opts, evaluated) {
-            self.warnings.push(note);
-            self.empty_selection_noted = true;
+            self.acc.warnings.push(note);
+            self.acc.empty_selection_noted = true;
         }
     }
 
-    async fn run_project(&mut self, pctx: &'a super::ProjectCtx) {
-        let Some(read) = self.ws.read_project_ctx(pctx, self.opts) else {
+    async fn run_project(&mut self, pctx: &'a super::ProjectCtx, progress: ProjectProgress) {
+        let Some(read) = self.ws.read_project_ctx(pctx, self.opts, progress) else {
             return;
         };
 
-        let (continue_run, refresh_guard) = self.refresh_lock(pctx, &read.project_label).await;
+        let (continue_run, refresh_guard) = self.refresh_lock(pctx, &read).await;
         if !continue_run {
             return;
         }
@@ -190,7 +189,7 @@ impl<'a> OutdatedRunner<'a> {
             match self.ws.project_read_guard(pctx).await {
                 Ok(guard) => Some(guard),
                 Err(error) => {
-                    self.errors.push(diag_from_error(
+                    self.acc.errors.push(diag_from_error(
                         &error,
                         pctx.tool,
                         &read.project_label,
@@ -201,37 +200,13 @@ impl<'a> OutdatedRunner<'a> {
             }
         };
 
-        self.opts.progress.phase("resolving dependency graph");
-        let (mut deps, excluded_members) = match self
-            .ws
-            .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
-            .await
-        {
-            Ok(scoped) => (scoped.deps, scoped.excluded_members),
-            Err(error) => {
-                tracing::warn!(
-                    project = read.project_label,
-                    tool = pctx.tool.as_str(),
-                    error = %error,
-                    "could not enumerate dependencies"
-                );
-                let diagnostic = diag_from_error(&error, pctx.tool, &read.project_label, None)
-                    .with_path(pctx.project.manifest.as_str());
-                if self.opts.allow_stale_lock
-                    && matches!(error, cooldown_core::CoreError::StaleLock(_))
-                {
-                    self.skipped_stale_projects += 1;
-                    self.warnings.push(stale_evaluation_skipped(diagnostic));
-                } else {
-                    self.errors.push(diagnostic);
-                }
-                return;
-            }
+        let Some((mut deps, excluded_members)) = self.scoped_dependencies(pctx, &read).await else {
+            return;
         };
         let manifest_only = self
             .merge_manifest_constraints(read.adapter, pctx, &read.project_label, &mut deps)
             .await;
-        self.evaluated += deps.len();
+        self.acc.evaluated += deps.len();
         drop(read_guard);
         drop(refresh_guard);
         if self.selection_notes {
@@ -250,12 +225,12 @@ impl<'a> OutdatedRunner<'a> {
             &read.project_label,
             super::advisories::AdvisoryPackages::from_deps(&deps),
             self.opts,
+            &read.progress,
         );
-        let release_fetch =
-            self.fetch_releases(read.adapter, pctx, &read.project_label, deps, &read.fetch);
+        let release_fetch = self.fetch_releases(&read, pctx, deps);
         let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
         let advisories = advisory_fetch
-            .record(&mut self.warnings, &mut self.errors)
+            .record(&mut self.acc.warnings, &mut self.acc.errors)
             .map(std::sync::Arc::new);
 
         let ClassifiedProject {
@@ -276,14 +251,54 @@ impl<'a> OutdatedRunner<'a> {
         // upgrade that would silently be held. Runs only when there is something to verify.
         self.verify_blocked(
             pctx,
+            &read.progress,
             &mut project_items,
             verification_candidates,
-            manifest_only,
-            advisories,
-            excluded_members,
+            PreviewEvidence {
+                manifest_only,
+                advisories,
+                excluded_members,
+            },
         )
         .await;
-        self.items.extend(project_items);
+        self.acc.items.extend(project_items);
+    }
+
+    /// The project's scoped dependencies beside the members the scope dropped, or `None` after
+    /// recording why the graph could not be read: a stale lock is a skip under
+    /// `--allow-stale-lock` and an error otherwise.
+    async fn scoped_dependencies(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+    ) -> Option<(Vec<Dependency>, Vec<cooldown_core::MemberRef>)> {
+        read.progress.phase("resolving dependency graph");
+        match self
+            .ws
+            .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
+            .await
+        {
+            Ok(scoped) => Some((scoped.deps, scoped.excluded_members)),
+            Err(error) => {
+                tracing::warn!(
+                    project = read.project_label,
+                    tool = pctx.tool.as_str(),
+                    error = %error,
+                    "could not enumerate dependencies"
+                );
+                let diagnostic = diag_from_error(&error, pctx.tool, &read.project_label, None)
+                    .with_path(pctx.project.manifest.as_str());
+                if self.opts.allow_stale_lock
+                    && matches!(error, cooldown_core::CoreError::StaleLock(_))
+                {
+                    self.acc.skipped_stale_projects += 1;
+                    self.acc.warnings.push(stale_evaluation_skipped(diagnostic));
+                } else {
+                    self.acc.errors.push(diagnostic);
+                }
+                None
+            }
+        }
     }
 
     /// Merges the build-backend requirements (`[build-system].requires`, e.g. hatchling) the
@@ -317,7 +332,8 @@ impl<'a> OutdatedRunner<'a> {
                     error = %error,
                     "could not read build-system requirements"
                 );
-                self.warnings
+                self.acc
+                    .warnings
                     .push(diag_from_error(&error, pctx.tool, project_label, None));
             }
         }
@@ -343,7 +359,8 @@ impl<'a> OutdatedRunner<'a> {
             match result {
                 Ok(releases) => {
                     if is_yanked_locked(&releases, &dep) {
-                        self.warnings
+                        self.acc
+                            .warnings
                             .push(yanked_warning(pctx, project_label, &dep));
                     }
                     let advised =
@@ -389,11 +406,10 @@ impl<'a> OutdatedRunner<'a> {
     async fn verify_blocked(
         &mut self,
         pctx: &'a super::ProjectCtx,
+        progress: &ProjectProgress,
         items: &mut [OutdatedItem],
         candidates: Vec<VerificationCandidate>,
-        manifest_only: HashSet<PackageId>,
-        advisories: Option<std::sync::Arc<ProjectAdvisories>>,
-        excluded_members: Vec<cooldown_core::MemberRef>,
+        evidence: PreviewEvidence,
     ) {
         if candidates.is_empty() {
             return;
@@ -404,7 +420,7 @@ impl<'a> OutdatedRunner<'a> {
         if self.opts.offline {
             // The whole-graph resolve needs the registry, so the verdicts stay per-package; saying
             // so keeps an unverified `adoptable` from reading as a verified one.
-            self.warnings.push(
+            self.acc.warnings.push(
                 Diagnostic::new(
                     DiagnosticKind::Config,
                     format!(
@@ -418,28 +434,19 @@ impl<'a> OutdatedRunner<'a> {
             return;
         }
 
-        self.opts.progress.phase("verifying upgrade policy");
+        progress.phase("verifying upgrade policy");
         let changes = candidates
             .iter()
             .map(|candidate| candidate.change.clone())
             .collect::<Vec<_>>();
-        self.opts
-            .progress
-            .candidates(&changes, "adoptable updates against upgrade policy");
+        progress.candidates(&changes, "adoptable updates against upgrade policy");
         let preview = self
             .ws
-            .preview_project_upgrade(
-                pctx,
-                self.opts,
-                changes,
-                manifest_only,
-                advisories,
-                excluded_members,
-            )
+            .preview_project_upgrade(pctx, self.opts, progress, changes, evidence)
             .await;
         let mut verification_errors = preview.errors;
         verification_errors.extend(preview.items.iter().filter_map(|item| item.error.clone()));
-        self.warnings.extend(preview.warnings);
+        self.acc.warnings.extend(preview.warnings);
         if !verification_errors.is_empty() {
             // An incomplete probe cannot turn an adoptable candidate into a false `blocked` row.
             tracing::warn!(
@@ -448,7 +455,7 @@ impl<'a> OutdatedRunner<'a> {
                 errors = verification_errors.len(),
                 "could not verify adoptable updates against the complete upgrade policy"
             );
-            self.warnings.extend(verification_errors);
+            self.acc.warnings.extend(verification_errors);
             return;
         }
         let held = held_from_preview(preview.items);
@@ -458,16 +465,21 @@ impl<'a> OutdatedRunner<'a> {
     async fn refresh_lock(
         &mut self,
         pctx: &'a super::ProjectCtx,
-        project_label: &str,
+        read: &ReadProjectCtx<'_>,
     ) -> (bool, Option<ProjectAccessWriteGuard>) {
-        match self.ws.refresh_project_lock(pctx, self.opts).await {
+        let project_label = read.project_label.as_str();
+        match self
+            .ws
+            .refresh_project_lock(pctx, self.opts, &read.progress)
+            .await
+        {
             Ok(refresh) => {
-                self.warnings.extend(refresh.warnings);
+                self.acc.warnings.extend(refresh.warnings);
                 let continue_run = match refresh.report {
                     Ok(report) => report
                         .is_none_or(|report| self.handle_lock_report(report, pctx, project_label)),
                     Err(error) => {
-                        self.errors.push(
+                        self.acc.errors.push(
                             diag_from_error(&error, pctx.tool, project_label, None)
                                 .with_path(pctx.project.manifest.as_str()),
                         );
@@ -477,7 +489,7 @@ impl<'a> OutdatedRunner<'a> {
                 (continue_run, refresh.guard)
             }
             Err(error) => {
-                self.errors.push(
+                self.acc.errors.push(
                     diag_from_error(&error, pctx.tool, project_label, None)
                         .with_path(pctx.project.manifest.as_str()),
                 );
@@ -503,14 +515,14 @@ impl<'a> OutdatedRunner<'a> {
         match outcome.action {
             LockReportAction::Continue => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.warnings.push(if stale {
+                    self.acc.warnings.push(if stale {
                         stale_evaluation_skipped(diagnostic)
                     } else {
                         diagnostic
                     });
                 }
                 if stale {
-                    self.skipped_stale_projects += 1;
+                    self.acc.skipped_stale_projects += 1;
                     false
                 } else {
                     true
@@ -518,7 +530,7 @@ impl<'a> OutdatedRunner<'a> {
             }
             LockReportAction::Skip => {
                 if let Some(diagnostic) = outcome.diagnostic {
-                    self.errors.push(diagnostic);
+                    self.acc.errors.push(diagnostic);
                 }
                 false
             }
@@ -531,12 +543,11 @@ impl<'a> OutdatedRunner<'a> {
     /// a stalled network call visible under `--log-level debug`.
     async fn fetch_releases(
         &self,
-        adapter: &dyn cooldown_core::ToolRead,
+        read: &ReadProjectCtx<'_>,
         pctx: &super::ProjectCtx,
-        project_label: &str,
         deps: Vec<Dependency>,
-        fctx: &cooldown_core::FetchContext<'_>,
     ) -> Vec<FetchedRelease<Vec<Release>>> {
+        let project_label = read.project_label.as_str();
         tracing::info!(
             project = project_label,
             tool = pctx.tool.as_str(),
@@ -544,18 +555,17 @@ impl<'a> OutdatedRunner<'a> {
             fanout = self.opts.fanout(),
             "fetching release metadata"
         );
-        self.opts
-            .progress
+        read.progress
             .phase(format!("fetching metadata for {} dependencies", deps.len()));
         let started = std::time::Instant::now();
         let fetched = self
             .ws
             .fetch_candidate_releases(
-                adapter,
+                read.adapter,
                 deps,
-                fctx,
+                &read.fetch,
                 self.opts.candidate_scope(),
-                &self.opts.progress,
+                &read.progress,
                 self.opts.fanout(),
             )
             .await;
@@ -703,6 +713,39 @@ impl<'a> OutdatedRunner<'a> {
             security,
             error: None,
         }
+    }
+}
+
+/// Sorts the merged rows and folds the tallies into the run's report.
+fn finalize_outdated(opts: &RunOpts, mut acc: OutdatedAccum) -> OutdatedOutcome {
+    // Releases are fetched concurrently (`buffer_unordered`), so the items arrive in a
+    // non-deterministic order.
+    // Sort by (project, status, name, version) for a stable report (and stable `--json`); the
+    // status rank puts ready-to-adopt updates last.
+    acc.items.sort_by(|a, b| {
+        a.project
+            .cmp(&b.project)
+            .then_with(|| a.status.sort_rank().cmp(&b.status.sort_rank()))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.current.cmp(&b.current))
+    });
+    let mut summary = summarize(&acc.items);
+    summary.skipped_stale_projects = acc.skipped_stale_projects;
+    // An error already explains an empty run; otherwise a selection that evaluated nothing
+    // must say so, or the report is indistinguishable from "everything is current".
+    if acc.errors.is_empty()
+        && !acc.empty_selection_noted
+        && let Some(note) =
+            super::empty_selection_diagnostic(opts, acc.evaluated, acc.skipped_stale_projects)
+    {
+        acc.warnings.push(note);
+    }
+    OutdatedOutcome {
+        summary,
+        items: acc.items,
+        warnings: acc.warnings,
+        errors: acc.errors,
+        exit: Exit::Ok,
     }
 }
 
@@ -937,6 +980,79 @@ mod tests {
 
     const UV: ToolId = ToolId("uv");
     const GO: ToolId = ToolId("go");
+
+    /// Folding two projects keeps every row and diagnostic in fold order and sums the tallies,
+    /// so the run reads as the sequential fold would.
+    #[test]
+    fn merged_projects_fold_every_row_tally_and_diagnostic() {
+        let mut first = super::OutdatedAccum {
+            skipped_stale_projects: 1,
+            empty_selection_noted: true,
+            evaluated: 3,
+            ..super::OutdatedAccum::default()
+        };
+        first.items.push(adoptable("a", "1.0.0", "1.1.0"));
+        first.warnings.push(cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::Config,
+            "first",
+        ));
+        let mut second = super::OutdatedAccum {
+            evaluated: 2,
+            ..super::OutdatedAccum::default()
+        };
+        second.items.push(adoptable("b", "1.0.0", "1.1.0"));
+        second.warnings.push(cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::Config,
+            "second",
+        ));
+        second.errors.push(cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::Config,
+            "error",
+        ));
+
+        let mut run = super::OutdatedAccum::default();
+        run.merge(first);
+        run.merge(second);
+
+        assert_eq!(run.skipped_stale_projects, 1);
+        assert_eq!(run.evaluated, 5);
+        assert!(run.empty_selection_noted);
+        let names: Vec<&str> = run.items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        let warnings: Vec<&str> = run
+            .warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(warnings, ["first", "second"]);
+        assert_eq!(run.errors.len(), 1);
+    }
+
+    /// A project that already explained an empty selection keeps the run-level note away.
+    #[test]
+    fn a_noted_empty_selection_suppresses_the_run_level_note() {
+        let opts = crate::app::RunOpts {
+            scope: crate::app::RunScope::new(
+                camino::Utf8Path::new("/repo"),
+                camino::Utf8Path::new("/repo/sub"),
+            ),
+            ..crate::app::RunOpts::default()
+        };
+        let noted = super::OutdatedAccum {
+            empty_selection_noted: true,
+            ..super::OutdatedAccum::default()
+        };
+
+        let with_note = super::finalize_outdated(&opts, super::OutdatedAccum::default());
+        let without_note = super::finalize_outdated(&opts, noted);
+
+        assert_eq!(with_note.warnings.len(), 1, "{:?}", with_note.warnings);
+        assert!(
+            without_note.warnings.is_empty(),
+            "{:?}",
+            without_note.warnings
+        );
+    }
 
     fn adoptable(name: &str, current: &str, target: &str) -> OutdatedItem {
         OutdatedItem {

@@ -1,10 +1,11 @@
 use super::Window;
 use super::baseline::Baseline;
-use super::lock::{ProjectAccessReadGuard, ProjectAccessWriteGuard};
-use super::progress::Progress;
+use super::lock::{EnvironmentWriteGuard, ProjectAccessReadGuard, ProjectAccessWriteGuard};
+use super::progress::{Progress, ProjectProgress};
 use super::release_cache::{ReleaseCache, ReleaseResolver};
 use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
     ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext,
     LockStatus, LockVerifyReport, MutationRecovery, PatternGlob, PolicyLayer, PolicyStack, Project,
@@ -278,6 +279,8 @@ pub struct RunOpts {
     pub progress: Progress,
     /// Concurrency for registry fan-out.
     pub concurrency: usize,
+    /// `--jobs`: how many tools run at once; `None` runs every detected tool's lane at once.
+    pub jobs: Option<std::num::NonZeroUsize>,
     /// Round budget for the `fix`/reconcile fixpoint loops; `None` uses the built-in default.
     /// No CLI flag sets this — it exists so tests (and embedders) can exercise the budget-
     /// exhaustion path without driving a dozen productive rounds.
@@ -287,6 +290,24 @@ pub struct RunOpts {
 impl RunOpts {
     pub(crate) fn fanout(&self) -> usize {
         self.concurrency.max(1)
+    }
+
+    /// Whether the run refreshes each project's lock before reading it, which takes an
+    /// exclusive lease: `--lock`, except in a dry run, which never writes.
+    ///
+    /// The lease site and the lane plan both read this one predicate, so they cannot drift
+    /// apart.
+    pub(crate) fn refreshes_lock(&self) -> bool {
+        self.lock && !self.dry_run
+    }
+
+    /// Whether a mutating command writes the source project under an exclusive lease, rather
+    /// than a throwaway copy under a shared one (a dry run).
+    ///
+    /// The lease sites and the lane plan both read this one predicate, so they cannot drift
+    /// apart.
+    pub(crate) fn mutates_source(&self) -> bool {
+        !self.dry_run
     }
 
     pub(crate) fn artifact_scope(&self) -> ArtifactScope {
@@ -775,6 +796,18 @@ impl AdapterSet {
             .filter_map(|id| self.adapters.get(id).map(|adapter| &adapter.reader))
     }
 
+    /// The manifest family `tool`'s lease guards for `project`; see [`ToolRead::lease_family`].
+    ///
+    /// Detection never yields a project of an unregistered tool, so the fallback to the recorded
+    /// manifest's file name only keeps the accessor total.
+    #[must_use]
+    pub fn lease_family(&self, tool: ToolId, project: &Project) -> ManifestFamily {
+        self.reader(tool).map_or_else(
+            || ManifestFamily::of(&project.manifest),
+            |reader| reader.lease_family(project),
+        )
+    }
+
     /// Look up the read-side port for one tool.
     #[must_use]
     pub fn reader(&self, id: ToolId) -> Option<&dyn ToolRead> {
@@ -868,6 +901,33 @@ impl Workspace {
         self.adapters.reader(id)
     }
 
+    /// The manifest family `pctx`'s lease guards, as its adapter declares it; see
+    /// [`ToolRead::lease_family`].
+    pub(crate) fn lease_family(&self, pctx: &ProjectCtx) -> ManifestFamily {
+        self.adapters.lease_family(pctx.tool, &pctx.project)
+    }
+
+    /// Runs `writer`'s `--build` step for `project` under the environment turn: one environment
+    /// write at a time in this process, and none while another cooldown builds at the root.
+    ///
+    /// A build installs into an environment shared at the root (`node_modules`, `.venv`), which
+    /// the per-family project leases deliberately leave open, and into the environment the
+    /// process shares across roots (the active virtualenv or conda prefix), so builds and
+    /// installing applies never overlap; see [`EnvironmentWriteGuard`].
+    /// Another cooldown process building a different root into the same ambient environment is
+    /// not excluded, as the per-root project lease never excluded it either.
+    /// `environment` is the source project's root, whose environment the build writes even when
+    /// `project` is a copy.
+    pub(crate) async fn build_project(
+        &self,
+        writer: &dyn ToolWrite,
+        project: &Project,
+        environment: &Utf8Path,
+    ) -> cooldown_core::Result<cooldown_core::VerifyReport> {
+        let _environment = EnvironmentWriteGuard::acquire_async(environment).await?;
+        writer.build(project).await
+    }
+
     pub(crate) fn mutator(&self, id: ToolId) -> Option<&dyn ToolWrite> {
         self.adapters.writer(id)
     }
@@ -880,8 +940,9 @@ impl Workspace {
         &self,
         pctx: &ProjectCtx,
         opts: &RunOpts,
+        progress: &ProjectProgress,
     ) -> cooldown_core::Result<LockRefresh> {
-        if !opts.lock || opts.dry_run {
+        if !opts.refreshes_lock() {
             return Ok(LockRefresh {
                 report: Ok(None),
                 warnings: Vec::new(),
@@ -915,13 +976,15 @@ impl Workspace {
                 guard: None,
             });
         }
-        opts.progress.phase("refreshing lock state");
-        let guard = ProjectAccessWriteGuard::acquire(
+        progress.phase("refreshing lock state");
+        let guard = ProjectAccessWriteGuard::acquire_async(
             self.repo_root(),
             &pctx.project.root,
+            &self.lease_family(pctx),
             pctx.tool,
             writer.sync_scope() == cooldown_core::SyncScope::Repo,
-        )?;
+        )
+        .await?;
         let recovery = writer
             .recover_pending_mutation(&pctx.project, guard.coordination())
             .await?;
@@ -940,12 +1003,14 @@ impl Workspace {
         pctx: &ProjectCtx,
     ) -> cooldown_core::Result<ProjectAccessReadGuard> {
         let writer = self.mutator(pctx.tool);
-        let guard = ProjectAccessReadGuard::acquire(
+        let guard = ProjectAccessReadGuard::acquire_async(
             self.repo_root(),
             &pctx.project.root,
+            &self.lease_family(pctx),
             pctx.tool,
             writer.is_some_and(|writer| writer.sync_scope() == cooldown_core::SyncScope::Repo),
-        )?;
+        )
+        .await?;
         if let Some(writer) = writer {
             writer.ensure_no_pending_mutation(&pctx.project).await?;
         }
@@ -1180,7 +1245,7 @@ impl Workspace {
         adapter: &dyn ToolRead,
         deps: Vec<Dependency>,
         fetch: &FetchContext<'_>,
-        progress: &Progress,
+        progress: &ProjectProgress,
         fanout: usize,
     ) -> Vec<FetchedRelease<Release>> {
         let started = std::time::Instant::now();
@@ -1224,7 +1289,7 @@ impl Workspace {
         deps: Vec<Dependency>,
         fetch: &FetchContext<'_>,
         candidate_scope: CandidateScope,
-        progress: &Progress,
+        progress: &ProjectProgress,
         fanout: usize,
     ) -> Vec<FetchedRelease<Vec<Release>>> {
         let started = std::time::Instant::now();
@@ -1399,7 +1464,7 @@ pub(crate) fn lock_report_outcome(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use color_eyre::eyre;
@@ -1418,9 +1483,12 @@ mod tests {
         deps: Vec<Dependency>,
     }
 
-    struct TestAdapter {
-        write_id: ToolId,
-        refresh: bool,
+    /// A mutator with an empty graph whose lock is always current; `refresh` makes `--lock`
+    /// refresh it, and `repo_sync` makes it sync one repository-wide native file.
+    pub(crate) struct TestAdapter {
+        pub(crate) write_id: ToolId,
+        pub(crate) refresh: bool,
+        pub(crate) repo_sync: bool,
     }
 
     #[async_trait]
@@ -1523,6 +1591,29 @@ mod tests {
             })
         }
 
+        fn sync_scope(&self) -> cooldown_core::SyncScope {
+            if self.repo_sync {
+                cooldown_core::SyncScope::Repo
+            } else {
+                cooldown_core::SyncScope::None
+            }
+        }
+
+        async fn write_repo_native(
+            &self,
+            repo_root: &Utf8Path,
+            _policy: &cooldown_core::ResolvedPolicy,
+            _dry_run: bool,
+        ) -> cooldown_core::Result<cooldown_core::SyncReport> {
+            if self.repo_sync {
+                Ok(cooldown_core::SyncReport::Written {
+                    path: repo_root.join("native.toml"),
+                })
+            } else {
+                Ok(cooldown_core::SyncReport::Unsupported)
+            }
+        }
+
         async fn refresh_lock(
             &self,
             _project: &Project,
@@ -1545,6 +1636,7 @@ mod tests {
         let result = adapters.register_target_verified_mutator(Arc::new(TestAdapter {
             write_id: PNPM,
             refresh: false,
+            repo_sync: false,
         }));
 
         std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
@@ -1560,6 +1652,7 @@ mod tests {
             adapters.register_target_verified_mutator(Arc::new(TestAdapter {
                 write_id: CARGO,
                 refresh: false,
+                repo_sync: false,
             })),
             Ok(())
         );
@@ -1567,12 +1660,51 @@ mod tests {
         let result = adapters.register_read(Arc::new(TestAdapter {
             write_id: CARGO,
             refresh: false,
+            repo_sync: false,
         }));
 
         std::assert_matches!(result, Err(cooldown_core::CoreError::System(_)));
         assert_eq!(adapters.readers().count(), 1);
         assert_eq!(adapters.reader(CARGO).map(ToolRead::id), Some(CARGO));
         assert!(adapters.writer(CARGO).is_some());
+    }
+
+    /// A build stops while another cooldown holds the root's environment lease; the lease is
+    /// held in this process here, so the conflict is immediate instead of a wait.
+    #[tokio::test]
+    async fn a_build_stops_while_another_cooldown_holds_the_environment() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: false,
+            repo_sync: false,
+        }))?;
+        let ws = Workspace::new(
+            adapters,
+            vec![project_ctx(CARGO, root.as_str())],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+        let writer = ws
+            .mutator(CARGO)
+            .ok_or_else(|| eyre::eyre!("the adapter mutates"))?;
+        let project = &ws.projects()[0].project;
+        let held = cooldown_core::fs::ProjectWriteLease::acquire_environment(
+            cooldown_core::fs::ProjectCoordination::resolve(&root)?,
+        )?;
+
+        std::assert_matches!(
+            ws.build_project(writer, project, &project.root).await,
+            Err(cooldown_core::CoreError::LockConflict(_))
+        );
+        drop(held);
+        ws.build_project(writer, project, &project.root).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1585,6 +1717,7 @@ mod tests {
         adapters.register_target_verified_mutator(Arc::new(TestAdapter {
             write_id: CARGO,
             refresh: true,
+            repo_sync: false,
         }))?;
         let ws = Workspace::new(
             adapters,
@@ -1599,15 +1732,19 @@ mod tests {
             ..RunOpts::default()
         };
 
-        let refresh = ws.refresh_project_lock(&ws.projects()[0], &opts).await?;
+        let refresh = ws
+            .refresh_project_lock(&ws.projects()[0], &opts, &ProjectProgress::default())
+            .await?;
 
         assert!(refresh.guard.is_some());
+        let project = &ws.projects()[0].project;
+        let family = ws.lease_family(&ws.projects()[0]);
         std::assert_matches!(
-            ProjectAccessReadGuard::acquire(&root, &root, CARGO, false),
+            ProjectAccessReadGuard::acquire(&root, &project.root, &family, CARGO, false),
             Err(cooldown_core::CoreError::LockConflict(_))
         );
         drop(refresh);
-        ProjectAccessReadGuard::acquire(&root, &root, CARGO, false)?;
+        ProjectAccessReadGuard::acquire(&root, &project.root, &family, CARGO, false)?;
         Ok(())
     }
 
@@ -1672,8 +1809,9 @@ mod tests {
         )
     }
 
-    /// A project at `root`, located relative to the `/repo` scan root the tests scan from.
-    fn project_ctx(tool: ToolId, root: &str) -> ProjectCtx {
+    /// A project of `tool` at `root`, located relative to the `/repo` scan root the tests scan
+    /// from, with the manifest and lock the test adapter declares.
+    pub(crate) fn project_ctx(tool: ToolId, root: &str) -> ProjectCtx {
         let root = Utf8PathBuf::from(root);
         let rel_path = root
             .strip_prefix("/repo")

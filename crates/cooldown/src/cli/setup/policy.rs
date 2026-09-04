@@ -98,7 +98,10 @@ async fn assemble_ctx(
             .filter(|writer| writer.sync_scope() == SyncScope::Repo)
             .map(|_| RepoToolReadGuard::acquire(assembly.repo_root, tool))
             .transpose()?;
-        let _project_guard = ProjectReadGuard::acquire(&project.root)?;
+        let _project_guard = ProjectReadGuard::acquire(
+            &project.root,
+            &assembly.adapters.lease_family(tool, &project),
+        )?;
         if let Some(writer) = assembly.adapters.writer(tool) {
             writer.ensure_no_pending_mutation(&project).await?;
         }

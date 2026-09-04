@@ -187,6 +187,11 @@ impl ToolWrite for BundlerTool {
         BUNDLER_ID
     }
 
+    // `bundle update --conservative` installs the gem as it re-resolves.
+    fn mutation_installs(&self) -> bool {
+        true
+    }
+
     fn resolve_inputs(&self) -> ResolveInputs {
         // A `gemspec` directive in the Gemfile makes bundler load the project's `*.gemspec` (Ruby),
         // which typically `require_relative`s a `lib/**/version.rb`. The throwaway probe copy must
@@ -249,6 +254,8 @@ mod tests {
         let tool = BundlerTool::from_http(
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
         );
+        // The apply installs the gem, so it takes the environment turn.
+        assert!(tool.mutation_installs());
         assert_eq!(tool.capabilities().advisory_ecosystem, Some("RubyGems"));
     }
 

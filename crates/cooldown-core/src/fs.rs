@@ -2,6 +2,8 @@
 //! syncing, and stable file-name hashing.
 //! They keep trust-bearing state transitions and per-path lock/cache names consistent across
 //! crates.
+//! The project leases live here too: one per [`ManifestFamily`] at a root, plus the root's
+//! build-environment lease.
 
 use crate::error::CoreError;
 use crate::model::ToolId;
@@ -24,6 +26,46 @@ pub struct RecoveryAuthority {
     directory: PathBuf,
     directory_identity: std::sync::Arc<same_file::Handle>,
     project: Utf8PathBuf,
+}
+
+/// The manifest a tool rewrites at a project root — `Cargo.toml`, `package.json`,
+/// `pyproject.toml` — which is what a project lease guards.
+///
+/// Tools of one family share a lease at a root, since they rewrite the same file: uv and poetry
+/// both own `pyproject.toml`, and every npm-family tool owns `package.json`.
+/// Tools of different families at one root hold different leases and never conflict, since each
+/// rewrites only its own manifest and lock.
+/// What a build installs at a root (`node_modules`, `.venv`) is shared across families, so the
+/// build step takes the root's environment lease instead; see
+/// [`ProjectWriteLease::acquire_environment`].
+///
+/// Each adapter names its family through [`ToolRead::lease_family`](crate::ToolRead::lease_family),
+/// the one source the lane planner and every lease site read, so they always agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestFamily(String);
+
+impl ManifestFamily {
+    /// The family named by the manifest at `manifest`: its file name, or the empty family for a
+    /// path without one, which no adapter-declared family ever is.
+    ///
+    /// Adapters declare their family directly; this derives one for a lease taken on a manifest
+    /// path alone, as a test does.
+    #[must_use]
+    pub fn of(manifest: &Utf8Path) -> Self {
+        Self(manifest.file_name().unwrap_or_default().to_owned())
+    }
+
+    /// The family named by a manifest file name (`"Cargo.toml"`).
+    #[must_use]
+    pub fn named(manifest: &str) -> Self {
+        Self(manifest.to_owned())
+    }
+
+    /// The manifest file name that names this family.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// An exclusive OS-backed lease for one project's mutation state.
@@ -292,9 +334,9 @@ impl ProjectWriteLease {
     /// Returns [`CoreError::LockConflict`] when another cooldown operation still holds project
     /// access at the wait deadline (or immediately under a fail-fast wait).
     /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
-    pub fn acquire(target: &Utf8Path) -> Result<Self, CoreError> {
+    pub fn acquire(target: &Utf8Path, family: &ManifestFamily) -> Result<Self, CoreError> {
         let coordination = ProjectCoordination::resolve(target)?;
-        Self::acquire_coordination(coordination)
+        Self::acquire_coordination(coordination, family)
     }
 
     /// [`acquire`](Self::acquire) with an explicit wait policy, for callers that must observe a
@@ -306,9 +348,13 @@ impl ProjectWriteLease {
     /// Returns [`CoreError::LockConflict`] when another cooldown operation still holds project
     /// access at `wait`'s deadline.
     /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
-    pub fn acquire_with_wait(target: &Utf8Path, wait: LockWait) -> Result<Self, CoreError> {
+    pub fn acquire_with_wait(
+        target: &Utf8Path,
+        family: &ManifestFamily,
+        wait: LockWait,
+    ) -> Result<Self, CoreError> {
         let coordination = ProjectCoordination::resolve(target)?;
-        Self::acquire_coordination_with_wait(coordination, wait)
+        Self::acquire_coordination_with_wait(coordination, family, wait)
     }
 
     /// Acquires exclusive access through an already resolved coordination identity, waiting per
@@ -319,8 +365,11 @@ impl ProjectWriteLease {
     /// Returns [`CoreError::LockConflict`] when another cooldown operation still holds project
     /// access at the wait deadline.
     /// Returns a filesystem error when the coordination lock cannot be opened safely.
-    pub fn acquire_coordination(coordination: ProjectCoordination) -> Result<Self, CoreError> {
-        Self::acquire_coordination_with_wait(coordination, LockWait::default())
+    pub fn acquire_coordination(
+        coordination: ProjectCoordination,
+        family: &ManifestFamily,
+    ) -> Result<Self, CoreError> {
+        Self::acquire_coordination_with_wait(coordination, family, LockWait::default())
     }
 
     /// [`acquire_coordination`](Self::acquire_coordination) with an explicit wait policy.
@@ -332,13 +381,43 @@ impl ProjectWriteLease {
     /// Returns a filesystem error when the coordination lock cannot be opened safely.
     pub fn acquire_coordination_with_wait(
         coordination: ProjectCoordination,
+        family: &ManifestFamily,
         wait: LockWait,
     ) -> Result<Self, CoreError> {
-        let (path, file, maintenance) = open_project_lease_files(&coordination)?;
+        Self::acquire_exclusive(coordination, ExclusiveLease::Family(family), wait)
+    }
+
+    /// Acquires exclusive access to the environment at `coordination`'s project, for a build or
+    /// an apply that installs, waiting per [`LockWait::default`].
+    ///
+    /// The environment lease is keyed by the root alone, apart from every manifest family, so a
+    /// build never waits on a sibling family's source write and never overlaps another build or
+    /// install at the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when another cooldown operation still builds at the
+    /// root at the wait deadline.
+    /// Returns a filesystem error when the coordination lock cannot be opened safely.
+    pub fn acquire_environment(coordination: ProjectCoordination) -> Result<Self, CoreError> {
+        Self::acquire_exclusive(
+            coordination,
+            ExclusiveLease::Environment,
+            LockWait::default(),
+        )
+    }
+
+    fn acquire_exclusive(
+        coordination: ProjectCoordination,
+        lease: ExclusiveLease<'_>,
+        wait: LockWait,
+    ) -> Result<Self, CoreError> {
+        let (path, file, maintenance) =
+            open_lease_files(&coordination, lease.file_name(coordination.project()))?;
         let registry_entry =
             acquire_file_lock(&file, &path, "another cooldown run", false, false, wait)?;
         #[cfg(unix)]
-        record_lock_owner(&file, &path, &format!("project {}", coordination.project()))?;
+        record_lock_owner(&file, &path, &lease.owner(coordination.project()))?;
         coordination.validate_current()?;
         Ok(ProjectWriteLease {
             project_lock: file,
@@ -482,9 +561,9 @@ impl ProjectReadLease {
     ///
     /// Returns [`CoreError::LockConflict`] while another cooldown operation holds exclusive access.
     /// Returns a filesystem error when the coordination namespace or lock cannot be opened safely.
-    pub fn acquire(target: &Utf8Path) -> Result<Self, CoreError> {
+    pub fn acquire(target: &Utf8Path, family: &ManifestFamily) -> Result<Self, CoreError> {
         let coordination = ProjectCoordination::resolve(target)?;
-        Self::acquire_coordination(coordination)
+        Self::acquire_coordination(coordination, family)
     }
 
     /// Acquires shared access through an already resolved coordination identity, waiting per
@@ -495,8 +574,11 @@ impl ProjectReadLease {
     /// Returns [`CoreError::LockConflict`] when another cooldown operation still holds exclusive
     /// access at the wait deadline.
     /// Returns a filesystem error when the coordination lock cannot be opened safely.
-    pub fn acquire_coordination(coordination: ProjectCoordination) -> Result<Self, CoreError> {
-        Self::acquire_coordination_with_wait(coordination, LockWait::default())
+    pub fn acquire_coordination(
+        coordination: ProjectCoordination,
+        family: &ManifestFamily,
+    ) -> Result<Self, CoreError> {
+        Self::acquire_coordination_with_wait(coordination, family, LockWait::default())
     }
 
     /// [`acquire_coordination`](Self::acquire_coordination) with an explicit wait policy.
@@ -508,9 +590,10 @@ impl ProjectReadLease {
     /// Returns a filesystem error when the coordination lock cannot be opened safely.
     pub fn acquire_coordination_with_wait(
         coordination: ProjectCoordination,
+        family: &ManifestFamily,
         wait: LockWait,
     ) -> Result<Self, CoreError> {
-        let (path, file, maintenance) = open_project_lease_files(&coordination)?;
+        let (path, file, maintenance) = open_project_lease_files(&coordination, family)?;
         let registry_entry = acquire_file_lock(
             &file,
             &path,
@@ -535,18 +618,72 @@ impl ProjectReadLease {
     }
 }
 
+/// What an exclusive project lease guards: one manifest family's source state, or the build
+/// environment every family at the root shares.
+#[derive(Clone, Copy)]
+enum ExclusiveLease<'a> {
+    Family(&'a ManifestFamily),
+    Environment,
+}
+
+impl ExclusiveLease<'_> {
+    fn file_name(self, project: &Utf8Path) -> String {
+        match self {
+            ExclusiveLease::Family(family) => project_lease_name(project, family),
+            ExclusiveLease::Environment => environment_lease_name(project),
+        }
+    }
+
+    /// The holder description recorded in the lock file for a waiting run to report.
+    #[cfg(unix)]
+    fn owner(self, project: &Utf8Path) -> String {
+        match self {
+            ExclusiveLease::Family(family) => format!("project {project} ({})", family.as_str()),
+            ExclusiveLease::Environment => format!("project {project} (build environment)"),
+        }
+    }
+}
+
 fn open_project_lease_files(
     coordination: &ProjectCoordination,
+    family: &ManifestFamily,
+) -> Result<(PathBuf, std::fs::File, std::fs::File), CoreError> {
+    open_lease_files(
+        coordination,
+        project_lease_name(coordination.project(), family),
+    )
+}
+
+/// Opens the lease file `name` in the coordination directory under its shared maintenance lock,
+/// so a sweep of stale locks never removes a file a live lease holds.
+fn open_lease_files(
+    coordination: &ProjectCoordination,
+    name: String,
 ) -> Result<(PathBuf, std::fs::File, std::fs::File), CoreError> {
     let maintenance_path = coordination.directory().join(".maintenance.lock");
     let maintenance = open_coordination_lock(&maintenance_path)?;
     maintenance.lock_shared()?;
-    let path = coordination.directory().join(format!(
-        "{:016x}.lock",
-        fnv1a_64(coordination.project().as_str())
-    ));
+    let path = coordination.directory().join(name);
     let file = open_coordination_lock(&path)?;
     Ok((path, file, maintenance))
+}
+
+/// The lease file for `family` at `project`, keyed by both so tools that rewrite different
+/// manifests at one root never wait on each other.
+/// Public so a test can assert where a run's lease landed.
+#[must_use]
+pub fn project_lease_name(project: &Utf8Path, family: &ManifestFamily) -> String {
+    let identity = format!("{}\0{}", project, family.as_str());
+    format!("{:016x}.lock", fnv1a_64(&identity))
+}
+
+/// The lease file for the environment at `project`, keyed by the root alone since every family
+/// installs into the same `node_modules` or `.venv` there.
+/// The doubled separator keeps the name apart from every family lease, whose family holds no
+/// NUL.
+fn environment_lease_name(project: &Utf8Path) -> String {
+    let identity = format!("{project}\0\0environment");
+    format!("{:016x}.lock", fnv1a_64(&identity))
 }
 
 fn open_repository_lease_files(
@@ -1406,8 +1543,8 @@ mod tests {
     #[cfg(unix)]
     use super::DurableWriteError;
     use super::{
-        LockWait, ProjectCoordination, ProjectReadLease, ProjectWriteLease, atomic_write,
-        atomic_write_with_permissions_checked,
+        LockWait, ManifestFamily, ProjectCoordination, ProjectReadLease, ProjectWriteLease,
+        atomic_write, atomic_write_with_permissions_checked,
     };
     use camino::Utf8Path;
     use color_eyre::eyre;
@@ -1484,29 +1621,78 @@ mod tests {
         Ok(())
     }
 
+    fn family() -> ManifestFamily {
+        ManifestFamily::named("Cargo.toml")
+    }
+
     #[test]
     fn project_read_and_write_leases_share_one_lock_protocol() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let first_reader = ProjectReadLease::acquire(root)?;
-        let second_reader = ProjectReadLease::acquire(root)?;
+        let first_reader = ProjectReadLease::acquire(root, &family())?;
+        let second_reader = ProjectReadLease::acquire(root, &family())?;
 
         std::assert_matches!(
-            ProjectWriteLease::acquire(root),
+            ProjectWriteLease::acquire(root, &family()),
             Err(CoreError::LockConflict(_))
         );
         drop(first_reader);
         drop(second_reader);
 
-        let writer = ProjectWriteLease::acquire(root)?;
-        let conflict = ProjectReadLease::acquire(root)
+        let writer = ProjectWriteLease::acquire(root, &family())?;
+        let conflict = ProjectReadLease::acquire(root, &family())
             .err()
             .ok_or_else(|| eyre::eyre!("reader acquired a write-locked project"))?;
         #[cfg(unix)]
         assert!(conflict.to_string().contains("locked by cooldown pid"));
         std::assert_matches!(conflict, CoreError::LockConflict(_));
         drop(writer);
+        Ok(())
+    }
+
+    /// Two tools that rewrite different manifests at one root hold different leases: a cargo
+    /// writer and a uv writer at one directory never wait on each other, while a second tool of
+    /// the uv family (poetry, also on `pyproject.toml`) does.
+    #[test]
+    fn leases_are_shared_within_a_manifest_family_only() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = ManifestFamily::named("Cargo.toml");
+        let python = ManifestFamily::of(Utf8Path::new("/repo/pyproject.toml"));
+        let _cargo_writer = ProjectWriteLease::acquire(root, &cargo)?;
+
+        let _uv_writer = ProjectWriteLease::acquire(root, &python)?;
+        std::assert_matches!(
+            ProjectWriteLease::acquire(root, &python),
+            Err(CoreError::LockConflict(_))
+        );
+        std::assert_matches!(
+            ProjectReadLease::acquire(root, &cargo),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    /// The environment lease is one per root: a second build there conflicts whatever family
+    /// asks, while a family's source lease at the root coexists with it.
+    #[test]
+    fn environment_leases_exclude_each_other_but_not_family_leases() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let coordination = || ProjectCoordination::resolve(root);
+
+        let environment = ProjectWriteLease::acquire_environment(coordination()?)?;
+
+        std::assert_matches!(
+            ProjectWriteLease::acquire_environment(coordination()?),
+            Err(CoreError::LockConflict(_))
+        );
+        let _source = ProjectWriteLease::acquire(root, &family())?;
+        drop(environment);
+        ProjectWriteLease::acquire_environment(coordination()?)?;
         Ok(())
     }
 
@@ -1518,10 +1704,9 @@ mod tests {
         // Hash the canonical spelling the lease derivation uses — the as-given tempdir path is
         // not canonical on macOS (/var → /private/var) or Windows (\\?\-verbatim), and hashing
         // it would lock a different file than the lease under test.
-        let path = coordination.directory().join(format!(
-            "{:016x}.lock",
-            super::fnv1a_64(coordination.project().as_str())
-        ));
+        let path = coordination
+            .directory()
+            .join(super::project_lease_name(coordination.project(), &family()));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1544,6 +1729,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             ProjectReadLease::acquire_coordination_with_wait(
                 coordination,
+                &family(),
                 LockWait::bounded(std::time::Duration::from_secs(30)),
             )
         });
@@ -1570,6 +1756,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = ProjectWriteLease::acquire_coordination_with_wait(
             coordination,
+            &family(),
             LockWait::bounded(std::time::Duration::from_millis(500)),
         );
 
@@ -1588,12 +1775,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let _reader = ProjectReadLease::acquire(root)?;
+        let _reader = ProjectReadLease::acquire(root, &family())?;
         let coordination = ProjectCoordination::resolve(root)?;
 
         let started = std::time::Instant::now();
         let result = ProjectWriteLease::acquire_coordination_with_wait(
             coordination,
+            &family(),
             LockWait::bounded(std::time::Duration::from_secs(30)),
         );
 

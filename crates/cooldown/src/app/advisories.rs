@@ -13,7 +13,7 @@
 //! to flag for that project — or, when the staleness arrives with an upgrade top-up after the
 //! mode is settled, for exactly the topped-up packages.
 
-use super::{AdvisoryFailureMode, ProjectCtx, RunOpts, Workspace};
+use super::{AdvisoryFailureMode, ProjectCtx, ProjectProgress, RunOpts, Workspace};
 use cooldown_core::{
     Advisory, AdvisoryContext, AdvisoryMode, AdvisorySourceId, AdvisorySourceKind, Dependency,
     Diagnostic, DiagnosticKind, RawAdvisory, Release, ResolveKind, ResolveQuery,
@@ -374,6 +374,7 @@ impl Workspace {
         project_label: &str,
         packages: AdvisoryPackages,
         opts: &RunOpts,
+        progress: &ProjectProgress,
     ) -> AdvisoryOutcome {
         let Some(mut policy) = advisory_fetch_policy(pctx) else {
             return AdvisoryOutcome::inert();
@@ -423,7 +424,7 @@ impl Workspace {
             };
         };
 
-        opts.progress.phase(format!(
+        progress.phase(format!(
             "querying {} advisories for {} packages",
             source.id(),
             identities.len()
@@ -500,6 +501,7 @@ impl Workspace {
         existing: &ProjectAdvisories,
         packages: &[String],
         opts: &RunOpts,
+        progress: &ProjectProgress,
     ) -> AdvisoryOutcome {
         let Some(source) = self
             .advisory_source
@@ -518,7 +520,7 @@ impl Workspace {
             .with_project(project_label);
             return AdvisoryOutcome::fail_open(diagnostic, opts.advisory_failure);
         };
-        opts.progress.phase(format!(
+        progress.phase(format!(
             "querying {} advisories for {} newly resolved packages",
             source.id(),
             packages.len()
@@ -695,6 +697,7 @@ fn unsupported_ecosystem_warning(pctx: &ProjectCtx, project_label: &str) -> Diag
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::ProjectProgress;
     use crate::app::{AdapterSet, Baseline, ProjectCtx, Workspace};
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
@@ -916,6 +919,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(outcome.advisories.is_none());
@@ -940,6 +944,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(outcome.advisories.is_none());
@@ -955,7 +960,14 @@ mod tests {
             ..RunOpts::default()
         };
         let outcome = ws
-            .fetch_project_advisories(&reader, &pctx, ".", queries(&["serde"]), &opts)
+            .fetch_project_advisories(
+                &reader,
+                &pctx,
+                ".",
+                queries(&["serde"]),
+                &opts,
+                &ProjectProgress::default(),
+            )
             .await;
         assert!(outcome.advisories.is_none());
         assert!(outcome.warnings.is_empty());
@@ -980,6 +992,7 @@ mod tests {
                 ".",
                 queries(&["conda-thing"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(outcome.advisories.is_none());
@@ -1007,6 +1020,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         let advisories = outcome.advisories.expect("fetched");
@@ -1031,6 +1045,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         let advisories = outcome.advisories.expect("fetched");
@@ -1059,6 +1074,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &opts,
+                &ProjectProgress::default(),
             )
             .await;
         assert_eq!(outcome.errors.len(), 1);
@@ -1089,6 +1105,7 @@ mod tests {
                 ".",
                 AdvisoryPackages::from_deps(&deps),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert_eq!(outcome.warnings.len(), 1);
@@ -1114,6 +1131,7 @@ mod tests {
                 ".",
                 AdvisoryPackages::from_deps(&deps),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
@@ -1144,6 +1162,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         let initial = outcome.advisories.expect("fetched");
@@ -1161,6 +1180,7 @@ mod tests {
                 &initial,
                 &["tokio".to_string()],
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         let merged = topped_up.advisories.expect("topped up");
@@ -1192,6 +1212,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await
             .advisories
@@ -1205,6 +1226,7 @@ mod tests {
                 &initial,
                 &["tokio".to_string()],
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert_eq!(topped_up.warnings.len(), 1);
@@ -1239,6 +1261,7 @@ mod tests {
                     advisory_failure: AdvisoryFailureMode::Error,
                     ..RunOpts::default()
                 },
+                &ProjectProgress::default(),
             )
             .await;
         assert_eq!(topped_up.errors.len(), 1);
@@ -1253,6 +1276,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await
             .advisories
@@ -1264,6 +1288,7 @@ mod tests {
                 &initial,
                 &["tokio".to_string()],
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(topped_up.advisories.is_some());
@@ -1285,6 +1310,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await
             .advisories
@@ -1297,6 +1323,7 @@ mod tests {
                 &initial,
                 &["tokio".to_string()],
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(topped_up.advisories.is_none());
@@ -1321,6 +1348,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await
             .advisories
@@ -1333,6 +1361,7 @@ mod tests {
                 &initial,
                 &["tokio".to_string()],
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(topped_up.advisories.is_none());
@@ -1363,6 +1392,7 @@ mod tests {
                 ".",
                 queries(&["serde"]),
                 &RunOpts::default(),
+                &ProjectProgress::default(),
             )
             .await;
         assert!(outcome.advisories.is_none());
@@ -1375,7 +1405,14 @@ mod tests {
             ..RunOpts::default()
         };
         let outcome = ws
-            .fetch_project_advisories(&reader, &pctx, ".", queries(&["serde"]), &opts)
+            .fetch_project_advisories(
+                &reader,
+                &pctx,
+                ".",
+                queries(&["serde"]),
+                &opts,
+                &ProjectProgress::default(),
+            )
             .await;
         assert_eq!(outcome.errors.len(), 1, "the gate refuses to certify");
     }

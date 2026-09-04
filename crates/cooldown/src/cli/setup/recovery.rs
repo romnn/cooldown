@@ -92,6 +92,7 @@ recovery_options! {
         "offline" => ("--offline", |global| global.offline),
         "fresh" => ("--fresh", |global| global.fresh),
         "concurrency" => ("--concurrency", |global| global.concurrency.is_some()),
+        "jobs" => ("--jobs", |global| global.jobs.is_some()),
         "no_native" => ("--no-native", |global| global.no_native),
         "no_global" => ("--no-global", |global| global.no_global),
         "config" => ("--config", |global| global.config.is_some()),

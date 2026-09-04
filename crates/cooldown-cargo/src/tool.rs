@@ -151,11 +151,11 @@ impl ToolRead for CargoTool {
         cooldown_core::ProjectDetection::PrimaryWithValidation {
             primary: ProjectMarker {
                 lockfile: "Cargo.lock",
-                manifest: "Cargo.toml",
+                manifest: crate::CARGO_MANIFEST,
                 alternate_manifests: &[],
                 workspace_root: true,
             },
-            validation_marker: "Cargo.toml",
+            validation_marker: crate::CARGO_MANIFEST,
         }
     }
 
@@ -2023,6 +2023,31 @@ mod tests {
 
         let result = skipped_on_apply_error(&change, err);
         std::assert_matches!(result, Err(CoreError::ToolSpawn { .. }));
+    }
+
+    /// The family the adapter declares is `CARGO_MANIFEST`, the one recovery names when it
+    /// re-takes the lease a run held (`publication.rs` tests recovery itself), and cargo's apply
+    /// rewrites files only, so it never takes the environment turn.
+    #[test]
+    fn the_lease_family_is_the_declared_manifest() -> eyre::Result<()> {
+        let cache = tempfile::tempdir()?;
+        let tool = CargoTool::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let project = Project {
+            root: "/repo".into(),
+            kind: CARGO_ID,
+            manifest: "/repo/Cargo.toml".into(),
+            exclude_newer: None,
+        };
+
+        assert_eq!(
+            tool.lease_family(&project),
+            cooldown_core::fs::ManifestFamily::named(crate::CARGO_MANIFEST)
+        );
+        assert!(!tool.mutation_installs());
+        Ok(())
     }
 
     /// A project Cargo did not stage itself cannot be prepared for mutation.

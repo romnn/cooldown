@@ -21,6 +21,9 @@ use cooldown_core::ToolId;
 /// The [`ToolId`] identifying the Rust/Cargo tool (`"cargo"`).
 pub const CARGO_ID: ToolId = ToolId("cargo");
 
+/// The manifest cargo records and rewrites, which names the family its project lease guards.
+pub const CARGO_MANIFEST: &str = "Cargo.toml";
+
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;
 
@@ -160,12 +163,13 @@ pub fn recover_interrupted_mutation(
     // owns the project, its journal is live and there is nothing valid to recover.
     let lease = cooldown_core::fs::ProjectWriteLease::acquire_with_wait(
         project_root,
+        &cooldown_core::fs::ManifestFamily::named(CARGO_MANIFEST),
         cooldown_core::fs::LockWait::fail_fast(),
     )?;
     let project_root = lease.coordination().project().to_owned();
     let project = cooldown_core::Project {
         root: project_root.clone(),
-        manifest: project_root.join("Cargo.toml"),
+        manifest: project_root.join(CARGO_MANIFEST),
         kind: CARGO_ID,
         exclude_newer: None,
     };

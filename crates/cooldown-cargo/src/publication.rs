@@ -652,7 +652,10 @@ mod tests {
     #[test]
     fn public_recovery_entry_acquires_the_project_lease() -> eyre::Result<()> {
         let (_directory, project, _lock_path) = setup();
-        let _lease = cooldown_core::fs::ProjectWriteLease::acquire(&project.root)?;
+        let _lease = cooldown_core::fs::ProjectWriteLease::acquire(
+            &project.root,
+            &cooldown_core::fs::ManifestFamily::of(&project.manifest),
+        )?;
 
         let error = crate::recover_interrupted_mutation(&project.root)
             .err()
