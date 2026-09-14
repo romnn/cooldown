@@ -156,6 +156,23 @@ multiline case.
 - `color-eyre` is for the CLI binary only — it formats errors for the human at
   the terminal and must not leak into the library layers.
 
+## Paths
+
+CI runs on Windows too, so path handling must not assume a separator:
+
+- Build and compare filesystem paths through `Path` / `Utf8Path` (`join`,
+  `strip_prefix`, `components`), never by string concatenation, splitting on
+  `/`, or `MAIN_SEPARATOR` — both `/` and `\` separate on Windows
+  (`std::path::is_separator`).
+- A path that leaves the process as data — a diagnostic or report `path`, a
+  member path, a message, JSON output — is project-relative and `/`-separated
+  on every platform. `Utf8Path::join` and `to_string()` spell the native
+  separator, so normalize where the relative path is derived.
+- In tests, never interpolate a real (temp) path raw into JSON, TOML, or another
+  escaped format: a Windows path's backslashes are escapes there. Serialize it
+  (`serde_json::to_string`, a `toml` value) instead, and assert on
+  `/`-separated relative paths rather than native absolute ones.
+
 ## Lints
 
 - Fix clippy findings for real rather than silencing them. `#[allow(...)]` is a
