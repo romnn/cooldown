@@ -321,7 +321,9 @@ pub(crate) fn member_manifest_rel(member_path: &str) -> Utf8PathBuf {
     if member_path.is_empty() || member_path == "." {
         Utf8PathBuf::from("Cargo.toml")
     } else {
-        Utf8Path::new(member_path).join("Cargo.toml")
+        // Not `Utf8Path::join`, which spells the native separator: this path is reported (a
+        // diagnostic's `path`, the regeneration note), and `/` separates on Windows as well.
+        Utf8PathBuf::from(format!("{member_path}/Cargo.toml"))
     }
 }
 

@@ -1206,7 +1206,13 @@ fn member_path(manifest_path: &str, workspace_root: &str) -> String {
         .unwrap_or_else(|| Utf8Path::new(""));
     let root = Utf8Path::new(workspace_root);
     match dir.strip_prefix(root) {
-        Ok(rel) if !rel.as_str().is_empty() => rel.to_string(),
+        // Joined with `/` rather than the native separator: the member path is reported and
+        // matched against folder globs, both `/`-separated on every platform.
+        Ok(rel) if !rel.as_str().is_empty() => rel
+            .components()
+            .map(|component| component.as_str())
+            .collect::<Vec<_>>()
+            .join("/"),
         _ => ".".to_string(),
     }
 }
@@ -1867,6 +1873,17 @@ mod tests {
             "crates/app"
         );
         assert_eq!(member_path("/repo/Cargo.toml", "/repo"), ".");
+    }
+
+    /// Cargo reports native manifest paths, which on Windows separate with backslashes; the
+    /// member path still spells `/`.
+    #[cfg(windows)]
+    #[test]
+    fn member_path_is_slash_separated_on_windows() {
+        assert_eq!(
+            member_path("C:\\repo\\crates\\app\\Cargo.toml", "C:\\repo"),
+            "crates/app"
+        );
     }
 
     #[test]

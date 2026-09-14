@@ -1813,6 +1813,9 @@ mod tests {
             "#},
         )
         .expect("hack manifest");
+        // A Windows temp root carries backslashes, which are escapes inside a JSON string.
+        let root = serde_json::to_string(root.as_str()).expect("json root");
+        let root = root.trim_matches('"');
         let json = formatdoc! {r#"{{
             "packages": [
                 {{"id": "app", "name": "app", "version": "0.1.0",
