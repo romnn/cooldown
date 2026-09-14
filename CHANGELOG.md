@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.21
+
 - **A cargo-hakari workspace-hack follows upgrades instead of being one.** A workspace-hack's
   `[dependencies]` are generated from the lock — one entry per crate and compatibility line,
   hash-aliased when several majors coexist — and cooldown read every entry as an ordinary direct

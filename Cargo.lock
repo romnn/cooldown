@@ -400,7 +400,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "cooldown"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-adapter-util"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "camino",
  "cooldown-core",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-cargo"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-conda"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-core"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-go"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-hex"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-maven"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-npm"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-pip"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-registry"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-render"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "color-eyre",
  "comfy-table",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-rubygems"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-swift"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-toml-util"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "camino",
  "cooldown-core",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "cooldown-uv"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "async-trait",
  "camino",
