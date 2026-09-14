@@ -6,6 +6,7 @@ use cooldown_core::{
     AcceptedProjectState, CoreError, Project, ProjectMutationFile, ProjectMutationJournal, Result,
 };
 use sha2::{Digest as _, Sha256};
+use std::fmt::Write as _;
 
 const PROJECT_RECOVERY_FORMAT: &str = "cooldown-cargo-project-recovery-v1";
 pub(super) const RECOVERY_ANCHOR_FORMAT: &str = "cooldown-cargo-recovery-anchor-v1";
@@ -342,7 +343,13 @@ pub(super) fn canonical_project_root(project: &Project) -> Result<String> {
 }
 
 pub(super) fn bytes_digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    // sha2 0.11's digest output no longer implements `LowerHex`, so hex-encode byte by byte.
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 pub(super) fn is_sha256_digest(value: &str) -> bool {

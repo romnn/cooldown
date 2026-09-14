@@ -104,7 +104,7 @@ fn path_label(path: &str) -> String {
 
 fn base_table(use_color: bool) -> Table {
     let mut t = Table::new();
-    t.load_preset(comfy_table::presets::UTF8_HORIZONTAL_ONLY)
+    t.load_style(comfy_table::presets::UTF8_HORIZONTAL_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic);
     // The caller has already decided whether to colorize (TTY / `--color`); enforce it so comfy-
     // table's own TTY check can't strip ANSI when the output is piped (e.g. into a screenshot tool).
