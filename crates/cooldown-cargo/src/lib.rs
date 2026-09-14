@@ -172,6 +172,7 @@ pub fn recover_interrupted_mutation(
         manifest: project_root.join(CARGO_MANIFEST),
         kind: CARGO_ID,
         exclude_newer: None,
+        generated_members: cooldown_core::GeneratedMembers::undeclared(),
     };
     if lease.coordination().recovery_authority().is_none()
         && !publication::has_project_recovery_artifacts(&project.root.join("Cargo.lock"))?

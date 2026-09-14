@@ -643,6 +643,65 @@ pub struct Project {
     /// policy resolved yet), or a `Latest`/zero-age window with no binding floor. The application fills
     /// it in once policy is resolved.
     pub exclude_newer: Option<String>,
+    /// The workspace members whose manifests are generated projections of the resolved graph
+    /// rather than authored intent (`[tool.cargo] generated-members`), populated by the
+    /// application from the project's config cascade.
+    /// An adapter that honors it treats such a member's declarations as following the lock, never
+    /// driving it: they originate no candidate, hold nothing, and attribute nothing they merely
+    /// mirror, yet they are rewritten alongside the authored declaration that moves so the lock
+    /// stays resolvable.
+    /// Honored by cargo (cargo-hakari's workspace-hack is the shape it exists for); other
+    /// adapters ignore it, and the config layer only accepts it where an adapter honors it.
+    pub generated_members: GeneratedMembers,
+}
+
+/// The workspace members a project declares as generated (`[tool.cargo] generated-members`).
+///
+/// Whether the list was declared at all is significant: an undeclared list leaves an adapter free
+/// to *hint* that a member looks generated, while an explicit empty list says the user has
+/// decided every member is authored and wants no hint.
+/// Detection is never inferred from a manifest's contents — marking a member generated narrows
+/// what cooldown proposes and reports, and a supply-chain tool must not narrow its own scope from
+/// a heuristic — so the only way into [`Declared`](Self::declared) is the config declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedMembers {
+    declared: Option<Vec<String>>,
+}
+
+impl GeneratedMembers {
+    /// No declaration at all (the default): every member is authored, and an adapter may hint
+    /// when one looks generated.
+    #[must_use]
+    pub const fn undeclared() -> Self {
+        GeneratedMembers { declared: None }
+    }
+
+    /// An explicit declaration of exactly these member package names; empty means "none, and I
+    /// know it".
+    #[must_use]
+    pub fn declared(names: Vec<String>) -> Self {
+        GeneratedMembers {
+            declared: Some(names),
+        }
+    }
+
+    /// Whether the user declared the list (even an empty one).
+    #[must_use]
+    pub const fn is_declared(&self) -> bool {
+        self.declared.is_some()
+    }
+
+    /// The declared member package names; empty when undeclared.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        self.declared.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether a member of this package name is declared generated.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.names().iter().any(|declared| declared == name)
+    }
 }
 
 /// What slice of the dependency set a command evaluates.
@@ -1102,6 +1161,12 @@ pub struct ApplyReport {
     /// Non-fatal adapter warnings about a mutation that is already visible and must still be
     /// reported as committed.
     pub warnings: Vec<Diagnostic>,
+    /// The generated manifests ([`Project::generated_members`]) whose projected requirements
+    /// this apply rewrote to follow the moves it landed, project-root-relative. A fact rather
+    /// than a warning: only the caller knows whether the mutation is kept (a real run) or thrown
+    /// away (a dry run, `outdated`'s policy preview), so it phrases the regeneration note in the
+    /// run's mood.
+    pub followed_manifests: Vec<Utf8PathBuf>,
 }
 
 /// The authoritative final edge audit plus non-fatal durability warnings.

@@ -28,6 +28,11 @@ bookCollapseSection: false
 | Java (Gradle) | `gradle` | Maven Central | `gradle.lockfile` |
 | Swift | `swift` | GitHub Releases | `Package.resolved` |
 
+A cargo-hakari workspace-hack — a member whose `[dependencies]` are generated from the lock —
+should be declared in [`[tool.cargo] generated-members`]({{< relref "../configuration/selectors.md" >}}#toolcargo-generated-members);
+its entries then follow every upgrade instead of being proposed (and reported `blocked`) as
+upgrades of their own. cooldown hints when an undeclared member carries the hakari marker.
+
 Cargo projects must currently use the workspace-root `Cargo.lock`.
 Cooldown fails explicitly when Cargo's `resolver.lockfile-path` configuration or
 `CARGO_RESOLVER_LOCKFILE_PATH` selects a custom location, because safely staging, normalizing, and

@@ -204,6 +204,23 @@ across layers (only ratchets stricter); `allow` is an **accumulated union** that
 only when co-declared with it (or via an audited `--latest`/`--allow`). `cooldown explain <pkg>`
 prints the field-by-field derivation.
 
+### Generated manifests (cargo-hakari workspace-hack)
+
+A workspace-hack's `[dependencies]` are generated from the lock, so its entries can only *follow* an
+upgrade — nothing a user does can upgrade `hashbrown-3575ec1268b04181` on its own. Declare it and
+cooldown stops proposing (and reporting `blocked`) its hundreds of projected lines, keeps gating
+every crate they name through the real graph, and rewrites the matching entry whenever an authored
+declaration moves a crate across a major, so the workspace still resolves without a second copy:
+
+```toml
+[tool.cargo]
+generated-members = ["workspace-hack"]   # exact member names; a name that matches nothing is an error
+```
+
+A run that rewrote the projection tells you to regenerate it (`cargo hakari generate`). Detection is
+never inferred from the manifest; an undeclared member that carries the hakari marker only earns a
+hint. See [selectors](https://romnn.github.io/cooldown/docs/configuration/selectors/#toolcargo-generated-members).
+
 ### Excluding folders and packages
 
 Two independent knobs trim what a run looks at. Both live under the flag-default sections —

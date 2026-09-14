@@ -33,14 +33,43 @@ use cooldown_adapter_util::{
 };
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
-    Dependency, EdgeNormalizationReport, EdgePolicy, EdgeRebind, FetchContext, LockVerifyReport,
-    MemberRef, MutationExecution, NativePolicyLayer, PackageId, PackageRegistry, Plan,
-    PreparedMutation, Project, ProjectMarker, ProjectMutationFile, ProjectMutationJournal, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason,
-    Skipped, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
+    Dependency, Diagnostic, DiagnosticKind, EdgeNormalizationReport, EdgePolicy, EdgeRebind,
+    FetchContext, LockVerifyReport, MemberRef, MutationExecution, NativePolicyLayer, PackageId,
+    PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker, ProjectMutationFile,
+    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
+    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
+    VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+/// The line cargo-hakari writes above the dependency tables it generates. Read for one purpose
+/// only: to hint that an *undeclared* member looks like a workspace-hack. It never decides
+/// anything — the marker is a convention, not a contract (forks of the tool exist), and a
+/// supply-chain tool must not narrow its own scope from a heuristic.
+const HAKARI_SECTION_MARKER: &str = "### BEGIN HAKARI SECTION";
+
+/// How many stale projected crates a staleness notice names before eliding the rest.
+const STALE_NODES_NAMED: usize = 6;
+
+/// What one graph read establishes about a project's generated members
+/// ([`Project::generated_members`]): the members themselves, as the manifests a lock move must
+/// be followed into, and the notices the read gives rise to. Memoized per project root so the
+/// notice pass, the mutation journal, and the apply need no graph read of their own.
+#[derive(Debug, Default)]
+struct GeneratedFacts {
+    /// The declared generated members, resolved to their manifests.
+    members: Vec<MemberRef>,
+    /// The same members as lock identities (name, version, no source), so an edge observation
+    /// can be matched to a generated member exactly rather than to any source-less namesake.
+    identities: Vec<crate::lockfile::LockPackageId>,
+    /// The authored members' lock identities — the roots a lock-text walk starts from, since a
+    /// source-less lock block can also be an external path package.
+    authored_identities: Vec<crate::lockfile::LockPackageId>,
+    /// Advisory only (see [`ToolRead::manifest_notices`]).
+    notices: Vec<Diagnostic>,
+}
 
 /// The Rust/Cargo implementation of the [`Tool`] port.
 ///
@@ -50,6 +79,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct CargoTool {
     index: CratesIoIndex,
     cargo: Cargo,
+    /// The [`GeneratedFacts`] per project root, established by the first graph read of that root
+    /// (workspace membership cannot change within a run). A staged copy is a root of its own and
+    /// establishes its own.
+    generated: tokio::sync::Mutex<HashMap<Utf8PathBuf, Arc<GeneratedFacts>>>,
 }
 
 impl CargoTool {
@@ -62,7 +95,42 @@ impl CargoTool {
         CargoTool {
             index,
             cargo: Cargo::new(),
+            generated: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The generated-member facts for `project`: the memoized ones, else established from a
+    /// fresh locked graph read — which the notice pass never needs, since it follows the
+    /// dependency read that memoized them, and a mutation needs at most once per staged copy.
+    /// A project that names no generated member has no followers and, short of the memoized
+    /// hint a dependency read may have left, no notices either, so it never spawns cargo for
+    /// them: the common workspace pays nothing for the feature.
+    async fn generated_facts(&self, project: &Project) -> Result<Arc<GeneratedFacts>> {
+        if let Some(facts) = self.generated.lock().await.get(&project.root) {
+            return Ok(Arc::clone(facts));
+        }
+        if project.generated_members.names().is_empty() {
+            return Ok(Arc::new(GeneratedFacts::default()));
+        }
+        let graph = self
+            .cargo
+            .metadata_locked(&project.root, &project.generated_members)
+            .await?;
+        self.remember_generated_facts(project, &graph).await
+    }
+
+    /// Establishes and memoizes the facts a graph read of `project` yields.
+    async fn remember_generated_facts(
+        &self,
+        project: &Project,
+        graph: &ResolvedGraph,
+    ) -> Result<Arc<GeneratedFacts>> {
+        let facts = Arc::new(generated_facts(project, graph));
+        self.generated
+            .lock()
+            .await
+            .insert(project.root.clone(), Arc::clone(&facts));
+        Ok(facts)
     }
 
     /// Creates an tool backed by the shared HTTP layer, building the index for you.
@@ -76,6 +144,121 @@ impl CargoTool {
     pub(crate) const fn cargo(&self) -> &Cargo {
         &self.cargo
     }
+}
+
+/// Derives the [`GeneratedFacts`] of `project` from one resolved `graph`.
+///
+/// With generated members declared, the notice is staleness: nodes only the generated members
+/// reach are declared by a projection that nothing authored still needs, so the projection lags
+/// the workspace and a regeneration would drop them. Without a declaration at all, the notice is
+/// the hint: an authored member whose manifest carries the hakari marker looks like the shape the
+/// declaration exists for, and its declarations are about to be proposed as upgrades. An explicit
+/// empty declaration is the user saying every member is authored, and gets neither.
+fn generated_facts(project: &Project, graph: &ResolvedGraph) -> GeneratedFacts {
+    let members = graph.generated_member_refs();
+    let mut notices = Vec::new();
+    let stale = graph.nodes_reached_only_via_generated();
+    if project.generated_members.is_declared() && !stale.is_empty() {
+        let declared = members
+            .iter()
+            .map(|member| format!("`{}`", member.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut named = stale
+            .iter()
+            .take(STALE_NODES_NAMED)
+            .map(|(name, version)| format!("{name} {version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(elided) = stale.len().checked_sub(STALE_NODES_NAMED)
+            && elided > 0
+        {
+            use std::fmt::Write as _;
+            let _ = write!(named, " and {elided} more");
+        }
+        let mut notice = Diagnostic::new(
+            DiagnosticKind::StaleLock,
+            format!(
+                "generated member {declared} declares {} crate(s) no authored member reaches ({named}); the projection is stale relative to the workspace, so regenerate it (cargo-hakari: `cargo hakari generate`) and re-lock",
+                stale.len()
+            ),
+        );
+        if let [only] = members.as_slice() {
+            notice = notice.with_path(manifest::member_manifest_rel(&only.path).as_str());
+        }
+        notices.push(notice);
+    }
+    if !project.generated_members.is_declared() {
+        for member in hakari_marked_members(project, graph) {
+            let declarations = graph.edges.get(&member.id).map_or(0, Vec::len);
+            notices.push(
+                Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "member `{}` carries a `{HAKARI_SECTION_MARKER}` marker, so its manifest looks generated by cargo-hakari, yet cooldown treats its {declarations} dependency declarations as authored and proposes upgrades for them; declare it in `[tool.cargo] generated-members = [\"{}\"]` so they follow the lock instead, or set `generated-members = []` to keep them authored and silence this hint",
+                        member.name, member.name
+                    ),
+                )
+                .with_path(manifest::member_manifest_rel(&member.path).as_str()),
+            );
+        }
+    }
+    let identity_of = |root: &String| {
+        graph.packages.get(root).map(|info| {
+            crate::lockfile::LockPackageId::from_metadata(
+                &info.name,
+                &info.version,
+                info.source.as_deref(),
+            )
+        })
+    };
+    let identities = graph
+        .generated_roots
+        .iter()
+        .filter_map(identity_of)
+        .collect();
+    let authored_identities = graph
+        .roots
+        .iter()
+        .filter(|root| !graph.generated_roots.contains(*root))
+        .filter_map(identity_of)
+        .collect();
+    GeneratedFacts {
+        members,
+        identities,
+        authored_identities,
+        notices,
+    }
+}
+
+/// A workspace member whose manifest carries the hakari marker, with its graph node id.
+struct MarkedMember {
+    id: String,
+    name: String,
+    path: String,
+}
+
+/// The authored members whose manifests carry the hakari marker, sorted by name. A manifest that
+/// cannot be read contributes nothing: this is a hint, and a read failure is the graph read's to
+/// report.
+fn hakari_marked_members(project: &Project, graph: &ResolvedGraph) -> Vec<MarkedMember> {
+    let mut marked: Vec<MarkedMember> = graph
+        .roots
+        .iter()
+        .filter(|root| !graph.generated_roots.contains(*root))
+        .filter_map(|root| graph.packages.get(root).map(|info| (root, info)))
+        .filter(|(_, info)| {
+            std::fs::read_to_string(project.root.join(manifest::member_manifest_rel(&info.path)))
+                .is_ok_and(|manifest| manifest.contains(HAKARI_SECTION_MARKER))
+        })
+        .map(|(root, info)| MarkedMember {
+            id: root.clone(),
+            name: info.name.clone(),
+            path: info.path.clone(),
+        })
+        .collect();
+    marked.sort_by(|a, b| a.name.cmp(&b.name));
+    marked
 }
 
 fn classify_quality(v: &str) -> ReleaseQuality {
@@ -140,6 +323,7 @@ impl ToolRead for CargoTool {
             can_sync: false,
             artifact_granular: false,
             advisory_ecosystem: Some("crates.io"),
+            honors_generated_members: true,
         }
     }
 
@@ -178,7 +362,11 @@ impl ToolRead for CargoTool {
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
-        let graph = self.cargo.metadata_locked(&project.root).await?;
+        let graph = self
+            .cargo
+            .metadata_locked(&project.root, &project.generated_members)
+            .await?;
+        self.remember_generated_facts(project, &graph).await?;
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
             if graph.roots.contains(id) || !info.is_crates_io() {
@@ -228,6 +416,10 @@ impl ToolRead for CargoTool {
         Ok(deps)
     }
 
+    async fn manifest_notices(&self, project: &Project) -> Result<Vec<Diagnostic>> {
+        Ok(self.generated_facts(project).await?.notices.clone())
+    }
+
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
         parse_native(&project.manifest)
     }
@@ -235,7 +427,11 @@ impl ToolRead for CargoTool {
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
-        match self.cargo.verify_locked(&project.root).await {
+        match self
+            .cargo
+            .verify_locked(&project.root, &project.generated_members)
+            .await
+        {
             // The stale detail names the project: a repository can hold several Cargo locks (a
             // parked nested workspace, standalone fuzz targets), and `check` prints the detail
             // without the path, so a bare "Cargo.lock is stale" leaves the reader to guess which
@@ -542,9 +738,11 @@ fn classify_planned_changes(
 fn widen_snapshot(
     root: &Utf8Path,
     members: &[MemberRef],
+    followers: &[MemberRef],
 ) -> Result<Vec<(Utf8PathBuf, Option<String>)>> {
     let mut paths: Vec<Utf8PathBuf> = members
         .iter()
+        .chain(followers)
         .map(|member| manifest::member_manifest_rel(&member.path))
         .collect();
     paths.push(Utf8PathBuf::from("Cargo.toml"));
@@ -675,19 +873,13 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<PinRejections> {
+        let followers = self.generated_facts(project).await?;
+        let followers = followers.members.as_slice();
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
         if matches!(plan.rewrite, RewriteMode::Always) {
-            for change in &plan.changes {
-                journal.validate_project(&project.root)?;
-                manifest::widen_constraint(
-                    &project.root,
-                    &change.members,
-                    &change.package.name,
-                    change.to.as_str(),
-                )?;
-            }
+            widen_all_up_front(project, plan, journal, followers)?;
         }
         let mut rejections = BTreeMap::new();
         self.pin_batch(project, &plan.changes, journal, observer, &mut rejections)
@@ -715,7 +907,11 @@ impl CargoTool {
                 let after = read_lock(project)?.crates_io_locked_versions();
                 let graph = if needs_graph {
                     journal.validate_project(&project.root)?;
-                    Some(self.cargo.metadata(&project.root).await?)
+                    Some(
+                        self.cargo
+                            .metadata(&project.root, &project.generated_members)
+                            .await?,
+                    )
                 } else {
                     None
                 };
@@ -728,16 +924,11 @@ impl CargoTool {
                     // Captured before the widen — the first mutation the rollback must undo; the
                     // pin and the metadata probe below both mutate the staged lock the snapshot
                     // carries.
-                    let snapshot = widen_snapshot(&project.root, &change.members)?;
+                    let snapshot = widen_snapshot(&project.root, &change.members, followers)?;
                     journal.validate_project(&project.root)?;
-                    if manifest::widen_constraint(
-                        &project.root,
-                        &change.members,
-                        &change.package.name,
-                        change.to.as_str(),
-                    )?
-                    .modified
-                    .is_empty()
+                    if widen_and_follow(&project.root, change, followers)?
+                        .modified
+                        .is_empty()
                     {
                         unwidened_short.push(change.clone());
                         continue;
@@ -758,7 +949,11 @@ impl CargoTool {
                     // cargo's explanation, restore the widen, and move on.
                     let landed_graph = if needs_member_graph(change) {
                         journal.validate_project(&project.root)?;
-                        match self.cargo.metadata(&project.root).await {
+                        match self
+                            .cargo
+                            .metadata(&project.root, &project.generated_members)
+                            .await
+                        {
                             Ok(graph) => Some(graph),
                             Err(err)
                                 if err.is_tool_spawn_failure()
@@ -805,7 +1000,74 @@ impl CargoTool {
         }
         self.land_rejected_group_atomically(project, plan, journal, &mut rejections)
             .await?;
+        self.reconcile_projections(project, journal).await?;
         Ok(rejections)
+    }
+
+    /// Makes the generated projections follow the moves the pin phase landed *beyond* the plan:
+    /// a planned move drags its dependents' companions to other lines (`toml 0.7 → 0.8` takes
+    /// `toml_edit 0.19 → 0.22`), and following only the planned change would leave the
+    /// projection demanding the companion's old line — which cargo then keeps alive as a second
+    /// copy for the projection's sake alone. Every crates.io node only the generated members
+    /// reach now, and did not before the mutation, is such a copy; its projection follows to
+    /// the line the authored graph resolves the crate to, and one re-resolve lets cargo drop the
+    /// node. A crate the authored graph no longer resolves at all is simply a stale projection
+    /// line, left for the regeneration the report asks for.
+    ///
+    /// Both reachabilities are read from lock text, the same model on both sides: the baseline
+    /// from the journal's preimage — fixed for the mutation, so a trial's rollback cannot leave a
+    /// later trial judging against the state the rolled-back trial reached — and the current
+    /// state from the lock on disk. Cargo is spawned only to re-resolve after a follow. Bounded
+    /// because a followed companion can have companions of its own; a pass that follows nothing
+    /// ends it.
+    async fn reconcile_projections(
+        &self,
+        project: &Project,
+        journal: &ProjectMutationJournal,
+    ) -> Result<()> {
+        let facts = self.generated_facts(project).await?;
+        if facts.members.is_empty() {
+            return Ok(());
+        }
+        let (authored_ids, generated_ids) = (&facts.authored_identities, &facts.identities);
+        let stale_before = journal_preimage_lock(journal)?
+            .map(|lock| lock.reached_only_via(authored_ids, generated_ids))
+            .unwrap_or_default();
+        for _ in 0..4 {
+            let lock = read_lock(project)?;
+            let authored = lock.authored_crates_io_versions(authored_ids, generated_ids);
+            let mut followed = false;
+            for (name, retained) in lock.reached_only_via(authored_ids, generated_ids) {
+                if stale_before.contains(&(name.clone(), retained.clone())) {
+                    continue;
+                }
+                let Some(target) = authored
+                    .get(&name)
+                    .and_then(|versions| companion_target(versions, &retained))
+                else {
+                    continue;
+                };
+                journal.validate_project(&project.root)?;
+                followed |= !manifest::follow_constraint(
+                    &project.root,
+                    &facts.members,
+                    &name,
+                    &retained,
+                    target,
+                )?
+                .modified
+                .is_empty();
+            }
+            if !followed {
+                return Ok(());
+            }
+            // The re-resolve that lets cargo drop the node the projection no longer demands.
+            journal.validate_project(&project.root)?;
+            self.cargo
+                .metadata(&project.root, &project.generated_members)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Lands the co-planned changes the per-package pin passes could not: a family whose members'
@@ -867,18 +1129,36 @@ impl CargoTool {
             group = moves.len(),
             "seeding rejected co-planned changes for one atomic reconcile"
         );
+        // The generated projections follow the seeded moves as they follow a pin: a projection
+        // still demanding a seeded node's old version would reject the joint resolve for the
+        // projection's sake. Captured with the lock, restored with it.
+        let followers = self.generated_facts(project).await?;
+        let snapshot = widen_snapshot(&project.root, &[], &followers.members)?;
         journal.validate_project(&project.root)?;
+        for planned in &moves {
+            manifest::follow_constraint(
+                &project.root,
+                &followers.members,
+                &planned.name,
+                &planned.from,
+                &planned.to,
+            )?;
+        }
         std::fs::write(&lock_path, &seeded)?;
-        match self.cargo.metadata(&project.root).await {
+        match self
+            .cargo
+            .metadata(&project.root, &project.generated_members)
+            .await
+        {
             Ok(_) => {}
             Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
-                std::fs::write(&lock_path, &lock_text)?;
+                restore_widen_snapshot(&project.root, &snapshot)?;
                 return Err(err);
             }
             // The joint seed is unsatisfiable as a whole: restore the lock and let each change
             // keep the per-pin rejection cargo already explained.
             Err(_) => {
-                std::fs::write(&lock_path, &lock_text)?;
+                restore_widen_snapshot(&project.root, &snapshot)?;
                 return Ok(());
             }
         }
@@ -898,7 +1178,7 @@ impl CargoTool {
                 rejections.remove(key);
             }
         } else {
-            std::fs::write(&lock_path, &lock_text)?;
+            restore_widen_snapshot(&project.root, &snapshot)?;
         }
         Ok(())
     }
@@ -1070,7 +1350,11 @@ impl CargoTool {
             matches!(plan.edge_policy, EdgePolicy::Canonicalize) || preserve_needs_graph;
         let graph = if needs_graph || corrective_edges {
             journal.validate_project(&project.root)?;
-            Some(self.cargo.metadata(&project.root).await?)
+            Some(
+                self.cargo
+                    .metadata(&project.root, &project.generated_members)
+                    .await?,
+            )
         } else {
             None
         };
@@ -1079,12 +1363,14 @@ impl CargoTool {
         // can pair across stable dependent identities and coexisting endpoints.
         journal.validate_project(&project.root)?;
         let edge_phase = std::time::Instant::now();
+        let generated = self.generated_facts(project).await?;
         let enforced = edges::enforce::enforce(
             &self.cargo,
             project,
             plan.edge_policy,
             before_lock.as_ref(),
             graph,
+            &generated.identities,
         )
         .await?;
         tracing::debug!(
@@ -1119,6 +1405,8 @@ impl CargoTool {
         );
         report.applied.extend(collateral);
         report.edge_rebinds = edge_rebinds;
+        let followers = self.generated_facts(project).await?;
+        report.followed_manifests = followed_manifests(project, &followers.members, journal)?;
         Ok(report)
     }
 }
@@ -1126,6 +1414,117 @@ impl CargoTool {
 fn read_lock(project: &Project) -> Result<CargoLock> {
     let content = std::fs::read_to_string(project.root.join("Cargo.lock"))?;
     CargoLock::parse(&content)
+}
+
+/// The lock as the mutation journal captured it before anything moved, when the capture is
+/// readable; the baseline every trial of the mutation starts from.
+fn journal_preimage_lock(journal: &ProjectMutationJournal) -> Result<Option<CargoLock>> {
+    journal
+        .files()
+        .iter()
+        .find(|file| file.path() == Utf8Path::new("Cargo.lock"))
+        .and_then(ProjectMutationFile::contents)
+        .map(|bytes| {
+            let text = std::str::from_utf8(bytes).map_err(|error| {
+                CoreError::LockUnreadable(format!("journaled Cargo.lock: {error}"))
+            })?;
+            CargoLock::parse(text)
+        })
+        .transpose()
+}
+
+/// The `RewriteMode::Always` widen: every planned change's owning requirements, and the
+/// projections of them, before any pin runs.
+fn widen_all_up_front(
+    project: &Project,
+    plan: &Plan,
+    journal: &ProjectMutationJournal,
+    followers: &[MemberRef],
+) -> Result<()> {
+    for change in &plan.changes {
+        journal.validate_project(&project.root)?;
+        widen_and_follow(&project.root, change, followers)?;
+    }
+    Ok(())
+}
+
+/// The authored line a projection-retained node should follow: the nearest authored version
+/// above it, else the highest — the line the retained node's requirers moved to.
+fn companion_target<'a>(authored: &'a [String], retained: &str) -> Option<&'a str> {
+    authored
+        .iter()
+        .filter(|version| version::compare(version, retained).is_gt())
+        .min_by(|a, b| version::compare(a, b))
+        .or_else(|| authored.iter().max_by(|a, b| version::compare(a, b)))
+        .map(String::as_str)
+}
+
+/// Widens the declaring members' requirements on `change` to its target, then makes the
+/// generated `followers`' projections of the moving version follow it — one rewrite step, so a
+/// tentative widen and its follow are kept or restored together. Every widen is followed into
+/// the generated manifests because the projection of the moving node must admit the target too,
+/// or the resolver keeps the old version alive as a second copy for the projection's sake. The
+/// union of the manifests either touched is what the caller judges progress by: a candidate only
+/// the projection held back has nothing to widen and still needs its re-pin.
+fn widen_and_follow(
+    root: &Utf8Path,
+    change: &Change,
+    followers: &[MemberRef],
+) -> Result<manifest::ManifestRewrite> {
+    // A generated member attributed to the change (a node only its projection still holds) is
+    // not an author to widen: the key-based, source-blind authored rewrite would touch whatever
+    // entry of that name the projection carries, and with no author left there is no root
+    // fallback to take either — the projection follows below, and that is all.
+    let authors: Vec<MemberRef> = change
+        .members
+        .iter()
+        .filter(|member| !followers.contains(member))
+        .cloned()
+        .collect();
+    let mut rewrite = if authors.is_empty() && !change.members.is_empty() {
+        manifest::ManifestRewrite::default()
+    } else {
+        manifest::widen_constraint(root, &authors, &change.package.name, change.to.as_str())?
+    };
+    if !followers.is_empty() {
+        let followed = manifest::follow_constraint(
+            root,
+            followers,
+            &change.package.name,
+            change.from.as_str(),
+            change.to.as_str(),
+        )?;
+        rewrite.modified.extend(followed.modified);
+    }
+    Ok(rewrite)
+}
+
+/// The generated manifests whose journaled preimage differs from what is on disk after the
+/// apply: every projection a landed move was followed into, which its generator now has to
+/// rewrite.
+fn followed_manifests(
+    project: &Project,
+    followers: &[MemberRef],
+    journal: &ProjectMutationJournal,
+) -> Result<Vec<Utf8PathBuf>> {
+    let mut followed = Vec::new();
+    for member in followers {
+        let rel = manifest::member_manifest_rel(&member.path);
+        let before = journal
+            .files()
+            .iter()
+            .find(|file| file.path() == rel)
+            .and_then(ProjectMutationFile::contents);
+        let after = match std::fs::read(project.root.join(&rel)) {
+            Ok(after) => after,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CoreError::from(error)),
+        };
+        if before != Some(after.as_slice()) && !followed.contains(&rel) {
+            followed.push(rel);
+        }
+    }
+    Ok(followed)
 }
 
 /// Whether a planned candidate landed at its exact target in `after`.
@@ -1233,6 +1632,12 @@ impl ToolWrite for CargoTool {
                 relative.insert(manifest::member_manifest_rel(&member.path));
             }
         }
+        // A generated member's manifest is rewritten whenever a move is followed into it, so it
+        // is journaled as an output like any declaring member's — and the preimage is what the
+        // apply report later compares against to say which projections followed.
+        for member in &self.generated_facts(project).await?.members {
+            relative.insert(manifest::member_manifest_rel(&member.path));
+        }
         ProjectMutationJournal::capture(&project.root, relative)
     }
 
@@ -1335,18 +1740,33 @@ impl ToolWrite for CargoTool {
                     )
                 });
                 if needs_graph {
-                    Some(self.cargo.metadata(&project.root).await?)
+                    Some(
+                        self.cargo
+                            .metadata(&project.root, &project.generated_members)
+                            .await?,
+                    )
                 } else {
                     None
                 }
             }
             // A metadata failure must remain a project error; otherwise requested canonical
             // healing would degrade to a successful no-op.
-            EdgePolicy::Canonicalize => Some(self.cargo.metadata(&project.root).await?),
+            EdgePolicy::Canonicalize => Some(
+                self.cargo
+                    .metadata(&project.root, &project.generated_members)
+                    .await?,
+            ),
         };
-        let mut result =
-            edges::enforce::enforce(&self.cargo, project, policy, before_lock.as_ref(), graph)
-                .await?;
+        let generated = self.generated_facts(project).await?;
+        let mut result = edges::enforce::enforce(
+            &self.cargo,
+            project,
+            policy,
+            before_lock.as_ref(),
+            graph,
+            &generated.identities,
+        )
+        .await?;
         let final_view = edges::LockEdgeView::from_lock(&read_lock(project)?);
         edges::enforce::reconcile_committed_outcomes(&final_view, &mut result.rebinds, committed);
         Ok(EdgeNormalizationReport {
@@ -1367,6 +1787,220 @@ mod tests {
     use cooldown_adapter_util::skipped_on_apply_error;
     use cooldown_core::CoreError;
     use indoc::{formatdoc, indoc};
+
+    /// A two-member workspace under a temp root, as `cargo metadata` would describe it, whose
+    /// `hack` member's manifest carries the hakari marker and mirrors `dep`; `app` declares `dep`
+    /// too, while `orphan` is the hack's alone.
+    fn hakari_workspace(root: &Utf8Path) -> ResolvedGraph {
+        std::fs::create_dir_all(root.join("crates/app")).expect("app dir");
+        std::fs::create_dir_all(root.join("crates/hack")).expect("hack dir");
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\ndep = \"1\"\n",
+        )
+        .expect("app manifest");
+        std::fs::write(
+            root.join("crates/hack/Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "hack"
+
+                ### BEGIN HAKARI SECTION
+                [dependencies]
+                dep = "1"
+                orphan = "2"
+                ### END HAKARI SECTION
+            "#},
+        )
+        .expect("hack manifest");
+        let json = formatdoc! {r#"{{
+            "packages": [
+                {{"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "{root}/crates/app/Cargo.toml",
+                 "dependencies": [{{"name": "dep", "req": "^1"}}, {{"name": "hack", "req": "^0.1"}}]}},
+                {{"id": "hack", "name": "hack", "version": "0.1.0",
+                 "manifest_path": "{root}/crates/hack/Cargo.toml",
+                 "dependencies": [{{"name": "dep", "req": "^1"}}, {{"name": "orphan", "req": "^2"}}]}},
+                {{"id": "dep", "name": "dep", "version": "1.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index"}},
+                {{"id": "orphan", "name": "orphan", "version": "2.0.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index"}}
+            ],
+            "workspace_members": ["app", "hack"],
+            "workspace_root": "{root}",
+            "resolve": {{"nodes": [
+                {{"id": "app", "deps": [{{"name": "dep", "pkg": "dep"}}, {{"name": "hack", "pkg": "hack"}}]}},
+                {{"id": "hack", "deps": [{{"name": "dep", "pkg": "dep"}}, {{"name": "orphan", "pkg": "orphan"}}]}},
+                {{"id": "dep", "deps": []}},
+                {{"id": "orphan", "deps": []}}
+            ]}}
+        }}"#};
+        crate::cargocmd::Cargo::build_graph_from_json(&json)
+    }
+
+    fn hakari_project(root: &Utf8Path, generated: cooldown_core::GeneratedMembers) -> Project {
+        Project {
+            root: root.to_owned(),
+            kind: CARGO_ID,
+            manifest: root.join("Cargo.toml"),
+            exclude_newer: None,
+            generated_members: generated,
+        }
+    }
+
+    /// Without a declaration the marker earns a hint that names the member, counts the
+    /// declarations about to be proposed as upgrades, and spells the declaration to make.
+    #[test]
+    fn undeclared_hakari_member_earns_a_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let graph = hakari_workspace(root);
+        let project = hakari_project(root, cooldown_core::GeneratedMembers::undeclared());
+
+        let facts = generated_facts(&project, &graph);
+
+        assert!(facts.members.is_empty());
+        let [hint] = facts.notices.as_slice() else {
+            panic!("one hint: {:?}", facts.notices);
+        };
+        assert_eq!(hint.kind, DiagnosticKind::Config);
+        assert_eq!(hint.path.as_deref(), Some("crates/hack/Cargo.toml"));
+        assert!(hint.message.contains("member `hack`"), "{}", hint.message);
+        assert!(
+            hint.message.contains("2 dependency declarations"),
+            "{}",
+            hint.message
+        );
+        assert!(
+            hint.message.contains("generated-members = [\"hack\"]"),
+            "{}",
+            hint.message
+        );
+    }
+
+    /// An explicit empty declaration is the user's decision that every member is authored: no
+    /// hint, no followers.
+    #[test]
+    fn explicit_empty_declaration_silences_the_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let graph = hakari_workspace(root);
+        let project = hakari_project(root, cooldown_core::GeneratedMembers::declared(Vec::new()));
+
+        let facts = generated_facts(&project, &graph);
+
+        assert!(facts.members.is_empty());
+        assert!(facts.notices.is_empty(), "{:?}", facts.notices);
+    }
+
+    /// Declared, the member resolves to its manifest for the follower rewrite and the projection's
+    /// stale line — a crate nothing authored reaches — is reported for regeneration.
+    #[test]
+    fn declared_hakari_member_reports_its_stale_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let generated = cooldown_core::GeneratedMembers::declared(vec!["hack".to_string()]);
+        let json_graph = hakari_workspace(root);
+        // The fixture graph was built undeclared; rebuild it under the declaration the way the
+        // adapter's read does.
+        drop(json_graph);
+        let graph = {
+            let manifest = std::fs::read_to_string(root.join("crates/hack/Cargo.toml"))
+                .expect("hack manifest");
+            assert!(manifest.contains(HAKARI_SECTION_MARKER));
+            let mut raw_graph = hakari_workspace(root);
+            raw_graph.generated_roots.insert("hack".to_string());
+            raw_graph
+        };
+        let project = hakari_project(root, generated);
+
+        let facts = generated_facts(&project, &graph);
+
+        assert_eq!(
+            facts.members,
+            vec![MemberRef {
+                name: "hack".to_string(),
+                path: "crates/hack".to_string()
+            }]
+        );
+        let [stale] = facts.notices.as_slice() else {
+            panic!("one staleness notice: {:?}", facts.notices);
+        };
+        assert_eq!(stale.kind, DiagnosticKind::StaleLock);
+        assert_eq!(stale.path.as_deref(), Some("crates/hack/Cargo.toml"));
+        assert!(stale.message.contains("`hack`"), "{}", stale.message);
+        assert!(stale.message.contains("orphan 2.0.0"), "{}", stale.message);
+        assert!(
+            !stale.message.contains("dep 1.0.0"),
+            "a line an authored member reaches is not stale: {}",
+            stale.message
+        );
+        assert!(stale.message.contains("regenerate"), "{}", stale.message);
+    }
+
+    /// A change attributed only to a generated member (a node its projection alone holds) has
+    /// no author to widen, so the source-blind key rewrite never touches the projection's git
+    /// namesake, and no root fallback runs either; the projection's crates.io line still follows.
+    #[test]
+    fn widen_and_follow_never_widens_a_generated_member_as_an_author() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("hack")).expect("mkdir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"hack\"]\n\n[workspace.dependencies]\nfoo = \"1\"\n",
+        )
+        .expect("root");
+        std::fs::write(
+            root.join("hack/Cargo.toml"),
+            indoc! {r#"
+                [dependencies]
+                foo = { git = "https://example.com/foo", rev = "abc", version = "1" }
+                foo-crates = { package = "foo", version = "1" }
+            "#},
+        )
+        .expect("hack");
+        let hack = MemberRef {
+            name: "hack".to_string(),
+            path: "hack".to_string(),
+        };
+        let mut planned = change("foo", "1.0.0", "2.0.0", false);
+        planned.members = vec![hack.clone()];
+
+        let rewrite =
+            widen_and_follow(root, &planned, std::slice::from_ref(&hack)).expect("rewrite");
+
+        assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("hack/Cargo.toml")]);
+        let hack_after = std::fs::read_to_string(root.join("hack/Cargo.toml")).expect("read");
+        assert!(
+            hack_after.contains(r#"rev = "abc", version = "1""#),
+            "{hack_after}"
+        );
+        assert!(
+            hack_after.contains(r#"foo-crates = { package = "foo", version = "2.0.0" }"#),
+            "{hack_after}"
+        );
+        let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
+        assert!(
+            root_after.contains("foo = \"1\""),
+            "no root fallback: {root_after}"
+        );
+    }
+
+    /// A projection-retained node follows to the nearest authored line above it — the line its
+    /// requirers moved to — and to the highest when every authored line is below it.
+    #[test]
+    fn companion_target_picks_the_nearest_authored_line_above() {
+        let authored = [
+            "0.22.1".to_string(),
+            "0.20.0".to_string(),
+            "0.19.3".to_string(),
+        ];
+        assert_eq!(companion_target(&authored, "0.19.15"), Some("0.20.0"));
+        assert_eq!(companion_target(&authored, "0.21.0"), Some("0.22.1"));
+        assert_eq!(companion_target(&authored, "0.23.0"), Some("0.22.1"));
+        assert_eq!(companion_target(&[], "0.19.15"), None);
+    }
 
     #[test]
     fn advisory_ecosystem_matches_osv() {
@@ -2048,6 +2682,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: "/repo/Cargo.toml".into(),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         assert_eq!(
@@ -2076,6 +2711,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: other_root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
         let tool = CargoTool::from_http(SharedHttp::new(
@@ -2100,6 +2736,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
         let tool = CargoTool::from_http(SharedHttp::new(
@@ -2141,6 +2778,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
         let tool = CargoTool::from_http(SharedHttp::new(
@@ -2185,6 +2823,7 @@ mod tests {
             kind: CARGO_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let journal = eco.mutation_journal(&project, &Plan::default()).await?;
@@ -2280,6 +2919,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))
     }
@@ -2389,6 +3029,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))
     }
@@ -2700,6 +3341,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let plan = Plan {
             changes: vec![
@@ -2912,6 +3554,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))
     }

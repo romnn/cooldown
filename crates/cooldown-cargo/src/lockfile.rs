@@ -3,7 +3,7 @@
 use crate::version;
 use cooldown_core::{CoreError, Result};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// The `source` string Cargo records for crates.io packages.
@@ -278,6 +278,18 @@ impl LockPackage {
     }
 }
 
+/// A source spelling without its `#commit` fragment — the form a dependency entry uses for a
+/// git package whose block spells the precise revision.
+fn without_precise(source: &str) -> &str {
+    source.split_once('#').map_or(source, |(base, _)| base)
+}
+
+/// The blocks each walk of [`CargoLock::reachability`] visits, by index into the lock.
+struct LockReachability {
+    authored: HashSet<usize>,
+    generated: HashSet<usize>,
+}
+
 impl CargoLock {
     /// Parses the subset of `Cargo.lock` used by the adapter.
     pub(crate) fn parse(content: &str) -> Result<Self> {
@@ -335,6 +347,141 @@ impl CargoLock {
                 .or_insert_with(|| version.to_string());
         }
         slots
+    }
+
+    /// The `(name, version)` crates.io packages only the `generated` workspace members reach
+    /// along the lock's own dependency lists — the lock-text twin of
+    /// [`ResolvedGraph::nodes_reached_only_via_generated`](crate::cargocmd::ResolvedGraph::nodes_reached_only_via_generated),
+    /// for judging a mutation against the journaled lock it started from without a graph read.
+    /// The walks start from the `authored` and `generated` member identities the graph
+    /// established (a source-less block is not necessarily a member: an external path package
+    /// is one too, and is only ever an intermediate node here).
+    pub(crate) fn reached_only_via(
+        &self,
+        authored: &[LockPackageId],
+        generated: &[LockPackageId],
+    ) -> BTreeSet<(String, String)> {
+        let walk = self.reachability(authored, generated);
+        self.package
+            .iter()
+            .enumerate()
+            .filter(|(index, package)| {
+                package.is_crates_io()
+                    && !walk.authored.contains(index)
+                    && walk.generated.contains(index)
+            })
+            .filter_map(|(_, package)| {
+                package
+                    .version
+                    .clone()
+                    .map(|version| (package.name.clone(), version))
+            })
+            .collect()
+    }
+
+    /// The crates.io versions the authored members reach each crate at, keyed by name — the
+    /// lines a projection is meant to mirror.
+    pub(crate) fn authored_crates_io_versions(
+        &self,
+        authored: &[LockPackageId],
+        generated: &[LockPackageId],
+    ) -> BTreeMap<String, Vec<String>> {
+        let walk = self.reachability(authored, generated);
+        let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (index, package) in self.package.iter().enumerate() {
+            if package.is_crates_io()
+                && walk.authored.contains(&index)
+                && let Some(version) = &package.version
+            {
+                versions
+                    .entry(package.name.clone())
+                    .or_default()
+                    .push(version.clone());
+            }
+        }
+        versions
+    }
+
+    /// Walks the lock's dependency lists twice: from the authored members without stepping
+    /// through a generated one, and from the generated members alone.
+    ///
+    /// A dependency entry is `"name"` when the name is unique in the lock, `"name x.y.z"` when
+    /// several versions coexist, and `"name x.y.z (source)"` when several sources do — with a
+    /// git source spelled *without* the `#commit` the package block carries, so sources are
+    /// compared with that fragment stripped.
+    fn reachability(
+        &self,
+        authored: &[LockPackageId],
+        generated: &[LockPackageId],
+    ) -> LockReachability {
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, package) in self.package.iter().enumerate() {
+            by_name
+                .entry(package.name.as_str())
+                .or_default()
+                .push(index);
+        }
+        let resolve = |entry: &str| -> Option<usize> {
+            let (name, remainder) = entry.split_once(' ').unwrap_or((entry, ""));
+            let candidates = by_name.get(name)?;
+            if remainder.is_empty() {
+                return match candidates.as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                };
+            }
+            let version = remainder.split(' ').next().unwrap_or(remainder);
+            let source = remainder
+                .split_once(" (")
+                .and_then(|(_, source)| source.strip_suffix(')'))
+                .map(without_precise);
+            candidates.iter().copied().find(|&index| {
+                self.package.get(index).is_some_and(|package| {
+                    package.version.as_deref() == Some(version)
+                        && source.is_none_or(|source| {
+                            package.source.as_deref().map(without_precise) == Some(source)
+                        })
+                })
+            })
+        };
+        let members_of = |identities: &[LockPackageId]| -> Vec<usize> {
+            self.package
+                .iter()
+                .enumerate()
+                .filter(|(_, package)| {
+                    package.source.is_none()
+                        && identities.iter().any(|id| {
+                            id.name == package.name
+                                && Some(id.version.as_str()) == package.version.as_deref()
+                        })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let generated_indices: HashSet<usize> = members_of(generated).into_iter().collect();
+        let walk = |from: Vec<usize>, skip_generated: bool| -> HashSet<usize> {
+            let mut seen = HashSet::new();
+            let mut queue = from;
+            while let Some(index) = queue.pop() {
+                let Some(package) = self.package.get(index) else {
+                    continue;
+                };
+                if !seen.insert(index) || (skip_generated && generated_indices.contains(&index)) {
+                    continue;
+                }
+                queue.extend(
+                    package
+                        .dependencies
+                        .iter()
+                        .filter_map(|entry| resolve(entry)),
+                );
+            }
+            seen
+        };
+        LockReachability {
+            authored: walk(members_of(authored), true),
+            generated: walk(generated_indices.iter().copied().collect(), false),
+        }
     }
 
     fn matching_slots(&self, include: impl Fn(&LockPackage) -> bool) -> LockedSlots {
@@ -463,8 +610,121 @@ pub(crate) fn rewrite_planned_nodes(lock_text: &str, moves: &[PlannedNodeMove]) 
 #[cfg(test)]
 mod tests {
     use super::LockPackageId;
-    use super::{PlannedNodeMove, rewrite_planned_nodes};
+    use super::{CargoLock, PlannedNodeMove, rewrite_planned_nodes};
     use indoc::indoc;
+
+    /// `app → mid → dep 0.14` beside the generated hack's own `dep 0.13`, `dep 0.14`, and
+    /// `orphan` entries; an external *path* namesake `hack 0.2.0` and a git `bridge` (qualified
+    /// against a registry namesake, and spelled without the block's `#commit`) both still need
+    /// `dep 0.13`.
+    const HAKARI_LOCK: &str = indoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = [
+         "bridge 1.0.0 (git+https://example.com/bridge)",
+         "hack 0.1.0",
+         "hack 0.2.0",
+         "mid",
+        ]
+
+        [[package]]
+        name = "hack"
+        version = "0.1.0"
+        dependencies = [
+         "dep 0.13.0",
+         "dep 0.14.0",
+         "orphan",
+        ]
+
+        [[package]]
+        name = "hack"
+        version = "0.2.0"
+        dependencies = [
+         "dep 0.13.0",
+        ]
+
+        [[package]]
+        name = "bridge"
+        version = "1.0.0"
+        source = "git+https://example.com/bridge#abcdef0123456789"
+        dependencies = [
+         "dep 0.13.0",
+        ]
+
+        [[package]]
+        name = "bridge"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "mid"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        dependencies = [
+         "dep 0.14.0",
+        ]
+
+        [[package]]
+        name = "dep"
+        version = "0.13.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "dep"
+        version = "0.14.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "orphan"
+        version = "2.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+
+    fn member(name: &str, version: &str) -> LockPackageId {
+        LockPackageId::new(name, version, None::<&str>)
+    }
+
+    /// The lock-text reachability agrees with the graph's: only the orphan is projection-only,
+    /// since the path namesake and the git bridge — authored reaches, neither a generated member
+    /// — still need `dep 0.13`; both lines are authored; without a generated member nothing is
+    /// projection-only. Without those two requirers the hack alone holds `dep 0.13`.
+    #[test]
+    fn lock_reachability_separates_projection_only_nodes() {
+        let lock = CargoLock::parse(HAKARI_LOCK).expect("lock parses");
+        let authored = [member("app", "0.1.0")];
+        let generated = [member("hack", "0.1.0")];
+        let only_via_hack: Vec<(String, String)> = lock
+            .reached_only_via(&authored, &generated)
+            .into_iter()
+            .collect();
+        assert_eq!(only_via_hack, [("orphan".to_string(), "2.0.0".to_string())]);
+        let lines = lock.authored_crates_io_versions(&authored, &generated);
+        assert_eq!(
+            lines.get("dep").map(Vec::as_slice),
+            Some(["0.13.0".to_string(), "0.14.0".to_string()].as_slice())
+        );
+        assert!(!lines.contains_key("orphan"));
+        assert!(lock.reached_only_via(&authored, &[]).is_empty());
+
+        let pruned = HAKARI_LOCK
+            .replace(" \"bridge 1.0.0 (git+https://example.com/bridge)\",\n", "")
+            .replace(" \"hack 0.2.0\",\n", "");
+        let lock = CargoLock::parse(&pruned).expect("pruned lock parses");
+        let only_via_hack: Vec<(String, String)> = lock
+            .reached_only_via(&authored, &generated)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            only_via_hack,
+            [
+                ("dep".to_string(), "0.13.0".to_string()),
+                ("orphan".to_string(), "2.0.0".to_string()),
+            ]
+        );
+    }
 
     const FAMILY_LOCK: &str = indoc! {r#"
         version = 4

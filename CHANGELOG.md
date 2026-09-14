@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **A cargo-hakari workspace-hack follows upgrades instead of being one.** A workspace-hack's
+  `[dependencies]` are generated from the lock — one entry per crate and compatibility line,
+  hash-aliased when several majors coexist — and cooldown read every entry as an ordinary direct
+  dependency: each `0.x` line was a `--major` candidate, each candidate was attributed to the hack,
+  and the resolve then reported each one `blocked`, since the version is decided by whichever real
+  crate pulls it in. On a 445-member workspace that was 24 of 30 blocked rows. A member declared
+  in the new `[tool.cargo] generated-members = ["workspace-hack"]` is a follower: nothing it
+  declares is direct (a crate only it declares is a transitive of the members that reach it, still
+  gated by `check`), nothing it declares holds a row, and when `upgrade`/`fix` moves a crate an
+  authored member declares, the hack's entry for that version — hash-aliased or not — follows in
+  the same step (bumped, or dropped when the sibling entry for the target major already projects
+  that line, as a regeneration would merge them), so `cargo metadata --locked` still passes and
+  no crate gains a second copy for the projection's sake — including a companion the move drags
+  to another line (`toml_edit` behind `toml`), whose projection follows after the pin phase. A
+  run that rewrote a projection ends
+  — and the hack's own edges moving is that follow, so they are no longer reported as `rebound`
+  edge rows (the real sweep's 11 rebound rows were all the hack's). Such a run
+  with a `stale_lock` warning telling you to regenerate it (`cargo hakari generate`); a dry run
+  or `outdated`'s policy preview says it would. Detection is never inferred:
+  the declaration is the only way in, by exact member name, and a name that matches no member is
+  a config error in every command, so a stale entry cannot quietly stop covering a manifest. An
+  undeclared member whose manifest carries the `### BEGIN HAKARI SECTION` marker earns a hint (an
+  explicit `generated-members = []` silences it), a declared member whose projection declares
+  crates nothing authored reaches any more is reported stale, and `cooldown config` prints the
+  resolved list with the file that declared it (`--json`: `generatedMembers`). Adapters gain
+  `ToolRead::manifest_notices` and a `generated_members` capability; the JSON `configItem`
+  gains an optional `generatedMembers` object.
+
 ## v0.0.20
 
 - **Held rows say why.** A candidate the whole-graph resolve kept below its target and one the

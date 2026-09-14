@@ -82,6 +82,7 @@ impl ToolRead for BundlerTool {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("RubyGems"),
+            honors_generated_members: false,
         }
     }
 
@@ -273,6 +274,7 @@ mod tests {
             kind: BUNDLER_ID,
             manifest: root.join("Gemfile"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = BundlerTool::from_http(

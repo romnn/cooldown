@@ -64,6 +64,87 @@ often about forcing a patched transitive rather than about running the package o
 names you mean. Entries are exact package names, not globs: a pattern such as `@scope/*` is a
 config error rather than a gate that silently matches nothing.
 
+### `[tool.cargo] generated-members`
+
+The workspace members whose `Cargo.toml` is a *generated projection* of the resolved graph rather
+than something anyone wrote — a [cargo-hakari](https://crates.io/crates/cargo-hakari)
+workspace-hack, whose `[dependencies]` table is regenerated wholesale from the lock so that every
+member builds with one unified feature set:
+
+```toml
+[tool.cargo]
+generated-members = ["workspace-hack"]
+```
+
+Such a manifest declares a crate because *something else in the graph already depends on it*,
+never because a first-party crate wants it, so its entries can only follow the lock. Without the
+declaration cooldown reads them as ordinary direct dependencies: every hash-aliased
+`hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }` line becomes an
+upgradeable row attributed to the hack, every `0.x` line becomes a `--major` candidate, and the
+resolve then reports each one `blocked`, because the version is decided by whichever real crate
+pulls it in. On a large workspace that is most of the blocked set, hiding the few rows that name a
+real constraint.
+
+A declared member becomes a **follower, never a driver**:
+
+- **Nothing it declares is direct.** A crate only the generated member declares is a transitive
+  dependency of the members that reach it through the real graph — reported under `--transitive`
+  and attributed `via` those members, gated by `check` exactly as before, but never proposed as a
+  direct upgrade. A crate an authored member also declares is attributed to that member alone.
+- **Nothing it declares holds.** Its `=` pins, `<` bounds, and caret ranges are whatever its
+  generator last wrote, so they neither mark a row `held` nor cap a candidate.
+- **Its requirements follow every move.** When `upgrade`/`fix` moves a crate an authored member
+  declares — including across a major — the generated manifest's entry that admitted the old
+  version is made to project the new one, in the same step as the authored requirement and rolled
+  back with it if the move does not land. Cargo therefore never sees the projection demand a
+  version the lock no longer carries, which would otherwise resolve a second copy of the crate (or
+  fail) — the workspace still resolves under `cargo metadata --locked` and no crate gains an extra
+  copy. Following is what a generator does when it recomputes the projection: the entry's
+  requirement is bumped, with its other fields (`features`, `default-features`) kept as written,
+  unless a differently-keyed sibling entry already projects the line the crate is moving *to* (the
+  hash-aliased entry for that major), in which case the moving entry is removed instead — bumped,
+  both would resolve to one node under two names, which cargo refuses. A feature the new major no
+  longer has is cargo's rejection of that one candidate, reported `blocked` with cargo's
+  explanation like any other resolver rejection.
+- **The run tells you to regenerate.** A rewritten projection no longer matches its generator's
+  output, so the report ends with a `stale_lock` warning naming the manifest; finish the
+  upgrade the way the generator expects — `cargo hakari generate`, then re-lock — and the
+  projection converges (the generator computes the hack from the graph without the hack's own
+  contribution, so a followed entry regenerates to the same line).
+
+Detection is **never inferred**. A `### BEGIN HAKARI SECTION` marker, a `package.metadata` table,
+or a `workspace-hack` name changes nothing: marking a member generated narrows what cooldown
+proposes and reports, and a supply-chain tool must not narrow its own scope from a heuristic that
+would be invisible in review and could capture a hand-written crate that merely looks similar. The
+marker is used in one direction only, as advice: a project that declares nothing and has a member
+whose manifest carries it gets a `config` warning suggesting the declaration (or an explicit
+`generated-members = []`, which says every member is authored and silences the hint). A declared
+member whose projection has gone stale — it declares crates no authored member reaches any more,
+which a regeneration would drop — gets a `stale_lock` warning too.
+
+A move can also drag companions the plan never named — `toml 0.7 → 0.8` takes `toml_edit 0.19 →
+0.22` with it — and the projection's line for the old companion would keep that old copy alive
+alone. After the pin phase cooldown therefore follows every crate the generated members are the
+only ones still reaching, to the line the authored graph now resolves it to, and re-resolves so
+cargo drops the retained copy. A crate the authored graph no longer resolves at all is left as a
+stale projection line for the regeneration.
+
+The key is cargo-specific and accepted only under `[tool.cargo]`, like `edge-policy`. Entries are
+exact member **package names** (the name `cargo metadata`, `cargo -p`, and hakari's own config
+use), not paths and not globs; a pattern is a config error. Every listed name must match a
+workspace member, or every command that reads the workspace reports a `config` error for the
+project and evaluates none of it — `check`, `upgrade`, and `fix` exit non-zero on it, while
+`outdated`, which never gates, carries it in its report — so a stale entry, a renamed crate, or a
+deleted one can never quietly stop covering a manifest that still exists. The nearest
+`cooldown.toml` that sets the key decides for the workspace below it (an explicit `--config` file
+wins over all); lists do not merge across files, since a declaration names *this* workspace's
+members. `cooldown config` prints the resolved list and the file that declared it for every cargo
+project, so an audit can see that scope was narrowed and by which file. `exclude-packages` is not
+a substitute: it drops the member from reports but leaves its requirements alone, so an upgrade
+would still resolve a second copy for the projection's sake. The two compose as excludes always
+do: a crate whose only authored declarers are excluded goes with them, mirrored line included —
+the projection never keeps a row alive that its authors are out of the run for.
+
 ## `[registry."<host>"]` — per registry
 
 Scope policy to a registry or index by host. The natural home for "our own registry is trusted":

@@ -753,6 +753,23 @@ pub struct ConfigItem {
     pub layers: Vec<String>,
     /// The resolved `[advisories]` policy and this tool's feed coverage.
     pub advisories: AdvisoryConfigInfo,
+    /// The `[tool.cargo] generated-members` declaration resolved for this project and the
+    /// config file that made it, reported only for a tool that honors the declaration (so an
+    /// audit sees that scope was narrowed, and by which file). Absent for other tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_members: Option<GeneratedMembersInfo>,
+}
+
+/// The generated-members declaration of one project, as `config` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedMembersInfo {
+    /// The declared member package names; empty when none is declared.
+    pub names: Vec<String>,
+    /// The config layer that made the declaration (`repo:<path>`, `config:<path>`, `global`),
+    /// or `None` when no config file declares the key at all — the default, under which every
+    /// member is authored and a member that looks generated earns a hint.
+    pub origin: Option<String>,
 }
 
 /// The resolved `[advisories]` policy for one project, plus its tool's database mapping.

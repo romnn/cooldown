@@ -15,8 +15,25 @@ pub(in crate::cli) fn render_config_text(items: &[app::ConfigItem]) -> String {
             item.layers.join(" < "),
             advisories_line(&item.advisories),
         );
+        if let Some(generated) = &item.generated_members {
+            let _ = writeln!(
+                text,
+                "  generated members: {}",
+                generated_members_line(generated)
+            );
+        }
     }
     text
+}
+
+/// The `generated-members` one-liner: the declared members and the file that declared them, or
+/// the fact that nothing declares the key — each a different thing for an audit to know.
+fn generated_members_line(generated: &app::GeneratedMembersInfo) -> String {
+    match (&generated.origin, generated.names.as_slice()) {
+        (None, _) => "none declared (every member is authored)".to_string(),
+        (Some(origin), []) => format!("none (declared by {origin})"),
+        (Some(origin), names) => format!("{} (declared by {origin})", names.join(", ")),
+    }
 }
 
 /// The `[advisories]` one-liner: the resolved policy plus this tool's feed coverage, so a run

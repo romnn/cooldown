@@ -348,6 +348,7 @@ fn project(root: &Utf8Path) -> Project {
         kind: GO_ID,
         manifest: root.join("go.mod"),
         exclude_newer: None,
+        generated_members: cooldown_core::GeneratedMembers::undeclared(),
     }
 }
 
@@ -376,6 +377,7 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
         kind: GO_ID,
         manifest,
         exclude_newer: None,
+        generated_members: cooldown_core::GeneratedMembers::undeclared(),
     };
 
     let journal = tool

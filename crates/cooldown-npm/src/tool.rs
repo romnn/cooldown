@@ -367,6 +367,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("npm"),
+            honors_generated_members: false,
         }
     }
 
@@ -3249,6 +3250,7 @@ packages:
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let policy = cooldown_core::ResolvedPolicy {
             default_window: Some(cooldown_core::WindowSpec::MinAge(
@@ -3311,6 +3313,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let direct = tool()
@@ -3353,6 +3356,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let direct = tool()
@@ -3396,6 +3400,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let graph = tool()
@@ -3473,6 +3478,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_dep("lodash"), granted_dep("@corp/api")];
 
@@ -3515,6 +3521,7 @@ packages:
             kind: crate::lock::Yarn::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_dep("lodash")];
 
@@ -3554,6 +3561,7 @@ packages:
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let direct = pnpm_tool()
@@ -3605,6 +3613,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let captured = tool()
@@ -3645,6 +3654,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("nanoid", "3.1.0", "3.3.0");
         planned.members = vec![MemberRef {
@@ -3882,6 +3892,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut direct = change("chalk", "5.0.0", "5.3.0");
         direct.members = vec![cooldown_core::MemberRef {
@@ -3979,6 +3990,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut landed = change("chalk", "4.1.1", "4.1.2");
         landed.members = vec![cooldown_core::MemberRef {
@@ -4014,6 +4026,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let landed = change("chalk", "4.1.1", "4.1.2");
 
@@ -4108,6 +4121,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("dep", "1.0.0", "1.1.0");
         planned.members = vec![cooldown_core::MemberRef {
@@ -4233,6 +4247,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("dep", "1.0.0", "1.1.0");
         planned.members = vec![cooldown_core::MemberRef {
@@ -4290,6 +4305,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let plan = Plan {
             changes: vec![change("nanoid", "3.1.0", "3.3.0")],
@@ -4334,6 +4350,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         // No manifest declares nanoid, so the candidate is held not-eligible without invoking
         // npm and the batch still reaches the final before/after diff.
@@ -4527,6 +4544,7 @@ mod whole_graph_tests {
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 

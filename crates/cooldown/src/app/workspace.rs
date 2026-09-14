@@ -37,6 +37,11 @@ pub struct ProjectCtx {
     /// packages a settled resolve must not *add* a copy of (a standing split is reported, not
     /// refused); a `--lock` refresh is pnpm's own install and is not judged.
     pub single_copy: Vec<String>,
+    /// The `[tool.cargo] generated-members` declaration this project's config cascade resolved,
+    /// with the file it came from — the same names the project carries as
+    /// [`Project::generated_members`](cooldown_core::Project::generated_members), kept here with
+    /// their origin for `config`.
+    pub generated_members: Option<crate::discovery::DeclaredGeneratedMembers>,
 }
 
 pub(crate) struct LockRefresh {
@@ -496,6 +501,9 @@ pub(crate) fn prune_excluded_members(
 pub(crate) struct ScopedDependencies {
     pub(crate) deps: Vec<Dependency>,
     pub(crate) excluded_members: Vec<cooldown_core::MemberRef>,
+    /// The adapter's non-fatal observations about the project's manifests
+    /// ([`ToolRead::manifest_notices`]), for the caller's warnings; they change no row.
+    pub(crate) notices: Vec<Diagnostic>,
 }
 
 /// How the selection scopes one project's dependency rows.
@@ -1116,6 +1124,18 @@ impl Workspace {
                 .rescope_members(&pctx.project, &mut scoped.deps, &scoped.excluded_members)
                 .await?;
         }
+        // Read after the rows so an adapter can answer from the graph it just read; labelled
+        // here, once, rather than in every reporting command.
+        scoped.notices = adapter
+            .manifest_notices(&pctx.project)
+            .await?
+            .into_iter()
+            .map(|notice| {
+                notice
+                    .with_tool(pctx.tool.as_str())
+                    .with_project(pctx.rel_path.as_str())
+            })
+            .collect();
         Ok(scoped)
     }
 
@@ -1175,6 +1195,7 @@ impl Workspace {
         ScopedDependencies {
             deps,
             excluded_members: excluded.into_values().collect(),
+            notices: Vec::new(),
         }
     }
 
@@ -1826,6 +1847,7 @@ pub(crate) mod tests {
                 kind: tool,
                 manifest: root.join("manifest"),
                 exclude_newer: None,
+                generated_members: cooldown_core::GeneratedMembers::undeclared(),
             },
             policy: PolicyStack {
                 layers: vec![builtin_default_layer()],
@@ -1833,6 +1855,7 @@ pub(crate) mod tests {
             },
             edge_policy: cooldown_core::EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         }
     }
 

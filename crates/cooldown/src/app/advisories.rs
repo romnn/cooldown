@@ -724,6 +724,7 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 advisory_ecosystem: self.advisory_ecosystem,
+                honors_generated_members: false,
                 ..Capabilities::default()
             }
         }
@@ -876,6 +877,7 @@ mod tests {
                 kind: CARGO,
                 manifest: root.join("manifest"),
                 exclude_newer: None,
+                generated_members: cooldown_core::GeneratedMembers::undeclared(),
             },
             policy: PolicyStack {
                 layers: vec![builtin_default_layer(), layer],
@@ -883,6 +885,7 @@ mod tests {
             },
             edge_policy: cooldown_core::EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         }
     }
 

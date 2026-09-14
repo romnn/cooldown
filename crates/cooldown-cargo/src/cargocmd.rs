@@ -3,8 +3,8 @@
 use camino::Utf8Path;
 use cooldown_adapter_util::resolve_program;
 use cooldown_core::{
-    CoreError, LockStatus, LockVerifyReport, MemberRef, ToolTermination, VerifyReport,
-    failure_detail,
+    CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ToolTermination,
+    VerifyReport, failure_detail,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
@@ -23,6 +23,15 @@ pub struct ResolvedGraph {
     pub packages: HashMap<String, PkgInfo>,
     /// workspace members / roots (their edges are what `upgrade` can change).
     pub roots: HashSet<String>,
+    /// The roots whose manifests are generated projections of this very graph (`[tool.cargo]
+    /// generated-members`; a cargo-hakari workspace-hack). Still roots — cargo resolves their
+    /// requirements like any member's — but they follow the lock rather than express intent, so
+    /// the graph counts none of their declarations as a direct dependency, a declaring member, an
+    /// exact pin, a ceiling, or a declared bound, and attributes a reach through them only when
+    /// no authored member reaches the node at all. Their active requirements stay in
+    /// [`declared_requirements`](Self::declared_requirements): the edge policy must satisfy what
+    /// the resolver actually sees.
+    pub generated_roots: HashSet<String>,
     /// node id → its resolved dependency package ids.
     pub edges: HashMap<String, Vec<String>>,
     /// `(crate, version)` pairs a workspace member pins exactly (`serde = "=1.0.197"`). A single
@@ -185,13 +194,125 @@ impl PkgInfo {
 }
 
 impl ResolvedGraph {
-    /// Is `id` an edge target of any root node (a direct dep)?
-    #[must_use]
-    pub fn is_direct(&self, id: &str) -> bool {
+    /// The roots whose declarations count as authored intent: every workspace member except the
+    /// generated ones.
+    fn authored_roots(&self) -> impl Iterator<Item = &String> {
         self.roots
             .iter()
+            .filter(|root| !self.generated_roots.contains(*root))
+    }
+
+    /// Is `id` an edge target of any authored root node (a direct dep)? A generated member's
+    /// edge makes nothing direct: it mirrors a requirement that exists elsewhere in the graph.
+    #[must_use]
+    pub fn is_direct(&self, id: &str) -> bool {
+        self.authored_roots()
             .filter_map(|r| self.edges.get(r))
             .any(|deps| deps.iter().any(|d| d == id))
+    }
+
+    /// The generated members as report references, sorted by name for stable output.
+    #[must_use]
+    pub fn generated_member_refs(&self) -> Vec<MemberRef> {
+        let mut members: Vec<MemberRef> = self
+            .generated_roots
+            .iter()
+            .filter_map(|root| self.member_of(root))
+            .collect();
+        members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        members
+    }
+
+    /// The `(name, version)` nodes only generated members reach — declared by a projection that
+    /// nothing authored still needs, so the projection is stale relative to the workspace and a
+    /// regeneration would drop them. Sorted by name then version. Empty without generated
+    /// members.
+    ///
+    /// Two forward walks over the whole graph rather than a reverse walk per node: the graph a
+    /// workspace-hack sits in has thousands of nodes, and this runs on every dependency read.
+    #[must_use]
+    pub fn nodes_reached_only_via_generated(&self) -> Vec<(String, String)> {
+        if self.generated_roots.is_empty() {
+            return Vec::new();
+        }
+        let authored = self.reachable_from(self.authored_roots(), true);
+        let generated = self.reachable_from(self.generated_roots.iter(), false);
+        let mut nodes: Vec<(String, String)> = self
+            .packages
+            .iter()
+            .filter(|(id, info)| {
+                !self.roots.contains(*id)
+                    && info.is_crates_io()
+                    && !authored.contains(id.as_str())
+                    && generated.contains(id.as_str())
+            })
+            .map(|(_, info)| (info.name.clone(), info.version.clone()))
+            .collect();
+        nodes.sort();
+        nodes
+    }
+
+    /// The crates.io versions the authored members resolve each crate to, without passing
+    /// through a generated member: the lines a projection is meant to mirror. Keyed by crate
+    /// name, versions in resolver order.
+    #[must_use]
+    pub fn authored_crates_io_versions(&self) -> HashMap<String, Vec<String>> {
+        let authored = self.reachable_from(self.authored_roots(), true);
+        let mut versions: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, info) in &self.packages {
+            if !self.roots.contains(id) && info.is_crates_io() && authored.contains(id.as_str()) {
+                versions
+                    .entry(info.name.clone())
+                    .or_default()
+                    .push(info.version.clone());
+            }
+        }
+        versions
+    }
+
+    /// Every node reachable from `roots` along the resolved edges, the roots included; with
+    /// `skip_generated`, a generated root's own edges are not followed, so its projections count
+    /// only where an authored path also leads.
+    fn reachable_from<'a>(
+        &'a self,
+        roots: impl Iterator<Item = &'a String>,
+        skip_generated: bool,
+    ) -> HashSet<&'a str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: Vec<&str> = roots.map(String::as_str).collect();
+        while let Some(node) = queue.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if skip_generated && self.generated_roots.contains(node) {
+                continue;
+            }
+            if let Some(next) = self.edges.get(node) {
+                queue.extend(next.iter().map(String::as_str));
+            }
+        }
+        seen
+    }
+
+    /// The authored roots reaching `id` without passing through a generated member's edges.
+    fn authored_reaching_roots<'a>(&'a self, id: &'a str) -> Vec<&'a str> {
+        let edges = self
+            .edges
+            .iter()
+            .filter(|(from, _)| !self.generated_roots.contains(*from))
+            .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())));
+        let roots: HashSet<&str> = self.authored_roots().map(String::as_str).collect();
+        cooldown_adapter_util::reaching_roots(edges, &roots, id)
+    }
+
+    /// The generated roots reaching `id` over the full edge set.
+    fn generated_reaching_roots<'a>(&'a self, id: &'a str) -> Vec<&'a str> {
+        let edges = self
+            .edges
+            .iter()
+            .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())));
+        let roots: HashSet<&str> = self.generated_roots.iter().map(String::as_str).collect();
+        cooldown_adapter_util::reaching_roots(edges, &roots, id)
     }
     /// Is `crate_name` at `version` exact-pinned (`=x.y.z`) by a workspace member?
     #[must_use]
@@ -331,13 +452,12 @@ impl ResolvedGraph {
         true
     }
 
-    /// The workspace member crates that directly depend on `id` — the source packages a dependency
-    /// is attributed to in reports. Sorted by name and deduplicated for stable output.
+    /// The authored workspace member crates that directly depend on `id` — the source packages a
+    /// dependency is attributed to in reports. Sorted by name and deduplicated for stable output.
     #[must_use]
     pub fn direct_members(&self, id: &str) -> Vec<MemberRef> {
         let mut members: Vec<MemberRef> = self
-            .roots
-            .iter()
+            .authored_roots()
             .filter(|root| {
                 self.edges
                     .get(*root)
@@ -353,14 +473,25 @@ impl ResolvedGraph {
     /// The workspace members that reach `id` through the graph — directly or transitively — so a
     /// *transitive* dependency can be attributed to the members that pull it in ("via …"). Uses the
     /// shared, tool-agnostic reverse-reachability helper over this graph's edges.
+    ///
+    /// A generated member's edges are not a path: every member depends on the workspace-hack,
+    /// so counting them would attribute each of its hundreds of mirrored nodes to the whole
+    /// workspace. Only when no authored member reaches the node at all is it attributed to the
+    /// generated members that do, so the row keeps an owner (and the gate keeps the node) while
+    /// the attribution says exactly what holds it in the graph: a stale projection.
     #[must_use]
     pub fn reaching_members(&self, id: &str) -> Vec<MemberRef> {
-        let edges = self
-            .edges
-            .iter()
-            .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())));
-        let roots: HashSet<&str> = self.roots.iter().map(String::as_str).collect();
-        cooldown_adapter_util::reaching_members(edges, &roots, id, |node| self.member_of(node))
+        let mut reaching = self.authored_reaching_roots(id);
+        if reaching.is_empty() {
+            reaching = self.generated_reaching_roots(id);
+        }
+        let mut members: Vec<MemberRef> = reaching
+            .into_iter()
+            .filter_map(|root| self.member_of(root))
+            .collect();
+        members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        members.dedup();
+        members
     }
 }
 
@@ -486,13 +617,30 @@ struct EdgeCandidates {
     declared_requirement_edges: Vec<DeclaredEdge>,
 }
 
+/// What a package's declarations mean to the graph: a third-party crate's requirements are
+/// structural graph constraints, an authored member's are the project's own intent, and a
+/// generated member's are a projection of the lock that constrains nothing cooldown gates on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackageRole {
+    ThirdParty,
+    AuthoredMember,
+    GeneratedMember,
+}
+
 impl EdgeCandidates {
-    fn record(&mut self, p: &RawPkg, is_root: bool) {
+    fn record(&mut self, p: &RawPkg, role: PackageRole) {
+        let is_root = role != PackageRole::ThirdParty;
+        // A generated member follows the lock: its `=` pins, ceilings, and explicit bounds are
+        // whatever its generator last wrote and get rewritten when the authored declaration
+        // moves, so recording them would hold a candidate on a constraint that only mirrors the
+        // current lock. Its plain requirements are still recorded below: the resolver enforces
+        // them, so the edge policy must know them.
+        let holds = role != PackageRole::GeneratedMember;
         for dep in &p.dependencies {
             // A dev dependency of a transitive crate is not in the resolved build graph and caps
             // nothing; normal and build dependencies do, once confirmed active below.
             let is_dev = dep.kind.as_deref() == Some("dev");
-            if let Some(version) = exact_req_version(&dep.req) {
+            if holds && let Some(version) = exact_req_version(&dep.req) {
                 // A workspace member's own exact pin is the project's choice: it surfaces as
                 // `pinned` (held, but with an adoptable target showing what it could be repinned
                 // to).
@@ -522,7 +670,10 @@ impl EdgeCandidates {
             // A member's dev-dependency bound is as deliberate as its normal one, and dev deps
             // are resolved and upgradeable — the same reasoning that keeps dev pins in
             // `exact_pins` above.
-            if is_root && let Some(upper) = explicit_upper_bound(&dep.req) {
+            if holds
+                && is_root
+                && let Some(upper) = explicit_upper_bound(&dep.req)
+            {
                 self.declared_bound_edges.push(DeclaredBoundEdge {
                     declaration: DeclaredEdge {
                         requirer: p.id.clone(),
@@ -1006,6 +1157,44 @@ fn req_floor(req: &str) -> Option<String> {
     best.map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
 }
 
+/// The package ids of the declared generated members, each name matched against the workspace
+/// members exactly.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] naming the first declared name no member carries, beside the
+/// members that exist, so a typo, a renamed crate, or a deleted one is caught in every command
+/// that reads the graph rather than quietly narrowing nothing.
+fn resolve_generated_roots(
+    raw: &RawMeta,
+    roots: &HashSet<String>,
+    generated: &GeneratedMembers,
+) -> Result<HashSet<String>, CoreError> {
+    let mut resolved = HashSet::new();
+    if generated.names().is_empty() {
+        return Ok(resolved);
+    }
+    let members: HashMap<&str, &str> = raw
+        .packages
+        .iter()
+        .filter(|package| roots.contains(&package.id))
+        .map(|package| (package.name.as_str(), package.id.as_str()))
+        .collect();
+    for name in generated.names() {
+        let Some(id) = members.get(name.as_str()) else {
+            let mut known: Vec<&str> = members.keys().copied().collect();
+            known.sort_unstable();
+            return Err(CoreError::Config(format!(
+                "[tool.cargo] generated-members names `{name}`, but no workspace member in {} has that package name (members: {}); fix or remove the entry",
+                raw.workspace_root,
+                known.join(", ")
+            )));
+        };
+        resolved.insert((*id).to_string());
+    }
+    Ok(resolved)
+}
+
 /// The crate's directory relative to the workspace root (`.` for a crate at the root). Cargo reports
 /// absolute manifest paths; relativizing keeps member paths short and workspace-portable.
 fn member_path(manifest_path: &str, workspace_root: &str) -> String {
@@ -1196,21 +1385,28 @@ impl Cargo {
         })
     }
 
-    /// Resolves the lock-generation graph for `dir` via `cargo metadata --all-features`.
+    /// Resolves the lock-generation graph for `dir` via `cargo metadata --all-features`,
+    /// demoting the declared `generated` members to followers (see
+    /// [`ResolvedGraph::generated_roots`]).
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned,
-    /// [`CoreError::Tool`] if it exits non-zero, and [`CoreError::LockUnreadable`] if its JSON
-    /// output cannot be parsed.
-    pub async fn metadata(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
+    /// [`CoreError::Tool`] if it exits non-zero, [`CoreError::LockUnreadable`] if its JSON
+    /// output cannot be parsed, and [`CoreError::Config`] if a declared generated member names no
+    /// workspace member.
+    pub async fn metadata(
+        &self,
+        dir: &Utf8Path,
+        generated: &GeneratedMembers,
+    ) -> Result<ResolvedGraph, CoreError> {
         let stdout = self
             .run(
                 dir,
                 &["metadata", "--all-features", "--format-version", "1"],
             )
             .await?;
-        Self::parse_graph(&stdout)
+        Self::parse_graph(&stdout, generated)
     }
 
     /// Reads the lock-generation graph without allowing Cargo to update `Cargo.lock`.
@@ -1220,11 +1416,16 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the corresponding Cargo
-    /// tool error for any other failure.
-    pub async fn metadata_locked(&self, dir: &Utf8Path) -> Result<ResolvedGraph, CoreError> {
+    /// Returns [`CoreError::StaleLock`] when the lock must be updated, [`CoreError::Config`] if a
+    /// declared generated member names no workspace member, or the corresponding Cargo tool error
+    /// for any other failure.
+    pub async fn metadata_locked(
+        &self,
+        dir: &Utf8Path,
+        generated: &GeneratedMembers,
+    ) -> Result<ResolvedGraph, CoreError> {
         let stdout = self.run_locked_metadata(dir).await?;
-        Self::parse_graph(&stdout)
+        Self::parse_graph(&stdout, generated)
     }
 
     /// Reads the locked package and target topology without allowing Cargo to rewrite the source.
@@ -1289,22 +1490,48 @@ impl Cargo {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn build_graph_from_json(json: &str) -> ResolvedGraph {
+        Self::build_graph_from_json_generated(json, &GeneratedMembers::undeclared())
+            .expect("no generated member to resolve")
+    }
+
+    /// [`build_graph_from_json`](Self::build_graph_from_json) with declared generated members,
+    /// for tests of the follower semantics — including the error a declaration that matches no
+    /// member raises.
+    #[cfg(test)]
+    pub(crate) fn build_graph_from_json_generated(
+        json: &str,
+        generated: &GeneratedMembers,
+    ) -> Result<ResolvedGraph, CoreError> {
         let raw: RawMeta = serde_json::from_str(json).expect("parse metadata");
-        Self::build_graph(raw)
+        Self::build_graph(raw, generated)
     }
 
     /// Builds the [`ResolvedGraph`] from parsed `cargo metadata`. Split from [`Self::metadata`] so the
     /// graph logic — exact pins, the active-edge ceiling intersection, reverse edges — is unit-testable
     /// without spawning cargo.
-    fn build_graph(raw: RawMeta) -> ResolvedGraph {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] when a declared generated member names no workspace
+    /// member: a declaration that matched nothing would otherwise silently leave a manifest it
+    /// was meant to cover — or one that was renamed away — treated as authored.
+    fn build_graph(raw: RawMeta, generated: &GeneratedMembers) -> Result<ResolvedGraph, CoreError> {
         let workspace_root = raw.workspace_root.clone();
         let roots: HashSet<String> = raw.workspace_members.iter().cloned().collect();
+        let generated_roots = resolve_generated_roots(&raw, &roots, generated)?;
         let mut packages = HashMap::new();
         let mut candidates = EdgeCandidates::default();
         let mut msrv = MsrvIndex::default();
         for p in raw.packages {
+            let role = if generated_roots.contains(&p.id) {
+                PackageRole::GeneratedMember
+            } else if roots.contains(&p.id) {
+                PackageRole::AuthoredMember
+            } else {
+                PackageRole::ThirdParty
+            };
             msrv.record(&p, roots.contains(&p.id));
-            candidates.record(&p, roots.contains(&p.id));
+            candidates.record(&p, role);
             packages.insert(
                 p.id.clone(),
                 PkgInfo {
@@ -1346,9 +1573,10 @@ impl Cargo {
             &packages,
             &renames,
         );
-        ResolvedGraph {
+        Ok(ResolvedGraph {
             packages,
             roots,
+            generated_roots,
             edges,
             exact_pins: candidates.exact_pins,
             graph_ceilings,
@@ -1359,13 +1587,13 @@ impl Cargo {
             declared_requirements,
             rust_versions: msrv.rust_versions,
             workspace_rust_version: msrv.workspace_rust_version,
-        }
+        })
     }
 
-    fn parse_graph(stdout: &str) -> Result<ResolvedGraph, CoreError> {
+    fn parse_graph(stdout: &str, generated: &GeneratedMembers) -> Result<ResolvedGraph, CoreError> {
         let raw: RawMeta = serde_json::from_str(stdout)
             .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
-        Ok(Self::build_graph(raw))
+        Self::build_graph(raw, generated)
     }
 
     /// Verifies `Cargo.lock` and returns the authoritative resolved graph when it is current.
@@ -1379,11 +1607,16 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if it
-    /// fails for a reason other than a stale lock.
-    pub async fn verify_locked(&self, dir: &Utf8Path) -> Result<Option<ResolvedGraph>, CoreError> {
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, [`CoreError::Config`] if a
+    /// declared generated member names no workspace member, or [`CoreError::Tool`] if it fails
+    /// for a reason other than a stale lock.
+    pub async fn verify_locked(
+        &self,
+        dir: &Utf8Path,
+        generated: &GeneratedMembers,
+    ) -> Result<Option<ResolvedGraph>, CoreError> {
         match self.run_locked_metadata(dir).await {
-            Ok(stdout) => Self::parse_graph(&stdout).map(Some),
+            Ok(stdout) => Self::parse_graph(&stdout, generated).map(Some),
             Err(CoreError::StaleLock(_)) => Ok(None),
             Err(error) => Err(error),
         }
@@ -1514,7 +1747,10 @@ mod tests {
         )?;
 
         let cargo = Cargo::new();
-        let error = cargo.metadata_locked(root).await.err();
+        let error = cargo
+            .metadata_locked(root, &GeneratedMembers::undeclared())
+            .await
+            .err();
         std::assert_matches!(error, Some(CoreError::StaleLock(_)));
         let staging_error = cargo.staging_metadata(root).await.err();
         std::assert_matches!(staging_error, Some(CoreError::StaleLock(_)));
@@ -1555,11 +1791,19 @@ mod tests {
             root.join("Cargo.lock").is_file(),
             "a missing lock is generated"
         );
-        assert!(cargo.verify_locked(root).await?.is_some());
+        assert!(
+            cargo
+                .verify_locked(root, &GeneratedMembers::undeclared())
+                .await?
+                .is_some()
+        );
 
         std::fs::write(root.join("Cargo.toml"), manifest("0.2.0"))?;
         std::assert_matches!(
-            cargo.metadata_locked(root).await.err(),
+            cargo
+                .metadata_locked(root, &GeneratedMembers::undeclared())
+                .await
+                .err(),
             Some(CoreError::StaleLock(_)),
             "the version bump staled the lock"
         );
@@ -1571,7 +1815,10 @@ mod tests {
             refreshed.detail
         );
         assert!(
-            cargo.verify_locked(root).await?.is_some(),
+            cargo
+                .verify_locked(root, &GeneratedMembers::undeclared())
+                .await?
+                .is_some(),
             "the refreshed lock is current again"
         );
 
@@ -2391,6 +2638,7 @@ mod tests {
         let graph = ResolvedGraph {
             packages: HashMap::new(),
             roots: HashSet::new(),
+            generated_roots: HashSet::new(),
             edges: HashMap::new(),
             exact_pins: HashSet::from([("serde".to_string(), "1.0.197".to_string())]),
             graph_ceilings: HashSet::new(),
@@ -2414,6 +2662,7 @@ mod tests {
         let graph = ResolvedGraph {
             packages: HashMap::new(),
             roots: HashSet::new(),
+            generated_roots: HashSet::new(),
             edges: HashMap::new(),
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::from([("serde_derive".to_string(), "1.0.228".to_string())]),
@@ -2458,7 +2707,7 @@ mod tests {
             ]}
         }"#;
         let raw: RawMeta = serde_json::from_str(json).expect("parse metadata");
-        let graph = Cargo::build_graph(raw);
+        let graph = Cargo::build_graph(raw, &GeneratedMembers::undeclared()).expect("graph");
         assert!(graph.is_graph_capped("dep", "1.0.0")); // active `=` edge → real ceiling
         assert!(!graph.is_graph_capped("other", "2.0.0")); // pinned only by an inactive edge
     }
@@ -2498,6 +2747,7 @@ mod tests {
                 ),
             ]),
             roots: HashSet::from(["root-a".to_string(), "root-b".to_string()]),
+            generated_roots: HashSet::new(),
             edges: HashMap::from([
                 ("root-a".to_string(), vec!["dep".to_string()]),
                 ("root-b".to_string(), Vec::new()),
@@ -2721,6 +2971,7 @@ mod tests {
                 ("trans".to_string(), pkg("syn", ".")),
             ]),
             roots: HashSet::from(["root-a".to_string(), "root-b".to_string()]),
+            generated_roots: HashSet::new(),
             edges: HashMap::from([
                 ("root-a".to_string(), vec!["dep".to_string()]),
                 ("root-b".to_string(), Vec::new()),
@@ -2748,5 +2999,157 @@ mod tests {
         assert_eq!(names(graph.reaching_members("trans")), vec!["app-a"]);
         // Direct deps are reached too — reaching is a superset of direct.
         assert_eq!(names(graph.reaching_members("dep")), vec!["app-a"]);
+    }
+
+    /// A hakari-shaped workspace: `app` declares `itertools 0.13` and `pinned`, a third-party
+    /// `mid` needs `itertools 0.14`, and the generated `hack` — which every member depends on —
+    /// mirrors both itertools lines under hash-aliased renames, pins `pinned` exactly, and still
+    /// declares `orphan`, which nothing authored reaches any more.
+    const HAKARI_META: &str = r#"{
+        "packages": [
+            {"id": "app", "name": "app", "version": "0.1.0",
+             "manifest_path": "/ws/crates/app/Cargo.toml",
+             "dependencies": [
+                {"name": "itertools", "req": "^0.13"},
+                {"name": "mid", "req": "^1"},
+                {"name": "pinned", "req": "^1"},
+                {"name": "hack", "req": "^0.1"}
+             ]},
+            {"id": "hack", "name": "hack", "version": "0.1.0",
+             "manifest_path": "/ws/crates/hack/Cargo.toml",
+             "dependencies": [
+                {"name": "itertools", "rename": "itertools-aaaa", "req": "^0.13"},
+                {"name": "itertools", "rename": "itertools-bbbb", "req": "^0.14"},
+                {"name": "pinned", "req": "=1.0.0"},
+                {"name": "orphan", "req": "^2"}
+             ]},
+            {"id": "mid", "name": "mid", "version": "1.0.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index",
+             "dependencies": [{"name": "itertools", "req": "^0.14"}]},
+            {"id": "it13", "name": "itertools", "version": "0.13.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"id": "it14", "name": "itertools", "version": "0.14.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"id": "pinned", "name": "pinned", "version": "1.0.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"id": "orphan", "name": "orphan", "version": "2.0.0",
+             "source": "registry+https://github.com/rust-lang/crates.io-index"}
+        ],
+        "workspace_members": ["app", "hack"],
+        "workspace_root": "/ws",
+        "resolve": {"nodes": [
+            {"id": "app", "deps": [{"name": "itertools", "pkg": "it13"}, {"name": "mid", "pkg": "mid"}, {"name": "pinned", "pkg": "pinned"}, {"name": "hack", "pkg": "hack"}]},
+            {"id": "hack", "deps": [{"name": "itertools_aaaa", "pkg": "it13"}, {"name": "itertools_bbbb", "pkg": "it14"}, {"name": "pinned", "pkg": "pinned"}, {"name": "orphan", "pkg": "orphan"}]},
+            {"id": "mid", "deps": [{"name": "itertools", "pkg": "it14"}]},
+            {"id": "it13", "deps": []},
+            {"id": "it14", "deps": []},
+            {"id": "pinned", "deps": []},
+            {"id": "orphan", "deps": []}
+        ]}
+    }"#;
+
+    fn member_names(members: Vec<MemberRef>) -> Vec<String> {
+        members.into_iter().map(|member| member.name).collect()
+    }
+
+    /// Without a declaration the hack is an ordinary member (the regression baseline): every
+    /// line it mirrors is direct and attributed to it, and its pin holds.
+    #[test]
+    fn undeclared_hack_is_an_ordinary_member() {
+        let graph = Cargo::build_graph_from_json(HAKARI_META);
+        assert!(graph.generated_roots.is_empty());
+        assert!(graph.is_direct("it14"));
+        assert!(graph.is_direct("orphan"));
+        assert_eq!(member_names(graph.direct_members("it13")), ["app", "hack"]);
+        assert_eq!(member_names(graph.direct_members("it14")), ["hack"]);
+        assert!(graph.is_exact_pinned("pinned", "1.0.0"));
+        assert!(graph.nodes_reached_only_via_generated().is_empty());
+    }
+
+    /// Declared generated, the hack's declarations follow rather than drive: nothing it alone
+    /// declares is direct, it never appears as a declaring member, its pin holds nothing, and a
+    /// node only it reaches is attributed to it — visibly, as the stale projection it is — rather
+    /// than dropped.
+    #[test]
+    fn generated_hack_declarations_neither_drive_nor_hold() {
+        let graph = Cargo::build_graph_from_json_generated(
+            HAKARI_META,
+            &GeneratedMembers::declared(vec!["hack".to_string()]),
+        )
+        .expect("graph");
+        assert_eq!(graph.generated_roots, HashSet::from(["hack".to_string()]));
+        assert_eq!(
+            member_names(graph.generated_member_refs()),
+            ["hack"],
+            "the generated member resolves to its manifest for the follower rewrite"
+        );
+
+        // `app`'s own line stays direct, attributed to `app` alone.
+        assert!(graph.is_direct("it13"));
+        assert_eq!(member_names(graph.direct_members("it13")), ["app"]);
+        // The line only the hack mirrors is transitive, reached through `mid`.
+        assert!(!graph.is_direct("it14"));
+        assert!(graph.direct_members("it14").is_empty());
+        assert_eq!(member_names(graph.reaching_members("it14")), ["app"]);
+        // A generated pin is the generator's last output, not the project's choice.
+        assert!(!graph.is_exact_pinned("pinned", "1.0.0"));
+        assert!(!graph.is_graph_capped("pinned", "1.0.0"));
+        // The orphan is kept — attributed to the hack, since nothing authored reaches it — and
+        // named as the stale projection.
+        assert!(!graph.is_direct("orphan"));
+        assert_eq!(member_names(graph.reaching_members("orphan")), ["hack"]);
+        assert_eq!(
+            graph.nodes_reached_only_via_generated(),
+            vec![("orphan".to_string(), "2.0.0".to_string())]
+        );
+        // The lines a projection is meant to mirror: what the authored members resolve.
+        let authored = graph.authored_crates_io_versions();
+        assert_eq!(authored.get("itertools").map(Vec::len), Some(2));
+        assert_eq!(
+            authored.get("pinned").map(Vec::as_slice),
+            Some(["1.0.0".to_string()].as_slice())
+        );
+        assert!(!authored.contains_key("orphan"));
+        // The resolver still sees the hack's requirements, so the edge policy must too.
+        let hack_id = LockPackageId::from_metadata("hack", "0.1.0", None::<&str>);
+        assert!(
+            graph
+                .declared_requirements
+                .get(&hack_id)
+                .is_some_and(|reqs| reqs.iter().any(|req| req.dependency == "itertools")),
+            "generated requirements stay in the edge-policy index"
+        );
+    }
+
+    /// A declaration that matches no member fails the graph read — every command that reads the
+    /// workspace — rather than narrowing nothing.
+    #[test]
+    fn generated_member_that_matches_nothing_is_a_config_error() {
+        let error = Cargo::build_graph_from_json_generated(
+            HAKARI_META,
+            &GeneratedMembers::declared(vec!["workspace-hack".to_string()]),
+        )
+        .err()
+        .expect("unknown member");
+        let message = error.to_string();
+        assert!(matches!(error, CoreError::Config(_)), "{message}");
+        assert!(message.contains("`workspace-hack`"), "{message}");
+        assert!(
+            message.contains("app, hack"),
+            "names the members: {message}"
+        );
+    }
+
+    /// A member can only be declared by its package name: a third-party crate's name is not a
+    /// member and is rejected like any other unknown name.
+    #[test]
+    fn generated_member_must_be_a_workspace_member() {
+        let error = Cargo::build_graph_from_json_generated(
+            HAKARI_META,
+            &GeneratedMembers::declared(vec!["mid".to_string()]),
+        )
+        .err()
+        .expect("a third-party crate is not a member");
+        assert!(matches!(error, CoreError::Config(_)), "{error}");
     }
 }

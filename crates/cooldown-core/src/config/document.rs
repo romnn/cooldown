@@ -39,6 +39,30 @@ fn reject_tool_only_fields(selector: &SelectorToml, ctx: &str) -> Result<(), Cor
             "{ctx}: `single-copy` is pnpm-specific; move it to [tool.pnpm]"
         )));
     }
+    if selector.generated_members.is_some() {
+        return Err(CoreError::Config(format!(
+            "{ctx}: `generated-members` is cargo-specific; move it to [tool.cargo]"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a `generated-members` entry that could never name one member exactly: a glob (the
+/// list is matched by name, so a pattern would fail the "matches nothing" check for the wrong
+/// reason), or a blank.
+fn validate_generated_members(names: &[String], ctx: &str) -> Result<(), CoreError> {
+    for name in names {
+        if name.trim().is_empty() {
+            return Err(CoreError::Config(format!(
+                "{ctx}: `generated-members` lists exact member package names, and one entry is blank"
+            )));
+        }
+        if name.contains(['*', '?', '[', '{']) {
+            return Err(CoreError::Config(format!(
+                "{ctx}: `generated-members` lists exact member package names, and `{name}` is a glob; a generated member is declared by name, never matched by pattern"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -56,6 +80,15 @@ fn validate_structure(config: &ConfigToml, origin: &Origin) -> Result<(), CoreEr
                     "{}: `single-copy` in [tool.{name}] is pnpm-specific; move it to [tool.pnpm]",
                     origin.token()
                 )));
+            }
+            if let Some(names) = &selector.generated_members {
+                if name != "cargo" {
+                    return Err(CoreError::Config(format!(
+                        "{}: `generated-members` in [tool.{name}] is cargo-specific; move it to [tool.cargo]",
+                        origin.token()
+                    )));
+                }
+                validate_generated_members(names, &format!("{} [tool.{name}]", origin.token()))?;
             }
             // The gate matches exact names, so a glob would parse, fold, and gate nothing.
             if let Some(list) = &selector.single_copy
@@ -135,6 +168,17 @@ impl ConfigDocument {
             .as_ref()
             .and_then(|tools| tools.get("cargo"))
             .and_then(|cargo| cargo.edge_policy)
+    }
+
+    /// Returns the document's declared generated cargo members, if `[tool.cargo]` sets the
+    /// `generated-members` key (an explicit `[]` is a declaration too).
+    #[must_use]
+    pub fn cargo_generated_members(&self) -> Option<Vec<String>> {
+        self.raw
+            .tool
+            .as_ref()
+            .and_then(|tools| tools.get("cargo"))
+            .and_then(|cargo| cargo.generated_members.clone())
     }
 
     /// Returns the document's pnpm single-copy list with its merge mode, if `[tool.pnpm]` sets
@@ -219,6 +263,53 @@ mod tests {
             assert!(
                 err.to_string().contains("[tool.pnpm]"),
                 "the error points at the correct placement: {err}"
+            );
+        }
+    }
+
+    /// `generated-members` is a declaration by exact member name: an explicit `[]` is a
+    /// declaration too, a glob or a blank can never name a member, and the key belongs under
+    /// `[tool.cargo]` alone.
+    #[test]
+    fn generated_members_is_a_cargo_only_list_of_exact_names() {
+        let declared = ConfigDocument::parse(
+            "[tool.cargo]\ngenerated-members = [\"workspace-hack\"]\n",
+            &Origin::Global,
+        )
+        .expect("declared under [tool.cargo]");
+        assert_eq!(
+            declared.cargo_generated_members(),
+            Some(vec!["workspace-hack".to_string()])
+        );
+        let empty =
+            ConfigDocument::parse("[tool.cargo]\ngenerated-members = []\n", &Origin::Global)
+                .expect("an explicit empty list is a declaration");
+        assert_eq!(empty.cargo_generated_members(), Some(Vec::new()));
+        let unset =
+            ConfigDocument::parse("[tool.cargo]\nedge-policy = \"none\"\n", &Origin::Global)
+                .expect("no declaration");
+        assert_eq!(unset.cargo_generated_members(), None);
+
+        for (src, expected) in [
+            (
+                "[tool.cargo]\ngenerated-members = [\"*-hack\"]\n",
+                "is a glob",
+            ),
+            ("[tool.cargo]\ngenerated-members = [\" \"]\n", "is blank"),
+            (
+                "[tool.pnpm]\ngenerated-members = [\"workspace-hack\"]\n",
+                "[tool.cargo]",
+            ),
+            (
+                "[project.\"apps/*\"]\ngenerated-members = [\"workspace-hack\"]\n",
+                "[tool.cargo]",
+            ),
+        ] {
+            let err = ConfigDocument::parse(src, &Origin::Global)
+                .expect_err("a declaration that can never name a member exactly is rejected");
+            assert!(
+                err.to_string().contains(expected),
+                "{src}: the error says why: {err}"
             );
         }
     }

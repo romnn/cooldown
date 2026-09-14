@@ -178,6 +178,7 @@ impl ToolRead for UvTool {
             can_sync: true,
             artifact_granular: true,
             advisory_ecosystem: Some("PyPI"),
+            honors_generated_members: false,
         }
     }
 
@@ -1076,6 +1077,7 @@ mod tests {
             kind: UV_ID,
             manifest: Utf8PathBuf::from("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let dep = Dependency {
             package: PackageId::new(UV_ID, "requests", Some(PYPI.to_string())),
@@ -1176,6 +1178,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let graph = tool
@@ -1247,6 +1250,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let graph = tool
@@ -1355,6 +1359,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let graph = tool
@@ -1414,6 +1419,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let graph = tool
@@ -1446,6 +1452,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let journal = eco.mutation_journal(&project, &Plan::default()).await?;
@@ -1582,6 +1589,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let roots = uv_tool().external_resolve_roots(&project);
@@ -1647,6 +1655,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let roots = uv_tool().external_resolve_roots(&project);
@@ -1697,6 +1706,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let roots = uv_tool().external_resolve_roots(&project);
@@ -1745,6 +1755,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let roots = uv_tool().external_resolve_roots(&project);

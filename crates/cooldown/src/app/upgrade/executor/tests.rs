@@ -1,9 +1,9 @@
 use super::planning::{effective_hold, plan_baseline_violations, target_package};
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
-    collateral_rows, combine_lock_status, conflict_skip_message, indeterminate_trial,
-    insert_graph_violation, is_downgrade, newly_introduced_violations, package_label,
-    planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
+    collateral_rows, combine_lock_status, conflict_skip_message, followed_manifest_warning,
+    indeterminate_trial, insert_graph_violation, is_downgrade, newly_introduced_violations,
+    package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
     verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
@@ -452,6 +452,28 @@ fn collateral_rows_keep_a_held_candidates_real_movement() {
         vec![("referencing", "0.46.10"), ("quote", "1.0.45")],
         "a package-level filter would drop the held candidate's movement row"
     );
+}
+
+/// The regeneration note for a followed generated manifest speaks in the run's mood — a preview
+/// or dry run has rewritten nothing the user keeps — and names the manifest as its path so a
+/// consumer can key on it.
+#[test]
+fn followed_manifest_warning_matches_the_run_mood() {
+    let rel = camino::Utf8Path::new("crates/workspace-hack/Cargo.toml");
+    let landed = followed_manifest_warning(rel, false);
+    let dry = followed_manifest_warning(rel, true);
+    for warning in [&landed, &dry] {
+        assert_eq!(warning.kind, cooldown_core::DiagnosticKind::StaleLock);
+        assert_eq!(warning.path.as_deref(), Some(rel.as_str()));
+        assert!(warning.message.contains("cargo hakari generate"));
+    }
+    assert!(
+        landed.message.contains("was rewritten"),
+        "{}",
+        landed.message
+    );
+    assert!(dry.message.contains("would rewrite"), "{}", dry.message);
+    assert!(!dry.message.contains("was rewritten"), "{}", dry.message);
 }
 
 #[test]

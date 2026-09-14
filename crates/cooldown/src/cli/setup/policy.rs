@@ -5,8 +5,8 @@ use crate::discovery::ConfigSources;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{builtin_default_layer, layer_from_fields};
 use cooldown_core::{
-    CoreError, Origin, PolicyLayer, PolicyStack, Project, ResolveKind, ResolveQuery, SyncScope,
-    ToolId, normalize_native, resolve, window_exclude_newer,
+    CoreError, GeneratedMembers, Origin, PolicyLayer, PolicyStack, Project, ResolveKind,
+    ResolveQuery, SyncScope, ToolId, normalize_native, resolve, window_exclude_newer,
 };
 use jiff::Timestamp;
 
@@ -123,6 +123,12 @@ async fn assemble_ctx(
         .or(project_config.cargo_edge_policy)
         .unwrap_or_default();
     let single_copy = project_config.pnpm_single_copy;
+    let generated_members = project_config.cargo_generated_members;
+    project.generated_members = generated_members
+        .as_ref()
+        .map_or_else(GeneratedMembers::undeclared, |declared| {
+            declared.generated_members()
+        });
 
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &assembly.shared.global {
@@ -201,6 +207,7 @@ async fn assemble_ctx(
         },
         edge_policy,
         single_copy,
+        generated_members,
     })
 }
 

@@ -599,6 +599,7 @@ mod tests {
             kind: TOOL,
             manifest,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         TempProject {
             directory: dir,

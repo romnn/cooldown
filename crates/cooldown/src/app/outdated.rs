@@ -278,7 +278,10 @@ impl<'a> OutdatedRunner<'a> {
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
         {
-            Ok(scoped) => Some((scoped.deps, scoped.excluded_members)),
+            Ok(scoped) => {
+                self.acc.warnings.extend(scoped.notices);
+                Some((scoped.deps, scoped.excluded_members))
+            }
             Err(error) => {
                 tracing::warn!(
                     project = read.project_label,

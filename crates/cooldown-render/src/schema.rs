@@ -422,7 +422,17 @@ pub fn json_schema() -> Value {
                 "source": { "type": "string" },
                 "strictNative": { "type": "boolean" },
                 "layers": { "type": "array", "items": { "type": "string" } },
-                "advisories": { "$ref": "#/$defs/advisoryConfigInfo" }
+                "advisories": { "$ref": "#/$defs/advisoryConfigInfo" },
+                "generatedMembers": { "$ref": "#/$defs/generatedMembersInfo" }
+            },
+            "additionalProperties": false
+        },
+        "generatedMembersInfo": {
+            "type": "object",
+            "required": ["names", "origin"],
+            "properties": {
+                "names": { "type": "array", "items": { "type": "string" } },
+                "origin": { "type": ["string", "null"] }
             },
             "additionalProperties": false
         },
@@ -665,10 +675,10 @@ mod tests {
     use crate::model::{
         AdvisoryConfigInfo, BaselineItem, BaselineMeta, BaselineSummary, BuildInfo, CheckItem,
         CheckMeta, CheckStatus, CheckSummary, ConfigItem, ConfigMeta, ConfigSummary, EffectiveInfo,
-        Envelope, ExplainDeclaration, ExplainMeta, ExplainStep, ExplainSummary, LatestInfo,
-        OutdatedItem, OutdatedMeta, OutdatedStatus, OutdatedSummary, RecoveryItem, RecoveryMeta,
-        RecoveryStatus, RecoverySummary, SecurityInfo, SkippedInfo, UpgradeEdgeInfo, UpgradeItem,
-        UpgradeMeta, UpgradeSummary, Window,
+        Envelope, ExplainDeclaration, ExplainMeta, ExplainStep, ExplainSummary,
+        GeneratedMembersInfo, LatestInfo, OutdatedItem, OutdatedMeta, OutdatedStatus,
+        OutdatedSummary, RecoveryItem, RecoveryMeta, RecoveryStatus, RecoverySummary, SecurityInfo,
+        SkippedInfo, UpgradeEdgeInfo, UpgradeItem, UpgradeMeta, UpgradeSummary, Window,
     };
     use color_eyre::eyre;
     use cooldown_core::{
@@ -859,6 +869,7 @@ mod tests {
         assert_def_keys(schema, "configSummary", config_summary());
         assert_def_keys(schema, "configItem", config_item());
         assert_def_keys(schema, "advisoryConfigInfo", advisory_config_info());
+        assert_def_keys(schema, "generatedMembersInfo", generated_members_info());
         assert_def_keys(schema, "baselineSummary", baseline_summary());
         assert_def_keys(schema, "baselineItem", baseline_item());
         assert_def_keys(schema, "recoverySummary", recovery_summary());
@@ -1283,6 +1294,14 @@ mod tests {
             strict_native: true,
             layers: vec!["default".to_string(), "workspace".to_string()],
             advisories: advisory_config_info(),
+            generated_members: Some(generated_members_info()),
+        }
+    }
+
+    fn generated_members_info() -> GeneratedMembersInfo {
+        GeneratedMembersInfo {
+            names: vec!["workspace-hack".to_string()],
+            origin: Some("repo:/repo/cooldown.toml".to_string()),
         }
     }
 

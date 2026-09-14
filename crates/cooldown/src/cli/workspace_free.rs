@@ -92,6 +92,8 @@ const STARTER_CONFIG: &str = indoc! {r#"
     # exclude-packages = ["xtask"]       # ecosystem-specific package excludes (npm: "@scope/*")
     #                                    # [] clears an inherited list; { replace = [...] } replaces it
     # edge-policy = "preserve"           # lock edge bindings: preserve (default) | canonicalize | none
+    # generated-members = ["workspace-hack"]  # cargo-hakari members: their generated declarations
+    #                                    #   follow upgrades instead of being proposed as upgrades
     #
     # [outdated]
     # major = true                # outdated shows cross-major by default; set false for minor-only

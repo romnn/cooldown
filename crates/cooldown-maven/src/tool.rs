@@ -187,6 +187,7 @@ impl<L: JavaLayout> ToolRead for JavaTool<L> {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("Maven"),
+            honors_generated_members: false,
         }
     }
 
@@ -356,6 +357,7 @@ mod tests {
             kind: Maven::ID,
             manifest: root.join("pom.xml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = JavaTool::<Maven>::from_http(

@@ -159,6 +159,7 @@ impl FakeEco {
             kind: GO,
             manifest: self.root.join("go.mod"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 
@@ -207,6 +208,7 @@ impl IsolatedMutationStrategy for FakeEco {
             manifest: root.join("go.mod"),
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
+            generated_members: source.generated_members.clone(),
         };
         Ok(Box::new(FakeMutationStage {
             scratch,
@@ -316,6 +318,7 @@ impl ToolRead for FakeEco {
             // Lets the advisory conformance tests below exercise the feed; inert for every
             // other test because no other test's policy stack enables `[advisories]`.
             advisory_ecosystem: Some("Go"),
+            honors_generated_members: false,
             ..Default::default()
         }
     }
@@ -645,6 +648,7 @@ impl ToolWrite for FakeEco {
             applied,
             skipped,
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
+            followed_manifests: Vec::new(),
             warnings: p
                 .root
                 .join("warn-on-apply")
@@ -736,6 +740,7 @@ fn workspace_with_layers(fake: FakeEco, baseline: Baseline, layers: Vec<PolicyLa
         },
         edge_policy: EdgePolicy::default(),
         single_copy: Vec::new(),
+        generated_members: None,
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -838,6 +843,7 @@ fn unknown_lock_workspace(fake: FakeEco, baseline: Baseline) -> Workspace {
         },
         edge_policy: EdgePolicy::default(),
         single_copy: Vec::new(),
+        generated_members: None,
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -5086,6 +5092,7 @@ async fn explain_applies_registry_scoped_rule() -> eyre::Result<()> {
         },
         edge_policy: EdgePolicy::default(),
         single_copy: Vec::new(),
+        generated_members: None,
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(
@@ -5138,6 +5145,7 @@ impl RepoScopedFake {
             kind: REPO_TOOL,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 }
@@ -5277,6 +5285,7 @@ async fn sync_repo_scope_writes_once_for_many_projects_and_is_idempotent() -> ey
             },
             edge_policy: EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5346,6 +5355,7 @@ async fn repo_sync_preserves_earlier_recovery_notice_when_later_access_fails() -
             },
             edge_policy: EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5395,6 +5405,7 @@ impl ProjectScopedFake {
             kind: PROJECT_TOOL,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 }
@@ -5509,6 +5520,7 @@ async fn sync_project_scope_writes_native_per_project() -> eyre::Result<()> {
             },
             edge_policy: EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         })
         .collect::<Vec<_>>();
     let mut adapters = AdapterSet::new();
@@ -5564,6 +5576,7 @@ impl HeldConflictFake {
             kind: HELD_TOOL,
             manifest: self.root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 
@@ -5694,6 +5707,7 @@ fn held_conflict_workspace(root: Utf8PathBuf) -> Workspace {
         },
         edge_policy: EdgePolicy::default(),
         single_copy: Vec::new(),
+        generated_members: None,
     };
     let mut adapters = AdapterSet::new();
     std::assert_matches!(

@@ -81,7 +81,10 @@ async fn apply_transaction(
     rewritten: String,
     transaction: &mut SpeculativeLockTransaction,
 ) -> Result<RewriteApplication> {
-    match cargo.verify_locked(&project.root).await {
+    match cargo
+        .verify_locked(&project.root, &project.generated_members)
+        .await
+    {
         Ok(Some(graph)) => {
             transaction.accept()?;
             transaction.commit()?;
@@ -375,7 +378,10 @@ async fn try_candidate(
         return Ok(Err(CandidateFailure::TextMismatch));
     };
     transaction.stage(&candidate_text)?;
-    match cargo.verify_locked(&project.root).await {
+    match cargo
+        .verify_locked(&project.root, &project.generated_members)
+        .await
+    {
         Ok(Some(graph)) => {
             transaction.accept()?;
             Ok(Ok((candidate_text, graph)))
@@ -444,6 +450,7 @@ mod tests {
             kind: ToolId("cargo"),
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let transaction = SpeculativeLockTransaction::begin(&lock_path, "resolver", "candidate")?;
         Ok((directory, project, lock_path, transaction))

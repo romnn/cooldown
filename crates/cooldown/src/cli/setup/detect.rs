@@ -208,6 +208,7 @@ pub(super) fn detect_projects(
                     root: dir,
                     kind: pending.id,
                     exclude_newer: None,
+                    generated_members: cooldown_core::GeneratedMembers::undeclared(),
                 },
             ));
         }

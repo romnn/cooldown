@@ -1256,6 +1256,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             Ok(scoped) => {
                 self.excluded_members = scoped.excluded_members;
+                // The fixpoint re-reads the graph every round; a notice repeats verbatim, so
+                // keep each one once.
+                for notice in scoped.notices {
+                    if !self.acc.warnings.contains(&notice) {
+                        self.acc.warnings.push(notice);
+                    }
+                }
                 scoped.deps
             }
             Err(error) => {
@@ -2082,6 +2089,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             collateral,
             edge_rebinds: report.edge_rebinds,
             warnings: report.warnings,
+            followed_manifests: report.followed_manifests,
             planned_applied,
         }
     }
@@ -2139,15 +2147,25 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             collateral,
             edge_rebinds,
             warnings,
+            followed_manifests,
             planned_applied: _,
         } = report;
         outcome.lock_refreshed = self.ctx.writer.successful_apply_proves_lock_current();
         outcome.mark_committed(committed);
-        outcome.warnings.extend(warnings.into_iter().map(|warning| {
-            warning
-                .with_tool(self.ctx.tool_name())
-                .with_project(self.project_label.clone())
-        }));
+        outcome.warnings.extend(
+            warnings
+                .into_iter()
+                .chain(
+                    followed_manifests
+                        .iter()
+                        .map(|rel| followed_manifest_warning(rel, self.ctx.opts.dry_run)),
+                )
+                .map(|warning| {
+                    warning
+                        .with_tool(self.ctx.tool_name())
+                        .with_project(self.project_label.clone())
+                }),
+        );
         for change in changes {
             let key = change_target_key(change);
             if applied.contains(&key) {
@@ -2958,6 +2976,24 @@ fn push_upgrade_halves(work: &mut Vec<Vec<Change>>, mut changes: Vec<Change>) {
     }
 }
 
+/// The note that a generated manifest's projected requirements followed the batch's moves, so it
+/// no longer matches its generator's output and the user's flow ends with a regeneration.
+///
+/// Like the advisory rollback note, it speaks in the run's mood: a dry run (or `outdated`'s
+/// policy preview) *would* rewrite the projection, a real run *has*.
+fn followed_manifest_warning(rel: &camino::Utf8Path, dry_run: bool) -> Diagnostic {
+    let message = if dry_run {
+        format!(
+            "applying would rewrite generated manifest {rel} so its projected requirements follow the moves; regenerate it afterwards (cargo-hakari: `cargo hakari generate`) and re-lock before committing"
+        )
+    } else {
+        format!(
+            "generated manifest {rel} was rewritten so its projected requirements follow the moves this run landed; it no longer matches its generator's output, so regenerate it (cargo-hakari: `cargo hakari generate`) and re-lock before committing"
+        )
+    };
+    Diagnostic::new(DiagnosticKind::StaleLock, message).with_path(rel.as_str())
+}
+
 fn validate_edge_rebinds(rebinds: &[cooldown_core::EdgeRebind]) -> cooldown_core::Result<()> {
     for rebind in rebinds {
         rebind.validate()?;
@@ -2994,6 +3030,7 @@ fn verify_applied_targets(
         skipped: report.skipped,
         edge_rebinds: report.edge_rebinds,
         warnings: report.warnings,
+        followed_manifests: report.followed_manifests,
     };
 
     for change in report.applied {

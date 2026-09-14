@@ -148,6 +148,7 @@ impl CargoMutationStage {
             manifest: canonical_utf8(&staged_manifest)?,
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
+            generated_members: source.generated_members.clone(),
         };
         let initial = ProjectMutationState::capture(&staged.root, &preimage)?;
         let initial =
@@ -1041,6 +1042,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 

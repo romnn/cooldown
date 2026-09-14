@@ -366,6 +366,7 @@ fn project(
             kind: tool,
             manifest: root.join(manifest),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         },
         rel_path,
         policy: PolicyStack {
@@ -374,6 +375,7 @@ fn project(
         },
         edge_policy: cooldown_core::EdgePolicy::default(),
         single_copy: Vec::new(),
+        generated_members: None,
     }
 }
 

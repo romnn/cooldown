@@ -48,6 +48,16 @@ pub(crate) struct SelectorToml {
     /// un-gate the root's runtimes by listing one name of its own.
     #[serde(rename = "single-copy")]
     pub(crate) single_copy: Option<ExcludeList>,
+    /// The workspace members whose manifests are generated projections of the lock (a
+    /// cargo-hakari workspace-hack), by exact package name: their declarations follow the lock
+    /// and never drive a candidate. Cargo-specific like `edge-policy`: accepted only under
+    /// `[tool.cargo]`.
+    /// Exact names rather than globs, and no merge modes: the nearest file that sets the key
+    /// decides, and every listed name must match a member or the run fails, so a stale entry can
+    /// never quietly stop covering a manifest. An explicit `[]` declares that no member is
+    /// generated (and silences the workspace-hack hint).
+    #[serde(rename = "generated-members")]
+    pub(crate) generated_members: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]

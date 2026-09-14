@@ -241,6 +241,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("PyPI"),
+            honors_generated_members: false,
         }
     }
 
@@ -487,6 +488,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = PyTool::<Pip>::from_http(
@@ -595,6 +597,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let script = pip_config_script(&root, "echo \"global.timeout='60'\"");
@@ -655,6 +658,7 @@ mod tests {
             kind: Poetry::ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_pin(Poetry::ID, "django")];
 
@@ -679,6 +683,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
         let tool = PyTool::<Pip>::from_http(SharedHttp::new(
@@ -729,6 +734,7 @@ mod tests {
             kind: Poetry::ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = PyTool::<Poetry>::from_http(

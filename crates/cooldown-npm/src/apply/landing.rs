@@ -469,6 +469,7 @@ mod tests {
             manifest: root.join("package.json"),
             kind: Npm::ID,
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 
@@ -662,6 +663,7 @@ mod tests {
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok(DeclaredProject {
             guard: dir,
@@ -837,6 +839,7 @@ mod tests {
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut change = change("chalk", "5.6.0", "5.6.2");
         change.members = vec![
@@ -905,6 +908,7 @@ mod tests {
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let change = change("chalk", "5.6.0", "5.6.2");
         let declarations =
@@ -976,6 +980,7 @@ mod tests {
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut change = change("nanoid", "3.1.0", "3.3.0");
         change.members = vec![

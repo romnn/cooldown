@@ -215,6 +215,7 @@ mod tests {
         ResolvedGraph {
             packages: HashMap::new(),
             roots: HashSet::new(),
+            generated_roots: HashSet::new(),
             edges: HashMap::new(),
             exact_pins: HashSet::new(),
             graph_ceilings: HashSet::new(),

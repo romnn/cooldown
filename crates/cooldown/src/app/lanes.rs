@@ -256,6 +256,7 @@ mod tests {
                 root,
                 kind: tool,
                 exclude_newer: None,
+                generated_members: cooldown_core::GeneratedMembers::undeclared(),
             },
             rel_path: Utf8PathBuf::from("."),
             policy: PolicyStack {
@@ -264,6 +265,7 @@ mod tests {
             },
             edge_policy: cooldown_core::EdgePolicy::default(),
             single_copy: Vec::new(),
+            generated_members: None,
         }
     }
 

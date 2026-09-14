@@ -89,6 +89,38 @@ pub struct ProjectConfig {
     /// adds to the root's, so listing one runtime of its own never un-gates the root's, and `[]`
     /// or `{ replace = [...] }` are the explicit ways to drop inherited names.
     pub pnpm_single_copy: Vec<String>,
+    /// The `[tool.cargo] generated-members` declaration from the nearest config document that
+    /// sets it, like the edge policy: a declaration names *this* workspace's members, so a nearer
+    /// file's list — even an empty one — replaces a farther file's rather than adding to it.
+    pub cargo_generated_members: Option<DeclaredGeneratedMembers>,
+}
+
+/// A `[tool.cargo] generated-members` declaration and the config file it came from, so `config`
+/// can show which file narrowed what cooldown proposes and reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredGeneratedMembers {
+    /// The declared member package names; empty is a deliberate "none".
+    pub names: Vec<String>,
+    /// The config layer that set the declaration.
+    pub origin: Origin,
+}
+
+impl DeclaredGeneratedMembers {
+    /// The declaration as the project carries it.
+    #[must_use]
+    pub fn generated_members(&self) -> cooldown_core::GeneratedMembers {
+        cooldown_core::GeneratedMembers::declared(self.names.clone())
+    }
+}
+
+/// The declaration `document` makes at `origin`, if any.
+fn declared_generated_members(
+    document: &ConfigDocument,
+    origin: Origin,
+) -> Option<DeclaredGeneratedMembers> {
+    document
+        .cargo_generated_members()
+        .map(|names| DeclaredGeneratedMembers { names, origin })
 }
 
 impl ConfigSources {
@@ -227,6 +259,10 @@ impl ConfigSources {
             .as_ref()
             .and_then(|config| config.document.pnpm_single_copy())
             .unwrap_or_default();
+        let mut cargo_generated_members = self
+            .global
+            .as_ref()
+            .and_then(|config| declared_generated_members(&config.document, Origin::Global));
         let repo_root_config = repo_root.join(CONFIG_FILE);
         for dir in dirs {
             let path = dir.join(CONFIG_FILE);
@@ -237,6 +273,9 @@ impl ConfigSources {
             };
             if let Some(config) = maybe_doc {
                 cargo_edge_policy = config.document.cargo_edge_policy().or(cargo_edge_policy);
+                cargo_generated_members =
+                    declared_generated_members(&config.document, Origin::Repo(config.path.clone()))
+                        .or(cargo_generated_members);
                 if let Some(layer) = config.document.pnpm_single_copy() {
                     pnpm_single_copy = pnpm_single_copy.merge(layer);
                 }
@@ -248,6 +287,13 @@ impl ConfigSources {
             .as_ref()
             .and_then(|config| config.document.cargo_edge_policy())
             .or(cargo_edge_policy);
+        cargo_generated_members = self
+            .explicit
+            .as_ref()
+            .and_then(|config| {
+                declared_generated_members(&config.document, Origin::Config(config.path.clone()))
+            })
+            .or(cargo_generated_members);
         if let Some(layer) = self
             .explicit
             .as_ref()
@@ -259,6 +305,7 @@ impl ConfigSources {
             policy_layers,
             cargo_edge_policy,
             pnpm_single_copy: pnpm_single_copy.patterns().to_vec(),
+            cargo_generated_members,
         })
     }
 
@@ -409,6 +456,72 @@ mod tests {
                 .expect("inherited config")
                 .cargo_edge_policy,
             Some(EdgePolicy::Preserve)
+        );
+    }
+
+    /// `generated-members` resolves like the edge policy: the nearest declaring file decides,
+    /// an explicit empty list is a decision of its own, and the origin of the decision is kept
+    /// for `config`.
+    #[test]
+    fn cargo_generated_members_resolve_from_the_nearest_declaring_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            indoc! {r#"
+                [tool.cargo]
+                generated-members = ["workspace-hack"]
+            "#},
+        )
+        .expect("root config");
+        let authored = root.join("apps/authored");
+        let inherited = root.join("apps/inherited");
+        std::fs::create_dir_all(&authored).expect("authored project");
+        std::fs::create_dir_all(&inherited).expect("inherited project");
+        std::fs::write(
+            authored.join(CONFIG_FILE),
+            indoc! {r"
+                [tool.cargo]
+                generated-members = []
+            "},
+        )
+        .expect("nested config");
+
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+        assert_eq!(
+            configs
+                .project_config(root, &inherited)
+                .expect("inherited config")
+                .cargo_generated_members,
+            Some(DeclaredGeneratedMembers {
+                names: vec!["workspace-hack".to_string()],
+                origin: Origin::Repo(root.join(CONFIG_FILE)),
+            })
+        );
+        assert_eq!(
+            configs
+                .project_config(root, &authored)
+                .expect("authored config")
+                .cargo_generated_members,
+            Some(DeclaredGeneratedMembers {
+                names: Vec::new(),
+                origin: Origin::Repo(authored.join(CONFIG_FILE)),
+            }),
+            "a nearer empty list replaces the inherited declaration rather than adding to it"
+        );
+
+        let bare = tempfile::tempdir().expect("tempdir");
+        let bare_root = Utf8Path::from_path(bare.path()).expect("utf8 root");
+        std::fs::create_dir(bare_root.join(".git")).expect("git dir");
+        let bare_configs = ConfigSources::load(bare_root, None, true).expect("config sources");
+        assert_eq!(
+            bare_configs
+                .project_config(bare_root, bare_root)
+                .expect("no config")
+                .cargo_generated_members,
+            None,
+            "no file declares the key"
         );
     }
 

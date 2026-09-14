@@ -83,6 +83,7 @@ impl ToolRead for SwiftTool {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("SwiftURL"),
+            honors_generated_members: false,
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
             kind: SWIFT_ID,
             manifest: root.join("Package.swift"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = SwiftTool::from_http(
@@ -305,6 +307,7 @@ mod tests {
             kind: SWIFT_ID,
             manifest: root.join("Package.swift"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = SwiftTool::from_http(

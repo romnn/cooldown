@@ -554,6 +554,35 @@ impl Envelope {
         self.summary_u64("checked")
     }
 
+    /// `summary.direct`: how many of the checked dependencies some workspace member declares.
+    pub fn summary_direct(&self) -> u64 {
+        self.summary_u64("direct")
+    }
+
+    /// The `members[].name` of the first item with this `name` at this `current` version — the
+    /// "Used by" attribution of one row.
+    pub fn item_member_names(&self, name: &str, current: &str) -> Vec<String> {
+        self.items()
+            .iter()
+            .find(|item| {
+                item.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                    && item.get("current").and_then(serde_json::Value::as_str) == Some(current)
+            })
+            .and_then(|item| item.get("members"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|member| member.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The first item as raw JSON, for envelopes whose items are not keyed by a package `name`
+    /// (`config`'s per-project rows).
+    pub fn first_item(&self) -> Option<serde_json::Value> {
+        self.items().first().cloned()
+    }
+
     /// Names of items the mutation actually moved (`applied == true`).
     pub fn applied_names(&self) -> BTreeSet<String> {
         self.filter_names(|item| {

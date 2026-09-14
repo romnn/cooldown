@@ -83,6 +83,7 @@ impl ToolRead for HexTool {
             can_sync: true,
             artifact_granular: false,
             advisory_ecosystem: Some("Hex"),
+            honors_generated_members: false,
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             kind: HEX_ID,
             manifest: root.join("mix.exs"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = HexTool::from_http(

@@ -96,6 +96,7 @@ impl ToolRead for GoTool {
             can_sync: false,
             artifact_granular: false,
             advisory_ecosystem: Some("Go"),
+            honors_generated_members: false,
         }
     }
 

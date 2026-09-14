@@ -179,5 +179,9 @@ pub(super) struct VerifiedBatchReport {
     pub(super) edge_rebinds: Vec<EdgeRebind>,
     /// Adapter warnings whose provenance is valid only if this batch commits.
     pub(super) warnings: Vec<Diagnostic>,
+    /// Generated manifests the adapter rewrote to follow this batch's moves
+    /// ([`ApplyReport::followed_manifests`](cooldown_core::ApplyReport::followed_manifests)),
+    /// each owed a regeneration note once the batch commits.
+    pub(super) followed_manifests: Vec<camino::Utf8PathBuf>,
     pub(super) planned_applied: bool,
 }

@@ -182,7 +182,11 @@ remain `applied`. Corrections are applied as targeted lock edits and re-verified
 `held`, with `to` naming the withheld target; when the resolver also moved that edge, a separate
 `rebound` row records the committed move. If a renamed multi-version or source-qualified lock
 entry moves but cannot be mapped safely to one declared requirement, it is `unaddressable` rather
-than being mislabeled as an ordinary rebound. The JSON summary counts edge activity apart from
+than being mislabeled as an ordinary rebound. A member declared in
+[`generated-members`]({{< relref "../configuration/selectors.md" >}}#toolcargo-generated-members)
+has its requirements rewritten to follow the run's moves, so its own edges moving is that follow
+rather than a rebind: their `rebound`/`unaddressable` observations are not rows (a correction or a
+held attempt on such an edge still is). The JSON summary counts edge activity apart from
 version changes (`edgesCorrected`, `edgesRebound`, `edgesHeld`, and `edgesUnaddressable`); each edge row's `applied`
 says whether its binding outcome is present in the committed lock, while top-level `applied` says
 whether cooldown wrote a mutation. Either `held` or `unaddressable` fails a `--strict` run because

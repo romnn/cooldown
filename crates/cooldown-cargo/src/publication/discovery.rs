@@ -103,6 +103,7 @@ fn validate_attributed_anchor(
         manifest: project_root.join("Cargo.toml"),
         kind: crate::CARGO_ID,
         exclude_newer: None,
+        generated_members: cooldown_core::GeneratedMembers::undeclared(),
     };
     let project_coordination =
         cooldown_core::fs::ProjectCoordination::resolve_existing(project_root)?;

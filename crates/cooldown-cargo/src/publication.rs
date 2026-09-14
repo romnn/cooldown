@@ -64,6 +64,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 

@@ -248,6 +248,7 @@ impl Workspace {
                         policy: pctx.policy.clone(),
                         edge_policy: pctx.edge_policy,
                         single_copy: pctx.single_copy.clone(),
+                        generated_members: pctx.generated_members.clone(),
                     };
                     let (scratch, ancestor) = copy.relabel_roots();
                     dry_roots = Some((scratch.to_owned(), ancestor.to_owned()));
@@ -358,6 +359,7 @@ impl Workspace {
             policy: pctx.policy.clone(),
             edge_policy: pctx.edge_policy,
             single_copy: pctx.single_copy.clone(),
+            generated_members: pctx.generated_members.clone(),
         };
         let mut preview_opts = opts.clone();
         preview_opts.build = false;
@@ -445,6 +447,7 @@ impl Workspace {
             policy: pctx.policy.clone(),
             edge_policy: pctx.edge_policy,
             single_copy: pctx.single_copy.clone(),
+            generated_members: pctx.generated_members.clone(),
         };
         let mut trial_opts = opts.clone();
         trial_opts.build = false;

@@ -51,6 +51,7 @@ pub(crate) async fn enforce(
     policy: EdgePolicy,
     before: Option<&CargoLock>,
     graph: Option<ResolvedGraph>,
+    generated: &[super::LockPackageId],
 ) -> Result<EnforcementResult> {
     let lock_path = project.root.join("Cargo.lock");
     let resolver_text = std::fs::read_to_string(&lock_path)?;
@@ -141,10 +142,34 @@ pub(crate) async fn enforce(
             .map(|(rewrite, reason)| BindingOutcome::Withheld { rewrite, reason }),
     );
 
-    Ok(EnforcementResult {
-        rebinds: outcomes.into_iter().map(outcome_row).collect(),
-        graph,
-    })
+    let mut rebinds: Vec<EdgeRebind> = outcomes.into_iter().map(outcome_row).collect();
+    drop_generated_follows(&mut rebinds, generated);
+    Ok(EnforcementResult { rebinds, graph })
+}
+
+/// Drops the observed moves of a generated member's own edges: its requirements are rewritten
+/// to follow the moves the run lands, so its edge moving *is* the follow — one row per followed
+/// crate would restate the regeneration note the report already carries. A generated
+/// requirement names one line, so its edge never has two coexisting versions to be rebound
+/// between; a correction or a held attempt on it is still reported, since the policy acted.
+/// Matched on the member's full lock identity, since a source-less dependent can also be an
+/// external path package that merely shares the name.
+fn drop_generated_follows(rebinds: &mut Vec<EdgeRebind>, generated: &[super::LockPackageId]) {
+    if generated.is_empty() {
+        return;
+    }
+    rebinds.retain(|rebind| {
+        let observed = matches!(
+            rebind.action,
+            EdgeBindingAction::Rebound | EdgeBindingAction::Unaddressable
+        );
+        let dependent = super::LockPackageId::new(
+            &rebind.dependent,
+            rebind.dependent_version.as_str(),
+            rebind.dependent_source.as_deref(),
+        );
+        !(observed && generated.contains(&dependent))
+    });
 }
 
 /// Folds each residual binding change whose edge also carries a withheld correction into a single
@@ -409,6 +434,93 @@ mod tests {
     use super::super::tests::{path_key, view};
     use super::*;
     use indoc::indoc;
+
+    fn generated_row(
+        dependent: &str,
+        source: Option<&str>,
+        action: EdgeBindingAction,
+    ) -> EdgeRebind {
+        generated_row_at(dependent, "0.1.0", source, action)
+    }
+
+    fn generated_row_at(
+        dependent: &str,
+        version: &str,
+        source: Option<&str>,
+        action: EdgeBindingAction,
+    ) -> EdgeRebind {
+        EdgeRebind {
+            dependent: dependent.to_string(),
+            dependent_version: Version::new(version),
+            dependent_source: source.map(str::to_string),
+            dependency: PackageId::new(
+                crate::CARGO_ID,
+                "nom",
+                Some(crate::index::CRATES_IO.to_string()),
+            ),
+            from: Version::new("7.1.3"),
+            to: Version::new("8.0.0"),
+            action,
+            detail: matches!(
+                action,
+                EdgeBindingAction::Held | EdgeBindingAction::Unaddressable
+            )
+            .then(|| "detail".to_string()),
+        }
+    }
+
+    /// A generated member's edge moving is the follow the run performed, not a rebind to
+    /// report; a source-less namesake at another version (an external path package), a namesake
+    /// registry crate, an authored member, and a correction or held attempt on the generated
+    /// member's edge are all still rows.
+    #[test]
+    fn generated_member_follows_are_not_rebind_rows() {
+        let generated = vec![super::super::LockPackageId::new(
+            "workspace-hack",
+            "0.1.0",
+            None::<&str>,
+        )];
+        let mut rows = vec![
+            generated_row_at("workspace-hack", "0.2.0", None, EdgeBindingAction::Rebound),
+            generated_row("workspace-hack", None, EdgeBindingAction::Rebound),
+            generated_row("workspace-hack", None, EdgeBindingAction::Unaddressable),
+            generated_row("workspace-hack", None, EdgeBindingAction::Restored),
+            generated_row("workspace-hack", None, EdgeBindingAction::Held),
+            generated_row(
+                "workspace-hack",
+                Some(crate::lockfile::CRATES_IO_SOURCE),
+                EdgeBindingAction::Rebound,
+            ),
+            generated_row("app", None, EdgeBindingAction::Rebound),
+        ];
+        drop_generated_follows(&mut rows, &generated);
+        let kept: Vec<(&str, EdgeBindingAction)> = rows
+            .iter()
+            .map(|row| (row.dependent.as_str(), row.action))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("workspace-hack", EdgeBindingAction::Rebound),
+                ("workspace-hack", EdgeBindingAction::Restored),
+                ("workspace-hack", EdgeBindingAction::Held),
+                ("workspace-hack", EdgeBindingAction::Rebound),
+                ("app", EdgeBindingAction::Rebound),
+            ]
+        );
+
+        let mut undeclared = vec![generated_row(
+            "workspace-hack",
+            None,
+            EdgeBindingAction::Rebound,
+        )];
+        drop_generated_follows(&mut undeclared, &[]);
+        assert_eq!(
+            undeclared.len(),
+            1,
+            "without a declaration every row stands"
+        );
+    }
 
     const AMBIGUOUS_LOCK: &str = indoc! {r#"
         version = 4

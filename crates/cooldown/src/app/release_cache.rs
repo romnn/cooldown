@@ -472,6 +472,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: camino::Utf8PathBuf::from(root),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
 

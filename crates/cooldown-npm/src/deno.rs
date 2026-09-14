@@ -430,6 +430,7 @@ impl ToolRead for DenoTool {
             // `npm` ecosystem could alias onto unrelated npm packages, so the feed stays inert
             // here rather than half-right.
             advisory_ecosystem: None,
+            honors_generated_members: false,
         }
     }
 
@@ -666,6 +667,7 @@ mod tests {
             kind: DENO_ID,
             manifest: root.join("deno.json"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         let mut direct = DenoTool::read_deps(&project, DepScope::Direct).expect("direct");

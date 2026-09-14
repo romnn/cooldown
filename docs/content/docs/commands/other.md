@@ -76,6 +76,8 @@ Where `explain` answers "why this one package," `config` answers "what is the ef
 
 Each project also reports its resolved [`[advisories]`]({{< relref "../configuration/advisories.md" >}}) policy and the advisory-database ecosystem covering its tool — the place to look when an enabled feed annotates nothing. Mixed-registry tools such as conda, pixi, and Deno currently have no single project-wide ecosystem mapping, even though individual PyPI or npm packages in their locks may be covered by OSV.
 
+A cargo project also reports its [`generated-members`]({{< relref "../configuration/selectors.md" >}}#toolcargo-generated-members) declaration — the workspace-hack members whose declarations follow the lock rather than drive candidates — and the config file that declared it (`--json`: `generatedMembers`), or that nothing declares the key, so an audit can see whether the run's scope was narrowed and by which file.
+
 ## `init`
 
 Scaffold a documented starter `cooldown.toml`:

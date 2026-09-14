@@ -211,6 +211,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             artifact_granular: false,
             // Conda and PyPI packages share this graph, so no single OSV ecosystem is safe.
             advisory_ecosystem: None,
+            honors_generated_members: false,
         }
     }
 
@@ -390,6 +391,7 @@ mod tests {
             kind: ToolId("pixi"),
             manifest: root.join(lock),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
         assert_eq!(
@@ -443,6 +445,7 @@ mod tests {
             kind: Pixi::ID,
             manifest: root.join("pixi.lock"),
             exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
         let tool = CondaEnvTool::<Pixi>::from_http(

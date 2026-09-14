@@ -49,6 +49,10 @@ pub struct Capabilities {
     /// then inert there, and any run with the feed enabled says so with an
     /// `advisory_ecosystem_unsupported` warning rather than pretending coverage.
     pub advisory_ecosystem: Option<&'static str>,
+    /// The adapter honors [`Project::generated_members`]: a declared generated member's
+    /// declarations follow the lock rather than drive candidates (cargo, for a cargo-hakari
+    /// workspace-hack). `config` reports the declaration only where it is honored.
+    pub honors_generated_members: bool,
 }
 
 /// The run's clock — the single source of the evaluation instant ("now").
@@ -200,6 +204,26 @@ pub trait ToolRead: Send + Sync {
     ///
     /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
+
+    /// Non-fatal observations about `project`'s manifests that a reporting command surfaces as
+    /// warnings beside the rows [`dependencies`](Self::dependencies) returned — never anything
+    /// that changes a row, a candidate, or a gate.
+    ///
+    /// The orchestrator calls this once per project read, right after `dependencies`, so an
+    /// adapter may answer from what that read already established (cargo memoizes its
+    /// generated-member facts per project root) rather than re-reading the graph.
+    /// Cargo reports a member whose manifest carries a workspace-hack marker while the project
+    /// declares no `[tool.cargo] generated-members`, and a declared generated member whose
+    /// projection has gone stale — the hints [`Project::generated_members`] exists to make
+    /// unnecessary. The default is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the manifests or graph the observations
+    /// need cannot be read.
+    async fn manifest_notices(&self, _project: &Project) -> Result<Vec<crate::Diagnostic>> {
+        Ok(Vec::new())
+    }
 
     /// Every workspace member's declaration of `name`, for `explain`: the declared range, the
     /// version the member's own lock entry resolves to, and the manifest fields naming it —

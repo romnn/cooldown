@@ -4,8 +4,8 @@
 //! of each value. Together they keep the override system from being a black box.
 
 use super::{
-    ConfigItem, ConfigSummary, EffectiveInfo, Exit, ExplainMeta, ExplainStep, ProjectCtx, RunOpts,
-    Workspace, round2,
+    ConfigItem, ConfigSummary, EffectiveInfo, Exit, ExplainMeta, ExplainStep, GeneratedMembersInfo,
+    ProjectCtx, RunOpts, Workspace, round2,
 };
 use cooldown_core::{Declaration, DepScope, Diagnostic, ResolveKind, ResolveQuery, resolve};
 
@@ -200,6 +200,7 @@ impl<'a> ExplainService<'a> {
                 strict_native: pctx.policy.strict_native,
                 layers,
                 advisories: self.advisory_config(pctx),
+                generated_members: self.generated_members_config(pctx),
             });
         }
 
@@ -210,6 +211,29 @@ impl<'a> ExplainService<'a> {
             items,
             exit: Exit::Ok,
         }
+    }
+
+    /// The `generated-members` declaration and its origin, for a project whose tool honors it;
+    /// `None` for every other tool, where the key is not even accepted.
+    ///
+    /// Reported even when nothing is declared: a declaration narrows what the run proposes and
+    /// reports, so an audit must be able to see from `config` alone whether scope was narrowed
+    /// and which file did it.
+    fn generated_members_config(&self, pctx: &ProjectCtx) -> Option<GeneratedMembersInfo> {
+        let honored = self
+            .ws
+            .adapter(pctx.tool)
+            .is_some_and(|adapter| adapter.capabilities().honors_generated_members);
+        honored.then(|| match &pctx.generated_members {
+            Some(declared) => GeneratedMembersInfo {
+                names: declared.names.clone(),
+                origin: Some(declared.origin.token()),
+            },
+            None => GeneratedMembersInfo {
+                names: Vec::new(),
+                origin: None,
+            },
+        })
     }
 
     /// The resolved `[advisories]` policy plus the project tool's feed coverage.
