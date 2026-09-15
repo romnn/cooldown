@@ -9,7 +9,7 @@ use super::read::ReadProjectCtx;
 use super::{
     CheckItem, CheckMeta, CheckStatus, CheckSummary, Exit, FetchedRelease, LockReportAction,
     ProjectProgress, RunOpts, TransitiveGate, Window, Workspace, age_days, diag_from_error,
-    lock_report_outcome, render_window,
+    lock_report_outcome, render_window, stale_evaluation_skipped,
 };
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, Origin, Resolution,
@@ -578,13 +578,6 @@ fn finalize_check(opts: &RunOpts, mut acc: CheckAccum) -> CheckOutcome {
         errors: acc.errors,
         exit,
     }
-}
-
-fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
-    diagnostic
-        .message
-        .push_str("; dependency evaluation was skipped for this project");
-    diagnostic
 }
 
 /// Map the tallies to the fail-closed exit code: errors/unknown-age first, then a tripped

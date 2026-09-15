@@ -96,10 +96,15 @@ impl CargoMutationStage {
         let metadata = cargo
             .staging_metadata(&source.root)
             .await
-            .map_err(|error| {
-                isolation_error(format!(
+            .map_err(|error| match error {
+                // A lock that is stale or absent is not an isolation failure: nothing about the
+                // filesystem is wrong, the resolve simply does not exist yet, and the remedy is
+                // the lock. Passing it through keeps the `stale_lock` kind (and its
+                // `--allow-stale-lock` contract) the same in `upgrade`/`fix` as in `check`.
+                error @ CoreError::StaleLock(_) => error,
+                error => isolation_error(format!(
                     "Cargo could not describe the locked source topology: {error}"
-                ))
+                )),
             })?;
         let layout = StagingLayout::new(source, metadata.clone())?;
         let source_files = layout.source_files()?;
@@ -703,16 +708,14 @@ fn cargo_registry_index_variable(key: &OsStr) -> bool {
     })
 }
 
+/// Rejects a project whose Cargo configuration moves the lock away from the workspace root.
+///
+/// Every read and every mutation of a project calls this, so a `resolver.lockfile-path` project is
+/// refused per project at run time. Detection cannot refuse it any earlier: the marker is the
+/// manifest, and whether a project's configuration is supported is a property of the project, not
+/// of the scan that found it.
 pub(crate) fn reject_custom_lockfile(workspace: &Utf8Path) -> Result<()> {
     reject_custom_lockfile_roots(&[workspace])
-}
-
-pub(crate) fn reject_custom_lockfiles(workspaces: &[Utf8PathBuf]) -> Result<()> {
-    let workspaces = workspaces
-        .iter()
-        .map(Utf8PathBuf::as_path)
-        .collect::<Vec<_>>();
-    reject_custom_lockfile_roots(&workspaces)
 }
 
 fn reject_custom_lockfile_roots(workspaces: &[&Utf8Path]) -> Result<()> {
@@ -783,11 +786,11 @@ fn foreign_workspace_roots(
         if package.starts_with(source_root) {
             continue;
         }
-        if crate::manifest::declares_workspace(&package.join("Cargo.toml")) {
+        if crate::ownership::declares_workspace(&package.join("Cargo.toml")) {
             continue;
         }
         for ancestor in package.ancestors().skip(1) {
-            if crate::manifest::declares_workspace(&ancestor.join("Cargo.toml")) {
+            if crate::ownership::declares_workspace(&ancestor.join("Cargo.toml")) {
                 roots.insert(ancestor.to_owned());
                 break;
             }
@@ -1248,30 +1251,6 @@ mod tests {
             .err()
             .ok_or_else(|| eyre::eyre!("included Cargo configuration was accepted"))?;
         assert!(error.to_string().contains("uses `include`"));
-        Ok(())
-    }
-
-    #[test]
-    fn batched_custom_lockfile_audit_checks_shared_configuration() -> eyre::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let root = canonical_root(&directory)?.join("repository");
-        let first = root.join("crates/first");
-        let second = root.join("crates/second");
-        write(&first.join("Cargo.toml"), "[workspace]\n")?;
-        write(&second.join("Cargo.toml"), "[workspace]\n")?;
-        write(
-            &root.join(".cargo/config.toml"),
-            indoc! {r#"
-                [resolver]
-                lockfile-path = "state/Cargo.lock"
-            "#},
-        )?;
-
-        let error = reject_custom_lockfiles(&[first, second])
-            .err()
-            .ok_or_else(|| eyre::eyre!("shared custom-lock configuration was accepted"))?;
-
-        assert!(error.to_string().contains("resolver.lockfile-path"));
         Ok(())
     }
 

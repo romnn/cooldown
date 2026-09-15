@@ -100,15 +100,15 @@ impl ToolRead for GoTool {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
         // Go multi-module repos nest independent modules, so every `go.mod` is its own project
         // (not a workspace root).
-        cooldown_core::ProjectDetection::Primary(ProjectMarker {
-            lockfile: "go.mod",
+        ProjectMarker {
+            marker: "go.mod",
             manifest: "go.mod",
             alternate_manifests: &[],
             workspace_root: false,
-        })
+        }
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {

@@ -371,14 +371,14 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
         // The lockfile sits at the workspace root; nested `package.json`s share it (no nested lock).
-        cooldown_core::ProjectDetection::Primary(ProjectMarker {
-            lockfile: L::LOCKFILE,
+        ProjectMarker {
+            marker: L::LOCKFILE,
             manifest: "package.json",
             alternate_manifests: &[],
             workspace_root: true,
-        })
+        }
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {

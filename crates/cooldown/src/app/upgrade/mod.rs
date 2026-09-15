@@ -431,12 +431,7 @@ impl Workspace {
         let trial = match strategy.prepare(&pctx.project, guard.coordination()).await {
             Ok(trial) => trial,
             Err(error) => {
-                acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    pctx.rel_path.as_str(),
-                    None,
-                ));
+                record_pre_mutation_failure(acc, &error, pctx, opts);
                 return;
             }
         };
@@ -809,6 +804,29 @@ fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
     .with_tool(pctx.tool.as_str())
     .with_project(pctx.rel_path.as_str())
     .with_path(pctx.project.manifest.as_str())
+}
+
+/// Records a failure raised for one project before anything about it was staged or written.
+///
+/// `--allow-stale-lock` is documented as downgrading a stale or absent lock from a failure to a
+/// warning, and nothing has been touched at this point, so honouring it here is exactly the skip
+/// the flag promises: the project contributes a warning and no rows, and the run's exit is decided
+/// by the projects it could evaluate. Every other failure stays an error, and so does the same lock
+/// met later — once a trial is under way the project's state is in play and a silent skip would
+/// hide it.
+fn record_pre_mutation_failure(
+    acc: &mut UpgradeAccum,
+    error: &cooldown_core::CoreError,
+    pctx: &super::ProjectCtx,
+    opts: &RunOpts,
+) {
+    let diagnostic = diag_from_error(error, pctx.tool, pctx.rel_path.as_str(), None);
+    if opts.allow_stale_lock && matches!(error, cooldown_core::CoreError::StaleLock(_)) {
+        acc.warnings
+            .push(super::stale_evaluation_skipped(diagnostic));
+    } else {
+        acc.errors.push(diagnostic);
+    }
 }
 
 /// Distills the accumulated per-project state into the final report: dedupes and sorts the rows,

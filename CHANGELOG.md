@@ -2,6 +2,79 @@
 
 ## Unreleased
 
+- **A Cargo project with no `Cargo.lock` no longer escapes the gate.** Detection keyed on
+  `Cargo.lock`, so a `Cargo.toml` without one was either not a project at all (`no supported tool
+  detected`, exit 3) or — nested under a detected root — silently assumed to belong to it, and
+  `check` reported green over dependencies that were never evaluated. The confirmed case is a
+  workspace whose `fuzz/` crate declares its own `[workspace]` and gitignores its lock, as
+  cargo-fuzz does: a crate with no lock resolves to the newest release of everything at build time,
+  which is precisely what cooldown exists to prevent. The marker is now `Cargo.toml`, and which
+  `Cargo.toml` is a project of its own is decided by cargo's own ownership rules
+  (`Workspace::find_root`, plus the `path`-dependency closure) rather than by where a lock happens
+  to sit. A nested manifest is a project of its own unless the resolve of a project the run
+  evaluates already covers it, computed from those projects outward: a workspace resolves its
+  members — the directories its `members` globs match, the root package when the root manifest
+  declares `[package]`, and the in-workspace `path` dependencies those pull in, which cargo makes
+  members too, whether they lie inside the workspace directory or outside it with their own
+  `package.workspace` pointing back at this root, minus whatever `exclude` names unless `members`
+  names it as well — and then every `path` dependency those members reach, through
+  `[dependencies]`, `[build-dependencies]`, and the `[target.<cfg>.…]` forms. A `members` entry
+  spelled `./a` or `a/` means the directory `a`, and a member's `dep = { workspace = true }`
+  resolves through the root's `[workspace.dependencies]`. Two kinds of edge stop at the members.
+  `[dev-dependencies]` count for members only, since cargo locks its members with dev units enabled
+  but activates everything beyond them as an ordinary dependency with dev-dependencies off, so a
+  crate reachable only as a reached package's dev path dependency is in nobody's lock and is a
+  project of its own. An `optional` path dependency of a reached package is not followed either —
+  that one is cooldown's own rule, not cargo's: the edge is skipped whether or not a feature
+  enables it, because only the resolve knows which features are on, so such a crate is gated on its
+  own lock (reporting a missing one rather than passing silently) or dropped with
+  `exclude-folders`. (The mirror is a known limit: a non-member's own `[dev-dependencies]` are in
+  nobody's lock either, and cooldown gates the crate through the project that resolves it rather
+  than gating what only its standalone test build would fetch.)
+  A plain `[package]` is the single member of its own implicit workspace and resolves the same
+  closure. Only projects the run actually evaluates can cover anything: a workspace that was
+  pruned, ignored, or never scanned covers nothing. A manifest
+  declaring `[workspace]` is always a project, since cargo forbids a workspace root from being
+  another workspace's member; a manifest an enclosing root neither lists nor `exclude`s stays with
+  that workspace instead, because cargo refuses to build such a crate standalone and nothing else
+  resolves it, which is exactly where fixture crates commonly sit; and a `package.workspace`
+  pointer at a root that does not list it is a project of its own rather than a silent member.
+  Below a detected project a vendored crate (`cargo vendor` output, marked by
+  `.cargo-checksum.json`) and `cargo package`'s unpacked output under `target/package` are never
+  projects: cargo loads neither as a package of the surrounding build. `-C`/`--dir` follows the
+  same rule: pointing the run at a directory another project resolves now runs that project,
+  wherever its root sits, instead of the project that merely encloses the directory — which could
+  read a lock saying nothing about it.
+
+  Two green-to-red transitions follow, both deliberate. A repository whose only Cargo project
+  gitignores its lock now fails with exit 4 and a `stale_lock` error where it previously said `no
+  supported tool detected` (exit 3), and one that also holds a non-Cargo project now fails where it
+  previously passed. And a crate the enclosing workspace `exclude`s is a project now whether or not
+  it has a lock — the ownership rule decides detection, not the lock — so an excluded fixture,
+  example, or fuzz crate that *does* have one is gated for the first time and can surface
+  violations in a repository that was green yesterday. The `stale_lock` error names the project and
+  the remedy: run `cargo generate-lockfile` there and commit the lock, then `cooldown fix` to mature
+  the fresh resolve, since a lock generated from scratch resolves everything to its newest release
+  — or drop the directory with `exclude-folders` if the crate is never built. `check --lock` and
+  `outdated --lock` generate the missing lock in place. `--allow-stale-lock` downgrades the failure
+  to a warning saying the project went unevaluated, and now does so on `upgrade` and `fix` too:
+  before, those still failed on a lock met before any mutation, contradicting the flag's own
+  documented promise. `baseline` still fails on it, since skipping a project there would let
+  `--prune` drop that project's acknowledgements.
+
+  For adapter authors: `ToolRead::nested_lockfile_root_escapes` became
+  `ToolRead::nested_ownership(primary: &[Utf8PathBuf], nested: &[Utf8PathBuf]) ->
+  Vec<NestedOwnership>` — handed both sides of the scan so it can only answer from projects that
+  exist, batched so an adapter can memoize its manifest loads across a whole workspace's members,
+  and answering `Enclosing` / `Standalone` / `Root(path)`, where the named path must be one of
+  `primary` or a directory the same batch answered `Standalone`. `ProjectDetection` collapsed into `ProjectMarker`
+  (`ToolRead::project_marker`, field `marker` rather than `lockfile`), and
+  `validate_manifests_without_lock` is gone — a `resolver.lockfile-path` project is still rejected,
+  now per project at run time rather than at detect time. Left for later: bundler, hex, and swift
+  have the same shape (an unambiguous manifest without its lock is silently not a project); the
+  npm-family and pyproject-based tools cannot, since a lockless `package.json` or `pyproject.toml`
+  does not say which tool owns it.
+
 ## v0.0.21
 
 - **A cargo-hakari workspace-hack follows upgrades instead of being one.** A workspace-hack's

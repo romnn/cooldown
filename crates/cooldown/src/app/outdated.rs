@@ -9,7 +9,7 @@ use super::read::ReadProjectCtx;
 use super::upgrade::PreviewEvidence;
 use super::{
     Exit, FetchedRelease, LockReportAction, ProjectProgress, RunOpts, Workspace, age_days,
-    diag_from_error, lock_report_outcome, render_window,
+    diag_from_error, lock_report_outcome, render_window, stale_evaluation_skipped,
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
 use cooldown_core::{
@@ -961,13 +961,6 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
         }
     }
     s
-}
-
-fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
-    diagnostic
-        .message
-        .push_str("; dependency evaluation was skipped for this project");
-    diagnostic
 }
 
 #[cfg(test)]

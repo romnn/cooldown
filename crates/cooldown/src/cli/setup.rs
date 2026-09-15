@@ -128,7 +128,7 @@ pub(crate) async fn prepare_run(
         adopting && invocation.respect_dist_tags(),
     )?;
     let selected_dir = scope.selected_dir();
-    let projects = detect::detect_projects(
+    let detected = detect::detect_projects(
         &adapters,
         &scan_root,
         selected_dir.as_deref(),
@@ -137,6 +137,7 @@ pub(crate) async fn prepare_run(
         invocation.tools(),
         invocation.respect_gitignore(),
     )?;
+    let projects = detected.projects;
     invocation
         .progress()
         .phase(format!("loading policy for {} projects", projects.len()));
@@ -180,7 +181,10 @@ pub(crate) async fn prepare_run(
     // modes).
     // Wiring it unconditionally is harmless: nothing is fetched unless a project's
     // `[advisories]` policy enables the feed.
-    .with_advisory_source(std::sync::Arc::new(cooldown_registry::OsvSource::new(http)));
+    .with_advisory_source(std::sync::Arc::new(cooldown_registry::OsvSource::new(http)))
+    // A `-C` into a directory another project resolves has to run that project, so selection
+    // needs to know which directories those are and which project holds each one's lock.
+    .with_covered_dirs(detected.covered);
     let mut opts = invocation.into_run_opts();
     opts.scope = scope;
     // The scan-exclude globs also filter workspace-member dependencies (folders by member

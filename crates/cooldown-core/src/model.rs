@@ -1198,15 +1198,17 @@ pub enum CandidateScope {
     AllowCrossMajor,
 }
 
-/// The primary filesystem markers that directly identify a tool's project root.
+/// The filesystem marker that identifies a tool's project roots.
 ///
-/// Adapters carry this inside [`ProjectDetection`] rather than scanning themselves.
+/// Adapters declare this rather than scanning themselves.
 /// The orchestrator owns gitignore-aware and exclude-aware traversal, so an adapter cannot bypass
 /// shared detection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectMarker {
-    /// The lock/manifest filename whose presence marks a project root (e.g. `"Cargo.lock"`).
-    pub lockfile: &'static str,
+    /// The filename whose presence in a directory marks a project root (`Cargo.toml`, `uv.lock`,
+    /// `go.mod`). A lock for the tools whose lock is the unambiguous root evidence, a manifest for
+    /// the tools (cargo, go) whose manifest is.
+    pub marker: &'static str,
     /// The primary manifest filename recorded on the detected [`Project`] (e.g. `"Cargo.toml"`).
     pub manifest: &'static str,
     /// Alternate manifest names for tools that accept more than one root config filename.
@@ -1214,47 +1216,29 @@ pub struct ProjectMarker {
     /// When `true`, a marked root's descendants are not also reported — a workspace root already
     /// owns its members (Cargo/uv). When `false`, every match is its own project (Go multi-module).
     /// A dropped descendant gets one appeal: the adapter's
-    /// [`nested_lockfile_root_escapes`](crate::ToolRead::nested_lockfile_root_escapes) can
-    /// recognize it as a workspace root of its own that the enclosing workspace only excludes.
+    /// [`nested_ownership`](crate::ToolRead::nested_ownership) can recognize it as a root of its
+    /// own that the enclosing workspace does not own.
     pub workspace_root: bool,
 }
 
-/// The complete filesystem-marker specification for one adapter's project discovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectDetection {
-    /// A primary marker directly identifies every project root.
-    Primary(ProjectMarker),
-    /// A second marker identifies roots that must be validated but not automatically accepted.
-    PrimaryWithValidation {
-        /// The marker that directly identifies project roots.
-        primary: ProjectMarker,
-        /// The validation-only filename inspected during the same repository traversal.
-        validation_marker: &'static str,
-    },
-}
-
-impl ProjectDetection {
-    /// Returns the primary marker that directly identifies project roots.
-    #[must_use]
-    pub fn primary(self) -> ProjectMarker {
-        match self {
-            ProjectDetection::Primary(marker)
-            | ProjectDetection::PrimaryWithValidation {
-                primary: marker, ..
-            } => marker,
-        }
-    }
-
-    /// Returns the optional validation-only marker scanned alongside the primary marker.
-    #[must_use]
-    pub fn validation_marker(self) -> Option<&'static str> {
-        match self {
-            ProjectDetection::Primary(_) => None,
-            ProjectDetection::PrimaryWithValidation {
-                validation_marker, ..
-            } => Some(validation_marker),
-        }
-    }
+/// How a nested marked directory relates to the roots above it, as the adapter reads it.
+///
+/// The adapter reports what the tool's own rules say about the directory; it never decides whether
+/// the run may act on that. Which answers become projects is the orchestrator's call, because only
+/// it knows the scan's bounds (see [`nested_ownership`](crate::ToolRead::nested_ownership)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedOwnership {
+    /// Nothing resolves it, but it is not a project either: the enclosing root takes it in without
+    /// listing it, so the tool cannot build it on its own. Also the default for an adapter that
+    /// does not implement the hook, which keeps the topmost-only rule's assumption.
+    Enclosing,
+    /// No project resolves it: it resolves its own lock and is a project of its own.
+    Standalone,
+    /// The project at this directory resolves it — the workspace it belongs to, or a package whose
+    /// path dependencies reach it. The named directory is one this run evaluates: either a root the
+    /// orchestrator already detected, or a directory answered [`Standalone`](Self::Standalone) in
+    /// the same batch.
+    Root(Utf8PathBuf),
 }
 
 /// The context an adapter needs to fetch releases and locked metadata for the right artifacts.

@@ -613,8 +613,33 @@ fn member_location(pctx: &ProjectCtx, member: &cooldown_core::MemberRef) -> Utf8
     if is_root_member(path) {
         project.to_owned()
     } else {
-        project.join(path)
+        normalize_location(&project.join(path))
     }
+}
+
+/// A scan-root-relative location with `.` and `..` resolved lexically.
+///
+/// A workspace may list a member outside its own directory (`members = ["../bridge"]`), and the
+/// member path is reported verbatim, so the joined location reads `owner/../bridge`. Everything
+/// downstream compares it lexically — against the selection, against the folder globs — so it has
+/// to be lexically true first. A `..` with nothing left to cancel is kept: the member then really
+/// does lie above the scan root, and matching nothing is the honest answer.
+fn normalize_location(path: &Utf8Path) -> Utf8PathBuf {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in path.components() {
+        match component {
+            camino::Utf8Component::CurDir => {}
+            camino::Utf8Component::ParentDir => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other.as_str()),
+        }
+    }
+    parts.into_iter().collect()
 }
 
 /// A project's location relative to the scan root, the empty path for the root itself (see
@@ -684,6 +709,21 @@ fn empty_project_selection_diagnostic(
     )
 }
 
+/// A marked directory some detected project's resolve covers, so it is not a project of its own.
+///
+/// Detection records these so a selection can be resolved against them: `-C` into a directory a
+/// project resolves must run *that* project, even when its root lies elsewhere entirely — a
+/// workspace may list a member that is not below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveredDir {
+    /// The tool whose detection produced the answer.
+    pub tool: ToolId,
+    /// The covered directory.
+    pub dir: Utf8PathBuf,
+    /// The root of the project whose resolve covers it.
+    pub root: Utf8PathBuf,
+}
+
 /// The detected adapters, per-project policy, and the run's single `now`.
 pub struct Workspace {
     adapters: AdapterSet,
@@ -705,6 +745,10 @@ pub struct Workspace {
     ///
     /// `None` keeps the feature inert — tests and embedded callers need not care.
     pub(crate) advisory_source: Option<Arc<dyn cooldown_core::AdvisorySource>>,
+    /// The marked directories detection found covered, and by which project (see
+    /// [`Workspace::with_covered_dirs`]). Empty unless detection supplied them, which only makes a
+    /// `-C` into such a directory fall back to the older enclosing-project behaviour.
+    covered: Vec<CoveredDir>,
 }
 
 struct RegisteredAdapter {
@@ -863,7 +907,18 @@ impl Workspace {
             baseline,
             release_cache: Box::new(ReleaseCache::new()),
             advisory_source: None,
+            covered: Vec::new(),
         }
+    }
+
+    /// Records which marked directories a detected project's resolve covers.
+    ///
+    /// Selection reads this: a directory another project resolves belongs to that project, so
+    /// pointing the run at it must run that project rather than whatever happens to enclose it.
+    #[must_use]
+    pub fn with_covered_dirs(mut self, covered: Vec<CoveredDir>) -> Self {
+        self.covered = covered;
+        self
     }
 
     /// Wires an advisory feed into the run.
@@ -1060,8 +1115,8 @@ impl Workspace {
             .filter(move |project| self.project_in_selection(project, opts))
     }
 
-    /// Whether `pctx` is in the selection: at or below the selected directory, or the nearest
-    /// project of its tool containing it.
+    /// Whether `pctx` is in the selection: at or below the selected directory, the project whose
+    /// resolve covers it, or the nearest project of its tool containing it.
     /// A farther containing project of the same tool cannot own the selection — a nested
     /// workspace root is never a member of the one above it — so it stays out, and neither a
     /// read nor a `--lock` refresh touches it.
@@ -1071,16 +1126,54 @@ impl Workspace {
         let Some(selected) = opts.scope.selected_dir() else {
             return true;
         };
+        if self.covers_selection(pctx, &selected) {
+            return true;
+        }
         match SelectionRelation::of(&pctx.project.root, &selected) {
             SelectionRelation::Unrelated => false,
             SelectionRelation::Within => true,
             SelectionRelation::Encloses => !self.projects.iter().any(|nearer| {
                 nearer.tool == pctx.tool
                     && nearer.project.root != pctx.project.root
-                    && nearer.project.root.starts_with(&pctx.project.root)
-                    && selected.starts_with(&nearer.project.root)
+                    // A project that resolves the selected directory owns it wherever its own root
+                    // sits, so it displaces a project that merely contains the directory.
+                    && (self.covers_selection(nearer, &selected)
+                        || (nearer.project.root.starts_with(&pctx.project.root)
+                            && selected.starts_with(&nearer.project.root)))
             }),
         }
+    }
+
+    /// Whether `pctx` is the project whose resolve covers the selected directory.
+    ///
+    /// Coverage reaches from the covered directory down through its subtree, because a selection
+    /// inside a covered member is still that member's — until an independent project of the same
+    /// tool intervenes. A directory the covering project resolves can itself contain a project the
+    /// covering project does not (a member with its own nested workspace), and a selection at or
+    /// below *that* belongs to it, not to whatever covers the directory above.
+    fn covers_selection(&self, pctx: &ProjectCtx, selected: &Utf8Path) -> bool {
+        self.covered.iter().any(|covered| {
+            covered.tool == pctx.tool
+                && covered.root == pctx.project.root
+                && selected.starts_with(&covered.dir)
+                && !self.intervenes(covered, selected)
+        })
+    }
+
+    /// Whether an independent project of the same tool sits between a covered directory and the
+    /// selection, taking the selection over.
+    ///
+    /// Such a project is one detection accepted in its own right — a nested workspace root the
+    /// covering project could never resolve — so a selection at or below it is its business alone.
+    /// Without this, a selection deep inside a covered member would drag the outer project into
+    /// scope and leave the inner one, whose lock is the one that matters there, unevaluated.
+    fn intervenes(&self, covered: &CoveredDir, selected: &Utf8Path) -> bool {
+        self.projects.iter().any(|other| {
+            other.tool == covered.tool
+                && other.project.root != covered.root
+                && other.project.root.starts_with(&covered.dir)
+                && selected.starts_with(&other.project.root)
+        })
     }
 
     /// The tool of each project the run's scope covers, one entry per project — what the
@@ -1427,6 +1520,18 @@ pub(crate) fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+/// Marks a downgraded stale/absent-lock diagnostic with what the downgrade costs: the project was
+/// not evaluated.
+///
+/// Wherever `--allow-stale-lock` turns the failure into a warning, the warning has to say that a
+/// clean summary covers one project fewer than the reader expects.
+pub(crate) fn stale_evaluation_skipped(mut diagnostic: Diagnostic) -> Diagnostic {
+    diagnostic
+        .message
+        .push_str("; dependency evaluation was skipped for this project");
+    diagnostic
+}
+
 /// A diagnostic built from a `CoreError`, scoped to a package where possible.
 pub(crate) fn diag_from_error(
     err: &cooldown_core::CoreError,
@@ -1522,13 +1627,13 @@ pub(crate) mod tests {
             Capabilities::default()
         }
 
-        fn project_detection(&self) -> cooldown_core::ProjectDetection {
-            cooldown_core::ProjectDetection::Primary(ProjectMarker {
-                lockfile: "lock",
+        fn project_marker(&self) -> cooldown_core::ProjectMarker {
+            ProjectMarker {
+                marker: "lock",
                 manifest: "manifest",
                 alternate_manifests: &[],
                 workspace_root: true,
-            })
+            }
         }
 
         async fn dependencies(
@@ -1779,13 +1884,13 @@ pub(crate) mod tests {
             Capabilities::default()
         }
 
-        fn project_detection(&self) -> cooldown_core::ProjectDetection {
-            cooldown_core::ProjectDetection::Primary(ProjectMarker {
-                lockfile: "lock",
+        fn project_marker(&self) -> cooldown_core::ProjectMarker {
+            ProjectMarker {
+                marker: "lock",
                 manifest: "manifest",
                 alternate_manifests: &[],
                 workspace_root: true,
-            })
+            }
         }
 
         async fn dependencies(
@@ -1961,6 +2066,82 @@ pub(crate) mod tests {
             .collect();
 
         assert_eq!(projects, vec![&Utf8PathBuf::from("/repo/packages/right")]);
+    }
+
+    /// A workspace covers its member, and a selection inside that member is the workspace's — but
+    /// only down to an independent project the workspace could never resolve. A nested workspace
+    /// root inside a covered member takes the selection over, whether it is named exactly or from
+    /// somewhere below it; otherwise a run pointed at a lockless nested workspace would silently
+    /// evaluate the outer one instead.
+    #[tokio::test]
+    async fn coverage_stops_at_a_project_between_the_covered_dir_and_the_selection() {
+        let outer = project_ctx(CARGO, "/repo");
+        let fuzz = project_ctx(CARGO, "/repo/a/fuzz");
+        let ws = Workspace::new(
+            AdapterSet::new(),
+            vec![outer, fuzz],
+            "2026-06-17T00:00:00Z".parse().expect("timestamp"),
+            Baseline::default(),
+            Utf8PathBuf::from("/repo"),
+            vec![builtin_default_layer()],
+        )
+        .with_covered_dirs(vec![CoveredDir {
+            tool: CARGO,
+            dir: Utf8PathBuf::from("/repo/a"),
+            root: Utf8PathBuf::from("/repo"),
+        }]);
+
+        for selected in ["/repo/a/fuzz", "/repo/a/fuzz/src"] {
+            let opts = opts_for(Some(selected));
+            let projects: Vec<&Utf8PathBuf> = ws
+                .scoped_projects(&opts)
+                .map(|project| &project.project.root)
+                .collect();
+            assert_eq!(
+                projects,
+                vec![&Utf8PathBuf::from("/repo/a/fuzz")],
+                "-C {selected} must evaluate the nested workspace alone"
+            );
+        }
+
+        // Inside the covered member but above its nested workspace, the covering project is still
+        // the one that resolves the selection.
+        let opts = opts_for(Some("/repo/a/src"));
+        let projects: Vec<&Utf8PathBuf> = ws
+            .scoped_projects(&opts)
+            .map(|project| &project.project.root)
+            .collect();
+        assert_eq!(projects, vec![&Utf8PathBuf::from("/repo")]);
+    }
+
+    /// The sideways case coverage exists for: the project that resolves the selection is a sibling,
+    /// and nothing sits between it and the selection, so it stays in scope while the package that
+    /// merely contains the directory drops out.
+    #[tokio::test]
+    async fn coverage_keeps_a_sideways_resolver_in_selection() {
+        let enclosing = project_ctx(CARGO, "/repo");
+        let owner = project_ctx(CARGO, "/repo/owner");
+        let ws = Workspace::new(
+            AdapterSet::new(),
+            vec![enclosing, owner],
+            "2026-06-17T00:00:00Z".parse().expect("timestamp"),
+            Baseline::default(),
+            Utf8PathBuf::from("/repo"),
+            vec![builtin_default_layer()],
+        )
+        .with_covered_dirs(vec![CoveredDir {
+            tool: CARGO,
+            dir: Utf8PathBuf::from("/repo/bridge"),
+            root: Utf8PathBuf::from("/repo/owner"),
+        }]);
+
+        let opts = opts_for(Some("/repo/bridge"));
+        let projects: Vec<&Utf8PathBuf> = ws
+            .scoped_projects(&opts)
+            .map(|project| &project.project.root)
+            .collect();
+
+        assert_eq!(projects, vec![&Utf8PathBuf::from("/repo/owner")]);
     }
 
     #[tokio::test]

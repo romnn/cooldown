@@ -34,7 +34,7 @@
 
 mod support;
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use std::collections::BTreeSet;
 use support::{ChangeVersions, Fixture, changed_packages, toml_lock_entries, toml_lock_pins};
 
@@ -681,6 +681,1115 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
         "explain must fail closed on a stale lock"
     );
     assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
+}
+
+/// The shape that surfaced the lockless gap: a workspace with a lock beside a cargo-fuzz-style
+/// crate that declares its own `[workspace]` — so the root resolve can never cover it — and whose
+/// `Cargo.lock` is gitignored, hence absent from a fresh checkout.
+fn lockless_nested_workspace_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["member"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "member/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("member/src/lib.rs", "")
+        .write(
+            "fuzz/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "fuzzish"
+                version = "0.1.0"
+                edition = "2021"
+
+                [workspace]
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("fuzz/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    // Hold the root's own dependency at an immutable historical release, so the root project has a
+    // real upgrade to plan while the lockless nested project is being reported or skipped.
+    fixture
+        .run_tool(
+            "cargo",
+            &["update", "-p", "itoa", "--precise", LOCKLESS_ROOT_PIN],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// An old, immutable `itoa` release: the starting pin the lockless-nested fixture upgrades from.
+const LOCKLESS_ROOT_PIN: &str = "1.0.9";
+
+/// Assert that `envelope` carries a `stale_lock` error attributed to `project`, saying the lock is
+/// missing and giving the remedy that follows generating one.
+///
+/// Project identity is asserted through the diagnostic's structured `project` field, which is
+/// run-relative and `/`-separated everywhere; the message quotes the project's native absolute
+/// path, which spells its separators differently on Windows.
+fn assert_missing_lock_error(envelope: &support::Envelope, project: &str) {
+    assert!(
+        envelope.error_kinds().contains("stale_lock"),
+        "expected a stale_lock error, got {:?}: {:?}",
+        envelope.error_kinds(),
+        envelope.error_messages()
+    );
+    assert!(
+        envelope.error_projects().contains(project),
+        "the stale_lock error must be attributed to {project}, got {:?}",
+        envelope.error_projects()
+    );
+    assert!(
+        envelope.error_messages().iter().any(|message| {
+            message.contains("Cargo.lock is missing in") && message.contains("cooldown fix")
+        }),
+        "the error must say the lock is missing and give the remedy that follows generating one, \
+         got {:?}",
+        envelope.error_messages()
+    );
+}
+
+/// A nested `[workspace]` crate with no lock is a project of its own, and one cooldown cannot
+/// evaluate: it fails the gate naming itself rather than passing silently while its dependencies
+/// resolve to whatever is newest at build time.
+#[test]
+fn a_lockless_nested_workspace_fails_the_gate_instead_of_passing_silently() {
+    skip_if_missing!("cargo");
+    let fixture = lockless_nested_workspace_fixture();
+
+    let gated = fixture.cooldown(&["check", "--cargo", "--latest"]);
+    assert_eq!(
+        gated.status.code(),
+        Some(4),
+        "a project cooldown could not evaluate must fail the gate: {}",
+        gated.stderr_str()
+    );
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    assert!(!checked.ok());
+    assert_missing_lock_error(&checked, "fuzz");
+
+    // `outdated --all` names everything in scope, so it shows both that the root was evaluated and
+    // that the fuzz project was not silently dropped from the run.
+    let listed = fixture.cooldown_json(&["outdated", "--cargo", "--all", "--freeze", FREEZE]);
+    assert_eq!(
+        listed.item_names(),
+        ["itoa".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "the root workspace's dependency is still reported"
+    );
+    assert_missing_lock_error(&listed, "fuzz");
+
+    // The documented downgrade applies to an absent lock exactly as to a stale one, and says the
+    // project went unevaluated rather than leaving the reader to infer it from a clean summary.
+    let allowed = fixture.cooldown_json(&["check", "--cargo", "--latest", "--allow-stale-lock"]);
+    assert!(
+        allowed.ok(),
+        "--allow-stale-lock downgrades the missing lock: {:?}",
+        allowed.error_messages()
+    );
+    assert!(allowed.warning_kinds().contains("stale_lock"));
+    assert!(
+        allowed
+            .warning_messages()
+            .iter()
+            .any(|message| message.contains("dependency evaluation was skipped")),
+        "the warning must say the project went unevaluated, got {:?}",
+        allowed.warning_messages()
+    );
+
+    // `--lock` is the way forward: it generates the missing lock and the gate then reads it.
+    let locked = fixture.cooldown_json(&["check", "--cargo", "--latest", "--lock"]);
+    assert!(
+        locked.ok(),
+        "check --lock must generate the missing lock and gate it: {:?} {:?}",
+        locked.error_kinds(),
+        locked.error_messages()
+    );
+    assert!(
+        fixture.root().join("fuzz/Cargo.lock").is_file(),
+        "--lock generates the nested project's lock"
+    );
+    assert_eq!(
+        locked.summary_checked(),
+        2,
+        "both projects' dependencies are gated once the nested lock exists"
+    );
+}
+
+/// The other half of cargo's ownership rule: a plain package the enclosing workspace `exclude`s is
+/// no more covered by the root resolve than a nested `[workspace]` is.
+#[test]
+fn a_lockless_excluded_package_fails_the_gate() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["member"]
+                exclude = ["tools/x"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "member/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("member/src/lib.rs", "")
+        .write(
+            "tools/x/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "toolx"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("tools/x/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    assert!(!checked.ok());
+    assert_missing_lock_error(&checked, "tools/x");
+}
+/// A repository-root package beside a `bridge/` that points at a sibling `owner/` workspace, which
+/// lists both `bridge` and `bridge/child` as members from outside its own directory.
+fn sibling_owner_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "root"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("src/lib.rs", "")
+        .write(
+            "owner/Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["../bridge", "../bridge/child"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "bridge/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "bridge"
+                version = "0.1.0"
+                edition = "2021"
+                workspace = "../owner"
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("bridge/src/lib.rs", "")
+        .write(
+            "bridge/child/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "bridge-child"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("bridge/child/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &["generate-lockfile", "--manifest-path", "owner/Cargo.toml"],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// Cargo's root search stops at an ancestor carrying `package.workspace` and hands everything
+/// below it to the workspace that ancestor points at — even a sibling tree the upward walk would
+/// never otherwise reach. `bridge/child` is a member of `owner` through `bridge`'s pointer, so it is
+/// covered by `owner`'s lock and must not be detected (and fail) as a lockless project of its own.
+#[test]
+fn a_pointer_carrying_ancestor_hands_its_subtree_to_the_named_workspace() {
+    skip_if_missing!("cargo");
+    let fixture = sibling_owner_fixture();
+
+    let listed = fixture.cooldown_json(&["outdated", "--cargo", "--all", "--freeze", FREEZE]);
+
+    assert!(
+        listed.error_kinds().is_empty(),
+        "nothing here is unevaluated: {:?}",
+        listed.error_messages()
+    );
+    // One `ryu` row, attributed to the workspace that resolves both members. A second row (or a
+    // `stale_lock`) would mean `bridge/child` was detected as a lockless project of its own.
+    assert_eq!(listed.item_projects_for("ryu"), vec!["owner".to_string()]);
+    assert_eq!(
+        listed.item_names(),
+        ["itoa".to_string(), "ryu".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+/// Pointing the run at `bridge` runs the project that resolves it — `owner`, whose root is a
+/// sibling — not the repository-root package that merely contains the directory, whose lock says
+/// nothing about it. The report is scoped to what the selected directory declares, and the lock
+/// the gate reads is `owner`'s even though it lives outside the selection.
+#[test]
+fn selecting_a_directory_another_project_resolves_runs_that_project() {
+    skip_if_missing!("cargo");
+    let fixture = sibling_owner_fixture();
+
+    let scoped = fixture.cooldown_json_in(
+        Some("bridge"),
+        &["outdated", "--cargo", "--all", "--freeze", FREEZE],
+    );
+    assert!(
+        scoped.error_kinds().is_empty(),
+        "{:?}",
+        scoped.error_messages()
+    );
+    assert_eq!(
+        scoped.item_names(),
+        ["ryu".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "only what the selected member declares, not the enclosing package's own dependency"
+    );
+    assert_eq!(
+        scoped.item_projects_for("ryu"),
+        vec!["owner".to_string()],
+        "reported through the project that resolves the selection"
+    );
+
+    std::fs::remove_file(fixture.root().join("owner/Cargo.lock")).expect("remove owner lock");
+    let gated = fixture.cooldown_json_in(Some("bridge"), &["check", "--cargo", "--latest"]);
+    assert!(!gated.ok(), "the resolving project has no lock to read");
+    assert!(
+        gated.error_kinds().contains("stale_lock"),
+        "{:?}",
+        gated.error_kinds()
+    );
+    assert_eq!(
+        gated.error_projects(),
+        ["owner".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "the missing lock is reported against the project that owns it"
+    );
+}
+
+/// A workspace that excludes two siblings, the later-sorting of which (`b`) path-depends on the
+/// earlier (`a`) and holds the lock that resolves it.
+fn later_sibling_resolver_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["member"]
+                exclude = ["a", "b"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "member/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("member/src/lib.rs", "")
+        .write(
+            "a/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                cfg-if = "1"
+            "#},
+        )
+        .write("a/src/lib.rs", "")
+        .write(
+            "b/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                a = { path = "../a" }
+                ryu = "1"
+            "#},
+        )
+        .write("b/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &["generate-lockfile", "--manifest-path", "b/Cargo.toml"],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// Which of two plain directories is the project must not depend on which one is visited first.
+/// Here `b` resolves `a`, so `b` is the project and `a` is in its lock — the order that previously
+/// misfired, since `a` sorts first and used to settle before `b` existed as a project.
+#[test]
+fn a_directory_resolved_by_a_later_sorting_sibling_is_not_a_project() {
+    skip_if_missing!("cargo");
+    let fixture = later_sibling_resolver_fixture();
+
+    // Cargo's own lock is the oracle: `b` resolved `a`, and `a`'s dependency with it.
+    let nested_lock = toml_lock_pins(&fixture.read_bytes("b/Cargo.lock"));
+    assert!(
+        nested_lock.contains_key("cfg-if"),
+        "`a`'s dependency is in `b`'s lock: {nested_lock:?}"
+    );
+
+    let listed = fixture.cooldown_json(&["outdated", "--cargo", "--all", "--freeze", FREEZE]);
+    assert!(
+        listed.error_kinds().is_empty(),
+        "`a` is in `b`'s lock, so nothing is unevaluated: {:?}",
+        listed.error_messages()
+    );
+    assert_eq!(
+        listed.item_names(),
+        ["itoa".to_string(), "ryu".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "the two projects' direct dependencies, and no row for a third project"
+    );
+
+    // The gate reads the whole graph, so `a`'s own dependency is evaluated through `b`: three
+    // crates, not the two a run that dropped `a` would see.
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    assert!(checked.ok(), "{:?}", checked.error_messages());
+    assert_eq!(
+        checked.summary_checked(),
+        3,
+        "the dependee's dependency is gated through the project that resolves it"
+    );
+
+    // Take the path dependency away and `a` really is a project of its own, with no lock — the
+    // contrast that shows the first result was coverage rather than a silent drop.
+    fixture.write(
+        "b/Cargo.toml",
+        indoc! {r#"
+            [package]
+            name = "b"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            ryu = "1"
+        "#},
+    );
+    fixture
+        .run_tool(
+            "cargo",
+            &["generate-lockfile", "--manifest-path", "b/Cargo.toml"],
+            &[],
+        )
+        .expect_success();
+    let orphaned = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    assert!(!orphaned.ok());
+    assert_missing_lock_error(&orphaned, "a");
+}
+
+/// Cargo activates a package it reached as an ordinary dependency with only the features its
+/// requirer asked for, so an optional path dependency no feature turns on is never resolved — its
+/// own dependencies are in nobody's lock, and it is a project of its own.
+#[test]
+fn an_optional_dependency_of_a_reached_package_is_its_own_project() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "root"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                a = { path = "a" }
+                itoa = "1"
+            "#},
+        )
+        .write("src/lib.rs", "")
+        .write(
+            "a/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                opt = { path = "opt", optional = true }
+            "#},
+        )
+        .write("a/src/lib.rs", "")
+        .write(
+            "a/opt/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "opt"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("a/opt/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+
+    // Cargo's own lock is the oracle: it never resolved the optional crate, so `ryu` is absent.
+    let locked = toml_lock_pins(&fixture.read_bytes("Cargo.lock"));
+    assert!(
+        !locked.contains_key("ryu"),
+        "the optional path dependency is not in the root's lock: {locked:?}"
+    );
+
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+
+    assert!(!checked.ok());
+    assert_missing_lock_error(&checked, "a/opt");
+}
+
+/// Every member-discovery shape at once: a `./a` spelling, an inherited `workspace = true` path
+/// dependency, and a nested workspace whose member lives outside it and points back at it.
+/// The member-discovery root manifest. `EXCLUDED_DIR` stands in for the fixture's own absolute
+/// path, which only exists once the temp directory does.
+const MEMBER_DISCOVERY_ROOT: &str = indoc! {r#"
+    [package]
+    name = "root"
+    version = "0.1.0"
+    edition = "2021"
+
+    [workspace]
+    members = ["./a"]
+    exclude = [EXCLUDED_DIR]
+
+    [workspace.dependencies]
+    inherited = { path = "inherited" }
+
+    [dependencies]
+    itoa = "1"
+"#};
+
+/// The nested workspace whose member `b` lives beside it and points back at it, with `b`'s own
+/// dev-dependency subtree below: cargo admits a path dependency outside the root directory when
+/// the package's root search lands here, and consults pointers on ancestors while searching.
+fn write_outside_pointer_member(fixture: &Fixture) -> &Fixture {
+    fixture
+        // A nested workspace whose member `b` lives beside it and points back at it: cargo admits a
+        // path dependency outside the root directory when the package's own root search lands here.
+        .write(
+            "ws/Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["a"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "ws/a/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "ws-a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                b = { path = "../../b" }
+            "#},
+        )
+        .write("ws/a/src/lib.rs", "")
+        .write(
+            "b/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+                workspace = "../ws"
+
+                [dev-dependencies]
+                fixture = { path = "fixture" }
+            "#},
+        )
+        .write("b/src/lib.rs", "")
+        .write(
+            "b/fixture/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "fixture"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                cfg-if = "1"
+
+                [dev-dependencies]
+                helper = { path = "helper" }
+            "#},
+        )
+        .write("b/fixture/src/lib.rs", "")
+        // Two levels below the pointing directory: cargo's root search consults the pointer on the
+        // ancestor `b`, so this is a member of `ws` too, and its dependency is in `ws`'s lock.
+        .write(
+            "b/fixture/helper/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "helper"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                log = "0.4"
+            "#},
+        )
+        .write("b/fixture/helper/src/lib.rs", "");
+    fixture
+}
+
+fn member_discovery_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write("src/lib.rs", "")
+        .write(
+            "a/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                inherited = { workspace = true }
+            "#},
+        )
+        .write("a/src/lib.rs", "")
+        .write(
+            "inherited/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "inherited"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("inherited/src/lib.rs", "")
+        // An absolute `exclude` entry, which cargo honours: the crate is no member, has no lock of
+        // its own, and must be reported rather than quietly folded into the workspace.
+        .write(
+            "excluded/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "excluded"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bytes = "1"
+            "#},
+        )
+        .write("excluded/src/lib.rs", "");
+    write_outside_pointer_member(&fixture);
+    // The root manifest names the excluded crate by absolute path — canonicalized, because that is
+    // the spelling the run scans under and therefore the one cargo's prefix test has to match.
+    // Serialized rather than interpolated: a Windows temp path's backslashes are escapes inside a
+    // TOML string.
+    let excluded = serde_json::to_string(
+        std::fs::canonicalize(fixture.root())
+            .expect("canonical fixture root")
+            .join("excluded")
+            .to_str()
+            .expect("utf-8 fixture root"),
+    )
+    .expect("serialize the excluded path");
+    fixture.write(
+        "Cargo.toml",
+        &MEMBER_DISCOVERY_ROOT.replace("EXCLUDED_DIR", &excluded),
+    );
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_tool(
+            "cargo",
+            &["generate-lockfile", "--manifest-path", "ws/Cargo.toml"],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// Three member-discovery shapes cargo accepts that a literal reading of the manifest would miss:
+/// a `./a` member spelling, an inherited `workspace = true` path dependency, and a member outside
+/// the workspace directory that points back at it — whose dev path dependency cargo resolves too,
+/// since a member's dev units are part of the lock. Every crate here belongs to one of the two
+/// locks, so none of them is a project of its own.
+#[test]
+fn member_discovery_follows_cargos_own_rules() {
+    skip_if_missing!("cargo");
+    let fixture = member_discovery_fixture();
+
+    // Cargo's own locks are the oracle for what each project resolves.
+    let root_lock = toml_lock_pins(&fixture.read_bytes("Cargo.lock"));
+    assert!(
+        root_lock.contains_key("ryu"),
+        "the `./a` member's inherited path dependency is in the root's lock: {root_lock:?}"
+    );
+    let nested_lock = toml_lock_pins(&fixture.read_bytes("ws/Cargo.lock"));
+    assert!(
+        nested_lock.contains_key("cfg-if") && nested_lock.contains_key("log"),
+        "the outside member's whole subtree is in the nested lock: {nested_lock:?}"
+    );
+
+    let listed = fixture.cooldown_json(&["outdated", "--cargo", "--all", "--freeze", FREEZE]);
+
+    assert_eq!(
+        listed.item_projects_for("ryu"),
+        vec![".".to_string()],
+        "reached through the `./a` member's inherited `workspace = true` entry"
+    );
+    assert_eq!(
+        listed.item_projects_for("cfg-if"),
+        vec!["ws".to_string()],
+        "reached through the outside-directory member's dev path dependency"
+    );
+    assert_eq!(
+        listed.item_projects_for("log"),
+        vec!["ws".to_string()],
+        "two levels below the pointing directory, and still a member through its ancestor"
+    );
+    // The absolutely-excluded crate is nobody's member: cargo never resolved it, and it has no
+    // lock of its own, so it is reported rather than silently folded into the workspace.
+    assert_eq!(
+        listed.error_projects(),
+        ["excluded".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "{:?}",
+        listed.error_messages()
+    );
+    assert!(listed.error_kinds().contains("stale_lock"));
+    assert_eq!(
+        listed.item_names(),
+        [
+            "cfg-if".to_string(),
+            "itoa".to_string(),
+            "log".to_string(),
+            "ryu".to_string()
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+    );
+}
+/// Cargo's exclusion test compares the raw joined paths, so a `members` entry spelled differently
+/// from the `exclude` entry does not cancel it: `members = ["tmp/../shadowed"]` leaves
+/// `exclude = ["shadowed"]` in force, cargo drops the crate from the workspace, and it builds — and
+/// must be gated — on its own. Normalizing both spellings to the same directory would let the
+/// member entry override the exclusion and wave the crate through unevaluated.
+#[test]
+fn a_member_entry_spelled_around_an_exclusion_does_not_cancel_it() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["member", "tmp/../shadowed"]
+                exclude = ["shadowed"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "member/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("member/src/lib.rs", "")
+        .write(
+            "shadowed/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "shadowed"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                once_cell = "1"
+            "#},
+        )
+        .write("shadowed/src/lib.rs", "")
+        // The directory the `tmp/..` spelling walks through has to exist for cargo to accept the
+        // manifest at all.
+        .write("tmp/.keep", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+
+    // Cargo's own lock is the oracle: the excluded crate is no member, so its dependency is absent.
+    let locked = toml_lock_pins(&fixture.read_bytes("Cargo.lock"));
+    assert!(
+        !locked.contains_key("once_cell"),
+        "the excluded crate is not in the workspace's lock: {locked:?}"
+    );
+
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+
+    assert!(!checked.ok());
+    assert_missing_lock_error(&checked, "shadowed");
+    assert_eq!(
+        checked.summary_checked(),
+        1,
+        "only the real member's dependency is gated"
+    );
+}
+
+/// A workspace with a member, and inside that member a cargo-fuzz-style workspace of its own with
+/// no lock.
+fn fuzz_inside_a_member_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["member"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "member/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("member/src/lib.rs", "")
+        .write(
+            "member/fuzz/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "fuzzish"
+                version = "0.1.0"
+                edition = "2021"
+
+                [workspace]
+
+                [dependencies]
+                ryu = "1"
+            "#},
+        )
+        .write("member/fuzz/src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+}
+
+/// The workspace covers its member, so a selection inside the member is normally the workspace's —
+/// but not past an independent project the workspace cannot resolve. Pointing the run at the
+/// member's own lockless workspace, or anywhere below it, must evaluate that workspace alone;
+/// evaluating the outer one instead would report a clean gate over a project with no lock.
+#[test]
+fn selecting_a_lockless_workspace_inside_a_covered_member_evaluates_it_alone() {
+    skip_if_missing!("cargo");
+    let fixture = fuzz_inside_a_member_fixture();
+
+    for selected in ["member/fuzz", "member/fuzz/src"] {
+        let gated = fixture.cooldown_json_in(Some(selected), &["check", "--cargo", "--latest"]);
+        assert!(!gated.ok(), "-C {selected}: {:?}", gated.error_messages());
+        assert_missing_lock_error(&gated, "member/fuzz");
+        assert_eq!(
+            gated.summary_checked(),
+            0,
+            "-C {selected} must evaluate nothing but the selected workspace, which has no lock"
+        );
+    }
+
+    // From the repository root both projects are in scope, and the member's dependency is gated.
+    let whole = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    assert_missing_lock_error(&whole, "member/fuzz");
+    assert_eq!(whole.summary_checked(), 1);
+}
+
+/// Cargo's cycle check ignores dev edges, so three plain packages that dev-depend on each other in
+/// a ring are a valid repository. The ownership fixpoint oscillates on that ring, and whatever
+/// state it stops in must still be self-consistent: a claim on a directory that is not a project
+/// would be rejected as an adapter bug and abort discovery for the whole run.
+#[test]
+fn a_dev_dependency_ring_between_plain_packages_does_not_abort_discovery() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "root"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("src/lib.rs", "");
+    for (name, registry, next) in [
+        ("a", "ryu = \"1\"", "b"),
+        ("b", "cfg-if = \"1\"", "c"),
+        ("c", "log = \"0.4\"", "a"),
+    ] {
+        fixture
+            .write(
+                &format!("{name}/Cargo.toml"),
+                &formatdoc! {r#"
+                    [package]
+                    name = "{name}"
+                    version = "0.1.0"
+                    edition = "2021"
+
+                    [dependencies]
+                    {registry}
+
+                    [dev-dependencies]
+                    {next} = {{ path = "../{next}" }}
+                "#},
+            )
+            .write(&format!("{name}/src/lib.rs"), "");
+    }
+    for manifest in ["Cargo.toml", "a/Cargo.toml", "b/Cargo.toml", "c/Cargo.toml"] {
+        fixture
+            .run_tool(
+                "cargo",
+                &["generate-lockfile", "--manifest-path", manifest],
+                &[],
+            )
+            .expect_success();
+    }
+
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+
+    assert!(
+        checked.ok(),
+        "a valid repository must not fail discovery: {:?}",
+        checked.error_messages()
+    );
+    assert!(
+        checked.error_kinds().is_empty(),
+        "{:?}",
+        checked.error_kinds()
+    );
+    // Every crate in the ring is gated, through whichever project the fixpoint settled on as its
+    // resolver: the root's own dependency plus the four the ring declares.
+    assert_eq!(checked.summary_checked(), 5);
+
+    let listed = fixture.cooldown_json(&["outdated", "--cargo", "--all", "--freeze", FREEZE]);
+    assert!(
+        listed.error_kinds().is_empty(),
+        "{:?}",
+        listed.error_kinds()
+    );
+    // One row per project's own direct dependency; a crate the ring resolves is reported through
+    // the project whose lock holds it rather than as a project of its own.
+    for name in listed.item_names() {
+        assert_eq!(
+            listed.item_projects_for(&name).len(),
+            1,
+            "{name} is reported by more than one project: {:?}",
+            listed.item_projects_for(&name)
+        );
+    }
+}
+
+/// A lone crate whose lock was never generated is a project cooldown cannot evaluate, not a
+/// directory with no supported tool: exit 4 naming the lock, rather than exit 3 naming nothing.
+#[test]
+fn a_lone_crate_without_a_lock_is_a_stale_lock_not_a_missing_tool() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "solo"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa = "1"
+            "#},
+        )
+        .write("src/lib.rs", "");
+
+    let gated = fixture.cooldown(&["check", "--cargo", "--latest"]);
+    assert_eq!(
+        gated.status.code(),
+        Some(4),
+        "a crate with no lock is a project that fails, not an absent tool: {}",
+        gated.stderr_str()
+    );
+    let checked = fixture.cooldown_json(&["check", "--cargo", "--latest"]);
+    // The project *is* the scan root, which every report spells `.`.
+    assert_missing_lock_error(&checked, ".");
+    assert!(
+        !checked.error_kinds().iter().any(|kind| kind == "not_found"),
+        "the crate is right there; only its lock is missing: {:?}",
+        checked.error_kinds()
+    );
+}
+
+/// `upgrade` must not skip the project `check` now fails on: the same missing lock stops the
+/// mutation, with the same diagnostic kind and the same remedy.
+#[test]
+fn upgrade_reports_a_missing_lock_instead_of_skipping_the_project() {
+    skip_if_missing!("cargo");
+    let fixture = lockless_nested_workspace_fixture();
+
+    let dry = fixture.cooldown_json(&["upgrade", "--cargo", "--latest", "--dry-run"]);
+    assert!(
+        !dry.ok(),
+        "upgrade must not report success for a project it could not resolve"
+    );
+    assert_missing_lock_error(&dry, "fuzz");
+    assert!(
+        !fixture.root().join("fuzz/Cargo.lock").exists(),
+        "upgrade reports the missing lock; it does not generate one"
+    );
+}
+
+/// `--allow-stale-lock` means the same thing on a mutating command as on `check`: the project
+/// whose lock cooldown cannot read is skipped with a warning, and the projects it *can* read are
+/// planned as usual.
+#[test]
+fn allow_stale_lock_skips_the_lockless_project_and_plans_the_rest() {
+    skip_if_missing!("cargo");
+    let fixture = lockless_nested_workspace_fixture();
+
+    let dry = fixture.cooldown_json(&[
+        "upgrade",
+        "--cargo",
+        "--latest",
+        "--dry-run",
+        "--allow-stale-lock",
+    ]);
+
+    assert!(
+        dry.ok(),
+        "--allow-stale-lock must downgrade the missing lock on upgrade too: {:?}",
+        dry.error_messages()
+    );
+    assert!(dry.error_kinds().is_empty(), "{:?}", dry.error_messages());
+    assert!(
+        dry.warning_kinds().contains("stale_lock"),
+        "expected a stale_lock warning, got {:?}",
+        dry.warning_kinds()
+    );
+    assert!(
+        dry.warning_projects().contains("fuzz"),
+        "the warning must be attributed to the skipped project, got {:?}",
+        dry.warning_projects()
+    );
+    assert!(
+        dry.warning_messages()
+            .iter()
+            .any(|message| message.contains("dependency evaluation was skipped")),
+        "the warning must say the project went unevaluated, got {:?}",
+        dry.warning_messages()
+    );
+    // The root workspace is still planned: skipping one project must not skip the run.
+    assert_eq!(
+        dry.change_for("itoa").map(|change| change.from),
+        Some(LOCKLESS_ROOT_PIN.to_string()),
+        "the readable project's upgrade is still planned: {:?}",
+        dry.item_names()
+    );
 }
 
 /// A monorepo whose root config excludes both a nested incubator workspace and one of its own

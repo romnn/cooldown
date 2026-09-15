@@ -87,13 +87,13 @@ impl ToolRead for HexTool {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
-        cooldown_core::ProjectDetection::Primary(ProjectMarker {
-            lockfile: "mix.lock",
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        ProjectMarker {
+            marker: "mix.lock",
             manifest: "mix.exs",
             alternate_manifests: &[],
             workspace_root: false,
-        })
+        }
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {

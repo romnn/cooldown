@@ -670,6 +670,21 @@ impl Envelope {
 
     /// The named top-level string field of the first item with this `name` (e.g. `"blockedBy"`,
     /// `"adoptableTarget"`, `"current"`), when present.
+    /// The projects that reported a row for `name`, in report order — one entry per row, so a
+    /// package listed twice because two projects were detected where one was expected shows up.
+    /// `project` is run-relative and `/`-separated on every platform.
+    pub fn item_projects_for(&self, name: &str) -> Vec<String> {
+        self.items()
+            .iter()
+            .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .filter_map(|item| {
+                item.get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     pub fn item_field_str(&self, name: &str, field: &str) -> Option<String> {
         self.items().iter().find_map(|item| {
             if item.get("name").and_then(serde_json::Value::as_str) != Some(name) {
@@ -808,6 +823,18 @@ impl Envelope {
 
     pub fn error_paths(&self) -> BTreeSet<String> {
         self.diagnostic_values("errors", "path")
+    }
+
+    /// The projects the errors are attributed to. `project` is the run-relative, `/`-separated
+    /// identity of the project (`.` for the scan root), so it is the portable way to assert *which*
+    /// project a diagnostic is about — a message quotes a native absolute path instead.
+    pub fn error_projects(&self) -> BTreeSet<String> {
+        self.diagnostic_values("errors", "project")
+    }
+
+    /// The projects the warnings are attributed to; see [`error_projects`](Self::error_projects).
+    pub fn warning_projects(&self) -> BTreeSet<String> {
+        self.diagnostic_values("warnings", "project")
     }
 
     fn diagnostic_values(&self, section: &str, key: &str) -> BTreeSet<String> {

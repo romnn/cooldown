@@ -1,11 +1,11 @@
-use crate::app::AdapterSet;
+use crate::app::{AdapterSet, CoveredDir};
 use crate::cli::GlobalArgs;
 use crate::discovery;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::CargoTool;
 use cooldown_conda::{CondaTool, PixiTool};
 use cooldown_core::config::ScanConfig;
-use cooldown_core::{CoreError, Project, ProjectDetection, ToolId, ToolRead};
+use cooldown_core::{CoreError, NestedOwnership, Project, ProjectMarker, ToolId, ToolRead};
 use cooldown_go::GoTool;
 use cooldown_hex::HexTool;
 use cooldown_maven::{GradleTool, MavenTool};
@@ -114,11 +114,11 @@ pub(super) fn detect_projects(
     exclude_folders_base: &[String],
     tools: &[ToolId],
     respect_gitignore: bool,
-) -> Result<Vec<(ToolId, Project)>, CoreError> {
+) -> Result<Detected, CoreError> {
     struct PendingDetection<'a> {
         adapter: &'a dyn ToolRead,
         id: ToolId,
-        detection: ProjectDetection,
+        marker: ProjectMarker,
         exclude: Vec<String>,
     }
 
@@ -135,7 +135,7 @@ pub(super) fn detect_projects(
             Some(PendingDetection {
                 adapter: adapter.as_ref(),
                 id,
-                detection: adapter.project_detection(),
+                marker: adapter.project_marker(),
                 exclude: scan.exclude_folders_for(exclude_folders_base, id.as_str()),
             })
         })
@@ -149,13 +149,13 @@ pub(super) fn detect_projects(
     }
     let mut found_by_adapter = vec![None; selected.len()];
     for (exclude, indices) in groups {
-        let detections = indices
+        let markers = indices
             .iter()
-            .filter_map(|index| selected.get(*index).map(|pending| pending.detection))
+            .filter_map(|index| selected.get(*index).map(|pending| pending.marker))
             .collect::<Vec<_>>();
         let found = crate::scan::find_project_marker_dirs_batch(
             workdir,
-            &detections,
+            &markers,
             crate::scan::WalkPolicy {
                 respect_gitignore,
                 exclude: &exclude,
@@ -171,26 +171,38 @@ pub(super) fn detect_projects(
     }
 
     let mut projects = Vec::new();
+    let mut covered = Vec::new();
     for (pending, found) in selected.into_iter().zip(found_by_adapter) {
         // The orchestrator owns the scan: the adapter only declares its markers, and we apply the
         // shared gitignore/exclude policy here so a leaf crate can't diverge from it.
-        let marker = pending.detection.primary();
+        let marker = pending.marker;
         let mut found = found.ok_or_else(|| {
             CoreError::System(format!(
                 "project discovery produced no result for {}",
                 pending.id.as_str()
             ))
         })?;
-        // The topmost-only rule assumed every nested lockfile root is covered by the workspace
-        // above it; give the adapter its appeal for the ones that are not (a nested workspace
-        // root the enclosing workspace can only exclude, never own).
-        promote_nested(&mut found, |dir| {
-            pending.adapter.nested_lockfile_root_escapes(dir)
-        });
-        let validation_only = validation_roots_outside_primary(&found);
-        pending
+        // The topmost-only rule assumed every nested marked directory is covered by the root
+        // above it; ask the adapter which of them a project this run evaluates actually resolves,
+        // handing it both sides of the scan so it can only answer from projects that exist.
+        let ownership = pending
             .adapter
-            .validate_manifests_without_lock(&validation_only)?;
+            .nested_ownership(&found.primary, &found.nested);
+        // A directory with a named resolver is where a `-C` into it has to run: the selection
+        // belongs to the project whose lock holds that directory's dependencies. Collected before
+        // promotion, which consumes the nested list.
+        covered.extend(found.nested.iter().zip(&ownership).filter_map(
+            |(dir, answer)| match answer {
+                cooldown_core::NestedOwnership::Root(root) => Some(CoveredDir {
+                    tool: pending.id,
+                    dir: dir.clone(),
+                    root: root.clone(),
+                }),
+                cooldown_core::NestedOwnership::Enclosing
+                | cooldown_core::NestedOwnership::Standalone => None,
+            },
+        ));
+        promote_nested(&mut found, &ownership)?;
         let dirs = found.primary;
         tracing::info!(
             tool = pending.id.as_str(),
@@ -213,47 +225,72 @@ pub(super) fn detect_projects(
             ));
         }
     }
-    Ok(projects)
+    Ok(Detected { projects, covered })
 }
 
-/// Move every nested lockfile root that `escapes` says stands on its own into the primary set.
+/// What one detection pass produced: the projects to run, and the marked directories some project
+/// resolves rather than being projects themselves.
+pub(super) struct Detected {
+    pub(super) projects: Vec<(ToolId, Project)>,
+    pub(super) covered: Vec<CoveredDir>,
+}
+
+/// Move every nested marked directory no evaluated project resolves into the primary set.
 ///
-/// Escape is a property of the directory alone — a workspace root escapes any enclosure, however
-/// deep — so each candidate is judged independently rather than against its nearest kept ancestor.
+/// The adapter answers from the two sets it was handed, so the decision here is only to apply the
+/// answers and to hold the adapter to its contract: a [`NestedOwnership::Root`] must name a
+/// directory this run evaluates — a detected root, or a nested directory the same batch answered
+/// [`NestedOwnership::Standalone`]. A claim on anything else would leave the directory covered by a
+/// resolve that never happens, which is exactly how a project passes the gate unevaluated, so it is
+/// reported as the adapter bug it is rather than silently trusted.
+///
+/// # Errors
+///
+/// Returns [`CoreError::System`] if `ownership` is not index-aligned with the nested directories,
+/// or if an answer names a project this run does not evaluate.
 fn promote_nested(
     found: &mut crate::scan::ProjectMarkerDirs,
-    escapes: impl Fn(&camino::Utf8Path) -> bool,
-) {
+    ownership: &[NestedOwnership],
+) -> Result<(), CoreError> {
+    if ownership.len() != found.nested.len() {
+        return Err(CoreError::System(format!(
+            "project discovery returned {} nested-ownership answers for {} nested directories",
+            ownership.len(),
+            found.nested.len()
+        )));
+    }
+    let evaluated =
+        |root: &Utf8Path| {
+            found.primary.iter().any(|primary| primary == root)
+                || found.nested.iter().zip(ownership).any(|(nested, answer)| {
+                    nested == root && *answer == NestedOwnership::Standalone
+                })
+        };
+    for (dir, answer) in found.nested.iter().zip(ownership) {
+        if let NestedOwnership::Root(root) = answer
+            && !evaluated(root)
+        {
+            return Err(CoreError::System(format!(
+                "project discovery claimed {dir} is resolved by {root}, which this run does not \
+                 evaluate"
+            )));
+        }
+    }
     let promoted = found
         .nested
         .iter()
-        .filter(|dir| escapes(dir))
-        .cloned()
+        .zip(ownership)
+        .filter(|(_, answer)| **answer == NestedOwnership::Standalone)
+        .map(|(dir, _)| dir.clone())
         .collect::<Vec<_>>();
     if promoted.is_empty() {
-        return;
+        return Ok(());
     }
     found.nested.retain(|dir| !promoted.contains(dir));
     found.primary.extend(promoted);
     found.primary.sort();
     found.primary.dedup();
-    found
-        .validation_only
-        .retain(|candidate| found.primary.binary_search(candidate).is_err());
-}
-
-fn validation_roots_outside_primary(found: &crate::scan::ProjectMarkerDirs) -> Vec<Utf8PathBuf> {
-    found
-        .validation_only
-        .iter()
-        .filter(|candidate| {
-            !found
-                .primary
-                .iter()
-                .any(|primary| candidate.starts_with(primary))
-        })
-        .cloned()
-        .collect()
+    Ok(())
 }
 
 fn marker_manifest_path(
@@ -281,7 +318,7 @@ mod tests {
         std::fs::write(root.join("deno.jsonc"), "{}").unwrap();
 
         let marker = ProjectMarker {
-            lockfile: "deno.lock",
+            marker: "deno.lock",
             manifest: "deno.json",
             alternate_manifests: &["deno.jsonc"],
             workspace_root: true,
@@ -290,49 +327,100 @@ mod tests {
         assert_eq!(marker_manifest_path(root, &marker), root.join("deno.jsonc"));
     }
 
+    /// Only a directory no evaluated project resolves becomes a project of its own; a claimed
+    /// project the run really evaluates keeps its directory where it is.
     #[test]
-    fn promotion_moves_escaping_nested_roots_into_primary() {
+    fn promotion_keeps_what_an_evaluated_project_resolves() -> Result<(), CoreError> {
         let root = Utf8PathBuf::from("/repo");
-        let escaping = root.join("incubator");
-        let owned = root.join("member");
+        let silent = root.join("fixtures");
+        let standalone = root.join("fuzz");
+        let member = root.join("crates/app");
+        let sibling = root.join("fuzz/helper");
         let mut found = crate::scan::ProjectMarkerDirs {
             primary: vec![root.clone()],
-            validation_only: vec![escaping.clone(), owned.clone()],
-            nested: vec![escaping.clone(), owned.clone()],
+            nested: vec![
+                member.clone(),
+                silent.clone(),
+                standalone.clone(),
+                sibling.clone(),
+            ],
         };
 
-        promote_nested(&mut found, |dir| dir == escaping);
+        promote_nested(
+            &mut found,
+            &[
+                // Resolved by a root detection already holds.
+                NestedOwnership::Root(root.clone()),
+                NestedOwnership::Enclosing,
+                NestedOwnership::Standalone,
+                // Resolved by a directory this same batch promotes, which the run then evaluates.
+                NestedOwnership::Root(standalone.clone()),
+            ],
+        )?;
 
-        assert_eq!(found.primary, vec![root, escaping]);
-        assert_eq!(found.nested, vec![owned.clone()]);
-        assert_eq!(found.validation_only, vec![owned]);
+        assert_eq!(
+            found.primary,
+            vec![root, standalone],
+            "only the unresolved directory joins the detected roots"
+        );
+        assert_eq!(found.nested, vec![member, silent, sibling]);
+        Ok(())
     }
 
     #[test]
-    fn promotion_without_escaping_roots_changes_nothing() {
+    fn promotion_without_unresolved_directories_changes_nothing() -> Result<(), CoreError> {
         let root = Utf8PathBuf::from("/repo");
         let mut found = crate::scan::ProjectMarkerDirs {
             primary: vec![root.clone()],
-            validation_only: vec![root.join("member")],
             nested: vec![root.join("member")],
         };
         let unchanged = found.clone();
 
-        promote_nested(&mut found, |_| false);
+        promote_nested(&mut found, &[NestedOwnership::Enclosing])?;
 
         assert_eq!(found, unchanged);
+        Ok(())
     }
 
+    /// A claim on a project the run never evaluates would leave the directory covered by a resolve
+    /// that never happens — the very shape the gate exists to catch — so it is an adapter bug, not
+    /// a coverage answer to trust.
     #[test]
-    fn validation_skips_manifests_owned_by_a_detected_workspace() {
+    fn promotion_rejects_a_claim_on_a_project_the_run_does_not_evaluate() {
         let root = Utf8PathBuf::from("/repo");
-        let sibling = Utf8PathBuf::from("/other");
-        let found = crate::scan::ProjectMarkerDirs {
+        let claimed = root.join("member");
+        let mut found = crate::scan::ProjectMarkerDirs {
             primary: vec![root.clone()],
-            validation_only: vec![root.clone(), root.join("member"), sibling.clone()],
-            nested: vec![],
+            nested: vec![claimed.clone(), root.join("pruned")],
         };
 
-        assert_eq!(validation_roots_outside_primary(&found), vec![sibling]);
+        let error = promote_nested(
+            &mut found,
+            &[
+                // `pruned` is nested but answered `Enclosing`, so the run never evaluates it.
+                NestedOwnership::Root(root.join("pruned")),
+                NestedOwnership::Enclosing,
+            ],
+        )
+        .expect_err("a claim on an unevaluated project must not be applied");
+
+        std::assert_matches!(&error, CoreError::System(message)
+            if message.contains(claimed.as_str()) && message.contains("does not"));
+    }
+
+    /// A misaligned answer could silently reassign ownership between directories, so it is a bug
+    /// report rather than a guess.
+    #[test]
+    fn promotion_rejects_answers_that_do_not_match_the_directories() {
+        let root = Utf8PathBuf::from("/repo");
+        let mut found = crate::scan::ProjectMarkerDirs {
+            primary: vec![root.clone()],
+            nested: vec![root.join("a"), root.join("b")],
+        };
+
+        let error = promote_nested(&mut found, &[NestedOwnership::Standalone])
+            .expect_err("a short answer list must not be applied");
+
+        std::assert_matches!(error, CoreError::System(_));
     }
 }

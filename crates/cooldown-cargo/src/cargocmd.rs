@@ -1197,6 +1197,12 @@ fn resolve_generated_roots(
 
 /// The crate's directory relative to the workspace root (`.` for a crate at the root). Cargo reports
 /// absolute manifest paths; relativizing keeps member paths short and workspace-portable.
+///
+/// A workspace may list a member outside its own directory (`members = ["../bridge"]`), so the
+/// result can climb with `..`. Collapsing such a member to `.` would report it as the root package,
+/// which is a different crate: every scoping and exclude decision downstream reads this path, and a
+/// `-C` into that member must find it where it is. The separator is `/` on every platform, since
+/// the path is reported and matched against folder globs.
 fn member_path(manifest_path: &str, workspace_root: &str) -> String {
     if manifest_path.is_empty() || workspace_root.is_empty() {
         return ".".to_string();
@@ -1205,15 +1211,11 @@ fn member_path(manifest_path: &str, workspace_root: &str) -> String {
         .parent()
         .unwrap_or_else(|| Utf8Path::new(""));
     let root = Utf8Path::new(workspace_root);
-    match dir.strip_prefix(root) {
-        // Joined with `/` rather than the native separator: the member path is reported and
-        // matched against folder globs, both `/`-separated on every platform.
-        Ok(rel) if !rel.as_str().is_empty() => rel
-            .components()
-            .map(|component| component.as_str())
-            .collect::<Vec<_>>()
-            .join("/"),
-        _ => ".".to_string(),
+    let relative = crate::ownership::relativize(root, dir);
+    if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative
     }
 }
 #[derive(serde::Deserialize)]
@@ -1379,10 +1381,8 @@ impl Cargo {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stale_lock_diagnostic(&stderr) {
-            return Err(CoreError::StaleLock(format!(
-                "Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`"
-            )));
+        if let Some(lock) = stale_lock_diagnostic(&stderr) {
+            return Err(CoreError::StaleLock(stale_lock_detail(dir, lock)));
         }
         Err(CoreError::Tool {
             tool: self.bin.clone(),
@@ -1604,8 +1604,11 @@ impl Cargo {
 
     /// Verifies `Cargo.lock` and returns the authoritative resolved graph when it is current.
     ///
-    /// Runs the same `cargo metadata --all-features --locked` as [`Self::metadata_locked`]; a
-    /// stale lock exits 101 with cargo's `--locked` message and yields `Ok(None)`.
+    /// Runs the same `cargo metadata --all-features --locked` as [`Self::metadata_locked`]; a lock
+    /// cargo refuses exits 101 with its `--locked` message, which becomes
+    /// [`CoreError::StaleLock`] carrying the detail that names the project and its remedy. The
+    /// error is propagated rather than flattened into a bare "not current", so a caller reporting
+    /// lock currency can reuse that detail instead of re-deriving one.
     /// The probe deliberately does not pass `--offline`: `cargo metadata` reads every package's
     /// manifest, so on a checkout whose crates are not cached it would fail to download them,
     /// and offline cargo also narrows the resolver to cached versions, which turns a stale lock
@@ -1613,19 +1616,17 @@ impl Cargo {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, [`CoreError::Config`] if a
-    /// declared generated member names no workspace member, or [`CoreError::Tool`] if it fails
-    /// for a reason other than a stale lock.
+    /// Returns [`CoreError::StaleLock`] when the lock is stale or absent,
+    /// [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, [`CoreError::Config`] if a declared
+    /// generated member names no workspace member, or [`CoreError::Tool`] if it fails for any
+    /// other reason.
     pub async fn verify_locked(
         &self,
         dir: &Utf8Path,
         generated: &GeneratedMembers,
-    ) -> Result<Option<ResolvedGraph>, CoreError> {
-        match self.run_locked_metadata(dir).await {
-            Ok(stdout) => Self::parse_graph(&stdout, generated).map(Some),
-            Err(CoreError::StaleLock(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
+    ) -> Result<ResolvedGraph, CoreError> {
+        let stdout = self.run_locked_metadata(dir).await?;
+        Self::parse_graph(&stdout, generated)
     }
 
     /// Pins the crates.io `name@from` node to exactly `to` via `cargo update -p <spec>
@@ -1703,10 +1704,55 @@ impl Cargo {
     }
 }
 
-fn stale_lock_diagnostic(stderr: &str) -> bool {
-    stderr.contains("needs to be updated but --locked was passed")
-        || (stderr.contains("cannot update the lock file")
-            && stderr.contains("because --locked was passed to prevent this"))
+/// Which `--locked` refusal cargo raised: one condition for cooldown (`stale_lock`), two remedies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRefusal {
+    /// `cannot create the lock file …`: there is no lock at all.
+    Missing,
+    /// `needs to be updated` / `cannot update the lock file …`: a lock exists but no longer matches
+    /// the manifests.
+    Stale,
+}
+
+/// The `stale_lock` detail for the project at `dir`, naming the project and the remedy that fits
+/// the refusal cargo actually raised.
+///
+/// The same diagnostic kind covers both shapes (the `--allow-stale-lock` contract is "a stale or
+/// absent lock"), but the remedies differ: generating a lock from scratch resolves every crate to
+/// its newest release, which is precisely what the gate rejects, so the absent-lock text has to say
+/// what comes after generating it. It names no flag that only some commands accept — the same text
+/// reaches `upgrade`, `fix`, and `baseline`, where `--lock` does not exist.
+pub(crate) fn stale_lock_detail(dir: &Utf8Path, refusal: LockRefusal) -> String {
+    match refusal {
+        LockRefusal::Stale => {
+            format!("Cargo.lock is stale in {dir}; run `cargo update` or `cargo generate-lockfile`")
+        }
+        LockRefusal::Missing => format!(
+            "Cargo.lock is missing in {dir}; run `cargo generate-lockfile` there and commit the \
+             lock, then `cooldown fix` to mature the fresh resolve, or exclude the directory with \
+             `exclude-folders` if the crate is never built"
+        ),
+    }
+}
+
+/// Reads cargo's own refusal rather than probing the filesystem, so the remedy always matches what
+/// cargo just complained about.
+///
+/// Cargo spells the refusal three ways: the manifest-update wording, `cannot update` when a lock
+/// exists but no longer matches the manifests, and `cannot create` when there is no lock at all
+/// (`ops::lockfile::write_pkg_lockfile` picks the verb from the file's existence).
+fn stale_lock_diagnostic(stderr: &str) -> Option<LockRefusal> {
+    if !stderr.contains("because --locked was passed to prevent this") {
+        return stderr
+            .contains("needs to be updated but --locked was passed")
+            .then_some(LockRefusal::Stale);
+    }
+    if stderr.contains("cannot create the lock file") {
+        return Some(LockRefusal::Missing);
+    }
+    stderr
+        .contains("cannot update the lock file")
+        .then_some(LockRefusal::Stale)
 }
 
 #[cfg(test)]
@@ -1714,6 +1760,72 @@ mod tests {
     use super::*;
     use color_eyre::eyre;
     use indoc::{formatdoc, indoc};
+
+    /// The two refusals share the `stale_lock` kind but not the remedy: a lock generated from
+    /// scratch resolves everything to its newest release, so the absent-lock text has to carry the
+    /// maturing step that follows. Neither text may name a flag only some commands accept — the
+    /// same detail reaches `upgrade`, `fix`, and `baseline`, which reject `--lock`.
+    #[test]
+    fn stale_lock_detail_distinguishes_an_absent_lock_from_a_stale_one() {
+        let root = Utf8Path::new("/repo/fuzz");
+
+        let missing = stale_lock_detail(root, LockRefusal::Missing);
+        assert_eq!(
+            missing,
+            "Cargo.lock is missing in /repo/fuzz; run `cargo generate-lockfile` there and commit \
+             the lock, then `cooldown fix` to mature the fresh resolve, or exclude the directory \
+             with `exclude-folders` if the crate is never built"
+        );
+        assert!(
+            !missing.contains("--lock"),
+            "the detail reaches commands that reject `--lock`: {missing}"
+        );
+
+        assert_eq!(
+            stale_lock_detail(root, LockRefusal::Stale),
+            "Cargo.lock is stale in /repo/fuzz; run `cargo update` or `cargo generate-lockfile`"
+        );
+    }
+
+    /// Cargo refuses a missing lock under `--locked` with `cannot create`, not `cannot update`;
+    /// both are the same stale-lock condition, and which verb it used picks the remedy.
+    #[test]
+    fn stale_lock_diagnostic_reads_the_refusal_cargo_raised() {
+        assert_eq!(
+            stale_lock_diagnostic(
+                "error: cannot create the lock file /repo/Cargo.lock because --locked was passed to prevent this"
+            ),
+            Some(LockRefusal::Missing)
+        );
+        assert_eq!(
+            stale_lock_diagnostic(
+                "error: cannot update the lock file /repo/Cargo.lock because --locked was passed to prevent this"
+            ),
+            Some(LockRefusal::Stale)
+        );
+        assert_eq!(
+            stale_lock_diagnostic(
+                "error: the manifest file needs to be updated but --locked was passed to prevent this"
+            ),
+            Some(LockRefusal::Stale)
+        );
+        // A lock cargo could not read or parse is a tool failure, not a refusal to write one:
+        // `--allow-stale-lock` must never wave those through.
+        assert_eq!(
+            stale_lock_diagnostic("error: no matching package named `x`"),
+            None
+        );
+        assert_eq!(
+            stale_lock_diagnostic(
+                "failed to read lock file while --locked was passed: permission denied"
+            ),
+            None
+        );
+        assert_eq!(
+            stale_lock_diagnostic("failed to parse lock file: invalid TOML"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn locked_metadata_rejects_a_stale_lock_without_rewriting_it() -> eyre::Result<()> {
@@ -1800,8 +1912,8 @@ mod tests {
         assert!(
             cargo
                 .verify_locked(root, &GeneratedMembers::undeclared())
-                .await?
-                .is_some()
+                .await
+                .is_ok()
         );
 
         std::fs::write(root.join("Cargo.toml"), manifest("0.2.0"))?;
@@ -1823,8 +1935,8 @@ mod tests {
         assert!(
             cargo
                 .verify_locked(root, &GeneratedMembers::undeclared())
-                .await?
-                .is_some(),
+                .await
+                .is_ok(),
             "the refreshed lock is current again"
         );
 
@@ -1851,22 +1963,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_classification_matches_only_cargos_update_diagnostic() {
-        assert!(stale_lock_diagnostic(
-            "the lock file /tmp/Cargo.lock needs to be updated but --locked was passed to prevent this"
-        ));
-        assert!(stale_lock_diagnostic(
-            "cannot update the lock file /tmp/Cargo.lock because --locked was passed to prevent this"
-        ));
-        assert!(!stale_lock_diagnostic(
-            "failed to read lock file while --locked was passed: permission denied"
-        ));
-        assert!(!stale_lock_diagnostic(
-            "failed to parse lock file: invalid TOML"
-        ));
-    }
-
-    #[test]
     fn member_path_relativizes_workspace_members() {
         assert_eq!(
             member_path("/repo/crates/app/Cargo.toml", "/repo"),
@@ -1883,6 +1979,20 @@ mod tests {
         assert_eq!(
             member_path("C:\\repo\\crates\\app\\Cargo.toml", "C:\\repo"),
             "crates/app"
+        );
+    }
+
+    /// A `members = ["../bridge"]` entry puts a member outside the workspace directory; it has to
+    /// keep its own identity rather than collapse onto the root package.
+    #[test]
+    fn member_path_climbs_out_of_the_workspace_directory() {
+        assert_eq!(
+            member_path("/repo/bridge/Cargo.toml", "/repo/owner"),
+            "../bridge"
+        );
+        assert_eq!(
+            member_path("/repo/bridge/child/Cargo.toml", "/repo/owner"),
+            "../bridge/child"
         );
     }
 

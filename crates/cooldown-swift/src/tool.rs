@@ -87,13 +87,13 @@ impl ToolRead for SwiftTool {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
-        cooldown_core::ProjectDetection::Primary(ProjectMarker {
-            lockfile: "Package.resolved",
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        ProjectMarker {
+            marker: "Package.resolved",
             manifest: "Package.swift",
             alternate_manifests: &[],
             workspace_root: false,
-        })
+        }
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {

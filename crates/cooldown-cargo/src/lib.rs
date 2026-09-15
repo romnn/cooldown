@@ -9,6 +9,7 @@ pub mod index;
 mod lockfile;
 mod manifest;
 mod native;
+mod ownership;
 mod publication;
 mod staging;
 #[cfg(test)]
@@ -23,6 +24,24 @@ pub const CARGO_ID: ToolId = ToolId("cargo");
 
 /// The manifest cargo records and rewrites, which names the family its project lease guards.
 pub const CARGO_MANIFEST: &str = "Cargo.toml";
+
+/// How Cargo projects are detected below a scan root, declared once for every caller (the adapter
+/// itself and the recovery scan, which must look for the same thing).
+///
+/// The `Cargo.toml` is what marks a Cargo project, not the lock: a manifest whose lock is missing
+/// is a project cooldown cannot evaluate, not one that is absent, and detecting it by the lock let
+/// it pass the gate unevaluated. Whether a usable `Cargo.lock` exists is decided later by the
+/// lock-currency probe, which reports a missing one as `stale_lock`.
+///
+/// A `Cargo.toml` marks a workspace root: `cargo metadata` there already covers every member, so
+/// nested manifests below it are not separate projects — except those no root above them owns,
+/// which [`ownership`] recognizes and the orchestrator turns back into projects.
+pub const PROJECT_MARKER: cooldown_core::ProjectMarker = cooldown_core::ProjectMarker {
+    marker: CARGO_MANIFEST,
+    manifest: CARGO_MANIFEST,
+    alternate_manifests: &[],
+    workspace_root: true,
+};
 
 /// The project-relative marker for an interrupted Cargo mutation transaction.
 pub const RECOVERY_MARKER: &str = publication::RECOVERY_MARKER;

@@ -8,8 +8,7 @@ use cooldown_cargo::{
     recovery_authority_projects,
 };
 use cooldown_core::{
-    CoreError, Diagnostic, DiagnosticKind, ProjectDetection, ProjectMarker, ToolId,
-    recognized_tool_names, tool_id,
+    CoreError, Diagnostic, DiagnosticKind, ToolId, recognized_tool_names, tool_id,
 };
 
 struct RecoveryOption {
@@ -333,15 +332,7 @@ fn cargo_recovery_discovery(
     }));
     let detected = scan::find_project_marker_dirs_batch(
         root,
-        &[ProjectDetection::PrimaryWithValidation {
-            primary: ProjectMarker {
-                lockfile: "Cargo.lock",
-                manifest: "Cargo.toml",
-                alternate_manifests: &[],
-                workspace_root: true,
-            },
-            validation_marker: "Cargo.toml",
-        }],
+        &[cooldown_cargo::PROJECT_MARKER],
         scan::WalkPolicy {
             respect_gitignore,
             exclude: &[],
@@ -355,15 +346,13 @@ fn cargo_recovery_discovery(
     authoritative.sort();
     authoritative.dedup();
 
-    let mut roots = authoritative.clone();
-    roots.extend(detected.validation_only.into_iter().filter(|manifest| {
-        !authoritative
-            .iter()
-            .any(|known| manifest.starts_with(known) || known.starts_with(manifest))
-    }));
-    roots.sort();
-    roots.dedup();
-    Ok(CargoRecoveryDiscovery { roots, warnings })
+    // The marked directories are exactly the manifest roots now, so there is no second set to
+    // merge: a nested one the scan dropped is reached through its own recovery artifact, which the
+    // artifact walk above finds regardless of ownership.
+    Ok(CargoRecoveryDiscovery {
+        roots: authoritative,
+        warnings,
+    })
 }
 
 fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
@@ -616,6 +605,7 @@ mod tests {
         let root = temp_root.as_path();
         let nested = root.join("tools/independent");
         std::fs::create_dir_all(&nested)?;
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
         std::fs::write(root.join("Cargo.lock"), "")?;
         std::fs::write(nested.join(RECOVERY_MARKER), "{}")?;
 

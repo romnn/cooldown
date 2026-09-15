@@ -729,13 +729,13 @@ mod tests {
             }
         }
 
-        fn project_detection(&self) -> cooldown_core::ProjectDetection {
-            cooldown_core::ProjectDetection::Primary(ProjectMarker {
-                lockfile: "lock",
+        fn project_marker(&self) -> cooldown_core::ProjectMarker {
+            ProjectMarker {
+                marker: "lock",
                 manifest: "manifest",
                 alternate_manifests: &[],
                 workspace_root: true,
-            })
+            }
         }
 
         async fn dependencies(

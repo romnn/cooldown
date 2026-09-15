@@ -461,6 +461,7 @@ dependencies = [
  "cooldown-core",
  "cooldown-registry",
  "cooldown-toml-util",
+ "globset",
  "indoc",
  "jiff",
  "libc",

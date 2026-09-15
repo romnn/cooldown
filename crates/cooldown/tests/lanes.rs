@@ -10,8 +10,8 @@ use cooldown::app::{AdapterSet, Baseline, ProjectCtx, RunOpts, Workspace};
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     Capabilities, CoreError, DepScope, Dependency, LockStatus, LockVerifyReport, MajorKey,
-    NativePolicyLayer, PackageId, PolicyStack, Project, ProjectDetection, ProjectMarker, Release,
-    ReleaseOrder, ReleaseQuality, ToolId, ToolRead, ToolWrite, UpdateKind, Version,
+    NativePolicyLayer, PackageId, PolicyStack, Project, ProjectMarker, Release, ReleaseOrder,
+    ReleaseQuality, ToolId, ToolRead, ToolWrite, UpdateKind, Version,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,13 +112,13 @@ impl ToolRead for LaneFake {
         Capabilities::default()
     }
 
-    fn project_detection(&self) -> ProjectDetection {
-        ProjectDetection::Primary(ProjectMarker {
-            lockfile: "lock",
+    fn project_marker(&self) -> ProjectMarker {
+        ProjectMarker {
+            marker: "lock",
             manifest: self.manifest,
             alternate_manifests: &[],
             workspace_root: true,
-        })
+        }
     }
 
     async fn dependencies(

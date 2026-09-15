@@ -215,13 +215,13 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
-        cooldown_core::ProjectDetection::Primary(ProjectMarker {
-            lockfile: L::LOCKFILE,
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        ProjectMarker {
+            marker: L::LOCKFILE,
             manifest: L::LOCKFILE,
             alternate_manifests: &[],
             workspace_root: false,
-        })
+        }
     }
 
     fn lease_family(&self, project: &Project) -> ManifestFamily {

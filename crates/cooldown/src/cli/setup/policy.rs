@@ -150,20 +150,7 @@ async fn assemble_ctx(
     }
 
     let strict_native = compute_strict_native(&layers, assembly.invocation);
-    let rel_path = project
-        .root
-        .strip_prefix(assembly.scan_root)
-        .ok()
-        .map_or_else(
-            || project.root.clone(),
-            |path| {
-                if path.as_str().is_empty() {
-                    Utf8PathBuf::from(".")
-                } else {
-                    path.to_owned()
-                }
-            },
-        );
+    let rel_path = scan_relative_project(&project.root, assembly.scan_root);
 
     // The resolution window the project's resolver should honor, as a uv `exclude-newer` value. Tools
     // that accept a publish-time cutoff (uv) pass this so the lock resolves against cooldown's own
@@ -211,10 +198,70 @@ async fn assemble_ctx(
     })
 }
 
+/// A project's identity within the run: its root relative to the scan root, `.` for the scan root
+/// itself, and the absolute root when it lies outside the scan (a selection above it).
+///
+/// The segments are joined with `/` rather than `Utf8Path`'s native separator, because this value
+/// leaves the process as data — the `project` field of every diagnostic and JSON report row — and
+/// is matched against `/`-separated folder globs. A Windows run must spell it the same way.
+fn scan_relative_project(root: &Utf8Path, scan_root: &Utf8Path) -> Utf8PathBuf {
+    let Ok(relative) = root.strip_prefix(scan_root) else {
+        return root.to_owned();
+    };
+    if relative.as_str().is_empty() {
+        return Utf8PathBuf::from(".");
+    }
+    Utf8PathBuf::from(
+        relative
+            .components()
+            .map(|component| component.as_str())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 fn compute_strict_native(layers: &[PolicyLayer], invocation: &ResolvedInvocation) -> bool {
     match invocation.strict_native() {
         StrictNativeMode::ForceOff => false,
         StrictNativeMode::ForceOn => true,
         StrictNativeMode::Inherit => layers.iter().any(|layer| layer.strict_native == Some(true)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_relative_project;
+    use camino::{Utf8Path, Utf8PathBuf};
+
+    #[test]
+    fn project_identity_is_relative_to_the_scan_root() {
+        let scan_root = Utf8Path::new("/repo");
+        assert_eq!(
+            scan_relative_project(Utf8Path::new("/repo"), scan_root),
+            Utf8PathBuf::from(".")
+        );
+        assert_eq!(
+            scan_relative_project(Utf8Path::new("/repo/tools/x"), scan_root),
+            Utf8PathBuf::from("tools/x")
+        );
+        // A project outside the scan has no relative identity; its own root is the honest answer.
+        assert_eq!(
+            scan_relative_project(Utf8Path::new("/elsewhere/app"), scan_root),
+            Utf8PathBuf::from("/elsewhere/app")
+        );
+    }
+
+    /// The identity is reported and glob-matched, so it spells `/` even where the platform's own
+    /// separator is `\`.
+    #[cfg(windows)]
+    #[test]
+    fn project_identity_is_slash_separated_on_windows() {
+        assert_eq!(
+            scan_relative_project(
+                Utf8Path::new("C:\\repo\\tools\\x"),
+                Utf8Path::new("C:\\repo")
+            ),
+            Utf8PathBuf::from("tools/x")
+        );
     }
 }

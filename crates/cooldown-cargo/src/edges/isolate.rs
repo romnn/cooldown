@@ -85,7 +85,7 @@ async fn apply_transaction(
         .verify_locked(&project.root, &project.generated_members)
         .await
     {
-        Ok(Some(graph)) => {
+        Ok(graph) => {
             transaction.accept()?;
             transaction.commit()?;
             Ok(RewriteApplication {
@@ -96,7 +96,9 @@ async fn apply_transaction(
                 },
             })
         }
-        Ok(None) => {
+        // A lock cargo will not accept is this candidate's verdict, not a run failure: fall back
+        // to isolating the rewrites one at a time.
+        Err(cooldown_core::CoreError::StaleLock(_)) => {
             transaction.reject()?;
             let committed =
                 isolate_rewrites(cargo, project, resolver_text, guarded, transaction).await?;
@@ -382,11 +384,13 @@ async fn try_candidate(
         .verify_locked(&project.root, &project.generated_members)
         .await
     {
-        Ok(Some(graph)) => {
+        Ok(graph) => {
             transaction.accept()?;
             Ok(Ok((candidate_text, graph)))
         }
-        Ok(None) => {
+        // The staged lock is one cargo refuses: the candidate failed verification, which the
+        // caller reports as such rather than failing the run.
+        Err(cooldown_core::CoreError::StaleLock(_)) => {
             transaction.reject()?;
             Ok(Err(CandidateFailure::Verification))
         }

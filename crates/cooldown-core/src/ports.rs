@@ -11,8 +11,8 @@ use crate::error::{CoreError, Result};
 use crate::fs::ManifestFamily;
 use crate::model::{
     ApplyReport, ArtifactId, CandidateScope, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, Plan, Project, ProjectDetection, Release, ToolId, UpdateKind, VerifyReport,
-    Version,
+    LockVerifyReport, NestedOwnership, Plan, Project, ProjectMarker, Release, ToolId, UpdateKind,
+    VerifyReport, Version,
 };
 use crate::mutation::{AcceptedProjectState, ProjectMutationJournal, ProjectMutationState};
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
@@ -93,15 +93,15 @@ pub trait ToolRead: Send + Sync {
     /// returned value must accurately reflect the features this adapter actually supports.
     fn capabilities(&self) -> Capabilities;
 
-    /// Declares how projects of this tool are detected below a scan root.
+    /// Declares the marker by which projects of this tool are detected below a scan root.
     ///
-    /// The orchestrator performs one gitignore-aware, exclude-aware scan for both primary and
-    /// validation-only markers.
+    /// The orchestrator performs one gitignore-aware, exclude-aware scan for every adapter's
+    /// marker.
     /// An adapter neither walks the tree nor decides `.gitignore` or exclude policy itself.
-    fn project_detection(&self) -> ProjectDetection;
+    fn project_marker(&self) -> ProjectMarker;
 
     /// Names the manifest family whose lease guards `project`: the file this tool rewrites at
-    /// the root, which is the primary marker's manifest unless the adapter says otherwise.
+    /// the root, which is the marker's manifest unless the adapter says otherwise.
     ///
     /// Tools of one family take turns at a root, since they rewrite the same file; tools of
     /// different families run side by side.
@@ -114,41 +114,38 @@ pub trait ToolRead: Send + Sync {
     /// A tool that rewrites either of two spellings (deno's `deno.json` or `deno.jsonc`) keeps
     /// one family for both, since the family is a lease key rather than a path.
     fn lease_family(&self, _project: &Project) -> ManifestFamily {
-        ManifestFamily::named(self.project_detection().primary().manifest)
+        ManifestFamily::named(self.project_marker().manifest)
     }
 
-    /// Validates manifest roots found without the adapter's declared lockfile marker.
-    ///
-    /// The orchestrator calls this only for validation markers declared by
-    /// [`Self::project_detection`].
-    /// It lets an adapter audit shared discovery inputs once and reject unsupported alternate state
-    /// without treating validation-only markers as detected projects.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`CoreError`](crate::CoreError) when a manifest selects project state outside the
-    /// adapter's supported filesystem model.
-    fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {
-        if let Some(root) = roots.first() {
-            return Err(CoreError::Config(format!(
-                "tool `{}` declared a validation-only project marker at {root} without implementing its validator",
-                self.id().as_str()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Decides whether a nested lockfile root escapes the enclosing detected project.
+    /// Reads how each of `nested` relates to the projects this run evaluates.
     ///
     /// For adapters that declare [`ProjectMarker::workspace_root`](crate::ProjectMarker), the
-    /// orchestrator keeps only the topmost lockfile directory, because a workspace-root resolve
-    /// already covers every member below it. That coverage claim is wrong for a nested directory
-    /// that is itself a workspace root the enclosing workspace merely excludes; an adapter
-    /// overrides this to recognize that shape from the nested manifest and turn the directory back
-    /// into a project of its own. `dir` always lies strictly below another detected project root
-    /// and carries the adapter's lockfile marker.
-    fn nested_lockfile_root_escapes(&self, _dir: &Utf8Path) -> bool {
-        false
+    /// orchestrator keeps only the topmost marked directory, because a workspace-root resolve
+    /// already covers what lies below it. That claim is wrong for a nested directory the resolve
+    /// does not actually reach — one that is a workspace root itself, one the enclosing root
+    /// excludes, one no `members` entry matches — and an adapter overrides this to say so. Every
+    /// `nested` entry lies strictly below a detected project root and carries the adapter's marker.
+    ///
+    /// The question is which *project* resolves the directory, so both sides of the scan are
+    /// handed over: `primary` is the roots detection accepted, `nested` the directories under
+    /// appeal. An adapter answers from those alone — it must not invent a project the run does not
+    /// evaluate, because a resolve that never happens covers nothing.
+    /// A [`Root`](NestedOwnership::Root) answer therefore names a directory that is either in
+    /// `primary` or answered [`Standalone`](NestedOwnership::Standalone) in the same batch; the
+    /// orchestrator rejects any other as a contract violation.
+    ///
+    /// The call is batched because `nested` holds every marked directory the topmost rule dropped —
+    /// each member of a large workspace — and an adapter is expected to memoize its manifest loads
+    /// across the batch rather than re-read one root manifest per member.
+    ///
+    /// The returned vector must be index-aligned with `nested`; the orchestrator rejects any other
+    /// length rather than guessing which answer belongs to which directory.
+    fn nested_ownership(
+        &self,
+        _primary: &[Utf8PathBuf],
+        nested: &[Utf8PathBuf],
+    ) -> Vec<NestedOwnership> {
+        nested.iter().map(|_| NestedOwnership::Enclosing).collect()
     }
 
     /// Classifies a version-to-version movement using the adapter's native version semantics.

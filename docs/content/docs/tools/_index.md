@@ -33,6 +33,61 @@ should be declared in [`[tool.cargo] generated-members`]({{< relref "../configur
 its entries then follow every upgrade instead of being proposed (and reported `blocked`) as
 upgrades of their own. cooldown hints when an undeclared member carries the hakari marker.
 
+Cargo projects are detected by `Cargo.toml`. A nested manifest is a project of its own unless the
+resolve of a project the run evaluates already covers it — only a project that is actually
+evaluated can cover anything, so a workspace that was pruned, ignored, or simply never scanned
+covers nothing.
+
+A workspace resolves its members: the directories its `members` globs match (`crates/*` matches
+`crates/x`, not `crates/x/y`, as in cargo, and `./a` and `a/` mean the directory `a`), the root
+package itself when the root manifest declares `[package]`, and the path dependencies those pull in
+— which cargo makes members too, whether they lie inside the workspace directory or outside it with
+their own `package.workspace` pointing back at this root — minus whatever `exclude` names, unless
+`members` names it as well. A member's `dep = { workspace = true }` resolves through the root's
+`[workspace.dependencies]`, so the crate that entry's `path` names is a member's dependency like any
+other. Beyond the members, the resolve follows every `path` dependency they reach, through
+`[dependencies]`, `[build-dependencies]`, and the `[target.<cfg>.…]` forms. A plain `[package]` with
+no `[workspace]` table is the single member of its own implicit workspace and resolves the same
+closure from there.
+
+Two kinds of edge stop at the members. `[dev-dependencies]` count for members only, because cargo
+locks its members with dev units enabled but activates everything beyond them as an ordinary
+dependency, with dev-dependencies off — so a crate reachable only as a reached package's dev path
+dependency is in nobody's lock and is a project of its own. cooldown treats an `optional` path
+dependency of a reached package the same way, and that one is cooldown's own rule rather than
+cargo's: the edge is not followed whether or not a feature enables it, because which features are
+enabled is known only to the resolve. A crate reached only that way is therefore gated on its own
+lock — it reports a missing one rather than passing silently — or dropped with
+[`exclude-folders`]({{< relref "../configuration/excludes.md" >}}).
+
+A known limit runs the other way: a path dependency reached as a non-member has its own
+`[dev-dependencies]` in nobody's lock either, and cooldown gates the crate through the project that
+resolves it rather than gating what only its standalone test build would fetch.
+
+Two shapes are neither covered nor projects. A manifest declaring `[workspace]` is always a project
+— cargo forbids a workspace root from being another workspace's member. And a manifest an
+enclosing `[workspace]` neither lists in `members` nor `exclude`s stays with that workspace: cargo
+refuses to build such a crate on its own ("current package believes it's in a workspace when it's
+not"), so nothing resolves it and nothing can, which is exactly where fixture and template crates
+commonly sit. A `package.workspace` pointer is the exception — it asked to be a member of the root
+it names, so if that root does not list it, it is a project of its own rather than a silent one.
+Below a detected Cargo project, a vendored crate (`cargo vendor` output, marked by
+`.cargo-checksum.json`) and `cargo package`'s unpacked output under `target/package` are never
+projects: cargo loads neither as a package of the surrounding build.
+
+`-C`/`--dir` follows the same rule: pointing the run at a directory another project resolves runs
+*that* project, wherever its root sits — a workspace may list a member that is not below it — and
+scopes the report to what the selected directory declares.
+
+A detected project without a `Cargo.lock` is a `stale_lock` error naming it: its dependencies would
+otherwise resolve to whatever is newest at build time, which is exactly what the gate exists to
+prevent. Generate and commit the lock (`cargo generate-lockfile`; `check --lock` and `outdated
+--lock` do it in place), then run `cooldown fix` to mature the fresh resolve. `--allow-stale-lock`
+downgrades the failure to a warning and skips the project on `check`, `outdated`, `upgrade`, and
+`fix` (`baseline` still fails on it), so a clean summary then covers one project fewer;
+[`exclude-folders`]({{< relref "../configuration/excludes.md" >}}) drops a crate that is never
+built.
+
 Cargo projects must currently use the workspace-root `Cargo.lock`.
 Cooldown fails explicitly when Cargo's `resolver.lockfile-path` configuration or
 `CARGO_RESOLVER_LOCKFILE_PATH` selects a custom location, because safely staging, normalizing, and

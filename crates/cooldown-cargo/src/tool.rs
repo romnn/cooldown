@@ -28,14 +28,12 @@ use crate::native::parse_native;
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_adapter_util::{
-    RegistryVersionClassifier, build_registry_releases, verify_current_report,
-};
+use cooldown_adapter_util::{RegistryVersionClassifier, build_registry_releases};
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
     Dependency, Diagnostic, DiagnosticKind, EdgeNormalizationReport, EdgePolicy, EdgeRebind,
-    FetchContext, LockVerifyReport, MemberRef, MutationExecution, NativePolicyLayer, PackageId,
-    PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker, ProjectMutationFile,
+    FetchContext, LockStatus, LockVerifyReport, MemberRef, MutationExecution, NativePolicyLayer,
+    PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMutationFile,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
     Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
     VerifyReport, Version, fs::RecoveryAuthority,
@@ -327,32 +325,16 @@ impl ToolRead for CargoTool {
         }
     }
 
-    fn project_detection(&self) -> cooldown_core::ProjectDetection {
-        // A `Cargo.lock` marks a workspace root: `cargo metadata` there already covers every
-        // member, so nested lockfiles below it are not separate projects — except one whose own
-        // manifest declares `[workspace]`, which the enclosing workspace can only `exclude`;
-        // `nested_lockfile_root_escapes` turns that shape back into a project.
-        cooldown_core::ProjectDetection::PrimaryWithValidation {
-            primary: ProjectMarker {
-                lockfile: "Cargo.lock",
-                manifest: crate::CARGO_MANIFEST,
-                alternate_manifests: &[],
-                workspace_root: true,
-            },
-            validation_marker: crate::CARGO_MANIFEST,
-        }
+    fn project_marker(&self) -> cooldown_core::ProjectMarker {
+        crate::PROJECT_MARKER
     }
 
-    fn nested_lockfile_root_escapes(&self, dir: &Utf8Path) -> bool {
-        // A workspace root can never be a member of an enclosing workspace — cargo demands the
-        // outer workspace `exclude` it — so the enclosing resolve does not cover this tree and it
-        // must be resolved as its own project. A nested lockfile *without* a `[workspace]` table
-        // stays covered: it can only be a member's stale lockfile, which cargo ignores.
-        manifest::declares_workspace(&dir.join("Cargo.toml"))
-    }
-
-    fn validate_manifests_without_lock(&self, roots: &[Utf8PathBuf]) -> Result<()> {
-        crate::staging::reject_custom_lockfiles(roots)
+    fn nested_ownership(
+        &self,
+        primary: &[Utf8PathBuf],
+        nested: &[Utf8PathBuf],
+    ) -> Vec<cooldown_core::NestedOwnership> {
+        crate::ownership::nested_ownership(primary, nested)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -432,18 +414,19 @@ impl ToolRead for CargoTool {
             .verify_locked(&project.root, &project.generated_members)
             .await
         {
-            // The stale detail names the project: a repository can hold several Cargo locks (a
-            // parked nested workspace, standalone fuzz targets), and `check` prints the detail
-            // without the path, so a bare "Cargo.lock is stale" leaves the reader to guess which
-            // one to refresh.
-            Ok(graph) => Ok(verify_current_report(
-                graph.is_some(),
-                "Cargo.lock is current",
-                &format!(
-                    "Cargo.lock is stale in {}; run `cargo update` or `cargo generate-lockfile`",
-                    project.root
-                ),
-            )),
+            Ok(_) => Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: "Cargo.lock is current".to_string(),
+            }),
+            // The probe reports what cargo refused, verbatim: the detail already names the project
+            // — a repository can hold several Cargo locks (a parked nested workspace, standalone
+            // fuzz targets) and `check` prints the detail without the path — and already carries
+            // the remedy for the refusal cargo actually raised, so deriving a second one here
+            // could only disagree with it.
+            Err(CoreError::StaleLock(detail)) => Ok(LockVerifyReport {
+                status: LockStatus::Stale,
+                detail,
+            }),
             Err(e) => Err(e),
         }
     }
