@@ -25,7 +25,7 @@ use crate::app::change_key::{
 };
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
-    recovery_diagnostics,
+    recovery_diagnostics, stale_evaluation_skipped,
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
@@ -210,6 +210,15 @@ type MutationFlow = ControlFlow<MutationTerminated>;
 pub(super) enum ProjectRunStatus {
     Complete,
     Terminated,
+}
+
+/// Where in a project's run the dependency graph is being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphRead {
+    /// The first read, before anything about the project has been staged or written.
+    Initial,
+    /// A re-read after a round of the trial applied changes.
+    Replan,
 }
 
 /// One policy trial's verdict over a candidate group: committed outcomes to keep, the residual
@@ -466,7 +475,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             );
         }
         self.ctx.progress.phase("resolving dependency graph");
-        let Some(deps) = self.scoped_deps().await else {
+        let Some(deps) = self.scoped_deps(GraphRead::Initial).await else {
             return ProjectRunStatus::Terminated;
         };
         self.fetch_advisories(deps.clone()).await;
@@ -1237,7 +1246,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    async fn scoped_deps(&mut self) -> Option<Vec<Dependency>> {
+    /// The project's dependencies in the mode's scope, or `None` after recording why the graph
+    /// could not be read.
+    ///
+    /// A stale or absent lock met on the [`GraphRead::Initial`] read is a skip under
+    /// `--allow-stale-lock`: nothing about the project has been touched yet, so the project
+    /// contributes a warning and no rows, exactly as it does on the isolated path.
+    /// The same lock met on a [`GraphRead::Replan`] stays an error, because by then the trial has
+    /// moved the project's state and a silent skip would hide it.
+    async fn scoped_deps(&mut self, read: GraphRead) -> Option<Vec<Dependency>> {
         let mut scope = candidate_scope(self.mode);
         // Graph-wide *upgrade* planning is additionally gated on the engine: advancing a
         // transitive needs an apply mechanism that can pin a package no manifest declares. An
@@ -1266,7 +1283,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 scoped.deps
             }
             Err(error) => {
-                self.record_project_error(&error, None);
+                if read == GraphRead::Initial
+                    && self.ctx.opts.allow_stale_lock
+                    && matches!(error, cooldown_core::CoreError::StaleLock(_))
+                {
+                    let diagnostic = self.project_diag(&error, None);
+                    self.acc.warnings.push(stale_evaluation_skipped(diagnostic));
+                } else {
+                    self.record_project_error(&error, None);
+                }
                 return None;
             }
         };
@@ -1775,7 +1800,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.emit_fix_warnings(warnings);
                 return ControlFlow::Continue(());
             }
-            let Some(next) = self.scoped_deps().await else {
+            let Some(next) = self.scoped_deps(GraphRead::Replan).await else {
                 return ControlFlow::Continue(());
             };
             deps = next;
