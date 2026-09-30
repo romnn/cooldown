@@ -1792,6 +1792,168 @@ fn allow_stale_lock_skips_the_lockless_project_and_plans_the_rest() {
     );
 }
 
+/// `file` in the fixture directory `dir`, which is the fixture root when empty.
+fn under(dir: &str, file: &str) -> String {
+    if dir.is_empty() {
+        file.to_owned()
+    } else {
+        format!("{dir}/{file}")
+    }
+}
+
+/// A cargo workspace at `workspace` (the fixture root when empty) whose member `member` inherits
+/// `itoa` from `[workspace.dependencies]`, and a standalone project at `standalone` — its own empty
+/// `[workspace]`, as cargo-fuzz writes one — that reaches the member through a `path` dependency,
+/// so its resolve reads the workspace's manifest.
+/// Both locks are seeded current, with `itoa` on the old `0.4` line, so `upgrade --major` rewrites
+/// the workspace's requirement and stales the standalone lock mid-run.
+fn run_staled_fixture(workspace: &str, standalone: &str, member_from_standalone: &str) -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            &under(workspace, "Cargo.toml"),
+            indoc! {r#"
+                [workspace]
+                members = ["member"]
+                resolver = "2"
+
+                [workspace.dependencies]
+                itoa = "0.4"
+            "#},
+        )
+        .write(
+            &under(workspace, "member/Cargo.toml"),
+            indoc! {r#"
+                [package]
+                name = "member"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                itoa.workspace = true
+            "#},
+        )
+        .write(&under(workspace, "member/src/lib.rs"), "")
+        .write(
+            &under(standalone, "Cargo.toml"),
+            &formatdoc! {r#"
+                [package]
+                name = "fuzzish"
+                version = "0.1.0"
+                edition = "2021"
+
+                [workspace]
+
+                [dependencies.member]
+                path = "{member_from_standalone}"
+            "#},
+        )
+        .write(&under(standalone, "src/lib.rs"), "");
+    for dir in [workspace, standalone] {
+        fixture
+            .run_tool(
+                "cargo",
+                &[
+                    "generate-lockfile",
+                    "--manifest-path",
+                    &under(dir, "Cargo.toml"),
+                ],
+                &[],
+            )
+            .expect_success();
+    }
+    fixture
+}
+
+/// Runs `upgrade --major` over a [`run_staled_fixture`] and asserts the run absorbed the
+/// staleness it caused in the standalone project's lock: the run succeeds, the lock is current and
+/// on the workspace's matured `itoa`, the refresh is reported, and the result passes the gate.
+fn assert_run_absorbs_the_lock_it_staled(fixture: &Fixture, workspace: &str, standalone: &str) {
+    let upgraded = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+
+    // The staleness is the run's own doing, so it neither fails the run nor goes unreported.
+    assert!(
+        upgraded.ok(),
+        "a lock the run itself staled must not fail it: {:?}",
+        upgraded.error_messages()
+    );
+    assert!(
+        upgraded.warning_kinds().contains("stale_lock")
+            && upgraded.warning_projects().contains(standalone),
+        "the refresh must be reported against {standalone}, got {:?} {:?}",
+        upgraded.warning_projects(),
+        upgraded.warning_messages()
+    );
+    assert!(
+        upgraded
+            .warning_messages()
+            .iter()
+            .any(|message| message.contains("another project in this run changed a manifest")),
+        "the warning must name the cause, got {:?}",
+        upgraded.warning_messages()
+    );
+
+    // The run leaves no lock stale behind it: cargo itself accepts the standalone lock as is.
+    let manifest = under(standalone, "Cargo.toml");
+    fixture
+        .run_tool(
+            "cargo",
+            &[
+                "metadata",
+                "--locked",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                &manifest,
+            ],
+            &[],
+        )
+        .expect_success();
+
+    // The refresh resolves `itoa` to the newest `1.x`, which is too fresh under the freeze; the
+    // gate pass rolls it back to the matured release the workspace adopted.
+    let workspace_itoa = toml_lock_pins(&fixture.read_bytes(&under(workspace, "Cargo.lock")))
+        .get("itoa")
+        .cloned();
+    let standalone_itoa = toml_lock_pins(&fixture.read_bytes(&under(standalone, "Cargo.lock")))
+        .get("itoa")
+        .cloned();
+    assert!(
+        workspace_itoa
+            .as_deref()
+            .is_some_and(|version| version.starts_with("1.")),
+        "the workspace must adopt the matured 1.x line, got {workspace_itoa:?}"
+    );
+    assert_eq!(standalone_itoa, workspace_itoa);
+    let checked = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(
+        checked.ok(),
+        "the refreshed lock must pass the gate: {:?}",
+        checked.error_messages()
+    );
+}
+
+/// The root workspace runs first and rewrites `[workspace.dependencies]`, which stales the
+/// standalone project's lock before its turn: the turn refreshes and gates the lock instead of
+/// failing on it.
+#[test]
+fn upgrade_refreshes_a_lock_an_earlier_project_staled() {
+    skip_if_missing!("cargo");
+    let fixture = run_staled_fixture("", "fuzz", "../member");
+
+    assert_run_absorbs_the_lock_it_staled(&fixture, "", "fuzz");
+}
+
+/// The standalone project sorts first, so the workspace stales its lock only after its turn: the
+/// run probes again once every project ran and re-runs the staled one.
+#[test]
+fn upgrade_reruns_a_project_a_later_project_staled() {
+    skip_if_missing!("cargo");
+    let fixture = run_staled_fixture("b", "a", "../b/member");
+
+    assert_run_absorbs_the_lock_it_staled(&fixture, "b", "a");
+}
+
 /// A monorepo whose root config excludes both a nested incubator workspace and one of its own
 /// members, each workspace seeded with its own lock by the real cargo.
 fn excluded_subtrees_fixture() -> Fixture {

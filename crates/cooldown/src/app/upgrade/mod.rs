@@ -10,9 +10,11 @@
 //! downgrading too-fresh pins.
 
 mod executor;
+mod run_staled;
 
 pub(super) use self::executor::target_package_for;
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
+use self::run_staled::{CurrentAtStart, ProjectPass, TurnLock, refresh_gate};
 use super::advisories::ProjectAdvisories;
 use super::lanes::LaneAccess;
 use super::{
@@ -182,42 +184,104 @@ impl Workspace {
     }
 
     async fn run_plan(&self, opts: &RunOpts, mode: PlanMode) -> UpgradeOutcome {
+        // One project can stale another's lock by rewriting a manifest it resolves against;
+        // knowing which locks were current before anything moved tells the run which staleness
+        // it caused (see `run_staled`).
+        let mut current_at_start = self.locks_current_at_start(opts).await;
         // A source mutation holds an exclusive lease, which decides how far the tools' lanes may
         // overlap (see `LaneAccess`); a dry run mutates a copy under a shared one.
         let lanes = self.lanes(opts, LaneAccess::for_mutation(opts));
+        let tracked = &current_at_start;
         let projects = lanes
-            .run(|pctx| self.run_plan_project(pctx, opts, mode))
+            .run(|pctx| async move {
+                ProjectPass {
+                    pctx,
+                    acc: self.run_plan_project(pctx, opts, mode, tracked).await,
+                }
+            })
             .await;
         let mut acc = UpgradeAccum {
             build_requested: opts.build,
             ..UpgradeAccum::default()
         };
-        for project in projects {
+        for ProjectPass { pctx, acc: project } in projects {
+            current_at_start.settle(pctx, &project);
             merge_upgrade_accum(&mut acc, project);
         }
+        self.rerun_staled_projects(opts, mode, current_at_start, &mut acc)
+            .await;
         finalize_outcome(opts, acc)
     }
 
     /// Plans and applies one project's changes, reporting into its own accumulator.
+    ///
+    /// A project in `current_at_start` whose lock the run has staled since is refreshed first,
+    /// and a `fix` pass gates what the refresh resolved before the requested `mode` runs.
     async fn run_plan_project(
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         mode: PlanMode,
+        current_at_start: &CurrentAtStart,
     ) -> UpgradeAccum {
         let mut acc = UpgradeAccum::default();
         let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
-        let Some(reader) = self.adapter(pctx.tool) else {
+        if self.adapter(pctx.tool).is_none() {
             return acc;
-        };
+        }
         let Some(writer) = self.mutator(pctx.tool) else {
             acc.errors.push(read_only_mutator_diag(pctx));
             return acc;
         };
+        if current_at_start.contains(pctx) {
+            match self
+                .refresh_run_staled_lock(pctx, opts, writer, &progress, &mut acc)
+                .await
+            {
+                TurnLock::Unchanged => {}
+                TurnLock::Refreshed => {
+                    if let Some(gate) = refresh_gate(mode) {
+                        // Only the requested pass builds, so the project is built once, from the
+                        // state the run leaves it in.
+                        let gate_opts = RunOpts {
+                            build: false,
+                            ..opts.clone()
+                        };
+                        let errors = acc.errors.len();
+                        self.run_plan_pass(pctx, &gate_opts, gate, &progress, &mut acc)
+                            .await;
+                        // A project the gate pass could not settle is reported already, and the
+                        // requested pass would start from a state the gate never accepted.
+                        if acc.errors.len() > errors {
+                            return acc;
+                        }
+                    }
+                }
+                TurnLock::Failed => return acc,
+            }
+        }
+        self.run_plan_pass(pctx, opts, mode, &progress, &mut acc)
+            .await;
+        acc
+    }
+
+    /// Runs one `mode` pass over a project, through its adapter's mutation execution, into `acc`.
+    async fn run_plan_pass(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        mode: PlanMode,
+        progress: &ProjectProgress,
+        acc: &mut UpgradeAccum,
+    ) {
+        let (Some(reader), Some(writer)) = (self.adapter(pctx.tool), self.mutator(pctx.tool))
+        else {
+            return;
+        };
         if let MutationExecution::Isolated(strategy) = writer.mutation_execution() {
-            self.run_isolated_source_project(pctx, opts, mode, strategy, &mut acc, &progress)
+            self.run_isolated_source_project(pctx, opts, mode, strategy, acc, progress)
                 .await;
-            return acc;
+            return;
         }
 
         // Under `--dry-run`, run the same mutation and verification flow against a throwaway
@@ -262,7 +326,7 @@ impl Workspace {
                         pctx.rel_path.as_str(),
                         None,
                     ));
-                    return acc;
+                    return;
                 }
             }
         };
@@ -279,23 +343,22 @@ impl Workspace {
                 writer,
                 pctx: effective_pctx,
                 opts,
-                progress: &progress,
+                progress,
                 repo_root: self.repo_root(),
                 source_root: &pctx.project.root,
                 access,
                 defer_build: false,
             },
             mode,
-            &mut acc,
+            acc,
         )
         .run()
         .await;
         // The whole scratch tree is spelled as the source ancestor it was staged from, so a
         // staged sibling (an out-of-tree path dependency) is relabeled with the project.
         if let Some((scratch, ancestor)) = &dry_roots {
-            relabel_copy_paths(&mut acc, scratch, ancestor);
+            relabel_copy_paths(acc, scratch, ancestor);
         }
-        acc
     }
 
     /// Runs preselected upgrade targets through the complete policy trial in a project copy,

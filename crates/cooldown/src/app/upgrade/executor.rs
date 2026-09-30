@@ -64,7 +64,7 @@ impl PlanMode {
     /// The `--transitive` gate this run plans and gates under — the single source both the
     /// candidate scope and the post-apply residual gate read, so a contradictory pairing is not
     /// constructible past the mode itself.
-    const fn transitive_mode(self) -> TransitiveGate {
+    pub(super) const fn transitive_mode(self) -> TransitiveGate {
         match self {
             PlanMode::Upgrade { transitive } | PlanMode::Fix { transitive, .. } => transitive,
         }

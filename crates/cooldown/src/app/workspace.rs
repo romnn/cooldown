@@ -1039,6 +1039,22 @@ impl Workspace {
                 guard: None,
             });
         }
+        self.refresh_lock_under_lease(pctx, writer, progress).await
+    }
+
+    /// Refreshes one project's lock with `writer` under a newly acquired exclusive project lease,
+    /// settling any interrupted mutation first.
+    ///
+    /// Unlike [`Self::refresh_project_lock`], this is not gated on `--lock`: a mutating run also
+    /// refreshes a lock its own earlier projects staled.
+    /// The caller must not already hold the project's lease, since a same-process conflict on it
+    /// fails at once; the returned guard keeps the lease until the caller drops it.
+    pub(crate) async fn refresh_lock_under_lease(
+        &self,
+        pctx: &ProjectCtx,
+        writer: &dyn ToolWrite,
+        progress: &ProjectProgress,
+    ) -> cooldown_core::Result<LockRefresh> {
         progress.phase("refreshing lock state");
         let guard = ProjectAccessWriteGuard::acquire_async(
             self.repo_root(),

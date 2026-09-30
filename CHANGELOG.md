@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **A lock the run staled itself no longer fails `upgrade` or `fix`.** In a monorepo whose
+  cargo-fuzz crates and nested workspace reach root workspace members through `path` dependencies,
+  `upgrade --major` rewrote the root's `[workspace.dependencies]` (`html5ever = "0.39"` to
+  `"0.40.1"`), which staled the other projects' locks mid-run; each then failed with
+  `Cargo.lock is stale in …/incubator` and the run exited `4`, although every lock had been current
+  when it started. A source-mutating run over several projects of one tool now records which locks
+  are current before anything moves (for the tools `--lock` can refresh: cargo and pnpm). A
+  recorded lock found stale at its project's turn is refreshed with the `--lock` command, reported
+  as a `stale_lock` warning naming the cause, and gated by a `fix` pass under the run's
+  `--transitive` mode before the requested pass, since the upgrade would otherwise accept whatever
+  too-fresh release the refresh resolved as its baseline. A lock a later project stales after its
+  own turn is caught by a probe once every project has run, and its project runs again the same
+  way, at most once per recorded project before a lock still stale is reported as an error. A lock
+  that was stale before the run began keeps the ordinary `stale_lock` handling, and `--dry-run` is
+  unaffected.
+
 - **A Cargo project with no `Cargo.lock` no longer escapes the gate.** Detection keyed on
   `Cargo.lock`, so a `Cargo.toml` without one was either not a project at all (`no supported tool
   detected`, exit 3) or — nested under a detected root — silently assumed to belong to it, and

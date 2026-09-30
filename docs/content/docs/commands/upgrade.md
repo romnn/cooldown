@@ -260,6 +260,29 @@ When `upgrade` holds a cross-major update back, it explains the required action:
 Only a matured release beyond the hold is reported. A fresh release still in cooldown does not
 produce an action that cannot yet be taken. Suppress command tips with `--no-suggestions`.
 
+## Projects that resolve against each other
+
+A project can resolve against another project's manifest: a cargo-fuzz crate or a nested workspace
+that reaches a root workspace member through a `path` dependency reads the root's
+`[workspace.dependencies]`. When the run rewrites that manifest, the other project's lock goes stale
+because of the run itself, not because it was left stale.
+
+So before anything moves, a run over several projects of one tool records which of their locks are
+current, for the tools that can refresh a lock on their own (cargo and pnpm, the ones
+[`check --lock`]({{< relref "check.md" >}}#flags) refreshes). When a recorded lock is stale by its
+project's turn, the run refreshes it with that same command and reports a `stale_lock` warning
+naming the cause. It
+then runs a `fix` pass under the same `--transitive` mode before the upgrade itself, because a
+refresh resolves whatever is newest and the upgrade would otherwise accept that as its starting
+point; the refreshed lock ends gate-clean. A project whose lock goes stale only after its turn,
+because a later project rewrote a manifest it reads, is caught by a second probe once every project
+has run, and runs again the same way. Projects that keep staling each other are re-run at most once
+per recorded project; a lock still stale after that is an error that names the cause.
+
+A lock that was already stale when the run began is not the run's doing: it keeps the ordinary
+`stale_lock` error (a warning and a skipped project under `--allow-stale-lock`). A `--dry-run`
+mutates only a throwaway copy, so it never stales, probes, or refreshes a lock.
+
 ## Flags
 
 | Flag | Effect |

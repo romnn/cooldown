@@ -213,9 +213,19 @@ impl<'a> Lanes<'a> {
 impl Workspace {
     /// The run's lanes over its in-scope projects (see [`Lanes`]).
     pub(crate) fn lanes<'a>(&'a self, opts: &'a RunOpts, access: LaneAccess) -> Lanes<'a> {
+        self.lanes_over(self.scoped_projects(opts), opts, access)
+    }
+
+    /// Lanes over a subset of the run's projects, given in scoped order; outputs come back in
+    /// the order `projects` gave them.
+    pub(crate) fn lanes_over<'a>(
+        &'a self,
+        projects: impl Iterator<Item = &'a ProjectCtx>,
+        opts: &RunOpts,
+        access: LaneAccess,
+    ) -> Lanes<'a> {
         Lanes::plan(
-            self.scoped_projects(opts)
-                .map(|pctx| (pctx, self.lease_family(pctx))),
+            projects.map(|pctx| (pctx, self.lease_family(pctx))),
             access,
             opts.jobs,
         )

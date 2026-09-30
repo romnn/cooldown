@@ -61,6 +61,15 @@ This is safe by construction: the graph floor *is* a version every requirer alre
 - **An exact pin.** A pinned violation is left in place with a warning, since a pin is a deliberate choice. Pass `--downgrade-pinned` to downgrade and rewrite it too.
 - **No matured fallback.** A violation with no older matured version to fall back to is reported — [`baseline`]({{< relref "other.md" >}}) it or wait — rather than downgraded to nothing.
 
+## Locks the run stales itself
+
+A `fix` that rewrites a manifest another project in the run resolves against (a root workspace's
+`[workspace.dependencies]` read by a cargo-fuzz crate) stales that project's lock. As under
+[`upgrade`]({{< relref "upgrade.md" >}}#projects-that-resolve-against-each-other), the run refreshes
+such a lock instead of failing on it, reports a `stale_lock` warning naming the cause, and fixes
+the refreshed graph like any other; a lock that was stale before the run began keeps the ordinary
+`stale_lock` error.
+
 ## Flags
 
 | Flag | Effect |
