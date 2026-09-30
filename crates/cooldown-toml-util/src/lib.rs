@@ -60,6 +60,19 @@ pub fn write_document(path: &Utf8Path, doc: &toml_edit::DocumentMut) -> Result<(
     std::fs::write(path, doc.to_string()).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))
 }
 
+/// Replace the value `item` holds with `value`, keeping the old value's decor: the spacing around
+/// it and a trailing same-line comment (`dep = "1"  # must match other-dep`), which `toml_edit`
+/// stores on the value rather than the key.
+///
+/// An `item` that holds no value (a table, or nothing) is replaced with `value` in default decor.
+pub fn replace_value(item: &mut toml_edit::Item, value: impl Into<toml_edit::Value>) {
+    let mut value = value.into();
+    if let Some(old) = item.as_value() {
+        *value.decor_mut() = old.decor().clone();
+    }
+    *item = toml_edit::Item::Value(value);
+}
+
 /// Set a nested string value in a TOML file, format-preserving.
 ///
 /// Navigates (creating intermediate tables as needed) to `keys` and sets the leaf to `val`, leaving
@@ -112,10 +125,11 @@ pub fn set_toml_string(
     if dry_run {
         return Ok(true);
     }
-    // Replacing the value via the existing key keeps the key's prefix decor (a leading `#` comment),
-    // so a documented `exclude-newer` line keeps its comment; a missing key is inserted fresh.
+    // Replacing the value via the existing key keeps the key's prefix decor (a leading `#` comment)
+    // and the value's own (a trailing one), so a documented `exclude-newer` line keeps its
+    // comments; a missing key is inserted fresh.
     match table.get_mut(last) {
-        Some(item) => *item = toml_edit::value(val),
+        Some(item) => replace_value(item, val),
         None => {
             table.insert(last, toml_edit::value(val));
         }
@@ -189,6 +203,39 @@ mod tests {
         let again = set_toml_string(&path, &["tool", "uv", "exclude-newer"], "14 days", false)
             .expect("set again");
         assert!(!again);
+    }
+
+    #[test]
+    fn set_toml_string_keeps_a_trailing_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("uv.toml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            "exclude-newer = \"7 days\"  # mirrors cooldown.toml\n",
+        )
+        .expect("write");
+
+        set_toml_string(&path, &["exclude-newer"], "14 days", false).expect("set");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "exclude-newer = \"14 days\"  # mirrors cooldown.toml\n"
+        );
+    }
+
+    #[test]
+    fn replace_value_keeps_the_old_values_decor() {
+        let mut doc = "a = \"1\"         # must match b\nb = { version = \"1\" }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+
+        replace_value(&mut doc["a"], "2");
+        replace_value(&mut doc["b"]["version"], "2");
+
+        assert_eq!(
+            doc.to_string(),
+            "a = \"2\"         # must match b\nb = { version = \"2\" }\n"
+        );
     }
 
     #[test]

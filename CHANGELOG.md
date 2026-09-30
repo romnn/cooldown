@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A requirement rewrite keeps the trailing comment on its line.** `upgrade` replaced the whole
+  value of a bumped entry, which dropped a same-line comment such as
+  `html5ever = "0.39"  # must match markup5ever_rcdom` — often the only record of why the
+  requirement is what it is. The Cargo manifest rewrite and the `sync` value writer now carry the
+  old value's spacing and trailing comment over to the new one.
+
 - **A lock the run staled itself no longer fails `upgrade` or `fix`.** In a monorepo whose
   cargo-fuzz crates and nested workspace reach root workspace members through `path` dependencies,
   `upgrade --major` rewrote the root's `[workspace.dependencies]` (`html5ever = "0.39"` to

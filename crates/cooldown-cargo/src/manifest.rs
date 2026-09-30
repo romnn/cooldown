@@ -13,7 +13,7 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, MemberRef};
-use cooldown_toml_util::{parse_document, write_document};
+use cooldown_toml_util::{parse_document, replace_value, write_document};
 use std::collections::BTreeSet;
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -225,7 +225,7 @@ fn name_package(item: &mut Item, crate_name: &str) {
     if let Some(requirement) = item.as_str().map(str::to_owned) {
         let mut table = toml_edit::InlineTable::new();
         table.insert("version", toml_edit::Value::from(requirement));
-        *item = toml_edit::value(table);
+        replace_value(item, table);
     }
     if let Some(table) = item.as_table_like_mut()
         && table.get("package").is_none()
@@ -399,7 +399,7 @@ fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
         if bumped == req {
             return Edit::Unchanged;
         }
-        *item = toml_edit::value(bumped);
+        replace_value(item, bumped);
         return Edit::Done;
     }
     let Some(table) = item.as_table_like_mut() else {
@@ -415,7 +415,7 @@ fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
         if bumped == req {
             return Edit::Unchanged;
         }
-        *version = toml_edit::value(bumped);
+        replace_value(version, bumped);
         return Edit::Done;
     }
     Edit::NoVersion
@@ -579,6 +579,54 @@ mod tests {
         let member_after =
             std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read member");
         assert_eq!(member_after, member_manifest);
+    }
+
+    #[test]
+    fn rewrite_keeps_trailing_comments() {
+        // A trailing comment is often the only record of why a requirement is what it is
+        // (`html5ever = "0.39"  # must match markup5ever_rcdom`), so a bump must carry it along.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc::indoc! {r#"
+                [workspace]
+                members = ["crates/app"]
+
+                [workspace.dependencies]
+                serde = "1"         # must match serde_derive
+                toml = { version = "0.5", features = ["preserve_order"] } # pinned by the parser
+            "#},
+        )
+        .expect("write root");
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            indoc::indoc! {r#"
+                [package]
+                name = "app"
+
+                [dependencies]
+                serde.workspace = true
+                toml.workspace = true
+            "#},
+        )
+        .expect("write member");
+
+        widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
+        widen_constraint(root, &[member("app", "crates/app")], "toml", "1.1.2").expect("widen");
+
+        let after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
+        assert!(
+            after.contains("serde = \"2.3.0\"         # must match serde_derive\n"),
+            "{after}"
+        );
+        assert!(
+            after.contains(
+                "toml = { version = \"1.1.2\", features = [\"preserve_order\"] } # pinned by the parser\n"
+            ),
+            "{after}"
+        );
     }
 
     #[test]
