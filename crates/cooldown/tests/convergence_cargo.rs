@@ -36,6 +36,7 @@ mod support;
 
 use indoc::{formatdoc, indoc};
 use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf, Prefix};
 use support::{ChangeVersions, Fixture, changed_packages, toml_lock_entries, toml_lock_pins};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
@@ -1221,6 +1222,23 @@ fn an_optional_dependency_of_a_reached_package_is_its_own_project() {
     assert_missing_lock_error(&checked, "a/opt");
 }
 
+/// `path` spelled the way a manifest author and cargo spell it: `C:\…` rather than the verbatim
+/// `\\?\C:\…` that canonicalizing yields on Windows.
+///
+/// Off Windows, and for any path without a verbatim disk prefix, this is `path` unchanged.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_owned();
+    };
+    let Prefix::VerbatimDisk(disk) = prefix.kind() else {
+        return path.to_owned();
+    };
+    let mut plain = PathBuf::from(format!("{}:", char::from(disk)));
+    plain.extend(components);
+    plain
+}
+
 /// Every member-discovery shape at once: a `./a` spelling, an inherited `workspace = true` path
 /// dependency, and a nested workspace whose member lives outside it and points back at it.
 /// The member-discovery root manifest. `EXCLUDED_DIR` stands in for the fixture's own absolute
@@ -1366,14 +1384,16 @@ fn member_discovery_fixture() -> Fixture {
     write_outside_pointer_member(&fixture);
     // The root manifest names the excluded crate by absolute path — canonicalized, because that is
     // the spelling the run scans under and therefore the one cargo's prefix test has to match.
+    // Cargo spells that directory without Windows' verbatim prefix, so the entry does too.
     // Serialized rather than interpolated: a Windows temp path's backslashes are escapes inside a
     // TOML string.
     let excluded = serde_json::to_string(
-        std::fs::canonicalize(fixture.root())
-            .expect("canonical fixture root")
-            .join("excluded")
-            .to_str()
-            .expect("utf-8 fixture root"),
+        without_verbatim_prefix(
+            &std::fs::canonicalize(fixture.root()).expect("canonical fixture root"),
+        )
+        .join("excluded")
+        .to_str()
+        .expect("utf-8 fixture root"),
     )
     .expect("serialize the excluded path");
     fixture.write(

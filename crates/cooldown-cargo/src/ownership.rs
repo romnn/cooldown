@@ -22,7 +22,7 @@
 //! pointer: that names a root which ought to list it, and a pointed-at-but-unlisted manifest is a
 //! project of its own rather than a silent one.
 
-use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf, Utf8Prefix};
 use cooldown_core::NestedOwnership;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -584,10 +584,14 @@ impl WorkspaceRoot {
     /// wave an independently-buildable crate through unevaluated. An absolute entry needs no
     /// normalization either: `join` on one already yields the entry itself.
     ///
+    /// The comparison goes through [`raw_join_prefixes`] rather than `root.join(entry)`, because
+    /// the scan root is canonical and on Windows that spells it `\\?\C:\…`, which cargo's own
+    /// paths are not.
+    ///
     /// `root` is the directory holding this workspace's manifest and `manifest` the candidate
     /// member's own `Cargo.toml` path, matching what cargo compares.
     fn excludes(&self, root: &Utf8Path, manifest: &Utf8Path) -> bool {
-        let names = |entry: &String| manifest.starts_with(root.join(entry));
+        let names = |entry: &String| raw_join_prefixes(root, Utf8Path::new(entry), manifest);
         let excluded = self.exclude.iter().any(names);
         let explicit_member = self
             .members
@@ -685,6 +689,58 @@ fn string_list(item: &Item) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether `root.join(entry)`, as cargo spells it, is a component-wise prefix of `path`.
+///
+/// Cargo runs under a plain `C:\…` working directory even when it is started in a verbatim
+/// `\\?\C:\…` one, and the two spellings differ in exactly the two ways an exclusion test
+/// depends on.
+/// `join` onto a verbatim path resolves the entry's `..` components, where cargo's plain join keeps
+/// them, so `tmp/../a` would name `a` here and not there.
+/// A verbatim prefix also never equals the plain one an absolute manifest entry carries, so
+/// `C:\repo\a` would not name the scanned `\\?\C:\repo\a`.
+/// Walking the components keeps the entry raw and lets the two prefix spellings of one volume
+/// compare equal.
+fn raw_join_prefixes(root: &Utf8Path, entry: &Utf8Path, path: &Utf8Path) -> bool {
+    // An absolute entry replaces the root outright, as `join` does.
+    let base = if entry.is_absolute() {
+        None
+    } else {
+        Some(root)
+    };
+    let mut joined = base
+        .into_iter()
+        .flat_map(Utf8Path::components)
+        .chain(entry.components());
+    let mut path = path.components();
+    joined.all(|component| {
+        path.next()
+            .is_some_and(|candidate| same_component(component, candidate))
+    })
+}
+
+/// Whether two path components name the same thing, reading a Windows verbatim prefix as the plain
+/// prefix of the same volume or share.
+fn same_component(left: Utf8Component<'_>, right: Utf8Component<'_>) -> bool {
+    match (left, right) {
+        (Utf8Component::Prefix(left), Utf8Component::Prefix(right)) => {
+            match (left.kind(), right.kind()) {
+                (
+                    Utf8Prefix::VerbatimDisk(left) | Utf8Prefix::Disk(left),
+                    Utf8Prefix::VerbatimDisk(right) | Utf8Prefix::Disk(right),
+                ) => left.eq_ignore_ascii_case(&right),
+                (
+                    Utf8Prefix::VerbatimUNC(left_server, left_share)
+                    | Utf8Prefix::UNC(left_server, left_share),
+                    Utf8Prefix::VerbatimUNC(right_server, right_share)
+                    | Utf8Prefix::UNC(right_server, right_share),
+                ) => left_server == right_server && left_share == right_share,
+                (left, right) => left == right,
+            }
+        }
+        (left, right) => left == right,
+    }
 }
 
 /// `target` spelled relative to `base`, climbing with `..` where it has to.
@@ -1615,6 +1671,42 @@ mod tests {
         .write("tmp/keep", "");
 
         assert_eq!(tree.ownership("a"), NestedOwnership::Standalone);
+    }
+
+    /// The scan root is canonical, which Windows spells with a verbatim `\\?\` prefix, while cargo
+    /// and the manifests it reads spell the same directory plainly.
+    /// The exclusion test has to read both as one volume, and must not let the verbatim root
+    /// resolve a `..` that cargo's plain join keeps.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_root_compares_like_the_plain_one_cargo_sees() {
+        let root = Utf8Path::new(r"\\?\C:\repo");
+        let manifest = Utf8Path::new(r"\\?\C:\repo\a\Cargo.toml");
+
+        // Relative entries
+        assert!(raw_join_prefixes(root, Utf8Path::new("a"), manifest));
+        assert!(!raw_join_prefixes(
+            root,
+            Utf8Path::new("tmp/../a"),
+            manifest
+        ));
+
+        // Absolute entries, in either spelling of the volume
+        assert!(raw_join_prefixes(
+            root,
+            Utf8Path::new(r"C:\repo\a"),
+            manifest
+        ));
+        assert!(raw_join_prefixes(
+            root,
+            Utf8Path::new(r"\\?\C:\repo\a"),
+            manifest
+        ));
+        assert!(!raw_join_prefixes(
+            root,
+            Utf8Path::new(r"D:\repo\a"),
+            manifest
+        ));
     }
 
     /// A TOML basic string holding `value`, escaped by the TOML serializer rather than by hand.
