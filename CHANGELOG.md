@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.22
+
 - **A requirement rewrite keeps the trailing comment on its line.** `upgrade` replaced the whole
   value of a bumped entry, which dropped a same-line comment such as
   `html5ever = "0.39"  # must match markup5ever_rcdom` — often the only record of why the
