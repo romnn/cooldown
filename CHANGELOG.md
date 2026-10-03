@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.23
+
 - **`include-hidden` scans named dot-directories.** Detection skips every directory whose name
   starts with `.`, so a repository keeping real projects under `.github/scripts` or an agent-tooling
   directory had them silently left out of every run, including the `check` gate.
