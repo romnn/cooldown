@@ -46,9 +46,10 @@ The [advisory feed]({{< relref "../configuration/advisories.md" >}}) flags (usua
 | `--cargo` | Only the Rust/Cargo tool — shorthand for `--tool cargo`. |
 | `--exclude-folders <GLOB>` | Directories never scanned, `.gitignore`-style (repeatable). |
 | `--exclude-packages <GLOB>` | Workspace members dropped from reports by package-name glob (repeatable). |
+| `--include-hidden <GLOB>` | Dot-directories scanned after all, `.gitignore`-style (repeatable; `.git` never is). |
 | `--no-gitignore` | Don't honor `.gitignore` during project detection. |
 
-See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder and package glob semantics.
+See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder, package, and hidden-directory glob semantics.
 
 ## Execution and network
 

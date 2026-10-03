@@ -129,12 +129,15 @@ impl ConfigDocument {
     pub fn parse(content: &str, origin: &Origin) -> Result<Self, CoreError> {
         let raw = toml::from_str(content).map_err(|error| {
             let error = error.to_string();
-            let exclude_hint =
-                if error.contains("exclude-folders") || error.contains("exclude-packages") {
-                    "; exclusion lists live under [tool.*], [global], or a command table"
-                } else {
-                    ""
-                };
+            // An unknown-field error lists every expected key, so the misplaced key is matched
+            // in the `unknown field` clause, before the exclude names in that list can match.
+            let exclude_hint = if error.contains("unknown field `include-hidden`") {
+                "; `include-hidden` lives under [global] or a command table"
+            } else if error.contains("exclude-folders") || error.contains("exclude-packages") {
+                "; exclusion lists live under [tool.*], [global], or a command table"
+            } else {
+                ""
+            };
             CoreError::Config(format!("{}: {error}{exclude_hint}", origin.token()))
         })?;
         validate_structure(&raw, origin)?;
@@ -218,6 +221,24 @@ mod tests {
         assert!(!layer.rules.is_empty(), "policy projection kept rule data");
         assert_eq!(scan.resolved("outdated").major, Some(true));
         assert_eq!(scan.exclude_folders_for(&[], "cargo"), vec!["vendor"]);
+    }
+
+    /// `include-hidden` has no per-tool or top-level form; a misplaced one names where it lives.
+    #[test]
+    fn misplaced_include_hidden_names_its_sections() {
+        for src in [
+            "include-hidden = [\".agents\"]\n",
+            "[tool.uv]\ninclude-hidden = [\".agents\"]\n",
+            "[project.\".\"]\ninclude-hidden = [\".agents\"]\n",
+        ] {
+            let err = ConfigDocument::parse(src, &Origin::Global)
+                .expect_err("include-hidden is only a [global]/[<command>] key");
+            assert!(
+                err.to_string()
+                    .contains("`include-hidden` lives under [global] or a command table"),
+                "the error points at the correct placement: {err}"
+            );
+        }
     }
 
     /// `single-copy` matches exact names, so a glob that would silently gate nothing is a config

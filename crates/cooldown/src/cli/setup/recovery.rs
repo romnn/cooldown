@@ -81,6 +81,7 @@ recovery_options! {
         "package" => ("--package", |global| !global.package.is_empty()),
         "exclude_folders" => ("--exclude-folders", |global| !global.exclude_folders.is_empty()),
         "exclude_packages" => ("--exclude-packages", |global| !global.exclude_packages.is_empty()),
+        "include_hidden" => ("--include-hidden", |global| !global.include_hidden.is_empty()),
         "list_packages" => ("--list-packages", |global| global.list_packages),
         "paths" => ("--paths", |global| global.paths),
         "show_projects" => ("--show-projects", |global| global.show_projects),
@@ -336,6 +337,9 @@ fn cargo_recovery_discovery(
         scan::WalkPolicy {
             respect_gitignore,
             exclude: &[],
+            // Recovery follows ownership evidence, not the discovery config: the artifact walk
+            // above already enters dot-directories.
+            include_hidden: &[],
             selected: None,
         },
     )?

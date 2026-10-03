@@ -6,7 +6,9 @@
 //! Centralizing it here keeps `.gitignore`, exclude, and workspace-root policy consistent.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::config::{compile_folder_globset, compile_package_globset};
+use cooldown_core::config::{
+    compile_folder_globset, compile_hidden_globset, compile_package_globset,
+};
 use cooldown_core::{CoreError, ProjectMarker};
 use globset::GlobSet;
 use ignore::WalkBuilder;
@@ -34,7 +36,7 @@ use std::collections::BTreeSet;
 ///   marks a workspace root that already owns its members, so nested markers below it are skipped.
 ///
 /// Hidden directories (dotfiles such as `.git`, `.venv`) are skipped unless the selection lies
-/// in or below one (see [`WalkPolicy`]).
+/// in or below one, or `include-hidden` names them (see [`WalkPolicy`]).
 /// Unreadable directories are skipped rather than failing the whole scan.
 ///
 /// # Errors
@@ -92,6 +94,14 @@ pub(crate) struct WalkPolicy<'a> {
     pub(crate) respect_gitignore: bool,
     /// `exclude-folders` globs with `.gitignore` semantics (see [`compile_folder_globset`]).
     pub(crate) exclude: &'a [String],
+    /// `include-hidden` globs, with the same semantics (see [`compile_hidden_globset`]): a
+    /// dot-directory they match is walked like any other directory.
+    ///
+    /// Each dot-directory is matched on its own path, so one nested inside an included directory
+    /// (`.agents/hooks/.venv`) stays pruned unless a glob matches it too.
+    /// `.git` is never entered through this list, whatever the globs match, and the exclude globs
+    /// still prune an included directory and anything below it.
+    pub(crate) include_hidden: &'a [String],
     /// A directory under the root the invocation named explicitly (`-C`/`--dir`, or its own
     /// working directory below the scan root).
     ///
@@ -154,6 +164,7 @@ fn scan_marker_dirs(
         WalkPolicy {
             respect_gitignore,
             exclude,
+            include_hidden: &[],
             selected: None,
         },
     )?
@@ -167,7 +178,7 @@ fn scan_marker_dirs(
 /// Files always pass because the markers are matched per walked directory, never as yielded
 /// files.
 /// Hidden directories are pruned unless they lie on the spine, the selected directory and every
-/// ancestor the walk must enter to reach it.
+/// ancestor the walk must enter to reach it, or `include-hidden` matches them.
 /// Excluded directories follow the same rule as a workspace member (see
 /// [`FolderExcludeSet::excludes_path`]): on the spine and below the selection a glob matching at
 /// or above the selection never counts, while beside the spine every glob counts, so a lifted
@@ -175,6 +186,7 @@ fn scan_marker_dirs(
 struct DirFilter {
     root: Utf8PathBuf,
     excludes: FolderExcludeSet,
+    include_hidden: GlobSet,
     /// The selection relative to `root`.
     selected: Option<Utf8PathBuf>,
 }
@@ -198,8 +210,8 @@ impl DirFilter {
         // The spine is the selection and every ancestor the walk must enter to reach it.
         let on_spine = selected.is_some_and(|selected| selected.starts_with(rel));
         // Dot-directories (`.git`, `.venv`) are never scanned unless the invocation named one, or
-        // a path through one.
-        if is_hidden(path) && !on_spine {
+        // a path through one, or `include-hidden` matches this very directory.
+        if is_hidden(path) && !on_spine && !self.includes_hidden(rel) {
             return false;
         }
         // Naming a directory outranks a glob that would prune it or a directory above it, so the
@@ -215,6 +227,14 @@ impl DirFilter {
         }
         true
     }
+
+    /// Whether `include-hidden` opts the dot-directory at `rel` into the walk.
+    /// `.git` never is: a broad glob like `.*` must not walk the object store.
+    fn includes_hidden(&self, rel: &Utf8Path) -> bool {
+        !self.include_hidden.is_empty()
+            && rel.file_name() != Some(".git")
+            && self.include_hidden.is_match(rel.as_std_path())
+    }
 }
 
 fn scan_marker_groups(
@@ -223,6 +243,7 @@ fn scan_marker_groups(
     policy: WalkPolicy<'_>,
 ) -> Result<Vec<ProjectMarkerDirs>, CoreError> {
     let excludes = FolderExcludeSet::compile(policy.exclude)?;
+    let include_hidden = compile_hidden_globset(policy.include_hidden)?;
     // A selection outside the root has nothing to lift and nothing to reach.
     let selected = policy
         .selected
@@ -236,8 +257,8 @@ fn scan_marker_groups(
 
     let mut builder = WalkBuilder::new(root);
     builder
-        // Hidden directories are pruned in `filter_entry` below, where the selection can lift
-        // the rule, rather than by the walker, which offers no exception.
+        // Hidden directories are pruned in `filter_entry` below, where the selection and
+        // `include-hidden` can lift the rule, rather than by the walker, which offers no exception.
         .hidden(false)
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
@@ -254,6 +275,7 @@ fn scan_marker_groups(
     let filter = DirFilter {
         root: root.to_owned(),
         excludes,
+        include_hidden,
         selected: selected
             .as_deref()
             .and_then(|selected| selected.strip_prefix(root).ok())
@@ -662,6 +684,7 @@ mod tests {
             WalkPolicy {
                 respect_gitignore: false,
                 exclude: &[],
+                include_hidden: &[],
                 selected: None,
             },
         )?;
@@ -712,6 +735,7 @@ mod tests {
         WalkPolicy {
             respect_gitignore: false,
             exclude,
+            include_hidden: &[],
             selected,
         }
     }
@@ -818,6 +842,152 @@ mod tests {
         Ok(())
     }
 
+    /// The layout `include-hidden` exists for: real projects under `.agents` and `.github`, a
+    /// virtualenv inside one of them, and a dot-directory nobody opted into.
+    fn hidden_layout() -> eyre::Result<(tempfile::TempDir, Utf8PathBuf)> {
+        let tmp = tempfile::tempdir()?;
+        let root = utf8(tmp.path());
+        for marker in [
+            "uv.lock",
+            ".agents/hooks/uv.lock",
+            ".agents/skills/comments/uv.lock",
+            ".agents/hooks/.venv/lib/uv.lock",
+            ".github/scripts/uv.lock",
+            ".other/uv.lock",
+            ".git/modules/uv.lock",
+        ] {
+            touch(&root.join(marker));
+        }
+        Ok((tmp, root))
+    }
+
+    fn scan_hidden(
+        root: &Utf8Path,
+        exclude: &[&str],
+        include_hidden: &[&str],
+    ) -> eyre::Result<Vec<String>> {
+        let exclude = exclude.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let include_hidden = include_hidden
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let found = find_project_marker_dirs_batch(
+            root,
+            &[uv_marker()],
+            WalkPolicy {
+                respect_gitignore: false,
+                exclude: &exclude,
+                include_hidden: &include_hidden,
+                selected: None,
+            },
+        )?
+        .remove(0);
+        Ok(found
+            .primary
+            .iter()
+            .map(|dir| {
+                dir.strip_prefix(root)
+                    .map(|rel| {
+                        rel.components()
+                            .map(|c| c.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .unwrap_or_else(|_| dir.to_string())
+            })
+            .collect())
+    }
+
+    /// Without `include-hidden` no dot-directory is walked; with it, the named ones are walked
+    /// like ordinary directories while a dot-directory nested inside them stays pruned.
+    #[test]
+    fn include_hidden_walks_only_the_named_dot_directories() -> eyre::Result<()> {
+        let (_tmp, root) = hidden_layout()?;
+
+        assert_eq!(scan_hidden(&root, &[], &[])?, [""]);
+        assert_eq!(
+            scan_hidden(&root, &[], &[".agents", ".github"])?,
+            [
+                "",
+                ".agents/hooks",
+                ".agents/skills/comments",
+                ".github/scripts"
+            ],
+            "the included trees are walked; `.agents/hooks/.venv` and `.other` are not"
+        );
+        // A trailing slash or a leading anchor matches the same way `exclude-folders` does.
+        assert_eq!(
+            scan_hidden(&root, &[], &["/.github/"])?,
+            ["", ".github/scripts"]
+        );
+        // A nested dot-directory is walked only once a glob matches it as well.
+        assert_eq!(
+            scan_hidden(&root, &[], &[".agents", ".venv"])?,
+            [
+                "",
+                ".agents/hooks",
+                ".agents/hooks/.venv/lib",
+                ".agents/skills/comments"
+            ]
+        );
+        Ok(())
+    }
+
+    /// `.git` is never walked, however broad the glob.
+    #[test]
+    fn include_hidden_never_walks_git() -> eyre::Result<()> {
+        let (_tmp, root) = hidden_layout()?;
+        for glob in [".*", ".git", "**"] {
+            let found = scan_hidden(&root, &[], &[glob])?;
+            assert!(
+                !found.iter().any(|dir| dir.starts_with(".git/")),
+                "`{glob}` must not reach `.git`: {found:?}"
+            );
+        }
+        assert!(scan_hidden(&root, &[], &[".*"])?.contains(&".other".to_string()));
+        Ok(())
+    }
+
+    /// `exclude-folders` outranks `include-hidden`, both on the included directory itself and
+    /// below it.
+    #[test]
+    fn exclude_folders_beat_include_hidden() -> eyre::Result<()> {
+        let (_tmp, root) = hidden_layout()?;
+        assert_eq!(
+            scan_hidden(&root, &[".agents/hooks"], &[".agents", ".github"])?,
+            ["", ".agents/skills/comments", ".github/scripts"]
+        );
+        assert_eq!(
+            scan_hidden(&root, &[".agents"], &[".agents", ".github"])?,
+            ["", ".github/scripts"]
+        );
+        Ok(())
+    }
+
+    /// An included dot-directory still honors `.gitignore`.
+    #[test]
+    fn include_hidden_keeps_gitignore() -> eyre::Result<()> {
+        let (_tmp, root) = hidden_layout()?;
+        std::fs::write(root.join(".gitignore"), ".agents/skills/\n")?;
+        let include_hidden = vec![".agents".to_string()];
+        let found = find_project_marker_dirs_batch(
+            &root,
+            &[uv_marker()],
+            WalkPolicy {
+                respect_gitignore: true,
+                exclude: &[],
+                include_hidden: &include_hidden,
+                selected: None,
+            },
+        )?
+        .remove(0);
+        assert_eq!(
+            found.primary,
+            vec![root.clone(), root.join(".agents/hooks")]
+        );
+        Ok(())
+    }
+
     /// Gitignore rules are not lifted, but a selection they hide is an error naming the escape
     /// hatch rather than an empty scan the run would report as clean.
     #[test]
@@ -836,6 +1006,7 @@ mod tests {
             WalkPolicy {
                 respect_gitignore: true,
                 exclude: &[],
+                include_hidden: &[],
                 selected: Some(&selected),
             },
         )
@@ -851,6 +1022,7 @@ mod tests {
             WalkPolicy {
                 respect_gitignore: false,
                 exclude: &[],
+                include_hidden: &[],
                 selected: Some(&selected),
             },
         )?

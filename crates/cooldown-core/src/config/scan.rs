@@ -15,31 +15,49 @@ pub struct CommandSections {
     pub commands: BTreeMap<String, CommandConfig>,
 }
 
+/// The scan lists of one file, or of the folded files: the folder and package excludes and the
+/// `include-hidden` list.
+#[derive(Default)]
+struct ScanLists {
+    folders: ExcludeList,
+    packages: ExcludeList,
+    hidden: ExcludeList,
+}
+
+impl ScanLists {
+    /// Folds the higher-precedence `layer` over `self`, each list on its own.
+    fn merge(self, layer: ScanLists) -> ScanLists {
+        ScanLists {
+            folders: self.folders.merge(layer.folders),
+            packages: self.packages.merge(layer.packages),
+            hidden: self.hidden.merge(layer.hidden),
+        }
+    }
+}
+
 impl CommandSections {
-    /// This file's folder and package exclude lists for `command`: the `[<command>]` list folded
-    /// over `[global]`.
-    fn exclude_lists(&self, command: &str) -> (ExcludeList, ExcludeList) {
-        let section = self.commands.get(command);
-        let folders = self.global.exclude_folders.clone().merge(
-            section
-                .map(|section| section.exclude_folders.clone())
-                .unwrap_or_default(),
-        );
-        let packages = self.global.exclude_packages.clone().merge(
-            section
-                .map(|section| section.exclude_packages.clone())
-                .unwrap_or_default(),
-        );
-        (folders, packages)
+    /// This file's scan lists for `command`: each `[<command>]` list folded over `[global]`'s.
+    fn scan_lists(&self, command: &str) -> ScanLists {
+        let lists = |section: &CommandConfig| ScanLists {
+            folders: section.exclude_folders.clone(),
+            packages: section.exclude_packages.clone(),
+            hidden: section.include_hidden.clone(),
+        };
+        let global = lists(&self.global);
+        match self.commands.get(command) {
+            Some(section) => global.merge(lists(section)),
+            None => global,
+        }
     }
 
-    /// Whether any section of this file sets an exclude list (an explicit `[]` counts).
-    fn sets_exclude_lists(&self) -> bool {
+    /// Whether any section of this file sets a scan list (an explicit `[]` counts).
+    fn sets_scan_lists(&self) -> bool {
         std::iter::once(&self.global)
             .chain(self.commands.values())
             .any(|section| {
                 section.exclude_folders != ExcludeList::default()
                     || section.exclude_packages != ExcludeList::default()
+                    || section.include_hidden != ExcludeList::default()
             })
     }
 }
@@ -91,10 +109,11 @@ impl ScanConfig {
         tool_patterns(&self.tool_exclude_packages)
     }
 
-    /// Whether any merged file sets an exclude list, in a section or a `[tool.*]` table.
+    /// Whether any merged file sets an exclude list or `include-hidden`, in a section or a
+    /// `[tool.*]` table.
     #[must_use]
-    pub fn sets_exclude_lists(&self) -> bool {
-        self.layers.iter().any(CommandSections::sets_exclude_lists)
+    pub fn sets_scan_lists(&self) -> bool {
+        self.layers.iter().any(CommandSections::sets_scan_lists)
             || !self.tool_exclude_folders.is_empty()
             || !self.tool_exclude_packages.is_empty()
     }
@@ -106,8 +125,8 @@ impl ScanConfig {
     /// `[<command>]` value overrides `[global]`, so a `[<command>]` value in any file beats a
     /// `[global]` value in every file.
     ///
-    /// The exclude lists resolve `[<command>]` over `[global]` within each file first and fold
-    /// the files second.
+    /// The exclude lists and `include-hidden` resolve `[<command>]` over `[global]` within each
+    /// file first and fold the files second.
     /// Folding the files first would let a `[<command>]` replacement in a farther file (a user's
     /// global config) silently void a `[global]` exclusion in a nearer one (the repository's), so
     /// a replacement reaches only what the same file and the files below it contributed.
@@ -127,15 +146,15 @@ impl ScanConfig {
                 acc.merge_layer(section.clone())
             });
         let mut config = global.merge_layer(section);
-        let (folders, packages) = self.layers.iter().fold(
-            (ExcludeList::default(), ExcludeList::default()),
-            |(folders, packages), layer| {
-                let (file_folders, file_packages) = layer.exclude_lists(command);
-                (folders.merge(file_folders), packages.merge(file_packages))
-            },
-        );
-        config.exclude_folders = folders;
-        config.exclude_packages = packages;
+        let lists = self
+            .layers
+            .iter()
+            .fold(ScanLists::default(), |lists, layer| {
+                lists.merge(layer.scan_lists(command))
+            });
+        config.exclude_folders = lists.folders;
+        config.exclude_packages = lists.packages;
+        config.include_hidden = lists.hidden;
         config
     }
 
@@ -152,7 +171,7 @@ impl ScanConfig {
         out
     }
 
-    /// Compile every folder/package glob across `[global]`, each `[<command>]`, and each
+    /// Compile every folder/package/hidden glob across `[global]`, each `[<command>]`, and each
     /// `[tool.<name>]`, so an invalid pattern is rejected when the config is parsed rather than deep
     /// inside a later scan.
     ///
@@ -167,6 +186,7 @@ impl ScanConfig {
         {
             super::compile_folder_globset(section.exclude_folders.patterns())?;
             super::compile_package_globset(section.exclude_packages.patterns())?;
+            super::compile_hidden_globset(section.include_hidden.patterns())?;
         }
         for folders in self.tool_exclude_folders.values() {
             super::compile_folder_globset(folders.patterns())?;
@@ -747,6 +767,63 @@ dry-run = true
         assert_eq!(cfg.resolved("upgrade").exclude_folders.patterns(), ["dist"]);
     }
 
+    /// `include-hidden` resolves and merges exactly like `exclude-folders`: a `[<command>]` list
+    /// adds to `[global]`, a nearer file adds to a farther one, and `[]` or `{ replace = [...] }`
+    /// drops what was inherited.
+    #[test]
+    fn include_hidden_resolves_and_merges_like_the_exclude_lists() {
+        let cfg = scan(indoc! {r#"
+            [global]
+            include-hidden = [".agents"]
+
+            [check]
+            include-hidden = [".github"]
+
+            [outdated]
+            include-hidden = { replace = [".config"] }
+        "#});
+        assert_eq!(
+            cfg.resolved("check").include_hidden.patterns(),
+            [".agents", ".github"]
+        );
+        assert_eq!(
+            cfg.resolved("outdated").include_hidden.patterns(),
+            [".config"]
+        );
+        assert_eq!(
+            cfg.resolved("upgrade").include_hidden.patterns(),
+            [".agents"]
+        );
+        // The folder excludes are a separate key.
+        assert!(cfg.resolved("check").exclude_folders.patterns().is_empty());
+
+        let added = cfg
+            .clone()
+            .merge(scan("[global]\ninclude-hidden = [\".ci\"]\n"));
+        assert_eq!(
+            added.resolved("upgrade").include_hidden.patterns(),
+            [".agents", ".ci"]
+        );
+        let cleared = cfg.merge(scan("[global]\ninclude-hidden = []\n"));
+        assert!(
+            cleared
+                .resolved("upgrade")
+                .include_hidden
+                .patterns()
+                .is_empty()
+        );
+        assert!(
+            scan("[global]\ninclude-hidden = [\".agents\"]\n").sets_scan_lists(),
+            "a nested file setting it is refused like an exclude list"
+        );
+        let error = parse_scan_config(
+            "[global]\ninclude-hidden = [\"a/**/[\"]\n",
+            &Origin::Default,
+        )
+        .expect_err("an invalid glob is rejected at parse");
+        assert!(error.to_string().contains("include-hidden"), "{error}");
+    }
+
     #[test]
     fn empty_config_is_inert() {
         let cfg = scan("min-age = \"7d\"\n");
@@ -763,6 +840,13 @@ dry-run = true
                 .patterns()
                 .is_empty()
         );
+        assert!(
+            cfg.resolved("outdated")
+                .include_hidden
+                .patterns()
+                .is_empty()
+        );
+        assert!(!cfg.sets_scan_lists());
         assert_eq!(cfg.resolved("outdated").gitignore, None);
         assert_eq!(cfg.resolved("outdated").major, None);
         assert_eq!(cfg.resolved("outdated").strict, None);

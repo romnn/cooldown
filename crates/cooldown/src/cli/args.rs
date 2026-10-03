@@ -471,6 +471,12 @@ pub(in crate::cli) struct GlobalArgs {
     /// `[global]`/`[<command>]` config lists (per-tool `[tool.*]` excludes still apply). Repeatable.
     #[arg(long = "exclude-packages", global = true, value_name = "GLOB")]
     pub(in crate::cli) exclude_packages: Vec<String>,
+    /// Dot-directories scanned after all, `.gitignore`-style (detection skips them by default) —
+    /// overrides the `[global]`/`[<command>]` config lists. A dot-directory nested inside one
+    /// stays skipped unless it matches too; `.git` is never scanned, and `--exclude-folders` still
+    /// prunes. Repeatable.
+    #[arg(long = "include-hidden", global = true, value_name = "GLOB")]
+    pub(in crate::cli) include_hidden: Vec<String>,
     /// Don't honor `.gitignore` while detecting projects (the rare repo whose lockfiles are
     /// themselves ignored). By default detection skips gitignored paths — correct and faster.
     #[arg(long = "no-gitignore", global = true)]

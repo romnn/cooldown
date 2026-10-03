@@ -262,6 +262,23 @@ covers a whole npm scope and `serde_*` a crate family. Because names differ per 
 vs `@scope/my-pkg`), reach for `[tool.<name>].exclude-packages` when a pattern is ecosystem-specific;
 a `[global]` entry applies to every tool.
 
+**`include-hidden`** opts dot-directories into detection. The scan skips every directory whose
+name starts with `.` (`.venv`, `.cache`, `.github`), which also hides real projects kept in one —
+tooling scripts under `.github/scripts`, say:
+
+```toml
+[global]
+include-hidden = [".agents", ".github"]
+```
+
+Each pattern uses the same `.gitignore` semantics as `exclude-folders` and is matched against the
+dot-directory itself; everything below a matched directory is walked like any other tree, except
+that a dot-directory nested inside it (`.github/scripts/.venv`) stays skipped unless a pattern
+matches it too. `.git` is never scanned, whatever the patterns say, `exclude-folders` still prunes
+an included directory or anything below it, and `.gitignore` still applies. It sits under
+`[global]` or a `[<command>]` table only — which dot-directories hold projects is a property of the
+repository, not of one ecosystem — and merges across sections and files like the exclude lists.
+
 A plain array **adds** to the list it inherits (the global config → the repo `cooldown.toml` →
 `--config`; `[global]` → `[<command>]`). An explicit `[]` **clears** the inherited list and
 `{ replace = [...] }` **replaces** it, so a repo can undo an org-wide default; each key merges on its
@@ -271,9 +288,9 @@ rather than checking nothing and reporting a clean result; members below the sel
 scope with the excludes applying, and a selection the scan cannot reach (a gitignored directory, or
 one the run's own `--exclude-folders` names) is an error rather than an empty result.
 
-Both have a CLI form — `--exclude-folders <glob>` and `--exclude-packages <glob>` (repeatable) — that
-**replaces** the `[global]`/`[<command>]` config lists for that run (per-tool `[tool.*]` excludes still
-apply). CLI globs are validated the same way, so a malformed pattern is a config error.
+All three have a CLI form — `--exclude-folders <glob>`, `--exclude-packages <glob>`, and
+`--include-hidden <glob>` (repeatable) — that **replaces** the `[global]`/`[<command>]` config lists
+for that run (per-tool `[tool.*]` excludes still apply). CLI globs are validated the same way, so a malformed pattern is a config error.
 
 ## Architecture
 

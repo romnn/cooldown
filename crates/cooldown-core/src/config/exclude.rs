@@ -12,7 +12,10 @@
 //!   `@scope/*` matches a whole npm scope and `serde_*` a family of crates. No registry permits `*`
 //!   in a package name, so `*` is always a wildcard and nothing needs escaping.
 //!
-//! Both are compiled here at config-load time so an invalid glob surfaces as a
+//! `include-hidden` names dot-directories the scan enters after all; it takes the folder flavor,
+//! since it names directories the same way `exclude-folders` does.
+//!
+//! All are compiled here at config-load time so an invalid glob surfaces as a
 //! [`CoreError::Config`] when the config is parsed, not deep inside a later scan.
 
 use crate::error::CoreError;
@@ -25,6 +28,23 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 ///
 /// Returns [`CoreError::Config`] if a pattern is not a valid glob.
 pub fn compile_folder_globset(patterns: &[String]) -> Result<GlobSet, CoreError> {
+    compile_directory_globset(patterns, "exclude-folders")
+}
+
+/// Compile `include-hidden` patterns into a validated [`GlobSet`] with the same `.gitignore`
+/// semantics as [`compile_folder_globset`], matched against a dot-directory's path relative to the
+/// scan root.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] if a pattern is not a valid glob.
+pub fn compile_hidden_globset(patterns: &[String]) -> Result<GlobSet, CoreError> {
+    compile_directory_globset(patterns, "include-hidden")
+}
+
+/// The `.gitignore`-style directory matcher behind both directory keys; `key` names the config key
+/// in an error.
+fn compile_directory_globset(patterns: &[String], key: &str) -> Result<GlobSet, CoreError> {
     let mut builder = GlobSetBuilder::new();
     for pat in patterns {
         let trimmed = pat.trim();
@@ -35,7 +55,7 @@ pub fn compile_folder_globset(patterns: &[String]) -> Result<GlobSet, CoreError>
             if anchored.is_empty() {
                 continue;
             }
-            builder.add(folder_glob(anchored)?);
+            builder.add(folder_glob(anchored, key)?);
         } else {
             // A trailing slash is the natural directory-exclude idiom; the walk yields directory
             // paths without one, so normalize it away before the bare-name test below — that is what
@@ -44,18 +64,18 @@ pub fn compile_folder_globset(patterns: &[String]) -> Result<GlobSet, CoreError>
             if bare.is_empty() {
                 continue;
             }
-            builder.add(folder_glob(bare)?);
+            builder.add(folder_glob(bare, key)?);
             // A name with no interior slash is unanchored: like `.gitignore`, it prunes that
             // directory at every depth, so add the `**/` variant. An interior slash (`a/b`) is
             // already root-anchored and gets no variant.
             if !bare.contains('/') {
-                builder.add(folder_glob(&format!("**/{bare}"))?);
+                builder.add(folder_glob(&format!("**/{bare}"), key)?);
             }
         }
     }
     builder
         .build()
-        .map_err(|error| CoreError::Config(format!("invalid exclude-folders set: {error}")))
+        .map_err(|error| CoreError::Config(format!("invalid {key} set: {error}")))
 }
 
 /// Compile `exclude-packages` patterns (name globs) into a validated [`GlobSet`] meant to be matched
@@ -78,10 +98,9 @@ pub fn compile_package_globset(patterns: &[String]) -> Result<GlobSet, CoreError
         .map_err(|error| CoreError::Config(format!("invalid exclude-packages set: {error}")))
 }
 
-fn folder_glob(pattern: &str) -> Result<Glob, CoreError> {
-    Glob::new(pattern).map_err(|error| {
-        CoreError::Config(format!("invalid exclude-folders glob {pattern:?}: {error}"))
-    })
+fn folder_glob(pattern: &str, key: &str) -> Result<Glob, CoreError> {
+    Glob::new(pattern)
+        .map_err(|error| CoreError::Config(format!("invalid {key} glob {pattern:?}: {error}")))
 }
 
 fn package_glob(pattern: &str) -> Result<Glob, CoreError> {
@@ -156,5 +175,19 @@ mod tests {
             compile_package_globset(&["[".to_string()]),
             Err(CoreError::Config(_))
         );
+    }
+
+    /// `include-hidden` matches like `exclude-folders`, and an invalid glob names its own key.
+    #[test]
+    fn hidden_globs_match_like_folders_and_name_their_key() {
+        let set = compile_hidden_globset(&[".agents".to_string(), "/.github".to_string()])
+            .expect("compile");
+        assert!(set.is_match(Path::new(".agents")));
+        assert!(set.is_match(Path::new("tools/.agents")));
+        assert!(set.is_match(Path::new(".github")));
+        assert!(!set.is_match(Path::new("tools/.github")));
+        assert!(!set.is_match(Path::new(".agents/hooks/.venv")));
+        let error = compile_hidden_globset(&["a/**/[".to_string()]).expect_err("bad glob");
+        assert!(error.to_string().contains("include-hidden"), "{error}");
     }
 }

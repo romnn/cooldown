@@ -4,7 +4,7 @@ use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::CargoTool;
 use cooldown_conda::{CondaTool, PixiTool};
-use cooldown_core::config::ScanConfig;
+use cooldown_core::config::{CommandConfig, ScanConfig};
 use cooldown_core::{CoreError, NestedOwnership, Project, ProjectMarker, ToolId, ToolRead};
 use cooldown_go::GoTool;
 use cooldown_hex::HexTool;
@@ -106,12 +106,16 @@ pub(super) fn adapter_set(
 /// directory) named below the scan root, when there is one: the `exclude-folders` globs never
 /// prune it or the ancestors leading to it, so a run pointed at an excluded subtree still finds
 /// the projects there.
+/// `cfg` is the run's resolved command config, CLI overrides applied: its `exclude-folders` list
+/// is the base every tool's `[tool.*]` list adds to, and its `include-hidden` list names the
+/// dot-directories every tool's walk enters (see
+/// [`WalkPolicy::include_hidden`](crate::scan::WalkPolicy::include_hidden)).
 pub(super) fn detect_projects(
     adapters: &AdapterSet,
     workdir: &camino::Utf8Path,
     selected_dir: Option<&camino::Utf8Path>,
     scan: &ScanConfig,
-    exclude_folders_base: &[String],
+    cfg: &CommandConfig,
     tools: &[ToolId],
     respect_gitignore: bool,
 ) -> Result<Detected, CoreError> {
@@ -136,7 +140,7 @@ pub(super) fn detect_projects(
                 adapter: adapter.as_ref(),
                 id,
                 marker: adapter.project_marker(),
-                exclude: scan.exclude_folders_for(exclude_folders_base, id.as_str()),
+                exclude: scan.exclude_folders_for(cfg.exclude_folders.patterns(), id.as_str()),
             })
         })
         .collect::<Vec<_>>();
@@ -159,6 +163,7 @@ pub(super) fn detect_projects(
             crate::scan::WalkPolicy {
                 respect_gitignore,
                 exclude: &exclude,
+                include_hidden: cfg.include_hidden.patterns(),
                 selected: selected_dir,
             },
         )?;

@@ -92,11 +92,12 @@ pub(crate) async fn prepare_run(
         discovery::ConfigSources::load(&repo_root, global.config.as_deref(), global.no_global)?;
     let scan = configs.scan_config()?;
     let mut cfg = scan.resolved(command.key());
-    // CLI `--exclude-folders`/`--exclude-packages` are the highest-precedence layer: they replace the
-    // resolved `[global]`/`[<command>]` lists (per-tool `[tool.*]` excludes, carried on `scan`, still
-    // apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
+    // CLI `--exclude-folders`/`--exclude-packages`/`--include-hidden` are the highest-precedence
+    // layer: they replace the resolved `[global]`/`[<command>]` lists (per-tool `[tool.*]` excludes,
+    // carried on `scan`, still apply). Applied to the resolved `cfg` — not the shared `scan` — so it cannot leak across other
     // commands' resolution; both detection and member-filtering read the override from `cfg`.
     cfg.override_excludes(&global.exclude_folders, &global.exclude_packages)?;
+    cfg.override_include_hidden(&global.include_hidden)?;
     if let Some(selected) = scope.selected() {
         reject_excluded_selection(selected, &global.exclude_folders)?;
     }
@@ -133,7 +134,7 @@ pub(crate) async fn prepare_run(
         &scan_root,
         selected_dir.as_deref(),
         &scan,
-        cfg.exclude_folders.patterns(),
+        &cfg,
         invocation.tools(),
         invocation.respect_gitignore(),
     )?;

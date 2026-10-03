@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`include-hidden` scans named dot-directories.** Detection skips every directory whose name
+  starts with `.`, so a repository keeping real projects under `.github/scripts` or an agent-tooling
+  directory had them silently left out of every run, including the `check` gate.
+  `include-hidden = [".agents", ".github"]` under `[global]` or a `[<command>]` table (or
+  `--include-hidden <glob>`, which replaces the config list for one run) walks those directories
+  like any other. Patterns use the `exclude-folders` `.gitignore` semantics and merge the same way,
+  and each one is matched against the dot-directory itself, so a virtualenv or cache nested inside
+  (`.github/scripts/.venv`) stays skipped unless it is named too. `.git` is never scanned,
+  `exclude-folders` still prunes an included directory or anything below it, and gitignore handling
+  is unchanged. Without the key, detection is exactly as before.
+
 ## v0.0.22
 
 - **A requirement rewrite keeps the trailing comment on its line.** `upgrade` replaced the whole

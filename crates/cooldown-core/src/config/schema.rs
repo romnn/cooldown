@@ -101,6 +101,15 @@ pub struct CommandConfig {
     /// [`compile_package_globset`]: crate::config::compile_package_globset
     #[serde(default)]
     pub exclude_packages: ExcludeList,
+    /// Dot-directories the scan enters after all, `.gitignore`-style like
+    /// [`exclude_folders`](Self::exclude_folders) and merging the same way.
+    /// Only a dot-directory the globs match itself is entered (a dot-directory nested inside it
+    /// stays pruned unless it is matched too), `exclude-folders` still prunes, and `.git` is
+    /// never entered.
+    /// No per-tool form: which dot-directories hold projects is a property of the repository
+    /// layout, not of one ecosystem.
+    #[serde(default)]
+    pub include_hidden: ExcludeList,
     /// Restrict to these tools (`--tool`); empty means "all detected".
     #[serde(default)]
     pub tool: Vec<String>,
@@ -169,6 +178,7 @@ impl CommandConfig {
         let CommandConfig {
             exclude_folders,
             exclude_packages,
+            include_hidden,
             mut tool,
             mut package,
             gitignore,
@@ -195,6 +205,7 @@ impl CommandConfig {
 
         self.exclude_folders = self.exclude_folders.merge(exclude_folders);
         self.exclude_packages = self.exclude_packages.merge(exclude_packages);
+        self.include_hidden = self.include_hidden.merge(include_hidden);
         self.tool.append(&mut tool);
         self.package.append(&mut package);
         self.gitignore = gitignore.or(self.gitignore);
@@ -230,8 +241,10 @@ impl CommandConfig {
             // CLI `--exclude-folders`/`--exclude-packages` flow through `override_excludes` on the
             // resolved config — project detection reads them from there before RunOpts exists — and
             // explicit layers never carry them, so they are deliberately not merged here.
+            // `--include-hidden` takes the same route through `override_include_hidden`.
             exclude_folders: _,
             exclude_packages: _,
+            include_hidden: _,
             tool,
             package,
             gitignore,
@@ -306,6 +319,21 @@ impl CommandConfig {
         if !packages.is_empty() {
             super::compile_package_globset(packages)?;
             self.exclude_packages = ExcludeList::replace(packages.to_vec());
+        }
+        Ok(())
+    }
+
+    /// Replace the `include-hidden` list with the CLI-provided one (`--include-hidden`), the
+    /// highest-precedence layer, the same way [`override_excludes`](Self::override_excludes)
+    /// treats the exclude lists: a no-op when empty, otherwise validated and replacing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`](crate::CoreError) if a pattern is not a valid glob.
+    pub fn override_include_hidden(&mut self, patterns: &[String]) -> Result<(), crate::CoreError> {
+        if !patterns.is_empty() {
+            super::compile_hidden_globset(patterns)?;
+            self.include_hidden = ExcludeList::replace(patterns.to_vec());
         }
         Ok(())
     }
@@ -452,5 +480,28 @@ mod tests {
                 .override_excludes(&[], &["[".to_string()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn override_include_hidden_replaces_non_empty_validates_and_noops_on_empty() {
+        let seed = CommandConfig {
+            include_hidden: ExcludeList::extend(vec![".agents".to_string()]),
+            ..CommandConfig::default()
+        };
+
+        let mut replaced = seed.clone();
+        replaced
+            .override_include_hidden(&[".github".to_string()])
+            .expect("valid override");
+        assert_eq!(replaced.include_hidden.patterns(), [".github"]);
+
+        let mut untouched = seed.clone();
+        untouched.override_include_hidden(&[]).expect("no-op");
+        assert_eq!(untouched.include_hidden.patterns(), [".agents"]);
+
+        let error = CommandConfig::default()
+            .override_include_hidden(&["a/**/[".to_string()])
+            .expect_err("bad glob");
+        assert!(error.to_string().contains("include-hidden"), "{error}");
     }
 }

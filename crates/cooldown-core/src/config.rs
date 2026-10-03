@@ -13,7 +13,7 @@ mod scan;
 mod schema;
 
 pub use document::ConfigDocument;
-pub use exclude::{compile_folder_globset, compile_package_globset};
+pub use exclude::{compile_folder_globset, compile_hidden_globset, compile_package_globset};
 pub use exclude_list::ExcludeList;
 pub use layers::{builtin_default_layer, layer_from_fields, parse_config};
 pub use scan::{ScanConfig, parse_scan_config};

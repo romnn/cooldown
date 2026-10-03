@@ -5,7 +5,7 @@ weight: 4
 
 # Exclusions
 
-Two independent knobs trim what a run looks at: `exclude-folders` (prune directories from detection) and `exclude-packages` (drop packages from reports). Both live under the flag-default sections — `[global]`, a `[<command>]` override, or `[tool.<name>]` for one ecosystem — and a plain array **adds** to what the other sections and config files contribute (a prune set, so order is irrelevant; see [Clearing or replacing an inherited list](#clearing-or-replacing-an-inherited-list) for the other merge modes). They belong in the repo-root `cooldown.toml`, the global config, or a `--config` file: a nested `cooldown.toml` sets policy only, and an exclude list there is a config error.
+Two independent knobs trim what a run looks at: `exclude-folders` (prune directories from detection) and `exclude-packages` (drop packages from reports). A third, [`include-hidden`](#include-hidden), widens detection to named dot-directories, which it otherwise skips. Both live under the flag-default sections — `[global]`, a `[<command>]` override, or `[tool.<name>]` for one ecosystem — and a plain array **adds** to what the other sections and config files contribute (a prune set, so order is irrelevant; see [Clearing or replacing an inherited list](#clearing-or-replacing-an-inherited-list) for the other merge modes). They belong in the repo-root `cooldown.toml`, the global config, or a `--config` file: a nested `cooldown.toml` sets policy only, and an exclude list there is a config error.
 
 Every pattern is compiled when the config is loaded, so a bad glob is a **config error** (exit `2`), not a surprise mid-scan.
 
@@ -42,6 +42,22 @@ Drops a workspace member from reports when its **package name** matches a glob �
 
 Because names differ per ecosystem (`my-pkg` vs `@scope/my-pkg`), reach for `[tool.<name>].exclude-packages` when a pattern is ecosystem-specific; a `[global]` entry applies to every tool.
 
+## `include-hidden`
+
+Detection never enters a directory whose name starts with `.` — `.git`, `.venv`, `.cache`, and every other dot-directory — which also hides real projects kept in one, such as tooling scripts under `.github/scripts`. `include-hidden` opts named dot-directories back in:
+
+```toml
+[global]
+include-hidden = [".agents", ".github"]
+```
+
+- Patterns take the [`exclude-folders`](#exclude-folders) semantics (a bare name at any depth, `/name` anchored to the scan root, an interior slash root-relative) and are matched against the **dot-directory itself**. Below a matched directory the walk proceeds as anywhere else, except that a dot-directory nested inside it (`.github/scripts/.venv`) stays skipped unless a pattern matches it too. A dot-directory below another one is reached only when the outer one is included as well.
+- **`.git` is never scanned**, whatever the patterns match (`.*` included).
+- **`exclude-folders` still wins**: it prunes an included directory, or anything below one, exactly as it would an ordinary directory. `.gitignore` handling is unchanged, so a gitignored path stays skipped.
+- It lives under `[global]` or a `[<command>]` table only — which dot-directories hold projects is a property of the repository, not of one ecosystem, so there is no `[tool.*]` form — and, like the exclude lists, only in the repo-root `cooldown.toml`, the global config, or a `--config` file. It merges across sections and files the same way (below).
+
+Without `include-hidden` nothing changes: no dot-directory is scanned unless the run [selects one](#running-from-an-excluded-directory).
+
 ## Clearing or replacing an inherited list
 
 Lists layer across files (the global config → the repo-root `cooldown.toml` → `--config`) and across sections (`[global]` → `[<command>]`), and a plain array **adds** to what it inherits. To undo an inherited list, name the merge mode instead:
@@ -53,7 +69,7 @@ Lists layer across files (the global config → the repo-root `cooldown.toml` �
 | `exclude-folders = { replace = ["a"] }` | **replaces** it with `a` |
 | `exclude-folders = { extend = ["a"] }` | adds `a` (the explicit spelling of the plain array) |
 
-Each key merges on its own. A `[tool.cargo]` replacement swaps only the inherited `[tool.cargo]` list — the `[global]` list is a different key and is still combined with it at scan time — and a `[outdated]` replacement shadows `[global]` for `outdated` alone. A later layer's plain array adds to a replacement rather than reviving what it dropped. `exclude-packages` merges the same way, and a misspelt merge key is a config error.
+Each key merges on its own. A `[tool.cargo]` replacement swaps only the inherited `[tool.cargo]` list — the `[global]` list is a different key and is still combined with it at scan time — and a `[outdated]` replacement shadows `[global]` for `outdated` alone. A later layer's plain array adds to a replacement rather than reviving what it dropped. `exclude-packages` and `include-hidden` merge the same way, and a misspelt merge key is a config error.
 
 Within one file the sections resolve first — `[global]`, then the `[<command>]` override — and only then do the files fold, lowest precedence first. A repo-root `[outdated]` replacement therefore drops everything the global config contributed for `outdated`, its `[global]` and `[outdated]` lists alike, and a plain array in a later `--config` file adds to that result.
 
@@ -82,10 +98,11 @@ A selection the run cannot honor is a usage error (exit `2`) rather than an empt
 
 ## On the command line
 
-Both have a CLI form — `--exclude-folders <glob>` and `--exclude-packages <glob>` (repeatable) — that **replaces** the `[global]` / `[<command>]` config lists for that run (per-tool `[tool.*]` excludes still apply). CLI globs are validated the same way, so a malformed pattern is a config error, and so is a `--exclude-folders` glob that names the `-C` directory:
+All three lists have a CLI form — `--exclude-folders <glob>`, `--exclude-packages <glob>`, and `--include-hidden <glob>` (repeatable) — that **replaces** the `[global]` / `[<command>]` config lists for that run (per-tool `[tool.*]` excludes still apply). CLI globs are validated the same way, so a malformed pattern is a config error, and so is a `--exclude-folders` glob that names the `-C` directory:
 
 ```bash
 cooldown outdated --exclude-folders 'e2e' --exclude-folders '/vendor'
+cooldown check --include-hidden '.github'
 ```
 
 > [!NOTE]

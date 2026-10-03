@@ -319,15 +319,15 @@ impl ConfigSources {
         let origin = Origin::Repo(path.to_owned());
         let document = read_document(path, &origin)?;
         // Only the repo-root file (and the global and `--config` files) feed the scan config, so
-        // an exclude list here would be validated and then ignored; refuse it rather than let a
-        // nested file look like the place to override an inherited list.
+        // an exclude or `include-hidden` list here would be validated and then ignored; refuse it
+        // rather than let a nested file look like the place to override an inherited list.
         if let Some(loaded) = &document
-            && loaded.scan_config(&origin)?.sets_exclude_lists()
+            && loaded.scan_config(&origin)?.sets_scan_lists()
         {
             return Err(CoreError::Config(format!(
-                "{}: `exclude-folders`/`exclude-packages` apply only from the repository root \
-                 `{CONFIG_FILE}`, the global config, or a `--config` file; a nested config \
-                 contributes policy only",
+                "{}: `exclude-folders`/`exclude-packages`/`include-hidden` apply only from the \
+                 repository root `{CONFIG_FILE}`, the global config, or a `--config` file; a \
+                 nested config contributes policy only",
                 origin.token()
             )));
         }
@@ -609,32 +609,37 @@ mod tests {
         );
     }
 
-    /// A nested `cooldown.toml` never feeds the scan config, so an exclude list there is refused
-    /// with a pointer to the files that do, instead of being validated and then ignored.
+    /// A nested `cooldown.toml` never feeds the scan config, so an exclude or `include-hidden`
+    /// list there is refused with a pointer to the files that do, instead of being validated and
+    /// then ignored.
     #[test]
     fn nested_exclude_lists_are_rejected_with_a_location_hint() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
-        std::fs::create_dir(root.join(".git")).expect("git dir");
-        let project = root.join("apps/api");
-        std::fs::create_dir_all(&project).expect("project dir");
-        std::fs::write(
-            project.join(CONFIG_FILE),
+        for nested in [
             indoc! {r"
                 [tool.cargo]
                 exclude-folders = []
             "},
-        )
-        .expect("nested config");
+            indoc! {r#"
+                [global]
+                include-hidden = [".agents"]
+            "#},
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+            std::fs::create_dir(root.join(".git")).expect("git dir");
+            let project = root.join("apps/api");
+            std::fs::create_dir_all(&project).expect("project dir");
+            std::fs::write(project.join(CONFIG_FILE), nested).expect("nested config");
 
-        let configs = ConfigSources::load(root, None, true).expect("config sources");
-        let error = configs
-            .project_config(root, &project)
-            .expect_err("nested exclude list");
-        assert!(
-            error.to_string().contains("repository root"),
-            "the error names where excludes belong: {error}"
-        );
+            let configs = ConfigSources::load(root, None, true).expect("config sources");
+            let error = configs
+                .project_config(root, &project)
+                .expect_err("nested scan list");
+            assert!(
+                error.to_string().contains("repository root"),
+                "the error names where scan lists belong: {error}"
+            );
+        }
     }
 
     #[test]

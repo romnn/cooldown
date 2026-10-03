@@ -217,6 +217,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
     CommandConfig {
         exclude_folders: ExcludeList::default(),
         exclude_packages: ExcludeList::default(),
+        include_hidden: ExcludeList::default(),
         tool: Vec::new(),
         package: Vec::new(),
         gitignore: Some(true),
@@ -251,6 +252,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
     CommandConfig {
         exclude_folders: ExcludeList::default(),
         exclude_packages: ExcludeList::default(),
+        include_hidden: ExcludeList::default(),
         tool,
         package: global.package.clone(),
         gitignore: overrides.gitignore,
