@@ -11,6 +11,7 @@ mod manifest;
 mod native;
 mod ownership;
 mod publication;
+mod rejection_memo;
 mod staging;
 #[cfg(test)]
 mod test_support;

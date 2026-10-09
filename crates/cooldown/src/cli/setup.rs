@@ -12,7 +12,9 @@ use crate::app::{
 use crate::discovery;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::CoreError;
+use cooldown_registry::HttpOptions;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub(crate) struct PreparedRun {
     pub(crate) repo_root: Utf8PathBuf,
@@ -123,9 +125,17 @@ pub(crate) async fn prepare_run(
     // conditional request per npm-family package would buy nothing.
     let adopting = command.adopts_versions();
     let (adapters, http) = detect::adapter_set(
-        invocation.offline(),
-        invocation.fresh(),
-        invocation.concurrency(),
+        HttpOptions {
+            offline: invocation.offline(),
+            fresh: invocation.fresh(),
+            // The resolve knob caps both the fan-out width and the per-host in-flight requests, so
+            // raising `--concurrency` actually widens the registry fetch (the per-host semaphore,
+            // not the fan-out, is otherwise the binding cap since every dep of one tool hits one host).
+            per_host_concurrency: invocation.concurrency().max(1),
+            request_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+        global.rejection_memo_enabled(invocation.fresh()),
         adopting && invocation.respect_dist_tags(),
     )?;
     let selected_dir = scope.selected_dir();

@@ -25,6 +25,9 @@ use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::lockfile::{CargoLock, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes};
 use crate::manifest;
 use crate::native::parse_native;
+use crate::rejection_memo::{
+    MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, RejectionEffect, RejectionMemo,
+};
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -39,8 +42,10 @@ use cooldown_core::{
     UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The line cargo-hakari writes above the dependency tables it generates. Read for one purpose
 /// only: to hint that an *undeclared* member looks like a workspace-hack. It never decides
@@ -83,9 +88,11 @@ pub struct CargoTool {
     generated: tokio::sync::Mutex<HashMap<Utf8PathBuf, Arc<GeneratedFacts>>>,
     /// The `(name, from, to)` moves a precise pin refused on their own during this run.
     ///
-    /// Such a move fails every seed that carries it, so each later batch would bisect down to it
-    /// again; it goes straight to its precise pin instead, which keeps cargo's explanation.
+    /// Ordinary pin batches route it to its precise pin to avoid repeated bisection.
+    /// Joint widen probes bypass this memory because their manifest context differs.
     refused_alone: std::sync::Mutex<HashSet<(String, String, String)>>,
+    rejection_memo: RejectionMemo,
+    rejection_memo_enabled: bool,
 }
 
 impl CargoTool {
@@ -113,6 +120,25 @@ impl CargoTool {
             cargo: Cargo::new(),
             generated: tokio::sync::Mutex::new(HashMap::new()),
             refused_alone: std::sync::Mutex::new(HashSet::new()),
+            rejection_memo: RejectionMemo::default(),
+            rejection_memo_enabled: true,
+        }
+    }
+
+    /// Enables or disables reuse of resolver rejections with identical resolution inputs.
+    #[must_use]
+    pub fn with_rejection_memo(mut self, enabled: bool) -> Self {
+        self.rejection_memo_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn register_memo_origin(&self, staged: &Project, original: &Project) {
+        if self.rejection_memo_enabled
+            && let Err(err) = self
+                .rejection_memo
+                .register_origin(&staged.root, &original.root)
+        {
+            tracing::debug!(%err, "cargo rejection memo origin unavailable; bypassing memo");
         }
     }
 
@@ -141,6 +167,21 @@ impl CargoTool {
             .metadata_locked(&project.root, &project.generated_members)
             .await?;
         self.remember_generated_facts(project, &graph).await
+    }
+
+    async fn pin_followers(&self, project: &Project) -> Result<Vec<MemberRef>> {
+        if let Some(facts) = self.generated.lock().await.get(&project.root) {
+            return Ok(facts.members.clone());
+        }
+        // An identical staged trial can hit the rejection memo before it has a locked graph.
+        // Resolve follower names from workspace manifests rather than spawning Cargo for the key.
+        match self.rejection_memo.followers(project) {
+            Ok(followers) => Ok(followers),
+            Err(err) => {
+                tracing::debug!(%err, "cargo rejection memo follower discovery bypassed");
+                Ok(self.generated_facts(project, None).await?.members.clone())
+            }
+        }
     }
 
     /// Establishes and memoizes the facts a graph read of `project` yields.
@@ -683,6 +724,19 @@ fn collateral_change(registry: &str, name: &str, from: &str, to: &str) -> Change
 type PinRejections = BTreeMap<(String, String, String), String>;
 
 #[derive(Default)]
+struct MemoStats {
+    hits: usize,
+    misses: usize,
+}
+
+impl MemoStats {
+    fn include(&mut self, other: &Self) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+    }
+}
+
+#[derive(Default)]
 struct PinBatchStats {
     resolves: usize,
     /// Target visits in seeded resolves, including failed attempts.
@@ -691,12 +745,242 @@ struct PinBatchStats {
     landed: usize,
     bisected: usize,
     per_crate: usize,
+    memo: MemoStats,
+    resolver_rejected: bool,
+    memo_disqualified: bool,
+    rejection_effects: Vec<RejectionEffect>,
+}
+
+impl PinBatchStats {
+    fn record_rejection(&mut self, resolver_rejection: bool) {
+        self.resolver_rejected |= resolver_rejection;
+        self.memo_disqualified |= !resolver_rejection;
+    }
+
+    fn memoizable_rejection(&self) -> bool {
+        self.resolver_rejected && !self.memo_disqualified
+    }
+
+    fn record_effects(&mut self, rejection: &MemoRejection, rejections: &mut PinRejections) {
+        rejection.apply(rejections);
+        self.rejection_effects
+            .extend(rejection.effects.iter().cloned());
+    }
+}
+
+struct SeedGroup<'a> {
+    moves: &'a [PlannedNodeMove],
+    changes: &'a [&'a Change],
+}
+
+struct MemoAttempt<'a> {
+    project: &'a Project,
+    operation: MemoOperation,
+    metadata_mode: MemoMetadataMode,
+    changes: &'a [&'a Change],
+    followers: &'a [MemberRef],
+    journal: &'a ProjectMutationJournal,
+}
+
+impl MemoAttempt<'_> {
+    fn validate(&self) -> Result<()> {
+        self.journal.validate_project(&self.project.root)?;
+        cooldown_core::interrupt::ensure_not_requested("checking cargo rejection memo")
+    }
+
+    fn key(&self, memo: &RejectionMemo) -> Result<MemoKey> {
+        memo.key(
+            self.project,
+            self.operation,
+            self.changes,
+            self.followers,
+            self.metadata_mode,
+        )
+    }
 }
 
 struct SeededResolve {
     before: CargoLock,
     after: CargoLock,
     snapshot: Vec<(Utf8PathBuf, Option<String>)>,
+}
+
+#[derive(Default)]
+struct WholeGraphStats {
+    rounds: usize,
+    joint_probes: usize,
+    joint_full_successes: usize,
+    partial_replays_kept: usize,
+    partial_replays_discarded: usize,
+    per_change_attempts: usize,
+    memo: MemoStats,
+}
+
+struct ResolveCounter<'a> {
+    observer: Option<&'a dyn ApplyObserver>,
+    invocations: AtomicUsize,
+}
+
+impl ApplyObserver for ResolveCounter<'_> {
+    fn resolver_started(&self, change: Option<&Change>) {
+        self.invocations.fetch_add(1, Ordering::Relaxed);
+        if let Some(observer) = self.observer {
+            observer.resolver_started(change);
+        }
+    }
+
+    fn candidate_started(&self, change: &Change) {
+        if let Some(observer) = self.observer {
+            observer.candidate_started(change);
+        }
+    }
+}
+
+struct WidenProbe<'a> {
+    project: &'a Project,
+    candidates: &'a [&'a Change],
+    protected: &'a [&'a Change],
+    followers: &'a [MemberRef],
+    journal: &'a ProjectMutationJournal,
+    observer: Option<&'a dyn ApplyObserver>,
+}
+
+impl WidenProbe<'_> {
+    fn metadata_mode(&self) -> MemoMetadataMode {
+        if self
+            .candidates
+            .iter()
+            .chain(self.protected)
+            .any(|change| needs_member_graph(change))
+        {
+            MemoMetadataMode::Resolve
+        } else {
+            MemoMetadataMode::Skip
+        }
+    }
+}
+
+struct WidenEvidence {
+    versions: BTreeMap<SlotKey, String>,
+    graph: Option<ResolvedGraph>,
+}
+
+impl WidenEvidence {
+    fn reached(&self, change: &Change) -> bool {
+        reached_after(&self.versions, self.graph.as_ref(), change)
+    }
+}
+
+struct WidenRound<'a> {
+    evidence: WidenEvidence,
+    protected: Vec<&'a Change>,
+}
+
+impl<'a> WidenRound<'a> {
+    fn new(project: &Project, changes: &'a [Change], graph: Option<ResolvedGraph>) -> Result<Self> {
+        let evidence = WidenEvidence {
+            versions: read_lock(project)?.crates_io_locked_versions(),
+            graph,
+        };
+        let protected = changes
+            .iter()
+            .filter(|change| evidence.reached(change))
+            .collect();
+        Ok(Self {
+            evidence,
+            protected,
+        })
+    }
+
+    fn accept(&mut self, evidence: WidenEvidence, changes: &'a [Change]) {
+        self.protected = changes
+            .iter()
+            .filter(|change| evidence.reached(change))
+            .collect();
+        self.evidence = evidence;
+    }
+}
+
+fn widen_checkpoint(
+    project: &Project,
+    candidates: &[&Change],
+    followers: &[MemberRef],
+) -> Result<ProjectMutationJournal> {
+    let mut paths: BTreeSet<_> = candidates
+        .iter()
+        .flat_map(|change| &change.members)
+        .chain(followers)
+        .map(|member| manifest::member_manifest_rel(&member.path))
+        .collect();
+    paths.insert(Utf8PathBuf::from("Cargo.toml"));
+    paths.insert(Utf8PathBuf::from("Cargo.lock"));
+    ProjectMutationJournal::capture(&project.root, paths)
+}
+
+fn restore_widen_checkpoint(
+    project: &Project,
+    journal: &ProjectMutationJournal,
+    checkpoint: &ProjectMutationJournal,
+) -> Result<()> {
+    journal.validate_project(&project.root)?;
+    checkpoint.validate_project(&project.root)?;
+    checkpoint.restore()
+}
+
+struct WidenFingerprint {
+    manifests: String,
+    lock: String,
+}
+
+enum TentativeWiden {
+    Unchanged,
+    Landed(Box<WidenEvidence>),
+    Rejected,
+}
+
+enum PrecisePinOutcome {
+    Completed,
+    Rejected {
+        detail: Option<String>,
+        resolver_rejection: bool,
+    },
+}
+
+fn widen_fingerprint(
+    project: &Project,
+    journal: &ProjectMutationJournal,
+) -> Result<Option<WidenFingerprint>> {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return Ok(None);
+    }
+    let mut manifests = Sha256::new();
+    let mut lock = Sha256::new();
+    let mut files: Vec<_> = journal.files().iter().collect();
+    files.sort_by_key(|file| file.path());
+    for file in files {
+        let path = file.path();
+        let contents = match std::fs::read(project.root.join(path)) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        let hash = if path == Utf8Path::new("Cargo.lock") {
+            &mut lock
+        } else {
+            &mut manifests
+        };
+        hash.update(path.as_str().len().to_le_bytes());
+        hash.update(path.as_str().as_bytes());
+        hash.update([u8::from(contents.is_some())]);
+        if let Some(contents) = contents {
+            hash.update(contents.len().to_le_bytes());
+            hash.update(contents);
+        }
+    }
+    Ok(Some(WidenFingerprint {
+        manifests: format!("{:02x?}", manifests.finalize().as_slice()),
+        lock: format!("{:02x?}", lock.finalize().as_slice()),
+    }))
 }
 
 /// Rejects seeded slots that resolve to neither their original nor requested version.
@@ -727,6 +1011,24 @@ fn seed_resolver_rejection(err: &CoreError) -> bool {
             ..
         }
     ) && !err.is_local_environment_failure()
+}
+
+fn memoizable_resolver_rejection(err: &CoreError) -> bool {
+    if !seed_resolver_rejection(err) {
+        return false;
+    }
+    let CoreError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    // Numeric Cargo exits also cover transport failures; only resolver diagnostics are reusable.
+    // This eligibility check leaves the existing fallback and held-candidate behavior intact.
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("error: "))
+        .is_some_and(|sentence| {
+            sentence.starts_with("failed to select a version for")
+                || sentence.starts_with("no matching package named")
+        })
 }
 
 /// The [`PinRejections`] key of one planned change: its `(name, from, to)` line.
@@ -823,9 +1125,11 @@ fn widen_snapshot(
 fn restore_widen_snapshot(
     root: &Utf8Path,
     snapshot: &[(Utf8PathBuf, Option<String>)],
+    journal: &ProjectMutationJournal,
 ) -> Result<()> {
     for (rel, contents) in snapshot {
         if let Some(contents) = contents {
+            journal.validate_project(root)?;
             std::fs::write(root.join(rel), contents)?;
         }
     }
@@ -899,6 +1203,58 @@ fn blocking_requirer(
 }
 
 impl CargoTool {
+    fn rejection_memo_key(&self, attempt: &MemoAttempt<'_>) -> Result<Option<MemoKey>> {
+        attempt.validate()?;
+        if self.rejection_memo_enabled {
+            match attempt.key(&self.rejection_memo) {
+                Ok(key) if key.is_cacheable() => Ok(Some(key)),
+                Ok(_) => Ok(None),
+                Err(err) => {
+                    tracing::debug!(operation = ?attempt.operation, %err, "cargo rejection memo input capture bypassed");
+                    Ok(None)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn recall_rejection(
+        &self,
+        attempt: &MemoAttempt<'_>,
+        key: Option<&MemoKey>,
+        stats: &mut MemoStats,
+    ) -> Result<Option<MemoRejection>> {
+        // A hit has no subprocess to perform the supervisor's interruption check.
+        attempt.validate()?;
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let rejection = self.rejection_memo.get(key);
+        if rejection.is_some() {
+            stats.hits += 1;
+        } else {
+            stats.misses += 1;
+        }
+        Ok(rejection)
+    }
+
+    fn remember_rejection(
+        &self,
+        attempt: &MemoAttempt<'_>,
+        before: Option<MemoKey>,
+        rejection: MemoRejection,
+    ) -> Result<()> {
+        attempt.validate()?;
+        let Some(before) = before else {
+            return Ok(());
+        };
+        if self.rejection_memo_key(attempt)?.as_ref() == Some(&before) {
+            self.rejection_memo.insert(before, rejection);
+        }
+        Ok(())
+    }
+
     /// Revalidates `mutation` through whichever execution mode this platform selected.
     ///
     /// The two accessors carry the same parts but enforce different capabilities, so the choice
@@ -918,10 +1274,11 @@ impl CargoTool {
     /// `upgrade` is informational for the rewrite policy.
     /// Cargo has no date cutoff, so each planned target is expressed as a concrete `--precise` pin
     /// computed by the core.
-    /// Under `Always`, every owning constraint is widened up front, before the pin batch. Under
-    /// `Auto`, the pin batch runs first and only the candidates it left short of a cross-major
-    /// target get a *tentative* post-pin widen — kept when the re-pin lands, restored when it
-    /// does not (see the loop below).
+    /// Under `Always`, every owning constraint is widened up front, before the pin batch.
+    /// Under `Auto`, the pin batch runs first, then every widen round tries its remaining targets
+    /// jointly and replays partial landings with only their own edits.
+    /// Targets still short get a tentative individual widen, kept when the re-pin lands and
+    /// restored when it does not.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
@@ -929,128 +1286,532 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<PinRejections> {
-        let followers = self.generated_facts(project, observer).await?;
-        let followers = followers.members.as_slice();
+        let counter = ResolveCounter {
+            observer,
+            invocations: AtomicUsize::new(0),
+        };
+        let mut stats = WholeGraphStats::default();
+        let result = self
+            .whole_graph_resolve_inner(project, plan, journal, Some(&counter), &mut stats)
+            .await;
+        tracing::debug!(
+            rounds = stats.rounds,
+            joint_probes = stats.joint_probes,
+            joint_full_successes = stats.joint_full_successes,
+            partial_replays_kept = stats.partial_replays_kept,
+            partial_replays_discarded = stats.partial_replays_discarded,
+            per_change_attempts = stats.per_change_attempts,
+            memo_hits = stats.memo.hits,
+            memo_misses = stats.memo.misses,
+            cargo_invocations = counter.invocations.load(Ordering::Relaxed),
+            outcome = if result.is_ok() { "resolved" } else { "error" },
+            "cargo whole graph resolve finished"
+        );
+        result
+    }
+
+    async fn whole_graph_resolve_inner(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        stats: &mut WholeGraphStats,
+    ) -> Result<PinRejections> {
+        let followers = self.pin_followers(project).await?;
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
         if matches!(plan.rewrite, RewriteMode::Always) {
-            widen_all_up_front(project, plan, journal, followers)?;
+            widen_all_up_front(project, plan, journal, &followers)?;
         }
         let mut rejections = BTreeMap::new();
-        self.pin_batch(project, &plan.changes, journal, observer, &mut rejections)
-            .await?;
+        self.pin_batch_with_memo_stats(
+            project,
+            &plan.changes,
+            journal,
+            observer,
+            &mut rejections,
+            &mut stats.memo,
+        )
+        .await?;
 
         if matches!(plan.rewrite, RewriteMode::Auto) {
-            // Widen only the candidates the pin batch could not place at their target because their
-            // own declared requirement caps them, then re-pin. Each widen is *tentative*: a widened
-            // requirement whose pin still cannot land (a third-party crate holds the old major)
-            // would leave the manifest demanding a version the lock does not carry, and that poisons
-            // the whole batch at lock verification (`--locked`) — so a widen whose candidate stays
-            // short is restored, and the candidate remains a held skip carrying its recorded
-            // rejection. A short candidate whose widen is a *no-op* (its own requirement already
-            // admits the target, or nothing declares it) may be held only by a sibling's
-            // not-yet-widened requirement, so a round in which any widen+pin progresses re-pins
-            // those candidates before it ends; a round that progresses nowhere proves the
-            // remaining short candidates conflict with another crate (a real conflict the diff
-            // reports), and only then does the loop stop widening.
-            // The member-aware reach check is the only thing in this loop that needs the resolved
-            // graph, so skip the `cargo metadata` spawn entirely when no candidate is a direct
-            // member dep. When it is needed, fail closed: falling back to the lock-slot check is the
-            // false positive this loop exists to avoid.
-            let needs_graph = plan.changes.iter().any(needs_member_graph);
-            for _ in 0..plan.changes.len() {
-                let after = read_lock(project)?.crates_io_locked_versions();
-                let graph = if needs_graph {
-                    journal.validate_project(&project.root)?;
-                    Some(self.metadata_with_observer(project, observer).await?)
-                } else {
-                    None
-                };
-                let mut progressed = false;
-                let mut unwidened_short: Vec<Change> = Vec::new();
-                for change in &plan.changes {
-                    if reached_after(&after, graph.as_ref(), change) {
-                        continue;
-                    }
-                    // Captured before the widen — the first mutation the rollback must undo; the
-                    // pin and the metadata probe below both mutate the staged lock the snapshot
-                    // carries.
-                    let snapshot = widen_snapshot(&project.root, &change.members, followers)?;
-                    journal.validate_project(&project.root)?;
-                    if widen_and_follow(&project.root, change, followers)?
-                        .modified
-                        .is_empty()
-                    {
-                        unwidened_short.push(change.clone());
-                        continue;
-                    }
-                    self.pin_batch(
-                        project,
-                        std::slice::from_ref(change),
-                        journal,
-                        observer,
-                        &mut rejections,
-                    )
-                    .await?;
-                    // The unlocked metadata resolve runs *before* the lock re-read: it may itself
-                    // re-lock the widened requirement — including forking a new major alongside a
-                    // third-party-held old one, which `update --precise` cannot express — and the
-                    // reach check must see that result. A resolve the widened requirement makes
-                    // unsatisfiable is this candidate's rejection, not a batch failure: record
-                    // cargo's explanation, restore the widen, and move on.
-                    let landed_graph = if needs_member_graph(change) {
-                        journal.validate_project(&project.root)?;
-                        match self.metadata_with_observer(project, observer).await {
-                            Ok(graph) => Some(graph),
-                            Err(err)
-                                if err.is_tool_spawn_failure()
-                                    || err.is_local_environment_failure() =>
-                            {
-                                return Err(err);
-                            }
-                            Err(err) => {
-                                if let Some(summary) = summarize_pin_rejection(&err) {
-                                    rejections.entry(rejection_key(change)).or_insert(summary);
-                                }
-                                restore_widen_snapshot(&project.root, &snapshot)?;
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let landed = read_lock(project)?.crates_io_locked_versions();
-                    if reached_after(&landed, landed_graph.as_ref(), change) {
-                        progressed = true;
-                    } else {
-                        restore_widen_snapshot(&project.root, &snapshot)?;
-                    }
-                }
-                // A sibling's landed widen+pin may have removed the shared blocker behind an
-                // unwidened candidate's recorded rejection, so give those candidates their re-pin
-                // (the batch skips any node already at target) before the next round decides they
-                // are conflicted.
-                if progressed && !unwidened_short.is_empty() {
-                    self.pin_batch(
-                        project,
-                        &unwidened_short,
-                        journal,
-                        observer,
-                        &mut rejections,
-                    )
-                    .await?;
-                }
-                if !progressed {
-                    break;
-                }
-            }
+            self.widen_in_rounds(project, plan, journal, observer, &mut rejections, stats)
+                .await?;
         }
-        self.land_rejected_group_atomically(project, plan, journal, observer, &mut rejections)
-            .await?;
+        self.land_rejected_group_atomically(
+            project,
+            plan,
+            journal,
+            observer,
+            &mut rejections,
+            &mut stats.memo,
+        )
+        .await?;
         self.reconcile_projections(project, journal, observer)
             .await?;
         Ok(rejections)
+    }
+
+    async fn widen_in_rounds(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut WholeGraphStats,
+    ) -> Result<()> {
+        // Widen only the candidates the pin batch could not place at their target because their
+        // own declared requirement caps them, then re-pin. Each widen is *tentative*: a widened
+        // requirement whose pin still cannot land (a third-party crate holds the old major)
+        // would leave the manifest demanding a version the lock does not carry, and that poisons
+        // the whole batch at lock verification (`--locked`) — so a widen whose candidate stays
+        // short is restored, and the candidate remains a held skip carrying its recorded
+        // rejection. A short candidate whose widen is a *no-op* (its own requirement already
+        // admits the target, or nothing declares it) may be held only by a sibling's
+        // not-yet-widened requirement, so a round in which any widen+pin progresses re-pins
+        // those candidates before it ends; a round that progresses nowhere proves the
+        // remaining short candidates conflict with another crate (a real conflict the diff
+        // reports), and only then does the loop stop widening.
+        // The member-aware reach check is the only thing in this loop that needs the resolved
+        // graph, so the initial preflight skips metadata when no candidate is a direct member
+        // dep; every joint probe still resolves its seeded graph.
+        // When a member graph is needed, fail closed: a lock-slot fallback is a false positive.
+        let followers = self.pin_followers(project).await?;
+        let graph = self
+            .widen_round_graph(
+                project,
+                plan.changes.iter().any(needs_member_graph),
+                journal,
+                observer,
+            )
+            .await?;
+        // Carry post-command evidence between rounds; another unlocked preflight could displace it.
+        let mut round = WidenRound::new(project, &plan.changes, graph)?;
+        for _ in 0..plan.changes.len() {
+            let candidates: Vec<_> = plan
+                .changes
+                .iter()
+                .filter(|change| !round.evidence.reached(change))
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            stats.rounds += 1;
+            let retained = self
+                .joint_widen_probe(
+                    WidenProbe {
+                        project,
+                        candidates: &candidates,
+                        protected: &round.protected,
+                        followers: &followers,
+                        journal,
+                        observer,
+                    },
+                    stats,
+                )
+                .await?;
+            let mut progressed = retained.is_some();
+            if let Some(retained) = retained {
+                round.accept(retained, &plan.changes);
+            }
+            let mut unwidened_short = Vec::new();
+            for change in &plan.changes {
+                if round.evidence.reached(change) {
+                    continue;
+                }
+                stats.per_change_attempts += 1;
+                let attempt = self
+                    .tentative_widen_logged(
+                        WidenProbe {
+                            project,
+                            candidates: &candidates,
+                            protected: &round.protected,
+                            followers: &followers,
+                            journal,
+                            observer,
+                        },
+                        change,
+                        rejections,
+                        &mut stats.memo,
+                    )
+                    .await?;
+                match attempt {
+                    TentativeWiden::Unchanged => unwidened_short.push(change.clone()),
+                    TentativeWiden::Landed(evidence) => {
+                        progressed = true;
+                        round.accept(*evidence, &plan.changes);
+                    }
+                    TentativeWiden::Rejected => {}
+                }
+            }
+            // A sibling's landed widen can remove the blocker behind an unwidened candidate.
+            if progressed
+                && !unwidened_short.is_empty()
+                && let Some(evidence) = self
+                    .pin_unwidened_protected(
+                        WidenProbe {
+                            project,
+                            candidates: &candidates,
+                            protected: &round.protected,
+                            followers: &followers,
+                            journal,
+                            observer,
+                        },
+                        &unwidened_short,
+                        rejections,
+                        &mut stats.memo,
+                    )
+                    .await?
+            {
+                round.accept(evidence, &plan.changes);
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn widen_round_graph(
+        &self,
+        project: &Project,
+        needed: bool,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<Option<ResolvedGraph>> {
+        if !needed {
+            return Ok(None);
+        }
+        journal.validate_project(&project.root)?;
+        let resolved = self.metadata_with_observer(project, observer).await;
+        journal.validate_project(&project.root)?;
+        resolved.map(Some)
+    }
+
+    // A probe never routes through pin_batch: lone-refusal memory belongs to its old context.
+    async fn joint_widen_probe(
+        &self,
+        probe: WidenProbe<'_>,
+        stats: &mut WholeGraphStats,
+    ) -> Result<Option<WidenEvidence>> {
+        if probe.candidates.is_empty() {
+            return Ok(None);
+        }
+        let mut candidates = probe.candidates.to_vec();
+        candidates.sort_by_key(|change| rejection_key(change));
+        probe.journal.validate_project(&probe.project.root)?;
+        let owners: Vec<_> = candidates.iter().chain(probe.protected).copied().collect();
+        let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
+        stats.joint_probes += 1;
+        let resolved = self.resolve_widened_group(&probe, &candidates).await?;
+        let reached: Vec<_> = resolved
+            .as_ref()
+            .map(|resolved| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|change| resolved.reached(change))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(resolved) = resolved
+            && reached.len() == candidates.len()
+            && probe
+                .protected
+                .iter()
+                .all(|change| resolved.reached(change))
+        {
+            stats.joint_full_successes += 1;
+            return Ok(Some(resolved));
+        }
+        restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+        if reached.is_empty() || reached.len() == candidates.len() {
+            return Ok(None);
+        }
+        // Evidence from the full probe cannot authorize A without the failed B's edits.
+        // Rebuild the subset from the checkpoint and resolve exactly those edits again.
+        let replayed = self.resolve_widened_group(&probe, &reached).await?;
+        if let Some(replayed) = replayed
+            && reached.iter().all(|change| replayed.reached(change))
+            && probe
+                .protected
+                .iter()
+                .all(|change| replayed.reached(change))
+        {
+            stats.partial_replays_kept += 1;
+            return Ok(Some(replayed));
+        }
+        stats.partial_replays_discarded += 1;
+        restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+        Ok(None)
+    }
+
+    async fn resolve_widened_group(
+        &self,
+        probe: &WidenProbe<'_>,
+        candidates: &[&Change],
+    ) -> Result<Option<WidenEvidence>> {
+        let mut edited = 0;
+        for change in candidates {
+            let rewrite =
+                widen_and_follow_checked(&probe.project.root, change, probe.followers, || {
+                    probe.journal.validate_project(&probe.project.root)
+                })?;
+            edited += usize::from(!rewrite.modified.is_empty());
+        }
+        tracing::debug!(
+            candidates = candidates.len(),
+            edited,
+            companions = candidates.len() - edited,
+            "cargo joint widen seed"
+        );
+        let lock_path = probe.project.root.join("Cargo.lock");
+        let lock_text = std::fs::read_to_string(&lock_path)?;
+        let before = CargoLock::parse(&lock_text)?;
+        let mut identities = BTreeSet::new();
+        let moves: Vec<_> = candidates
+            .iter()
+            .filter(|change| {
+                current_selector(&before, change).is_some()
+                    && !before.has_crates_io_package(&change.package.name, change.to.as_str())
+                    && identities.insert(rejection_key(change))
+            })
+            .map(|change| PlannedNodeMove {
+                name: change.package.name.clone(),
+                from: change.from.to_string(),
+                to: change.to.to_string(),
+            })
+            .collect();
+        if !moves.is_empty() {
+            let Some(seeded) = rewrite_planned_nodes(&lock_text, &moves) else {
+                return Ok(None);
+            };
+            probe.journal.validate_project(&probe.project.root)?;
+            std::fs::write(&lock_path, seeded)?;
+        }
+        probe.journal.validate_project(&probe.project.root)?;
+        if let Some(observer) = probe.observer {
+            observer.resolver_started(candidates.first().copied());
+        }
+        let resolved = self
+            .cargo
+            .metadata(&probe.project.root, &probe.project.generated_members)
+            .await;
+        // Topology failure forbids any rejected-path restoration through another writer's files.
+        probe.journal.validate_project(&probe.project.root)?;
+        let graph = match resolved {
+            Ok(graph) => graph,
+            Err(err) if seed_resolver_rejection(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        // No follower edit follows this call: the graph and lock describe the retained manifests.
+        let lock = read_lock(probe.project)?;
+        if seed_has_drive_by(&before, &lock, &moves) {
+            return Ok(None);
+        }
+        Ok(Some(WidenEvidence {
+            versions: lock.crates_io_locked_versions(),
+            graph: Some(graph),
+        }))
+    }
+
+    async fn tentative_widen_logged(
+        &self,
+        probe: WidenProbe<'_>,
+        change: &Change,
+        rejections: &mut PinRejections,
+        memo_stats: &mut MemoStats,
+    ) -> Result<TentativeWiden> {
+        let changes = [change];
+        let memo_attempt = MemoAttempt {
+            project: probe.project,
+            operation: MemoOperation::Widen,
+            metadata_mode: probe.metadata_mode(),
+            changes: &changes,
+            followers: probe.followers,
+            journal: probe.journal,
+        };
+        let key = self.rejection_memo_key(&memo_attempt)?;
+        let fingerprint = widen_fingerprint(probe.project, probe.journal)?;
+        let recalled = self.recall_rejection(&memo_attempt, key.as_ref(), memo_stats)?;
+        let memo_hit = recalled.is_some();
+        let attempt = if let Some(recalled) = recalled {
+            recalled.apply(rejections);
+            Ok(TentativeWiden::Rejected)
+        } else {
+            let owners: Vec<_> = std::iter::once(change)
+                .chain(probe.protected.iter().copied())
+                .collect();
+            let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
+            let mut pins = PinBatchStats::default();
+            let result = self
+                .tentative_widen(probe, change, &checkpoint, rejections, &mut pins)
+                .await;
+            memo_stats.include(&pins.memo);
+            if matches!(&result, Ok(TentativeWiden::Rejected)) && pins.memoizable_rejection() {
+                self.remember_rejection(
+                    &memo_attempt,
+                    key,
+                    MemoRejection {
+                        effects: pins.rejection_effects,
+                    },
+                )?;
+            }
+            result
+        };
+        tracing::debug!(
+            change = ?rejection_key(change),
+            members = ?change.members,
+            manifest_hash = fingerprint.as_ref().map(|hash| hash.manifests.as_str()),
+            lock_hash = fingerprint.as_ref().map(|hash| hash.lock.as_str()),
+            memo_hit,
+            outcome = match &attempt {
+                Ok(TentativeWiden::Unchanged) => "no-op",
+                Ok(TentativeWiden::Landed(_)) => "landed",
+                Ok(TentativeWiden::Rejected) => "rejected",
+                Err(_) => "error",
+            },
+            "cargo per-change widen attempt"
+        );
+        attempt
+    }
+
+    async fn tentative_widen(
+        &self,
+        probe: WidenProbe<'_>,
+        change: &Change,
+        checkpoint: &ProjectMutationJournal,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<TentativeWiden> {
+        probe.journal.validate_project(&probe.project.root)?;
+        if widen_and_follow_checked(&probe.project.root, change, probe.followers, || {
+            probe.journal.validate_project(&probe.project.root)
+        })?
+        .modified
+        .is_empty()
+        {
+            return Ok(TentativeWiden::Unchanged);
+        }
+        self.pin_batch_recorded(
+            probe.project,
+            std::slice::from_ref(change),
+            probe.journal,
+            probe.observer,
+            rejections,
+            stats,
+        )
+        .await?;
+        // Metadata may land a fork that a precise pin could not express.
+        // A candidate rejection retains Cargo's own explanation and restores the tentative widen.
+        let landed_graph = if probe.metadata_mode() == MemoMetadataMode::Resolve {
+            probe.journal.validate_project(&probe.project.root)?;
+            let resolved = self
+                .metadata_with_observer(probe.project, probe.observer)
+                .await;
+            probe.journal.validate_project(&probe.project.root)?;
+            match resolved {
+                Ok(graph) => Some(graph),
+                Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
+                    stats.memo_disqualified = true;
+                    return Err(err);
+                }
+                Err(err) => {
+                    if let Some(summary) = summarize_pin_rejection(&err) {
+                        let effect = RejectionEffect {
+                            key: rejection_key(change),
+                            detail: summary,
+                            overwrite: false,
+                        };
+                        MemoRejection {
+                            effects: vec![effect.clone()],
+                        }
+                        .apply(rejections);
+                        stats.rejection_effects.push(effect);
+                    }
+                    // Reach failure alone is not a resolver rejection eligible for memoization.
+                    stats.record_rejection(memoizable_resolver_rejection(&err));
+                    restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
+                    return Ok(TentativeWiden::Rejected);
+                }
+            }
+        } else {
+            None
+        };
+        let evidence = WidenEvidence {
+            versions: read_lock(probe.project)?.crates_io_locked_versions(),
+            graph: landed_graph,
+        };
+        let protected_reached = probe
+            .protected
+            .iter()
+            .all(|change| evidence.reached(change));
+        if !protected_reached {
+            // Displacement depends on protected obligations, not just the candidate's memo key.
+            stats.memo_disqualified = true;
+        }
+        if evidence.reached(change) && protected_reached {
+            Ok(TentativeWiden::Landed(Box::new(evidence)))
+        } else {
+            restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
+            Ok(TentativeWiden::Rejected)
+        }
+    }
+
+    async fn pin_unwidened_protected(
+        &self,
+        probe: WidenProbe<'_>,
+        changes: &[Change],
+        rejections: &mut PinRejections,
+        memo_stats: &mut MemoStats,
+    ) -> Result<Option<WidenEvidence>> {
+        probe.journal.validate_project(&probe.project.root)?;
+        let owners: Vec<_> = changes
+            .iter()
+            .chain(probe.protected.iter().copied())
+            .collect();
+        let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
+        self.pin_batch_with_memo_stats(
+            probe.project,
+            changes,
+            probe.journal,
+            probe.observer,
+            rejections,
+            memo_stats,
+        )
+        .await?;
+        let needs_graph = owners
+            .iter()
+            .chain(probe.candidates)
+            .any(|change| needs_member_graph(change));
+        let graph = match self
+            .widen_round_graph(probe.project, needs_graph, probe.journal, probe.observer)
+            .await
+        {
+            Ok(graph) => graph,
+            Err(err) if seed_resolver_rejection(&err) => {
+                restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let evidence = WidenEvidence {
+            versions: read_lock(probe.project)?.crates_io_locked_versions(),
+            graph,
+        };
+        if probe
+            .protected
+            .iter()
+            .all(|change| evidence.reached(change))
+        {
+            Ok(Some(evidence))
+        } else {
+            restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+            Ok(None)
+        }
     }
 
     /// Makes the generated projections follow the moves the pin phase landed *beyond* the plan:
@@ -1141,6 +1902,7 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
+        memo_stats: &mut MemoStats,
     ) -> Result<()> {
         if rejections.is_empty() {
             return Ok(());
@@ -1174,10 +1936,18 @@ impl CargoTool {
             "seeding rejected co-planned changes for one atomic reconcile"
         );
         let mut stats = PinBatchStats::default();
-        let Some(seeded) = self
+        let obligations: Vec<_> = plan
+            .changes
+            .iter()
+            .filter(|change| keys.contains(&rejection_key(change)))
+            .collect();
+        let seeded = self
             .seed_resolve(
                 project,
-                &moves,
+                SeedGroup {
+                    moves: &moves,
+                    changes: &obligations,
+                },
                 journal,
                 observer.zip(
                     plan.changes
@@ -1186,8 +1956,9 @@ impl CargoTool {
                 ),
                 &mut stats,
             )
-            .await?
-        else {
+            .await;
+        memo_stats.include(&stats.memo);
+        let Some(seeded) = seeded? else {
             return Ok(());
         };
         // All-or-nothing: the seed removed every `from` node, so a member the reconcile did NOT
@@ -1207,7 +1978,7 @@ impl CargoTool {
                 rejections.remove(key);
             }
         } else {
-            restore_widen_snapshot(&project.root, &seeded.snapshot)?;
+            restore_widen_snapshot(&project.root, &seeded.snapshot, journal)?;
         }
         Ok(())
     }
@@ -1216,11 +1987,12 @@ impl CargoTool {
     async fn seed_resolve(
         &self,
         project: &Project,
-        moves: &[PlannedNodeMove],
+        group: SeedGroup<'_>,
         journal: &ProjectMutationJournal,
         notification: Option<(&dyn ApplyObserver, &Change)>,
         stats: &mut PinBatchStats,
     ) -> Result<Option<SeededResolve>> {
+        let moves = group.moves;
         let lock_path = project.root.join("Cargo.lock");
         let lock_text = std::fs::read_to_string(&lock_path)?;
         let before = CargoLock::parse(&lock_text)?;
@@ -1231,20 +2003,36 @@ impl CargoTool {
         // still demanding a seeded node's old version would reject the joint resolve for the
         // projection's sake.
         // Captured with the lock, restored with it.
-        let followers = self
-            .generated_facts(project, notification.map(|(observer, _)| observer))
-            .await?;
-        let snapshot = widen_snapshot(&project.root, &[], &followers.members)?;
+        let followers = self.pin_followers(project).await?;
+        let memo_attempt = MemoAttempt {
+            project,
+            operation: MemoOperation::Seed,
+            metadata_mode: MemoMetadataMode::Resolve,
+            changes: group.changes,
+            followers: &followers,
+            journal,
+        };
+        let key = self.rejection_memo_key(&memo_attempt)?;
+        if self
+            .recall_rejection(&memo_attempt, key.as_ref(), &mut stats.memo)?
+            .is_some()
+        {
+            stats.resolver_rejected = true;
+            return Ok(None);
+        }
+        let snapshot = widen_snapshot(&project.root, &[], &followers)?;
         journal.validate_project(&project.root)?;
         for planned in moves {
-            manifest::follow_constraint(
+            manifest::follow_constraint_checked(
                 &project.root,
-                &followers.members,
+                &followers,
                 &planned.name,
                 &planned.from,
                 &planned.to,
+                || journal.validate_project(&project.root),
             )?;
         }
+        journal.validate_project(&project.root)?;
         std::fs::write(&lock_path, &seeded)?;
         stats.seeded += moves.len();
         stats.resolves += 1;
@@ -1274,7 +2062,7 @@ impl CargoTool {
                     {
                         manifest::follow_constraint(
                             &project.root,
-                            &followers.members,
+                            &followers,
                             &planned.name,
                             &planned.from,
                             &planned.to,
@@ -1288,8 +2076,12 @@ impl CargoTool {
                 }))
             }
             Err(err) => {
-                restore_widen_snapshot(&project.root, &snapshot)?;
+                stats.record_rejection(memoizable_resolver_rejection(&err));
+                restore_widen_snapshot(&project.root, &snapshot, journal)?;
                 if seed_resolver_rejection(&err) {
+                    if stats.memoizable_rejection() {
+                        self.remember_rejection(&memo_attempt, key, MemoRejection::default())?;
+                    }
                     // A group rejection cannot explain any one candidate's refusal.
                     Ok(None)
                 } else {
@@ -1307,6 +2099,7 @@ impl CargoTool {
     /// Successful seeds send only their unlanded changes to that loop.
     /// Resolver rejections remain non-fatal held candidates the final diff reports; local
     /// environment failures and interruptions abort without bisection.
+    #[cfg(all(test, unix))]
     async fn pin_batch(
         &self,
         project: &Project,
@@ -1315,10 +2108,30 @@ impl CargoTool {
         observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
     ) -> Result<()> {
+        self.pin_batch_recorded(
+            project,
+            changes,
+            journal,
+            observer,
+            rejections,
+            &mut PinBatchStats::default(),
+        )
+        .await
+    }
+
+    async fn pin_batch_recorded(
+        &self,
+        project: &Project,
+        changes: &[Change],
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
         // Direct workspace members can emit sibling changes sharing `(package, from, to)`;
         // those are one lock move and one resolver operation.
-        let mut worklist: Vec<&Change> = changes.iter().collect();
-        worklist.sort_by(|a, b| {
+        let mut sorted = changes.to_vec();
+        sorted.sort_by(|a, b| {
             a.package
                 .name
                 .cmp(&b.package.name)
@@ -1326,13 +2139,26 @@ impl CargoTool {
                 .then_with(|| a.from.as_str().cmp(b.from.as_str()))
                 .then_with(|| a.to.as_str().cmp(b.to.as_str()))
         });
-        worklist.dedup_by(|a, b| a.package == b.package && a.from == b.from && a.to == b.to);
-
-        let mut stats = PinBatchStats::default();
+        let mut obligations: Vec<Change> = Vec::new();
+        for change in sorted {
+            if let Some(previous) = obligations.last_mut()
+                && previous.package == change.package
+                && previous.from == change.from
+                && previous.to == change.to
+            {
+                previous.members.extend(change.members);
+                previous
+                    .members
+                    .sort_by(|a, b| (&a.name, &a.path).cmp(&(&b.name, &b.path)));
+                previous.members.dedup();
+                previous.direct |= change.direct;
+            } else {
+                obligations.push(change);
+            }
+        }
+        let worklist: Vec<_> = obligations.iter().collect();
         let result = self
-            .pin_fixed_point(
-                project, &worklist, journal, observer, rejections, &mut stats,
-            )
+            .pin_fixed_point(project, &worklist, journal, observer, rejections, stats)
             .await;
         tracing::debug!(
             resolves = stats.resolves,
@@ -1340,8 +2166,27 @@ impl CargoTool {
             landed = stats.landed,
             bisected = stats.bisected,
             per_crate = stats.per_crate,
+            memo_hits = stats.memo.hits,
+            memo_misses = stats.memo.misses,
             "cargo pin batch finished"
         );
+        result
+    }
+
+    async fn pin_batch_with_memo_stats(
+        &self,
+        project: &Project,
+        changes: &[Change],
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        memo_stats: &mut MemoStats,
+    ) -> Result<()> {
+        let mut stats = PinBatchStats::default();
+        let result = self
+            .pin_batch_recorded(project, changes, journal, observer, rejections, &mut stats)
+            .await;
+        memo_stats.include(&stats.memo);
         result
     }
 
@@ -1423,12 +2268,21 @@ impl CargoTool {
             }
             let notification = observer.zip(unlanded.first().copied());
             if let Some(seeded) = self
-                .seed_resolve(project, &moves, journal, notification, stats)
+                .seed_resolve(
+                    project,
+                    SeedGroup {
+                        moves: &moves,
+                        changes: &unlanded,
+                    },
+                    journal,
+                    notification,
+                    stats,
+                )
                 .await?
             {
                 if seed_has_drive_by(&seeded.before, &seeded.after, &moves) {
                     tracing::debug!(group = moves.len(), "restoring cargo seed after a drive-by");
-                    restore_widen_snapshot(&project.root, &seeded.snapshot)?;
+                    restore_widen_snapshot(&project.root, &seeded.snapshot, journal)?;
                 } else {
                     let leftovers: Vec<&Change> = unlanded
                         .iter()
@@ -1512,18 +2366,83 @@ impl CargoTool {
                 };
                 attempted = true;
                 journal.validate_project(&project.root)?;
+                let followers = self.pin_followers(project).await?;
+                let changes = [*change];
+                let memo_attempt = MemoAttempt {
+                    project,
+                    operation: MemoOperation::Precise,
+                    metadata_mode: MemoMetadataMode::Skip,
+                    changes: &changes,
+                    followers: &followers,
+                    journal,
+                };
+                let key = self.rejection_memo_key(&memo_attempt)?;
+                let fingerprint = widen_fingerprint(project, journal)?;
+                if let Some(recalled) =
+                    self.recall_rejection(&memo_attempt, key.as_ref(), &mut stats.memo)?
+                {
+                    stats.record_effects(&recalled, rejections);
+                    stats.resolver_rejected = true;
+                    tracing::debug!(
+                        change = ?rejection_key(change),
+                        members = ?change.members,
+                        manifest_hash = fingerprint.as_ref().map(|hash| hash.manifests.as_str()),
+                        lock_hash = fingerprint.as_ref().map(|hash| hash.lock.as_str()),
+                        memo_hit = true,
+                        outcome = "rejected",
+                        "cargo per-change pin attempt"
+                    );
+                    continue;
+                }
                 if let Some(observer) = observer {
                     observer.resolver_started(Some(change));
                 }
                 stats.resolves += 1;
                 stats.per_crate += 1;
-                if let Some(rejection) = self
+                let updated = self
                     .update_precise(project, &change.package.name, &current, change.to.as_str())
-                    .await?
+                    .await;
+                let validated = journal.validate_project(&project.root);
+                stats.memo_disqualified |= updated.is_err() || validated.is_err();
+                tracing::debug!(
+                    change = ?rejection_key(change),
+                    members = ?change.members,
+                    manifest_hash = fingerprint.as_ref().map(|hash| hash.manifests.as_str()),
+                    lock_hash = fingerprint.as_ref().map(|hash| hash.lock.as_str()),
+                    memo_hit = false,
+                    outcome = if validated.is_err() {
+                        "topology-error"
+                    } else {
+                        match &updated {
+                            Ok(PrecisePinOutcome::Rejected { .. }) => "rejected",
+                            Ok(PrecisePinOutcome::Completed) => "completed",
+                            Err(_) => "error",
+                        }
+                    },
+                    "cargo per-change pin attempt"
+                );
+                validated?;
+                if let PrecisePinOutcome::Rejected {
+                    detail,
+                    resolver_rejection,
+                } = updated?
                 {
+                    let effects: Vec<_> = detail
+                        .into_iter()
+                        .map(|detail| RejectionEffect {
+                            key: rejection_key(change),
+                            detail,
+                            overwrite: true,
+                        })
+                        .collect();
+                    let rejection = MemoRejection { effects };
                     // Last rejection wins; a candidate a later pass still lands never reads its
                     // stale entry (details are consulted only for unreached candidates).
-                    rejections.insert(rejection_key(change), rejection);
+                    stats.record_effects(&rejection, rejections);
+                    stats.record_rejection(resolver_rejection);
+                    if stats.memoizable_rejection() && resolver_rejection {
+                        self.remember_rejection(&memo_attempt, key, rejection)?;
+                    }
                 }
             }
             let after = read_lock(project)?.locked_slots();
@@ -1547,15 +2466,18 @@ impl CargoTool {
         name: &str,
         from: &str,
         to: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<PrecisePinOutcome> {
         match self
             .cargo
             .update_precise_crates_io(&project.root, name, from, to)
             .await
         {
-            Ok(()) => Ok(None),
+            Ok(()) => Ok(PrecisePinOutcome::Completed),
             Err(err) if err.is_local_environment_failure() => Err(err),
-            Err(err) => Ok(summarize_pin_rejection(&err)),
+            Err(err) => Ok(PrecisePinOutcome::Rejected {
+                resolver_rejection: memoizable_resolver_rejection(&err),
+                detail: summarize_pin_rejection(&err),
+            }),
         }
     }
 
@@ -1807,6 +2729,15 @@ fn widen_and_follow(
     change: &Change,
     followers: &[MemberRef],
 ) -> Result<manifest::ManifestRewrite> {
+    widen_and_follow_checked(root, change, followers, || Ok(()))
+}
+
+fn widen_and_follow_checked(
+    root: &Utf8Path,
+    change: &Change,
+    followers: &[MemberRef],
+    mut validate: impl FnMut() -> Result<()>,
+) -> Result<manifest::ManifestRewrite> {
     // A generated member attributed to the change (a node only its projection still holds) is
     // not an author to widen: the key-based, source-blind authored rewrite would touch whatever
     // entry of that name the projection carries, and with no author left there is no root
@@ -1820,15 +2751,22 @@ fn widen_and_follow(
     let mut rewrite = if authors.is_empty() && !change.members.is_empty() {
         manifest::ManifestRewrite::default()
     } else {
-        manifest::widen_constraint(root, &authors, &change.package.name, change.to.as_str())?
+        manifest::widen_constraint_checked(
+            root,
+            &authors,
+            &change.package.name,
+            change.to.as_str(),
+            &mut validate,
+        )?
     };
     if !followers.is_empty() {
-        let followed = manifest::follow_constraint(
+        let followed = manifest::follow_constraint_checked(
             root,
             followers,
             &change.package.name,
             change.from.as_str(),
             change.to.as_str(),
+            &mut validate,
         )?;
         rewrite.modified.extend(followed.modified);
     }
@@ -2228,6 +3166,12 @@ mod tests {
 
     #[cfg(unix)]
     mod seeded_pins;
+
+    #[cfg(unix)]
+    mod widen_probe;
+
+    #[cfg(unix)]
+    mod rejection_memo;
 
     fn duplicate_guard_lock(versions: &[(&str, &str)]) -> eyre::Result<CargoLock> {
         let mut content = String::new();
@@ -3965,8 +4909,15 @@ mod tests {
             .iter()
             .map(|change| (rejection_key(change), "held".to_string()))
             .collect();
-        tool.land_rejected_group_atomically(&project, &plan, &journal, None, &mut rejections)
-            .await?;
+        tool.land_rejected_group_atomically(
+            &project,
+            &plan,
+            &journal,
+            None,
+            &mut rejections,
+            &mut MemoStats::default(),
+        )
+        .await?;
 
         assert_eq!(
             std::fs::read_to_string(root.join("Cargo.lock"))?,
@@ -4002,8 +4953,15 @@ mod tests {
             rejection_key(&plan.changes[0]),
             "the precise pin was rejected".to_string(),
         )]);
-        tool.land_rejected_group_atomically(&project, &plan, &journal, None, &mut rejections)
-            .await?;
+        tool.land_rejected_group_atomically(
+            &project,
+            &plan,
+            &journal,
+            None,
+            &mut rejections,
+            &mut MemoStats::default(),
+        )
+        .await?;
 
         assert!(
             !root.join("metadata-ran").exists(),

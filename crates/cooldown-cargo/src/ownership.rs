@@ -59,6 +59,14 @@ pub(crate) fn nested_ownership(
     Scan::new(primary, nested).run()
 }
 
+pub(crate) fn workspace_member_directories(
+    root: &Utf8Path,
+    candidates: &[Utf8PathBuf],
+) -> BTreeSet<Utf8PathBuf> {
+    let primary = [root.to_path_buf()];
+    Scan::new(&primary, candidates).members_of(root)
+}
+
 /// Whether the manifest at `path` declares a top-level `[workspace]` table, marking its directory
 /// as a workspace root.
 ///

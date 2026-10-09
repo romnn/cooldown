@@ -528,9 +528,12 @@ pub(in crate::cli) struct GlobalArgs {
     /// Cache only; cache misses become `UnknownAge` (never a false "ok").
     #[arg(long, global = true, env = "COOLDOWN_OFFLINE")]
     pub(in crate::cli) offline: bool,
-    /// Ignore the local cache; always hit the registry (use in CI gates).
+    /// Ignore the HTTP cache and Cargo rejection memo; always hit the registry (use in CI gates).
     #[arg(long, global = true, visible_alias = "no-cache")]
     pub(in crate::cli) fresh: bool,
+    /// Disable Cargo rejection memoization while retaining HTTP caching.
+    #[arg(long, global = true, env = "COOLDOWN_NO_MEMO")]
+    pub(in crate::cli) no_memo: bool,
     /// How many registry requests to run concurrently — sets both the fan-out width and the
     /// per-host in-flight cap. Higher finishes a large workspace faster; too high can trip a
     /// registry's rate limit. Defaults to 16; also settable per-section in config as `concurrency`.
@@ -575,6 +578,10 @@ pub(in crate::cli) struct GlobalArgs {
 }
 
 impl GlobalArgs {
+    pub(in crate::cli) const fn rejection_memo_enabled(&self, fresh: bool) -> bool {
+        !(self.no_memo || fresh)
+    }
+
     /// The evaluation-clock override (`--now`), parsed to an instant. Always `None` in release
     /// builds — the flag exists only in debug builds — so production runs read the system clock.
     ///
@@ -792,6 +799,7 @@ fn set_on_subcommand(matches: &ArgMatches, command: &str, id: &str) -> bool {
 mod tests {
     use super::{Cli, CliOverrides};
     use clap::Parser;
+    use color_eyre::eyre;
 
     fn overrides(args: &[&str]) -> CliOverrides {
         let matches = Cli::command().get_matches_from(args);
@@ -857,6 +865,62 @@ mod tests {
             fresh,
             json,
         );
+    }
+
+    #[test]
+    fn rejection_memo_flags() -> eyre::Result<()> {
+        for (args, enabled) in [
+            (vec!["cooldown", "upgrade"], true),
+            (vec!["cooldown", "--no-memo", "upgrade"], false),
+            (vec!["cooldown", "upgrade", "--no-memo"], false),
+            (vec!["cooldown", "upgrade", "--fresh"], false),
+            (vec!["cooldown", "upgrade", "--no-cache"], false),
+        ] {
+            let command = <Cli as clap::CommandFactory>::command()
+                .mut_arg("no_memo", |arg| arg.env(None::<&str>));
+            let matches =
+                crate::cli::setup::configure_recovery_help(command).try_get_matches_from(args)?;
+            let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
+            assert_eq!(cli.global.rejection_memo_enabled(cli.global.fresh), enabled);
+            if cli.global.no_memo {
+                assert!(!cli.global.fresh, "--no-memo preserves HTTP caching");
+            }
+        }
+        let cli = Cli::try_parse_from(["cooldown", "upgrade"])?;
+        assert!(!cli.global.rejection_memo_enabled(true));
+        Ok(())
+    }
+
+    #[test]
+    fn rejection_memo_environment() -> eyre::Result<()> {
+        const CHILD_EXPECTATION: &str = "COOLDOWN_TEST_MEMO_EXPECTATION";
+        if let Ok(expected) = std::env::var(CHILD_EXPECTATION) {
+            let cli = Cli::try_parse_from(["cooldown", "upgrade"])?;
+            assert_eq!(cli.global.rejection_memo_enabled(false), expected == "true");
+            assert!(!cli.global.fresh);
+            return Ok(());
+        }
+
+        // Child processes isolate clap's environment reads from concurrently running tests.
+        for (value, enabled) in [("true", "false"), ("false", "true")] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "cli::args::tests::rejection_memo_environment",
+                    "--nocapture",
+                ])
+                .env("COOLDOWN_NO_MEMO", value)
+                .env(CHILD_EXPECTATION, enabled)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "environment parse failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        Ok(())
     }
 
     #[test]

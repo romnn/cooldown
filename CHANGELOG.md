@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Cargo retries reuse rejections for identical resolution inputs within a run.** Tentative
+  widens, individual precise pins, and failed seeds skip Cargo when the complete manifest, lock,
+  follower, and Cargo configuration bytes match a restored resolver rejection. Keys include the
+  original project root, ancestor and Cargo-home configs, referenced local inputs, resolution
+  environment, and metadata mode. Uncaptured source directories, optional input read failures,
+  and non-resolver failures bypass reuse. Reused pins retain Cargo's explanation; interruption
+  and topology checks still run. Debug logs count memo hits and misses for pin batches and whole
+  graph resolves. The global `--no-memo` flag
+  (or `COOLDOWN_NO_MEMO=true`) disables rejection reuse while retaining HTTP caching;
+  `--fresh` / `--no-cache` disables both.
+
+- **Cargo major upgrades widen candidates together before retrying individual pins.** Each widen
+  round seeds all remaining targets in one resolved transaction, including targets refused under
+  the previous manifest constraints. Partial landings are restored and replayed with only their
+  retained manifest edits; earlier member targets stay protected through subsequent individual
+  widens and no-op pin batches. Failed probes and individual widens restore exact manifest and
+  lock bytes, permissions, and captured absence, while individual retries still provide Cargo's
+  rejection explanations. Debug logs report round and process counts plus input fingerprints for
+  individual attempts; fingerprint hashing runs only when debug logging is enabled.
+
 - **An interrupted run rolls back instead of leaving its trial state behind.** A signal killed
   cooldown wherever it was, so `Ctrl-C` during a pnpm `upgrade` left the temporary resolver
   overrides in `pnpm-workspace.yaml` (re-quoted, with the block's comments gone), and any in-place

@@ -37,11 +37,22 @@ pub struct ManifestRewrite {
 /// # Errors
 ///
 /// Returns a [`CoreError`] if a manifest exists but cannot be read, parsed, or written back.
+#[cfg(test)]
 pub fn widen_constraint(
     root: &Utf8Path,
     members: &[MemberRef],
     crate_name: &str,
     target: &str,
+) -> Result<ManifestRewrite, CoreError> {
+    widen_constraint_checked(root, members, crate_name, target, || Ok(()))
+}
+
+pub(crate) fn widen_constraint_checked(
+    root: &Utf8Path,
+    members: &[MemberRef],
+    crate_name: &str,
+    target: &str,
+    mut validate: impl FnMut() -> Result<(), CoreError>,
 ) -> Result<ManifestRewrite, CoreError> {
     let mut rewrite = ManifestRewrite::default();
     let mut needs_workspace = false;
@@ -59,6 +70,7 @@ pub fn widen_constraint(
         };
         let edits = rewrite_member(&mut doc, crate_name, target);
         if edits.edited {
+            validate()?;
             write_document(&abs, &doc)?;
             rewrite.modified.push(rel);
         }
@@ -84,6 +96,7 @@ pub fn widen_constraint(
                 }
             };
             if changed && !rewrite.modified.iter().any(|path| path == &rel) {
+                validate()?;
                 write_document(&abs, &doc)?;
                 rewrite.modified.push(rel);
             }
@@ -134,6 +147,17 @@ pub fn follow_constraint(
     from: &str,
     target: &str,
 ) -> Result<ManifestRewrite, CoreError> {
+    follow_constraint_checked(root, generated, crate_name, from, target, || Ok(()))
+}
+
+pub(crate) fn follow_constraint_checked(
+    root: &Utf8Path,
+    generated: &[MemberRef],
+    crate_name: &str,
+    from: &str,
+    target: &str,
+    mut validate: impl FnMut() -> Result<(), CoreError>,
+) -> Result<ManifestRewrite, CoreError> {
     let mut rewrite = ManifestRewrite::default();
     let mut seen: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     for member in generated {
@@ -146,6 +170,7 @@ pub fn follow_constraint(
             continue;
         };
         if follow_document(&mut doc, crate_name, from, target) {
+            validate()?;
             write_document(&abs, &doc)?;
             rewrite.modified.push(rel);
         }

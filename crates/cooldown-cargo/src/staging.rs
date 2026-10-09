@@ -53,9 +53,9 @@ impl IsolatedMutationStrategy for CargoTool {
     ) -> Result<Box<dyn IsolatedMutation>> {
         coordination.validate_current()?;
         let recovery_authority = coordination.recovery_authority().cloned();
-        Ok(Box::new(
-            CargoMutationStage::prepare(self.cargo(), source, recovery_authority).await?,
-        ))
+        let stage = CargoMutationStage::prepare(self.cargo(), source, recovery_authority).await?;
+        self.register_memo_origin(&stage.staged, source);
+        Ok(Box::new(stage))
     }
 }
 
@@ -424,8 +424,10 @@ struct CargoConfigEnvironment {
 fn cargo_config_environment() -> Result<CargoConfigEnvironment> {
     let cargo_home = match std::env::var_os("CARGO_HOME") {
         Some(path) => Some((utf8_path(std::path::PathBuf::from(path))?, true)),
-        None => std::env::var_os("HOME")
-            .map(|home| std::path::PathBuf::from(home).join(".cargo"))
+        // Cargo's default home follows the platform home directory, which on Windows is the
+        // user profile rather than `HOME`.
+        None => std::env::home_dir()
+            .map(|home| home.join(".cargo"))
             .map(utf8_path)
             .transpose()?
             .map(|path| (path, false)),
@@ -433,7 +435,7 @@ fn cargo_config_environment() -> Result<CargoConfigEnvironment> {
     Ok(CargoConfigEnvironment { cargo_home })
 }
 
-fn cargo_config_dirs(
+pub(crate) fn cargo_config_dirs(
     workspace: &Utf8Path,
 ) -> Result<(BTreeSet<Utf8PathBuf>, BTreeSet<Utf8PathBuf>)> {
     Ok(cargo_config_dirs_with_environment(
@@ -462,7 +464,9 @@ fn cargo_config_dirs_with_environment(
     (config_dirs, ambient_config_dirs)
 }
 
-fn cargo_config_paths(config_dirs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf8PathBuf>> {
+pub(crate) fn cargo_config_paths(
+    config_dirs: &BTreeSet<Utf8PathBuf>,
+) -> Result<BTreeSet<Utf8PathBuf>> {
     let mut paths = BTreeSet::new();
     for config_dir in config_dirs {
         for name in ["config", "config.toml"] {
@@ -550,21 +554,98 @@ fn discover_vendor_roots(configs: &BTreeSet<Utf8PathBuf>) -> Result<BTreeSet<Utf
                 ))
             })?;
         reject_unsupported_config_inputs(config, &value)?;
-        let Some(sources) = value.get("source").and_then(toml::Value::as_table) else {
-            continue;
-        };
-        for source in sources.values() {
-            let Some(directory) = source.get("directory").and_then(toml::Value::as_str) else {
-                continue;
-            };
-            let base = config.parent().and_then(Utf8Path::parent).ok_or_else(|| {
-                isolation_error(format!("Cargo config has no project base: {config}"))
-            })?;
-            let root = canonical_utf8(&base.join(directory))?;
-            roots.insert(root);
+        for directory in cargo_config_references(config, &value)?.vendors {
+            roots.insert(canonical_utf8(&directory)?);
         }
     }
     Ok(roots)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CargoConfigReferences {
+    pub(crate) directories: BTreeSet<Utf8PathBuf>,
+    vendors: BTreeSet<Utf8PathBuf>,
+    pub(crate) packages: BTreeSet<Utf8PathBuf>,
+    pub(crate) includes: BTreeSet<Utf8PathBuf>,
+}
+
+pub(crate) fn cargo_config_references(
+    config: &Utf8Path,
+    value: &toml::Value,
+) -> Result<CargoConfigReferences> {
+    let base = config
+        .parent()
+        .and_then(Utf8Path::parent)
+        .ok_or_else(|| isolation_error(format!("Cargo config has no project base: {config}")))?;
+    let mut references = CargoConfigReferences::default();
+    if let Some(sources) = value.get("source").and_then(toml::Value::as_table) {
+        for source in sources.values() {
+            for field in ["directory", "local-registry"] {
+                if let Some(directory) = source.get(field).and_then(toml::Value::as_str) {
+                    let directory = base.join(directory);
+                    if field == "directory" {
+                        references.vendors.insert(directory.clone());
+                    }
+                    references.directories.insert(directory);
+                }
+            }
+            for field in ["registry", "git"] {
+                if let Some(source) = source.get(field).and_then(toml::Value::as_str)
+                    && let Some(path) = file_registry_path(source)
+                {
+                    references.directories.insert(base.join(path));
+                }
+            }
+        }
+    }
+    if let Some(registries) = value.get("registries").and_then(toml::Value::as_table) {
+        for registry in registries.values() {
+            if let Some(index) = registry.get("index").and_then(toml::Value::as_str)
+                && let Some(path) = file_registry_path(index)
+            {
+                references.directories.insert(base.join(path));
+            }
+        }
+    }
+    if let Some(paths) = value.get("paths").and_then(toml::Value::as_array) {
+        references.packages.extend(
+            paths
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(|path| base.join(path)),
+        );
+    }
+    if let Some(registries) = value.get("patch").and_then(toml::Value::as_table) {
+        for dependencies in registries.values().filter_map(toml::Value::as_table) {
+            for dependency in dependencies.values() {
+                if let Some(path) = dependency.get("path").and_then(toml::Value::as_str) {
+                    references.packages.insert(base.join(path));
+                }
+                if let Some(path) = dependency
+                    .get("git")
+                    .and_then(toml::Value::as_str)
+                    .and_then(file_registry_path)
+                {
+                    references.directories.insert(base.join(path));
+                }
+            }
+        }
+    }
+    if let Some(includes) = value.get("include") {
+        if let Some(include) = includes.as_str() {
+            references
+                .includes
+                .insert(config.parent().unwrap_or(base).join(include));
+        } else if let Some(includes) = includes.as_array() {
+            references.includes.extend(
+                includes
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(|include| config.parent().unwrap_or(base).join(include)),
+            );
+        }
+    }
+    Ok(references)
 }
 
 fn reject_unsupported_config_inputs(config: &Utf8Path, value: &toml::Value) -> Result<()> {
@@ -674,6 +755,24 @@ fn config_uses_file_registry(value: &toml::Value) -> bool {
 fn is_file_registry_url(value: &str) -> bool {
     let value = value.trim_start().to_ascii_lowercase();
     value.starts_with("file:") || value.starts_with("sparse+file:")
+}
+
+pub(crate) fn file_registry_path(value: &str) -> Option<&str> {
+    if !is_file_registry_url(value) {
+        return None;
+    }
+    let value = value.trim_start();
+    let value = if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sparse+"))
+    {
+        value.get(7..)?
+    } else {
+        value
+    };
+    let colon = value.find(':')?;
+    let path = value.get(colon + 1..)?;
+    Some(path.strip_prefix("//").unwrap_or(path))
 }
 
 fn reject_unsupported_config_environment(

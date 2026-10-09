@@ -17,7 +17,6 @@ use cooldown_swift::SwiftTool;
 use cooldown_uv::UvTool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
     let dir = match &global.dir {
@@ -48,28 +47,17 @@ pub(super) fn workdir(global: &GlobalArgs) -> Result<Utf8PathBuf, CoreError> {
 /// A run that ignores the tag reads it
 /// never, and pays nothing for its freshness.
 pub(super) fn adapter_set(
-    offline: bool,
-    fresh: bool,
-    concurrency: usize,
+    http_options: HttpOptions,
+    rejection_memo_enabled: bool,
     revalidate_npm_listings: bool,
 ) -> Result<(AdapterSet, SharedHttp), CoreError> {
-    let http = SharedHttp::new(
-        discovery::cache_dir().into_std_path_buf(),
-        HttpOptions {
-            offline,
-            fresh,
-            // The resolve knob caps both the fan-out width and the per-host in-flight requests, so
-            // raising `--concurrency` actually widens the registry fetch (the per-host semaphore,
-            // not the fan-out, is otherwise the binding cap since every dep of one tool hits one host).
-            per_host_concurrency: concurrency.max(1),
-            request_timeout: Duration::from_secs(30),
-            ..Default::default()
-        },
-    )?;
+    let http = SharedHttp::new(discovery::cache_dir().into_std_path_buf(), http_options)?;
 
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())))?;
-    adapters.register_target_verified_mutator(Arc::new(CargoTool::from_http(http.clone())))?;
+    adapters.register_target_verified_mutator(Arc::new(
+        CargoTool::from_http(http.clone()).with_rejection_memo(rejection_memo_enabled),
+    ))?;
     adapters.register_target_verified_mutator(Arc::new(UvTool::from_http(http.clone())))?;
     adapters.register_target_verified_mutator(Arc::new(
         NpmCliTool::from_http(http.clone()).with_listing_revalidation(revalidate_npm_listings),
@@ -429,3 +417,6 @@ mod tests {
         std::assert_matches!(error, CoreError::System(_));
     }
 }
+
+#[cfg(all(test, unix))]
+mod rejection_memo_tests;

@@ -941,3 +941,88 @@ async fn full_apply_counts_unattributed_resolves_without_naming_landed_targets()
     );
     Ok(())
 }
+
+/// Joint widens retry contextual refusals together without routing them to precise pins.
+#[tokio::test]
+async fn previously_refused_candidates_land_in_one_joint_widen_seed() -> eyre::Result<()> {
+    let fixture = SeedFixture::new(2)?;
+    let root = &fixture.project.root;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        indoc! {r#"
+            [workspace]
+            [workspace.dependencies]
+            pkg000 = "=1.0.0"
+            pkg001 = "=1.0.0"
+        "#},
+    )?;
+    let reject_unwidened = indoc! {r"
+        if grep -q '=1.0.0' Cargo.toml; then
+          echo 'error: failed to select a version for the original manifest constraints' >&2
+          exit 101
+        fi
+    "};
+    let script = SCRIPT
+        .replace("metadata)", &format!("metadata)\n{reject_unwidened}"))
+        .replace("update)", &format!("update)\n{reject_unwidened}"));
+    std::fs::write(root.join("fake-cargo"), script)?;
+    let journal = fixture.journal().await?;
+    let mut rejections = PinRejections::new();
+    fixture
+        .tool
+        .pin_batch(
+            &fixture.project,
+            &fixture.changes,
+            &journal,
+            None,
+            &mut rejections,
+        )
+        .await?;
+    assert_eq!(fixture.invocations()?.len(), 3);
+    assert!(
+        fixture
+            .changes
+            .iter()
+            .all(|planned| fixture.tool.was_refused_alone(planned))
+    );
+    assert_eq!(rejections.len(), 2);
+    std::fs::remove_file(root.join("invocations"))?;
+
+    let observer = CallbackRecorder::default();
+    fixture
+        .tool
+        .whole_graph_resolve(
+            &fixture.project,
+            &Plan {
+                changes: fixture.changes.clone(),
+                rewrite: RewriteMode::Auto,
+                ..Plan::default()
+            },
+            &journal,
+            Some(&observer),
+        )
+        .await?;
+    let invocations = fixture.invocations()?;
+    // The initial batch reuses its two rejections; one joint metadata resolve lands both.
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|arguments| arguments
+                .first()
+                .is_some_and(|command| command == "metadata"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observer
+            .operations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let lock = read_lock(&fixture.project)?;
+    for planned in &fixture.changes {
+        assert!(lock.has_crates_io_package(&planned.package.name, "1.1.0"));
+    }
+    Ok(())
+}

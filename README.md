@@ -61,6 +61,10 @@ cooldown fix           # remediate: downgrade too-fresh deps to a matured versio
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
 
+Cargo reuses identical resolver rejections within a run by default. Use the global
+`--no-memo` flag or `COOLDOWN_NO_MEMO=true` to retry every Cargo attempt while keeping
+HTTP caching. `--fresh` (alias `--no-cache`) disables both HTTP caching and the rejection memo.
+
 #### Fixing violations
 
 When `check` goes red because a dependency is younger than its cooldown, you have three options:

@@ -91,6 +91,7 @@ recovery_options! {
         "dry_run" => ("--dry-run", |global| global.dry_run),
         "offline" => ("--offline", |global| global.offline),
         "fresh" => ("--fresh", |global| global.fresh),
+        "no_memo" => ("--no-memo", |global| global.no_memo),
         "concurrency" => ("--concurrency", |global| global.concurrency.is_some()),
         "jobs" => ("--jobs", |global| global.jobs.is_some()),
         "no_native" => ("--no-native", |global| global.no_native),
@@ -387,13 +388,15 @@ mod tests {
 
     #[test]
     fn recovery_rejects_normal_run_options_it_does_not_use() -> eyre::Result<()> {
-        let cli = Cli::parse_from(["cooldown", "recover", "--offline"]);
+        for flag in ["--offline", "--no-memo"] {
+            let cli = Cli::parse_from(["cooldown", "recover", flag]);
 
-        let error = prepare_recovery(&cli.global)
-            .err()
-            .ok_or_else(|| eyre::eyre!("recovery accepted an unused registry option"))?;
+            let error = prepare_recovery(&cli.global)
+                .err()
+                .ok_or_else(|| eyre::eyre!("recovery accepted an unused resolver option"))?;
 
-        assert!(error.to_string().contains("--offline"));
+            assert!(error.to_string().contains(flag));
+        }
         Ok(())
     }
 
@@ -454,6 +457,7 @@ mod tests {
             "--sync",
             "--dry-run",
             "--offline",
+            "--no-memo",
         ] {
             assert!(
                 !help.contains(rejected),
