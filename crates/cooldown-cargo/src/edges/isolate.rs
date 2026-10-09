@@ -9,7 +9,7 @@ use super::{
 use crate::cargocmd::{Cargo, ResolvedGraph};
 use crate::lockfile::CargoLock;
 use camino::Utf8Path;
-use cooldown_core::{Project, Result};
+use cooldown_core::{ApplyObserver, Project, Result};
 use std::collections::{BTreeSet, VecDeque};
 
 /// Bounds every Cargo validation spawned after the initial all-rewrites candidate fails.
@@ -42,6 +42,7 @@ pub(super) async fn apply_rewrites(
     lock_path: &Utf8Path,
     resolver_text: &str,
     guarded: &mut GuardedRewrites,
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<RewriteApplication> {
     if guarded.accepted.is_empty() {
         return Ok(RewriteApplication {
@@ -65,6 +66,7 @@ pub(super) async fn apply_rewrites(
         guarded,
         rewritten,
         &mut transaction,
+        observer,
     )
     .await;
     match result {
@@ -80,7 +82,11 @@ async fn apply_transaction(
     guarded: &mut GuardedRewrites,
     rewritten: String,
     transaction: &mut SpeculativeLockTransaction,
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<RewriteApplication> {
+    if let Some(observer) = observer {
+        observer.resolver_started(None);
+    }
     match cargo
         .verify_locked(&project.root, &project.generated_members)
         .await
@@ -100,8 +106,15 @@ async fn apply_transaction(
         // to isolating the rewrites one at a time.
         Err(cooldown_core::CoreError::StaleLock(_)) => {
             transaction.reject()?;
-            let committed =
-                isolate_rewrites(cargo, project, resolver_text, guarded, transaction).await?;
+            let committed = isolate_rewrites(
+                cargo,
+                project,
+                resolver_text,
+                guarded,
+                transaction,
+                observer,
+            )
+            .await?;
             transaction.commit()?;
             Ok(RewriteApplication { committed })
         }
@@ -138,6 +151,7 @@ async fn isolate_rewrites(
     resolver_text: &str,
     guarded: &mut GuardedRewrites,
     transaction: &mut SpeculativeLockTransaction,
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<CommittedRewrites> {
     let mut corrected = Vec::new();
     let mut current_text = resolver_text.to_string();
@@ -154,6 +168,7 @@ async fn isolate_rewrites(
             &current_text,
             &component,
             &mut isolation_probes,
+            observer,
         )
         .await?
         {
@@ -170,6 +185,7 @@ async fn isolate_rewrites(
                     &current_text,
                     &component,
                     &mut isolation_probes,
+                    observer,
                 )
                 .await?
                 {
@@ -249,6 +265,7 @@ async fn verified_subset(
     current_text: &str,
     component: &[EdgeRewrite],
     probes_remaining: &mut usize,
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<SubsetSearch> {
     let view = LockEdgeView::from_lock(&CargoLock::parse(current_text)?);
     let units = balanced_retry_units(&view, component);
@@ -269,6 +286,7 @@ async fn verified_subset(
             current_text,
             &accepted,
             probes_remaining,
+            observer,
         )
         .await?
         {
@@ -356,13 +374,23 @@ async fn try_isolation_candidate(
     current_text: &str,
     rewrites: &[EdgeRewrite],
     probes_remaining: &mut usize,
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<IsolationCandidate> {
     if *probes_remaining == 0 {
         return Ok(IsolationCandidate::Exhausted);
     }
     *probes_remaining -= 1;
     Ok(
-        match try_candidate(cargo, project, transaction, current_text, rewrites).await? {
+        match try_candidate(
+            cargo,
+            project,
+            transaction,
+            current_text,
+            rewrites,
+            observer,
+        )
+        .await?
+        {
             Ok((lock_text, graph)) => IsolationCandidate::Verified(lock_text, Box::new(graph)),
             Err(failure) => IsolationCandidate::Rejected(failure),
         },
@@ -375,11 +403,15 @@ async fn try_candidate(
     transaction: &mut SpeculativeLockTransaction,
     current_text: &str,
     rewrites: &[EdgeRewrite],
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<Result<(String, ResolvedGraph), CandidateFailure>> {
     let Some(candidate_text) = rewrite_lock_text(current_text, rewrites) else {
         return Ok(Err(CandidateFailure::TextMismatch));
     };
     transaction.stage(&candidate_text)?;
+    if let Some(observer) = observer {
+        observer.resolver_started(None);
+    }
     match cargo
         .verify_locked(&project.root, &project.generated_members)
         .await

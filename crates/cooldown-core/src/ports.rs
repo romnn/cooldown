@@ -387,6 +387,17 @@ pub trait ReleaseFetcher: Send + Sync {
 
 /// Observes candidate-level work hidden inside a tool's logical apply operation.
 pub trait ApplyObserver: Send + Sync {
+    /// Reports one native resolver invocation, optionally naming a candidate still being tried.
+    ///
+    /// A graph-only resolve has no candidate to start.
+    /// The default forwards named invocations to [`candidate_started`](Self::candidate_started)
+    /// for observers that only expose the current candidate.
+    fn resolver_started(&self, change: Option<&Change>) {
+        if let Some(change) = change {
+            self.candidate_started(change);
+        }
+    }
+
     /// Reports the candidate whose native resolver operation is about to start.
     ///
     /// Batch-oriented adapters may leave this at its no-op default. Adapters that expand one
@@ -802,7 +813,7 @@ pub trait ToolWrite: Send + Sync {
     }
 
     /// Whether this tool's apply engine judges the settled lock for a package left at several
-    /// resolved copies (pnpm's whole-graph settlement guard), so that
+    /// resolved copies (Cargo and pnpm's whole-graph settlement guards), so that
     /// [`Plan::single_copy`](crate::Plan::single_copy) and `--fail-on-new-duplicate` have an
     /// effect. An engine without the guard leaves the policy inert, and the run says so rather
     /// than letting a CI job believe its graph is gated.
@@ -833,6 +844,13 @@ pub trait ToolWrite: Send + Sync {
     /// not-eligible, so it keeps direct-only upgrade planning. `fix` is unaffected — a too-fresh
     /// transitive is a policy violation that must at least be reported.
     fn supports_transitive_advance(&self) -> bool {
+        false
+    }
+
+    /// Whether upgrade trials may retry lower adoptable targets on the selected major line
+    /// after the original target fails to land.
+    /// The executor limits retries and reports the target that actually lands.
+    fn supports_target_fallback(&self) -> bool {
         false
     }
 

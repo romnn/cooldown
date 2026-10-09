@@ -52,7 +52,7 @@ A listed name that is *already* at several copies before a run has that standing
 split reported (as a `duplicate_copy` warning) rather than refused — refusing would hold every
 upgrade forever — so converge it for the listing to hold. A `--lock` refresh (`check --lock`,
 `outdated --lock`) is pnpm's own `install --lockfile-only` against the manifests as written and is
-not gated. `--fail-on-new-duplicate` gates every package for one run; on a tool without pnpm's
+not gated. `--fail-on-new-duplicate` gates every package for one run; on a tool without Cargo or pnpm's
 settlement guard it has no effect and the run says so. The key is pnpm-specific and accepted only
 here (like `edge-policy` under `[tool.cargo]`). It merges across config files the way
 `exclude-folders` does: a plain array adds to the list inherited from a farther file, `[]` clears

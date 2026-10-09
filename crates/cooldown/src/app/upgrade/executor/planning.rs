@@ -1,10 +1,35 @@
 use super::PlanMode;
 use crate::app::TransitiveGate;
 use cooldown_core::{
-    BaselineViolation, Change, DepScope, Dependency, GraphHoldEdge, GraphHoldKind, MajorKey,
-    PackageId, Release, ResolveContext, UpdateKind, Version,
+    BaselineViolation, Candidate, Change, DepScope, Dependency, GraphHoldEdge, GraphHoldKind,
+    MajorKey, PackageId, Release, ResolveContext, Status, UpdateKind, Verdict, Version,
 };
 use std::collections::HashSet;
+
+/// Limits fallback to three older adoptable targets on the originally selected line.
+pub(super) fn lower_adoptable_targets<'a>(
+    releases: &[Release],
+    verdict: &'a Verdict,
+    target: &Version,
+) -> Vec<&'a Candidate> {
+    let Some(selected) = releases.iter().find(|release| release.version == *target) else {
+        return Vec::new();
+    };
+    verdict
+        .candidates
+        .iter()
+        .rev()
+        .filter(|candidate| matches!(candidate.status, Status::Adoptable | Status::Exempt))
+        .filter(|candidate| {
+            releases.iter().any(|release| {
+                release.version == candidate.version
+                    && release.major == selected.major
+                    && release.order < selected.order
+            })
+        })
+        .take(3)
+        .collect()
+}
 
 /// Selects the dependency scope that supplies upgrade or downgrade candidates.
 ///

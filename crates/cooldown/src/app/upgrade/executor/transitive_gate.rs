@@ -15,20 +15,7 @@ pub(super) fn newly_introduced_violations(
     before: &HashSet<BaselineViolation>,
     after: &HashSet<BaselineViolation>,
 ) -> Vec<BaselineViolation> {
-    let before_counts = violation_counts_by_package(before);
-    let after_counts = violation_counts_by_package(after);
-    let mut residual: Vec<BaselineViolation> = after
-        .difference(before)
-        .filter(|violation| {
-            let package = (
-                violation.package.name.as_str(),
-                violation.package.registry.as_deref(),
-            );
-            after_counts.get(&package).copied().unwrap_or(0)
-                > before_counts.get(&package).copied().unwrap_or(0)
-        })
-        .cloned()
-        .collect();
+    let mut residual: Vec<BaselineViolation> = after.difference(before).cloned().collect();
     residual.sort_by(|left, right| {
         left.package
             .tool
@@ -39,21 +26,6 @@ pub(super) fn newly_introduced_violations(
             .then_with(|| left.version.as_str().cmp(right.version.as_str()))
     });
     residual
-}
-
-fn violation_counts_by_package(
-    violations: &HashSet<BaselineViolation>,
-) -> HashMap<(&str, Option<&str>), usize> {
-    let mut counts = HashMap::new();
-    for violation in violations {
-        *counts
-            .entry((
-                violation.package.name.as_str(),
-                violation.package.registry.as_deref(),
-            ))
-            .or_default() += 1;
-    }
-    counts
 }
 
 pub(super) fn insert_graph_violation(

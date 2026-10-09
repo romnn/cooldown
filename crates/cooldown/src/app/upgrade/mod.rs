@@ -2,12 +2,15 @@
 //! re-lock, verify the resolved graph against the cooldown gate, and reconcile or roll back.
 //!
 //! `upgrade` is optimistic about transitives: a forward move that floats a too-fresh transitive up is
-//! kept (a cooled parent cannot require a child newer than the window, so an older satisfying version
-//! exists by construction), and a reconcile pass matures the floated-up nodes back down to their
-//! newest matured version. A trial whose violation cannot be cleared is restored and partitioned;
+//! tried with a reconcile pass that matures the floated-up nodes back down to their newest matured
+//! version.
+//! Cargo retries up to three older adoptable targets on the selected line when remediation cannot
+//! settle the candidate, with companions co-planned and the graph restored before each attempt.
+//! A trial whose violation cannot be cleared is restored and partitioned;
 //! the safe subset is replayed and committed together while unsafe singletons report
-//! `TransitiveInCooldown`. No committed lock can make a subsequent `check` reject. `fix` is the dual,
-//! downgrading too-fresh pins.
+//! `TransitiveInCooldown`.
+//! No committed lock introduces a cooldown violation that was absent before the trial.
+//! `fix` is the dual, downgrading too-fresh pins.
 
 mod executor;
 mod run_staled;

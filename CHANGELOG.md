@@ -27,6 +27,30 @@
   receive no exemptions. Evaluation failures warn and preserve existing exact entries while
   still syncing the window and policy globs.
 
+- **Cargo pin batches use one seeded resolve first.** Planned targets are seeded into `Cargo.lock`
+  together and reconciled once. Exact landings and collateral dependency updates are kept; a
+  seeded target landing at an unrequested version or a resolver failure restores the validated
+  pre-seed state and splits the batch deterministically. Only failed leaves, lone changes, and
+  targets left at their original version need individual precise pins, preserving Cargo's
+  per-candidate rejection explanations, and a target refused on its own stays out of later seeds
+  for the rest of the run instead of failing and bisecting every batch that carries it. Generated
+  workspace-hack edits follow verified landings only. Local failures and interruptions propagate without bisection, and paths rejected by the
+  mutation journal are never used for seed restoration. Progress counts native resolver invocations;
+  debug logs report resolve, seeded, landed, bisected, and per-crate counts.
+
+- **Cargo upgrades settle on a cooled, coherent graph.** Before holding an upgrade for fresh
+  transitives, `upgrade` tries the existing `fix` cascade and re-plans until fresh versions are
+  pinned to mature releases or the graph stops changing. If the target still cannot land, it tries
+  up to three joint lower-target trials for the rejected candidates, then up to three individual
+  trials per rejected candidate when joint trials cannot settle the group. Every fallback retains
+  the accepted upgrades and reports the version that lands. A batch that introduces an incompatible
+  line of an authored member's direct dependency is held with the crate and versions named; generated
+  workspace-hack declarations do not drive that guard, and different package sources are judged
+  separately. `--fail-on-new-duplicate` also gates Cargo's growth in distinct resolved versions.
+  The residual cooldown gate compares exact package/version identities, so replacing one fresh
+  version with another no longer passes just because the number of violating copies stayed
+  constant.
+
 ## v0.0.23
 
 - **`include-hidden` scans named dot-directories.** Detection skips every directory whose name

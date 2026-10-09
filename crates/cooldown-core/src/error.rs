@@ -4,6 +4,9 @@
 use std::fmt;
 use std::process::{ExitStatus, Output};
 
+/// Windows reports Ctrl-C as the signed `STATUS_CONTROL_C_EXIT` status.
+const WINDOWS_CONTROL_C_EXIT: i32 = -1_073_741_510;
+
 /// A [`Result`](std::result::Result) specialized to [`CoreError`].
 ///
 /// Defaulting the error parameter to [`CoreError`] lets functions in the core
@@ -196,6 +199,8 @@ impl CoreError {
     /// propagate, so a missing binary, full disk, read-only tree, or corrupt package-manager store is
     /// never misreported as "every candidate held".
     ///
+    /// A signal termination or interruption exit status is also a whole-environment failure.
+    ///
     /// The structured variants (a tool that could not be spawned, or a filesystem/lock/serialization
     /// fault cooldown itself raised) are an exact, locale-independent signal. A [`CoreError::Tool`]
     /// carries only the subprocess's own free-form failure detail, which cooldown cannot introspect
@@ -215,7 +220,18 @@ impl CoreError {
             | CoreError::LockConflict(_)
             | CoreError::DurabilityUncertain(_)
             | CoreError::PendingRecovery(_) => true,
-            CoreError::Tool { stderr, .. } => detail_indicates_broken_environment(stderr),
+            CoreError::Tool {
+                termination,
+                stderr,
+                ..
+            } => {
+                matches!(
+                    termination,
+                    ToolTermination::Signal(_)
+                        | ToolTermination::Unknown
+                        | ToolTermination::ExitCode(130 | 137 | 143 | WINDOWS_CONTROL_C_EXIT)
+                ) || detail_indicates_broken_environment(stderr)
+            }
             _ => false,
         }
     }
@@ -577,6 +593,26 @@ mod tests {
         assert!(!resolver.is_local_environment_failure());
         assert!(!CoreError::StaleLock("lock is stale".into()).is_local_environment_failure());
         assert!(!CoreError::NotFound("colors@999.0.0".into()).is_local_environment_failure());
+    }
+
+    #[test]
+    fn interrupted_tools_are_local_environment_failures() {
+        for termination in [
+            ToolTermination::Signal(2),
+            ToolTermination::Signal(15),
+            ToolTermination::Unknown,
+            ToolTermination::ExitCode(130),
+            ToolTermination::ExitCode(137),
+            ToolTermination::ExitCode(143),
+            ToolTermination::ExitCode(WINDOWS_CONTROL_C_EXIT),
+        ] {
+            let error = CoreError::Tool {
+                tool: "cargo".into(),
+                termination,
+                stderr: "interrupted".into(),
+            };
+            assert!(error.is_local_environment_failure(), "{termination}");
+        }
     }
 
     #[test]

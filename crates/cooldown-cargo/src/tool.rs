@@ -8,8 +8,8 @@
 //! `cargo update --precise <version>` pins.
 //!
 //! Apply re-resolves the **whole** graph by issuing all planned pins as one logical unit.
-//! Each target gets its own command because Cargo silently applies only the first package spec when
-//! several share one `--precise` argument.
+//! Planned targets are seeded into the lock for one unlocked resolve; failed groups are bisected,
+//! and only small rejected groups or targets the seed left short need individual precise commands.
 //! Version reporting compares before/after `Cargo.lock` slots, while edge reporting audits moves
 //! paired across stable dependent identities whose endpoints coexist in both snapshots.
 //! The slot comparison reports planned and collateral version changes, while a planned candidate
@@ -35,11 +35,11 @@ use cooldown_core::{
     FetchContext, LockStatus, LockVerifyReport, MemberRef, MutationExecution, NativePolicyLayer,
     PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMutationFile,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version, fs::RecoveryAuthority,
+    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolTermination, ToolWrite,
+    UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// The line cargo-hakari writes above the dependency tables it generates. Read for one purpose
@@ -81,9 +81,27 @@ pub struct CargoTool {
     /// (workspace membership cannot change within a run). A staged copy is a root of its own and
     /// establishes its own.
     generated: tokio::sync::Mutex<HashMap<Utf8PathBuf, Arc<GeneratedFacts>>>,
+    /// The `(name, from, to)` moves a precise pin refused on their own during this run.
+    ///
+    /// Such a move fails every seed that carries it, so each later batch would bisect down to it
+    /// again; it goes straight to its precise pin instead, which keeps cargo's explanation.
+    refused_alone: std::sync::Mutex<HashSet<(String, String, String)>>,
 }
 
 impl CargoTool {
+    async fn metadata_with_observer(
+        &self,
+        project: &Project,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<ResolvedGraph> {
+        if let Some(observer) = observer {
+            observer.resolver_started(None);
+        }
+        self.cargo
+            .metadata(&project.root, &project.generated_members)
+            .await
+    }
+
     /// Creates an tool from an existing crates.io [`CratesIoIndex`] client.
     ///
     /// The [`Cargo`] CLI wrapper is constructed with its defaults (honoring the
@@ -94,6 +112,7 @@ impl CargoTool {
             index,
             cargo: Cargo::new(),
             generated: tokio::sync::Mutex::new(HashMap::new()),
+            refused_alone: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -103,12 +122,19 @@ impl CargoTool {
     /// A project that names no generated member has no followers and, short of the memoized
     /// hint a dependency read may have left, no notices either, so it never spawns cargo for
     /// them: the common workspace pays nothing for the feature.
-    async fn generated_facts(&self, project: &Project) -> Result<Arc<GeneratedFacts>> {
+    async fn generated_facts(
+        &self,
+        project: &Project,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<Arc<GeneratedFacts>> {
         if let Some(facts) = self.generated.lock().await.get(&project.root) {
             return Ok(Arc::clone(facts));
         }
         if project.generated_members.names().is_empty() {
             return Ok(Arc::new(GeneratedFacts::default()));
+        }
+        if let Some(observer) = observer {
+            observer.resolver_started(None);
         }
         let graph = self
             .cargo
@@ -399,7 +425,7 @@ impl ToolRead for CargoTool {
     }
 
     async fn manifest_notices(&self, project: &Project) -> Result<Vec<Diagnostic>> {
-        Ok(self.generated_facts(project).await?.notices.clone())
+        Ok(self.generated_facts(project, None).await?.notices.clone())
     }
 
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
@@ -656,6 +682,53 @@ fn collateral_change(registry: &str, name: &str, from: &str, to: &str) -> Change
 /// other's diagnostics and attach one target's rejection to the other's held row.
 type PinRejections = BTreeMap<(String, String, String), String>;
 
+#[derive(Default)]
+struct PinBatchStats {
+    resolves: usize,
+    /// Target visits in seeded resolves, including failed attempts.
+    seeded: usize,
+    /// Exact target landings kept from seeded resolves.
+    landed: usize,
+    bisected: usize,
+    per_crate: usize,
+}
+
+struct SeededResolve {
+    before: CargoLock,
+    after: CargoLock,
+    snapshot: Vec<(Utf8PathBuf, Option<String>)>,
+}
+
+/// Rejects seeded slots that resolve to neither their original nor requested version.
+fn seed_has_drive_by(before: &CargoLock, after: &CargoLock, moves: &[PlannedNodeMove]) -> bool {
+    moves.iter().any(|planned| {
+        let unexpected_slot = after.package.iter().any(|package| {
+            package.name == planned.name
+                && package.source.as_deref() == Some(crate::lockfile::CRATES_IO_SOURCE)
+                && package.version.as_ref().is_some_and(|resolved| {
+                    resolved != &planned.from
+                        && resolved != &planned.to
+                        && !before.has_crates_io_package(&planned.name, resolved)
+                        && (compatibility_line(resolved) == compatibility_line(&planned.from)
+                            || compatibility_line(resolved) == compatibility_line(&planned.to))
+                })
+        });
+        unexpected_slot
+            || (!after.has_crates_io_package(&planned.name, &planned.from)
+                && !after.has_crates_io_package(&planned.name, &planned.to))
+    })
+}
+
+fn seed_resolver_rejection(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Tool {
+            termination: ToolTermination::ExitCode(_),
+            ..
+        }
+    ) && !err.is_local_environment_failure()
+}
+
 /// The [`PinRejections`] key of one planned change: its `(name, from, to)` line.
 fn rejection_key(change: &Change) -> (String, String, String) {
     (
@@ -856,7 +929,7 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<PinRejections> {
-        let followers = self.generated_facts(project).await?;
+        let followers = self.generated_facts(project, observer).await?;
         let followers = followers.members.as_slice();
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
@@ -890,11 +963,7 @@ impl CargoTool {
                 let after = read_lock(project)?.crates_io_locked_versions();
                 let graph = if needs_graph {
                     journal.validate_project(&project.root)?;
-                    Some(
-                        self.cargo
-                            .metadata(&project.root, &project.generated_members)
-                            .await?,
-                    )
+                    Some(self.metadata_with_observer(project, observer).await?)
                 } else {
                     None
                 };
@@ -932,11 +1001,7 @@ impl CargoTool {
                     // cargo's explanation, restore the widen, and move on.
                     let landed_graph = if needs_member_graph(change) {
                         journal.validate_project(&project.root)?;
-                        match self
-                            .cargo
-                            .metadata(&project.root, &project.generated_members)
-                            .await
-                        {
+                        match self.metadata_with_observer(project, observer).await {
                             Ok(graph) => Some(graph),
                             Err(err)
                                 if err.is_tool_spawn_failure()
@@ -981,9 +1046,10 @@ impl CargoTool {
                 }
             }
         }
-        self.land_rejected_group_atomically(project, plan, journal, &mut rejections)
+        self.land_rejected_group_atomically(project, plan, journal, observer, &mut rejections)
             .await?;
-        self.reconcile_projections(project, journal).await?;
+        self.reconcile_projections(project, journal, observer)
+            .await?;
         Ok(rejections)
     }
 
@@ -1007,8 +1073,9 @@ impl CargoTool {
         &self,
         project: &Project,
         journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
     ) -> Result<()> {
-        let facts = self.generated_facts(project).await?;
+        let facts = self.generated_facts(project, observer).await?;
         if facts.members.is_empty() {
             return Ok(());
         }
@@ -1046,9 +1113,7 @@ impl CargoTool {
             }
             // The re-resolve that lets cargo drop the node the projection no longer demands.
             journal.validate_project(&project.root)?;
-            self.cargo
-                .metadata(&project.root, &project.generated_members)
-                .await?;
+            self.metadata_with_observer(project, observer).await?;
         }
         Ok(())
     }
@@ -1074,13 +1139,12 @@ impl CargoTool {
         project: &Project,
         plan: &Plan,
         journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
     ) -> Result<()> {
         if rejections.is_empty() {
             return Ok(());
         }
-        let lock_path = project.root.join("Cargo.lock");
-        let lock_text = std::fs::read_to_string(&lock_path)?;
         let lock = read_lock(project)?;
         let mut moves: Vec<PlannedNodeMove> = Vec::new();
         let mut keys: Vec<(String, String, String)> = Vec::new();
@@ -1105,20 +1169,74 @@ impl CargoTool {
         if moves.len() < 2 {
             return Ok(());
         }
-        let Some(seeded) = rewrite_planned_nodes(&lock_text, &moves) else {
-            return Ok(());
-        };
         tracing::debug!(
             group = moves.len(),
             "seeding rejected co-planned changes for one atomic reconcile"
         );
+        let mut stats = PinBatchStats::default();
+        let Some(seeded) = self
+            .seed_resolve(
+                project,
+                &moves,
+                journal,
+                observer.zip(
+                    plan.changes
+                        .iter()
+                        .find(|change| keys.contains(&rejection_key(change))),
+                ),
+                &mut stats,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        // All-or-nothing: the seed removed every `from` node, so a member the reconcile did NOT
+        // land at its target has an unanchored slot the resolver filled from the live index —
+        // possibly with a version fresher than the member started at, which later rounds cannot
+        // always mature back down (the only in-range candidate may be the still-fresh original).
+        // Keeping a partial landing would trade the group's progress for a silent drive-by
+        // upgrade; restoring keeps the spec's "verify every planned target landed" contract, and
+        // each member then still holds the per-pin rejection cargo explained.
+        let all_landed = moves.iter().all(|planned| {
+            seeded
+                .after
+                .has_crates_io_package(&planned.name, &planned.to)
+        });
+        if all_landed {
+            for key in &keys {
+                rejections.remove(key);
+            }
+        } else {
+            restore_widen_snapshot(&project.root, &seeded.snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Seeds one group and restores its snapshot on resolver or environment failure.
+    async fn seed_resolve(
+        &self,
+        project: &Project,
+        moves: &[PlannedNodeMove],
+        journal: &ProjectMutationJournal,
+        notification: Option<(&dyn ApplyObserver, &Change)>,
+        stats: &mut PinBatchStats,
+    ) -> Result<Option<SeededResolve>> {
+        let lock_path = project.root.join("Cargo.lock");
+        let lock_text = std::fs::read_to_string(&lock_path)?;
+        let before = CargoLock::parse(&lock_text)?;
+        let Some(seeded) = rewrite_planned_nodes(&lock_text, moves) else {
+            return Ok(None);
+        };
         // The generated projections follow the seeded moves as they follow a pin: a projection
         // still demanding a seeded node's old version would reject the joint resolve for the
-        // projection's sake. Captured with the lock, restored with it.
-        let followers = self.generated_facts(project).await?;
+        // projection's sake.
+        // Captured with the lock, restored with it.
+        let followers = self
+            .generated_facts(project, notification.map(|(observer, _)| observer))
+            .await?;
         let snapshot = widen_snapshot(&project.root, &[], &followers.members)?;
         journal.validate_project(&project.root)?;
-        for planned in &moves {
+        for planned in moves {
             manifest::follow_constraint(
                 &project.root,
                 &followers.members,
@@ -1128,54 +1246,67 @@ impl CargoTool {
             )?;
         }
         std::fs::write(&lock_path, &seeded)?;
-        match self
+        stats.seeded += moves.len();
+        stats.resolves += 1;
+        if let Some((observer, change)) = notification {
+            observer.resolver_started(Some(change));
+        }
+        let resolved = self
             .cargo
             .metadata(&project.root, &project.generated_members)
-            .await
-        {
-            Ok(_) => {}
-            Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
-                restore_widen_snapshot(&project.root, &snapshot)?;
-                return Err(err);
+            .await;
+        // A coordination failure forbids restoring files that may now belong to another writer.
+        journal.validate_project(&project.root)?;
+        match resolved {
+            Ok(_) => {
+                let after = read_lock(project)?;
+                // Replaying only exact landings preserves removed or renamed projection entries.
+                for (relative, contents) in &snapshot {
+                    if relative != Utf8Path::new("Cargo.lock")
+                        && let Some(contents) = contents
+                    {
+                        std::fs::write(project.root.join(relative), contents)?;
+                    }
+                }
+                for planned in moves {
+                    if after.has_crates_io_package(&planned.name, &planned.to)
+                        && !after.has_crates_io_package(&planned.name, &planned.from)
+                    {
+                        manifest::follow_constraint(
+                            &project.root,
+                            &followers.members,
+                            &planned.name,
+                            &planned.from,
+                            &planned.to,
+                        )?;
+                    }
+                }
+                Ok(Some(SeededResolve {
+                    before,
+                    after,
+                    snapshot,
+                }))
             }
-            // The joint seed is unsatisfiable as a whole: restore the lock and let each change
-            // keep the per-pin rejection cargo already explained.
-            Err(_) => {
+            Err(err) => {
                 restore_widen_snapshot(&project.root, &snapshot)?;
-                return Ok(());
+                if seed_resolver_rejection(&err) {
+                    // A group rejection cannot explain any one candidate's refusal.
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
             }
         }
-        // All-or-nothing: the seed removed every `from` node, so a member the reconcile did NOT
-        // land at its target has an unanchored slot the resolver filled from the live index —
-        // possibly with a version fresher than the member started at, which later rounds cannot
-        // always mature back down (the only in-range candidate may be the still-fresh original).
-        // Keeping a partial landing would trade the group's progress for a silent drive-by
-        // upgrade; restoring keeps the spec's "verify every planned target landed" contract, and
-        // each member then still holds the per-pin rejection cargo explained.
-        let landed = read_lock(project)?;
-        let all_landed = moves
-            .iter()
-            .all(|planned| landed.has_crates_io_package(&planned.name, &planned.to));
-        if all_landed {
-            for key in &keys {
-                rejections.remove(key);
-            }
-        } else {
-            restore_widen_snapshot(&project.root, &snapshot)?;
-        }
-        Ok(())
     }
 
     /// Applies all `changes` as one logical unit, driving each to its exact target.
     ///
-    /// Cargo accepts several `-p` specs beside one `--precise` but silently applies only the first
-    /// spec, so every planned pin needs its own command. Those commands are still graph-wide: one
-    /// pin can move another planned node, or remove the lock entry a later pin would have
-    /// addressed. Each pass therefore re-reads the lock before every pin and pins the node
-    /// [`current_selector`] picks (the planned `from` line while it exists, the unique off-target
-    /// node once another pin moved it); passes repeat until one makes no progress or the lock
-    /// revisits an earlier state. Resolver rejections remain non-fatal held candidates the final
-    /// diff reports; local environment failures abort.
+    /// A seed expresses all targets beside one unlocked resolve, avoiding one process per crate.
+    /// Seeded slots must stay at their original or requested version; other movement is reported.
+    /// Failed groups split deterministically until a single change needs the precise-pin loop.
+    /// Successful seeds send only their unlanded changes to that loop.
+    /// Resolver rejections remain non-fatal held candidates the final diff reports; local
+    /// environment failures and interruptions abort without bisection.
     async fn pin_batch(
         &self,
         project: &Project,
@@ -1184,8 +1315,8 @@ impl CargoTool {
         observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
     ) -> Result<()> {
-        // Direct workspace members can emit sibling changes sharing `(package, from, to)`; those
-        // are one lock move, so issue each distinct spec once, in a deterministic order.
+        // Direct workspace members can emit sibling changes sharing `(package, from, to)`;
+        // those are one lock move and one resolver operation.
         let mut worklist: Vec<&Change> = changes.iter().collect();
         worklist.sort_by(|a, b| {
             a.package
@@ -1197,6 +1328,176 @@ impl CargoTool {
         });
         worklist.dedup_by(|a, b| a.package == b.package && a.from == b.from && a.to == b.to);
 
+        let mut stats = PinBatchStats::default();
+        let result = self
+            .pin_fixed_point(
+                project, &worklist, journal, observer, rejections, &mut stats,
+            )
+            .await;
+        tracing::debug!(
+            resolves = stats.resolves,
+            seeded = stats.seeded,
+            landed = stats.landed,
+            bisected = stats.bisected,
+            per_crate = stats.per_crate,
+            "cargo pin batch finished"
+        );
+        result
+    }
+
+    async fn pin_fixed_point(
+        &self,
+        project: &Project,
+        worklist: &[&Change],
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
+        // A precise leftover or a later half can displace an earlier seed's target.
+        // Revisit only targets still needing a pin, retaining the original cycle and pass bounds.
+        let mut seen = BTreeSet::new();
+        for _ in 0..worklist.len().saturating_add(1) {
+            let before = read_lock(project)?.locked_slots();
+            if !seen.insert(before.clone()) {
+                break;
+            }
+            self.pin_seeded_worklist(project, worklist, journal, observer, rejections, stats)
+                .await?;
+            if read_lock(project)?.locked_slots() == before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn pin_seeded_worklist(
+        &self,
+        project: &Project,
+        worklist: &[&Change],
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
+        let mut groups = vec![worklist.to_vec()];
+        while let Some(group) = groups.pop() {
+            let lock = read_lock(project)?;
+            let (refused, mut unlanded): (Vec<&Change>, Vec<&Change>) = group
+                .iter()
+                .copied()
+                .filter(|change| current_selector(&lock, change).is_some())
+                .partition(|change| self.was_refused_alone(change));
+            if !refused.is_empty() {
+                self.pin_individually(project, &refused, journal, observer, rejections, stats)
+                    .await?;
+            }
+            if unlanded.is_empty() {
+                continue;
+            }
+            let lock = read_lock(project)?;
+            let moves: Vec<PlannedNodeMove> = unlanded
+                .iter()
+                .filter(|change| {
+                    !lock.has_crates_io_package(&change.package.name, change.to.as_str())
+                })
+                .map(|change| PlannedNodeMove {
+                    name: change.package.name.clone(),
+                    from: change.from.to_string(),
+                    to: change.to.to_string(),
+                })
+                .collect();
+            // Seeding an already present target would create duplicate lock blocks, and a precise
+            // pin can still converge the original source copy into that target.
+            // A lone change gains nothing from a seed either: the precise pin is one resolve too,
+            // and only it records cargo's explanation when the change is refused.
+            if let [lone] = unlanded.as_slice() {
+                self.pin_alone(project, lone, journal, observer, rejections, stats)
+                    .await?;
+                continue;
+            }
+            if moves.is_empty() {
+                self.pin_individually(project, &unlanded, journal, observer, rejections, stats)
+                    .await?;
+                continue;
+            }
+            let notification = observer.zip(unlanded.first().copied());
+            if let Some(seeded) = self
+                .seed_resolve(project, &moves, journal, notification, stats)
+                .await?
+            {
+                if seed_has_drive_by(&seeded.before, &seeded.after, &moves) {
+                    tracing::debug!(group = moves.len(), "restoring cargo seed after a drive-by");
+                    restore_widen_snapshot(&project.root, &seeded.snapshot)?;
+                } else {
+                    let leftovers: Vec<&Change> = unlanded
+                        .iter()
+                        .copied()
+                        .filter(|change| current_selector(&seeded.after, change).is_some())
+                        .collect();
+                    stats.landed += unlanded.len() - leftovers.len();
+                    self.pin_individually(
+                        project, &leftovers, journal, observer, rejections, stats,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            if let [lone] = unlanded.as_slice() {
+                self.pin_alone(project, lone, journal, observer, rejections, stats)
+                    .await?;
+            } else {
+                stats.bisected += 1;
+                let right = unlanded.split_off(unlanded.len() / 2);
+                groups.push(right);
+                groups.push(unlanded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins one change precisely and remembers it when it does not land, so later batches keep it
+    /// out of their seeds.
+    async fn pin_alone(
+        &self,
+        project: &Project,
+        change: &Change,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
+        self.pin_individually(project, &[change], journal, observer, rejections, stats)
+            .await?;
+        if current_selector(&read_lock(project)?, change).is_some() {
+            self.refused_alone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(rejection_key(change));
+        }
+        Ok(())
+    }
+
+    fn was_refused_alone(&self, change: &Change) -> bool {
+        self.refused_alone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&rejection_key(change))
+    }
+
+    /// Preserves the precise-pin fixed point for failed leaves and successful-seed leftovers.
+    ///
+    /// Each command can move or remove another planned node, so every pass re-reads the lock and
+    /// uses [`current_selector`] to address the original or unique off-target version.
+    async fn pin_individually(
+        &self,
+        project: &Project,
+        worklist: &[&Change],
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
         let mut seen = BTreeSet::new();
         for _ in 0..worklist.len().saturating_add(1) {
             let before = read_lock(project)?.locked_slots();
@@ -1204,16 +1505,18 @@ impl CargoTool {
                 break;
             }
             let mut attempted = false;
-            for change in &worklist {
+            for change in worklist {
                 let lock = read_lock(project)?;
                 let Some(current) = current_selector(&lock, change) else {
                     continue;
                 };
                 attempted = true;
-                if let Some(observer) = observer {
-                    observer.candidate_started(change);
-                }
                 journal.validate_project(&project.root)?;
+                if let Some(observer) = observer {
+                    observer.resolver_started(Some(change));
+                }
+                stats.resolves += 1;
+                stats.per_crate += 1;
                 if let Some(rejection) = self
                     .update_precise(project, &change.package.name, &current, change.to.as_str())
                     .await?
@@ -1288,9 +1591,8 @@ impl CargoTool {
             .map(CargoLock::locked_versions_by_source)
             .unwrap_or_default();
 
-        // The whole graph is re-resolved as one logical batch: each concrete pin gets its own Cargo
-        // invocation, repeated to a bounded fixed point because one invocation may move a package
-        // another planned pin still needs to address.
+        // The whole graph is re-resolved as one logical batch, trying seeded targets before the
+        // precise-pin fixed point for failed leaves and unlanded targets.
         // The diff below surfaces every paired version-slot move.
         let pin_phase = std::time::Instant::now();
         let pin_rejections = match self
@@ -1333,11 +1635,7 @@ impl CargoTool {
             matches!(plan.edge_policy, EdgePolicy::Canonicalize) || preserve_needs_graph;
         let graph = if needs_graph || corrective_edges {
             journal.validate_project(&project.root)?;
-            Some(
-                self.cargo
-                    .metadata(&project.root, &project.generated_members)
-                    .await?,
-            )
+            Some(self.metadata_with_observer(project, observer).await?)
         } else {
             None
         };
@@ -1346,7 +1644,7 @@ impl CargoTool {
         // can pair across stable dependent identities and coexisting endpoints.
         journal.validate_project(&project.root)?;
         let edge_phase = std::time::Instant::now();
-        let generated = self.generated_facts(project).await?;
+        let generated = self.generated_facts(project, observer).await?;
         let enforced = edges::enforce::enforce(
             &self.cargo,
             project,
@@ -1354,6 +1652,7 @@ impl CargoTool {
             before_lock.as_ref(),
             graph,
             &generated.identities,
+            observer,
         )
         .await?;
         tracing::debug!(
@@ -1364,6 +1663,17 @@ impl CargoTool {
         let edge_rebinds = enforced.rebinds;
 
         let after_lock = read_lock(project)?;
+        journal.validate_project(&project.root)?;
+        let graph = self
+            .guard_after_resolve(
+                project,
+                before_lock.as_ref(),
+                &after_lock,
+                graph,
+                plan,
+                observer,
+            )
+            .await?;
         let after = after_lock.locked_versions_by_source();
         let crates_io_after = after_lock.crates_io_locked_versions();
         classify_planned_changes(
@@ -1374,24 +1684,67 @@ impl CargoTool {
             &mut report,
         );
 
-        // No paired version-slot change may be omitted.
-        // Every moved slot the applied rows above do not already report is surfaced as a collateral
-        // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
-        // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
-        // would hide that real move).
-        let collateral = collateral_changes(&before, &after, &report.applied);
-        tracing::debug!(
-            before_slots = before.len(),
-            after_slots = after.len(),
-            collateral = collateral.len(),
-            "cargo apply collateral diff"
-        );
-        report.applied.extend(collateral);
+        add_collateral_changes(&before, &after, &mut report);
         report.edge_rebinds = edge_rebinds;
-        let followers = self.generated_facts(project).await?;
+        let followers = self.generated_facts(project, observer).await?;
         report.followed_manifests = followed_manifests(project, &followers.members, journal)?;
         Ok(report)
     }
+
+    async fn guard_after_resolve(
+        &self,
+        project: &Project,
+        before: Option<&CargoLock>,
+        after: &CargoLock,
+        mut graph: Option<ResolvedGraph>,
+        plan: &Plan,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<Option<ResolvedGraph>> {
+        let initial = plan
+            .initial_lock_snapshot
+            .as_deref()
+            .map(|bytes| {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|err| CoreError::LockUnreadable(err.to_string()))?;
+                CargoLock::parse(text)
+            })
+            .transpose()?;
+        let before = initial.as_ref().or(before);
+        // Authored direct intent comes from Cargo's resolved edges, including renamed and
+        // workspace-inherited declarations, after generated projections and edge policy settle.
+        if graph.is_none() && !new_direct_lines(before, after).is_empty() {
+            if let Some(observer) = observer {
+                observer.resolver_started(None);
+            }
+            graph = Some(
+                self.cargo
+                    .metadata_locked(&project.root, &project.generated_members)
+                    .await?,
+            );
+        }
+        guard_resolved_copies(before, after, graph.as_ref(), &plan.single_copy)?;
+        Ok(graph)
+    }
+}
+
+fn add_collateral_changes(
+    before: &BTreeMap<SourcedSlotKey, String>,
+    after: &BTreeMap<SourcedSlotKey, String>,
+    report: &mut ApplyReport,
+) {
+    // No paired version-slot change may be omitted.
+    // Every moved slot the applied rows above do not already report is surfaced as a collateral
+    // applied row: a transitive pushed backward for consistency, a crate matured down by `fix`,
+    // or a *held* candidate the resolve still floated off its baseline (whose skip row alone
+    // would hide that real move).
+    let collateral = collateral_changes(before, after, &report.applied);
+    tracing::debug!(
+        before_slots = before.len(),
+        after_slots = after.len(),
+        collateral = collateral.len(),
+        "cargo apply collateral diff"
+    );
+    report.applied.extend(collateral);
 }
 
 fn read_lock(project: &Project) -> Result<CargoLock> {
@@ -1535,6 +1888,107 @@ fn needs_apply_graph(changes: &[Change], after: &BTreeMap<SlotKey, String>) -> b
         .any(|change| needs_member_graph(change) || !reached(after, change))
 }
 
+fn resolved_copies(lock: &CargoLock) -> BTreeMap<(Option<String>, String), BTreeSet<String>> {
+    let mut copies: BTreeMap<(Option<String>, String), BTreeSet<String>> = BTreeMap::new();
+    for package in &lock.package {
+        if let Some(version) = &package.version {
+            copies
+                .entry((package.source.clone(), package.name.clone()))
+                .or_default()
+                .insert(version.clone());
+        }
+    }
+    copies
+}
+
+fn new_direct_lines(
+    before: Option<&CargoLock>,
+    after: &CargoLock,
+) -> BTreeSet<(Option<String>, String)> {
+    let compatibility_lines = |lock: &CargoLock| {
+        let mut lines: BTreeMap<(Option<String>, String), BTreeSet<String>> = BTreeMap::new();
+        for (name, versions) in resolved_copies(lock) {
+            lines
+                .entry(name)
+                .or_default()
+                .extend(versions.iter().map(|version| compatibility_line(version)));
+        }
+        lines
+    };
+    let before = before.map(compatibility_lines).unwrap_or_default();
+    compatibility_lines(after)
+        .into_iter()
+        .filter(|(name, lines)| {
+            lines.len() > 1
+                && lines
+                    .iter()
+                    .any(|line| !before.get(name).is_some_and(|before| before.contains(line)))
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn compatibility_line(version: &str) -> String {
+    // Cargo treats different 0.0.x patches as incompatible, too.
+    match version::parse(version) {
+        Some(parsed) if parsed.major == 0 && parsed.minor == 0 => format!("0.0.{}", parsed.patch),
+        _ => version::major_key(version).0,
+    }
+}
+
+/// Refuses new incompatible direct lines and policy-gated growth in distinct resolved versions.
+fn guard_resolved_copies(
+    before: Option<&CargoLock>,
+    after: &CargoLock,
+    graph: Option<&ResolvedGraph>,
+    single_copy: &cooldown_core::SingleCopyPolicy,
+) -> Result<()> {
+    let after_copies = resolved_copies(after);
+    let before_copies = before.map(resolved_copies).unwrap_or_default();
+    for (identity, versions) in &after_copies {
+        let (_, name) = identity;
+        if let Some(gate) = single_copy.gate_of(name)
+            && versions.len()
+                > before_copies
+                    .get(identity)
+                    .map_or(1, |before| before.len().max(1))
+        {
+            return Err(CoreError::UnacceptableResolve(format!(
+                "would resolve {name} at another version ({}), which {gate} forbids; upgrade its dependents together so the copies converge",
+                versions.iter().cloned().collect::<Vec<_>>().join(" and ")
+            )));
+        }
+    }
+    let Some(graph) = graph else {
+        return Ok(());
+    };
+    for identity in new_direct_lines(before, after) {
+        let (source, name) = &identity;
+        if graph
+            .packages
+            .iter()
+            .any(|(id, info)| info.name == *name && info.source == *source && graph.is_direct(id))
+        {
+            let versions = versions_for_name(&after_copies, &identity).join(" and ");
+            return Err(CoreError::UnacceptableResolve(format!(
+                "would resolve direct dependency {name} at another incompatible line ({versions}); upgrade {name} with it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn versions_for_name(
+    copies: &BTreeMap<(Option<String>, String), BTreeSet<String>>,
+    identity: &(Option<String>, String),
+) -> Vec<String> {
+    copies
+        .get(identity)
+        .into_iter()
+        .flat_map(|versions| versions.iter().cloned())
+        .collect()
+}
+
 fn reached_after(
     after: &BTreeMap<SlotKey, String>,
     graph: Option<&ResolvedGraph>,
@@ -1562,6 +2016,14 @@ impl ToolWrite for CargoTool {
     fn supports_transitive_advance(&self) -> bool {
         // The per-spec `update -p name@from --precise to` pin addresses any locked crate, declared
         // or not.
+        true
+    }
+
+    fn guards_duplicate_copies(&self) -> bool {
+        true
+    }
+
+    fn supports_target_fallback(&self) -> bool {
         true
     }
 
@@ -1618,7 +2080,7 @@ impl ToolWrite for CargoTool {
         // A generated member's manifest is rewritten whenever a move is followed into it, so it
         // is journaled as an output like any declaring member's — and the preimage is what the
         // apply report later compares against to say which projections followed.
-        for member in &self.generated_facts(project).await?.members {
+        for member in &self.generated_facts(project, None).await?.members {
             relative.insert(manifest::member_manifest_rel(&member.path));
         }
         ProjectMutationJournal::capture(&project.root, relative)
@@ -1740,7 +2202,7 @@ impl ToolWrite for CargoTool {
                     .await?,
             ),
         };
-        let generated = self.generated_facts(project).await?;
+        let generated = self.generated_facts(project, None).await?;
         let mut result = edges::enforce::enforce(
             &self.cargo,
             project,
@@ -1748,6 +2210,7 @@ impl ToolWrite for CargoTool {
             before_lock.as_ref(),
             graph,
             &generated.identities,
+            None,
         )
         .await?;
         let final_view = edges::LockEdgeView::from_lock(&read_lock(project)?);
@@ -1762,6 +2225,376 @@ impl ToolWrite for CargoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod seeded_pins;
+
+    fn duplicate_guard_lock(versions: &[(&str, &str)]) -> eyre::Result<CargoLock> {
+        let mut content = String::new();
+        for (name, version) in versions {
+            content.push_str(&indoc::formatdoc! {r#"
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#});
+        }
+        Ok(CargoLock::parse(&content)?)
+    }
+
+    #[test]
+    fn duplicate_guard_rejects_authored_direct_lines_but_not_generated_only() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let mut graph = hakari_workspace(root);
+        graph.generated_roots.insert("hack".to_string());
+        let before = duplicate_guard_lock(&[("dep", "1.0.0"), ("orphan", "2.0.0")])?;
+        let after = duplicate_guard_lock(&[
+            ("dep", "1.0.0"),
+            ("dep", "2.0.0"),
+            ("orphan", "2.0.0"),
+            ("orphan", "3.0.0"),
+        ])?;
+        let error = guard_resolved_copies(
+            Some(&before),
+            &after,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+        )
+        .expect_err("authored dep cannot gain an incompatible line");
+        assert!(matches!(error, CoreError::UnacceptableResolve(ref detail)
+            if detail.contains("direct dependency dep") && detail.contains("1.0.0 and 2.0.0")
+            && detail.contains("upgrade dep with it")));
+
+        // A pre-existing split does not authorize replacing one line with a new incompatible one.
+        let standing = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "3.0.0")])?;
+        assert!(matches!(
+            guard_resolved_copies(
+                Some(&standing),
+                &after,
+                Some(&graph),
+                &cooldown_core::SingleCopyPolicy::default()
+            ),
+            Err(CoreError::UnacceptableResolve(_))
+        ));
+
+        // Removing the authored declaration leaves only generated projection intent.
+        graph
+            .edges
+            .get_mut("app")
+            .expect("app edges")
+            .retain(|id| id != "dep");
+        guard_resolved_copies(
+            Some(&before),
+            &after,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_allows_standing_split_and_ordinary_major_move() -> eyre::Result<()> {
+        let before = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+        let after = duplicate_guard_lock(&[("dep", "1.1.0"), ("dep", "2.1.0")])?;
+        let policy = cooldown_core::SingleCopyPolicy {
+            every_name: true,
+            ..Default::default()
+        };
+        assert!(new_direct_lines(Some(&before), &after).is_empty());
+        guard_resolved_copies(Some(&before), &after, None, &policy)?;
+        let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
+        let after = duplicate_guard_lock(&[("dep", "2.0.0")])?;
+        assert!(new_direct_lines(Some(&before), &after).is_empty());
+        guard_resolved_copies(Some(&before), &after, None, &policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_uses_cargo_zero_major_compatibility() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let graph = hakari_workspace(root);
+        for (baseline, target, incompatible) in [
+            ("0.136.1", "0.136.2", false),
+            ("0.136.1", "0.137.1", true),
+            ("0.0.1", "0.0.2", true),
+        ] {
+            let before = duplicate_guard_lock(&[("dep", baseline)])?;
+            let after = duplicate_guard_lock(&[("dep", baseline), ("dep", target)])?;
+            let result = guard_resolved_copies(
+                Some(&before),
+                &after,
+                Some(&graph),
+                &cooldown_core::SingleCopyPolicy::default(),
+            );
+            assert_eq!(result.is_err(), incompatible, "{baseline} and {target}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_flag_rejects_transitive_versions_in_same_compatible_line() -> eyre::Result<()>
+    {
+        let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
+        let after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "1.1.0")])?;
+        assert!(new_direct_lines(Some(&before), &after).is_empty());
+        guard_resolved_copies(
+            Some(&before),
+            &after,
+            None,
+            &cooldown_core::SingleCopyPolicy::default(),
+        )?;
+        let policy = cooldown_core::SingleCopyPolicy {
+            every_name: true,
+            ..Default::default()
+        };
+        assert!(
+            matches!(guard_resolved_copies(Some(&before), &after, None, &policy),
+            Err(CoreError::UnacceptableResolve(detail)) if detail.contains("--fail-on-new-duplicate"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_covers_authored_dependencies_outside_crates_io() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        // The direct-dependency invariant also covers private registries, Git and path sources.
+        for source in [
+            Some("registry+https://private.example/index"),
+            Some("git+https://example.com/repo#abc"),
+            None,
+        ] {
+            let mut graph = hakari_workspace(root);
+            graph
+                .packages
+                .get_mut("dep")
+                .ok_or_else(|| eyre::eyre!("missing direct crate"))?
+                .source = source.map(str::to_string);
+            let mut before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
+            let mut after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+            for package in before.package.iter_mut().chain(&mut after.package) {
+                package.source = source.map(str::to_string);
+            }
+            assert!(matches!(
+                guard_resolved_copies(
+                    Some(&before),
+                    &after,
+                    Some(&graph),
+                    &cooldown_core::SingleCopyPolicy::default()
+                ),
+                Err(CoreError::UnacceptableResolve(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn seed_rejects_a_target_slot_drive_by_while_the_original_line_survives() -> eyre::Result<()> {
+        let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
+        let after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.2.0")])?;
+        assert!(seed_has_drive_by(
+            &before,
+            &after,
+            &[PlannedNodeMove {
+                name: "dep".to_string(),
+                from: "1.0.0".to_string(),
+                to: "2.1.0".to_string()
+            }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_keeps_source_baselines_and_direct_intent_separate() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let graph = hakari_workspace(root);
+        let mut before = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+        before
+            .package
+            .get_mut(1)
+            .ok_or_else(|| eyre::eyre!("private package"))?
+            .source = Some("registry+https://private.example/index".to_string());
+        let mut after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+        after
+            .package
+            .get_mut(1)
+            .ok_or_else(|| eyre::eyre!("private package"))?
+            .source = Some("registry+https://private.example/index".to_string());
+        after
+            .package
+            .extend(duplicate_guard_lock(&[("dep", "2.0.0")])?.package);
+        assert!(matches!(
+            guard_resolved_copies(
+                Some(&before),
+                &after,
+                Some(&graph),
+                &cooldown_core::SingleCopyPolicy::default()
+            ),
+            Err(CoreError::UnacceptableResolve(_))
+        ));
+        let mut private_move = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+        private_move
+            .package
+            .get_mut(1)
+            .ok_or_else(|| eyre::eyre!("private package"))?
+            .source = Some("registry+https://private.example/index".to_string());
+        private_move
+            .package
+            .get_mut(1)
+            .ok_or_else(|| eyre::eyre!("private package"))?
+            .version = Some("3.0.0".to_string());
+        guard_resolved_copies(
+            Some(&before),
+            &private_move,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+        )?;
+        // A newly split private line has no authored direct intent in the crates.io graph.
+        for lock in [&mut before, &mut private_move] {
+            let mut extra = duplicate_guard_lock(&[("dep", "4.0.0")])?;
+            for package in &mut extra.package {
+                package.source = Some("registry+https://private.example/index".to_string());
+            }
+            lock.package.extend(extra.package);
+        }
+        assert!(!new_direct_lines(Some(&before), &private_move).is_empty());
+        guard_resolved_copies(
+            Some(&before),
+            &private_move,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+        )?;
+        Ok(())
+    }
+
+    /// Remediation may restore a pre-existing line that an earlier batch temporarily removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplicate_guard_uses_the_run_snapshot_across_batches() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let (project, tool) = atomic_fixture(root, "")?;
+        let initial = indoc! {r#"
+            version = 3
+            [[package]]
+            name = "dep"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            [[package]]
+            name = "dep"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+        "#};
+        let before = duplicate_guard_lock(&[("dep", "2.0.0")])?;
+        let after = CargoLock::parse(initial)?;
+        let graph = hakari_workspace(root);
+        let policy = cooldown_core::SingleCopyPolicy {
+            every_name: true,
+            ..cooldown_core::SingleCopyPolicy::default()
+        };
+        assert!(matches!(
+            guard_resolved_copies(Some(&before), &after, Some(&graph), &policy),
+            Err(CoreError::UnacceptableResolve(_))
+        ));
+        let plan = Plan {
+            single_copy: policy,
+            initial_lock_snapshot: Some(Arc::from(initial.as_bytes())),
+            ..Plan::default()
+        };
+        tool.guard_after_resolve(&project, Some(&before), &after, Some(graph), &plan, None)
+            .await?;
+        Ok(())
+    }
+
+    /// The inherited alias is authored intent even when only its sibling is in the plan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplicate_guard_apply_rejects_inherited_alias_split() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let (project, tool) = atomic_fixture(root, "")?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc! {r#"
+                [workspace]
+                [workspace.dependencies]
+                runtime = { package = "beta", version = "2" }
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2024"
+                [dependencies]
+                alpha = "2"
+                runtime.workspace = true
+            "#},
+        )?;
+        std::fs::write(
+            root.join("Cargo.lock.settled"),
+            indoc::formatdoc! {r#"
+                {ATOMIC_LOCK_RECONCILED}
+                [[package]]
+                name = "beta"
+                version = "3.0.0"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#},
+        )?;
+        std::fs::write(
+            root.join("metadata.json"),
+            indoc! {r#"
+                {
+                    "packages": [
+                        {"id":"app", "name":"app", "version":"0.1.0",
+                         "manifest_path":"/repo/Cargo.toml", "dependencies":[
+                            {"name":"beta", "rename":"runtime", "req":"^2"},
+                            {"name":"alpha", "req":"^2"}]},
+                        {"id":"beta", "name":"beta", "version":"2.2.0",
+                         "source":"registry+https://github.com/rust-lang/crates.io-index"},
+                        {"id":"alpha", "name":"alpha", "version":"2.2.0",
+                         "source":"registry+https://github.com/rust-lang/crates.io-index"},
+                        {"id":"beta-new", "name":"beta", "version":"3.0.0",
+                         "source":"registry+https://github.com/rust-lang/crates.io-index"}
+                    ],
+                    "workspace_members":["app"], "workspace_root":"/repo",
+                    "resolve":{"nodes":[
+                        {"id":"app", "deps":[{"name":"runtime", "pkg":"beta"},
+                            {"name":"alpha", "pkg":"alpha"}]},
+                        {"id":"alpha", "deps":[{"name":"beta", "pkg":"beta-new"}]},
+                        {"id":"beta", "deps":[]}, {"id":"beta-new", "deps":[]}
+                    ]}
+                }
+            "#},
+        )?;
+        std::fs::write(
+            root.join("fake-cargo.sh"),
+            indoc! {r#"
+                #!/bin/sh
+                case "$1" in
+                  update) cp Cargo.lock.settled Cargo.lock; exit 0 ;;
+                  metadata) cp Cargo.lock.settled Cargo.lock; cat metadata.json; exit 0 ;;
+                esac
+                exit 1
+            "#},
+        )?;
+        let plan = Plan {
+            changes: vec![Change {
+                direct: false,
+                ..change("alpha", "2.3.0", "2.2.0", true)
+            }],
+            ..Default::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+        let error = tool
+            .apply_plan(&project, &plan, &journal, None)
+            .await
+            .expect_err("settled authored sibling split must trigger candidate isolation");
+        assert!(matches!(error, CoreError::UnacceptableResolve(detail)
+            if detail.contains("direct dependency beta") && detail.contains("2.2.0 and 3.0.0")));
+        assert!(tool.guards_duplicate_copies());
+        Ok(())
+    }
     // Only [`InPlaceCargoFamilyWriter`] implements a trait here, and it is Unix-only.
     #[cfg(unix)]
     use async_trait::async_trait;
@@ -2876,6 +3709,9 @@ mod tests {
             indoc! {r#"
                 if ! grep -q 'dep = "1"' Cargo.toml; then
                   cp Cargo.lock.forked Cargo.lock
+                  if [ "$1" = metadata ]; then
+                    printf '%s\n' '{"packages": [], "workspace_members": [], "workspace_root": "", "resolve": null}'
+                  fi
                   exit 0
                 fi
             "#}
@@ -3124,8 +3960,12 @@ mod tests {
         let plan = atomic_plan();
         let journal = tool.mutation_journal(&project, &plan).await?;
 
-        let rejections = tool
-            .whole_graph_resolve(&project, &plan, &journal, None)
+        let mut rejections: PinRejections = plan
+            .changes
+            .iter()
+            .map(|change| (rejection_key(change), "held".to_string()))
+            .collect();
+        tool.land_rejected_group_atomically(&project, &plan, &journal, None, &mut rejections)
             .await?;
 
         assert_eq!(
@@ -3158,13 +3998,16 @@ mod tests {
         };
         let journal = tool.mutation_journal(&project, &plan).await?;
 
-        let rejections = tool
-            .whole_graph_resolve(&project, &plan, &journal, None)
+        let mut rejections = PinRejections::from([(
+            rejection_key(&plan.changes[0]),
+            "the precise pin was rejected".to_string(),
+        )]);
+        tool.land_rejected_group_atomically(&project, &plan, &journal, None, &mut rejections)
             .await?;
 
         assert!(
             !root.join("metadata-ran").exists(),
-            "no reconcile may run for a single rejection"
+            "atomic rejection recovery abstains for a single rejection"
         );
         assert_eq!(
             std::fs::read_to_string(root.join("Cargo.lock"))?,
@@ -3483,6 +4326,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::write(root.join("Cargo.toml"), MEMBER_WIDEN_MANIFEST)?;
         std::fs::write(root.join("Cargo.lock"), MEMBER_WIDEN_LOCK)?;
+        std::fs::write(root.join("Cargo.lock.unwidened"), MEMBER_WIDEN_LOCK)?;
         std::fs::write(
             root.join("Cargo.lock.forked"),
             formatdoc! {r#"
@@ -3518,6 +4362,7 @@ mod tests {
                 #!/bin/sh
                 if [ "$1" = metadata ]; then
                   if grep -q 'dep = "1"' Cargo.toml; then
+                    cp Cargo.lock.unwidened Cargo.lock
                     cat metadata.unwidened.json
                     exit 0
                   fi

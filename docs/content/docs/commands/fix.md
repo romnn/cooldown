@@ -78,7 +78,7 @@ the refreshed graph like any other; a lock that was stale before the run began k
 | `--downgrade-pinned` | Downgrade and rewrite exact-pinned dependencies too (off by default). |
 | `--cargo-edge-policy <policy>` | cargo: `preserve` (default), `canonicalize`, or `none` — how lock edge bindings are treated after the re-resolve (see [upgrade]({{< relref "upgrade.md" >}}#lock-edge-bindings-cargo)). Config: `[tool.cargo] edge-policy`. |
 | `--strict` | Exit `1` if the fix cannot complete cleanly. |
-| `--fail-on-new-duplicate` | pnpm: refuse a resolve that gives *any* package a second resolved copy instead of committing it with a `duplicate_copy` warning (see [upgrade]({{< relref "upgrade.md" >}}#whole-workspace-landings-pnpm)). On a tool without pnpm's settlement guard the flag has no effect and the run says so. |
+| `--fail-on-new-duplicate` | Cargo and pnpm: refuse a resolve that gives *any* package a second resolved copy instead of committing it with a `duplicate_copy` warning (see [upgrade]({{< relref "upgrade.md" >}}#whole-workspace-landings-pnpm)). On a tool without Cargo or pnpm's settlement guard the flag has no effect and the run says so. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
 ## `fix` versus `baseline`

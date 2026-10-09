@@ -4721,12 +4721,11 @@ async fn upgrade_checks_full_graph_even_when_package_filtered() {
 }
 
 #[tokio::test]
-async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_floats() {
+async fn upgrade_rejects_a_replacement_of_a_pre_existing_violating_version() {
     // The repo is already dirty: `t@v0.5.0` is an unacknowledged too-fresh transitive before the run
     // (a standing `check` violation). Upgrading unrelated `a` re-resolves `t` to another fresh version
-    // `v0.6.0` that the reconcile pass cannot mature down. Because `t` was ALREADY violating, floating
-    // it is not a newly-introduced offender — the optimistic gate must keep the valid `a` upgrade
-    // rather than roll it back (one dirty version line stayed one dirty version line).
+    // `v0.6.0` that the reconcile pass cannot mature down.
+    // The standing violation acknowledges only v0.5.0; its replacement must reject the trial.
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
@@ -4792,23 +4791,17 @@ async fn upgrade_keeps_an_unrelated_change_when_a_pre_existing_violation_merely_
     };
     let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
 
-    // The unrelated `a` upgrade is kept (not rolled back); only `t` is reported as a leftover violation.
+    // The new violating identity prevents the forward upgrade from committing.
     let a = out
         .items
         .iter()
         .find(|item| item.name == "a")
         .expect("a row");
-    assert!(
-        a.applied,
-        "the valid `a` upgrade survives a pre-existing violation"
-    );
-    assert_eq!(a.to, "v1.1.0");
-    assert!(
-        out.items
-            .iter()
-            .all(|item| item.skipped.as_ref().map(|s| s.reason)
-                != Some(SkipReason::TransitiveInCooldown)),
-        "nothing is rolled back as TransitiveInCooldown for a pre-existing violation"
+    assert!(!a.applied);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(
+        a.skipped.as_ref().map(|skip| skip.reason),
+        Some(SkipReason::TransitiveInCooldown)
     );
 }
 

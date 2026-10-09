@@ -1006,6 +1006,12 @@ pub struct Plan {
     /// The packages the resolve must not leave at a second resolved copy (`[tool.pnpm]
     /// single-copy`, `--fail-on-new-duplicate`); see [`SingleCopyPolicy`].
     pub single_copy: SingleCopyPolicy,
+    /// The adapter-owned lock snapshot from before this run, when available.
+    ///
+    /// Cargo compares new duplicate lines and copy counts against this fixed baseline across
+    /// remediation batches; each batch's journal remains the rollback and version-diff baseline.
+    /// The format matches [`ToolWrite::lock_edge_snapshot`](crate::ToolWrite::lock_edge_snapshot).
+    pub initial_lock_snapshot: Option<std::sync::Arc<[u8]>>,
 }
 
 /// Declares [`SkipReason`] together with its [`ALL`](SkipReason::ALL) enumeration and per-variant

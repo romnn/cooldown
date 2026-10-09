@@ -1,10 +1,12 @@
-use super::planning::{effective_hold, plan_baseline_violations, target_package};
+use super::planning::{
+    effective_hold, lower_adoptable_targets, plan_baseline_violations, target_package,
+};
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
     collateral_rows, combine_lock_status, conflict_skip_message, followed_manifest_warning,
-    indeterminate_trial, insert_graph_violation, is_downgrade, newly_introduced_violations,
-    package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
-    verify_applied_targets, violation_identity,
+    indeterminate_trial, insert_graph_violation, is_downgrade, landed_upgrade_changes,
+    newly_introduced_violations, package_label, planned_changes_landed, preserve_rollback_entries,
+    sort_planned_changes, verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
@@ -15,6 +17,8 @@ use cooldown_core::{
     Version,
 };
 use std::collections::HashSet;
+
+mod cargo_trials;
 
 #[test]
 fn upgrade_walks_the_graph_unless_transitive_hidden() {
@@ -255,6 +259,61 @@ fn dep(name: &str, version: &str) -> Dependency {
         pinned: false,
         hold_edges: Vec::new(),
     }
+}
+
+#[test]
+fn fallback_targets_are_adoptable_on_the_selected_line_and_bounded() -> eyre::Result<()> {
+    let dependency = dep("runtime", "1.0.0");
+    let mut releases = vec![
+        rel("1.0.0", 0),
+        rel("1.9.0", 1),
+        rel("2.0.0", 2),
+        rel("2.0.1", 3),
+        rel("2.0.2", 4),
+        rel("2.0.3", 5),
+        rel("2.0.4", 6),
+        rel("2.0.5", 7),
+        rel("2.0.6", 8),
+        rel("3.0.0", 9),
+    ];
+    for release in &mut releases {
+        release.major = MajorKey(release.major_number.unwrap_or_default().to_string());
+        release.kind_from_current = Some(UpdateKind::Major);
+        release.published_at = Some("2026-09-01T00:00:00Z".parse()?);
+        if release.version.as_str() == "2.0.3" {
+            release.published_at = Some("2026-10-08T00:00:00Z".parse()?);
+        }
+        if release.version.as_str() == "2.0.2" {
+            release.published_at = None;
+        }
+    }
+    let verdict = cooldown_core::evaluate(
+        &dependency,
+        &releases,
+        &[cooldown_core::config::builtin_default_layer()],
+        &cooldown_core::ResolveContext {
+            tool: ToolId("mock"),
+            project: camino::Utf8Path::new("."),
+            allow_major: true,
+            honor_declared_bounds: false,
+            honor_latest_tag: false,
+        },
+        "2026-10-09T00:00:00Z".parse()?,
+    );
+    let targets = lower_adoptable_targets(&releases, &verdict, &Version::new("2.0.6"));
+    // Cooling and unknown-age releases cannot be fallback targets; another major is untouched.
+    assert_eq!(
+        targets
+            .iter()
+            .map(|candidate| candidate.version.as_str())
+            .collect::<Vec<_>>(),
+        ["2.0.5", "2.0.4", "2.0.1"]
+    );
+    assert!(lower_adoptable_targets(&releases, &verdict, &Version::new("missing")).is_empty());
+    // A target with no lower candidate on its own line has no fallback.
+    let targets = lower_adoptable_targets(&releases, &verdict, &Version::new("3.0.0"));
+    assert!(targets.is_empty());
+    Ok(())
 }
 
 fn member(name: &str, path: &str) -> MemberRef {
@@ -744,14 +803,20 @@ fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
 }
 
 #[test]
-fn residual_gate_allows_a_pre_existing_violation_to_float_versions() {
+fn residual_gate_flags_a_replacement_violating_version() {
     let before = violations(&[("t", "0.5.0")]);
     let after = violations(&[("t", "0.6.0")]);
 
-    assert!(
-        newly_introduced_violations(&before, &after).is_empty(),
-        "one dirty version line stayed one dirty version line"
+    assert_eq!(
+        newly_introduced_violations(&before, &after),
+        vec![violation("t", "0.6.0", Some("crates.io"))]
     );
+}
+
+#[test]
+fn residual_gate_allows_an_unchanged_pre_existing_violation() {
+    let before = violations(&[("t", "0.5.0")]);
+    assert!(newly_introduced_violations(&before, &before).is_empty());
 }
 
 #[test]
@@ -1268,5 +1333,60 @@ fn target_package_keeps_the_name_when_the_major_is_version_derived() {
     assert_eq!(
         target_package(&go("example.com/foo/v2"), &major("/v2"), &major("/v2")).name,
         "example.com/foo/v2"
+    );
+}
+
+#[test]
+fn landed_targets_require_committed_evidence_for_each_original_copy() {
+    let held = change("shared", "1.0.0", "1.2.0");
+    let accepted = change("safe", "1.0.0", "1.2.0");
+    let graph = vec![
+        dep("shared", "1.0.0"),
+        dep("shared", "1.2.0"),
+        dep("safe", "1.2.0"),
+    ];
+    let mut outcome = BatchOutcome::default();
+    let mut applied = applied_item("safe", "1.0.0", "1.2.0", false);
+    applied.registry = None;
+    applied.direct = true;
+    outcome.items.push(applied);
+    // The target copy predates the trial; upgrading another copy does not land the held original.
+    let mut other_copy = applied_item("shared", "1.1.0", "1.2.0", false);
+    other_copy.registry = None;
+    other_copy.direct = true;
+    outcome.items.push(other_copy);
+    outcome.mark_committed(CommittedBatch {
+        violations_after: HashSet::new(),
+        reconcile_needed: false,
+    });
+    let landed = landed_upgrade_changes(&[held, accepted], &[outcome], &graph);
+    assert_eq!(landed.len(), 1);
+    assert_eq!(
+        landed.first().map(|change| change.package.name.as_str()),
+        Some("safe")
+    );
+}
+
+#[test]
+fn restored_applied_rows_are_not_landed_evidence() {
+    let candidate = change("safe", "1.0.0", "1.2.0");
+    let mut restored = BatchOutcome::default();
+    let mut applied = applied_item("safe", "1.0.0", "1.2.0", false);
+    applied.registry = None;
+    applied.direct = true;
+    restored.items.push(applied);
+    restored.mark_restored();
+    let mut committed = BatchOutcome::default();
+    committed.mark_committed(CommittedBatch {
+        violations_after: HashSet::new(),
+        reconcile_needed: false,
+    });
+    assert!(
+        landed_upgrade_changes(
+            &[candidate],
+            &[restored, committed],
+            &[dep("safe", "1.2.0")]
+        )
+        .is_empty()
     );
 }

@@ -10,7 +10,7 @@ use self::batch::{
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
     EffectiveHold, candidate_scope, dep_resolve_ctx, effective_hold, fix_change, is_downgrade,
-    plan_baseline_violations, sort_planned_changes,
+    lower_adoptable_targets, plan_baseline_violations, sort_planned_changes,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
@@ -22,6 +22,7 @@ use crate::app::advisories::{
 };
 use crate::app::change_key::{
     ChangeProvenanceKey, ChangeTargetKey, change_provenance_key, change_target_key,
+    change_target_key_parts,
 };
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
@@ -229,10 +230,16 @@ enum UpgradeTrialResult {
     Aborted(Vec<BatchOutcome>),
 }
 
-/// A candidate isolation rejected, with the residual violations its trial forced into the graph.
+/// A held candidate with the policy violations or native resolver explanation from its trial.
 struct RejectedUpgrade {
     change: Change,
     residual: Vec<BaselineViolation>,
+    skipped: Option<SkippedInfo>,
+}
+
+struct UpgradeFallback {
+    original: Change,
+    alternatives: Vec<Change>,
 }
 
 /// The outcome of isolating a policy-blocked batch into safe and unsafe candidates.
@@ -324,6 +331,8 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     lock_edges_enforced: bool,
     /// Adapter-owned edge state captured before this project's first mutation.
     initial_edge_snapshot: Option<Vec<u8>>,
+    /// Run-level lock baseline shared with duplicate guards, including preview trials.
+    initial_duplicate_snapshot: Option<std::sync::Arc<[u8]>>,
     /// Correction provenance from committed batches, pending validation against the final lock.
     committed_edge_rebinds: Vec<cooldown_core::EdgeRebind>,
     /// Packages whose only requirement is a manifest constraint with no lock entry (a build backend).
@@ -347,6 +356,8 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// copies of one package can converge on the same target while an advisory affects only one
     /// copy's current version, and only that copy's row is security-relevant.
     security_by_change: HashMap<ChangeProvenanceKey, crate::app::SecurityInfo>,
+    /// Older targets reuse the original planning evidence across isolation and replay trials.
+    fallback_changes: HashMap<ChangeProvenanceKey, Vec<Change>>,
     /// The advisory relevance of locked pins, keyed by `(name, version, registry)`, captured on
     /// every residual-gate pass ([`graph_violations`](Self::graph_violations)).
     ///
@@ -413,11 +424,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             lock_refreshed_by_apply: false,
             lock_edges_enforced: false,
             initial_edge_snapshot: None,
+            initial_duplicate_snapshot: None,
             committed_edge_rebinds: Vec::new(),
             manifest_only: HashSet::new(),
             excluded_members: Vec::new(),
             batch_item_offsets: Vec::new(),
             security_by_change: HashMap::new(),
+            fallback_changes: HashMap::new(),
             pin_security: HashMap::new(),
             pin_affected: HashMap::new(),
             last_gate_graph: Vec::new(),
@@ -458,7 +471,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             self.ctx.pctx.tool,
             self.ctx.pctx.rel_path.as_str(),
         ));
-        // The duplicate-copy gate lives in pnpm's whole-graph settlement; anywhere else the flag
+        // The duplicate-copy gate lives in Cargo and pnpm's settlement; elsewhere the flag
         // would be silently inert, so a run that asked for it is told, as a usage note a script
         // can see (the same shape `--lock` uses for an adapter without a refresh).
         if self.ctx.opts.fail_on_new_duplicate && !self.ctx.writer.guards_duplicate_copies() {
@@ -466,7 +479,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 Diagnostic::new(
                     DiagnosticKind::Config,
                     format!(
-                        "--fail-on-new-duplicate: {} has no duplicate-copy guard (only pnpm's whole-graph resolve judges the settled lock), so the flag has no effect here",
+                        "--fail-on-new-duplicate: {} has no duplicate-copy guard (Cargo and pnpm judge the settled lock), so the flag has no effect here",
                         self.ctx.pctx.tool.as_str()
                     ),
                 )
@@ -493,7 +506,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .lock_edge_snapshot(&self.ctx.pctx.project)
             .await
         {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => {
+                self.initial_duplicate_snapshot = snapshot.as_deref().map(std::sync::Arc::from);
+                snapshot
+            }
             Err(error) => {
                 self.record_project_error(&error, None);
                 return ProjectRunStatus::Terminated;
@@ -641,6 +657,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.fetch_advisories(Vec::new()).await;
             }
         }
+        self.initial_duplicate_snapshot = match self
+            .ctx
+            .writer
+            .lock_edge_snapshot(&self.ctx.pctx.project)
+            .await
+        {
+            Ok(snapshot) => snapshot.map(std::sync::Arc::from),
+            Err(err) => {
+                self.record_project_error(&err, None);
+                return;
+            }
+        };
         let Some(mut state) = self.initial_trial_state().await else {
             return;
         };
@@ -829,8 +857,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// Applies the lock batch, isolating candidates when the joint result violates cooldown policy.
     ///
-    /// The fast path is one trial of the complete batch: settled outcomes commit as-is. A policy
-    /// residual restores the fixed pre-lock baseline and — for more than one candidate —
+    /// The complete batch is tried first; fully landed outcomes commit as-is.
+    /// Resolver-held candidates enter bounded target fallback on top of the landed subset.
+    /// A policy residual restores the fixed pre-lock baseline and — for more than one candidate —
     /// partitions the batch to find a deterministic verified subset, which is then replayed jointly
     /// from that same baseline; only the replay commits.
     /// Errors abort recovery and restore the baseline: an infrastructure failure must surface as an
@@ -840,10 +869,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         lock_changes: Vec<Change>,
         state: &mut TrialState,
     ) -> MutationFlow {
-        let baseline_before_lock = state.clone();
         self.ctx
             .progress
             .candidates(&lock_changes, "checking upgrade policy");
+        let planned = lock_changes.clone();
+        let flow = self.run_lock_upgrade_trials(lock_changes, state).await;
+        // Fallback changes target versions, but progress owns the original planned keys.
+        self.ctx.progress.candidates_decided(&planned);
+        flow
+    }
+
+    async fn run_lock_upgrade_trials(
+        &mut self,
+        lock_changes: Vec<Change>,
+        state: &mut TrialState,
+    ) -> MutationFlow {
+        let baseline_before_lock = state.clone();
         let mut rollback = TrialRollback::default();
         let initial = self
             .try_upgrade_group(
@@ -855,10 +896,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await;
         match initial {
             UpgradeTrialResult::Settled(outcomes) => {
-                self.ctx.progress.candidates_decided(&lock_changes);
-                let flow = self.merge_batch_outcomes(outcomes);
-                self.collapse_collateral(&baseline_before_lock.baseline_violations);
-                return flow;
+                return self
+                    .finish_settled_upgrade_trial(
+                        lock_changes,
+                        outcomes,
+                        &baseline_before_lock,
+                        state,
+                        &mut rollback,
+                    )
+                    .await;
             }
             UpgradeTrialResult::Aborted(outcomes) => {
                 let outcome = self.settle_aborted_trial(
@@ -881,12 +927,34 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 ) {
                     return self.merge_batch_outcome(outcome);
                 }
-                // A singleton batch has nothing to isolate: the lone candidate is the culprit.
                 if lock_changes.len() == 1 {
-                    self.ctx.progress.candidates_decided(&lock_changes);
-                    self.record_unreconciled_skips(&lock_changes, &violations);
+                    let rejected = lock_changes
+                        .into_iter()
+                        .map(|change| RejectedUpgrade {
+                            change,
+                            residual: violations.clone(),
+                            skipped: None,
+                        })
+                        .collect();
+                    let selection = self
+                        .select_upgrade_fallbacks(
+                            Vec::new(),
+                            rejected,
+                            &baseline_before_lock,
+                            state,
+                            &mut rollback,
+                        )
+                        .await;
+                    let flow = self
+                        .commit_upgrade_selection(
+                            selection,
+                            &baseline_before_lock,
+                            state,
+                            &mut rollback,
+                        )
+                        .await;
                     self.collapse_collateral(&baseline_before_lock.baseline_violations);
-                    return ControlFlow::Continue(());
+                    return flow;
                 }
             }
         }
@@ -900,6 +968,52 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await;
         self.collapse_collateral(&baseline_before_lock.baseline_violations);
+        flow
+    }
+
+    async fn finish_settled_upgrade_trial(
+        &mut self,
+        lock_changes: Vec<Change>,
+        outcomes: Vec<BatchOutcome>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> MutationFlow {
+        let accepted = landed_upgrade_changes(&lock_changes, &outcomes, &self.last_gate_graph);
+        let held: Vec<_> = lock_changes
+            .iter()
+            .filter(|change| {
+                !accepted
+                    .iter()
+                    .any(|item| change_target_key(item) == change_target_key(change))
+            })
+            .cloned()
+            .collect();
+        if self.ctx.writer.supports_target_fallback() && !held.is_empty() {
+            let rejected = held
+                .into_iter()
+                .map(|change| RejectedUpgrade {
+                    skipped: held_upgrade_info(&change, &outcomes),
+                    change,
+                    residual: Vec::new(),
+                })
+                .collect();
+            let mut outcome = BatchOutcome::default();
+            if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                return self.merge_batch_outcome(outcome);
+            }
+            let selection = self
+                .select_upgrade_fallbacks(accepted, rejected, baseline, state, rollback)
+                .await;
+            let flow = self
+                .commit_upgrade_selection(selection, baseline, state, rollback)
+                .await;
+            self.collapse_collateral(&baseline.baseline_violations);
+            return flow;
+        }
+        self.ctx.progress.candidates_decided(&lock_changes);
+        let flow = self.merge_batch_outcomes(outcomes);
+        self.collapse_collateral(&baseline.baseline_violations);
         flow
     }
 
@@ -917,6 +1031,24 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let selection = self
             .select_safe_upgrade_changes(lock_changes, baseline, state, rollback)
             .await;
+        let selection = match selection {
+            UpgradeSelectionResult::Selected { accepted, rejected } => {
+                self.select_upgrade_fallbacks(accepted, rejected, baseline, state, rollback)
+                    .await
+            }
+            aborted @ UpgradeSelectionResult::Aborted { .. } => aborted,
+        };
+        self.commit_upgrade_selection(selection, baseline, state, rollback)
+            .await
+    }
+
+    async fn commit_upgrade_selection(
+        &mut self,
+        selection: UpgradeSelectionResult,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> MutationFlow {
         match selection {
             UpgradeSelectionResult::Selected { accepted, rejected } if accepted.is_empty() => {
                 self.record_rejected_upgrade_changes(rejected);
@@ -952,7 +1084,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
         let mut work = Vec::new();
-        push_upgrade_halves(&mut work, lock_changes);
+        if lock_changes.len() == 1 {
+            work.push(lock_changes);
+        } else {
+            push_upgrade_halves(&mut work, lock_changes);
+        }
         while let Some(group) = work.pop() {
             let mut trial_changes = accepted.clone();
             trial_changes.extend(group.iter().cloned());
@@ -965,12 +1101,54 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 )
                 .await;
             match result {
-                UpgradeTrialResult::Settled(_) => {
+                UpgradeTrialResult::Settled(outcomes) => {
+                    let mut trial = accepted.clone();
+                    trial.extend(group.iter().cloned());
+                    let landed = landed_upgrade_changes(&trial, &outcomes, &self.last_gate_graph);
+                    let preserves_accepted = accepted.iter().all(|change| {
+                        landed
+                            .iter()
+                            .any(|item| change_target_key(item) == change_target_key(change))
+                    });
+                    let held: Vec<_> = group
+                        .iter()
+                        .filter(|change| {
+                            !landed
+                                .iter()
+                                .any(|item| change_target_key(item) == change_target_key(change))
+                        })
+                        .cloned()
+                        .collect();
                     let mut outcome = BatchOutcome::default();
                     if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
                         return UpgradeSelectionResult::Aborted { outcome, rejected };
                     }
-                    accepted.extend(group);
+                    if !preserves_accepted {
+                        if group.len() > 1 {
+                            push_upgrade_halves(&mut work, group);
+                        } else {
+                            rejected.extend(group.into_iter().map(|change| RejectedUpgrade {
+                                skipped: held_upgrade_info(&change, &outcomes),
+                                change,
+                                residual: Vec::new(),
+                            }));
+                        }
+                        continue;
+                    }
+                    for change in group {
+                        if held
+                            .iter()
+                            .any(|item| change_target_key(item) == change_target_key(&change))
+                        {
+                            rejected.push(RejectedUpgrade {
+                                skipped: held_upgrade_info(&change, &outcomes),
+                                change,
+                                residual: Vec::new(),
+                            });
+                        } else {
+                            accepted.push(change);
+                        }
+                    }
                 }
                 UpgradeTrialResult::PolicyBlocked(violations) => {
                     let mut outcome = BatchOutcome::default();
@@ -984,6 +1162,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         rejected.extend(group.into_iter().map(|change| RejectedUpgrade {
                             change,
                             residual: violations.clone(),
+                            skipped: None,
                         }));
                     }
                 }
@@ -1001,8 +1180,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// outcomes reach the report and the committed lock.
     ///
     /// The accepted set's final composition always equals the last settled selection trial, so the
-    /// replay normally settles too. A replay that still blocks (the registry moved between trials)
-    /// fails closed: the baseline is restored and the accepted candidates report as held rather
+    /// replay normally settles too. A replay that blocks or loses an accepted target (the registry
+    /// moved between trials) fails closed: the baseline is restored and the accepted candidates report as held rather
     /// than committing a lock no trial verified.
     async fn replay_selected_upgrade_changes(
         &mut self,
@@ -1025,6 +1204,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             UpgradeTrialResult::Settled(outcomes) => {
+                let landed = landed_upgrade_changes(&accepted, &outcomes, &self.last_gate_graph);
+                if landed.len() != accepted.len() {
+                    let mut outcome = BatchOutcome::default();
+                    if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                        return self.merge_batch_outcome(outcome);
+                    }
+                    self.ctx.progress.candidates_decided(&accepted);
+                    let mut held = rejected;
+                    held.extend(accepted.into_iter().map(|change| RejectedUpgrade {
+                        skipped: held_upgrade_info(&change, &outcomes),
+                        change,
+                        residual: Vec::new(),
+                    }));
+                    self.record_rejected_upgrade_changes(held);
+                    return ControlFlow::Continue(());
+                }
                 self.ctx.progress.candidates_decided(&accepted);
                 if let ControlFlow::Break(conflict) = self.merge_batch_outcomes(outcomes) {
                     return ControlFlow::Break(conflict);
@@ -1069,6 +1264,146 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> UpgradeTrialResult {
+        self.try_upgrade_group_once(changes, policy_baseline, state, rollback)
+            .await
+    }
+
+    async fn select_upgrade_fallbacks(
+        &mut self,
+        mut accepted: Vec<Change>,
+        mut rejected: Vec<RejectedUpgrade>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> UpgradeSelectionResult {
+        if !self.ctx.writer.supports_target_fallback() || rejected.is_empty() {
+            return UpgradeSelectionResult::Selected { accepted, rejected };
+        }
+        let candidates = match self
+            .fallback_candidates(rejected.iter().map(|item| item.change.clone()).collect())
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                let mut outcome = BatchOutcome::default();
+                outcome.errors.push(error);
+                return UpgradeSelectionResult::Aborted { outcome, rejected };
+            }
+        };
+        // Retry only rejected candidates. Joint substitutions preserve coupled exact families;
+        // individual substitutions salvage independent candidates if the joint family cannot land.
+        // The budget excludes initial isolation and the final replay: at most 3 + 3 * |R| trials.
+        for individual in std::iter::once(None).chain(
+            (candidates.len() > 1)
+                .then_some(0..candidates.len())
+                .into_iter()
+                .flatten()
+                .map(Some),
+        ) {
+            let required = accepted.clone();
+            let mut best = accepted.clone();
+            for attempt in 0..3 {
+                let mut retry = required.clone();
+                let mut has_alternative = false;
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if individual.is_some_and(|selected| selected != index)
+                        || accepted
+                            .iter()
+                            .any(|change| same_upgrade_candidate(change, &candidate.original))
+                    {
+                        continue;
+                    }
+                    let alternative = candidate.alternatives.get(attempt);
+                    has_alternative |= alternative.is_some();
+                    retry.push(alternative.unwrap_or(&candidate.original).clone());
+                }
+                if !has_alternative {
+                    continue;
+                }
+                let result = self
+                    .try_upgrade_group_once(
+                        retry.clone(),
+                        &baseline.baseline_violations,
+                        state,
+                        rollback,
+                    )
+                    .await;
+                match result {
+                    UpgradeTrialResult::Settled(outcomes) => {
+                        let landed =
+                            landed_upgrade_changes(&retry, &outcomes, &self.last_gate_graph);
+                        // Score the entire landed batch and never exchange an accepted target
+                        // for a lower candidate, even when the resolver reports a safe subset.
+                        if required.iter().all(|change| {
+                            landed
+                                .iter()
+                                .any(|item| change_target_key(item) == change_target_key(change))
+                        }) && landed.len() > best.len()
+                        {
+                            best = landed;
+                        }
+                    }
+                    UpgradeTrialResult::PolicyBlocked(_) => {}
+                    UpgradeTrialResult::Aborted(outcomes) => {
+                        let outcome =
+                            self.settle_aborted_trial(rollback, baseline, state, outcomes);
+                        return UpgradeSelectionResult::Aborted { outcome, rejected };
+                    }
+                }
+                let mut outcome = BatchOutcome::default();
+                if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                    return UpgradeSelectionResult::Aborted { outcome, rejected };
+                }
+                if best.len()
+                    == required.len()
+                        + if individual.is_some() {
+                            1
+                        } else {
+                            candidates.len()
+                        }
+                {
+                    break;
+                }
+            }
+            accepted = best;
+            rejected.retain(|item| {
+                !accepted
+                    .iter()
+                    .any(|change| same_upgrade_candidate(change, &item.change))
+            });
+            if rejected.is_empty() {
+                break;
+            }
+        }
+        UpgradeSelectionResult::Selected { accepted, rejected }
+    }
+
+    async fn fallback_candidates(
+        &mut self,
+        changes: Vec<Change>,
+    ) -> Result<Vec<UpgradeFallback>, Diagnostic> {
+        let mut candidates = Vec::new();
+        for change in changes {
+            let alternatives = self
+                .upgrade_fallbacks(&change)
+                .await
+                .map_err(|err| self.project_diag(&err, Some(&change.package.name)))?;
+            candidates.push(UpgradeFallback {
+                original: change,
+                alternatives,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Runs a candidate landing and its transitive remediation before rejecting the graph.
+    async fn try_upgrade_group_once(
+        &mut self,
+        changes: Vec<Change>,
+        policy_baseline: &HashSet<BaselineViolation>,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
         let lock_outcome = self
             .apply_batch_with_rollback(changes, state, Some(rollback), HashMap::new())
@@ -1099,13 +1434,91 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if self.transitive_mode() != TransitiveGate::Enforce {
             return UpgradeTrialResult::Settled(pending);
         }
-        // A pre-existing dirty package may move between fresh versions, but an additional fresh
-        // version line for that package is still a new residual.
+        // Baselines acknowledge exact pins; replacing one fresh pin with another still introduces
+        // a violation, even if the number of violating copies does not grow.
         let residual = newly_introduced_violations(policy_baseline, &state.baseline_violations);
         if residual.is_empty() {
             return UpgradeTrialResult::Settled(pending);
         }
         UpgradeTrialResult::PolicyBlocked(residual)
+    }
+
+    async fn upgrade_fallbacks(&mut self, change: &Change) -> cooldown_core::Result<Vec<Change>> {
+        let key = change_provenance_key(change);
+        if let Some(alternatives) = self.fallback_changes.get(&key) {
+            return Ok(alternatives.clone());
+        }
+        // Policy previews supply preselected targets without calling the forward planner.
+        // Reconstruct their alternatives only after restoration, using the same advisory snapshot.
+        let deps = self.read_reconcile_deps().await?;
+        let Some(dep) = deps
+            .into_iter()
+            .find(|dep| dep.package == change.package && dep.current == change.from)
+        else {
+            return Ok(Vec::new());
+        };
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                self.ctx.reader,
+                vec![dep.clone()],
+                &fctx,
+                self.ctx.opts.candidate_scope(),
+                self.ctx.progress,
+                self.ctx.opts.fanout(),
+            )
+            .await;
+        let Some(fetched) = fetched.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let releases = fetched.result?;
+        let advisories = self.advisories.clone();
+        let advised = advisories
+            .as_ref()
+            .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
+        let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+        let rctx = ResolveContext {
+            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
+            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
+        };
+        let verdict = evaluate_advised(
+            &dep,
+            &releases,
+            advisory_ctx.as_ref(),
+            &self.ctx.pctx.policy.layers,
+            &dep_resolve_ctx(&rctx, &dep),
+            self.ws.now(),
+        );
+        self.remember_upgrade_fallbacks(change, &releases, &verdict);
+        Ok(self.fallback_changes.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn remember_upgrade_fallbacks(
+        &mut self,
+        change: &Change,
+        releases: &[Release],
+        verdict: &cooldown_core::Verdict,
+    ) {
+        let alternatives = lower_adoptable_targets(releases, verdict, &change.to)
+            .into_iter()
+            .map(|candidate| {
+                let alternative = Change {
+                    to: candidate.version.clone(),
+                    kind: candidate.kind,
+                    ..change.clone()
+                };
+                if let Some(relevance) = &candidate.security {
+                    self.security_by_change.insert(
+                        change_provenance_key(&alternative),
+                        crate::app::workspace::security_info(relevance, &alternative.to),
+                    );
+                }
+                alternative
+            })
+            .collect();
+        self.fallback_changes
+            .insert(change_provenance_key(change), alternatives);
     }
 
     /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
@@ -1194,7 +1607,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     fn record_rejected_upgrade_changes(&mut self, rejected: Vec<RejectedUpgrade>) {
+        self.acc.strict_incomplete |= !rejected.is_empty();
         for rejected_upgrade in rejected {
+            if rejected_upgrade.residual.is_empty() {
+                self.record_change_skip(
+                    &rejected_upgrade.change,
+                    Some(rejected_upgrade.skipped.unwrap_or_else(|| SkippedInfo {
+                        reason: SkipReason::ResolverConflict,
+                        message: SkipReason::ResolverConflict.message().to_string(),
+                        offending: None,
+                    })),
+                );
+                continue;
+            }
             self.record_unreconciled_skips(
                 std::slice::from_ref(&rejected_upgrade.change),
                 &rejected_upgrade.residual,
@@ -1389,7 +1814,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             if verdict.status == cooldown_core::Status::Held {
                 continue;
             }
-            let Some(target) = verdict.adoptable_target else {
+            let Some(target) = verdict.adoptable_target.clone() else {
                 continue;
             };
             if target == dep.current {
@@ -1426,6 +1851,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.security_by_change
                     .insert(change_provenance_key(&change), security);
             }
+            self.remember_upgrade_fallbacks(&change, &releases, &verdict);
             planned.push(change);
         }
         sort_planned_changes(&mut planned);
@@ -2092,6 +2518,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 names: self.ctx.pctx.single_copy.iter().cloned().collect(),
                 every_name: self.ctx.opts.fail_on_new_duplicate,
             },
+            initial_lock_snapshot: self
+                .initial_duplicate_snapshot
+                .as_ref()
+                .map(std::sync::Arc::clone),
         }
     }
 
@@ -3006,6 +3436,70 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let item = self.change_skip_item(change, skipped);
         self.acc.items.push(item);
     }
+}
+
+fn held_upgrade_info(change: &Change, outcomes: &[BatchOutcome]) -> Option<SkippedInfo> {
+    outcomes
+        .iter()
+        .flat_map(|outcome| &outcome.items)
+        .find_map(|item| {
+            if !item.applied
+                && item.edge.is_none()
+                && item.from == change.from.as_str()
+                && change_target_key_parts(
+                    &item.name,
+                    item.registry.as_deref(),
+                    &item.to,
+                    item.direct,
+                    &item.members,
+                ) == change_target_key(change)
+            {
+                item.skipped.clone()
+            } else {
+                None
+            }
+        })
+}
+
+fn same_upgrade_candidate(change: &Change, original: &Change) -> bool {
+    change.package == original.package
+        && change.from == original.from
+        && change.direct == original.direct
+        && change.members == original.members
+}
+
+fn landed_upgrade_changes(
+    changes: &[Change],
+    outcomes: &[BatchOutcome],
+    graph: &[Dependency],
+) -> Vec<Change> {
+    if !outcomes.iter().any(BatchOutcome::is_committed) {
+        return Vec::new();
+    }
+    changes
+        .iter()
+        .filter(|change| {
+            target_reached(graph, change)
+                && outcomes
+                    .iter()
+                    .filter(|outcome| outcome.is_committed())
+                    .any(|outcome| {
+                        outcome.items.iter().any(|item| {
+                            item.applied
+                                && item.edge.is_none()
+                                && item.from == change.from.as_str()
+                                && change_target_key_parts(
+                                    &item.name,
+                                    item.registry.as_deref(),
+                                    &item.to,
+                                    item.direct,
+                                    &item.members,
+                                ) == change_target_key(change)
+                        })
+                    })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Splits `changes` in two and pushes the halves so the left half is processed first (LIFO).

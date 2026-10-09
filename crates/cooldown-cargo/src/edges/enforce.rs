@@ -9,7 +9,7 @@ use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
 use crate::index::CRATES_IO;
 use crate::lockfile::CargoLock;
 use cooldown_core::{
-    EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
+    ApplyObserver, EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,6 +52,7 @@ pub(crate) async fn enforce(
     before: Option<&CargoLock>,
     graph: Option<ResolvedGraph>,
     generated: &[super::LockPackageId],
+    observer: Option<&dyn ApplyObserver>,
 ) -> Result<EnforcementResult> {
     let lock_path = project.root.join("Cargo.lock");
     let resolver_text = std::fs::read_to_string(&lock_path)?;
@@ -77,8 +78,15 @@ pub(crate) async fn enforce(
         }
     };
     let mut guarded = guard_rewrites(&resolver_view, proposed);
-    let application =
-        apply_rewrites(cargo, project, &lock_path, &resolver_text, &mut guarded).await?;
+    let application = apply_rewrites(
+        cargo,
+        project,
+        &lock_path,
+        &resolver_text,
+        &mut guarded,
+        observer,
+    )
+    .await?;
     let committed = application.committed;
 
     let (corrected, final_text, verified_graph) = match committed {

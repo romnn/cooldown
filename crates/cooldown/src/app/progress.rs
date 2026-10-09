@@ -528,13 +528,16 @@ impl ProjectProgress {
         }
     }
 
-    fn resolver_operation(&self, change: &Change) {
+    fn resolver_operation(&self, change: Option<&Change>) {
         let Some(inner) = &self.inner else {
             return;
         };
         let mut tracker = lock(&inner.tracker);
         tracker.candidates.begin_resolver_operation();
-        let detail = format!("{} {} → {}", change.package.name, change.from, change.to);
+        let detail = change.map_or_else(
+            || "resolving dependency graph".to_string(),
+            |change| format!("{} {} → {}", change.package.name, change.from, change.to),
+        );
         let message = tracker.candidates.status(&detail);
         match &inner.rows {
             Some(rows) => rows.candidates().set_message(message),
@@ -596,11 +599,22 @@ impl ProjectProgress {
             )),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn decided_candidates(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| lock(&inner.tracker).candidates.decided.len())
+    }
 }
 
 impl cooldown_core::ApplyObserver for ProjectProgress {
-    fn candidate_started(&self, change: &Change) {
+    fn resolver_started(&self, change: Option<&Change>) {
         self.resolver_operation(change);
+    }
+
+    fn candidate_started(&self, change: &Change) {
+        self.resolver_operation(Some(change));
     }
 }
 
@@ -857,6 +871,23 @@ mod tests {
         assert_eq!(
             candidate_summary(&project, ""),
             "1/2 decided · policy pass 1 · resolver op 2"
+        );
+    }
+
+    #[test]
+    fn graph_only_resolve_counts_without_starting_a_completed_candidate() {
+        let progress = Progress::plain();
+        let project = progress.project(CARGO, ".");
+        let change = member_change("completed");
+        project.candidates(std::slice::from_ref(&change), "checking");
+        project.candidates_decided(std::slice::from_ref(&change));
+
+        cooldown_core::ApplyObserver::resolver_started(&project, None);
+
+        assert_eq!(decided_candidates(&project), 1);
+        assert_eq!(
+            candidate_summary(&project, ""),
+            "1/1 decided · resolver op 1"
         );
     }
 

@@ -347,10 +347,9 @@ pub(in crate::cli) struct MutationArgs {
     /// Fail (exit 1) if the mutation cannot complete cleanly.
     #[arg(long)]
     pub(in crate::cli) strict: bool,
-    /// Refuse a resolve that gives any package a second resolved copy (pnpm): the candidate whose
-    /// landing added the copy is held with the copy named and the lock restored, instead of the
-    /// copy being committed with a `duplicate_copy` warning. `[tool.pnpm] single-copy` gates
-    /// named packages the same way without this flag.
+    /// Refuse a resolve that increases any package's resolved copy count (Cargo and pnpm): the
+    /// candidate whose landing added the copy is held with the versions named and the lock restored.
+    /// `[tool.pnpm] single-copy` gates named packages the same way without this flag.
     #[arg(long = "fail-on-new-duplicate")]
     pub(in crate::cli) fail_on_new_duplicate: bool,
 }
