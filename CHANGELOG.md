@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.24
+
 - **Cargo retries reuse rejections for identical resolution inputs within a run.** Tentative
   widens, individual precise pins, and failed seeds skip Cargo when the complete manifest, lock,
   follower, and Cargo configuration bytes match a restored resolver rejection. Keys include the
