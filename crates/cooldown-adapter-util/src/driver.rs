@@ -43,6 +43,60 @@ pub fn resolve_program(program: &str) -> PathBuf {
     program_on_path(program).unwrap_or_else(|| PathBuf::from(program))
 }
 
+/// Runs `command` to completion and collects its output, as [`Command::output`] does, under
+/// cooperative interruption.
+///
+/// Standard input is closed and both output streams are captured.
+/// A closed input matters: a package manager that sees a terminal there may stop at an
+/// interactive prompt (pnpm asks before adding to `minimumReleaseAgeExclude`) that nobody sees,
+/// because its output is captured, and so wait forever.
+///
+/// On Unix the child leads its own process group, registered with [`cooldown_core::interrupt`],
+/// so a signal to cooldown terminates it with every descendant.
+/// The child is also killed if the returned future is dropped.
+/// A spawn after the run was interrupted is refused, and a child that finishes once the run was
+/// interrupted reports the interruption whatever its status: a resolver that exited early on the
+/// signal neither counts as a candidate conflict nor hands back a partial result as success.
+/// `invocation` renders the command line for the spawn error.
+///
+/// # Errors
+///
+/// Returns [`cooldown_core::interrupt::interrupted`] once the run is interrupted, or
+/// [`CoreError::ToolSpawn`] if the process cannot be started or waited for.
+/// A non-zero exit is not an error here; callers inspect the returned status.
+pub async fn supervised_output(
+    command: &mut Command,
+    tool: &str,
+    invocation: impl FnOnce() -> String,
+) -> Result<std::process::Output> {
+    let activity = || format!("running `{tool}`");
+    cooldown_core::interrupt::ensure_not_requested(&activity())?;
+    #[cfg(unix)]
+    command.process_group(0);
+    let spawn_error = |error: std::io::Error| CoreError::ToolSpawn {
+        tool: tool.to_string(),
+        detail: format!("`{}`: {error}", invocation()),
+    };
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(spawn_error)?;
+    let registration = child.id().map(cooldown_core::interrupt::register_child);
+    let waited = child.wait_with_output().await;
+    drop(registration);
+    let output = waited.map_err(|error| CoreError::ToolSpawn {
+        tool: tool.to_string(),
+        detail: format!("waiting for `{tool}`: {error}"),
+    })?;
+    if cooldown_core::interrupt::requested() {
+        return Err(cooldown_core::interrupt::interrupted(&activity()));
+    }
+    Ok(output)
+}
+
 fn find_exact(program: &OsStr, search_path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(search_path).find_map(|dir| {
         let candidate = dir.join(program);
@@ -139,15 +193,14 @@ impl Driver {
         // `--log-level trace` documents itself as covering subprocess argv; this is the one spawn
         // point every adapter driver funnels through, so the promise is kept here.
         tracing::trace!(tool = %self.bin, %dir, args = %args.join(" "), "spawning subprocess");
-        let out = Command::new(resolve_program(&self.bin))
-            .args(args)
-            .current_dir(dir.as_std_path())
-            .output()
-            .await
-            .map_err(|e| CoreError::ToolSpawn {
-                tool: self.bin.clone(),
-                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            })?;
+        let out = supervised_output(
+            Command::new(resolve_program(&self.bin))
+                .args(args)
+                .current_dir(dir.as_std_path()),
+            &self.bin,
+            || format!("{} {}", self.bin, args.join(" ")),
+        )
+        .await?;
         if !out.status.success() {
             tracing::debug!(
                 tool = %self.bin,

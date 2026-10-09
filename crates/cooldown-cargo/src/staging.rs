@@ -71,6 +71,7 @@ impl IsolatedMutation for CargoMutationStage {
     }
 
     async fn publish(&self, accepted: &AcceptedProjectState) -> Result<AcceptedPublication> {
+        cooldown_core::interrupt::ensure_not_requested("publishing the staged Cargo project")?;
         let recovery_authority = self.recovery_authority.as_ref().ok_or_else(|| {
             CoreError::LockUnreadable(format!(
                 "recoverable Cargo publication is unavailable for {}; recovery requires a Git worktree on a platform where cooldown can verify owner-private authority",

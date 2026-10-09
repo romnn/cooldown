@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **An interrupted run rolls back instead of leaving its trial state behind.** A signal killed
+  cooldown wherever it was, so `Ctrl-C` during a pnpm `upgrade` left the temporary resolver
+  overrides in `pnpm-workspace.yaml` (re-quoted, with the block's comments gone), and any in-place
+  trial left its half-applied manifests and lock. The first `SIGINT`, `SIGTERM`, or `SIGHUP` now
+  stops the package manager cooldown is running together with its descendants (killing them after
+  10 seconds if they ignore the request), refuses to start another or to accept, publish, or sync a
+  result, and lets the run unwind through its normal rollback before exiting `130`. A second signal
+  quits immediately.
+
+- **pnpm no longer hangs on an invisible prompt.** Run from a terminal, cooldown handed pnpm the
+  terminal as its input while capturing its output, so when pnpm 11 asked whether to add an
+  immature version to `minimumReleaseAgeExclude`, the question never appeared and the run waited
+  forever. Package managers now run with no input, so pnpm fails the step instead of asking, which
+  cooldown already handles.
+
 ## v0.0.23
 
 - **`include-hidden` scans named dot-directories.** Detection skips every directory whose name

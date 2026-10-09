@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `cargo` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_adapter_util::resolve_program;
+use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
     CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ToolTermination,
     VerifyReport, failure_detail,
@@ -1319,15 +1319,14 @@ impl Cargo {
     ) -> Result<std::process::Output, CoreError> {
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn cargo");
         let started = std::time::Instant::now();
-        let result = Command::new(resolve_program(&self.bin))
-            .args(args)
-            .current_dir(dir.as_std_path())
-            .output()
-            .await
-            .map_err(|e| CoreError::ToolSpawn {
-                tool: self.bin.clone(),
-                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            });
+        let result = supervised_output(
+            Command::new(resolve_program(&self.bin))
+                .args(args)
+                .current_dir(dir.as_std_path()),
+            &self.bin,
+            || format!("{} {}", self.bin, args.join(" ")),
+        )
+        .await;
         tracing::debug!(
             bin = self.bin,
             args = ?args,

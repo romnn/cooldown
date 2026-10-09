@@ -131,6 +131,7 @@ min-age = "14d"
 | 2    | usage / config error (bad duration, unknown `--tool`, mutually-exclusive flags, …)   |
 | 3    | no tool detected                                                                |
 | 4    | stale/absent lock, registry unreachable, a tool failed, or unknown-age under a flag  |
+| 130  | interrupted by a signal (`SIGINT`, `SIGTERM`, `SIGHUP`)                              |
 
 ## Configuration
 

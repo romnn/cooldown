@@ -39,7 +39,7 @@ cooldown-conda.workspace = true
 cooldown-swift.workspace = true
 async-trait.workspace = true
 clap.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 color-eyre.workspace = true
 camino.workspace = true
 jiff.workspace = true

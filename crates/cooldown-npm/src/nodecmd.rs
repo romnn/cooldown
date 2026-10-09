@@ -3,7 +3,7 @@
 //! drivers merely re-pin a dependency and (optionally) install the resolved graph.
 
 use camino::Utf8Path;
-use cooldown_adapter_util::resolve_program;
+use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
     CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, VerifyReport, failure_detail,
 };
@@ -37,15 +37,14 @@ impl NodeCmd {
     }
 
     async fn output(&self, dir: &Utf8Path, args: &[String]) -> Result<std::process::Output> {
-        Command::new(resolve_program(&self.bin))
-            .args(args)
-            .current_dir(dir.as_std_path())
-            .output()
-            .await
-            .map_err(|e| CoreError::ToolSpawn {
-                tool: self.bin.clone(),
-                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            })
+        supervised_output(
+            Command::new(resolve_program(&self.bin))
+                .args(args)
+                .current_dir(dir.as_std_path()),
+            &self.bin,
+            || format!("{} {}", self.bin, args.join(" ")),
+        )
+        .await
     }
 
     async fn checked_output(

@@ -11,6 +11,7 @@ pub mod duration;
 pub mod error;
 pub mod evaluate;
 pub mod fs;
+pub mod interrupt;
 pub mod model;
 pub mod mutation;
 pub mod policy;

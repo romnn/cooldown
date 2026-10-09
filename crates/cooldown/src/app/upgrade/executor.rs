@@ -2042,15 +2042,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         }
 
-        let Some(committed) = self
+        let verified = self
             .verify_batch_graph(
                 &mut outcome,
                 &changes,
                 &report.applied,
                 &state.baseline_violations,
             )
-            .await
-        else {
+            .await;
+        let Some(committed) = verified.filter(|_| !self.record_interruption(&mut outcome)) else {
             self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             return outcome;
         };
@@ -2619,6 +2619,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .then_with(|| a.current.to_string().cmp(&b.current.to_string()))
         });
         Ok(deps)
+    }
+
+    /// Records a pending interruption as the batch's error, so the trial rolls back instead of
+    /// being accepted; `true` when one was pending.
+    ///
+    /// Steps that do not spawn a process (a manifest-only rewrite, the registry checks of the graph
+    /// gate) never see the interruption, so it is honoured here, while the trial can still roll
+    /// back.
+    fn record_interruption(&self, outcome: &mut BatchOutcome) -> bool {
+        match cooldown_core::interrupt::ensure_not_requested("accepting the batch") {
+            Ok(()) => false,
+            Err(error) => {
+                outcome.errors.push(self.project_diag(&error, None));
+                true
+            }
+        }
     }
 
     fn restore_journal_into_outcome(

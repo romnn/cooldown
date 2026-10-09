@@ -119,3 +119,4 @@ A `COOLDOWN_*` environment layer also feeds config values; it sits above the fil
 | `2` | Usage / config error (bad duration, unknown `--tool`, mutually-exclusive flags, …). |
 | `3` | No tool detected. |
 | `4` | Stale/absent lock, registry unreachable, a tool failed, or unknown-age under a flag. |
+| `130` | Interrupted by a signal (`SIGINT`, `SIGTERM`, `SIGHUP`). The first signal stops the package manager and rolls back the trial in progress; a second quits at once, without finishing the rollback. |

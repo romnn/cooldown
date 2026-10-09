@@ -316,9 +316,14 @@ impl Workspace {
             match acquire_sync_access(writer, pctx, &self.lease_family(pctx), opts.dry_run).await {
                 Ok(access) => {
                     warnings.extend(access.recovery);
-                    writer
-                        .write_native(&pctx.project, &policy, opts.dry_run)
-                        .await
+                    match cooldown_core::interrupt::ensure_not_requested("writing native config") {
+                        Ok(()) => {
+                            writer
+                                .write_native(&pctx.project, &policy, opts.dry_run)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 Err(error) => Err(error),
             };

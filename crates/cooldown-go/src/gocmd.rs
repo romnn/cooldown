@@ -2,7 +2,7 @@
 //! never as the source of cooldown policy.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_adapter_util::resolve_program;
+use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use std::collections::HashMap;
 use tokio::process::Command;
@@ -177,7 +177,8 @@ impl Go {
     ) -> Result<std::process::Output, CoreError> {
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn go");
         let started = std::time::Instant::now();
-        let result = Command::new(resolve_program(&self.bin))
+        let mut command = Command::new(resolve_program(&self.bin));
+        command
             .args(args)
             // Neutralize an ambient GOFLAGS for cooldown's own invocations. Repos commonly set
             // `GOFLAGS=-mod=mod` (via .env, a dotenv loaded by their task runner, or `go env -w`),
@@ -187,13 +188,11 @@ impl Go {
             // `-mod=mod` against a throwaway copy), so clearing the inherited value keeps reads
             // read-only and leaves the project's go.mod/go.sum untouched.
             .env_remove("GOFLAGS")
-            .current_dir(dir.as_std_path())
-            .output()
-            .await
-            .map_err(|e| CoreError::ToolSpawn {
-                tool: self.bin.clone(),
-                detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
-            });
+            .current_dir(dir.as_std_path());
+        let result = supervised_output(&mut command, &self.bin, || {
+            format!("{} {}", self.bin, args.join(" "))
+        })
+        .await;
         tracing::debug!(
             bin = self.bin,
             args = ?args,

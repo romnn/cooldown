@@ -1,7 +1,7 @@
 //! Thin wrappers around the project's own `uv` binary (resolution/apply engine only).
 
 use camino::Utf8Path;
-use cooldown_adapter_util::resolve_program;
+use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use tokio::process::Command;
 
@@ -69,10 +69,10 @@ impl Uv {
             Some(cutoff) => command.env("UV_EXCLUDE_NEWER", cutoff),
             None => command.env_remove("UV_EXCLUDE_NEWER"),
         };
-        command.output().await.map_err(|e| CoreError::ToolSpawn {
-            tool: self.bin.clone(),
-            detail: format!("`{} {}`: {e}", self.bin, args.join(" ")),
+        supervised_output(&mut command, &self.bin, || {
+            format!("{} {}", self.bin, args.join(" "))
         })
+        .await
     }
 
     async fn run(

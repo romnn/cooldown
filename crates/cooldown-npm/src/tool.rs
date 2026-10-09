@@ -4177,6 +4177,114 @@ packages:
         Ok(())
     }
 
+    /// An interruption while pnpm resolves under the temporary overrides stops the resolver and
+    /// restores the user's `pnpm-workspace.yaml` byte for byte, comments included, instead of
+    /// leaving the merged pins behind.
+    ///
+    /// The interruption flag is process-global; nextest runs every test in its own process, so it
+    /// cannot leak into another test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_override_resolve_restores_the_workspace_config() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let script = write_floated_lock_fixture(&root)?;
+        let workspace = indoc! {"
+            # Exact pins the codegen toolchain needs.
+            overrides:
+              # Keep the generated code and its runtime in lockstep.
+              pinned: 1.0.0
+        "};
+        std::fs::write(root.join("pnpm-workspace.yaml"), workspace)?;
+        // The resolution-only install announces itself and then blocks, as a hung resolver does,
+        // until the interruption terminates it.
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                case "$*" in
+                  *"config get"*)
+                    echo 'null'; exit 0 ;;
+                  *" update "*)
+                    cp floated.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"--resolution-only"*)
+                    touch resolving
+                    exec sleep 60 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let mut planned = change("dep", "1.0.0", "1.1.0");
+        planned.members = vec![cooldown_core::MemberRef {
+            name: "app".to_string(),
+            path: ".".to_string(),
+        }];
+        let plan = Plan {
+            changes: vec![planned],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+        let evidence =
+            PeerEvidence::gather::<Pnpm>(Some(&root), journaled_lock::<Pnpm>(&journal), &plan);
+        let apply = tool.apply_whole_graph(&project, &plan, &journal, &evidence);
+        tokio::pin!(apply);
+
+        // Interrupt only once the temporary overrides are on disk and the resolver is running.
+        let interrupted = async {
+            while !root.join("resolving").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let merged = std::fs::read_to_string(root.join("pnpm-workspace.yaml"))?;
+            assert!(
+                merged.contains("dep@^1.0.0"),
+                "the resolver runs under the temporary pins: {merged}"
+            );
+            cooldown_core::interrupt::request();
+            eyre::Ok(())
+        };
+        let (result, signalled) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(&mut apply, interrupted)
+        })
+        .await?;
+        signalled?;
+
+        // The run fails as interrupted rather than as a resolver conflict on the candidate.
+        let Err(error) = result else {
+            eyre::bail!("an interrupted resolve must fail the apply");
+        };
+        assert!(
+            error.to_string().contains("interrupted"),
+            "the failure names the interruption: {error}"
+        );
+        assert!(
+            error.is_local_environment_failure(),
+            "resilient apply must propagate it, not isolate a candidate"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-workspace.yaml"))?,
+            workspace,
+            "the user's overrides block is restored with its comments"
+        );
+        Ok(())
+    }
+
     /// The whole-graph report diff fails the batch when the resolve exits 0 but leaves a present,
     /// unparsable lock: the strict parse error propagates instead of diffing every candidate as
     /// held against an empty version map — the healthy-looking failure the fail-closed parse

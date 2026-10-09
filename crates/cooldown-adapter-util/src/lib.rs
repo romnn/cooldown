@@ -2,7 +2,7 @@
 //! resolver/apply outcomes.
 
 mod driver;
-pub use driver::{Driver, program_on_path, resolve_program};
+pub use driver::{Driver, program_on_path, resolve_program, supervised_output};
 
 use camino::Utf8Path;
 use cooldown_core::{
