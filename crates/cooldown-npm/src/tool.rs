@@ -12,7 +12,8 @@ use crate::apply::landing::{
 use crate::lock::{EffectiveRegistryQuery, MemberIndex, NameVersion, NodeLock};
 use crate::manifest;
 use crate::native::{
-    ConfigStringList, set_yaml_block_list, set_yaml_scalar, set_yaml_string_map, window_minutes,
+    ConfigStringList, NativeAge, exact_exclusion, minimum_age_exclusions, set_yaml_block_list,
+    set_yaml_scalar, set_yaml_string_map, window_minutes,
 };
 use crate::nodecmd::NodeCmd;
 use crate::peers::{
@@ -129,6 +130,9 @@ pub struct NpmTool<L> {
     effective_registry: tokio::sync::Mutex<
         std::collections::HashMap<Utf8PathBuf, Option<crate::npmrc::RegistryOverrides>>,
     >,
+    /// Publish times already trusted during planning, reused by native exemption persistence.
+    publish_times:
+        tokio::sync::Mutex<HashMap<PackageId, HashMap<Version, Option<jiff::Timestamp>>>>,
     _lock: PhantomData<fn() -> L>,
 }
 
@@ -140,6 +144,7 @@ impl<L: NodeLock> NpmTool<L> {
             registry,
             cmd: NodeCmd::new(L::BIN),
             effective_registry: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            publish_times: tokio::sync::Mutex::new(HashMap::new()),
             _lock: PhantomData,
         }
     }
@@ -527,6 +532,17 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
         _candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
         let packument = self.registry.packument(&dep.package).await?;
+        self.publish_times
+            .lock()
+            .await
+            .entry(dep.package.clone())
+            .or_default()
+            .extend(
+                packument
+                    .releases
+                    .iter()
+                    .map(|release| (release.version.clone(), release.published_at)),
+            );
         Ok(build_releases(
             dep.current.as_str(),
             packument.releases,
@@ -548,6 +564,12 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
             .registry
             .published_at(&dep.package, &dep.current, &[])
             .await?;
+        self.publish_times
+            .lock()
+            .await
+            .entry(dep.package.clone())
+            .or_default()
+            .insert(dep.current.clone(), time);
         Ok(Release {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
@@ -1995,6 +2017,15 @@ impl<L: NodeLock> NpmTool<L> {
         if !transitive.is_empty() {
             self.resolve_with_temporary_overrides(project, plan, transitive, window_minutes)
                 .await?;
+        } else if !inputs.exact_pins.is_empty() {
+            // An exact direct update can land below the native age floor without taking the
+            // repair leg; its plain frozen install still needs the same persisted permission.
+            self.persist_minimum_age_exclusions(
+                project,
+                &minimum_age_repair_versions(plan),
+                plan.evaluated_at,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2128,6 +2159,7 @@ impl<L: NodeLock> NpmTool<L> {
             .configured_value::<ConfigStringList>(project, "minimumReleaseAgeExclude")
             .await?
             .into_vec();
+        let exact_versions = minimum_age_repair_versions(plan);
         let exclusions = minimum_age_repair_exclusions(plan, configured_exclusions);
         let mut overrides = self
             .configured_value::<BTreeMap<String, String>>(project, "overrides")
@@ -2166,7 +2198,91 @@ impl<L: NodeLock> NpmTool<L> {
         self.cmd
             .run(&project.root, &args)
             .await
-            .map_err(propagate_repeated_minimum_age_rejection)
+            .map_err(propagate_repeated_minimum_age_rejection)?;
+        // This file is in the outer mutation journal, so a failed graph gate or isolated
+        // candidate restores these permissions together with the settled lock.
+        self.persist_minimum_age_exclusions(project, &exact_versions, plan.evaluated_at)
+            .await
+    }
+
+    async fn persist_minimum_age_exclusions(
+        &self,
+        project: &Project,
+        permitted_versions: &BTreeMap<String, BTreeSet<String>>,
+        evaluated_at: Option<jiff::Timestamp>,
+    ) -> Result<()> {
+        let Some(native) = L::NATIVE_MIN_AGE_FILE else {
+            return Ok(());
+        };
+        let path = project.root.join(native);
+        let native_age = NativeAge::read(&path)?;
+        let minutes = match native_age.minutes {
+            Some(minutes) => Some(minutes),
+            None => {
+                self.configured_value::<Option<i64>>(project, "minimumReleaseAge")
+                    .await?
+            }
+        };
+        let locked = resolved_version_lines::<L>(&read_lock::<L>(project)?)?;
+        let mut globs = Vec::new();
+        let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
+        for entry in native_age.exclusions.into_vec() {
+            if let Some((name, versions)) = exact_exclusion(&entry) {
+                if let Some(present) = locked.get(name) {
+                    exact_versions.entry(name.to_string()).or_default().extend(
+                        versions
+                            .into_iter()
+                            .filter(|version| present.contains(*version))
+                            .map(str::to_string),
+                    );
+                }
+            } else {
+                globs.push(entry);
+            }
+        }
+        if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
+            for (name, versions) in permitted_versions {
+                for version in versions.iter().filter(|version| {
+                    locked
+                        .get(name)
+                        .is_some_and(|present| present.contains(*version))
+                }) {
+                    let now = evaluated_at.ok_or_else(|| {
+                        CoreError::System(
+                            "pnpm native age admissions require the plan's evaluation clock"
+                                .to_string(),
+                        )
+                    })?;
+                    let package = PackageId::new(L::ID, name, Some(NPM.to_string()));
+                    let version_id = Version::new(version);
+                    let cached = self
+                        .publish_times
+                        .lock()
+                        .await
+                        .get(&package)
+                        .and_then(|times| times.get(&version_id).copied());
+                    let published_at = match cached {
+                        Some(time) => time,
+                        None => {
+                            self.registry
+                                .published_at(&package, &version_id, &[])
+                                .await?
+                        }
+                    };
+                    if published_at
+                        .is_some_and(|time| now.duration_since(time).as_secs() / 60 < minutes)
+                    {
+                        exact_versions
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(version.clone());
+                    }
+                }
+            }
+        }
+        let exclusions = minimum_age_exclusions(&globs, &exact_versions)?;
+        set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, false)?;
+        Ok(())
     }
 
     async fn configured_value<T>(&self, project: &Project, key: &str) -> Result<T>
@@ -2576,7 +2692,45 @@ fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
 /// A targeted package excludes only its approved destination; allowing its rejected starting version
 /// would let the settlement resolve float back to it after the temporary override is removed.
 fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
-    let mut exclusions = configured_exclusions.into_iter().collect::<BTreeSet<_>>();
+    let mut exclusions = BTreeSet::new();
+    let mut exact_versions = minimum_age_repair_versions(plan);
+    for entry in configured_exclusions {
+        if let Some((name, versions)) = exact_exclusion(&entry) {
+            exact_versions.entry(name.to_string()).or_default().extend(
+                versions
+                    .into_iter()
+                    .filter(|version| {
+                        // A repair must not reauthorize the rejected starting pin of its target.
+                        !plan.baseline_violations.iter().any(|violation| {
+                            violation.package.name == name
+                                && violation.version.as_str() == *version
+                                && plan
+                                    .changes
+                                    .iter()
+                                    .any(|change| change.package.name == name)
+                        })
+                    })
+                    .map(str::to_string),
+            );
+        } else {
+            exclusions.insert(entry);
+        }
+    }
+    exclusions.extend(
+        exact_versions
+            .into_iter()
+            .filter(|(_, versions)| !versions.is_empty())
+            .map(|(package, versions)| {
+                format!(
+                    "{package}@{}",
+                    versions.into_iter().collect::<Vec<_>>().join("||")
+                )
+            }),
+    );
+    exclusions.into_iter().collect()
+}
+
+fn minimum_age_repair_versions(plan: &Plan) -> BTreeMap<String, BTreeSet<String>> {
     let targeted = plan
         .changes
         .iter()
@@ -2599,13 +2753,7 @@ fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>
             .or_default()
             .insert(change.to.to_string());
     }
-    exclusions.extend(exact_versions.into_iter().map(|(package, versions)| {
-        format!(
-            "{package}@{}",
-            versions.into_iter().collect::<Vec<_>>().join("||")
-        )
-    }));
-    exclusions.into_iter().collect()
+    exact_versions
 }
 
 /// The post-resolve lock inconsistency, but only when this resolve introduced it.
@@ -2787,6 +2935,10 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         }
     }
 
+    fn requires_sync_admission_evaluation(&self) -> bool {
+        L::NATIVE_MIN_AGE_FILE.is_some()
+    }
+
     async fn write_native(
         &self,
         project: &Project,
@@ -2802,19 +2954,33 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             // expressed, so leave the file untouched.
             return Ok(SyncReport::Unchanged { path });
         };
-        let mut changed =
-            set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
-        // The cooldown.toml `latest`/`allow` packages become pnpm's native per-package exemption list,
-        // so a package cooldown's own policy exempts is also exempt from pnpm's rolling
-        // minimumReleaseAge gate (otherwise the native window would still quarantine it).
+        // Policy-exempt names and admitted young versions must also pass pnpm's rolling age gate.
         // An empty list removes the key, so toggling a package back under the cooldown cleans up
         // after itself.
-        changed |= set_yaml_block_list(
-            &path,
-            "minimumReleaseAgeExclude",
-            &policy.exempt_packages,
-            dry_run,
-        )?;
+        let exclusions = if let Some(admitted) = &policy.admitted_versions {
+            let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
+            for admitted in admitted {
+                exact_versions
+                    .entry(admitted.name.clone())
+                    .or_default()
+                    .insert(admitted.version.to_string());
+            }
+            minimum_age_exclusions(&policy.exempt_packages, &exact_versions)?
+        } else {
+            // Without complete evidence, preserve exact entry strings even for missing pins.
+            // Policy globs and the default window can still be synchronized safely.
+            let existing = NativeAge::read(&path)?.exclusions.into_vec();
+            let mut exclusions = minimum_age_exclusions(&policy.exempt_packages, &BTreeMap::new())?;
+            exclusions.extend(
+                existing
+                    .into_iter()
+                    .filter(|entry| exact_exclusion(entry).is_some()),
+            );
+            exclusions
+        };
+        let mut changed =
+            set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
+        changed |= set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, dry_run)?;
         Ok(if changed {
             SyncReport::Written { path }
         } else {
@@ -3036,12 +3202,18 @@ mod tests {
         assert_eq!(
             minimum_age_repair_exclusions(
                 &plan,
-                vec!["@typescript-eslint/*".to_string(), "nanoid".to_string()],
+                vec![
+                    "@typescript-eslint/*".to_string(),
+                    "nanoid".to_string(),
+                    "eslint@10.5.0".to_string(),
+                    "eslint@10.7.0".to_string(),
+                    "flatted@3.4.1".to_string()
+                ],
             ),
             vec![
                 "@typescript-eslint/*".to_string(),
-                "eslint@10.6.0".to_string(),
-                "flatted@3.4.2||3.4.3".to_string(),
+                "eslint@10.5.0||10.6.0".to_string(),
+                "flatted@3.4.1||3.4.2||3.4.3".to_string(),
                 "nanoid".to_string(),
             ]
         );
@@ -3257,6 +3429,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: vec!["@typescript/native-preview".to_string()],
+            admitted_versions: Some(Vec::new()),
         };
 
         let tool = NpmTool::<crate::lock::Pnpm>::from_http(
@@ -3279,6 +3452,67 @@ packages:
             written.contains("minimumReleaseAgeExclude:\n  - \"@typescript/native-preview\""),
             "latest package exempted natively: {written}"
         );
+    }
+
+    #[tokio::test]
+    async fn write_native_preserves_exact_entries_verbatim_when_evaluation_fails()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let before = indoc! {r#"
+            packages: []
+            minimumReleaseAge: 120
+            minimumReleaseAgeExclude:
+              - "old-glob"
+              - "@corp/pkg@2.0.1||1.2.2"
+              - "gone@1.0.0"
+              - "gone@1.0.0"
+        "#};
+        std::fs::write(&path, before)?;
+        let project = Project {
+            root: root.clone(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let policy = ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 14),
+            )),
+            exempt_packages: vec!["new-glob".to_string(), "@corp/*".to_string()],
+            admitted_versions: None,
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = NpmTool::<Pnpm>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        std::assert_matches!(
+            tool.write_native(&project, &policy, true).await?,
+            SyncReport::Written { .. }
+        );
+        assert_eq!(std::fs::read_to_string(&path)?, before);
+        tool.write_native(&project, &policy, false).await?;
+        let written = NativeAge::read(&path)?;
+        assert_eq!(written.minutes, Some(20160));
+        assert_eq!(
+            written.exclusions.into_vec(),
+            vec![
+                "@corp/*",
+                "new-glob",
+                "@corp/pkg@2.0.1||1.2.2",
+                "gone@1.0.0",
+                "gone@1.0.0",
+            ]
+        );
+        std::assert_matches!(
+            tool.write_native(&project, &policy, false).await?,
+            SyncReport::Unchanged { .. }
+        );
+        Ok(())
     }
 
     fn tool() -> NpmTool<Npm> {
@@ -4615,16 +4849,28 @@ mod whole_graph_tests {
         lock
     }
 
-    /// A scripted `pnpm` that logs every invocation to `legs.log`, answers `config get` with
-    /// `null`, and otherwise runs `body` (a `case "$*"` arm list) — an unmatched invocation fails.
+    /// A scripted `pnpm` that logs every invocation to `legs.log`, answers `config get` with an
+    /// empty exclusion list or `null`, and otherwise runs `body` (a `case "$*"` arm list).
+    /// An unmatched invocation fails.
     fn fake_pnpm(root: &Utf8Path, body: &str) -> eyre::Result<Utf8PathBuf> {
+        fake_pnpm_with_exclusions(root, body, &[])
+    }
+
+    fn fake_pnpm_with_exclusions(
+        root: &Utf8Path,
+        body: &str,
+        exclusions: &[&str],
+    ) -> eyre::Result<Utf8PathBuf> {
         let script = root.join("fake-pnpm.sh");
+        let exclusions = serde_json::to_string(exclusions)?;
         std::fs::write(
             &script,
             formatdoc! {r#"
                 #!/bin/sh
                 echo "$*" >> legs.log
                 case "$*" in
+                  *"config get minimumReleaseAgeExclude"*)
+                    echo '{exclusions}'; exit 0 ;;
                   *"config get"*)
                     echo 'null'; exit 0 ;;
                 {body}
@@ -4644,6 +4890,151 @@ mod whole_graph_tests {
         )?);
         tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
         Ok(tool)
+    }
+
+    #[tokio::test]
+    async fn young_direct_and_transitive_targets_persist_exact_native_exclusions()
+    -> eyre::Result<()> {
+        for direct in [true, false] {
+            assert_young_native_exclusions(direct, &[]).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_persistence_does_not_copy_effective_config_exclusions() -> eyre::Result<()> {
+        assert_young_native_exclusions(false, &["user-global-*", "external@9.0.0"]).await
+    }
+
+    async fn assert_young_native_exclusions(
+        direct: bool,
+        effective_exclusions: &[&str],
+    ) -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let mut lock = workspace(
+            &root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: if direct {
+                    vec![("foo", "^1.0.0", "1.0.0")]
+                } else {
+                    vec![("parent", "^1.0.0", "1.0.0")]
+                },
+            }],
+        )?;
+        if !direct {
+            lock.push_str(&package_entry("foo", "1.0.0"));
+            lock.push_str(indoc! {"
+
+                    snapshots:
+                      parent@1.0.0:
+                        dependencies:
+                          foo: 1.0.0
+                "});
+        }
+        let settled = if direct {
+            moved(&lock, ".", "foo", ("^1.0.0", "1.0.0"), ("^1.0.0", "1.1.0"))
+        } else {
+            lock.replace("foo@1.0.0", "foo@1.1.0")
+                .replace("foo: 1.0.0", "foo: 1.1.0")
+        };
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        std::fs::write(root.join("settled.yaml"), settled)?;
+        let native_before = indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "@corp/*"
+                  - "foo@0.9.0"
+            "#};
+        std::fs::write(root.join("pnpm-workspace.yaml"), native_before)?;
+        let script = fake_pnpm_with_exclusions(
+            &root,
+            indoc! {r#"
+                      *"--frozen-lockfile"*)
+                        grep -q 'foo@1.1.0' pnpm-workspace.yaml || exit 1
+                        exit 0 ;;
+                      *" update "*|*"install"*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            effective_exclusions,
+        )?;
+
+        // The planner can admit a two-day-old security fix through its shorter window.
+        // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
+        // The fixed January clock keeps the pin young even when this test runs months later.
+        let cache = tempfile::tempdir()?;
+        let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
+        let published = now.checked_sub(jiff::SignedDuration::from_hours(48))?;
+        cooldown_registry::cache::write_entry(
+            cache.path(),
+            &cooldown_registry::CacheEntry {
+                url: "https://registry.npmjs.org/foo".to_string(),
+                fetched_at: now.to_string(),
+                etag: None,
+                status: 200,
+                body: serde_json::json!({
+                    "versions": { "1.0.0": {}, "1.1.0": {} },
+                    "time": { "1.0.0": "2020-01-01T00:00:00Z", "1.1.0": published.to_string() }
+                })
+                .to_string(),
+                request_body: None,
+            },
+        )?;
+        let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions {
+                offline: true,
+                ..cooldown_registry::HttpOptions::default()
+            },
+        )?);
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let mut target = change("foo", "1.0.0", "1.1.0", &[("app", ".")]);
+        target.direct = direct;
+        if !direct {
+            target.members.clear();
+        }
+        let plan = Plan {
+            changes: vec![target],
+            evaluated_at: Some(now),
+            ..Plan::default()
+        };
+        let project = project(&root);
+        let manifest_before = read(&root, "package.json")?;
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
+        assert_eq!(applied_names(&report), vec!["foo"], "direct={direct}");
+        let native = read(&root, "pnpm-workspace.yaml")?;
+        assert!(native.contains("foo@1.1.0"), "direct={direct}: {native}");
+        assert!(native.contains("@corp/*"), "{native}");
+        assert!(!native.contains("foo@0.9.0"), "{native}");
+        assert!(!native.contains("overrides:"), "{native}");
+        assert_eq!(
+            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
+                .exclusions
+                .into_vec(),
+            vec!["@corp/*", "foo@1.1.0"]
+        );
+        for exclusion in effective_exclusions {
+            assert!(
+                read(&root, "legs.log")?.contains(exclusion),
+                "effective config should remain available to repair CLI arguments"
+            );
+        }
+        assert_eq!(
+            tool.verify_lock_current(&project).await?.status,
+            cooldown_core::LockStatus::Current,
+            "the persisted exception must prevent stale_lock"
+        );
+
+        // Candidate rejection uses the same journal after the native write, so the exact
+        // allowance must disappear together with the rejected lock.
+        mutation.journal().restore()?;
+        assert_eq!(read(&root, "package.json")?, manifest_before);
+        assert_eq!(read(&root, "pnpm-workspace.yaml")?, native_before);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
     }
 
     fn project(root: &Utf8Path) -> Project {
@@ -4694,6 +5085,7 @@ mod whole_graph_tests {
         std::fs::read_to_string(root.join("legs.log"))
             .unwrap_or_default()
             .lines()
+            .filter(|line| !line.starts_with("config get "))
             .map(str::to_string)
             .collect()
     }

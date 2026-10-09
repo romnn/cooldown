@@ -1487,6 +1487,7 @@ mod tests {
         assert_eq!(tool.sync_scope(), SyncScope::Repo);
 
         let policy = ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::MinAge(
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
@@ -1521,6 +1522,7 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         let tool = uv_tool();
         let policy = ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
         };

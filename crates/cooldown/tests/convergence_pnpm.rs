@@ -110,6 +110,94 @@ fn seed_lock(fixture: &Fixture, cutoff: &str) {
         .expect_success();
 }
 
+#[test]
+fn upgrade_sync_persists_a_shorter_package_windows_exact_native_exclusion() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-pnpm-shorter-window-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": { "lodash": "^4.17.20" }
+            }
+        "#},
+    );
+    // Avoid pnpm 11's interactive approval mode, which refuses any update using --no-save.
+    fixture.write(
+        "pnpm-workspace.yaml",
+        indoc::indoc! {"
+        packages: []
+        minimumReleaseAgeStrict: false
+    "},
+    );
+    seed_lock(&fixture, "2020-09-01T00:00:00Z");
+    assert_eq!(
+        pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
+            .get("lodash")
+            .map(String::as_str),
+        Some("4.17.20")
+    );
+
+    // The rolling native cutoff excludes 4.17.21, published in February 2021.
+    // The shorter package window reproduces a March 2021 cutoff on every test run.
+    let native_minutes = minimum_release_age_minutes("2020-09-01T00:00:00Z");
+    let package_minutes = minimum_release_age_minutes("2021-03-01T00:00:00Z");
+    fixture.write(
+        "cooldown.toml",
+        &indoc::formatdoc! {r#"
+            min-age = "{native_minutes}m"
+
+            [package.lodash]
+            min-age = "{package_minutes}m"
+        "#},
+    );
+    let upgraded = fixture.cooldown_json_traced(
+        "adopt a version inside the native window",
+        &["upgrade", "--sync"],
+    )?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert_eq!(upgraded.summary_applied(), 1);
+    assert_pnpm_lock_current(&upgraded);
+    let lock_after_upgrade = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        pnpm_lock_pins(&lock_after_upgrade)
+            .get("lodash")
+            .map(String::as_str),
+        Some("4.17.21")
+    );
+    let native = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml"))?;
+    assert!(native.contains(&format!("minimumReleaseAge: {native_minutes}")));
+    assert!(native.contains("lodash@4.17.21"), "{native}");
+    assert!(
+        !native
+            .lines()
+            .any(|line| { matches!(line.trim(), "- lodash" | "- \"lodash\"" | "- 'lodash'") })
+    );
+
+    let resynced =
+        fixture.cooldown_json_traced("retain the adopted exact permission", &["sync"])?;
+    assert!(
+        resynced.ok(),
+        "sync must retain the admitted pin: {resynced:#?}"
+    );
+    assert_eq!(native.as_bytes(), fixture.read_bytes("pnpm-workspace.yaml"));
+
+    // A separate pnpm process gets no temporary CLI exclusions from cooldown.
+    fixture
+        .run_tool_traced(
+            "verify native policy accepts the adopted lock",
+            "pnpm",
+            &["install", "--frozen-lockfile", "--lockfile-only"],
+            &[],
+        )?
+        .require_success()?;
+    assert_eq!(lock_after_upgrade, fixture.read_bytes("pnpm-lock.yaml"));
+    Ok(())
+}
+
 fn assert_pnpm_lock_current(report: &support::Envelope) {
     assert_eq!(
         report.lock_status(),

@@ -537,6 +537,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn normalize_edges(&mut self) -> MutationFlow {
         let plan = Plan {
             edge_policy: self.ctx.pctx.edge_policy,
+            evaluated_at: Some(self.ws.now()),
             ..Plan::default()
         };
         let mutation = match self.ctx.prepare_mutation(&plan).await {
@@ -2082,6 +2083,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn batch_plan(&self, changes: &[Change], state: &TrialState) -> Plan {
         Plan {
             changes: changes.to_vec(),
+            evaluated_at: Some(self.ws.now()),
             rewrite: self.ctx.opts.rewrite,
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),

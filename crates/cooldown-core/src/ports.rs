@@ -1037,6 +1037,14 @@ pub trait ToolWrite: Send + Sync {
         Ok(crate::EdgeNormalizationReport::default())
     }
 
+    /// Whether native sync needs evaluated exact locked-version admissions.
+    ///
+    /// Opting in requests read-side evaluation under the sync lease before writing.
+    /// Evaluation failures preserve existing exact admissions while syncing the remaining policy.
+    fn requires_sync_admission_evaluation(&self) -> bool {
+        false
+    }
+
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
     /// The default implementation returns [`SyncReport::Unsupported`]; adapters that can sync
@@ -1334,7 +1342,16 @@ pub struct RawArtifact {
     pub markers: Vec<String>,
 }
 
-/// The resolved policy handed to [`ToolWrite::write_native`] for `sync` (post-MVP; minimal for now).
+/// An exact locked version admitted by policy despite being younger than the native default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedVersion {
+    /// Registry package name, including its scope when present.
+    pub name: String,
+    /// Exact locked registry version; never a range or package-wide exemption.
+    pub version: Version,
+}
+
+/// The resolved policy handed to [`ToolWrite::write_native`] for `sync`.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     /// The default cooldown window to write into native config, if any.
@@ -1343,6 +1360,11 @@ pub struct ResolvedPolicy {
     /// to bake into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`). Empty for
     /// tools without such a native knob, which simply ignore it.
     pub exempt_packages: Vec<String>,
+    /// Exact locked versions admitted by read-side evaluation while still younger than the
+    /// native default window.
+    /// Successful evaluation supplies `Some`, including an empty list to prune expired admissions.
+    /// `None` preserves every existing exact entry verbatim when evaluation fails.
+    pub admitted_versions: Option<Vec<AdmittedVersion>>,
 }
 
 /// The outcome of a `sync`/[`ToolWrite::write_native`] (post-MVP).

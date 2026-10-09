@@ -978,6 +978,10 @@ impl SingleCopyPolicy {
 pub struct Plan {
     /// The planned version changes.
     pub changes: Vec<Change>,
+    /// The run clock used to evaluate the planned targets.
+    /// Adapters that persist age-based admissions require this timestamp when a native age floor
+    /// applies; mutations without version evaluation may leave it unset.
+    pub evaluated_at: Option<jiff::Timestamp>,
     /// How adapters should treat manifest constraints when applying these changes (the `--rewrite`
     /// flag).
     /// Defaults to [`RewriteMode::Auto`].

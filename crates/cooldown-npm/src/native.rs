@@ -2,7 +2,52 @@
 
 use camino::Utf8Path;
 use cooldown_core::{CoreError, Result, WindowSpec};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Renders name globs before exact version unions, omitting versions a glob already covers.
+pub(crate) fn minimum_age_exclusions(
+    globs: &[String],
+    exact_versions: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<String>> {
+    let globs: Vec<_> = globs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let matchers = globs
+        .iter()
+        .map(|glob| cooldown_core::PatternGlob::new(glob))
+        .collect::<Result<Vec<_>>>()?;
+    let mut exclusions = globs;
+    exclusions.extend(exact_versions.iter().filter_map(|(name, versions)| {
+        if versions.is_empty() || matchers.iter().any(|glob| glob.is_match(name)) {
+            return None;
+        }
+        Some(format!(
+            "{name}@{}",
+            versions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("||")
+        ))
+    }));
+    Ok(exclusions)
+}
+
+/// Recognizes cooldown-owned exact entries without claiming user-authored version ranges.
+pub(crate) fn exact_exclusion(entry: &str) -> Option<(&str, Vec<&str>)> {
+    let (name, union) = entry.rsplit_once('@')?;
+    if name.is_empty() {
+        return None;
+    }
+    let versions: Vec<_> = union.split("||").collect();
+    versions
+        .iter()
+        .all(|version| crate::version::parse(version).is_some())
+        .then_some((name, versions))
+}
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
@@ -23,6 +68,25 @@ impl ConfigStringList {
 impl Default for ConfigStringList {
     fn default() -> Self {
         ConfigStringList::Many(Vec::new())
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct NativeAge {
+    #[serde(rename = "minimumReleaseAge")]
+    pub(crate) minutes: Option<i64>,
+    #[serde(rename = "minimumReleaseAgeExclude", default)]
+    pub(crate) exclusions: ConfigStringList,
+}
+
+impl NativeAge {
+    pub(crate) fn read(path: &Utf8Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_saphyr::from_str(&content)
+                .map_err(|err| CoreError::Parse(format!("{path}: {err}"))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(CoreError::Filesystem(format!("{path}: {err}"))),
+        }
     }
 }
 
@@ -306,6 +370,41 @@ mod tests {
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
+
+    #[test]
+    fn minimum_age_exclusions_render_globs_then_exact_version_unions() -> eyre::Result<()> {
+        let globs = vec!["z-*".to_string(), "@scope/*".to_string(), "z-*".to_string()];
+        let versions = BTreeMap::from([
+            (
+                "a".to_string(),
+                BTreeSet::from(["2.0.1".to_string(), "1.2.2".to_string()]),
+            ),
+            (
+                "@scope/a".to_string(),
+                BTreeSet::from(["1.0.0".to_string()]),
+            ),
+            ("z-tool".to_string(), BTreeSet::from(["1.0.0".to_string()])),
+            ("b".to_string(), BTreeSet::from(["3.0.0".to_string()])),
+            ("empty".to_string(), BTreeSet::new()),
+        ]);
+        assert_eq!(
+            minimum_age_exclusions(&globs, &versions)?,
+            ["@scope/*", "z-*", "a@1.2.2||2.0.1", "b@3.0.0"]
+        );
+        assert!(minimum_age_exclusions(&[], &BTreeMap::new())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_exclusion_only_claims_full_version_unions() {
+        assert_eq!(
+            exact_exclusion("@scope/a@1.2.2||2.0.1"),
+            Some(("@scope/a", vec!["1.2.2", "2.0.1"]))
+        );
+        for entry in ["a", "@scope/*", "a@^1.2.2", "a@1.2.2||*", "a@", "@1.2.2"] {
+            assert_eq!(exact_exclusion(entry), None, "{entry}");
+        }
+    }
 
     #[test]
     fn configured_string_list_accepts_pnpm_singletons_and_arrays() -> eyre::Result<()> {

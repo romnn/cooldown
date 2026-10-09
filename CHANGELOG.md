@@ -17,6 +17,16 @@
   forever. Package managers now run with no input, so pnpm fails the step instead of asking, which
   cooldown already handles.
 
+- **pnpm keeps exact exemptions for releases admitted by cooldown.** An upgrade through a
+  shortened security or package window could leave a young version in `pnpm-lock.yaml` that
+  pnpm's native `minimumReleaseAge` rejected, failing final verification and a developer's next
+  install. Successful settlement now persists version-qualified `minimumReleaseAgeExclude`
+  entries with the lock, and rejected trials restore both files. `sync` evaluates the current
+  lock with the check policy, including advisories and baseline acknowledgements, to retain
+  needed entries, add missing ones, and remove obsolete ones. Tolerated transitive violations
+  receive no exemptions. Evaluation failures warn and preserve existing exact entries while
+  still syncing the window and policy globs.
+
 ## v0.0.23
 
 - **`include-hidden` scans named dot-directories.** Detection skips every directory whose name

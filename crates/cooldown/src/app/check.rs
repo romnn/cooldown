@@ -59,6 +59,7 @@ pub struct CheckOutcome {
 /// Finalized into a [`CheckOutcome`].
 #[derive(Default)]
 struct CheckAccum {
+    admitted_versions: Vec<cooldown_core::AdmittedVersion>,
     checked: usize,
     skipped_stale_projects: usize,
     /// Whether a project already explained an empty selection, so the run-level note is redundant.
@@ -114,6 +115,7 @@ struct CheckRunner<'a> {
     opts: &'a RunOpts,
     scope: DepScope,
     acc: CheckAccum,
+    admission_window: Option<cooldown_core::WindowSpec>,
 }
 
 /// `check --transitive hide` skips evaluating transitive deps; every other mode (including
@@ -151,6 +153,71 @@ impl Workspace {
         }
         finalize_check(opts, acc)
     }
+
+    /// Evaluate native exact-version admissions while the caller holds the sync lease.
+    ///
+    /// Reuses the check gate without refreshing the lock or acquiring another lease, which would
+    /// deadlock against the caller's exclusive access.
+    /// A frozen resolver probe would reject the very pins whose exact native admissions are missing,
+    /// so sync reads the existing graph directly and leaves currency verification to check.
+    pub(crate) async fn sync_admitted_versions(
+        &self,
+        pctx: &super::ProjectCtx,
+        opts: &RunOpts,
+        window: &cooldown_core::WindowSpec,
+        warnings: &mut Vec<Diagnostic>,
+    ) -> Result<Vec<cooldown_core::AdmittedVersion>, Diagnostic> {
+        let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
+        let Some(read) = self.read_project_ctx(pctx, opts, progress) else {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Config,
+                "missing sync read adapter",
+            ));
+        };
+        let mut runner = CheckRunner::new(self, opts);
+        // Native policy serves every locked registry version even when the command hides transitives.
+        runner.scope = DepScope::Graph;
+        // pnpm represents its native rolling age in whole minutes, truncated toward zero.
+        // Select against that persisted window so subminute precision cannot add needless entries.
+        runner.admission_window = match window {
+            cooldown_core::WindowSpec::MinAge(duration) => {
+                let minutes = duration.as_secs() / 60;
+                (minutes > 0).then_some(cooldown_core::WindowSpec::MinAge(
+                    jiff::SignedDuration::from_secs(minutes * 60),
+                ))
+            }
+            cooldown_core::WindowSpec::Freeze(_) | cooldown_core::WindowSpec::Latest => None,
+        };
+        if let Some(deps) = runner.read_dependencies(pctx, &read).await {
+            runner.evaluate_dependencies(pctx, &read, deps).await;
+        }
+        // A fail-open advisory read cannot safely revoke a permission that relied on that feed.
+        let advisory_error = runner
+            .acc
+            .warnings
+            .iter()
+            .find(|warning| warning.kind == DiagnosticKind::AdvisorySourceUnavailable)
+            .cloned();
+        warnings.append(&mut runner.acc.warnings);
+        if let Some(error) = runner
+            .acc
+            .errors
+            .into_iter()
+            .next()
+            .or_else(|| runner.acc.items.into_iter().find_map(|item| item.error))
+            .or(advisory_error)
+        {
+            return Err(error);
+        }
+        let mut admitted = runner.acc.admitted_versions;
+        admitted.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.version.as_str().cmp(right.version.as_str()))
+        });
+        admitted.dedup();
+        Ok(admitted)
+    }
 }
 
 impl<'a> CheckRunner<'a> {
@@ -160,6 +227,7 @@ impl<'a> CheckRunner<'a> {
             opts,
             scope: check_scope(opts),
             acc: CheckAccum::default(),
+            admission_window: None,
         }
     }
 
@@ -212,7 +280,20 @@ impl<'a> CheckRunner<'a> {
             return;
         }
 
-        let mut deps = match self
+        let deps = self.read_dependencies(pctx, &read).await;
+        drop(read_guard);
+        drop(refresh_guard);
+        if let Some(deps) = deps {
+            self.evaluate_dependencies(pctx, &read, deps).await;
+        }
+    }
+
+    async fn read_dependencies(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+    ) -> Option<Vec<Dependency>> {
+        let deps = match self
             .ws
             .dependencies_in_scope(read.adapter, pctx, self.scope, self.opts)
             .await
@@ -228,11 +309,18 @@ impl<'a> CheckRunner<'a> {
                     &read.project_label,
                     None,
                 ));
-                return;
+                return None;
             }
         };
-        drop(read_guard);
-        drop(refresh_guard);
+        Some(deps)
+    }
+
+    async fn evaluate_dependencies(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+        mut deps: Vec<Dependency>,
+    ) {
         self.note_empty_project(pctx, deps.len());
 
         // Identities must be adapter-confirmed before they are queried, matched, or counted
@@ -266,7 +354,7 @@ impl<'a> CheckRunner<'a> {
             result,
         } in fetched
         {
-            self.gate_pin(pctx, &read, advisories.as_ref(), &dep, result);
+            self.gate_pin(pctx, read, advisories.as_ref(), &dep, result);
         }
     }
 
@@ -432,11 +520,6 @@ impl<'a> CheckRunner<'a> {
             }
         }
 
-        if pv.status == Status::Exempt {
-            self.acc.exempt += 1;
-            return;
-        }
-
         let baseline_acked = pv.status == Status::CurrentInCooldown
             && self.ws.baseline.is_acknowledged(
                 pctx.tool.as_str(),
@@ -451,6 +534,16 @@ impl<'a> CheckRunner<'a> {
         // apart from a baselined acknowledgment. A per-version baseline record wins over the blanket
         // policy.
         let allowed_transitive = self.opts.transitive_mode == TransitiveGate::Allow && !dep.direct;
+        let admitted = pv.status == Status::UpToDate || baseline_acked;
+        self.record_native_admission(
+            dep,
+            pv.published_at,
+            admitted && locked.quality != cooldown_core::ReleaseQuality::Pseudo,
+        );
+        if pv.status == Status::Exempt {
+            self.acc.exempt += 1;
+            return;
+        }
         let status = match CheckStatus::from_pin_status(pv.status, baseline_acked) {
             Some(CheckStatus::Violation) if allowed_transitive => Some(CheckStatus::Allowed),
             other => other,
@@ -488,6 +581,26 @@ impl<'a> CheckRunner<'a> {
                 .map(|security| super::security_info(security, &dep.current)),
             error: None,
         });
+    }
+
+    fn record_native_admission(
+        &mut self,
+        dep: &Dependency,
+        published_at: Option<jiff::Timestamp>,
+        admitted: bool,
+    ) {
+        if admitted
+            && let Some(window) = &self.admission_window
+            && let Some(published_at) = published_at
+            && published_at > window.base_cutoff(self.ws.now())
+        {
+            self.acc
+                .admitted_versions
+                .push(cooldown_core::AdmittedVersion {
+                    name: dep.package.name.clone(),
+                    version: dep.current.clone(),
+                });
+        }
     }
 
     /// The stricter-native diagnostic for a pin, when repo/global policy overrides a stricter

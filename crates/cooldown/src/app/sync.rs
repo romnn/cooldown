@@ -129,7 +129,7 @@ pub struct SyncOutcome {
     pub summary: SyncSummary,
     /// The per-project results.
     pub items: Vec<SyncItem>,
-    /// Recovery notices and non-fatal recovery cleanup or durability diagnostics.
+    /// Recovery notices, admission evaluation failures, and other non-fatal diagnostics.
     pub warnings: Vec<Diagnostic>,
     /// Project-level errors (none today; per-project failures live on their [`SyncItem`]).
     pub errors: Vec<Diagnostic>,
@@ -306,27 +306,40 @@ impl Workspace {
         };
         let resolved = resolve(&pctx.policy.layers, &query, self.now());
         let window = resolved.window.effective_spec(self.now());
-        let policy = ResolvedPolicy {
+        let mut policy = ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             // Bake any `latest`/`allow` package selectors into the native per-package exemption list
             // alongside the default window, so a cooldown-exempt package is exempt natively too.
             exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
         };
-        let result =
-            match acquire_sync_access(writer, pctx, &self.lease_family(pctx), opts.dry_run).await {
-                Ok(access) => {
-                    warnings.extend(access.recovery);
-                    match cooldown_core::interrupt::ensure_not_requested("writing native config") {
-                        Ok(()) => {
-                            writer
-                                .write_native(&pctx.project, &policy, opts.dry_run)
-                                .await
+        let result = async {
+            let access = acquire_sync_access(writer, pctx, &self.lease_family(pctx), opts.dry_run)
+                .await
+                .map_err(|err| diag_from_error(&err, tool, &project, None))?;
+            warnings.extend(access.recovery);
+            if writer.requires_sync_admission_evaluation() {
+                policy.admitted_versions = match self
+                    .sync_admitted_versions(pctx, opts, &window, warnings)
+                    .await
+                {
+                    Ok(admitted) => Some(admitted),
+                    Err(warning) => {
+                        if !warnings.contains(&warning) {
+                            warnings.push(warning);
                         }
-                        Err(error) => Err(error),
+                        None
                     }
-                }
-                Err(error) => Err(error),
-            };
+                };
+            }
+            cooldown_core::interrupt::ensure_not_requested("writing native config")
+                .map_err(|err| diag_from_error(&err, tool, &project, None))?;
+            writer
+                .write_native(&pctx.project, &policy, opts.dry_run)
+                .await
+                .map_err(|err| diag_from_error(&err, tool, &project, None))
+        }
+        .await;
         match result {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
@@ -342,14 +355,13 @@ impl Workspace {
             }
             Err(error) => {
                 summary.errors += 1;
-                let diagnostic = diag_from_error(&error, tool, &project, None);
                 SyncItem {
                     tool: tool.as_str().to_string(),
                     project,
                     status: SyncStatus::Error,
                     path: None,
                     window: None,
-                    error: Some(diagnostic),
+                    error: Some(error),
                 }
             }
         }
@@ -380,6 +392,7 @@ impl Workspace {
         let resolved = resolve(self.repo_layers(), &query, self.now());
         let window = resolved.window.effective_spec(self.now());
         let policy = ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
         };
@@ -518,7 +531,9 @@ fn window_display(spec: &WindowSpec) -> String {
 #[cfg(test)]
 mod tests {
     use crate::app::workspace::tests::{TestAdapter, project_ctx};
-    use crate::app::{AdapterSet, Baseline, Progress, RunOpts, Workspace};
+    use crate::app::{
+        AdapterSet, AdvisoryFailureMode, Baseline, Exit, Progress, RunOpts, Workspace,
+    };
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use cooldown_core::ToolId;
@@ -567,6 +582,499 @@ mod tests {
         assert_eq!(out.items.len(), 1);
         assert_eq!(progress.finished_blocks(), 2);
         assert_eq!(progress.completed_tools(), 1);
+        Ok(())
+    }
+
+    struct AdmissionAdapter {
+        deps: Vec<cooldown_core::Dependency>,
+        published_at: Option<jiff::Timestamp>,
+        fail_fetch: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cooldown_core::ToolRead for AdmissionAdapter {
+        fn id(&self) -> ToolId {
+            CARGO
+        }
+
+        fn capabilities(&self) -> cooldown_core::Capabilities {
+            cooldown_core::Capabilities {
+                advisory_ecosystem: Some("crates.io"),
+                ..cooldown_core::Capabilities::default()
+            }
+        }
+
+        fn project_marker(&self) -> cooldown_core::ProjectMarker {
+            cooldown_core::ProjectMarker {
+                marker: "lock",
+                manifest: "manifest",
+                alternate_manifests: &[],
+                workspace_root: true,
+            }
+        }
+
+        async fn dependencies(
+            &self,
+            _project: &cooldown_core::Project,
+            scope: cooldown_core::DepScope,
+        ) -> cooldown_core::Result<Vec<cooldown_core::Dependency>> {
+            Ok(self
+                .deps
+                .iter()
+                .filter(|dep| scope == cooldown_core::DepScope::Graph || dep.direct)
+                .cloned()
+                .collect())
+        }
+
+        async fn native_policy(
+            &self,
+            _project: &cooldown_core::Project,
+        ) -> cooldown_core::Result<Option<cooldown_core::NativePolicyLayer>> {
+            Ok(None)
+        }
+
+        async fn verify_lock_current(
+            &self,
+            _project: &cooldown_core::Project,
+        ) -> cooldown_core::Result<cooldown_core::LockVerifyReport> {
+            Ok(cooldown_core::LockVerifyReport {
+                status: cooldown_core::LockStatus::Current,
+                detail: String::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cooldown_core::ReleaseFetcher for AdmissionAdapter {
+        async fn releases(
+            &self,
+            _dep: &cooldown_core::Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+            _candidates: cooldown_core::CandidateScope,
+        ) -> cooldown_core::Result<Vec<cooldown_core::Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn locked_release(
+            &self,
+            dep: &cooldown_core::Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+        ) -> cooldown_core::Result<cooldown_core::Release> {
+            if self.fail_fetch {
+                return Err(cooldown_core::CoreError::NotFound(dep.package.name.clone()));
+            }
+            Ok(cooldown_core::Release {
+                version: dep.current.clone(),
+                order: cooldown_core::ReleaseOrder(vec![1]),
+                major: cooldown_core::MajorKey("1".to_string()),
+                major_number: Some(1),
+                kind_from_current: None,
+                beyond_declared_bound: false,
+                beyond_latest_tag: false,
+                published_at: self.published_at,
+                yanked: false,
+                quality: cooldown_core::ReleaseQuality::Stable,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cooldown_core::ToolWrite for AdmissionAdapter {
+        fn mutation_tool(&self) -> ToolId {
+            CARGO
+        }
+
+        async fn mutation_journal(
+            &self,
+            project: &cooldown_core::Project,
+            _plan: &cooldown_core::Plan,
+        ) -> cooldown_core::Result<cooldown_core::ProjectMutationJournal> {
+            cooldown_core::ProjectMutationJournal::capture(
+                &project.root,
+                std::iter::empty::<&camino::Utf8Path>(),
+            )
+        }
+
+        async fn apply(
+            &self,
+            mutation: &cooldown_core::PreparedMutation,
+        ) -> cooldown_core::Result<cooldown_core::ApplyReport> {
+            mutation.parts_for(self)?;
+            Ok(cooldown_core::ApplyReport::default())
+        }
+
+        async fn build(
+            &self,
+            _project: &cooldown_core::Project,
+        ) -> cooldown_core::Result<cooldown_core::VerifyReport> {
+            Ok(cooldown_core::VerifyReport {
+                ok: true,
+                detail: String::new(),
+            })
+        }
+
+        fn sync_scope(&self) -> cooldown_core::SyncScope {
+            cooldown_core::SyncScope::Project
+        }
+
+        fn requires_sync_admission_evaluation(&self) -> bool {
+            true
+        }
+
+        async fn write_native(
+            &self,
+            project: &cooldown_core::Project,
+            policy: &cooldown_core::ResolvedPolicy,
+            dry_run: bool,
+        ) -> cooldown_core::Result<cooldown_core::SyncReport> {
+            let path = project.root.join("native-exclusions");
+            let exclusions = if let Some(admitted) = &policy.admitted_versions {
+                admitted
+                    .iter()
+                    .map(|admission| format!("{}@{}", admission.name, admission.version))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                std::fs::read_to_string(&path).map_err(|err| {
+                    cooldown_core::CoreError::Filesystem(format!("failed to read {path}: {err}"))
+                })?
+            };
+            if !dry_run {
+                std::fs::write(&path, exclusions).map_err(|err| {
+                    cooldown_core::CoreError::Filesystem(format!("failed to write {path}: {err}"))
+                })?;
+            }
+            Ok(cooldown_core::SyncReport::Written { path })
+        }
+    }
+
+    fn admission_dependency(name: &str, direct: bool) -> cooldown_core::Dependency {
+        cooldown_core::Dependency {
+            package: cooldown_core::PackageId::new(CARGO, name, None),
+            advisory_identity: None,
+            current: cooldown_core::Version::new("1.2.3"),
+            current_quality: cooldown_core::ReleaseQuality::Stable,
+            direct,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        }
+    }
+
+    fn admission_workspace(
+        root: &camino::Utf8Path,
+        adapter: AdmissionAdapter,
+        now: jiff::Timestamp,
+        baseline: Baseline,
+    ) -> eyre::Result<Workspace> {
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(adapter))?;
+        Ok(Workspace::new(
+            adapters,
+            vec![project_ctx(CARGO, root.as_str())],
+            now,
+            baseline,
+            root.to_owned(),
+            vec![builtin_default_layer()],
+        ))
+    }
+
+    fn acknowledged(package: &str) -> crate::app::baseline::AckEntry {
+        crate::app::baseline::AckEntry {
+            tool: CARGO.as_str().to_string(),
+            project: ".".to_string(),
+            package: package.to_string(),
+            version: "1.2.3".to_string(),
+            registry: None,
+            published_at: None,
+            window_days: None,
+            reason: None,
+            until: None,
+        }
+    }
+
+    /// Native admissions are recomputed from the locked graph: retained and newly acknowledged
+    /// pins survive, removed pins disappear, and every exact admission disappears after maturity.
+    #[tokio::test]
+    async fn sync_recomputes_exact_admissions_and_prunes_mature_versions() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("native-exclusions");
+        std::fs::write(&path, "retained@1.2.3,removed@1.2.3")?;
+        let published_at = Some("2026-06-16T00:00:00Z".parse()?);
+        let baseline = Baseline {
+            entries: vec![acknowledged("retained"), acknowledged("added")],
+        };
+        let deps = vec![
+            admission_dependency("retained", true),
+            admission_dependency("added", true),
+        ];
+        let ws = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps: deps.clone(),
+                published_at,
+                fail_fetch: false,
+            },
+            "2026-06-17T00:00:00Z".parse()?,
+            baseline.clone(),
+        )?;
+        let outcome = ws.sync(&RunOpts::default()).await;
+        assert_eq!(outcome.summary.errors, 0);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "added@1.2.3,retained@1.2.3"
+        );
+
+        let mature = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps,
+                published_at,
+                fail_fetch: false,
+            },
+            "2026-07-17T00:00:00Z".parse()?,
+            baseline,
+        )?;
+        assert_eq!(mature.sync(&RunOpts::default()).await.summary.errors, 0);
+        assert_eq!(std::fs::read_to_string(&path)?, "");
+        Ok(())
+    }
+
+    /// A registry lookup failure warns while preserving the exact native exclusions.
+    #[tokio::test]
+    async fn sync_evaluation_failure_preserves_native_exclusions() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("native-exclusions");
+        std::fs::write(&path, "retained@1.2.3")?;
+        let ws = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps: vec![admission_dependency("retained", true)],
+                published_at: None,
+                fail_fetch: true,
+            },
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+        )?;
+        let outcome = ws.sync(&RunOpts::default()).await;
+        assert_eq!(outcome.summary.errors, 0);
+        assert_eq!(outcome.summary.written, 1);
+        assert!(!outcome.warnings.is_empty());
+        assert!(outcome.items.iter().all(|item| item.error.is_none()));
+        assert_eq!(outcome.exit, Exit::Ok);
+        assert_eq!(std::fs::read_to_string(path)?, "retained@1.2.3");
+        Ok(())
+    }
+
+    /// Tolerating a transitive violation does not exempt it from the native age gate.
+    #[tokio::test]
+    async fn sync_admits_only_allowed_transitive_pins() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let ws = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps: vec![
+                    admission_dependency("direct", true),
+                    admission_dependency("transitive", false),
+                ],
+                published_at: Some("2026-06-16T00:00:00Z".parse()?),
+                fail_fetch: false,
+            },
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+        )?;
+        let opts = RunOpts {
+            transitive_mode: crate::app::TransitiveGate::Allow,
+            ..RunOpts::default()
+        };
+        assert_eq!(ws.sync(&opts).await.summary.errors, 0);
+        assert_eq!(std::fs::read_to_string(root.join("native-exclusions"))?, "");
+        assert_eq!(ws.sync(&RunOpts::default()).await.summary.errors, 0);
+        assert_eq!(std::fs::read_to_string(root.join("native-exclusions"))?, "");
+        Ok(())
+    }
+
+    /// A hidden transitive pin admitted by a shorter package window still needs an exact native
+    /// exemption, while a hidden transitive violation stays subject to the native default.
+    #[tokio::test]
+    async fn sync_evaluates_hidden_transitive_pins_against_package_policy() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let adapter = AdmissionAdapter {
+            deps: vec![
+                admission_dependency("shortened", false),
+                admission_dependency("held", false),
+            ],
+            published_at: Some("2026-06-14T00:00:00Z".parse()?),
+            fail_fetch: false,
+        };
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(adapter))?;
+        let mut project = project_ctx(CARGO, root.as_str());
+        let mut layer = cooldown_core::PolicyLayer::new(cooldown_core::Origin::Cli);
+        let mut rule = cooldown_core::Rule::new(cooldown_core::Selector::Package {
+            glob: cooldown_core::PatternGlob::new("shortened")?,
+            tool: Some(CARGO),
+        });
+        rule.window = cooldown_core::ByKind::scalar(cooldown_core::WindowSpec::MinAge(
+            jiff::SignedDuration::from_hours(24),
+        ));
+        layer.rules.push(rule);
+        project.policy.layers.push(layer);
+        let ws = Workspace::new(
+            adapters,
+            vec![project],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+        let opts = RunOpts {
+            transitive_mode: crate::app::TransitiveGate::Hide,
+            ..RunOpts::default()
+        };
+        assert_eq!(ws.sync(&opts).await.summary.errors, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("native-exclusions"))?,
+            "shortened@1.2.3"
+        );
+        Ok(())
+    }
+
+    enum AdmissionFeed {
+        Unavailable,
+        Stale,
+    }
+
+    #[async_trait::async_trait]
+    impl cooldown_core::AdvisorySource for AdmissionFeed {
+        fn id(&self) -> cooldown_core::AdvisorySourceId {
+            cooldown_core::AdvisorySourceId("osv")
+        }
+
+        async fn advisories(
+            &self,
+            _ecosystem: &str,
+            packages: &[String],
+        ) -> cooldown_core::Result<cooldown_core::AdvisoryFetch> {
+            match self {
+                Self::Unavailable => Err(cooldown_core::CoreError::System(
+                    "feed unavailable".to_string(),
+                )),
+                Self::Stale => Ok(cooldown_core::AdvisoryFetch {
+                    packages: packages
+                        .iter()
+                        .map(|package| cooldown_core::PackageAdvisories {
+                            package: package.clone(),
+                            advisories: Vec::new(),
+                        })
+                        .collect(),
+                    stale: true,
+                }),
+            }
+        }
+    }
+
+    /// Unavailable or stale advisory evidence cannot authorize pruning native security-fix
+    /// admissions, even when ordinary check would surface the feed failure as a warning.
+    #[tokio::test]
+    async fn sync_unusable_advisory_evidence_preserves_native_exclusions() -> eyre::Result<()> {
+        for (feed, failure_mode) in [
+            (AdmissionFeed::Unavailable, AdvisoryFailureMode::Warn),
+            (AdmissionFeed::Stale, AdvisoryFailureMode::Warn),
+            (AdmissionFeed::Unavailable, AdvisoryFailureMode::Error),
+            (AdmissionFeed::Stale, AdvisoryFailureMode::Error),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let path = root.join("native-exclusions");
+            let before = b"retained@1.2.3";
+            std::fs::write(&path, before)?;
+            let mut dep = admission_dependency("retained", true);
+            dep.advisory_identity = Some("retained".to_string());
+            let adapter = AdmissionAdapter {
+                deps: vec![dep],
+                published_at: Some("2026-06-16T00:00:00Z".parse()?),
+                fail_fetch: false,
+            };
+            let mut adapters = AdapterSet::new();
+            adapters.register_target_verified_mutator(Arc::new(adapter))?;
+            let mut project = project_ctx(CARGO, root.as_str());
+            let mut layer = cooldown_core::PolicyLayer::new(cooldown_core::Origin::Cli);
+            layer.advisories = Some(cooldown_core::AdvisoryPolicy {
+                enabled: Some(true),
+                mode: Some(cooldown_core::AdvisoryMode::Shorten),
+                ..cooldown_core::AdvisoryPolicy::default()
+            });
+            project.policy.layers.push(layer);
+            let ws = Workspace::new(
+                adapters,
+                vec![project],
+                "2026-06-17T00:00:00Z".parse()?,
+                Baseline::default(),
+                root,
+                vec![builtin_default_layer()],
+            )
+            .with_advisory_source(Arc::new(feed));
+            let opts = RunOpts {
+                advisory_failure: failure_mode,
+                ..RunOpts::default()
+            };
+            let outcome = ws.sync(&opts).await;
+            assert_eq!(outcome.summary.errors, 0);
+            assert_eq!(outcome.summary.written, 1);
+            assert_eq!(std::fs::read(path)?, before);
+            assert!(outcome.items.iter().all(|item| item.error.is_none()));
+            assert_eq!(outcome.exit, Exit::Ok);
+            let warning = outcome
+                .warnings
+                .iter()
+                .find(|warning| {
+                    warning.kind == cooldown_core::DiagnosticKind::AdvisorySourceUnavailable
+                })
+                .ok_or_else(|| eyre::eyre!("sync did not warn about advisory failure"))?;
+            assert_eq!(
+                warning.kind,
+                cooldown_core::DiagnosticKind::AdvisorySourceUnavailable
+            );
+        }
+        Ok(())
+    }
+
+    /// A baseline acknowledgement cannot produce an exact native admission without a known
+    /// publish time, because sync cannot prove the locked version needs the native exemption.
+    #[tokio::test]
+    async fn sync_omits_unknown_age_versions() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let ws = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps: vec![admission_dependency("unknown", true)],
+                published_at: None,
+                fail_fetch: false,
+            },
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline {
+                entries: vec![acknowledged("unknown")],
+            },
+        )?;
+        let outcome = ws.sync(&RunOpts::default()).await;
+        assert_eq!(outcome.summary.errors, 0);
+        assert_eq!(std::fs::read_to_string(root.join("native-exclusions"))?, "");
         Ok(())
     }
 }

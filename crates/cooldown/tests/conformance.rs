@@ -24,6 +24,7 @@ use cooldown::app::{
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -153,6 +154,29 @@ struct FakeEco {
 }
 
 impl FakeEco {
+    fn persist_native_exclusions(&self, project: &Project, plan: &Plan) -> Result<()> {
+        if !project.root.join("persist-native-exclusions").exists() {
+            return Ok(());
+        }
+        // Model an adapter's native write inside the same trial as its lock mutation.
+        let mut native = String::from(indoc::indoc! {"
+            minimumReleaseAge: 10080
+            minimumReleaseAgeExclude:
+        "});
+        for change in &plan.changes {
+            writeln!(native, "  - \"{}@{}\"", change.package.name, change.to)
+                .map_err(|err| CoreError::System(err.to_string()))?;
+        }
+        if let Some(fresh) = self.fresh_transitive.as_ref()
+            && self.inject_fresh_on_apply
+        {
+            writeln!(native, "  - \"{}@{}\"", fresh.package.name, fresh.current)
+                .map_err(|err| CoreError::System(err.to_string()))?;
+        }
+        std::fs::write(project.root.join("pnpm-workspace.yaml"), native)?;
+        Ok(())
+    }
+
     fn project(&self) -> Project {
         Project {
             root: self.root.clone(),
@@ -393,7 +417,21 @@ impl ToolRead for FakeEco {
                 "injected final lock verification failure".into(),
             ));
         }
+        let missing_native_exclusion = if p.root.join("persist-native-exclusions").exists()
+            && std::fs::read_to_string(p.root.join("fake.lock"))? == "mutated lock"
+        {
+            let native = std::fs::read_to_string(p.root.join("pnpm-workspace.yaml"))?;
+            self.state
+                .lock()
+                .unwrap()
+                .applied_versions
+                .iter()
+                .any(|(name, version)| !native.contains(&format!("{name}@{version}")))
+        } else {
+            false
+        };
         let stale = self.stale_lock
+            || missing_native_exclusion
             || (self.stale_lock_after_apply && self.state.lock().unwrap().apply_attempted);
         Ok(LockVerifyReport {
             status: if stale {
@@ -545,6 +583,15 @@ impl ToolWrite for FakeEco {
     }
 
     async fn mutation_journal(&self, p: &Project, _plan: &Plan) -> Result<ProjectMutationJournal> {
+        if p.root.join("persist-native-exclusions").exists() {
+            return ProjectMutationJournal::capture(
+                &p.root,
+                [
+                    camino::Utf8Path::new("fake.lock"),
+                    camino::Utf8Path::new("pnpm-workspace.yaml"),
+                ],
+            );
+        }
         #[cfg(unix)]
         if self.state.lock().unwrap().force_partial_restore_failure {
             return ProjectMutationJournal::capture(
@@ -603,6 +650,7 @@ impl ToolWrite for FakeEco {
         if self.inject_fresh_on_apply {
             state.fresh_transitive_present = true;
         }
+        self.persist_native_exclusions(p, plan)?;
         // The `hold-not-eligible` marker lists package names (one per line) the fake refuses to
         // move, reported as `NotEligible` skips — the catalog-managed / no-editable-requirement
         // shape the pnpm and npm adapters produce.
@@ -6356,6 +6404,118 @@ async fn advisory_shorten_mode_upgrades_the_fix_and_the_residual_gate_keeps_it()
     .with_advisory_source(advisory_feed());
     let flag_out = flag_ws.upgrade(&opts()).await;
     assert_eq!(flag_out.summary.applied, 0, "flag mode must not fast-track");
+}
+
+#[tokio::test]
+async fn advisory_shortened_direct_and_transitive_trials_keep_native_exclusions() -> eyre::Result<()>
+{
+    for direct in [true, false] {
+        let TmpRoot {
+            guard: _guard,
+            root,
+        } = tmp_root();
+        std::fs::write(root.join("persist-native-exclusions"), "")?;
+        std::fs::write(root.join("fake.lock"), "original lock")?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "minimumReleaseAge: 10080\n",
+        )?;
+        let mut adapter = advisory_fake(root.clone());
+        if !direct {
+            let mut dependency = adapter.direct.remove(0);
+            dependency.direct = false;
+            adapter.transitive.push(dependency);
+        }
+        adapter
+            .state
+            .get_mut()
+            .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?
+            .write_lock_on_apply = true;
+        let mut options = opts();
+        options.transitive = !direct;
+        let outcome = workspace_with_layers(
+            adapter,
+            Baseline::default(),
+            advisory_layers(Some(AdvisoryMode::Shorten)),
+        )
+        .with_advisory_source(advisory_feed())
+        .upgrade(&options)
+        .await;
+
+        assert_eq!(
+            outcome.exit,
+            Exit::Ok,
+            "direct={direct}: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.summary.applied, 1, "{:?}", outcome.items);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .all(|error| error.kind != DiagnosticKind::StaleLock)
+        );
+        assert!(outcome.items.iter().any(|item| {
+            item.applied
+                && item
+                    .security
+                    .as_ref()
+                    .is_some_and(|security| security.applied)
+        }));
+        assert!(std::fs::read_to_string(root.join("pnpm-workspace.yaml"))?.contains("a@v1.1.0"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("fake.lock"))?,
+            "mutated lock"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_advisory_trial_restores_native_workspace_bytes() -> eyre::Result<()> {
+    let TmpRoot {
+        guard: _guard,
+        root,
+    } = tmp_root();
+    std::fs::write(root.join("persist-native-exclusions"), "")?;
+    let native_before = indoc::indoc! {r#"
+        # The user's native settings must survive a rejected candidate.
+        minimumReleaseAge: 10080
+        minimumReleaseAgeExclude:
+          - "@corp/*"
+    "#};
+    std::fs::write(root.join("pnpm-workspace.yaml"), native_before)?;
+    std::fs::write(root.join("fake.lock"), "original lock")?;
+    let mut adapter = relock_introduces_fresh_transitive(root.clone());
+    adapter
+        .state
+        .get_mut()
+        .map_err(|_| eyre::eyre!("fake state mutex poisoned"))?
+        .write_lock_on_apply = true;
+    let outcome = workspace_with_layers(adapter, Baseline::default(), advisory_layers(None))
+        .with_advisory_source(Arc::new(StaticAdvisories {
+            advisories: vec![("t".to_string(), ghsa_fixed_by("GHSA-T", "v0.5.0"))],
+            stale: false,
+            unreachable: false,
+        }))
+        .upgrade(&opts())
+        .await;
+
+    assert_eq!(outcome.summary.applied, 0, "{:?}", outcome.items);
+    assert!(outcome.items.iter().any(|item| {
+        item.skipped
+            .as_ref()
+            .is_some_and(|skipped| skipped.reason == SkipReason::TransitiveInCooldown)
+    }));
+    assert_eq!(
+        std::fs::read(root.join("pnpm-workspace.yaml"))?,
+        native_before.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("fake.lock"))?,
+        "original lock"
+    );
+    Ok(())
 }
 
 /// A young cross-major security fix (2 days old, matured only under the 1-day security window)
