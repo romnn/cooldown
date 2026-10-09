@@ -49,7 +49,8 @@ impl WidenFixture {
             #!/bin/sh
             set -eu
             printf '%s\n' "$*" >> invocations
-            count=$(wc -l < invocations)
+            # Arithmetic expansion drops the padding BSD `wc` puts before the count.
+            count=$(($(wc -l < invocations)))
             {behavior}
             cat metadata.json
         "#},

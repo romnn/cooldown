@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cooldown_core::{Change, CoreError, MemberRef, Project};
 use sha2::{Digest as _, Sha256};
 
@@ -547,9 +547,9 @@ fn has_complex_member_globs(
                         .any(|member| {
                             let components = Utf8Path::new(member).components().collect::<Vec<_>>();
                             components.iter().enumerate().any(|(index, component)| {
-                                component.as_str().contains("**")
+                                is_recursive_glob_component(component)
                                     || (index + 1 < components.len()
-                                        && component.as_str().contains(['*', '?', '[', '{']))
+                                        && is_glob_component(component))
                             })
                         })
                 })
@@ -832,7 +832,7 @@ fn manifest_references(
             // and config is included without depending on Cargo or the owning-member list.
             let mut prefix = Utf8PathBuf::new();
             for component in joined.components() {
-                if component.as_str().contains(['*', '?', '[', '{']) {
+                if is_glob_component(&component) {
                     break;
                 }
                 prefix.push(component.as_str());
@@ -870,6 +870,16 @@ fn manifest_references(
         references.push(directory.join(workspace));
     }
     Ok(references)
+}
+
+// Only normal components hold member patterns.
+// A Windows verbatim prefix such as `\\?\C:` contains `?` without being a glob.
+fn is_glob_component(component: &Utf8Component<'_>) -> bool {
+    matches!(component, Utf8Component::Normal(name) if name.contains(['*', '?', '[', '{']))
+}
+
+fn is_recursive_glob_component(component: &Utf8Component<'_>) -> bool {
+    matches!(component, Utf8Component::Normal(name) if name.contains("**"))
 }
 
 fn collect_dependency_paths<'a>(
