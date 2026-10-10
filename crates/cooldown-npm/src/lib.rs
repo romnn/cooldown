@@ -14,6 +14,7 @@ mod manifest;
 mod native;
 pub mod nodecmd;
 mod npmrc;
+mod patches;
 mod peers;
 pub mod registry;
 pub mod tool;

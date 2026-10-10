@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Previews and dry runs stage declared npm patch files.** `outdated`, `explain`, and
+  `upgrade --dry-run` resolve in a throwaway copy, which now includes every patch named by
+  `patchedDependencies` in `pnpm-workspace.yaml` or `package.json` (pnpm and bun). pnpm hashes
+  those files while resolving, so a project with patched dependencies previously failed every
+  trial with `ENOENT` and reported each candidate as blocked.
+
 ## v0.0.24
 
 - **Cargo retries reuse rejections for identical resolution inputs within a run.** Tentative
