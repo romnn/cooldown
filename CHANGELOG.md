@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.25
+
 - **Previews and dry runs stage declared npm patch files.** `outdated`, `explain`, and
   `upgrade --dry-run` resolve in a throwaway copy, which now includes every patch named by
   `patchedDependencies` in `pnpm-workspace.yaml` or `package.json` (pnpm and bun). pnpm hashes
