@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.26
+
 - **uv honors package-level `min-age` rules.** A `[tool.uv.package."<name>"]` rule, or an
   unqualified `[package."<name>"]` one, now reaches uv's own per-package cutoff. `sync` writes it
   into the repository `uv.toml` as `exclude-newer-package` beside `exclude-newer` (a `0d`,
