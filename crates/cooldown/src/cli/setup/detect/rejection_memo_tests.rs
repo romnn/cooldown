@@ -124,6 +124,7 @@ async fn attempt_twice(flag: &str) -> eyre::Result<()> {
         root: root.clone(),
         kind: CARGO_ID,
         exclude_newer: None,
+        exclude_newer_package: std::collections::BTreeMap::new(),
         generated_members: GeneratedMembers::undeclared(),
     };
     let manifest_before = std::fs::read(&project.manifest)?;

@@ -357,6 +357,7 @@ mod tests {
             kind: Maven::ID,
             manifest: root.join("pom.xml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");

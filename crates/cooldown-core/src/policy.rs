@@ -21,4 +21,6 @@ pub use model::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, window_exclude_newer,
 };
-pub use resolve::{MaxMajorPick, exempt_package_globs, resolve, resolve_max_major};
+pub use resolve::{
+    MaxMajorPick, exempt_package_globs, package_windows, resolve, resolve_max_major,
+};

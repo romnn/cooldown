@@ -98,6 +98,30 @@ pub fn set_toml_string(
     val: &str,
     dry_run: bool,
 ) -> Result<bool, CoreError> {
+    set_toml_value(path, keys, Some(val.into()), dry_run)
+}
+
+/// Set or remove a nested value in a TOML file, format-preserving.
+///
+/// Like [`set_toml_string`], but for any value, including an inline table, and `None` removes the
+/// leaf instead, so a caller that owns a key can make it disappear again.
+/// The comparison is semantic: an existing value spelled differently (a standard
+/// `[exclude-newer-package]` table instead of an inline one, other key order or spacing) that holds
+/// the same data counts as unchanged and is left as written.
+/// Removing a key that is absent, including from a missing file, changes nothing and creates no
+/// file.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
+/// read or written, or [`CoreError::Config`](cooldown_core::CoreError::Config) if it is not valid
+/// TOML, the key path is empty, or an intermediate key exists but is not a table.
+pub fn set_toml_value(
+    path: &Utf8Path,
+    keys: &[&str],
+    val: Option<toml_edit::Value>,
+    dry_run: bool,
+) -> Result<bool, CoreError> {
     let (last, parents) = keys
         .split_last()
         .ok_or_else(|| CoreError::Config("empty TOML key path".to_string()))?;
@@ -110,6 +134,32 @@ pub fn set_toml_string(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| CoreError::Config(format!("{path}: invalid TOML: {e}")))?;
 
+    // Reject a non-table parent before the dry-run return, so a dry run fails exactly where the
+    // real write would.
+    let mut parent = Some(doc.as_table());
+    for key in parents {
+        parent = match parent.and_then(|table| table.get(key)) {
+            None => None,
+            Some(item) => Some(
+                item.as_table()
+                    .ok_or_else(|| CoreError::Config(format!("{path}: [{key}] is not a table")))?,
+            ),
+        };
+    }
+    let existing = existing_value(&content, keys)
+        .map_err(|e| CoreError::Config(format!("{path}: invalid TOML: {e}")))?;
+    let wanted = val
+        .as_ref()
+        .map(plain_value)
+        .transpose()
+        .map_err(|e| CoreError::Config(format!("{path}: unrepresentable TOML value: {e}")))?;
+    if existing == wanted {
+        return Ok(false);
+    }
+    if dry_run {
+        return Ok(true);
+    }
+
     let mut table = doc.as_table_mut();
     for key in parents {
         table = table
@@ -118,25 +168,44 @@ pub fn set_toml_string(
             .as_table_mut()
             .ok_or_else(|| CoreError::Config(format!("{path}: [{key}] is not a table")))?;
     }
-
-    if table.get(last).and_then(toml_edit::Item::as_str) == Some(val) {
-        return Ok(false);
-    }
-    if dry_run {
-        return Ok(true);
-    }
     // Replacing the value via the existing key keeps the key's prefix decor (a leading `#` comment)
     // and the value's own (a trailing one), so a documented `exclude-newer` line keeps its
     // comments; a missing key is inserted fresh.
-    match table.get_mut(last) {
-        Some(item) => replace_value(item, val),
-        None => {
-            table.insert(last, toml_edit::value(val));
+    match (val, table.get_mut(last)) {
+        (Some(val), Some(item)) => replace_value(item, val),
+        (Some(val), None) => {
+            table.insert(last, toml_edit::Item::Value(val));
+        }
+        (None, _) => {
+            table.remove(last);
         }
     }
     std::fs::write(path, doc.to_string())
         .map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))?;
     Ok(true)
+}
+
+/// The plain data at `keys` in the TOML `content`, or `None` when any key on the path is absent.
+fn existing_value(content: &str, keys: &[&str]) -> Result<Option<toml::Value>, toml::de::Error> {
+    let mut value = toml::Value::Table(toml::from_str::<toml::Table>(content)?);
+    for key in keys {
+        match value {
+            toml::Value::Table(mut table) => match table.remove(*key) {
+                Some(next) => value = next,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(value))
+}
+
+/// The plain data a format-preserving value holds, for a comparison that ignores its spelling.
+fn plain_value(value: &toml_edit::Value) -> Result<toml::Value, toml::de::Error> {
+    let mut table = toml::from_str::<toml::Table>(&format!("value = {value}"))?;
+    table
+        .remove("value")
+        .ok_or_else(|| serde::de::Error::custom("the parsed document lost its only key"))
 }
 
 #[cfg(test)]
@@ -279,5 +348,96 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("14 days")
         );
+    }
+
+    fn inline_table(entries: &[(&str, toml_edit::Value)]) -> toml_edit::Value {
+        let mut table = toml_edit::InlineTable::new();
+        for (key, value) in entries {
+            table.insert(*key, value.clone());
+        }
+        table.fmt();
+        table.into()
+    }
+
+    /// An owned table is inserted, rewritten when its entries change, and removed again, while
+    /// the neighbouring key and its comment stay untouched.
+    #[test]
+    fn set_toml_value_inserts_rewrites_and_removes_a_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("uv.toml")).expect("utf8 path");
+        std::fs::write(&path, "# repo window\nexclude-newer = \"14 days\"\n").expect("write");
+        let key = ["exclude-newer-package"];
+
+        // Insert
+        let exempt = inline_table(&[("onnxruntime", false.into())]);
+        assert!(set_toml_value(&path, &key, Some(exempt.clone()), false).expect("insert"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "# repo window\nexclude-newer = \"14 days\"\nexclude-newer-package = { onnxruntime = false }\n"
+        );
+        assert!(!set_toml_value(&path, &key, Some(exempt), false).expect("idempotent"));
+
+        // Rewrite
+        let both = inline_table(&[("numpy", "30 days".into()), ("onnxruntime", false.into())]);
+        assert!(set_toml_value(&path, &key, Some(both), false).expect("rewrite"));
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("exclude-newer-package = { numpy = \"30 days\", onnxruntime = false }")
+        );
+
+        // Remove
+        assert!(set_toml_value(&path, &key, None, false).expect("remove"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "# repo window\nexclude-newer = \"14 days\"\n"
+        );
+        assert!(!set_toml_value(&path, &key, None, false).expect("already absent"));
+    }
+
+    /// The same data spelled as a standard table, in another order, is already in sync, so a
+    /// hand-formatted table is not churned.
+    #[test]
+    fn set_toml_value_compares_data_not_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("uv.toml")).expect("utf8 path");
+        let before = "[exclude-newer-package]\nonnxruntime = false\nnumpy = \"30 days\"\n";
+        std::fs::write(&path, before).expect("write");
+
+        let same = inline_table(&[("numpy", "30 days".into()), ("onnxruntime", false.into())]);
+        assert!(
+            !set_toml_value(&path, &["exclude-newer-package"], Some(same), false).expect("set")
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    /// Removing a key never creates a file, and a dry run reports a change without writing one.
+    #[test]
+    fn set_toml_value_removal_and_dry_run_leave_the_disk_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("uv.toml")).expect("utf8 path");
+        let key = ["exclude-newer-package"];
+
+        assert!(!set_toml_value(&path, &key, None, false).expect("remove from missing file"));
+        let exempt = inline_table(&[("onnxruntime", false.into())]);
+        assert!(set_toml_value(&path, &key, Some(exempt), true).expect("dry run"));
+        assert!(!path.exists(), "neither call may create the file");
+    }
+
+    /// A dry run refuses a non-table parent the same way the real write does.
+    #[test]
+    fn set_toml_value_dry_run_rejects_a_non_table_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(dir.path().join("pyproject.toml")).expect("utf8 path");
+        std::fs::write(&path, "tool = 1\n").expect("write");
+        let keys = ["tool", "uv", "exclude-newer"];
+
+        for dry_run in [true, false] {
+            let err = set_toml_value(&path, &keys, Some("14 days".into()), dry_run)
+                .expect_err("a scalar parent must be rejected");
+            std::assert_matches!(err, CoreError::Config(_));
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "tool = 1\n");
     }
 }

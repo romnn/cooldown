@@ -6,7 +6,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{builtin_default_layer, layer_from_fields};
 use cooldown_core::{
     CoreError, GeneratedMembers, Origin, PolicyLayer, PolicyStack, Project, ResolveKind,
-    ResolveQuery, SyncScope, ToolId, normalize_native, resolve, window_exclude_newer,
+    ResolveQuery, SyncScope, ToolId, normalize_native, package_windows, resolve,
+    window_exclude_newer,
 };
 use jiff::Timestamp;
 
@@ -157,8 +158,9 @@ async fn assemble_ctx(
     // window rather than the tool's or environment's default — which may be shorter, silently
     // weakening the supply-chain delay. An age window becomes a *relative* span ("14 days") so the
     // persisted value stays stable across runs (no per-run churn in the file); a freeze becomes its
-    // absolute instant. The default-window query mirrors `sync` (per-package/per-kind windows are not
-    // expressible as one resolver cutoff), and the effective duration (`now - cutoff`) folds in any floor.
+    // absolute instant. The default-window query mirrors `sync` (per-kind windows are not
+    // expressible as one resolver cutoff; per-package windows travel separately, below), and the
+    // effective duration (`now - cutoff`) folds in any floor.
     let query = ResolveQuery {
         tool,
         package: "",
@@ -183,6 +185,9 @@ async fn assemble_ctx(
     // explicitly disclaimed one) and resolves to the latest releases.
     project.exclude_newer =
         window_exclude_newer(&effective).or_else(|| Some(assembly.now.to_string()));
+    // The per-package windows travel beside the default, so a package-level exemption or stricter
+    // window reaches a per-package resolver cutoff (uv's `--exclude-newer-package`) too.
+    project.exclude_newer_package = package_windows(&layers, tool, &rel_path, assembly.now);
 
     Ok(ProjectCtx {
         tool,

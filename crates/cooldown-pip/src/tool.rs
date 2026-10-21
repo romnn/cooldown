@@ -488,6 +488,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
@@ -597,6 +598,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -658,6 +660,7 @@ mod tests {
             kind: Poetry::ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_pin(Poetry::ID, "django")];
@@ -683,6 +686,7 @@ mod tests {
             kind: Pip::ID,
             manifest: root.join("requirements.txt"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
@@ -734,6 +738,7 @@ mod tests {
             kind: Poetry::ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");

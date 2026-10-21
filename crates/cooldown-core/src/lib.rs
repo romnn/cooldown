@@ -38,7 +38,7 @@ pub use mutation::{
 pub use policy::{
     ByKind, MaxMajorPick, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,
     ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, exempt_package_globs,
-    resolve, resolve_max_major, window_exclude_newer,
+    package_windows, resolve, resolve_max_major, window_exclude_newer,
 };
 pub use ports::{
     AcceptedPublication, AdmittedVersion, ApplyAttempt, ApplyAttemptOutcome, ApplyObserver,

@@ -183,6 +183,7 @@ impl FakeEco {
             kind: GO,
             manifest: self.root.join("go.mod"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
@@ -232,6 +233,7 @@ impl IsolatedMutationStrategy for FakeEco {
             manifest: root.join("go.mod"),
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
+            exclude_newer_package: source.exclude_newer_package.clone(),
             generated_members: source.generated_members.clone(),
         };
         Ok(Box::new(FakeMutationStage {
@@ -5186,6 +5188,7 @@ impl RepoScopedFake {
             kind: REPO_TOOL,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
@@ -5446,6 +5449,7 @@ impl ProjectScopedFake {
             kind: PROJECT_TOOL,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
@@ -5617,6 +5621,7 @@ impl HeldConflictFake {
             kind: HELD_TOOL,
             manifest: self.root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }

@@ -609,3 +609,158 @@ fn explicit_upper_bound_holds_until_rewrite() {
         "the crossed bound must be rewritten"
     );
 }
+
+/// The freeze the package-exemption fixture resolves under: `certifi` 2026.6.17 (uploaded
+/// 2026-06-17) is younger than it, so only a per-package exemption admits the pin below.
+const EXEMPTION_FREEZE: &str = "2026-06-07T00:00:00Z";
+
+/// A repo policy that freezes every uv package at [`EXEMPTION_FREEZE`] but exempts `certifi`.
+const EXEMPTION_POLICY: &str = indoc! {r#"
+    freeze = "2026-06-07T00:00:00Z"
+
+    [tool.uv.package."certifi"]
+    min-age = "0d"
+"#};
+
+/// The policy with the exemption removed again.
+const FROZEN_POLICY: &str = indoc! {r#"
+    freeze = "2026-06-07T00:00:00Z"
+"#};
+
+const EXEMPTION_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-package-exemption"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "certifi==2026.6.17",
+    ]
+"#};
+
+/// A package-level exemption reaches uv's own per-package cutoff through `sync`: written into the
+/// repo `uv.toml`, it lets a plain `uv lock` resolve the exempted pin, and cooldown's own
+/// `uv lock --check`, which passes the same override, accepts exactly that lock.
+/// Removing the exemption removes the synced entry again and the gate refuses the pin.
+#[test]
+fn package_exemption_reaches_uv_through_sync_and_cooldown_commands() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("cooldown.toml", EXEMPTION_POLICY);
+    fixture.write(".python-version", PYTHON_VERSION);
+    // Seed a lock under the freeze from a loose requirement, so the project is detected, then pin
+    // the release only the exemption admits.
+    fixture.write(
+        "pyproject.toml",
+        &EXEMPTION_PYPROJECT.replace("certifi==2026.6.17", "certifi>=2024.1.1"),
+    );
+    seed_lock(&fixture, EXEMPTION_FREEZE);
+    fixture.write("pyproject.toml", EXEMPTION_PYPROJECT);
+
+    // Sync writes the exemption next to the default cutoff, as uv's `false`.
+    let synced = fixture.cooldown(&["sync", "--tool", "uv"]).expect_success();
+    let uv_toml = String::from_utf8_lossy(&fixture.read_bytes("uv.toml")).into_owned();
+    assert!(
+        uv_toml.contains(r#"exclude-newer = "2026-06-07T00:00:00Z""#)
+            && uv_toml.contains("exclude-newer-package = { certifi = false }"),
+        "unexpected uv.toml after sync:\n{uv_toml}\n{}",
+        synced.stderr_str()
+    );
+
+    // A plain `uv lock` under the synced config adopts the exempted pin.
+    fixture.run_tool("uv", &["lock"], &[]).expect_success();
+    let plain_lock = fixture.read_bytes("uv.lock");
+    assert_eq!(
+        toml_lock_pins(&plain_lock)
+            .get("certifi")
+            .map(String::as_str),
+        Some("2026.6.17")
+    );
+
+    // cooldown's own `uv lock --check` agrees with that lock, and the gate exempts the pin.
+    let check = fixture.cooldown_json(&["check", "--tool", "uv"]);
+    assert!(check.ok(), "check must accept the synced lock");
+    assert_eq!(check.summary_errors(), 0);
+    assert_eq!(check.summary_violations(), 0);
+
+    // The gate exempts the pin, so `fix` has nothing to mature and leaves that lock alone.
+    let fixed = fixture.cooldown_json(&["fix", "--tool", "uv"]);
+    assert_eq!(fixed.summary_errors(), 0, "fix must not fail");
+    assert_eq!(fixed.summary_applied(), 0);
+    assert_eq!(plain_lock, fixture.read_bytes("uv.lock"));
+
+    // Without the exemption, sync drops the entry it owns and the pin is too fresh again.
+    fixture.write("cooldown.toml", FROZEN_POLICY);
+    fixture.cooldown(&["sync", "--tool", "uv"]).expect_success();
+    let uv_toml = String::from_utf8_lossy(&fixture.read_bytes("uv.toml")).into_owned();
+    assert!(
+        !uv_toml.contains("exclude-newer-package"),
+        "sync must remove the entry it wrote:\n{uv_toml}"
+    );
+    let refused = fixture.cooldown_json(&["check", "--tool", "uv"]);
+    assert!(
+        !refused.ok(),
+        "check must refuse the pin once the exemption is gone"
+    );
+}
+
+/// A manifest that admits the exempted `certifi` 2026.6.17 but nothing newer, and whose own
+/// `[tool.uv]` table makes uv ignore the repo `uv.toml` above it.
+const SHADOWING_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-shadowing-exemption"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "certifi>=2024.1.1,<2026.7",
+    ]
+
+    [tool.uv]
+    constraint-dependencies = []
+"#};
+
+/// A project below the repo root with its own `[tool.uv]` table ignores the synced repo `uv.toml`,
+/// so only the overrides cooldown passes on the command line carry the exemption: `upgrade` must
+/// re-resolve to the exempted release the gate admits, and `check` must accept the lock it produced.
+#[test]
+fn package_exemption_reaches_uv_in_a_project_that_shadows_the_repo_config() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("cooldown.toml", EXEMPTION_POLICY);
+    fixture.write("app/.python-version", PYTHON_VERSION);
+    fixture.write("app/pyproject.toml", SHADOWING_PYPROJECT);
+    // Seed under the freeze alone, so the lock starts on the last release before it.
+    fixture
+        .run_tool(
+            "uv",
+            &["lock", "--directory", "app"],
+            &[("UV_EXCLUDE_NEWER", EXEMPTION_FREEZE)],
+        )
+        .expect_success();
+    assert_eq!(
+        toml_lock_pins(&fixture.read_bytes("app/uv.lock"))
+            .get("certifi")
+            .map(String::as_str),
+        Some("2026.5.20")
+    );
+    // The repo `uv.toml` carries the exemption, but uv never reads it for this project.
+    fixture.cooldown(&["sync", "--tool", "uv"]).expect_success();
+    assert!(
+        String::from_utf8_lossy(&fixture.read_bytes("uv.toml"))
+            .contains("exclude-newer-package = { certifi = false }")
+    );
+
+    // The exemption makes 2026.6.17 adoptable, and uv only resolves it with the override.
+    let upgraded = fixture.cooldown_json(&["upgrade", "--tool", "uv"]);
+    assert_eq!(upgraded.summary_errors(), 0, "upgrade must not fail");
+    assert!(upgraded.applied_names().contains("certifi"));
+    assert_eq!(
+        toml_lock_pins(&fixture.read_bytes("app/uv.lock"))
+            .get("certifi")
+            .map(String::as_str),
+        Some("2026.6.17")
+    );
+
+    let check = fixture.cooldown_json(&["check", "--tool", "uv"]);
+    assert!(check.ok(), "check must accept the lock upgrade produced");
+    assert_eq!(check.summary_violations(), 0);
+}

@@ -198,6 +198,10 @@ max-major = 24
 Raising or removing the value in `cooldown.toml` is the only way to cross a configured
 `max-major`. There is no CLI or environment override.
 
+A package rule that applies to uv also reaches uv's own per-package cutoff: `cooldown sync` writes
+it into `exclude-newer-package`, and cooldown passes it to every uv command it runs (see
+[`sync`]({{< relref "../commands/other.md" >}}#uv)).
+
 ## Choosing a level
 
 - Trust a whole **registry** (an internal index)? Use `[registry."…"]`.

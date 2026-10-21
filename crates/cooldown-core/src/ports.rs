@@ -1378,6 +1378,11 @@ pub struct ResolvedPolicy {
     /// to bake into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`). Empty for
     /// tools without such a native knob, which simply ignore it.
     pub exempt_packages: Vec<String>,
+    /// The effective window of every package a literal `package` selector names (see
+    /// [`package_windows`](crate::package_windows)), to bake into a native per-package cutoff
+    /// table (uv's `exclude-newer-package`).
+    /// Empty for tools without such a knob, which simply ignore it.
+    pub package_windows: std::collections::BTreeMap<String, crate::WindowSpec>,
     /// Exact locked versions admitted by read-side evaluation while still younger than the
     /// native default window.
     /// Successful evaluation supplies `Some`, including an empty list to prune expired admissions.

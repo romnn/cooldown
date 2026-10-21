@@ -287,6 +287,7 @@ fn repo(roots: [&str; 2], staling: impl FnOnce(&Utf8PathBuf) -> Staling) -> eyre
                 root: project_root,
                 kind: FAKE,
                 exclude_newer: None,
+                exclude_newer_package: std::collections::BTreeMap::new(),
                 generated_members: cooldown_core::GeneratedMembers::undeclared(),
             },
             rel_path: Utf8PathBuf::from(rel),

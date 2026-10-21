@@ -277,6 +277,7 @@ mod tests {
             kind: SWIFT_ID,
             manifest: root.join("Package.swift"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
@@ -307,6 +308,7 @@ mod tests {
             kind: SWIFT_ID,
             manifest: root.join("Package.swift"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
