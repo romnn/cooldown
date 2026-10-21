@@ -366,6 +366,7 @@ fn project(
             kind: tool,
             manifest: root.join(manifest),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         },
         rel_path,

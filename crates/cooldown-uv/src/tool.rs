@@ -3,6 +3,7 @@
 //! `uv`-driven resolution/apply. The core owns the verdict; uv only resolves/applies a window.
 
 use crate::artifact::published_at_for_artifacts;
+use crate::cutoff::{Cutoffs, package_cutoffs};
 use crate::lock::UvLock;
 use crate::manifest;
 use crate::native::parse_native;
@@ -349,7 +350,7 @@ impl ToolRead for UvTool {
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         match self
             .uv
-            .verify_check(&project.root, project.exclude_newer.as_deref())
+            .verify_check(&project.root, &Cutoffs::for_project(project))
             .await
         {
             // The stale detail names the project so a repository with several uv locks says which
@@ -607,10 +608,12 @@ impl UvTool {
             return (held.to_string(), None);
         };
         let lift = crate::ceiling::lift(lock, &ceiling, held, target, &self.pypi).await;
+        // The lifting release is the blocker's, so it is dated against the blocker's own cutoff.
+        let cutoffs = Cutoffs::for_project(project);
         let detail = ceiling.detail(
             held,
             lift.as_ref(),
-            project.exclude_newer.as_deref(),
+            cutoffs.for_package(&ceiling.blocker),
             jiff::Timestamp::now(),
         );
         (ceiling.blocker, detail)
@@ -627,7 +630,7 @@ impl UvTool {
                 &project.root,
                 upgrade,
                 ceilings,
-                project.exclude_newer.as_deref(),
+                &Cutoffs::for_project(project),
             )
             .await
     }
@@ -895,16 +898,22 @@ impl ToolWrite for UvTool {
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         self.uv
-            .sync(&project.root, project.exclude_newer.as_deref())
+            .sync(&project.root, &Cutoffs::for_project(project))
             .await
     }
 
-    // uv's native cooldown config is repo-scoped (`SyncScope::Repo`), not per-project: the per-project
-    // `[tool.uv] exclude-newer` in a `pyproject.toml` is inert to uv and a per-project `uv.toml` would
-    // shadow that project's `[tool.uv]` sources/overrides. So `write_native` stays the default
-    // `Unsupported` (cooldown drives the window directly via `--exclude-newer` / `UV_EXCLUDE_NEWER` on
-    // every invocation) and the sync instead writes a single repo-root `uv.toml` via
-    // `write_repo_native`. The native *reader* still honors a window a project declares.
+    // uv's native cooldown config is synced repo-scoped (`SyncScope::Repo`), not per-project, so
+    // `write_native` stays the default `Unsupported` and the sync writes a single repo-root `uv.toml`
+    // via `write_repo_native`.
+    // A project's own `[tool.uv]` table is not a sync target because the native reader takes it as
+    // policy: a value sync wrote there would feed back as an input, and a written
+    // `exclude-newer-package` `false` would become a native `allow` that outlives the cooldown.toml
+    // rule it came from.
+    // Creating such a table or a per-project `uv.toml` would also shadow the repo `uv.toml` and with
+    // it any index or source settings the project inherits.
+    // uv reads only the nearest config file, so a project that has its own `[tool.uv]` table ignores
+    // the repo `uv.toml`; cooldown still pins its window on every uv command it runs
+    // (`--exclude-newer`, `--exclude-newer-package`, `UV_EXCLUDE_NEWER`), whatever the files say.
 
     fn sync_scope(&self) -> SyncScope {
         SyncScope::Repo
@@ -917,24 +926,52 @@ impl ToolWrite for UvTool {
         dry_run: bool,
     ) -> Result<SyncReport> {
         let path = repo_root.join("uv.toml");
-        let Some(value) = policy
+        // A `uv.toml` is a flat config file, so the keys are the top-level `exclude-newer` and
+        // `exclude-newer-package` — not the `[tool.uv]`-nested form a `pyproject.toml` uses.
+        // A `Latest`/zero default excludes nothing, so there is no default cutoff to write; the
+        // per-package table is still owned, since a stricter package window needs it all the same.
+        let default = policy
             .default_window
             .as_ref()
-            .and_then(cooldown_core::window_exclude_newer)
-        else {
-            // A `Latest`/zero window excludes nothing, so there is no native cutoff to write.
-            return Ok(SyncReport::Unchanged { path });
+            .and_then(cooldown_core::window_exclude_newer);
+        let mut written = match default {
+            Some(value) => {
+                cooldown_toml_util::set_toml_string(&path, &["exclude-newer"], &value, dry_run)?
+            }
+            None => false,
         };
-        // A `uv.toml` is a flat config file, so the key is the top-level `exclude-newer` — not the
-        // `[tool.uv]`-nested form a `pyproject.toml` uses.
-        let written =
-            cooldown_toml_util::set_toml_string(&path, &["exclude-newer"], &value, dry_run)?;
+        written |= cooldown_toml_util::set_toml_value(
+            &path,
+            &["exclude-newer-package"],
+            exclude_newer_package_table(&policy.package_windows),
+            dry_run,
+        )?;
         if written {
             Ok(SyncReport::Written { path })
         } else {
             Ok(SyncReport::Unchanged { path })
         }
     }
+}
+
+/// The `exclude-newer-package` inline table for `windows`, or `None` when no package needs an
+/// entry, so the key is removed rather than left empty.
+///
+/// cooldown owns the key outright: the table is rebuilt from the policy on every sync, so an entry
+/// whose `cooldown.toml` rule was removed disappears again.
+fn exclude_newer_package_table(
+    windows: &std::collections::BTreeMap<String, cooldown_core::WindowSpec>,
+) -> Option<toml_edit::Value> {
+    let cutoffs = package_cutoffs(windows);
+    if cutoffs.is_empty() {
+        return None;
+    }
+    let mut table = toml_edit::InlineTable::new();
+    for (package, cutoff) in cutoffs {
+        table.insert(&package, cutoff.to_toml());
+    }
+    table.fmt();
+    Some(table.into())
 }
 
 #[cfg(test)]
@@ -1077,6 +1114,7 @@ mod tests {
             kind: UV_ID,
             manifest: Utf8PathBuf::from("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let dep = Dependency {
@@ -1178,6 +1216,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1250,6 +1289,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1359,6 +1399,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1419,6 +1460,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1452,6 +1494,7 @@ mod tests {
             kind: UV_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1492,6 +1535,7 @@ mod tests {
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: Vec::new(),
+            package_windows: std::collections::BTreeMap::new(),
         };
         let uv_toml = root.join("uv.toml");
 
@@ -1525,6 +1569,7 @@ mod tests {
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
+            package_windows: std::collections::BTreeMap::new(),
         };
 
         let report = tool
@@ -1534,6 +1579,98 @@ mod tests {
         std::assert_matches!(report, SyncReport::Unchanged { .. });
         // A `Latest` window excludes nothing, so no uv.toml is created.
         assert!(!root.join("uv.toml").exists());
+    }
+
+    /// `sync` carries package-level windows into `exclude-newer-package` beside the default and
+    /// owns the key: a changed policy rewrites the table and a removed exemption disappears.
+    #[tokio::test]
+    async fn write_repo_native_owns_the_exclude_newer_package_table() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let uv_toml = root.join("uv.toml");
+        // A hand-written comment and an unrelated uv setting must survive every rewrite.
+        std::fs::write(&uv_toml, "# repo uv config\nnative-tls = true\n")?;
+        let tool = uv_tool();
+        let days = |count: i64| {
+            cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_hours(24 * count))
+        };
+        let policy = |packages: &[(&str, cooldown_core::WindowSpec)]| ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
+            default_window: Some(days(14)),
+            exempt_packages: Vec::new(),
+            package_windows: packages
+                .iter()
+                .map(|(name, window)| ((*name).to_string(), window.clone()))
+                .collect(),
+        };
+
+        // A `0d` exemption is `false`, so the package leaves the default window entirely, and a
+        // name uv cannot key is left out.
+        let exempt = policy(&[("onnxruntime", days(0)), ("@scope/pkg", days(0))]);
+        let report = tool.write_repo_native(&root, &exempt, false).await?;
+        std::assert_matches!(report, SyncReport::Written { .. });
+        assert_eq!(
+            std::fs::read_to_string(&uv_toml)?,
+            indoc! {r#"
+                # repo uv config
+                native-tls = true
+                exclude-newer = "14 days"
+                exclude-newer-package = { onnxruntime = false }
+            "#}
+        );
+        let again = tool.write_repo_native(&root, &exempt, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+
+        // A dry run of a changed policy reports the write without performing it.
+        let stricter = policy(&[("numpy", days(30)), ("onnxruntime", days(0))]);
+        let dry = tool.write_repo_native(&root, &stricter, true).await?;
+        std::assert_matches!(dry, SyncReport::Written { .. });
+        assert!(!std::fs::read_to_string(&uv_toml)?.contains("numpy"));
+
+        // A stricter package window is a relative span, like the default.
+        tool.write_repo_native(&root, &stricter, false).await?;
+        assert!(
+            std::fs::read_to_string(&uv_toml)?
+                .contains(r#"exclude-newer-package = { numpy = "30 days", onnxruntime = false }"#)
+        );
+
+        // Removing every package rule removes the key again.
+        let removed = tool.write_repo_native(&root, &policy(&[]), false).await?;
+        std::assert_matches!(removed, SyncReport::Written { .. });
+        assert_eq!(
+            std::fs::read_to_string(&uv_toml)?,
+            "# repo uv config\nnative-tls = true\nexclude-newer = \"14 days\"\n"
+        );
+        Ok(())
+    }
+
+    /// With no default window there is no default cutoff to write, but a stricter package window
+    /// still reaches the table.
+    #[tokio::test]
+    async fn write_repo_native_writes_package_windows_under_a_latest_default() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let policy = ResolvedPolicy {
+            admitted_versions: Some(Vec::new()),
+            default_window: Some(cooldown_core::WindowSpec::Latest),
+            exempt_packages: Vec::new(),
+            package_windows: [(
+                "numpy".to_string(),
+                cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_hours(24 * 30)),
+            )]
+            .into(),
+        };
+
+        let report = uv_tool().write_repo_native(&root, &policy, false).await?;
+
+        std::assert_matches!(report, SyncReport::Written { .. });
+        assert_eq!(
+            std::fs::read_to_string(root.join("uv.toml"))?,
+            "exclude-newer-package = { numpy = \"30 days\" }\n"
+        );
+        Ok(())
     }
 
     /// Out-of-tree local sources become external roots: editable/directory dependencies and
@@ -1591,6 +1728,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1657,6 +1795,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1708,6 +1847,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -1757,6 +1897,7 @@ mod tests {
             kind: UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 

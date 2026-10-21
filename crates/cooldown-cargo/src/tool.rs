@@ -3607,6 +3607,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: generated,
         }
     }
@@ -4445,6 +4446,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: "/repo/Cargo.toml".into(),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -4474,6 +4476,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: other_root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
@@ -4499,6 +4502,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
@@ -4541,6 +4545,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir()?;
@@ -4586,6 +4591,7 @@ mod tests {
             kind: CARGO_ID,
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -4685,6 +4691,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))
@@ -4795,6 +4802,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))
@@ -5128,6 +5136,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let plan = Plan {
@@ -5343,6 +5352,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok((project, tool))

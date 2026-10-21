@@ -95,6 +95,12 @@ impl PatternGlob {
         self.matcher.is_match(s)
     }
 
+    /// Whether the pattern has no glob syntax, so it matches only its own text.
+    #[must_use]
+    pub fn is_literal(&self) -> bool {
+        !self.raw.contains(['*', '?', '[', ']', '{', '}', '\\'])
+    }
+
     /// Returns the original pattern text the glob was compiled from.
     #[must_use]
     pub fn raw(&self) -> &str {

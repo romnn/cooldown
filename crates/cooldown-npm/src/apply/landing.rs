@@ -469,6 +469,7 @@ mod tests {
             manifest: root.join("package.json"),
             kind: Npm::ID,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
@@ -663,6 +664,7 @@ mod tests {
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         Ok(DeclaredProject {
@@ -839,6 +841,7 @@ mod tests {
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut change = change("chalk", "5.6.0", "5.6.2");
@@ -908,6 +911,7 @@ mod tests {
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let change = change("chalk", "5.6.0", "5.6.2");
@@ -980,6 +984,7 @@ mod tests {
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut change = change("nanoid", "3.1.0", "3.3.0");

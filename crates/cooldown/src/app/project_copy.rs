@@ -142,6 +142,7 @@ impl ProjectCopy {
             kind: project.kind,
             manifest: copied_manifest,
             exclude_newer: project.exclude_newer.clone(),
+            exclude_newer_package: project.exclude_newer_package.clone(),
             generated_members: project.generated_members.clone(),
         };
         Ok(ProjectCopy {
@@ -426,6 +427,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -468,6 +470,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -517,6 +520,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -561,6 +565,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -612,6 +617,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -691,6 +697,7 @@ mod tests {
             kind: cooldown_uv::UV_ID,
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");
@@ -772,6 +779,7 @@ mod tests {
             kind: ToolId("test"),
             manifest: root.join("pyproject.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -825,6 +833,7 @@ mod tests {
             kind: ToolId("test"),
             manifest,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 

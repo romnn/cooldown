@@ -206,16 +206,7 @@ pub(super) fn detect_projects(
         for dir in dirs {
             tracing::debug!(tool = pending.id.as_str(), root = %dir, "detected project");
             let manifest = marker_manifest_path(&dir, &marker);
-            projects.push((
-                pending.id,
-                Project {
-                    manifest,
-                    root: dir,
-                    kind: pending.id,
-                    exclude_newer: None,
-                    generated_members: cooldown_core::GeneratedMembers::undeclared(),
-                },
-            ));
+            projects.push((pending.id, Project::detected(dir, pending.id, manifest)));
         }
     }
     Ok(Detected { projects, covered })

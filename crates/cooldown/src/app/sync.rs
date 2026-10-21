@@ -312,6 +312,7 @@ impl Workspace {
             // Bake any `latest`/`allow` package selectors into the native per-package exemption list
             // alongside the default window, so a cooldown-exempt package is exempt natively too.
             exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
+            package_windows: pctx.project.exclude_newer_package.clone(),
         };
         let result = async {
             let access = acquire_sync_access(writer, pctx, &self.lease_family(pctx), opts.dry_run)
@@ -395,6 +396,12 @@ impl Workspace {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
+            package_windows: cooldown_core::package_windows(
+                self.repo_layers(),
+                tool,
+                Utf8Path::new("."),
+                self.now(),
+            ),
         };
         let result =
             match acquire_repo_sync_access(writer, self, tool, projects, opts.dry_run, warnings)

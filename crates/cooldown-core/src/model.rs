@@ -643,6 +643,16 @@ pub struct Project {
     /// policy resolved yet), or a `Latest`/zero-age window with no binding floor. The application fills
     /// it in once policy is resolved.
     pub exclude_newer: Option<String>,
+    /// The per-package resolution windows that accompany [`exclude_newer`](Self::exclude_newer),
+    /// keyed by the package name a literal `package` selector of the resolved policy names.
+    ///
+    /// Each window is effective (any binding floor folded in), so a tool with a per-package cutoff
+    /// (uv's `--exclude-newer-package`) resolves an exempted or stricter package against
+    /// cooldown's own window for it rather than the project default.
+    /// [`WindowSpec::Latest`](crate::WindowSpec::Latest) means the package has no cutoff.
+    /// Empty during detection and for a policy without literal package rules; the application
+    /// fills it in alongside `exclude_newer`.
+    pub exclude_newer_package: std::collections::BTreeMap<String, crate::WindowSpec>,
     /// The workspace members whose manifests are generated projections of the resolved graph
     /// rather than authored intent (`[tool.cargo] generated-members`), populated by the
     /// application from the project's config cascade.
@@ -653,6 +663,24 @@ pub struct Project {
     /// Honored by cargo (cargo-hakari's workspace-hack is the shape it exists for); other
     /// adapters ignore it, and the config layer only accepts it where an adapter honors it.
     pub generated_members: GeneratedMembers,
+}
+
+impl Project {
+    /// A freshly detected project whose policy the application has not resolved yet.
+    ///
+    /// The resolution windows are empty and no generated members are declared until the
+    /// application fills them in from the project's policy and config cascade.
+    #[must_use]
+    pub fn detected(root: Utf8PathBuf, kind: ToolId, manifest: Utf8PathBuf) -> Self {
+        Project {
+            root,
+            kind,
+            manifest,
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: GeneratedMembers::undeclared(),
+        }
+    }
 }
 
 /// The workspace members a project declares as generated (`[tool.cargo] generated-members`).

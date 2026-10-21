@@ -272,6 +272,7 @@ mod tests {
             kind: HEX_ID,
             manifest: root.join("mix.exs"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");

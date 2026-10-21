@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **uv honors package-level `min-age` rules.** A `[tool.uv.package."<name>"]` rule, or an
+  unqualified `[package."<name>"]` one, now reaches uv's own per-package cutoff. `sync` writes it
+  into the repository `uv.toml` as `exclude-newer-package` beside `exclude-newer` (a `0d`,
+  `latest`, or `allow` package as `false`) and removes the entry again when the rule goes away.
+  Every uv command cooldown runs passes the same `--exclude-newer-package` overrides, so `check`,
+  `fix`, and `upgrade` no longer fail to resolve an exempted release that uv previously filtered
+  out under the default window.
+
 ## v0.0.25
 
 - **Previews and dry runs stage declared npm patch files.** `outdated`, `explain`, and

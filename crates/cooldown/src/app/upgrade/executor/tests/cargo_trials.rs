@@ -536,6 +536,7 @@ fn fixture_with_edges(
         kind: CARGO,
         manifest: root.join("Cargo.toml"),
         exclude_newer: None,
+        exclude_newer_package: std::collections::BTreeMap::new(),
         generated_members: GeneratedMembers::undeclared(),
     };
     let initial_direct = if matches!(resolver, Resolver::CoupledPatchFrom(_)) {

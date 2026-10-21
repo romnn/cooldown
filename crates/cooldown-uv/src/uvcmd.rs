@@ -1,28 +1,10 @@
 //! Thin wrappers around the project's own `uv` binary (resolution/apply engine only).
 
+use crate::cutoff::Cutoffs;
 use camino::Utf8Path;
 use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{CoreError, ToolTermination, VerifyReport, failure_detail};
 use tokio::process::Command;
-
-/// The `--exclude-newer <window>` argument pair for a resolution cutoff, or empty when `None`. The
-/// window is cooldown's resolved value — a relative span (`"14 days"`) or an absolute instant.
-///
-/// A relative span keeps the *persisted* value stable across runs (no per-run churn in the lock), but
-/// it still resolves to `now - window` each run, so once a dependency matures past the window
-/// `uv lock --check` reports the lock needs updating — the intended signal to re-lock, not a
-/// guarantee `--check`'s verdict never changes.
-///
-/// uv resolves against a cutoff from (in precedence order) `--exclude-newer`, the `UV_EXCLUDE_NEWER`
-/// env var, then config files. Passing cooldown's window as the CLI flag — the highest-precedence
-/// source — makes the lock honor cooldown's policy regardless of the developer's environment or
-/// `~/.config/uv/uv.toml`, which may set a shorter (weaker) window.
-fn exclude_newer_args(cutoff: Option<&str>) -> Vec<String> {
-    match cutoff {
-        Some(cutoff) => vec!["--exclude-newer".to_string(), cutoff.to_string()],
-        None => Vec::new(),
-    }
-}
 
 /// A handle to the project's own `uv` binary, used only as the resolution/apply engine.
 ///
@@ -49,39 +31,53 @@ impl Uv {
         Self::default()
     }
 
-    /// Spawns `uv` with `args`, pinning the resolution cutoff. `cutoff` is a *required* argument — not
-    /// a default — so no uv invocation can be added without consciously deciding its window. The
+    /// Spawns `uv` with `args`, pinning the resolution cutoffs. `cutoffs` is a *required* argument —
+    /// not a default — so no uv invocation can be added without consciously deciding its window. The
     /// single chokepoint every uv command flows through, so the type system guarantees cooldown's
-    /// window is never silently forgotten. `Some` sets `UV_EXCLUDE_NEWER` to cooldown's cutoff
-    /// (overriding the inherited env, `~/.config/uv`, and any pyproject value, since env beats config).
-    /// `None` (a `Latest`/opt-out window) *clears* the inherited `UV_EXCLUDE_NEWER` rather than letting
-    /// the developer's ambient value silently apply a cutoff the policy disclaimed — uv then falls
-    /// back to its config (the repo's own `uv.toml`), never the developer's shell.
+    /// window is never silently forgotten.
+    ///
+    /// The cutoffs are appended as `--exclude-newer` / `--exclude-newer-package` arguments, the
+    /// highest-precedence source, so the lock honors cooldown's policy regardless of the developer's
+    /// environment or `~/.config/uv/uv.toml`, which may set a shorter (weaker) window or no
+    /// exemption for a package the policy exempts.
+    /// A relative span keeps the *persisted* value stable across runs (no per-run churn in the lock),
+    /// but it still resolves to `now - window` each run, so once a dependency matures past the window
+    /// `uv lock --check` reports the lock needs updating — the intended signal to re-lock, not a
+    /// guarantee `--check`'s verdict never changes.
+    ///
+    /// A default cutoff also sets `UV_EXCLUDE_NEWER` (overriding the inherited env, `~/.config/uv`,
+    /// and any pyproject value, since env beats config).
+    /// No default (a `Latest`/opt-out window) *clears* the inherited `UV_EXCLUDE_NEWER` rather than
+    /// letting the developer's ambient value silently apply a cutoff the policy disclaimed — uv then
+    /// falls back to its config (the repo's own `uv.toml`), never the developer's shell.
     async fn output(
         &self,
         dir: &Utf8Path,
         args: &[&str],
-        cutoff: Option<&str>,
+        cutoffs: &Cutoffs,
     ) -> Result<std::process::Output, CoreError> {
+        let cutoff_args = cutoffs.args();
         let mut command = Command::new(resolve_program(&self.bin));
-        command.args(args).current_dir(dir.as_std_path());
-        match cutoff {
+        command
+            .args(args)
+            .args(&cutoff_args)
+            .current_dir(dir.as_std_path());
+        match cutoffs.default_cutoff() {
             Some(cutoff) => command.env("UV_EXCLUDE_NEWER", cutoff),
             None => command.env_remove("UV_EXCLUDE_NEWER"),
         };
         supervised_output(&mut command, &self.bin, || {
-            format!("{} {}", self.bin, args.join(" "))
+            std::iter::once(self.bin.as_str())
+                .chain(args.iter().copied())
+                .chain(cutoff_args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .await
     }
 
-    async fn run(
-        &self,
-        dir: &Utf8Path,
-        args: &[&str],
-        cutoff: Option<&str>,
-    ) -> Result<(), CoreError> {
-        let out = self.output(dir, args, cutoff).await?;
+    async fn run(&self, dir: &Utf8Path, args: &[&str], cutoffs: &Cutoffs) -> Result<(), CoreError> {
+        let out = self.output(dir, args, cutoffs).await?;
         if out.status.success() {
             Ok(())
         } else {
@@ -103,15 +99,8 @@ impl Uv {
     /// Returns [`CoreError::ToolSpawn`] if `uv` cannot be spawned, or [`CoreError::Tool`] if it
     /// exits non-zero for a reason *other* than a stale lock (so a genuine failure is never
     /// silently reported as "stale").
-    pub async fn verify_check(
-        &self,
-        dir: &Utf8Path,
-        cutoff: Option<&str>,
-    ) -> Result<bool, CoreError> {
-        let mut args = vec!["lock".to_string(), "--check".to_string()];
-        args.extend(exclude_newer_args(cutoff));
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.output(dir, &arg_refs, cutoff).await?;
+    pub async fn verify_check(&self, dir: &Utf8Path, cutoffs: &Cutoffs) -> Result<bool, CoreError> {
+        let out = self.output(dir, &["lock", "--check"], cutoffs).await?;
         if out.status.success() {
             return Ok(true);
         }
@@ -150,7 +139,8 @@ impl Uv {
     /// It is empty in the uniform-window case (one global cutoff governs the whole graph); cooldown
     /// adds a ceiling only for a package whose verdict is stricter than the global window — a longer
     /// per-package window, a floor, or an exempt freeze — so that per-package policy is enforced
-    /// without pinning the rest of the graph. The global `cutoff` still applies to every other package.
+    /// without pinning the rest of the graph. The default cutoff still applies to every other
+    /// package, and each per-package cutoff in `cutoffs` to its own package.
     ///
     /// # Errors
     ///
@@ -161,7 +151,7 @@ impl Uv {
         dir: &Utf8Path,
         upgrade: bool,
         ceilings: &[(String, String)],
-        cutoff: Option<&str>,
+        cutoffs: &Cutoffs,
     ) -> Result<(), CoreError> {
         let mut args = vec!["lock".to_string()];
         if upgrade {
@@ -171,9 +161,8 @@ impl Uv {
             args.push("--upgrade-package".to_string());
             args.push(format!("{name}<={version}"));
         }
-        args.extend(exclude_newer_args(cutoff));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(dir, &arg_refs, cutoff).await
+        self.run(dir, &arg_refs, cutoffs).await
     }
 
     /// Runs `uv sync`, the opt-in install/build verification step.
@@ -186,15 +175,8 @@ impl Uv {
     ///
     /// Returns [`CoreError::ToolSpawn`] only if `uv` cannot be spawned at all; a non-zero
     /// `uv sync` exit is reported via the [`VerifyReport`] instead.
-    pub async fn sync(
-        &self,
-        dir: &Utf8Path,
-        cutoff: Option<&str>,
-    ) -> Result<VerifyReport, CoreError> {
-        let mut args = vec!["sync".to_string()];
-        args.extend(exclude_newer_args(cutoff));
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.output(dir, &arg_refs, cutoff).await?;
+    pub async fn sync(&self, dir: &Utf8Path, cutoffs: &Cutoffs) -> Result<VerifyReport, CoreError> {
+        let out = self.output(dir, &["sync"], cutoffs).await?;
         Ok(VerifyReport {
             ok: out.status.success(),
             detail: if out.status.success() {

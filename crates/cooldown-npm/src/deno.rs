@@ -667,6 +667,7 @@ mod tests {
             kind: DENO_ID,
             manifest: root.join("deno.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 

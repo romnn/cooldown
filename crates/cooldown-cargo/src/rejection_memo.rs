@@ -482,6 +482,7 @@ fn capture_configuration_inputs(
                 root: package,
                 kind: crate::CARGO_ID,
                 exclude_newer: None,
+                exclude_newer_package: std::collections::BTreeMap::new(),
                 generated_members: cooldown_core::GeneratedMembers::default(),
             };
             for (path, bytes) in capture_files(&dependency, &[], cache)? {
@@ -924,6 +925,7 @@ mod tests {
             root,
             kind: crate::CARGO_ID,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: GeneratedMembers::default(),
         };
         Ok((directory, project))
@@ -1391,6 +1393,7 @@ mod tests {
             root,
             kind: crate::CARGO_ID,
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: GeneratedMembers::default(),
         })
     }

@@ -266,6 +266,7 @@ mod tests {
                 root,
                 kind: tool,
                 exclude_newer: None,
+                exclude_newer_package: std::collections::BTreeMap::new(),
                 generated_members: cooldown_core::GeneratedMembers::undeclared(),
             },
             rel_path: Utf8PathBuf::from("."),

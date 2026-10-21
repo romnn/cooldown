@@ -3427,6 +3427,7 @@ packages:
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let policy = cooldown_core::ResolvedPolicy {
@@ -3434,6 +3435,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: vec!["@typescript/native-preview".to_string()],
+            package_windows: std::collections::BTreeMap::new(),
             admitted_versions: Some(Vec::new()),
         };
 
@@ -3481,6 +3483,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let policy = ResolvedPolicy {
@@ -3488,6 +3491,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: vec!["new-glob".to_string(), "@corp/*".to_string()],
+            package_windows: std::collections::BTreeMap::new(),
             admitted_versions: None,
         };
         let cache = tempfile::tempdir()?;
@@ -3552,6 +3556,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -3595,6 +3600,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -3639,6 +3645,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -3717,6 +3724,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_dep("lodash"), granted_dep("@corp/api")];
@@ -3760,6 +3768,7 @@ packages:
             kind: crate::lock::Yarn::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut deps = vec![granted_dep("lodash")];
@@ -3800,6 +3809,7 @@ packages:
             kind: crate::lock::Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -3852,6 +3862,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -3893,6 +3904,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("nanoid", "3.1.0", "3.3.0");
@@ -4131,6 +4143,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut direct = change("chalk", "5.0.0", "5.3.0");
@@ -4229,6 +4242,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut landed = change("chalk", "4.1.1", "4.1.2");
@@ -4265,6 +4279,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let landed = change("chalk", "4.1.1", "4.1.2");
@@ -4360,6 +4375,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("dep", "1.0.0", "1.1.0");
@@ -4467,6 +4483,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("dep", "1.0.0", "1.1.0");
@@ -4594,6 +4611,7 @@ packages:
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let mut planned = change("dep", "1.0.0", "1.1.0");
@@ -4652,6 +4670,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let plan = Plan {
@@ -4697,6 +4716,7 @@ packages:
             kind: Npm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         // No manifest declares nanoid, so the candidate is held not-eligible without invoking
@@ -5048,6 +5068,7 @@ mod whole_graph_tests {
             kind: Pnpm::ID,
             manifest: root.join("package.json"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }

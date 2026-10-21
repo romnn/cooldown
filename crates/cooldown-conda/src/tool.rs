@@ -391,6 +391,7 @@ mod tests {
             kind: ToolId("pixi"),
             manifest: root.join(lock),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
@@ -445,6 +446,7 @@ mod tests {
             kind: Pixi::ID,
             manifest: root.join("pixi.lock"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
         let cache = tempfile::tempdir().expect("cache");

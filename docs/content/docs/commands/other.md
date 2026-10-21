@@ -108,6 +108,49 @@ cooldown sync
 
 The same behavior is available as a global `--sync` flag on any command, which syncs before the command runs (a no-op under `--dry-run`). See [Supported ecosystems]({{< relref "../tools/_index.md" >}}) for which tools have a native cooldown that `sync` can write to.
 
+### uv
+
+For uv, `sync` writes the repository-root `uv.toml`: the default window as `exclude-newer`, and
+every package-level rule that applies to uv (`[tool.uv.package."…"]` or an unqualified
+`[package."…"]`) as an `exclude-newer-package` entry:
+
+```toml
+# cooldown.toml
+min-age = "14d"
+
+[tool.uv.package."onnxruntime"]
+min-age = "0d"
+```
+
+```toml
+# uv.toml, as written by `cooldown sync`
+exclude-newer = "14 days"
+exclude-newer-package = { onnxruntime = false }
+```
+
+An age is written as a relative span (`"30 days"`), a `freeze` as its RFC 3339 instant, and a
+package without a window (`0d`, `latest`, or `allow`) as `false`, so uv applies no cutoff to it.
+cooldown owns the `exclude-newer-package` table: every sync rewrites it from the policy, so removing
+a package rule removes its entry again.
+Run `cooldown sync` (or pass `--sync`) after changing package rules: uv merges the command-line
+overrides below into the table key by key, so an entry left in `uv.toml` for a rule that no longer
+exists still applies until the next sync removes it.
+Only exact names in their normalized PyPI spelling (`types-pyyaml`, not `Types_PyYAML`) are
+written, since those are the names the gate matches against `uv.lock`; glob rules such as
+`[package."types-*"]` have no `exclude-newer-package` form and stay enforced by the gate alone.
+
+Every uv command cooldown runs (`uv lock --check` under `check`, the re-locks under `fix` and
+`upgrade`, and `uv sync` under `--build`) passes the project's resolved policy the same way, as
+`--exclude-newer` and `--exclude-newer-package <name>=<cutoff>` arguments.
+For a project the repository `uv.toml` governs, whose policy is the repository's own (no nearer
+`cooldown.toml` changes it), the lock cooldown accepts is therefore the lock a plain `uv lock`
+produces under the synced file.
+
+uv reads only the nearest configuration file, so a project below the repository root whose
+`pyproject.toml` has its own `[tool.uv]` table ignores the repository `uv.toml`.
+cooldown's own commands still pin the policy for such a project on the command line, but a plain
+`uv lock` there follows that project's `[tool.uv]` table, which `sync` does not write.
+
 ## `recover`
 
 Settle Cargo project state left by an interrupted cooldown mutation, then stop without resolving

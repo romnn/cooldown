@@ -154,6 +154,7 @@ impl CargoMutationStage {
             manifest: canonical_utf8(&staged_manifest)?,
             kind: source.kind,
             exclude_newer: source.exclude_newer.clone(),
+            exclude_newer_package: source.exclude_newer_package.clone(),
             generated_members: source.generated_members.clone(),
         };
         let initial = ProjectMutationState::capture(&staged.root, &preimage)?;
@@ -523,6 +524,15 @@ fn reject_staging_ancestor_overrides_with_environment(
         .skip(1)
         .map(Utf8Path::to_owned)
         .collect::<BTreeSet<_>>();
+    reject_ancestor_overrides(&ancestors, environment)
+}
+
+/// Rejects Cargo or Rust toolchain configuration in any of `ancestors`, the directories above a
+/// staging location, other than the Cargo home `environment` names.
+fn reject_ancestor_overrides(
+    ancestors: &BTreeSet<Utf8PathBuf>,
+    environment: &CargoConfigEnvironment,
+) -> Result<()> {
     let mut config_dirs = ancestors
         .iter()
         .map(|ancestor| ancestor.join(".cargo"))
@@ -534,7 +544,7 @@ fn reject_staging_ancestor_overrides_with_environment(
     }
     let unexpected = cargo_config_paths(&config_dirs)?
         .into_iter()
-        .chain(rust_toolchain_paths(&ancestors)?)
+        .chain(rust_toolchain_paths(ancestors)?)
         .next();
     if let Some(path) = unexpected {
         return Err(isolation_error(format!(
@@ -1145,6 +1155,7 @@ mod tests {
             kind: CARGO_ID,
             manifest: root.join("Cargo.toml"),
             exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         }
     }
@@ -1201,6 +1212,12 @@ mod tests {
         Ok(())
     }
 
+    /// The Cargo home's own configuration applies to every Cargo invocation alike, so finding it
+    /// above the staging location is no divergence.
+    ///
+    /// Only the ancestors inside the temporary root are scanned: the machine's temporary directory
+    /// may itself sit below a real Cargo home (a `TMPDIR` under `~/.cache` beside `~/.cargo`), which
+    /// would otherwise decide the outcome instead of the fixture.
     #[test]
     fn ambient_cargo_home_is_not_a_staging_divergence() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1215,11 +1232,21 @@ mod tests {
                 offline = true
             "},
         )?;
+        let ancestors = scratch
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.starts_with(&root))
+            .map(Utf8Path::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            ancestors.contains(&root),
+            "the fixture root must be scanned"
+        );
         for configured in [false, true] {
             let environment = CargoConfigEnvironment {
                 cargo_home: Some((cargo_home.clone(), configured)),
             };
-            reject_staging_ancestor_overrides_with_environment(&scratch, &environment)?;
+            reject_ancestor_overrides(&ancestors, &environment)?;
         }
         Ok(())
     }

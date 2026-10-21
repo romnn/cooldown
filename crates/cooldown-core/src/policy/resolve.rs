@@ -269,6 +269,56 @@ pub fn exempt_package_globs(layers: &[PolicyLayer], target: crate::model::ToolId
     globs.into_iter().collect()
 }
 
+/// The effective resolution window of every package a literal `package` selector names for
+/// `target`, keyed by the selector's name.
+///
+/// This feeds a tool's own per-package resolver cutoff (uv's `exclude-newer-package`), so a
+/// package-level `min-age`, `freeze`, `floor`, `latest`, or `allow` reaches the native resolver
+/// instead of only cooldown's gate.
+/// Each name resolves exactly as [`resolve`] resolves a locked pin of that package in `project`
+/// ([`ResolveKind::CurrentPin`], no registry), with any binding floor folded in via
+/// [`ResolvedWindow::effective_spec`].
+///
+/// Every literal name is listed, including one whose window equals the project default: an
+/// explicit entry overrides a per-package value the tool may inherit from its own config.
+/// Glob patterns (`types-*`) are skipped because they name no single package a native
+/// per-package table can key.
+/// The name is the selector's raw text; the caller decides whether it is a valid package name
+/// for its tool.
+#[must_use]
+pub fn package_windows(
+    layers: &[PolicyLayer],
+    target: crate::model::ToolId,
+    project: &camino::Utf8Path,
+    now: Timestamp,
+) -> std::collections::BTreeMap<String, WindowSpec> {
+    let mut windows = std::collections::BTreeMap::new();
+    let names = layers
+        .iter()
+        .flat_map(|layer| &layer.rules)
+        .filter_map(|rule| match &rule.selector {
+            Selector::Package { glob, tool } if tool.is_none_or(|tool| tool == target) => {
+                glob.is_literal().then(|| glob.raw())
+            }
+            _ => None,
+        });
+    for name in names {
+        if windows.contains_key(name) {
+            continue;
+        }
+        let query = ResolveQuery {
+            tool: target,
+            package: name,
+            registry: None,
+            project,
+            kind: ResolveKind::CurrentPin,
+        };
+        let window = resolve(layers, &query, now).window.effective_spec(now);
+        windows.insert(name.to_string(), window);
+    }
+    windows
+}
+
 /// The authority-first `max-major` result for a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaxMajorPick {
@@ -650,5 +700,120 @@ mod exempt_tests {
             vec!["shared".to_string()]
         );
         assert!(exempt_package_globs(&[layer], crate::model::ToolId("pnpm")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod package_window_tests {
+    use super::package_windows;
+    use crate::model::ToolId;
+    use crate::{ByKind, Origin, PatternGlob, PolicyLayer, Rule, Selector, WindowSpec};
+    use camino::Utf8Path;
+    use jiff::{SignedDuration, Timestamp};
+
+    const UV: ToolId = ToolId("uv");
+
+    fn days(count: i64) -> WindowSpec {
+        WindowSpec::MinAge(SignedDuration::from_hours(24 * count))
+    }
+
+    fn rule(selector: Selector, window: Option<WindowSpec>) -> Rule {
+        let mut rule = Rule::new(selector);
+        if let Some(window) = window {
+            rule.window = ByKind::scalar(window);
+        }
+        rule
+    }
+
+    fn package(glob: &str, tool: Option<ToolId>) -> Selector {
+        Selector::Package {
+            glob: PatternGlob::new(glob).expect("glob"),
+            tool,
+        }
+    }
+
+    fn now() -> Timestamp {
+        "2026-10-21T00:00:00Z".parse().expect("timestamp")
+    }
+
+    /// The issue's policy: a 14-day default with a tool-qualified `0d` exemption, plus a global
+    /// package rule that also applies to uv and one qualified for another tool that does not.
+    #[test]
+    fn lists_every_literal_package_rule_that_applies_to_the_tool() {
+        let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        layer.rules.push(rule(Selector::Default, Some(days(14))));
+        layer
+            .rules
+            .push(rule(package("onnxruntime", Some(UV)), Some(days(0))));
+        layer
+            .rules
+            .push(rule(package("numpy", None), Some(days(30))));
+        layer
+            .rules
+            .push(rule(package("ort", Some(ToolId("cargo"))), Some(days(0))));
+
+        let windows = package_windows(&[layer], UV, Utf8Path::new("."), now());
+
+        // The exemption and the stricter global rule both reach uv; the cargo-only rule does not.
+        assert_eq!(
+            windows.into_iter().collect::<Vec<_>>(),
+            [
+                ("numpy".to_string(), days(30)),
+                ("onnxruntime".to_string(), days(0)),
+            ]
+        );
+    }
+
+    /// Glob selectors name no single package a native per-package table can key, so they are
+    /// skipped, while a rule whose window only matches the default is still listed so it can
+    /// override an inherited native entry.
+    #[test]
+    fn skips_globs_and_keeps_default_valued_names() {
+        let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        layer.rules.push(rule(Selector::Default, Some(days(14))));
+        layer
+            .rules
+            .push(rule(package("types-*", None), Some(days(0))));
+        layer
+            .rules
+            .push(rule(package("httpx", None), Some(days(14))));
+
+        let windows = package_windows(&[layer], UV, Utf8Path::new("."), now());
+
+        assert_eq!(
+            windows.into_iter().collect::<Vec<_>>(),
+            [("httpx".to_string(), days(14))]
+        );
+    }
+
+    /// Each name resolves through the full cascade: a higher layer's default outranks a lower
+    /// layer's package rule, an `allow` exempts, and a floor in another layer still clamps it.
+    #[test]
+    fn resolves_each_name_through_the_whole_cascade() {
+        let mut global = PolicyLayer::new(Origin::Global);
+        global
+            .rules
+            .push(rule(package("outranked", None), Some(days(0))));
+        let mut floor = rule(package("floored", None), None);
+        floor.floor = Some(SignedDuration::from_hours(24 * 3));
+        global.rules.push(floor);
+
+        let mut repo = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        repo.rules.push(rule(Selector::Default, Some(days(14))));
+        let mut allowed = rule(package("allowed", None), None);
+        allowed.allow = true;
+        repo.rules.push(allowed);
+        let mut floored = rule(package("floored", None), None);
+        floored.allow = true;
+        repo.rules.push(floored);
+
+        let windows = package_windows(&[global, repo], UV, Utf8Path::new("."), now());
+
+        // The repo default is a higher layer than the global package rule, so it wins.
+        assert_eq!(windows.get("outranked"), Some(&days(14)));
+        // An allow with no binding floor exempts the package outright.
+        assert_eq!(windows.get("allowed"), Some(&WindowSpec::Latest));
+        // The global floor survives the repo allow, which is declared in another layer.
+        assert_eq!(windows.get("floored"), Some(&days(3)));
     }
 }

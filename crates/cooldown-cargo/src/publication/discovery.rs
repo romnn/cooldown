@@ -103,6 +103,7 @@ fn validate_attributed_anchor(
         manifest: project_root.join("Cargo.toml"),
         kind: crate::CARGO_ID,
         exclude_newer: None,
+        exclude_newer_package: std::collections::BTreeMap::new(),
         generated_members: cooldown_core::GeneratedMembers::undeclared(),
     };
     let project_coordination =
