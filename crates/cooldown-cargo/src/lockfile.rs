@@ -1,7 +1,7 @@
 //! Cargo lockfile representation and package-slot projections.
 
 use crate::version;
-use cooldown_core::{CoreError, Result};
+use cooldown_core::{CoreError, GeneratedMembers, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -304,6 +304,23 @@ impl CargoLock {
                 && package.version.as_deref() == Some(version)
                 && package.is_crates_io()
         })
+    }
+
+    /// The names the authored local packages list among their own dependencies.
+    ///
+    /// Every path or workspace package counts except a generated member, whose entries only mirror
+    /// what the authored members already reach.
+    pub(crate) fn authored_dependency_names(&self, generated: &GeneratedMembers) -> HashSet<&str> {
+        self.package
+            .iter()
+            .filter(|package| package.source.is_none() && !generated.contains(&package.name))
+            .flat_map(|package| &package.dependencies)
+            .map(|entry| {
+                entry
+                    .split_once(' ')
+                    .map_or(entry.as_str(), |(name, _)| name)
+            })
+            .collect()
     }
 
     /// Every crates.io version the lock carries of `name`.

@@ -37,11 +37,11 @@ use cooldown_adapter_util::{RegistryVersionClassifier, build_registry_releases};
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, Capabilities, Change, CoreError, DepScope,
     Dependency, Diagnostic, DiagnosticKind, EdgeNormalizationReport, EdgePolicy, EdgeRebind,
-    FetchContext, LockStatus, LockVerifyReport, MemberRef, MutationExecution, NativePolicyLayer,
-    PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMutationFile,
-    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
-    Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead, ToolTermination, ToolWrite,
-    UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
+    FetchContext, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, MutationExecution,
+    NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project,
+    ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
+    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
+    ToolTermination, ToolWrite, UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use sha2::{Digest as _, Sha256};
@@ -1273,19 +1273,37 @@ fn locked_parties(lock: &CargoLock, parties: &[ConflictParty]) -> Vec<PackageKey
     nodes
 }
 
-/// The locked nodes a refused pin of `change` may release: the conflict's parties the lock
-/// carries, except the candidate itself and every crate the batch plans to move, which reach
-/// their own targets through their own pins.
-fn pin_blockers(
+/// The locked nodes of a refused pin's conflict other than the candidate itself.
+fn conflicting_nodes(
     lock: &CargoLock,
     change: &Change,
-    batch: &[&Change],
     parties: &[ConflictParty],
 ) -> Vec<PackageKey> {
     locked_parties(lock, parties)
         .into_iter()
+        .filter(|node| node.name != change.package.name)
+        .collect()
+}
+
+/// The locked nodes a refused pin of `change` may release: the [`conflicting_nodes`] that are
+/// neither planned nor declared by an authored package.
+///
+/// A planned crate reaches its own target through its own pin.
+/// A directly declared one is never moved outside the plan, because the batch gate admits a
+/// too-fresh collateral move under `--transitive hide` or `allow`, which a direct dependency must
+/// never get.
+fn pin_blockers(
+    lock: &CargoLock,
+    change: &Change,
+    batch: &[&Change],
+    generated: &GeneratedMembers,
+    parties: &[ConflictParty],
+) -> Vec<PackageKey> {
+    let declared = lock.authored_dependency_names(generated);
+    conflicting_nodes(lock, change, parties)
+        .into_iter()
         .filter(|node| {
-            node.name != change.package.name
+            !declared.contains(node.name.as_str())
                 && batch
                     .iter()
                     .all(|planned| planned.package.name != node.name)
@@ -2645,12 +2663,16 @@ impl CargoTool {
         let lock_path = project.root.join("Cargo.lock");
         let before_text = std::fs::read_to_string(&lock_path)?;
         let before = CargoLock::parse(&before_text)?;
-        let mut blockers = pin_blockers(&before, change, batch, &refused.parties);
+        // Which conflict parties may be released depends on the batch, which the memo key omits,
+        // so a refusal naming any is not remembered even when this batch releases none of them.
+        if !conflicting_nodes(&before, change, &refused.parties).is_empty() {
+            stats.memo_disqualified = true;
+        }
+        let generated = &project.generated_members;
+        let mut blockers = pin_blockers(&before, change, batch, generated, &refused.parties);
         if blockers.is_empty() {
             return Ok(false);
         }
-        // The retry's outcome depends on the batch, which the memo key omits.
-        stats.memo_disqualified = true;
         let mut released: Vec<PackageKey> = Vec::new();
         for _ in 0..PIN_BLOCKER_ROUNDS {
             blockers.retain(|node| !released.contains(node));
@@ -2692,7 +2714,8 @@ impl CargoTool {
                 }
                 Err(err) if err.is_local_environment_failure() => return Err(err),
                 Err(err) => {
-                    blockers = pin_blockers(&before, change, batch, &rejection_parties(&err));
+                    blockers =
+                        pin_blockers(&before, change, batch, generated, &rejection_parties(&err));
                 }
             }
         }

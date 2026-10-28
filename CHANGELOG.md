@@ -8,7 +8,12 @@
   valid lock. A precise pin that another locked crate blocks (pest 2.9.3 pins
   `psm = "=0.1.24"` while `stacker` holds psm 0.1.32) is retried with that crate released, for a
   bounded number of newly named blockers, and lands only when every planned target stays put; the
-  released crate's move is reported as a collateral row.
+  released crate's move is reported as a collateral row. A crate the project declares directly is
+  never released outside the plan, so the pin is held instead.
+
+- **Cargo diagnostics stay plain under `CARGO_TERM_COLOR=always`.** cooldown runs cargo with color
+  turned off, so the conflicts it parses and the details it reports carry no escape codes when the
+  environment requests color, as CI runners commonly do.
 
 - **A lock another project's manifest edit leaves unresolvable is repaired in the same run.** A
   lock current at the start of the run that later fails to resolve after one of the manifests it

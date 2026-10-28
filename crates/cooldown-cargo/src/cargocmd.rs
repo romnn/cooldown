@@ -1322,7 +1322,10 @@ impl Cargo {
         let result = supervised_output(
             Command::new(resolve_program(&self.bin))
                 .args(args)
-                .current_dir(dir.as_std_path()),
+                .current_dir(dir.as_std_path())
+                // Cargo's diagnostics are parsed and quoted in reports, never shown on a terminal,
+                // so an inherited `CARGO_TERM_COLOR=always` must not wrap them in escape codes.
+                .env("CARGO_TERM_COLOR", "never"),
             &self.bin,
             || format!("{} {}", self.bin, args.join(" ")),
         )
@@ -1977,6 +1980,45 @@ mod tests {
         "#};
 
         assert!(conflict_parties(stderr).is_empty());
+    }
+
+    /// CI exports `CARGO_TERM_COLOR=always`, under which cargo wraps `error:` in escape codes and
+    /// the conflict's first party no longer parses.
+    /// The fake colors its diagnostic unless the child environment asks for none, so the test
+    /// fails whatever the caller's environment holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_diagnostics_stay_plain_under_an_inherited_color_request() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let fake = root.join("fake-cargo");
+        std::fs::write(
+            &fake,
+            indoc! {r#"
+                #!/bin/sh
+                if [ "$CARGO_TERM_COLOR" = never ]; then error='error'; else error='\033[1m\033[91merror\033[0m'; fi
+                printf "$error: failed to select a version for \`psm\`.\n" >&2
+                printf 'versions that meet the requirements `^0.1.7` (locked to 0.1.32) are: 0.1.32\n' >&2
+                exit 101
+            "#},
+        )?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+
+        let error = Cargo::with_bin(fake.as_str())
+            .run(root, &["update"])
+            .await
+            .err();
+
+        let Some(CoreError::Tool { stderr, .. }) = error else {
+            return Err(eyre::eyre!("expected a tool failure, got {error:?}"));
+        };
+        // The recorded diagnostic is plain text, so the locked blocker is still named.
+        assert!(!stderr.contains('\u{1b}'), "{stderr}");
+        assert_eq!(conflict_parties(&stderr), [party("psm", Some("0.1.32"))]);
+        Ok(())
     }
 
     #[test]

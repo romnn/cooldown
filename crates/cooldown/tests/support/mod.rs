@@ -178,6 +178,17 @@ impl Fixture {
     /// state, which is also why a caller cannot pass its own `-C`: this is the way to run from a
     /// subdirectory.
     pub fn cooldown_in(&self, dir: Option<&str>, args: &[&str]) -> CapturedOutput {
+        self.cooldown_in_env(dir, args, &[])
+    }
+
+    /// [`cooldown_in`](Self::cooldown_in) with `envs` added to the binary's environment, for a
+    /// setting the caller's own environment may or may not carry.
+    pub fn cooldown_in_env(
+        &self,
+        dir: Option<&str>,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> CapturedOutput {
         let exe = env!("CARGO_BIN_EXE_cooldown");
         let pinned = dir.map_or_else(
             || self.dir.path().to_path_buf(),
@@ -185,6 +196,7 @@ impl Fixture {
         );
         let output = Command::new(exe)
             .current_dir(self.dir.path())
+            .envs(envs.iter().copied())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
             .arg("--dir")
@@ -223,9 +235,24 @@ impl Fixture {
     /// [`cooldown_json`](Self::cooldown_json) pinned to the project-root-relative `dir`; see
     /// [`cooldown_in`](Self::cooldown_in).
     pub fn cooldown_json_in(&self, dir: Option<&str>, args: &[&str]) -> Envelope {
+        self.cooldown_json_in_env(dir, args, &[])
+    }
+
+    /// [`cooldown_json`](Self::cooldown_json) with `envs` added to the binary's environment; see
+    /// [`cooldown_in_env`](Self::cooldown_in_env).
+    pub fn cooldown_json_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Envelope {
+        self.cooldown_json_in_env(None, args, envs)
+    }
+
+    fn cooldown_json_in_env(
+        &self,
+        dir: Option<&str>,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Envelope {
         let mut full: Vec<&str> = args.to_vec();
         full.push("--json");
-        let captured = self.cooldown_in(dir, &full);
+        let captured = self.cooldown_in_env(dir, &full, envs);
         let value: serde_json::Value =
             serde_json::from_slice(&captured.stdout).unwrap_or_else(|err| {
                 panic!(

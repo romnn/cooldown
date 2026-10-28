@@ -238,6 +238,60 @@ async fn a_planned_blocker_is_not_released_for_another_pin() -> eyre::Result<()>
     Ok(())
 }
 
+/// Whether a refused pin's blocker may be released depends on the batch, which the rejection memo
+/// key omits, so a refusal the batch's own plan for the blocker caused is not remembered.
+/// When the executor retries the candidate alone, as a rollback does, the blocker is released and
+/// the pin lands instead of the earlier refusal being recalled.
+#[tokio::test]
+async fn a_refusal_a_planned_blocker_caused_is_retried_once_the_blocker_leaves_the_plan()
+-> eyre::Result<()> {
+    let fixture = UnlockFixture::new(SCRIPT)?;
+    let candidate = change("pkg", "1.0.0", "1.2.0", false);
+
+    fixture
+        .resolve(&UnlockFixture::plan(vec![
+            candidate.clone(),
+            change("blocker", "1.0.0", "1.1.0", false),
+        ]))
+        .await?;
+    assert!(!fixture.released_blocker()?, "{:?}", fixture.invocations()?);
+    assert_eq!(fixture.lock()?, lock("1.0.0", "1.0.0", "1.0.0"));
+
+    fixture
+        .resolve(&UnlockFixture::plan(vec![candidate]))
+        .await?;
+
+    assert!(fixture.released_blocker()?, "{:?}", fixture.invocations()?);
+    assert_eq!(fixture.lock()?, lock("1.2.0", "1.0.0", "0.9.0"));
+    Ok(())
+}
+
+/// A blocker an authored package declares directly is never released outside the plan, since the
+/// batch gate would let a too-fresh collateral move of it stand under `--transitive hide`.
+#[tokio::test]
+async fn a_directly_declared_blocker_is_not_released() -> eyre::Result<()> {
+    let fixture = UnlockFixture::new(SCRIPT)?;
+    let local = indoc! {r#"
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["blocker", "pkg", "sibling"]
+    "#};
+    let declared = format!("{}{local}", lock("1.0.0", "1.0.0", "1.0.0"));
+    std::fs::write(fixture.project.root.join("Cargo.lock"), &declared)?;
+
+    fixture
+        .resolve(&UnlockFixture::plan(vec![change(
+            "pkg", "1.0.0", "1.2.0", false,
+        )]))
+        .await?;
+
+    assert!(!fixture.released_blocker()?, "{:?}", fixture.invocations()?);
+    assert_eq!(fixture.lock()?, declared);
+    Ok(())
+}
+
 /// A lock the run's own manifest edit left unresolvable is re-resolved by releasing each locked
 /// crate Cargo's conflict names in turn, never the whole workspace.
 #[tokio::test]

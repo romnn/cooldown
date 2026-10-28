@@ -105,7 +105,8 @@ cargo (`update --precise`), uv
 and Go's `go.mod` *is* the version source, so those always rewrite the manifest regardless of mode.
 When cargo refuses an in-range pin because another locked crate stands in the way (the target
 requires a different version of it), cooldown releases that crate for the same resolve and reports
-its move as a collateral row instead of raising the manifest's floor.
+its move as a collateral row instead of raising the manifest's floor. A crate the project declares
+directly is never released this way; the pin is held instead.
 
 The happy path is zero config. Raising the whole repo to 14 days is one line of `cooldown.toml`:
 
