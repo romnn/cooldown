@@ -14,15 +14,26 @@
 //! A recorded lock a later project stales after its own turn is caught by a re-probe once the
 //! lanes finish, and its project runs again the same way.
 //! A lock that was already stale when the run began keeps the ordinary stale-lock handling.
+//!
+//! An edit can also leave a lock unresolvable rather than stale: a raised floor in a shared path
+//! crate that another locked dependent's requirement also binds makes the resolver fail before it
+//! ever reports the lock as out of date.
+//! The run therefore also snapshots the inputs each current lock resolves against, and a lock
+//! whose probe fails after one of those inputs changed gets the adapter's conflicted refresh,
+//! which releases only the locked packages the conflict names, before the same gate.
 
 use super::UpgradeAccum;
 use super::executor::PlanMode;
 use crate::app::lanes::LaneAccess;
+use crate::app::workspace::LockRefreshKind;
 use crate::app::{
     ProjectCtx, ProjectProgress, RunOpts, Workspace, diag_from_error, stale_evaluation_skipped,
 };
 use camino::Utf8PathBuf;
-use cooldown_core::{Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport, ToolId, ToolWrite};
+use cooldown_core::{
+    CoreError, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport, ProjectInputSnapshot,
+    ToolId, ToolWrite,
+};
 use std::collections::{HashMap, HashSet};
 
 /// A project's identity across the run: one tool never detects two projects at one root.
@@ -42,15 +53,29 @@ impl ProjectKey {
 }
 
 /// The projects whose lock was current when the run began and whose staleness the run therefore
-/// owns.
+/// owns, each with the inputs its lock resolved against then.
 #[derive(Debug, Default)]
 pub(super) struct CurrentAtStart {
-    projects: HashSet<ProjectKey>,
+    projects: HashMap<ProjectKey, ProjectInputSnapshot>,
 }
 
 impl CurrentAtStart {
     pub(super) fn contains(&self, pctx: &ProjectCtx) -> bool {
-        self.projects.contains(&ProjectKey::of(pctx))
+        self.projects.contains_key(&ProjectKey::of(pctx))
+    }
+
+    /// Whether an input `pctx`'s lock resolved against when the run began has changed since, which
+    /// makes the run's own edits the explanation for a lock that stopped resolving.
+    fn inputs_changed(&self, pctx: &ProjectCtx) -> bool {
+        self.projects
+            .get(&ProjectKey::of(pctx))
+            .is_some_and(|inputs| match inputs.changed() {
+                Ok(changed) => changed,
+                Err(err) => {
+                    tracing::debug!(%err, project = %pctx.rel_path, "lock inputs unreadable");
+                    false
+                }
+            })
     }
 
     pub(super) fn len(&self) -> usize {
@@ -67,6 +92,31 @@ impl CurrentAtStart {
         if !acc.errors.is_empty() {
             self.projects.remove(&ProjectKey::of(pctx));
         }
+    }
+}
+
+/// What probing a project's lock established.
+enum LockProbe {
+    /// The probe ran and reported the lock's state.
+    Report(LockVerifyReport),
+    /// The package manager refused to resolve the lock.
+    Refused,
+    /// The probe could not run, so nothing is known.
+    Unknown,
+}
+
+/// How a tracked project's lock went bad during the run, and so which refresh it needs.
+fn run_staling(
+    probe: &LockProbe,
+    tracked: &CurrentAtStart,
+    pctx: &ProjectCtx,
+) -> Option<LockRefreshKind> {
+    match probe {
+        LockProbe::Report(report) if report.status == LockStatus::Stale => {
+            Some(LockRefreshKind::Stale)
+        }
+        LockProbe::Refused if tracked.inputs_changed(pctx) => Some(LockRefreshKind::Conflicted),
+        LockProbe::Report(_) | LockProbe::Refused | LockProbe::Unknown => None,
     }
 }
 
@@ -91,6 +141,14 @@ pub(super) struct ProjectPass<'a> {
 struct StaledProject<'a> {
     pctx: &'a ProjectCtx,
     detail: String,
+}
+
+/// Whether a failed lock probe is the package manager's own refusal to resolve the lock, as
+/// opposed to a probe that could not run or reach what it needed.
+fn resolver_refusal(err: &CoreError) -> bool {
+    matches!(err, CoreError::Tool { .. })
+        && !err.is_local_environment_failure()
+        && !err.is_transient()
 }
 
 /// The tools with at least two projects among `tools`: a lone project cannot be staled by
@@ -151,10 +209,13 @@ impl Workspace {
                 LaneAccess::Shared,
             )
             .run(|pctx| async move {
-                self.probe_lock(pctx)
-                    .await
-                    .is_some_and(|report| report.status == LockStatus::Current)
-                    .then(|| ProjectKey::of(pctx))
+                let LockProbe::Report(report) = self.probe_lock(pctx).await else {
+                    return None;
+                };
+                if report.status != LockStatus::Current {
+                    return None;
+                }
+                Some((ProjectKey::of(pctx), self.lock_input_snapshot(pctx).await))
             })
             .await;
         CurrentAtStart {
@@ -162,22 +223,47 @@ impl Workspace {
         }
     }
 
-    /// Probes whether `pctx`'s lock is current under a shared lease; `None` when the probe
-    /// cannot run.
-    async fn probe_lock(&self, pctx: &ProjectCtx) -> Option<LockVerifyReport> {
-        let reader = self.adapter(pctx.tool)?;
-        let _guard = self
-            .project_read_guard(pctx)
-            .await
-            .inspect_err(
-                |err| tracing::debug!(%err, project = %pctx.rel_path, "lock probe skipped"),
-            )
-            .ok()?;
-        reader
-            .verify_lock_current(&pctx.project)
-            .await
-            .inspect_err(|err| tracing::debug!(%err, project = %pctx.rel_path, "lock probe failed"))
-            .ok()
+    /// Probes whether `pctx`'s lock is current under a shared lease.
+    async fn probe_lock(&self, pctx: &ProjectCtx) -> LockProbe {
+        let Some(reader) = self.adapter(pctx.tool) else {
+            return LockProbe::Unknown;
+        };
+        let _guard = match self.project_read_guard(pctx).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                tracing::debug!(%err, project = %pctx.rel_path, "lock probe skipped");
+                return LockProbe::Unknown;
+            }
+        };
+        match reader.verify_lock_current(&pctx.project).await {
+            Ok(report) => LockProbe::Report(report),
+            Err(err) => {
+                tracing::debug!(%err, project = %pctx.rel_path, "lock probe failed");
+                if resolver_refusal(&err) {
+                    LockProbe::Refused
+                } else {
+                    LockProbe::Unknown
+                }
+            }
+        }
+    }
+
+    /// Captures the inputs `pctx`'s current lock resolves against; empty when the adapter cannot
+    /// name or the run cannot read them, which leaves the lock to the stale-lock probe alone.
+    async fn lock_input_snapshot(&self, pctx: &ProjectCtx) -> ProjectInputSnapshot {
+        let Some(reader) = self.adapter(pctx.tool) else {
+            return ProjectInputSnapshot::default();
+        };
+        let paths = match self.project_read_guard(pctx).await {
+            Ok(_guard) => reader.lock_inputs(&pctx.project).await,
+            Err(err) => Err(err),
+        };
+        paths
+            .and_then(|paths| ProjectInputSnapshot::capture(&paths))
+            .unwrap_or_else(|err| {
+                tracing::debug!(%err, project = %pctx.rel_path, "lock inputs not captured");
+                ProjectInputSnapshot::default()
+            })
     }
 
     /// Refreshes a tracked project's lock if another project in the run staled it, recording
@@ -188,22 +274,24 @@ impl Workspace {
         opts: &RunOpts,
         writer: &dyn ToolWrite,
         progress: &ProjectProgress,
+        tracked: &CurrentAtStart,
         acc: &mut UpgradeAccum,
     ) -> TurnLock {
         progress.phase("checking lock state");
-        let Some(probe) = self.probe_lock(pctx).await else {
+        let probe = self.probe_lock(pctx).await;
+        let Some(kind) = run_staling(&probe, tracked, pctx) else {
             return TurnLock::Unchanged;
         };
-        if probe.status != LockStatus::Stale {
-            return TurnLock::Unchanged;
-        }
         let project_diag = |diagnostic: Diagnostic| {
             diagnostic
                 .with_tool(pctx.tool.as_str())
                 .with_project(pctx.rel_path.as_str())
                 .with_path(pctx.project.manifest.as_str())
         };
-        let refresh = match self.refresh_lock_under_lease(pctx, writer, progress).await {
+        let refresh = match self
+            .refresh_lock_under_lease(pctx, writer, progress, kind)
+            .await
+        {
             Ok(refresh) => refresh,
             Err(err) => {
                 acc.errors.push(
@@ -219,10 +307,14 @@ impl Workspace {
         acc.warnings.extend(refresh.warnings);
         match refresh.report {
             Ok(Some(report)) if report.status == LockStatus::Current => {
+                let staled = match kind {
+                    LockRefreshKind::Stale => "went stale",
+                    LockRefreshKind::Conflicted => "stopped resolving",
+                };
                 acc.warnings.push(project_diag(Diagnostic::new(
                     DiagnosticKind::StaleLock,
                     format!(
-                        "the lock in {} went stale because another project in this run changed a manifest it resolves against; it was refreshed ({}) and the result gated before the project was evaluated",
+                        "the lock in {} {staled} because another project in this run changed a manifest it resolves against; it was refreshed ({}) and the result gated before the project was evaluated",
                         pctx.project.root,
                         cooldown_core::redact::url_secrets(&report.detail)
                     ),
@@ -333,13 +425,16 @@ impl Workspace {
                 LaneAccess::Shared,
             )
             .run(|pctx| async move {
-                self.probe_lock(pctx)
-                    .await
-                    .filter(|report| report.status == LockStatus::Stale)
-                    .map(|report| StaledProject {
-                        pctx,
-                        detail: report.detail,
-                    })
+                let probe = self.probe_lock(pctx).await;
+                run_staling(&probe, tracked, pctx)?;
+                let detail = match probe {
+                    LockProbe::Report(report) => report.detail,
+                    LockProbe::Refused | LockProbe::Unknown => format!(
+                        "the lock in {} no longer resolves against the manifests this run changed",
+                        pctx.project.root
+                    ),
+                };
+                Some(StaledProject { pctx, detail })
             })
             .await;
         probed.into_iter().flatten().collect()
@@ -353,8 +448,8 @@ mod tests {
     use crate::app::upgrade::UpgradeAccum;
     use crate::app::workspace::tests::project_ctx;
     use camino::Utf8PathBuf;
-    use cooldown_core::{Diagnostic, DiagnosticKind, ToolId};
-    use std::collections::HashSet;
+    use cooldown_core::{Diagnostic, DiagnosticKind, ProjectInputSnapshot, ToolId};
+    use std::collections::{HashMap, HashSet};
 
     const CARGO: ToolId = ToolId("cargo");
     const GO: ToolId = ToolId("go");
@@ -404,7 +499,7 @@ mod tests {
     fn a_failed_pass_stops_tracking_its_project() {
         let project = project_ctx(CARGO, "/repo/fuzz");
         let mut tracked = CurrentAtStart {
-            projects: HashSet::from([ProjectKey::of(&project)]),
+            projects: HashMap::from([(ProjectKey::of(&project), ProjectInputSnapshot::default())]),
         };
 
         tracked.settle(&project, &UpgradeAccum::default());
@@ -424,10 +519,13 @@ mod tests {
     fn tracking_keys_on_tool_and_root() {
         let cargo = project_ctx(CARGO, "/repo");
         let tracked = CurrentAtStart {
-            projects: HashSet::from([ProjectKey {
-                tool: CARGO,
-                root: Utf8PathBuf::from("/repo"),
-            }]),
+            projects: HashMap::from([(
+                ProjectKey {
+                    tool: CARGO,
+                    root: Utf8PathBuf::from("/repo"),
+                },
+                ProjectInputSnapshot::default(),
+            )]),
         };
 
         assert!(tracked.contains(&cargo));

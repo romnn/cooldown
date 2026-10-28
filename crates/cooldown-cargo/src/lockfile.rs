@@ -306,6 +306,15 @@ impl CargoLock {
         })
     }
 
+    /// Every crates.io version the lock carries of `name`.
+    pub(crate) fn crates_io_versions(&self, name: &str) -> Vec<&str> {
+        self.package
+            .iter()
+            .filter(|package| package.name == name && package.is_crates_io())
+            .filter_map(|package| package.version.as_deref())
+            .collect()
+    }
+
     /// Returns every registry version grouped by Cargo compatibility slot.
     pub(crate) fn locked_slots(&self) -> LockedSlots {
         self.matching_slots(LockPackage::is_registry)

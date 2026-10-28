@@ -1650,10 +1650,59 @@ impl Cargo {
         from: &str,
         to: &str,
     ) -> Result<(), CoreError> {
-        let spec = format!("{CRATES_IO_SPEC_SOURCE}#{name}@{from}");
-        self.run(dir, &["update", "-p", &spec, "--precise", to])
+        self.update_precise_crates_io_unlocking(dir, name, from, to, &[])
             .await
-            .map(|_| ())
+    }
+
+    /// Pins the crates.io `name@from` node to exactly `to` like
+    /// [`update_precise_crates_io`](Self::update_precise_crates_io), with each crates.io node in
+    /// `unlocked` also released for the same resolve.
+    ///
+    /// Cargo applies `--precise` to the first spec only and re-resolves every other named node
+    /// freely, which is what lets a pin land when its target needs a version of another locked
+    /// crate (pest 2.9.3 requires `psm = "=0.1.24"` while another dependent holds psm 0.1.32).
+    /// The caller has to verify the outcome: an unlocked node may land anywhere its requirements
+    /// admit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`update_precise_crates_io`](Self::update_precise_crates_io).
+    pub(crate) async fn update_precise_crates_io_unlocking(
+        &self,
+        dir: &Utf8Path,
+        name: &str,
+        from: &str,
+        to: &str,
+        unlocked: &[PackageKey],
+    ) -> Result<(), CoreError> {
+        let mut specs = vec![format!("{CRATES_IO_SPEC_SOURCE}#{name}@{from}")];
+        specs.extend(unlocked.iter().map(crates_io_spec));
+        let mut args = vec!["update"];
+        for spec in &specs {
+            args.extend(["-p", spec.as_str()]);
+        }
+        args.extend(["--precise", to]);
+        self.run(dir, &args).await.map(|_| ())
+    }
+
+    /// Releases each crates.io node in `unlocked` from the lock and re-resolves them together with
+    /// `cargo update -p …`, keeping every other locked version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if
+    /// cargo rejects the update.
+    pub(crate) async fn update_unlocking(
+        &self,
+        dir: &Utf8Path,
+        unlocked: &[PackageKey],
+    ) -> Result<(), CoreError> {
+        let specs: Vec<String> = unlocked.iter().map(crates_io_spec).collect();
+        let mut args = vec!["update"];
+        for spec in &specs {
+            args.extend(["-p", spec.as_str()]);
+        }
+        self.run(dir, &args).await.map(|_| ())
     }
 
     /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].
@@ -1754,6 +1803,74 @@ fn stale_lock_diagnostic(stderr: &str) -> Option<LockRefusal> {
         .then_some(LockRefusal::Stale)
 }
 
+/// The `cargo update -p` spec addressing exactly one crates.io node.
+fn crates_io_spec(node: &PackageKey) -> String {
+    format!("{CRATES_IO_SPEC_SOURCE}#{}@{}", node.name, node.version)
+}
+
+/// A package on one side of a Cargo version-selection conflict, at the version its lock entry
+/// holds when the diagnostic states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConflictParty {
+    /// The package name.
+    pub(crate) name: String,
+    /// The version the diagnostic attributes to it, if any.
+    pub(crate) version: Option<String>,
+}
+
+/// The packages a `failed to select a version for` diagnostic sets against each other: the one
+/// Cargo could not select, at the version its requirement is `(locked to …)`, and every
+/// `previously selected package`.
+///
+/// Either side can be the locked node that keeps the rest of the resolve from moving, depending on
+/// the order Cargo visited them in, so the caller decides which of them the lock actually carries.
+/// The `failed to select a version for the requirement` form names a requirement no published
+/// version satisfies, which no unlocking can fix, so it names no party.
+pub(crate) fn conflict_parties(stderr: &str) -> Vec<ConflictParty> {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let mut parties: Vec<ConflictParty> = Vec::new();
+    let mut add = |party: ConflictParty| {
+        if !parties.contains(&party) {
+            parties.push(party);
+        }
+    };
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.strip_prefix("error: ").unwrap_or(line);
+        if let Some(name) = line
+            .strip_prefix("failed to select a version for `")
+            .and_then(|rest| rest.split_once('`'))
+            .map(|(name, _)| name)
+            .filter(|name| !name.contains(char::is_whitespace))
+        {
+            let version = lines
+                .iter()
+                .skip(index + 1)
+                .take_while(|line| {
+                    !line.contains("failed to select a version for")
+                        && !line.starts_with("previously selected package")
+                })
+                .find(|line| line.starts_with("versions that meet the requirements"))
+                .and_then(|line| line.split_once("(locked to "))
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(version, _)| version.to_string());
+            add(ConflictParty {
+                name: name.to_string(),
+                version,
+            });
+        } else if let Some((name, version)) = line
+            .strip_prefix("previously selected package `")
+            .and_then(|rest| rest.split_once('`'))
+            .and_then(|(package, _)| package.rsplit_once(" v"))
+        {
+            add(ConflictParty {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+            });
+        }
+    }
+    parties
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1788,6 +1905,80 @@ mod tests {
 
     /// Cargo refuses a missing lock under `--locked` with `cannot create`, not `cannot update`;
     /// both are the same stale-lock condition, and which verb it used picks the remedy.
+    fn party(name: &str, version: Option<&str>) -> ConflictParty {
+        ConflictParty {
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+        }
+    }
+
+    /// The precise pin of pest 2.9.3 that issue #5 hits: Cargo visits `psm` through `stacker`
+    /// first, so the locked side is the one it failed to select and the new side was previously
+    /// selected.
+    #[test]
+    fn conflict_parties_read_both_sides_of_a_refused_pin() {
+        let stderr = indoc! {r#"
+            Updating crates.io index
+            error: failed to select a version for `psm`.
+                ... required by package `stacker v0.1.25`
+                ... which satisfies dependency `stacker = "^0.1"` (locked to 0.1.25) of package `app v0.1.0 (/repo/app)`
+            versions that meet the requirements `^0.1.7` (locked to 0.1.32) are: 0.1.32
+
+            all possible versions conflict with previously selected packages
+
+              previously selected package `psm v0.1.24`
+                ... which satisfies dependency `psm = "=0.1.24"` of package `pest v2.9.3`
+                ... which satisfies dependency `pest = "^2.2.0"` of package `handlebars v6.4.4`
+
+            failed to select a version for `psm` which could resolve this conflict
+        "#};
+
+        assert_eq!(
+            conflict_parties(stderr),
+            [
+                party("psm", Some("0.1.32")),
+                party("psm", Some("0.1.24")),
+                party("psm", None),
+            ]
+        );
+    }
+
+    /// A raised floor in a path crate against a lock that still binds the old version: the locked
+    /// side is the previously selected package, and the unselectable side states no lock.
+    #[test]
+    fn conflict_parties_read_a_lock_a_raised_floor_no_longer_resolves() {
+        let stderr = indoc! {r#"
+            error: failed to select a version for `pest`.
+                ... required by package `shared v0.1.0 (/repo/shared)`
+                ... which satisfies path dependency `shared` (locked to 0.1.0) of package `tool v0.1.0 (/repo/nested/tool)`
+            versions that meet the requirements `^2.9.3` are: 2.9.5, 2.9.4, 2.9.3
+
+            all possible versions conflict with previously selected packages
+
+              previously selected package `pest v2.9.2`
+                ... which satisfies dependency `pest = "^2.2.0"` (locked to 2.9.2) of package `handlebars v6.4.4`
+
+            failed to select a version for `pest` which could resolve this conflict
+        "#};
+
+        assert_eq!(
+            conflict_parties(stderr),
+            [party("pest", None), party("pest", Some("2.9.2"))]
+        );
+    }
+
+    /// A requirement nothing published satisfies is not a conflict between locked packages.
+    #[test]
+    fn conflict_parties_ignore_an_unsatisfiable_requirement() {
+        let stderr = indoc! {r#"
+            error: failed to select a version for the requirement `serde = "^9"`
+            candidate versions found which didn't match: 1.0.228
+            required by package `app v0.1.0 (/repo/app)`
+        "#};
+
+        assert!(conflict_parties(stderr).is_empty());
+    }
+
     #[test]
     fn stale_lock_diagnostic_reads_the_refusal_cargo_raised() {
         assert_eq!(

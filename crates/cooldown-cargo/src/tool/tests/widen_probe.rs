@@ -181,6 +181,7 @@ impl WidenFixture {
             .joint_widen_probe(
                 WidenProbe {
                     project: &self.project,
+                    rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &[],
                     followers: &[],
@@ -455,6 +456,7 @@ async fn protected_member_reach_cannot_be_replaced_by_a_disconnected_target_copy
             .joint_widen_probe(
                 WidenProbe {
                     project: &fixture.project,
+                    rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &protected,
                     followers: &[],
@@ -575,6 +577,7 @@ async fn rejected_metadata_restores_removed_and_renamed_follower_entries_and_loc
             .joint_widen_probe(
                 WidenProbe {
                     project: &fixture.project,
+                    rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &[],
                     followers: &followers,
@@ -839,6 +842,7 @@ async fn checked_write_failure_after_an_author_edit_is_restored_by_the_outer_jou
         &fixture.project.root,
         fixture.changes.first().expect("candidate"),
         &followers,
+        RewriteMode::Auto,
         || {
             checks.set(checks.get() + 1);
             if checks.get() == 2 {
@@ -1142,6 +1146,7 @@ async fn rejected_singleton_restores_bytes_permissions_and_absent_member_manifes
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                rewrite: RewriteMode::Auto,
                 candidates: &[planned],
                 protected: &[],
                 followers: &[],
@@ -1243,6 +1248,7 @@ async fn protected_displacement_does_not_memoize_a_candidate_only_widen_rejectio
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                rewrite: RewriteMode::Auto,
                 candidates: &[candidate],
                 protected: &[protected],
                 followers: &[],
@@ -1271,6 +1277,7 @@ async fn protected_displacement_does_not_memoize_a_candidate_only_widen_rejectio
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                rewrite: RewriteMode::Auto,
                 candidates: &[candidate],
                 protected: &[],
                 followers: &[],
@@ -1344,6 +1351,7 @@ async fn transitive_widen_memo_does_not_skip_a_later_member_metadata_mode() -> e
             .tentative_widen_logged(
                 WidenProbe {
                     project: &fixture.project,
+                    rewrite: RewriteMode::Auto,
                     candidates: &[candidate],
                     protected,
                     followers: &[],
@@ -1438,6 +1446,7 @@ async fn composite_widen_transport_failures_disqualify_the_outer_rejection() -> 
                 .tentative_widen_logged(
                     WidenProbe {
                         project: &fixture.project,
+                        rewrite: RewriteMode::Auto,
                         candidates: &[candidate],
                         protected: &[],
                         followers: &[],
@@ -1469,6 +1478,57 @@ async fn composite_widen_transport_failures_disqualify_the_outer_rejection() -> 
         assert_eq!(updates, if update_transport { 2 } else { 1 });
         // A resolver rejection cannot erase the earlier transport failure's disqualification.
         assert_eq!(stats.hits, usize::from(!update_transport));
+    }
+    Ok(())
+}
+
+/// A refused in-range pin leaves an admitting requirement alone in the default mode, even when
+/// raising the floor would let Cargo land it, so other projects that resolve the manifest keep
+/// their locks; `--rewrite` still normalizes it.
+#[tokio::test]
+async fn a_refused_in_range_pin_raises_its_requirement_only_under_rewrite() -> eyre::Result<()> {
+    for (rewrite, requirement, landed) in [
+        (RewriteMode::Auto, "pkg000 = \"1\"", false),
+        (RewriteMode::Always, "pkg000 = \"1.5.0\"", true),
+    ] {
+        // Only a raised floor lets Cargo re-resolve the target; every pin and seed is refused.
+        let mut fixture = WidenFixture::new(
+            1,
+            indoc! {r#"
+            if grep -q 'pkg000 = "1.5.0"' Cargo.toml; then
+              cp raised.lock Cargo.lock
+            else
+              echo 'error: failed to select a version for `pkg000`.' >&2
+              exit 101
+            fi
+        "#},
+        )?;
+        for planned in &mut fixture.changes {
+            planned.to = Version::new("1.5.0");
+        }
+        std::fs::write(
+            fixture.project.root.join("raised.lock"),
+            WidenFixture::lock(&fixture.changes, 0).replace("1.0.0", "1.5.0"),
+        )?;
+        let journal = fixture.journal().await?;
+        let plan = Plan {
+            changes: fixture.changes.clone(),
+            rewrite,
+            ..Plan::default()
+        };
+
+        let rejections = fixture
+            .tool
+            .whole_graph_resolve(&fixture.project, &plan, &journal, None)
+            .await?;
+
+        let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
+        assert!(manifest.contains(requirement), "{rewrite:?}: {manifest}");
+        assert_eq!(
+            read_lock(&fixture.project)?.has_crates_io_package("pkg000", "1.5.0"),
+            landed,
+            "{rewrite:?}: {rejections:?}"
+        );
     }
     Ok(())
 }

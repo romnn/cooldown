@@ -103,6 +103,9 @@ default is honored where the tool can pin an exact in-range version without edit
 cargo (`update --precise`), uv
 (`lock --upgrade-package`), and pnpm (`update --no-save`). npm, yarn, and bun have no such command,
 and Go's `go.mod` *is* the version source, so those always rewrite the manifest regardless of mode.
+When cargo refuses an in-range pin because another locked crate stands in the way (the target
+requires a different version of it), cooldown releases that crate for the same resolve and reports
+its move as a collateral row instead of raising the manifest's floor.
 
 The happy path is zero config. Raising the whole repo to 14 days is one line of `cooldown.toml`:
 

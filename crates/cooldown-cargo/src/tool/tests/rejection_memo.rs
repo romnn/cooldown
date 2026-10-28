@@ -156,6 +156,7 @@ impl MemoFixture {
                     .tentative_widen_logged(
                         WidenProbe {
                             project: &self.project,
+                            rewrite: RewriteMode::Auto,
                             candidates: &[&self.change],
                             protected: &[],
                             followers: &[],
@@ -182,10 +183,13 @@ impl MemoFixture {
         let mut rejections = PinRejections::new();
         self.tool
             .pin_individually(
-                &self.project,
+                PinPass {
+                    project: &self.project,
+                    batch: &[&self.change],
+                    journal,
+                    observer: None,
+                },
                 &[&self.change],
-                journal,
-                None,
                 &mut rejections,
                 stats,
             )
@@ -325,6 +329,7 @@ async fn tentative_widen_hit_preserves_files_and_the_rejection_detail() -> eyre:
             .tentative_widen_logged(
                 WidenProbe {
                     project: &fixture.project,
+                    rewrite: RewriteMode::Auto,
                     candidates: &[&fixture.change],
                     protected: &[],
                     followers: &[],
@@ -610,6 +615,7 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
                         .tentative_widen_logged(
                             WidenProbe {
                                 project: &fixture.project,
+                                rewrite: RewriteMode::Auto,
                                 candidates: &[&fixture.change],
                                 protected: &[],
                                 followers: &[],

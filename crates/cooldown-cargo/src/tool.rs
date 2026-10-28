@@ -10,6 +10,8 @@
 //! Apply re-resolves the **whole** graph by issuing all planned pins as one logical unit.
 //! Planned targets are seeded into the lock for one unlocked resolve; failed groups are bisected,
 //! and only small rejected groups or targets the seed left short need individual precise commands.
+//! A precise command Cargo refuses because a locked crate outside the plan blocks the target is
+//! retried with that crate released, so an in-range target lands without a manifest edit.
 //! Version reporting compares before/after `Cargo.lock` slots, while edge reporting audits moves
 //! paired across stable dependent identities whose endpoints coexist in both snapshots.
 //! The slot comparison reports planned and collateral version changes, while a planned candidate
@@ -19,7 +21,7 @@
 //! A converged graph re-applies to a byte-stable fixed point.
 
 use crate::CARGO_ID;
-use crate::cargocmd::{Cargo, ResolvedGraph};
+use crate::cargocmd::{Cargo, ConflictParty, PackageKey, ResolvedGraph, conflict_parties};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::lockfile::{CargoLock, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes};
@@ -497,6 +499,11 @@ impl ToolRead for CargoTool {
             Err(e) => Err(e),
         }
     }
+
+    async fn lock_inputs(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
+        edges::enforce::ensure_no_pending(project)?;
+        crate::staging::lock_input_manifests(&self.cargo, project).await
+    }
 }
 
 #[async_trait]
@@ -838,6 +845,8 @@ impl ApplyObserver for ResolveCounter<'_> {
 
 struct WidenProbe<'a> {
     project: &'a Project,
+    /// The plan's rewrite mode, which decides whether an already admitting requirement is kept.
+    rewrite: RewriteMode,
     candidates: &'a [&'a Change],
     protected: &'a [&'a Change],
     followers: &'a [MemberRef],
@@ -943,8 +952,39 @@ enum PrecisePinOutcome {
     Rejected {
         detail: Option<String>,
         resolver_rejection: bool,
+        /// The packages Cargo's conflict set against the pin, when it reported one.
+        parties: Vec<ConflictParty>,
     },
 }
+
+/// The context every precise pin of one pin batch runs in.
+#[derive(Clone, Copy)]
+struct PinPass<'a> {
+    project: &'a Project,
+    /// Every obligation of the running pin batch, which no retry that unlocks a blocker may
+    /// displace.
+    batch: &'a [&'a Change],
+    journal: &'a ProjectMutationJournal,
+    observer: Option<&'a dyn ApplyObserver>,
+}
+
+/// A precise pin Cargo refused, with what its refusal said.
+struct RefusedPin<'a> {
+    change: &'a Change,
+    /// The locked version the pin addresses.
+    current: &'a str,
+    detail: Option<String>,
+    resolver_rejection: bool,
+    parties: Vec<ConflictParty>,
+}
+
+/// How many rounds of newly named blockers one refused pin may release before it stays held.
+const PIN_BLOCKER_ROUNDS: usize = 3;
+
+/// How many rounds of newly named blockers a conflicted lock refresh may release before it fails.
+/// Each round releases at least one more node Cargo named, so a family that moves together (the
+/// four pest crates and the `psm` they pin) settles well inside it.
+const LOCK_CONFLICT_ROUNDS: usize = 8;
 
 fn widen_fingerprint(
     project: &Project,
@@ -1202,6 +1242,84 @@ fn blocking_requirer(
     blocker.filter(|name| name != held)
 }
 
+/// The parties of a resolver conflict `error` reports, or none for any other refusal.
+fn rejection_parties(error: &CoreError) -> Vec<ConflictParty> {
+    match error {
+        CoreError::Tool { stderr, .. } if memoizable_resolver_rejection(error) => {
+            conflict_parties(stderr)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The crates.io nodes of `lock` that `parties` name: each party at its stated version, or at the
+/// only version the lock carries of it when the diagnostic stated none.
+fn locked_parties(lock: &CargoLock, parties: &[ConflictParty]) -> Vec<PackageKey> {
+    let mut nodes: Vec<PackageKey> = Vec::new();
+    for party in parties {
+        let version = match &party.version {
+            Some(version) if lock.has_crates_io_package(&party.name, version) => version.clone(),
+            Some(_) => continue,
+            None => match lock.crates_io_versions(&party.name).as_slice() {
+                [only] => (*only).to_string(),
+                _ => continue,
+            },
+        };
+        let node = PackageKey::new(party.name.clone(), version);
+        if !nodes.contains(&node) {
+            nodes.push(node);
+        }
+    }
+    nodes
+}
+
+/// The locked nodes a refused pin of `change` may release: the conflict's parties the lock
+/// carries, except the candidate itself and every crate the batch plans to move, which reach
+/// their own targets through their own pins.
+fn pin_blockers(
+    lock: &CargoLock,
+    change: &Change,
+    batch: &[&Change],
+    parties: &[ConflictParty],
+) -> Vec<PackageKey> {
+    locked_parties(lock, parties)
+        .into_iter()
+        .filter(|node| {
+            node.name != change.package.name
+                && batch
+                    .iter()
+                    .all(|planned| planned.package.name != node.name)
+        })
+        .collect()
+}
+
+/// Whether an unlocking retry kept the batch's obligations: the candidate reached its exact target,
+/// every planned target already reached stays reached, and every planned crate still at its
+/// original version stays there or reached its target instead of drifting elsewhere.
+fn unlocking_kept_obligations(
+    before: &CargoLock,
+    after: &CargoLock,
+    change: &Change,
+    batch: &[&Change],
+) -> bool {
+    let (before_versions, after_versions) = (
+        before.crates_io_locked_versions(),
+        after.crates_io_locked_versions(),
+    );
+    reached(&after_versions, change)
+        && batch.iter().all(|planned| {
+            let name = &planned.package.name;
+            if reached(&before_versions, planned) {
+                reached(&after_versions, planned)
+            } else if before.has_crates_io_package(name, planned.from.as_str()) {
+                after.has_crates_io_package(name, planned.from.as_str())
+                    || reached(&after_versions, planned)
+            } else {
+                true
+            }
+        })
+}
+
 impl CargoTool {
     fn rejection_memo_key(&self, attempt: &MemoAttempt<'_>) -> Result<Option<MemoKey>> {
         attempt.validate()?;
@@ -1404,6 +1522,7 @@ impl CargoTool {
                 .joint_widen_probe(
                     WidenProbe {
                         project,
+                        rewrite: plan.rewrite,
                         candidates: &candidates,
                         protected: &round.protected,
                         followers: &followers,
@@ -1427,6 +1546,7 @@ impl CargoTool {
                     .tentative_widen_logged(
                         WidenProbe {
                             project,
+                            rewrite: plan.rewrite,
                             candidates: &candidates,
                             protected: &round.protected,
                             followers: &followers,
@@ -1454,6 +1574,7 @@ impl CargoTool {
                     .pin_unwidened_protected(
                         WidenProbe {
                             project,
+                            rewrite: plan.rewrite,
                             candidates: &candidates,
                             protected: &round.protected,
                             followers: &followers,
@@ -1556,10 +1677,13 @@ impl CargoTool {
     ) -> Result<Option<WidenEvidence>> {
         let mut edited = 0;
         for change in candidates {
-            let rewrite =
-                widen_and_follow_checked(&probe.project.root, change, probe.followers, || {
-                    probe.journal.validate_project(&probe.project.root)
-                })?;
+            let rewrite = widen_and_follow_checked(
+                &probe.project.root,
+                change,
+                probe.followers,
+                probe.rewrite,
+                || probe.journal.validate_project(&probe.project.root),
+            )?;
             edited += usize::from(!rewrite.modified.is_empty());
         }
         tracing::debug!(
@@ -1688,9 +1812,13 @@ impl CargoTool {
         stats: &mut PinBatchStats,
     ) -> Result<TentativeWiden> {
         probe.journal.validate_project(&probe.project.root)?;
-        if widen_and_follow_checked(&probe.project.root, change, probe.followers, || {
-            probe.journal.validate_project(&probe.project.root)
-        })?
+        if widen_and_follow_checked(
+            &probe.project.root,
+            change,
+            probe.followers,
+            probe.rewrite,
+            || probe.journal.validate_project(&probe.project.root),
+        )?
         .modified
         .is_empty()
         {
@@ -2225,6 +2353,12 @@ impl CargoTool {
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<()> {
+        let pass = PinPass {
+            project,
+            batch: worklist,
+            journal,
+            observer,
+        };
         let mut groups = vec![worklist.to_vec()];
         while let Some(group) = groups.pop() {
             let lock = read_lock(project)?;
@@ -2234,7 +2368,7 @@ impl CargoTool {
                 .filter(|change| current_selector(&lock, change).is_some())
                 .partition(|change| self.was_refused_alone(change));
             if !refused.is_empty() {
-                self.pin_individually(project, &refused, journal, observer, rejections, stats)
+                self.pin_individually(pass, &refused, rejections, stats)
                     .await?;
             }
             if unlanded.is_empty() {
@@ -2257,12 +2391,11 @@ impl CargoTool {
             // A lone change gains nothing from a seed either: the precise pin is one resolve too,
             // and only it records cargo's explanation when the change is refused.
             if let [lone] = unlanded.as_slice() {
-                self.pin_alone(project, lone, journal, observer, rejections, stats)
-                    .await?;
+                self.pin_alone(pass, lone, rejections, stats).await?;
                 continue;
             }
             if moves.is_empty() {
-                self.pin_individually(project, &unlanded, journal, observer, rejections, stats)
+                self.pin_individually(pass, &unlanded, rejections, stats)
                     .await?;
                 continue;
             }
@@ -2290,16 +2423,13 @@ impl CargoTool {
                         .filter(|change| current_selector(&seeded.after, change).is_some())
                         .collect();
                     stats.landed += unlanded.len() - leftovers.len();
-                    self.pin_individually(
-                        project, &leftovers, journal, observer, rejections, stats,
-                    )
-                    .await?;
+                    self.pin_individually(pass, &leftovers, rejections, stats)
+                        .await?;
                     continue;
                 }
             }
             if let [lone] = unlanded.as_slice() {
-                self.pin_alone(project, lone, journal, observer, rejections, stats)
-                    .await?;
+                self.pin_alone(pass, lone, rejections, stats).await?;
             } else {
                 stats.bisected += 1;
                 let right = unlanded.split_off(unlanded.len() / 2);
@@ -2314,16 +2444,14 @@ impl CargoTool {
     /// out of their seeds.
     async fn pin_alone(
         &self,
-        project: &Project,
+        pass: PinPass<'_>,
         change: &Change,
-        journal: &ProjectMutationJournal,
-        observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<()> {
-        self.pin_individually(project, &[change], journal, observer, rejections, stats)
+        self.pin_individually(pass, &[change], rejections, stats)
             .await?;
-        if current_selector(&read_lock(project)?, change).is_some() {
+        if current_selector(&read_lock(pass.project)?, change).is_some() {
             self.refused_alone
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2343,15 +2471,16 @@ impl CargoTool {
     ///
     /// Each command can move or remove another planned node, so every pass re-reads the lock and
     /// uses [`current_selector`] to address the original or unique off-target version.
+    /// A pin Cargo refuses because another locked node stands in the way is retried with that node
+    /// unlocked (see [`pin_unlocking_blockers`](Self::pin_unlocking_blockers)).
     async fn pin_individually(
         &self,
-        project: &Project,
+        pass: PinPass<'_>,
         worklist: &[&Change],
-        journal: &ProjectMutationJournal,
-        observer: Option<&dyn ApplyObserver>,
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<()> {
+        let (project, journal, observer) = (pass.project, pass.journal, pass.observer);
         let mut seen = BTreeSet::new();
         for _ in 0..worklist.len().saturating_add(1) {
             let before = read_lock(project)?.locked_slots();
@@ -2425,24 +2554,18 @@ impl CargoTool {
                 if let PrecisePinOutcome::Rejected {
                     detail,
                     resolver_rejection,
+                    parties,
                 } = updated?
                 {
-                    let effects: Vec<_> = detail
-                        .into_iter()
-                        .map(|detail| RejectionEffect {
-                            key: rejection_key(change),
-                            detail,
-                            overwrite: true,
-                        })
-                        .collect();
-                    let rejection = MemoRejection { effects };
-                    // Last rejection wins; a candidate a later pass still lands never reads its
-                    // stale entry (details are consulted only for unreached candidates).
-                    stats.record_effects(&rejection, rejections);
-                    stats.record_rejection(resolver_rejection);
-                    if stats.memoizable_rejection() && resolver_rejection {
-                        self.remember_rejection(&memo_attempt, key, rejection)?;
-                    }
+                    let refused = RefusedPin {
+                        change,
+                        current: &current,
+                        detail,
+                        resolver_rejection,
+                        parties,
+                    };
+                    self.settle_refused_pin(pass, refused, &memo_attempt, key, rejections, stats)
+                        .await?;
                 }
             }
             let after = read_lock(project)?.locked_slots();
@@ -2451,6 +2574,134 @@ impl CargoTool {
             }
         }
         Ok(())
+    }
+
+    /// Lands a refused pin by releasing its blockers, or records Cargo's refusal for the candidate's
+    /// held row and, where the outcome is reusable, in the rejection memo.
+    async fn settle_refused_pin(
+        &self,
+        pass: PinPass<'_>,
+        refused: RefusedPin<'_>,
+        memo_attempt: &MemoAttempt<'_>,
+        key: Option<MemoKey>,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<()> {
+        if self.pin_unlocking_blockers(pass, &refused, stats).await? {
+            return Ok(());
+        }
+        let RefusedPin {
+            change,
+            detail,
+            resolver_rejection,
+            ..
+        } = refused;
+        let effects: Vec<_> = detail
+            .into_iter()
+            .map(|detail| RejectionEffect {
+                key: rejection_key(change),
+                detail,
+                overwrite: true,
+            })
+            .collect();
+        let rejection = MemoRejection { effects };
+        // Last rejection wins; a candidate a later pass still lands never reads its
+        // stale entry (details are consulted only for unreached candidates).
+        stats.record_effects(&rejection, rejections);
+        stats.record_rejection(resolver_rejection);
+        if stats.memoizable_rejection() && resolver_rejection {
+            self.remember_rejection(memo_attempt, key, rejection)?;
+        }
+        Ok(())
+    }
+
+    /// Retries a refused precise pin with the locked nodes Cargo blamed released beside it, so a
+    /// target that needs another crate's version moved (pest 2.9.3 pins `psm = "=0.1.24"` while
+    /// another dependent holds psm 0.1.32) still lands within the requirement that admits it,
+    /// instead of being held or forcing a raised floor into a manifest other projects resolve.
+    ///
+    /// A retry Cargo also refuses names the next blockers, and a bounded number of rounds release
+    /// them too.
+    /// A landing is kept only when it keeps the batch's obligations
+    /// ([`unlocking_kept_obligations`]); otherwise the lock is restored byte for byte.
+    /// The released nodes may move anywhere their requirements admit: the apply reports them as
+    /// collateral rows, and the executor's transitive gate matures any that floated too fresh.
+    /// Returns whether the pin landed.
+    async fn pin_unlocking_blockers(
+        &self,
+        pass: PinPass<'_>,
+        refused: &RefusedPin<'_>,
+        stats: &mut PinBatchStats,
+    ) -> Result<bool> {
+        let PinPass {
+            project,
+            batch,
+            journal,
+            observer,
+        } = pass;
+        let RefusedPin {
+            change, current, ..
+        } = *refused;
+        let lock_path = project.root.join("Cargo.lock");
+        let before_text = std::fs::read_to_string(&lock_path)?;
+        let before = CargoLock::parse(&before_text)?;
+        let mut blockers = pin_blockers(&before, change, batch, &refused.parties);
+        if blockers.is_empty() {
+            return Ok(false);
+        }
+        // The retry's outcome depends on the batch, which the memo key omits.
+        stats.memo_disqualified = true;
+        let mut released: Vec<PackageKey> = Vec::new();
+        for _ in 0..PIN_BLOCKER_ROUNDS {
+            blockers.retain(|node| !released.contains(node));
+            if blockers.is_empty() {
+                break;
+            }
+            released.append(&mut blockers);
+            journal.validate_project(&project.root)?;
+            if let Some(observer) = observer {
+                observer.resolver_started(Some(change));
+            }
+            stats.resolves += 1;
+            stats.per_crate += 1;
+            let updated = self
+                .cargo
+                .update_precise_crates_io_unlocking(
+                    &project.root,
+                    &change.package.name,
+                    current,
+                    change.to.as_str(),
+                    &released,
+                )
+                .await;
+            journal.validate_project(&project.root)?;
+            match updated {
+                Ok(()) => {
+                    let after = read_lock(project)?;
+                    let kept = unlocking_kept_obligations(&before, &after, change, batch);
+                    tracing::debug!(
+                        change = ?rejection_key(change),
+                        released = ?released,
+                        kept,
+                        "cargo unlocking pin attempt"
+                    );
+                    if !kept {
+                        std::fs::write(&lock_path, &before_text)?;
+                    }
+                    return Ok(kept);
+                }
+                Err(err) if err.is_local_environment_failure() => return Err(err),
+                Err(err) => {
+                    blockers = pin_blockers(&before, change, batch, &rejection_parties(&err));
+                }
+            }
+        }
+        tracing::debug!(
+            change = ?rejection_key(change),
+            released = ?released,
+            "cargo unlocking pin refused"
+        );
+        Ok(false)
     }
 
     /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
@@ -2477,6 +2728,7 @@ impl CargoTool {
             Err(err) => Ok(PrecisePinOutcome::Rejected {
                 resolver_rejection: memoizable_resolver_rejection(&err),
                 detail: summarize_pin_rejection(&err),
+                parties: rejection_parties(&err),
             }),
         }
     }
@@ -2701,7 +2953,7 @@ fn widen_all_up_front(
 ) -> Result<()> {
     for change in &plan.changes {
         journal.validate_project(&project.root)?;
-        widen_and_follow(&project.root, change, followers)?;
+        widen_and_follow(&project.root, change, followers, plan.rewrite)?;
     }
     Ok(())
 }
@@ -2728,14 +2980,16 @@ fn widen_and_follow(
     root: &Utf8Path,
     change: &Change,
     followers: &[MemberRef],
+    mode: RewriteMode,
 ) -> Result<manifest::ManifestRewrite> {
-    widen_and_follow_checked(root, change, followers, || Ok(()))
+    widen_and_follow_checked(root, change, followers, mode, || Ok(()))
 }
 
 fn widen_and_follow_checked(
     root: &Utf8Path,
     change: &Change,
     followers: &[MemberRef],
+    mode: RewriteMode,
     mut validate: impl FnMut() -> Result<()>,
 ) -> Result<manifest::ManifestRewrite> {
     // A generated member attributed to the change (a node only its projection still holds) is
@@ -2756,6 +3010,7 @@ fn widen_and_follow_checked(
             &authors,
             &change.package.name,
             change.to.as_str(),
+            mode,
             &mut validate,
         )?
     };
@@ -3064,6 +3319,51 @@ impl ToolWrite for CargoTool {
         true
     }
 
+    /// Releases the locked nodes Cargo's version-selection conflict names, round by round, until
+    /// the lock resolves: `cargo update --workspace` keeps every node the manifests still admit
+    /// on its own, so a raised floor that a locked dependent's requirement also binds (handlebars
+    /// holding pest 2.9.2 against a path crate's new `pest = "2.9.3"`) never resolves through it.
+    async fn refresh_conflicted_lock(&self, project: &Project) -> Result<Option<LockVerifyReport>> {
+        crate::staging::reject_custom_lockfile(&project.root)?;
+        edges::enforce::ensure_no_pending(project)?;
+        let Err(mut error) = self
+            .cargo
+            .verify_locked(&project.root, &project.generated_members)
+            .await
+        else {
+            return Ok(None);
+        };
+        let mut released: Vec<PackageKey> = Vec::new();
+        for _ in 0..LOCK_CONFLICT_ROUNDS {
+            let mut blockers = locked_parties(&read_lock(project)?, &rejection_parties(&error));
+            blockers.retain(|node| !released.contains(node));
+            if blockers.is_empty() {
+                break;
+            }
+            released.append(&mut blockers);
+            match self.cargo.update_unlocking(&project.root, &released).await {
+                Ok(()) => {
+                    let nodes: Vec<String> = released
+                        .iter()
+                        .map(|node| format!("{}@{}", node.name, node.version))
+                        .collect();
+                    return Ok(Some(LockVerifyReport {
+                        status: LockStatus::Current,
+                        detail: format!(
+                            "Cargo.lock re-resolved with {} unlocked",
+                            nodes.join(", ")
+                        ),
+                    }));
+                }
+                Err(err) if err.is_local_environment_failure() || err.is_tool_spawn_failure() => {
+                    return Err(err);
+                }
+                Err(err) => error = err,
+            }
+        }
+        Err(error)
+    }
+
     async fn recover_pending_mutation(
         &self,
         project: &Project,
@@ -3172,6 +3472,9 @@ mod tests {
 
     #[cfg(unix)]
     mod rejection_memo;
+
+    #[cfg(unix)]
+    mod unlocking_pins;
 
     fn duplicate_guard_lock(versions: &[(&str, &str)]) -> eyre::Result<CargoLock> {
         let mut content = String::new();
@@ -3731,8 +4034,13 @@ mod tests {
         let mut planned = change("foo", "1.0.0", "2.0.0", false);
         planned.members = vec![hack.clone()];
 
-        let rewrite =
-            widen_and_follow(root, &planned, std::slice::from_ref(&hack)).expect("rewrite");
+        let rewrite = widen_and_follow(
+            root,
+            &planned,
+            std::slice::from_ref(&hack),
+            RewriteMode::Auto,
+        )
+        .expect("rewrite");
 
         assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("hack/Cargo.toml")]);
         let hack_after = std::fs::read_to_string(root.join("hack/Cargo.toml")).expect("read");
@@ -4113,9 +4421,14 @@ mod tests {
         )
         .expect("write manifest");
 
-        let rewrite =
-            manifest::widen_constraint(&root, std::slice::from_ref(&mcp_member), "nix", "0.31.3")
-                .expect("rewrite target-gated dep");
+        let rewrite = manifest::widen_constraint(
+            &root,
+            std::slice::from_ref(&mcp_member),
+            "nix",
+            "0.31.3",
+            RewriteMode::Always,
+        )
+        .expect("rewrite target-gated dep");
 
         assert_eq!(
             rewrite.modified,

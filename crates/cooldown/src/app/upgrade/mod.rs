@@ -238,7 +238,7 @@ impl Workspace {
         };
         if current_at_start.contains(pctx) {
             match self
-                .refresh_run_staled_lock(pctx, opts, writer, &progress, &mut acc)
+                .refresh_run_staled_lock(pctx, opts, writer, &progress, current_at_start, &mut acc)
                 .await
             {
                 TurnLock::Unchanged => {}
