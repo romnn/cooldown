@@ -37,7 +37,9 @@ mod support;
 use indoc::{formatdoc, indoc};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf, Prefix};
-use support::{ChangeVersions, Fixture, changed_packages, toml_lock_entries, toml_lock_pins};
+use support::{
+    ChangeVersions, Envelope, Fixture, changed_packages, toml_lock_entries, toml_lock_pins,
+};
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
 /// the matured-version set — and the precise targets cooldown computes — reproduce forever.
@@ -2914,4 +2916,256 @@ fn explicit_upper_bound_holds_until_rewrite() {
         !String::from_utf8_lossy(&fixture.read_bytes("Cargo.toml")).contains(">=3, <4"),
         "the crossed bound must be rewritten"
     );
+}
+
+/// The cutoff admits pest 2.9.3 (2026-10-09) but neither 2.9.4 (2026-10-16) nor 2.9.5, and every
+/// version the shared-path-crate fixture pins was published before it.
+const SHARED_PATH_FREEZE: &str = "2026-10-12T00:00:00Z";
+
+/// The four crates of the pest family, which move together.
+const PEST_FAMILY: [&str; 4] = ["pest", "pest_derive", "pest_generator", "pest_meta"];
+
+/// The issue #5 layout: a root workspace of `shared` and `app`, and a standalone `nested`
+/// workspace whose `tool` reaches `shared` by path, so both locks resolve `shared`'s requirements.
+/// `shared` declares `pest = "2"`, which already admits the matured 2.9.3.
+/// Both locks hold the pest family at 2.9.2 and `psm` at 0.1.32 through `stacker`, while pest
+/// 2.9.3 requires `psm = "=0.1.24"`, so the precise pin of pest is refused until `psm` moves too.
+/// `consumer_extra` is appended to both consumers' `[dependencies]`.
+fn shared_path_crate_fixture(consumer_extra: &str) -> Fixture {
+    let consumer = |shared: &str, name: &str| {
+        formatdoc! {r#"
+            [package]
+            name = "{name}"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            shared = {{ path = "{shared}", features = ["pest"] }}
+            handlebars = "6"
+            stacker = "0.1"
+            {consumer_extra}
+        "#}
+    };
+    let fixture = Fixture::new();
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["shared", "app"]
+                exclude = ["nested"]
+                resolver = "2"
+            "#},
+        )
+        .write(
+            "shared/Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "shared"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                default = []
+                pest = ["dep:pest", "dep:pest_derive"]
+
+                [dependencies]
+                pest = { version = "2", optional = true }
+                pest_derive = { version = "2", optional = true }
+            "#},
+        )
+        .write("shared/src/lib.rs", "")
+        .write("app/Cargo.toml", &consumer("../shared", "app"))
+        .write("app/src/lib.rs", "")
+        .write(
+            "nested/Cargo.toml",
+            indoc! {r#"
+                [workspace]
+                members = ["tool"]
+                resolver = "2"
+            "#},
+        )
+        .write("nested/tool/Cargo.toml", &consumer("../../shared", "tool"))
+        .write("nested/tool/src/lib.rs", "");
+    for manifest in ["Cargo.toml", "nested/Cargo.toml"] {
+        let run = |args: &[&str]| {
+            let mut args = args.to_vec();
+            args.extend(["--manifest-path", manifest]);
+            fixture.run_tool("cargo", &args, &[]).expect_success();
+        };
+        run(&["generate-lockfile"]);
+        run(&["update", "-p", "handlebars", "--precise", "6.4.4"]);
+        run(&["update", "-p", "stacker", "--precise", "0.1.25"]);
+        // One crate per command, since cargo pins only the first of several `-p` specs precisely,
+        // and dependents first, since each requires its dependencies at its own version or newer.
+        for name in ["pest_derive", "pest_generator", "pest_meta", "pest"] {
+            run(&["update", "-p", name, "--precise", "2.9.2"]);
+        }
+        run(&["update", "-p", "psm", "--precise", "0.1.32"]);
+    }
+    for lock in ["Cargo.lock", "nested/Cargo.lock"] {
+        let pins = toml_lock_pins(&fixture.read_bytes(lock));
+        for name in PEST_FAMILY {
+            assert_eq!(pins.get(name).map(String::as_str), Some("2.9.2"), "{lock}");
+        }
+        assert_eq!(
+            pins.get("psm").map(String::as_str),
+            Some("0.1.32"),
+            "{lock}"
+        );
+    }
+    fixture
+}
+
+/// Asserts both locks of a [`shared_path_crate_fixture`] hold the whole pest family at the matured
+/// 2.9.3, and that cargo accepts the nested lock as it is.
+fn assert_both_locks_land_pest(fixture: &Fixture) {
+    for lock in ["Cargo.lock", "nested/Cargo.lock"] {
+        let pins = toml_lock_pins(&fixture.read_bytes(lock));
+        for name in PEST_FAMILY {
+            assert_eq!(pins.get(name).map(String::as_str), Some("2.9.3"), "{lock}");
+        }
+    }
+    fixture
+        .run_tool(
+            "cargo",
+            &[
+                "metadata",
+                "--locked",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "nested/Cargo.toml",
+            ],
+            &[],
+        )
+        .expect_success();
+}
+
+/// Issue #5: a precise pin another locked crate blocks lands by releasing that crate, so the
+/// default mode keeps `shared`'s `pest = "2"` instead of raising it to 2.9.3 and breaking the
+/// nested lock that resolves the same manifest.
+#[test]
+fn upgrade_lands_a_blocked_in_range_pin_without_raising_a_shared_requirement() {
+    skip_if_missing!("cargo");
+    let fixture = shared_path_crate_fixture("");
+    let shared_before = fixture.read_bytes("shared/Cargo.toml");
+
+    let upgraded = fixture.cooldown_json(&["upgrade", "--major", "--freeze", SHARED_PATH_FREEZE]);
+
+    assert_blocked_pin_landed(&fixture, &upgraded, &shared_before);
+}
+
+/// CI runners export `CARGO_TERM_COLOR=always`, under which cargo colors its conflict
+/// diagnostics; the blocked pin must still land, because cooldown asks cargo for plain output
+/// whatever the caller's environment holds.
+#[test]
+fn upgrade_lands_a_blocked_pin_when_the_environment_requests_cargo_color() {
+    skip_if_missing!("cargo");
+    let fixture = shared_path_crate_fixture("");
+    let shared_before = fixture.read_bytes("shared/Cargo.toml");
+
+    let upgraded = fixture.cooldown_json_env(
+        &["upgrade", "--major", "--freeze", SHARED_PATH_FREEZE],
+        &[("CARGO_TERM_COLOR", "always")],
+    );
+
+    assert_blocked_pin_landed(&fixture, &upgraded, &shared_before);
+}
+
+/// Asserts the outcome issue #5 asks for: `shared` keeps its admitting requirement, both locks
+/// land the pest family, and the released `psm` is reported as collateral in each project.
+fn assert_blocked_pin_landed(fixture: &Fixture, upgraded: &Envelope, shared_before: &[u8]) {
+    assert!(upgraded.ok(), "{:?}", upgraded.error_messages());
+    assert_eq!(
+        String::from_utf8_lossy(&fixture.read_bytes("shared/Cargo.toml")),
+        String::from_utf8_lossy(shared_before),
+        "an admitting requirement stays as written"
+    );
+    assert_both_locks_land_pest(fixture);
+    // The released `psm` is the collateral the pinned pest requires, reported in each project.
+    assert_eq!(
+        upgraded.changes_for("psm"),
+        vec![ChangeVersions::new("0.1.32", "0.1.24"); 2]
+    );
+    assert!(
+        upgraded.downgraded_names().contains("psm"),
+        "{:?}",
+        upgraded.downgraded_names()
+    );
+}
+
+/// A blocker the consumers declare themselves is never moved outside the plan: with `psm = "0.1"`
+/// declared beside `stacker`, the pin of pest 2.9.3 stays refused and is held, `psm` keeps its
+/// matured 0.1.32, and no requirement is raised to force the move.
+#[test]
+fn upgrade_holds_a_pin_whose_blocker_is_a_direct_dependency() {
+    skip_if_missing!("cargo");
+    let fixture = shared_path_crate_fixture(r#"psm = "0.1""#);
+    let shared_before = fixture.read_bytes("shared/Cargo.toml");
+
+    let upgraded = fixture.cooldown_json(&["upgrade", "--major", "--freeze", SHARED_PATH_FREEZE]);
+
+    assert!(upgraded.ok(), "{:?}", upgraded.error_messages());
+    assert_eq!(
+        String::from_utf8_lossy(&fixture.read_bytes("shared/Cargo.toml")),
+        String::from_utf8_lossy(&shared_before),
+        "the admitting requirement is not raised to force the move"
+    );
+    for lock in ["Cargo.lock", "nested/Cargo.lock"] {
+        let pins = toml_lock_pins(&fixture.read_bytes(lock));
+        assert_eq!(
+            pins.get("pest").map(String::as_str),
+            Some("2.9.2"),
+            "{lock}"
+        );
+        assert_eq!(
+            pins.get("psm").map(String::as_str),
+            Some("0.1.32"),
+            "{lock}"
+        );
+    }
+    assert!(upgraded.changes_for("psm").is_empty(), "{upgraded:?}");
+    assert!(
+        upgraded.held_conflict_names().contains("pest"),
+        "{:?} {:?}",
+        upgraded.held_conflict_names(),
+        upgraded.skipped_reasons()
+    );
+}
+
+/// `--rewrite` still raises `shared`'s floor to 2.9.3, which the nested lock — current when the
+/// run began — no longer resolves against while `handlebars` binds its pest 2.9.2.
+/// The run releases the conflicting locked crates, gates what they resolved to, and leaves both
+/// locks on the matured pest.
+#[test]
+fn rewrite_refreshes_a_lock_a_raised_shared_floor_left_unresolvable() {
+    skip_if_missing!("cargo");
+    let fixture = shared_path_crate_fixture("");
+
+    let upgraded = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--rewrite",
+        "--freeze",
+        SHARED_PATH_FREEZE,
+    ]);
+
+    assert!(upgraded.ok(), "{:?}", upgraded.error_messages());
+    let shared = String::from_utf8_lossy(&fixture.read_bytes("shared/Cargo.toml")).into_owned();
+    assert!(
+        shared.contains(r#"pest = { version = "2.9.3", optional = true }"#),
+        "{shared}"
+    );
+    assert!(
+        upgraded.warning_projects().contains("nested")
+            && upgraded
+                .warning_messages()
+                .iter()
+                .any(|message| message.contains("stopped resolving")),
+        "{:?} {:?}",
+        upgraded.warning_projects(),
+        upgraded.warning_messages()
+    );
+    assert_both_locks_land_pest(&fixture);
 }

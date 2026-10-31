@@ -230,13 +230,17 @@ async fn two_hundred_independent_targets_use_at_most_three_resolves() -> eyre::R
     // The precise-pin path is the reporting oracle, with the same original lock and targets.
     journal.restore()?;
     let mut stats = PinBatchStats::default();
+    let worklist: Vec<_> = fixture.changes.iter().collect();
     fixture
         .tool
         .pin_individually(
-            &fixture.project,
-            &fixture.changes.iter().collect::<Vec<_>>(),
-            &journal,
-            None,
+            PinPass {
+                project: &fixture.project,
+                batch: &worklist,
+                journal: &journal,
+                observer: None,
+            },
+            &worklist,
             &mut rejections,
             &mut stats,
         )

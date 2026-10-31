@@ -11,8 +11,9 @@
 //! `[dependencies] toml = "1"` beside `[build-dependencies] toml = "0.5"`), and an untouched second
 //! entry would keep the old-major line in the lock no matter how the first is widened.
 
+use crate::version;
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::{CoreError, MemberRef};
+use cooldown_core::{CoreError, MemberRef, RewriteMode};
 use cooldown_toml_util::{parse_document, replace_value, write_document};
 use std::collections::BTreeSet;
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -30,9 +31,14 @@ pub struct ManifestRewrite {
 /// `[workspace.dependencies]`. When attribution gave no members (or none declared it directly), the
 /// root manifest is the best-effort fallback.
 ///
+/// Under [`RewriteMode::Auto`], a requirement that already admits `target` is left as written: the
+/// default mode preserves in-range constraints, and raising such a floor would only demand a newer
+/// version from every other project that resolves this manifest.
+/// [`RewriteMode::Always`] normalizes every requirement to the target.
+///
 /// Returns the manifest paths whose contents changed. An empty result means either no editable
-/// requirement was found or every editable requirement already has the normalized target
-/// constraint, so the caller should not re-lock.
+/// requirement was found or every editable requirement already admits the target (under `Auto`) or
+/// has the normalized target constraint (under `Always`), so the caller should not re-lock.
 ///
 /// # Errors
 ///
@@ -43,8 +49,9 @@ pub fn widen_constraint(
     members: &[MemberRef],
     crate_name: &str,
     target: &str,
+    mode: RewriteMode,
 ) -> Result<ManifestRewrite, CoreError> {
-    widen_constraint_checked(root, members, crate_name, target, || Ok(()))
+    widen_constraint_checked(root, members, crate_name, target, mode, || Ok(()))
 }
 
 pub(crate) fn widen_constraint_checked(
@@ -52,6 +59,7 @@ pub(crate) fn widen_constraint_checked(
     members: &[MemberRef],
     crate_name: &str,
     target: &str,
+    mode: RewriteMode,
     mut validate: impl FnMut() -> Result<(), CoreError>,
 ) -> Result<ManifestRewrite, CoreError> {
     let mut rewrite = ManifestRewrite::default();
@@ -68,7 +76,7 @@ pub(crate) fn widen_constraint_checked(
         let Some(mut doc) = parse_document(&abs)? else {
             continue;
         };
-        let edits = rewrite_member(&mut doc, crate_name, target);
+        let edits = rewrite_member(&mut doc, crate_name, target, mode);
         if edits.edited {
             validate()?;
             write_document(&abs, &doc)?;
@@ -85,13 +93,16 @@ pub(crate) fn widen_constraint_checked(
         let abs = root.join(&rel);
         if let Some(mut doc) = parse_document(&abs)? {
             let changed = if needs_workspace {
-                matches!(rewrite_workspace(&mut doc, crate_name, target), Edit::Done)
+                matches!(
+                    rewrite_workspace(&mut doc, crate_name, target, mode),
+                    Edit::Done
+                )
             } else {
-                match rewrite_workspace(&mut doc, crate_name, target) {
+                match rewrite_workspace(&mut doc, crate_name, target, mode) {
                     Edit::Done => true,
                     Edit::Unchanged => false,
                     Edit::Inherited | Edit::NoVersion | Edit::NotFound => {
-                        rewrite_member(&mut doc, crate_name, target).edited
+                        rewrite_member(&mut doc, crate_name, target, mode).edited
                     }
                 }
             };
@@ -220,9 +231,13 @@ fn follow_document(doc: &mut DocumentMut, crate_name: &str, from: &str, target: 
             continue;
         };
         match follow {
+            // The entry does not admit the target, so either mode bumps it alike.
             Follow::Bump => {
                 if let Some(item) = table.get_mut(&entry.key) {
-                    edited |= matches!(rewrite_dep_item(item, target), Edit::Done);
+                    edited |= matches!(
+                        rewrite_dep_item(item, target, RewriteMode::Always),
+                        Edit::Done
+                    );
                 }
             }
             Follow::Remove => edited |= table.remove(&entry.key).is_some(),
@@ -233,7 +248,7 @@ fn follow_document(doc: &mut DocumentMut, crate_name: &str, from: &str, target: 
                     // must become `syn-new = { package = "syn", … }`, never a request for a
                     // registry crate called `syn-new`.
                     name_package(&mut item, crate_name);
-                    rewrite_dep_item(&mut item, target);
+                    rewrite_dep_item(&mut item, target, RewriteMode::Always);
                     table.insert(&key, item);
                     edited = true;
                 }
@@ -344,7 +359,8 @@ enum Edit {
     Inherited,
     /// The crate is declared but carries no version requirement (a path/git source).
     NoVersion,
-    /// The requirement already has the normalized target constraint.
+    /// The requirement already admits the target (under [`RewriteMode::Auto`]) or has the
+    /// normalized target constraint.
     Unchanged,
     /// The requirement was rewritten in place.
     Done,
@@ -365,11 +381,16 @@ struct MemberEdits {
 /// declares it. Stopping at the first hit is not enough: a crate declared twice (`[dependencies]
 /// toml = "1"` beside `[build-dependencies] toml = "0.5"`) keeps its old-major lock line alive
 /// through the second, untouched entry, so the planned move can never complete.
-fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> MemberEdits {
+fn rewrite_member(
+    doc: &mut DocumentMut,
+    crate_name: &str,
+    target: &str,
+    mode: RewriteMode,
+) -> MemberEdits {
     let mut edits = MemberEdits::default();
     for section in dependency_section_paths(doc) {
         let keys: Vec<&str> = section.iter().map(String::as_str).collect();
-        match rewrite_entry(doc, &keys, crate_name, target) {
+        match rewrite_entry(doc, &keys, crate_name, target, mode) {
             Edit::Done => {
                 edits.matched = true;
                 edits.edited = true;
@@ -383,8 +404,19 @@ fn rewrite_member(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Memb
 }
 
 /// Rewrite a crate's requirement in the root `[workspace.dependencies]` table, if present.
-fn rewrite_workspace(doc: &mut DocumentMut, crate_name: &str, target: &str) -> Edit {
-    rewrite_entry(doc, &["workspace", "dependencies"], crate_name, target)
+fn rewrite_workspace(
+    doc: &mut DocumentMut,
+    crate_name: &str,
+    target: &str,
+    mode: RewriteMode,
+) -> Edit {
+    rewrite_entry(
+        doc,
+        &["workspace", "dependencies"],
+        crate_name,
+        target,
+        mode,
+    )
 }
 
 /// The dotted key paths of every dependency table in a manifest, including per-target sections.
@@ -406,24 +438,29 @@ fn dependency_section_paths(doc: &DocumentMut) -> Vec<Vec<String>> {
 }
 
 /// Rewrite `crate_name`'s requirement under the table at `section`, if it is declared there.
-fn rewrite_entry(doc: &mut DocumentMut, section: &[&str], crate_name: &str, target: &str) -> Edit {
+fn rewrite_entry(
+    doc: &mut DocumentMut,
+    section: &[&str],
+    crate_name: &str,
+    target: &str,
+    mode: RewriteMode,
+) -> Edit {
     let Some(table) = navigate_mut(doc, section) else {
         return Edit::NotFound;
     };
     let Some(item) = table.get_mut(crate_name) else {
         return Edit::NotFound;
     };
-    rewrite_dep_item(item, target)
+    rewrite_dep_item(item, target, mode)
 }
 
 /// Rewrite one dependency entry, handling the bare-string form (`dep = "1"`) and the table form
 /// (`dep = { version = "1", … }` / `[deps.dep]`), preserving every other field.
-fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
+fn rewrite_dep_item(item: &mut Item, target: &str, mode: RewriteMode) -> Edit {
     if let Some(req) = item.as_str().map(str::to_owned) {
-        let bumped = bump_req(&req, target);
-        if bumped == req {
+        let Some(bumped) = widened_req(&req, target, mode) else {
             return Edit::Unchanged;
-        }
+        };
         replace_value(item, bumped);
         return Edit::Done;
     }
@@ -436,14 +473,23 @@ fn rewrite_dep_item(item: &mut Item, target: &str) -> Edit {
     if let Some(version) = table.get_mut("version")
         && let Some(req) = version.as_str().map(str::to_owned)
     {
-        let bumped = bump_req(&req, target);
-        if bumped == req {
+        let Some(bumped) = widened_req(&req, target, mode) else {
             return Edit::Unchanged;
-        }
+        };
         replace_value(version, bumped);
         return Edit::Done;
     }
     Edit::NoVersion
+}
+
+/// The requirement that replaces `req` so it admits `target` under `mode`, or `None` when `req`
+/// stays as written.
+fn widened_req(req: &str, target: &str, mode: RewriteMode) -> Option<String> {
+    if matches!(mode, RewriteMode::Auto) && version::version_in_range(req, target) {
+        return None;
+    }
+    let bumped = bump_req(req, target);
+    (bumped != req).then_some(bumped)
 }
 
 /// Descend `path` into a table-like node, or `None` if any segment is missing or not a table.
@@ -553,8 +599,14 @@ mod tests {
         )
         .expect("write");
 
-        let rewrite = widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0")
-            .expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         assert_eq!(
             rewrite.modified,
@@ -565,6 +617,98 @@ mod tests {
         assert!(
             after.contains("# pinned for a reason"),
             "comment kept: {after}"
+        );
+    }
+
+    /// The issue #5 shape: `"2"` already admits `2.9.3`, so the default mode leaves both entry
+    /// forms as written and takes no root fallback, while `--rewrite` normalizes them.
+    #[test]
+    fn auto_widen_keeps_a_requirement_that_already_admits_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("shared")).expect("mkdir");
+        let root_manifest = indoc::indoc! {r#"
+            [workspace]
+            members = ["shared"]
+
+            [workspace.dependencies]
+            pest = "2"
+        "#};
+        std::fs::write(root.join("Cargo.toml"), root_manifest).expect("write root");
+        let member_manifest = indoc::indoc! {r#"
+            [package]
+            name = "shared"
+
+            [dependencies]
+            pest = "2"
+            pest_derive = { version = "2", optional = true }
+        "#};
+        std::fs::write(root.join("shared/Cargo.toml"), member_manifest).expect("write member");
+        let shared = [member("shared", "shared")];
+
+        for name in ["pest", "pest_derive"] {
+            let rewrite =
+                widen_constraint(root, &shared, name, "2.9.3", RewriteMode::Auto).expect("widen");
+            assert!(
+                rewrite.modified.is_empty(),
+                "{name}: {:?}",
+                rewrite.modified
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/Cargo.toml")).expect("read member"),
+            member_manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read root"),
+            root_manifest
+        );
+
+        for name in ["pest", "pest_derive"] {
+            let rewrite =
+                widen_constraint(root, &shared, name, "2.9.3", RewriteMode::Always).expect("widen");
+            assert_eq!(
+                rewrite.modified,
+                vec![Utf8PathBuf::from("shared/Cargo.toml")]
+            );
+        }
+        let after = std::fs::read_to_string(root.join("shared/Cargo.toml")).expect("read member");
+        assert!(after.contains(r#"pest = "2.9.3""#), "{after}");
+        assert!(
+            after.contains(r#"pest_derive = { version = "2.9.3", optional = true }"#),
+            "{after}"
+        );
+    }
+
+    /// A requirement that caps the target below it is widened in the default mode too.
+    #[test]
+    fn auto_widen_raises_a_requirement_that_caps_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::create_dir_all(root.join("crates/app")).expect("mkdir");
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n",
+        )
+        .expect("write");
+
+        let rewrite = widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Auto,
+        )
+        .expect("widen");
+
+        assert_eq!(
+            rewrite.modified,
+            vec![Utf8PathBuf::from("crates/app/Cargo.toml")]
+        );
+        let after = std::fs::read_to_string(root.join("crates/app/Cargo.toml")).expect("read");
+        assert!(
+            after.contains(r#"serde = { version = "2.3.0", features = ["derive"] }"#),
+            "{after}"
         );
     }
 
@@ -595,6 +739,7 @@ mod tests {
             &[member("app", "crates/app")],
             "serde",
             "2.3.0+build.1",
+            RewriteMode::Always,
         )
         .expect("widen");
 
@@ -638,8 +783,22 @@ mod tests {
         )
         .expect("write member");
 
-        widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0").expect("widen");
-        widen_constraint(root, &[member("app", "crates/app")], "toml", "1.1.2").expect("widen");
+        widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen");
+        widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "toml",
+            "1.1.2",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         let after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
         assert!(
@@ -669,8 +828,14 @@ mod tests {
         )
         .expect("write");
 
-        let rewrite =
-            widen_constraint(root, &[member("app", "crates/app")], "toml", "1.1.2").expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "toml",
+            "1.1.2",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         assert_eq!(
             rewrite.modified,
@@ -698,8 +863,14 @@ mod tests {
         )
         .expect("write");
 
-        let rewrite =
-            widen_constraint(root, &[member("root", ".")], "serde", "2.3.0").expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("root", ".")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
         let after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
@@ -708,8 +879,14 @@ mod tests {
             after.contains("features = [\"derive\"]"),
             "features kept: {after}"
         );
-        let repeated =
-            widen_constraint(root, &[member("root", ".")], "serde", "2.3.0").expect("widen again");
+        let repeated = widen_constraint(
+            root,
+            &[member("root", ".")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen again");
         assert!(repeated.modified.is_empty());
     }
 
@@ -726,8 +903,14 @@ mod tests {
         let member_manifest = "[package]\nname = \"app\"\n\n[dependencies]\nserde = { workspace = true, features = [\"derive\"] }\n";
         std::fs::write(root.join("crates/app/Cargo.toml"), member_manifest).expect("write member");
 
-        let rewrite = widen_constraint(root, &[member("app", "crates/app")], "serde", "2.3.0")
-            .expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("app", "crates/app")],
+            "serde",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         assert_eq!(rewrite.modified, vec![Utf8PathBuf::from("Cargo.toml")]);
         let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
@@ -757,8 +940,14 @@ mod tests {
         )
         .expect("write");
 
-        let rewrite =
-            widen_constraint(root, &[member("mcp", "crates/mcp")], "nix", "0.31.3").expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("mcp", "crates/mcp")],
+            "nix",
+            "0.31.3",
+            RewriteMode::Always,
+        )
+        .expect("widen");
 
         assert_eq!(
             rewrite.modified,
@@ -779,8 +968,14 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[dependencies]\nserde = \"1\"\n").expect("write");
 
         // `tokio` is declared nowhere — a transitive-only crate cannot be widened.
-        let rewrite =
-            widen_constraint(root, &[member("root", ".")], "tokio", "2.3.0").expect("widen");
+        let rewrite = widen_constraint(
+            root,
+            &[member("root", ".")],
+            "tokio",
+            "2.3.0",
+            RewriteMode::Always,
+        )
+        .expect("widen");
         assert!(rewrite.modified.is_empty());
     }
 
@@ -1072,7 +1267,8 @@ mod tests {
     fn widen_does_not_see_a_renamed_entry() {
         let (_dir, root) = hack_fixture();
         let hack = member("workspace-hack", "crates/workspace-hack");
-        let rewrite = widen_constraint(&root, &[hack], "hashbrown", "0.17.1").expect("widen");
+        let rewrite = widen_constraint(&root, &[hack], "hashbrown", "0.17.1", RewriteMode::Always)
+            .expect("widen");
         assert!(rewrite.modified.is_empty());
     }
 }

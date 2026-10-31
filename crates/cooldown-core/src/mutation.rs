@@ -179,6 +179,20 @@ impl ProjectInputSnapshot {
         Ok(ProjectInputSnapshot { files })
     }
 
+    /// Whether any input lost the captured identity, bytes, or permissions since the capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when an input can no longer be inspected.
+    pub fn changed(&self) -> Result<bool> {
+        for expected in &self.files {
+            if !expected.matches_live()? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Checks that every source input still has the captured identity, bytes, and permissions.
     ///
     /// # Errors

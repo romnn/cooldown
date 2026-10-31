@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Cargo upgrades no longer raise an in-range requirement by default.** Without `--rewrite`, a
+  widen leaves a requirement that already admits the target as written: `shared`'s `pest = "2"`
+  stays `"2"` for pest 2.9.3, so a nested workspace that resolves the same path crate keeps a
+  valid lock. A precise pin that another locked crate blocks (pest 2.9.3 pins
+  `psm = "=0.1.24"` while `stacker` holds psm 0.1.32) is retried with that crate released, for a
+  bounded number of newly named blockers, and lands only when every planned target stays put; the
+  released crate's move is reported as a collateral row. A crate the project declares directly is
+  never released outside the plan, so the pin is held instead.
+
+- **Cargo diagnostics stay plain under `CARGO_TERM_COLOR=always`.** cooldown runs cargo with color
+  turned off, so the conflicts it parses and the details it reports carry no escape codes when the
+  environment requests color, as CI runners commonly do.
+
+- **A lock another project's manifest edit leaves unresolvable is repaired in the same run.** A
+  lock current at the start of the run that later fails to resolve after one of the manifests it
+  reads changed is re-resolved by releasing only the locked crates Cargo's conflict names, then
+  gated by a `fix` pass like a lock the run staled. Previously the project failed with "cannot
+  faithfully isolate this Cargo project".
+
 ## v0.0.26
 
 - **uv honors package-level `min-age` rules.** A `[tool.uv.package."<name>"]` rule, or an

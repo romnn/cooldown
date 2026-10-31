@@ -44,6 +44,16 @@ pub struct ProjectCtx {
     pub generated_members: Option<crate::discovery::DeclaredGeneratedMembers>,
 }
 
+/// Which refresh a lock needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRefreshKind {
+    /// The lock no longer matches the manifests: [`ToolWrite::refresh_lock`].
+    Stale,
+    /// The run's own edits left the lock unresolvable:
+    /// [`ToolWrite::refresh_conflicted_lock`].
+    Conflicted,
+}
+
 pub(crate) struct LockRefresh {
     pub(crate) report: cooldown_core::Result<Option<LockVerifyReport>>,
     /// What the caller should surface as warnings: recovery notes, and the note that the tool
@@ -1039,7 +1049,8 @@ impl Workspace {
                 guard: None,
             });
         }
-        self.refresh_lock_under_lease(pctx, writer, progress).await
+        self.refresh_lock_under_lease(pctx, writer, progress, LockRefreshKind::Stale)
+            .await
     }
 
     /// Refreshes one project's lock with `writer` under a newly acquired exclusive project lease,
@@ -1054,6 +1065,7 @@ impl Workspace {
         pctx: &ProjectCtx,
         writer: &dyn ToolWrite,
         progress: &ProjectProgress,
+        kind: LockRefreshKind,
     ) -> cooldown_core::Result<LockRefresh> {
         progress.phase("refreshing lock state");
         let guard = ProjectAccessWriteGuard::acquire_async(
@@ -1068,7 +1080,10 @@ impl Workspace {
             .recover_pending_mutation(&pctx.project, guard.coordination())
             .await?;
         let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
-        let report = writer.refresh_lock(&pctx.project).await;
+        let report = match kind {
+            LockRefreshKind::Stale => writer.refresh_lock(&pctx.project).await,
+            LockRefreshKind::Conflicted => writer.refresh_conflicted_lock(&pctx.project).await,
+        };
         Ok(LockRefresh {
             report,
             warnings: recovery,

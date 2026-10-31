@@ -294,6 +294,22 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`](crate::CoreError) when the probe itself fails. A known stale lock or
     /// unsupported currency proof is reported in the [`LockVerifyReport`].
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport>;
+
+    /// The files outside the lock that a current lock resolves against, as absolute paths:
+    /// manifests the project reads through path dependencies as well as its own.
+    ///
+    /// A mutating run snapshots them for every lock current at its start, so a lock that later
+    /// stops resolving can be traced to an edit the run made to one of them (see
+    /// [`ToolWrite::refresh_conflicted_lock`]).
+    /// Adapters that cannot name them return none, which leaves such a lock to the ordinary
+    /// failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) when the lock cannot be read.
+    async fn lock_inputs(&self, _project: &Project) -> Result<Vec<Utf8PathBuf>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The registry-fetch port: classified candidate releases and the locked release for a dependency.
@@ -959,6 +975,26 @@ pub trait ToolWrite: Send + Sync {
     /// A non-current [`LockVerifyReport`] is reserved for a refresh that ran and still left the
     /// lock out of date.
     async fn refresh_lock(&self, _project: &Project) -> Result<Option<LockVerifyReport>> {
+        Ok(None)
+    }
+
+    /// Re-resolves a lock that edits this run made to its [inputs](ToolRead::lock_inputs) left
+    /// unresolvable, rather than merely stale: the package manager cannot satisfy the new
+    /// requirements without moving locked packages that the ordinary
+    /// [`refresh_lock`](ToolWrite::refresh_lock) keeps where they are.
+    ///
+    /// The adapter releases only the locked packages the resolver's conflict names, and the run
+    /// gates whatever they resolve to before it evaluates the project.
+    /// Returns `None` when the lock resolves as it is, or when the adapter has no such refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if the lock still does not resolve, for the same
+    /// reason a failed [`refresh_lock`](ToolWrite::refresh_lock) is fatal.
+    async fn refresh_conflicted_lock(
+        &self,
+        _project: &Project,
+    ) -> Result<Option<LockVerifyReport>> {
         Ok(None)
     }
 

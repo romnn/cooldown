@@ -30,6 +30,15 @@ enum Staling {
     /// Every graph read of a project stales every other project's lock, so each project's pass
     /// stales the other and the run can never settle.
     EveryRead,
+    /// An apply in the first project leaves the second's lock unresolvable rather than stale, and
+    /// rewrites `input`, the shared manifest the second's lock resolves against, when
+    /// `writes_input` says so.
+    ConflictOnApply {
+        applied_in: Utf8PathBuf,
+        conflicts: Utf8PathBuf,
+        input: Utf8PathBuf,
+        writes_input: bool,
+    },
 }
 
 /// A tool with one dependency per project, which has one matured update, and lock state per
@@ -42,6 +51,10 @@ struct StalingFake {
     stale: Mutex<HashSet<Utf8PathBuf>>,
     /// The roots whose lock was refreshed, in order.
     refreshes: Mutex<Vec<Utf8PathBuf>>,
+    /// The roots whose lock no longer resolves.
+    conflicted: Mutex<HashSet<Utf8PathBuf>>,
+    /// The roots whose conflicted lock was refreshed, in order.
+    conflict_refreshes: Mutex<Vec<Utf8PathBuf>>,
 }
 
 impl StalingFake {
@@ -118,6 +131,18 @@ impl ToolRead for StalingFake {
         &self,
         project: &Project,
     ) -> cooldown_core::Result<LockVerifyReport> {
+        if self
+            .conflicted
+            .lock()
+            .map_err(|_| poisoned())?
+            .contains(&project.root)
+        {
+            return Err(CoreError::Tool {
+                tool: "fake".to_owned(),
+                termination: cooldown_core::ToolTermination::ExitCode(101),
+                stderr: "error: failed to select a version for `dep`".to_owned(),
+            });
+        }
         let stale = self
             .stale
             .lock()
@@ -133,6 +158,15 @@ impl ToolRead for StalingFake {
                 status: LockStatus::Current,
                 detail: "lock is current".to_owned(),
             }
+        })
+    }
+
+    async fn lock_inputs(&self, project: &Project) -> cooldown_core::Result<Vec<Utf8PathBuf>> {
+        Ok(match &self.staling {
+            Staling::ConflictOnApply {
+                conflicts, input, ..
+            } if *conflicts == project.root => vec![project.manifest.clone(), input.clone()],
+            _ => vec![project.manifest.clone()],
         })
     }
 }
@@ -221,6 +255,23 @@ impl ToolWrite for StalingFake {
                 .map_err(|_| poisoned())?
                 .insert(stales.clone());
         }
+        if let Staling::ConflictOnApply {
+            applied_in,
+            conflicts,
+            input,
+            writes_input,
+        } = &self.staling
+            && *applied_in == project.root
+            && !plan.changes.is_empty()
+        {
+            if *writes_input {
+                std::fs::write(input, "dep = \"1.1.0\"\n")?;
+            }
+            self.conflicted
+                .lock()
+                .map_err(|_| poisoned())?
+                .insert(conflicts.clone());
+        }
         Ok(report)
     }
 
@@ -254,6 +305,24 @@ impl ToolWrite for StalingFake {
 
     fn supports_lock_refresh(&self) -> bool {
         true
+    }
+
+    async fn refresh_conflicted_lock(
+        &self,
+        project: &Project,
+    ) -> cooldown_core::Result<Option<LockVerifyReport>> {
+        self.conflicted
+            .lock()
+            .map_err(|_| poisoned())?
+            .remove(&project.root);
+        self.conflict_refreshes
+            .lock()
+            .map_err(|_| poisoned())?
+            .push(project.root.clone());
+        Ok(Some(LockVerifyReport {
+            status: LockStatus::Current,
+            detail: "lock re-resolved".to_owned(),
+        }))
     }
 }
 
@@ -305,6 +374,8 @@ fn repo(roots: [&str; 2], staling: impl FnOnce(&Utf8PathBuf) -> Staling) -> eyre
         versions: Mutex::new(versions),
         stale: Mutex::new(HashSet::new()),
         refreshes: Mutex::new(Vec::new()),
+        conflicted: Mutex::new(HashSet::new()),
+        conflict_refreshes: Mutex::new(Vec::new()),
     });
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::clone(&fake))?;
@@ -328,6 +399,15 @@ fn refreshes(repo: &Repo) -> eyre::Result<Vec<Utf8PathBuf>> {
     Ok(repo
         .fake
         .refreshes
+        .lock()
+        .map_err(|_| eyre::eyre!("poisoned"))?
+        .clone())
+}
+
+fn conflict_refreshes(repo: &Repo) -> eyre::Result<Vec<Utf8PathBuf>> {
+    Ok(repo
+        .fake
+        .conflict_refreshes
         .lock()
         .map_err(|_| eyre::eyre!("poisoned"))?
         .clone())
@@ -439,5 +519,80 @@ async fn a_dry_run_refreshes_nothing() -> eyre::Result<()> {
 
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert!(refreshes(&repo)?.is_empty());
+    Ok(())
+}
+
+/// An earlier project's apply rewrites a manifest the later project's lock resolves against and
+/// leaves that lock unresolvable: the turn gives it the conflicted refresh, not the stale one,
+/// and both upgrades land.
+#[tokio::test]
+async fn a_lock_an_earlier_projects_edit_left_unresolvable_is_refreshed() -> eyre::Result<()> {
+    let repo = repo(["ws", "zz-nested"], |root| Staling::ConflictOnApply {
+        applied_in: root.join("ws"),
+        conflicts: root.join("zz-nested"),
+        input: root.join("shared.toml"),
+        writes_input: true,
+    })?;
+    std::fs::write(repo.root.join("shared.toml"), "dep = \"1\"\n")?;
+
+    let out = repo.ws.upgrade(&RunOpts::default()).await;
+
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(stale_lock_projects(&out.warnings), ["zz-nested"]);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|warning| warning.message.contains("stopped resolving")),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(conflict_refreshes(&repo)?, [repo.root.join("zz-nested")]);
+    assert!(refreshes(&repo)?.is_empty());
+    assert_eq!(out.summary.applied, 2, "{:?}", out.items);
+    Ok(())
+}
+
+/// The later project stops resolving only after its own turn: the re-probe once the lanes finish
+/// finds it, and its project runs again behind the conflicted refresh.
+#[tokio::test]
+async fn a_lock_a_later_projects_edit_left_unresolvable_is_refreshed_after_the_lanes()
+-> eyre::Result<()> {
+    let repo = repo(["aa-nested", "ws"], |root| Staling::ConflictOnApply {
+        applied_in: root.join("ws"),
+        conflicts: root.join("aa-nested"),
+        input: root.join("shared.toml"),
+        writes_input: true,
+    })?;
+    std::fs::write(repo.root.join("shared.toml"), "dep = \"1\"\n")?;
+
+    let out = repo.ws.upgrade(&RunOpts::default()).await;
+
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(stale_lock_projects(&out.warnings), ["aa-nested"]);
+    assert_eq!(conflict_refreshes(&repo)?, [repo.root.join("aa-nested")]);
+    Ok(())
+}
+
+/// A lock that stops resolving although nothing it resolves against changed is not the run's
+/// doing, so it gets no refresh of any kind.
+#[tokio::test]
+async fn an_unresolvable_lock_whose_inputs_did_not_change_is_not_refreshed() -> eyre::Result<()> {
+    let repo = repo(["ws", "zz-nested"], |root| Staling::ConflictOnApply {
+        applied_in: root.join("ws"),
+        conflicts: root.join("zz-nested"),
+        input: root.join("shared.toml"),
+        writes_input: false,
+    })?;
+    std::fs::write(repo.root.join("shared.toml"), "dep = \"1\"\n")?;
+
+    let out = repo.ws.upgrade(&RunOpts::default()).await;
+
+    assert!(conflict_refreshes(&repo)?.is_empty());
+    assert!(refreshes(&repo)?.is_empty());
+    assert!(
+        stale_lock_projects(&out.warnings).is_empty(),
+        "{:?}",
+        out.warnings
+    );
     Ok(())
 }
