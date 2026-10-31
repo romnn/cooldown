@@ -1042,8 +1042,13 @@ fn common_ancestor(paths: &[Utf8PathBuf]) -> Result<Utf8PathBuf> {
     Ok(common)
 }
 
+/// Resolves `path` in the spelling Cargo itself reports.
+///
+/// On Windows, [`std::fs::canonicalize`] returns a verbatim `\\?\C:\…` path while `cargo metadata`
+/// reports `C:\…`, and the two never compare equal or strip as prefixes of each other.
+/// [`dunce::canonicalize`] keeps the plain form wherever it means the same file.
 fn canonical_utf8(path: &Utf8Path) -> Result<Utf8PathBuf> {
-    utf8_path(std::fs::canonicalize(path)?)
+    utf8_path(dunce::canonicalize(path)?)
 }
 
 fn utf8_path(path: std::path::PathBuf) -> Result<Utf8PathBuf> {
