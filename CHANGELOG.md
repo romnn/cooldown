@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.27
+
 - **Cargo upgrades no longer raise an in-range requirement by default.** Without `--rewrite`, a
   widen leaves a requirement that already admits the target as written: `shared`'s `pest = "2"`
   stays `"2"` for pest 2.9.3, so a nested workspace that resolves the same path crate keeps a
