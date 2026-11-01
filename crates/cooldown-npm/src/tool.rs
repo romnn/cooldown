@@ -47,6 +47,14 @@ struct WholeGraphInputs {
     importer_filters: Vec<String>,
 }
 
+/// One importer-filtered exact-pin update, as [`NodeLock::whole_graph_args`] renders it.
+struct JointUpdate<'a> {
+    pins: &'a [(String, String)],
+    filters: &'a [String],
+    window_minutes: Option<i64>,
+    minimum_age_excludes: &'a [String],
+}
+
 /// The resolved lock's `name -> version` map, the snapshot `apply` diffs before/after the whole-graph
 /// re-resolve so *every* net version change is reported (the planned moves, the collateral churn the
 /// joint resolve forced on other packages, and the candidates left held below their target). A name
@@ -2000,11 +2008,17 @@ impl<L: NodeLock> NpmTool<L> {
     ) -> Result<()> {
         let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
         if !inputs.exact_pins.is_empty() {
+            let minimum_age_excludes = self
+                .joint_update_exclusions(project, &inputs.exact_pins)
+                .await?;
             self.joint_resolve(
                 project,
-                &inputs.exact_pins,
-                &inputs.importer_filters,
-                window_minutes,
+                &JointUpdate {
+                    pins: &inputs.exact_pins,
+                    filters: &inputs.importer_filters,
+                    window_minutes,
+                    minimum_age_excludes: &minimum_age_excludes,
+                },
             )
             .await?;
             // The up-front pass already widened every out-of-range exact target, so a candidate the
@@ -2100,17 +2114,51 @@ impl<L: NodeLock> NpmTool<L> {
         })
     }
 
-    async fn joint_resolve(
-        &self,
-        project: &Project,
-        pins: &[(String, String)],
-        filters: &[String],
-        window_minutes: Option<i64>,
-    ) -> Result<()> {
-        let Some(args) = L::whole_graph_args(pins, filters, window_minutes) else {
+    async fn joint_resolve(&self, project: &Project, update: &JointUpdate<'_>) -> Result<()> {
+        let Some(args) = L::whole_graph_args(
+            update.pins,
+            update.filters,
+            update.window_minutes,
+            update.minimum_age_excludes,
+        ) else {
             return Ok(());
         };
         self.cmd.run(&project.root, &args).await
+    }
+
+    /// The release-age exclusions the joint update passes so pnpm's native gate admits every pin.
+    ///
+    /// Each pin is exempted by its exact version: cooldown already admitted that version under the
+    /// candidate's own window, and the exemption is a no-op for a pin old enough to pass anyway.
+    /// The command-line list replaces the effective configured one, so its entries are carried too.
+    ///
+    /// pnpm reads a configured scalar as one pattern per character, so it is carried as that list.
+    ///
+    /// # Errors
+    ///
+    /// A failed configuration query is a [`CoreError::System`] error, never a resolver verdict, so
+    /// candidate isolation does not hold every candidate over a configuration it could not read.
+    async fn joint_update_exclusions(
+        &self,
+        project: &Project,
+        pins: &[(String, String)],
+    ) -> Result<Vec<String>> {
+        if L::NATIVE_MIN_AGE_FILE.is_none() {
+            return Ok(Vec::new());
+        }
+        let configured = self
+            .configured_value::<ConfigStringList>(project, "minimumReleaseAgeExclude")
+            .await
+            .map_err(|err| {
+                CoreError::System(format!(
+                    "could not read pnpm's effective minimumReleaseAgeExclude: {err}"
+                ))
+            })?;
+        let configured = match configured {
+            ConfigStringList::Many(configured) => configured,
+            ConfigStringList::One(scalar) => scalar.chars().map(String::from).collect(),
+        };
+        Ok(pinned_minimum_age_exclusions(pins, configured))
     }
 
     async fn repair_policy_rejected_graph(
@@ -2730,6 +2778,133 @@ fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>
     exclusions.into_iter().collect()
 }
 
+/// Adds each pin's exact version to the configured release-age exclusions without changing what
+/// they permit for any other package or version.
+///
+/// pnpm evaluates the rules in order, and the first rule whose name pattern matches a package
+/// decides alone: a rule without versions exempts every version, an exact rule only its union.
+/// So the configured rules keep their order and spelling.
+/// A pin whose package no rule names gets a rule of its own.
+/// A pin whose first matching rule is an exact rule for that literal name joins its union.
+/// One whose first match is a negated exact rule gets its own rule just before it, carrying that
+/// rule's versions, so the negated rule keeps its meaning for every other package.
+fn pinned_minimum_age_exclusions(
+    pins: &[(String, String)],
+    configured_exclusions: Vec<String>,
+) -> Vec<String> {
+    struct FirstMatch {
+        index: usize,
+        literal: bool,
+        versions: Option<String>,
+    }
+
+    let mut exclusions = configured_exclusions;
+    for (name, target) in pins {
+        let first_match = exclusions.iter().enumerate().find_map(|(index, entry)| {
+            let rule = PnpmVersionRule::parse(entry);
+            pnpm_name_matches(rule.name, name).then(|| FirstMatch {
+                index,
+                literal: rule.name == name,
+                versions: rule.versions.map(str::to_string),
+            })
+        });
+        let Some(FirstMatch {
+            index,
+            literal,
+            versions,
+        }) = first_match
+        else {
+            exclusions.push(format!("{name}@{target}"));
+            continue;
+        };
+        // A rule without versions already exempts every version.
+        let Some(versions) = versions else {
+            continue;
+        };
+        if union_contains(&versions, target) {
+            continue;
+        }
+        let union = format!("{name}@{versions}||{target}");
+        match exclusions.get_mut(index) {
+            Some(entry) if literal => *entry = union,
+            _ => exclusions.insert(index, union),
+        }
+    }
+    exclusions
+}
+
+/// One `minimumReleaseAgeExclude` entry split the way pnpm's version-policy parser splits it.
+struct PnpmVersionRule<'a> {
+    /// The package-name pattern.
+    name: &'a str,
+    /// The raw `||` union of exact versions, or `None` for a rule covering every version.
+    versions: Option<&'a str>,
+}
+
+impl<'a> PnpmVersionRule<'a> {
+    fn parse(entry: &'a str) -> Self {
+        // A scope's leading `@` is part of the name, so the version separator is searched after it.
+        let search_from = usize::from(entry.starts_with('@'));
+        match entry
+            .get(search_from..)
+            .and_then(|rest| rest.find('@'))
+            .map(|offset| offset + search_from)
+        {
+            Some(at) => PnpmVersionRule {
+                name: entry.get(..at).unwrap_or(entry),
+                versions: entry.get(at + 1..),
+            },
+            None => PnpmVersionRule {
+                name: entry,
+                versions: None,
+            },
+        }
+    }
+}
+
+/// Matches a package name against a pnpm name pattern.
+///
+/// pnpm's pattern language is not a general glob: `*` matches any run of characters including
+/// `/`, a leading `!` negates the pattern, and every other character is literal.
+fn pnpm_name_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_prefix('!') {
+        Some(negated) => !wildcard_matches(negated, name),
+        None => wildcard_matches(pattern, name),
+    }
+}
+
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(prefix) = parts.next() else {
+        return name.is_empty();
+    };
+    let Some(mut rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut middles: Vec<&str> = parts.collect();
+    // Without a `*`, the prefix is the whole pattern.
+    let Some(suffix) = middles.pop() else {
+        return rest.is_empty();
+    };
+    for middle in middles {
+        match rest.find(middle) {
+            Some(at) => rest = rest.get(at + middle.len()..).unwrap_or_default(),
+            None => return false,
+        }
+    }
+    rest.ends_with(suffix)
+}
+
+/// Whether a raw pnpm version union already names `version`.
+///
+/// pnpm accepts loose spellings such as `1.0.0 || v1.1.0`, so each member is trimmed of whitespace
+/// and a leading `v` before comparing.
+fn union_contains(union: &str, version: &str) -> bool {
+    union
+        .split("||")
+        .any(|member| member.trim().trim_start_matches('v').eq(version))
+}
+
 fn minimum_age_repair_versions(plan: &Plan) -> BTreeMap<String, BTreeSet<String>> {
     let targeted = plan
         .changes
@@ -3113,8 +3288,12 @@ mod tests {
             ),
         ];
         let filters = vec![".".to_string(), "./packages/app".to_string()];
+        let pin_exclusions = [
+            "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
+            "eslint@9.5.0".to_string(),
+        ];
         assert_eq!(
-            Pnpm::whole_graph_args(&pins, &filters, Some(20160)),
+            Pnpm::whole_graph_args(&pins, &filters, Some(20160), &pin_exclusions),
             Some(vec![
                 "--filter".to_string(),
                 ".".to_string(),
@@ -3127,10 +3306,13 @@ mod tests {
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
+                "--config.minimumReleaseAgeExclude=@typescript-eslint/eslint-plugin@8.0.0"
+                    .to_string(),
+                "--config.minimumReleaseAgeExclude=eslint@9.5.0".to_string(),
             ])
         );
         assert_eq!(
-            Pnpm::whole_graph_args(&pins, &[], None),
+            Pnpm::whole_graph_args(&pins, &[], None, &[]),
             Some(vec![
                 "update".to_string(),
                 "--recursive".to_string(),
@@ -3168,19 +3350,145 @@ mod tests {
             Npm::policy_repair_args(Some(20160), &exclusions, true),
             None
         );
-        assert_eq!(Pnpm::whole_graph_args(&[], &filters, None), None);
+        assert_eq!(Pnpm::whole_graph_args(&[], &filters, None, &[]), None);
         // npm/yarn/bun have no joint resolve, so they keep the per-package path.
         assert!(!Npm::supports_whole_graph_resolve());
         assert!(Pnpm::supports_whole_graph_resolve());
-        assert_eq!(Npm::whole_graph_args(&pins, &filters, Some(20160)), None);
         assert_eq!(
-            crate::lock::Yarn::whole_graph_args(&pins, &filters, None),
+            Npm::whole_graph_args(&pins, &filters, Some(20160), &[]),
             None
         );
         assert_eq!(
-            crate::lock::Bun::whole_graph_args(&[], &filters, None),
+            crate::lock::Yarn::whole_graph_args(&pins, &filters, None, &[]),
             None
         );
+        assert_eq!(
+            crate::lock::Bun::whole_graph_args(&[], &filters, None, &[]),
+            None
+        );
+    }
+
+    /// pnpm reads a lone repeated-list `--config` flag as a string, one pattern per character, so a
+    /// single exclusion must still reach pnpm as a list on both the joint update and the policy
+    /// repair.
+    #[test]
+    fn a_single_minimum_age_exclusion_is_passed_as_a_list() {
+        let single = ["lodash@4.17.21".to_string()];
+        let doubled = [
+            "--config.minimumReleaseAgeExclude=lodash@4.17.21".to_string(),
+            "--config.minimumReleaseAgeExclude=lodash@4.17.21".to_string(),
+        ];
+        let update = Pnpm::whole_graph_args(
+            &[("lodash".to_string(), "4.17.21".to_string())],
+            &[".".to_string()],
+            Some(20160),
+            &single,
+        )
+        .unwrap();
+        assert!(update.ends_with(&doubled), "{update:?}");
+        for resolution_only in [true, false] {
+            let repair = Pnpm::policy_repair_args(Some(20160), &single, resolution_only).unwrap();
+            assert!(repair.ends_with(&doubled), "{repair:?}");
+        }
+    }
+
+    fn strings(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(ToString::to_string).collect()
+    }
+
+    fn pin(name: &str, version: &str) -> (String, String) {
+        (name.to_string(), version.to_string())
+    }
+
+    #[test]
+    fn pinned_minimum_age_exclusions_keep_every_configured_rule_in_order() {
+        let configured = strings(&[
+            "@scope/limited@1.0.0",
+            "@scope/*",
+            "nanoid",
+            "eslint@10.5.0",
+            "flatted@3.4.1",
+            "flatted@3.4.2",
+        ]);
+        let exclusions = pinned_minimum_age_exclusions(
+            &[
+                pin("eslint", "10.6.0"),
+                pin("@scope/limited", "1.1.0"),
+                pin("@scope/other", "2.0.0"),
+                pin("lodash", "4.17.21"),
+            ],
+            configured,
+        );
+        // A pin joins the first exact rule naming its package, a scope glob already exempts every
+        // version of its other members, and an unnamed package gets a rule appended at the end.
+        // The glob stays behind the narrower rule and the second `flatted` rule stays shadowed,
+        // so no other package or version gains an exemption.
+        assert_eq!(
+            exclusions,
+            strings(&[
+                "@scope/limited@1.0.0||1.1.0",
+                "@scope/*",
+                "nanoid",
+                "eslint@10.5.0||10.6.0",
+                "flatted@3.4.1",
+                "flatted@3.4.2",
+                "lodash@4.17.21",
+            ])
+        );
+    }
+
+    #[test]
+    fn pinned_minimum_age_exclusions_extend_loosely_spelled_exact_unions() {
+        // pnpm accepts spaces and `v` prefixes in a union, so these rules are the first match and
+        // must carry the pin rather than shadow an appended rule.
+        assert_eq!(
+            pinned_minimum_age_exclusions(
+                &[pin("foo", "2.0.0"), pin("bar", "1.1.0")],
+                strings(&["foo@1.0.0 || 1.1.0", "bar@v1.0.0 || v1.1.0"]),
+            ),
+            strings(&["foo@1.0.0 || 1.1.0||2.0.0", "bar@v1.0.0 || v1.1.0"])
+        );
+    }
+
+    #[test]
+    fn pinned_minimum_age_exclusions_leave_a_negated_rule_alone() {
+        // `!foo@1.0.0` exempts version 1.0.0 of every package but `foo`.
+        // Widening it for `bar` would widen it for all of them, so `bar` gets its own rule ahead.
+        assert_eq!(
+            pinned_minimum_age_exclusions(
+                &[pin("bar", "2.0.0"), pin("foo", "3.0.0")],
+                strings(&["!foo@1.0.0"]),
+            ),
+            strings(&["bar@1.0.0||2.0.0", "!foo@1.0.0", "foo@3.0.0"])
+        );
+    }
+
+    #[test]
+    fn pinned_minimum_age_exclusions_are_the_pins_without_configured_rules() {
+        assert_eq!(
+            pinned_minimum_age_exclusions(
+                &[pin("lodash", "4.17.21"), pin("@types/node", "26.6.6")],
+                Vec::new(),
+            ),
+            strings(&["lodash@4.17.21", "@types/node@26.6.6"])
+        );
+    }
+
+    #[test]
+    fn pnpm_name_patterns_match_like_pnpm() {
+        assert!(pnpm_name_matches("*", "@scope/pkg"));
+        assert!(pnpm_name_matches("@scope/*", "@scope/pkg"));
+        assert!(pnpm_name_matches("@types/*-utils", "@types/react-utils"));
+        assert!(!pnpm_name_matches("@types/*-utils", "@types/react"));
+        assert!(pnpm_name_matches("a*b*c", "aXbYc"));
+        assert!(!pnpm_name_matches("a*b*c", "aXcYb"));
+        assert!(pnpm_name_matches("foo", "foo"));
+        assert!(!pnpm_name_matches("foo", "foobar"));
+        assert!(pnpm_name_matches("!foo", "bar"));
+        assert!(!pnpm_name_matches("!foo", "foo"));
+        // Glob metacharacters other than `*` are literal in pnpm patterns.
+        assert!(!pnpm_name_matches("lodas?", "lodash"));
+        assert!(pnpm_name_matches("lodas?", "lodas?"));
     }
 
     #[test]
@@ -4889,8 +5197,17 @@ mod whole_graph_tests {
         body: &str,
         exclusions: &[&str],
     ) -> eyre::Result<Utf8PathBuf> {
-        let script = root.join("fake-pnpm.sh");
         let exclusions = serde_json::to_string(exclusions)?;
+        fake_pnpm_answering_exclusions(root, body, &format!("echo '{exclusions}'; exit 0"))
+    }
+
+    /// Like [`fake_pnpm`], with `exclusion_answer` as the shell answering the exclusion query.
+    fn fake_pnpm_answering_exclusions(
+        root: &Utf8Path,
+        body: &str,
+        exclusion_answer: &str,
+    ) -> eyre::Result<Utf8PathBuf> {
+        let script = root.join("fake-pnpm.sh");
         std::fs::write(
             &script,
             formatdoc! {r#"
@@ -4898,7 +5215,7 @@ mod whole_graph_tests {
                 echo "$*" >> legs.log
                 case "$*" in
                   *"config get minimumReleaseAgeExclude"*)
-                    echo '{exclusions}'; exit 0 ;;
+                    {exclusion_answer} ;;
                   *"config get"*)
                     echo 'null'; exit 0 ;;
                 {body}
@@ -4920,6 +5237,88 @@ mod whole_graph_tests {
         Ok(tool)
     }
 
+    fn single_direct_dependency(root: &Utf8Path) -> eyre::Result<(String, Plan)> {
+        let lock = workspace(
+            root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![("foo", "^1.0.0", "1.0.0")],
+            }],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let plan = Plan {
+            changes: vec![change("foo", "1.0.0", "1.1.0", &[("app", ".")])],
+            ..Plan::default()
+        };
+        Ok((lock, plan))
+    }
+
+    /// A release-age exclusion query pnpm itself fails is a broken environment, not a resolver
+    /// verdict, so the apply fails before the update instead of holding the candidate.
+    #[tokio::test]
+    async fn a_failed_exclusion_query_fails_the_apply_before_the_update() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let (lock, plan) = single_direct_dependency(&root)?;
+        let script = fake_pnpm_answering_exclusions(
+            &root,
+            "",
+            "echo 'ERR_PNPM_CONFIG unreadable' >&2; exit 1",
+        )?;
+        let tool = tool_with(&script)?;
+
+        let error = apply(&tool, &project(&root), plan)
+            .await
+            .expect_err("an unreadable configuration must not be reported as held candidates");
+
+        assert!(error.is_local_environment_failure(), "{error:?}");
+        assert!(
+            error.to_string().contains("minimumReleaseAgeExclude"),
+            "{error}"
+        );
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// pnpm reads a scalar exclusion setting as one pattern per character, so the update carries
+    /// those patterns as its list and adds the pin only where none of them already exempts it.
+    #[tokio::test]
+    async fn a_scalar_exclusion_setting_keeps_pnpms_per_character_reading() -> eyre::Result<()> {
+        for (scalar, expected) in [
+            // No single character names `foo`, so its pin is appended.
+            ("lodash", "l o d a s h foo@1.1.0"),
+            // The `*` character already exempts every package, `foo` included.
+            ("@corp/*", "@ c o r p / *"),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            let (_, plan) = single_direct_dependency(&root)?;
+            let script = fake_pnpm_answering_exclusions(
+                &root,
+                indoc! {r#"
+                      *" update "*)
+                        exit 0 ;;
+                "#},
+                &format!("echo '{}'; exit 0", serde_json::to_string(scalar)?),
+            )?;
+            let tool = tool_with(&script)?;
+
+            apply(&tool, &project(&root), plan).await?;
+
+            let legs = legs(&root);
+            let update = legs
+                .iter()
+                .find(|leg| leg.contains(" update "))
+                .expect("the direct pin takes the joint update");
+            let passed: Vec<&str> = update
+                .split(' ')
+                .filter_map(|arg| arg.strip_prefix("--config.minimumReleaseAgeExclude="))
+                .collect();
+            assert_eq!(passed.join(" "), expected, "{scalar}: {update}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn young_direct_and_transitive_targets_persist_exact_native_exclusions()
     -> eyre::Result<()> {
@@ -4931,7 +5330,10 @@ mod whole_graph_tests {
 
     #[tokio::test]
     async fn native_persistence_does_not_copy_effective_config_exclusions() -> eyre::Result<()> {
-        assert_young_native_exclusions(false, &["user-global-*", "external@9.0.0"]).await
+        for direct in [true, false] {
+            assert_young_native_exclusions(direct, &["user-global-*", "external@9.0.0"]).await?;
+        }
+        Ok(())
     }
 
     async fn assert_young_native_exclusions(
@@ -5048,6 +5450,39 @@ mod whole_graph_tests {
             assert!(
                 read(&root, "legs.log")?.contains(exclusion),
                 "effective config should remain available to repair CLI arguments"
+            );
+        }
+        if direct {
+            // The joint update exempts the young pin itself, beside the effective configured
+            // entries its command-line list replaces, so pnpm's strict gate never asks for an
+            // approval that `--no-save` cannot record.
+            let legs = read(&root, "legs.log")?;
+            let update = legs
+                .lines()
+                .find(|leg| leg.contains(" update "))
+                .expect("the direct pin takes the joint update");
+            let mut expected: Vec<String> = effective_exclusions
+                .iter()
+                .map(|exclusion| format!("--config.minimumReleaseAgeExclude={exclusion}"))
+                .collect();
+            expected.push("--config.minimumReleaseAgeExclude=foo@1.1.0".to_string());
+            for flag in &expected {
+                assert!(
+                    update.contains(flag.as_str()),
+                    "{flag} missing from {update}"
+                );
+            }
+            let pin_flags = update
+                .matches("--config.minimumReleaseAgeExclude=foo@1.1.0")
+                .count();
+            assert_eq!(
+                pin_flags,
+                if effective_exclusions.is_empty() {
+                    2
+                } else {
+                    1
+                },
+                "a lone exclusion is repeated so pnpm reads a list: {update}"
             );
         }
         assert_eq!(
