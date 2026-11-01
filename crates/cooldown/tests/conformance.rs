@@ -628,6 +628,13 @@ impl ToolWrite for FakeEco {
             }
             std::fs::write(p.root.join("Cargo.lock"), "accepted lock")?;
         }
+        let pin_recorder = p.root.join("record-rewrite-pins");
+        if pin_recorder.exists() {
+            let mut recorder = std::fs::OpenOptions::new()
+                .append(true)
+                .open(pin_recorder)?;
+            writeln!(recorder, "{}", plan.rewrite_pins)?;
+        }
         let recorder = p.root.join("record-apply-batches");
         if recorder.exists() {
             let mut recorder = std::fs::OpenOptions::new().append(true).open(recorder)?;
@@ -3946,6 +3953,70 @@ async fn fix_pinned_hold_follows_the_downgrade_pinned_flag() {
         let item = out.items.iter().find(|item| item.name == name).expect(name);
         assert_eq!(item.to, "v1.0.1");
     }
+}
+
+/// Only `fix --downgrade-pinned` hands the adapter the permission to rewrite pins: a plain `fix`
+/// and an `upgrade` plan their moves without it, so an adapter holds a move off a manifest pin the
+/// lock does not show instead of rewriting the pin.
+#[tokio::test]
+async fn only_fix_downgrade_pinned_lets_the_adapter_rewrite_pins() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let package_releases = too_fresh_fix_releases();
+    let mut releases = HashMap::new();
+    releases.insert("a".to_string(), package_releases.clone());
+    let mut locked = HashMap::new();
+    locked.insert("a".to_string(), release_named(&package_releases, "v1.0.2"));
+    let recorder = root.join("record-rewrite-pins");
+    let run = |downgrade_pinned: bool| {
+        let root = root.clone();
+        let releases = releases.clone();
+        let locked = locked.clone();
+        let recorder = recorder.clone();
+        async move {
+            std::fs::write(&recorder, b"").unwrap();
+            let ws = workspace(
+                fake(
+                    root,
+                    vec![dep("a", "v1.0.2", true)],
+                    Vec::new(),
+                    releases,
+                    locked,
+                ),
+                Baseline::default(),
+            );
+            let mut opts = opts();
+            opts.downgrade_pinned = downgrade_pinned;
+            let out = ws.fix(&opts).await;
+            assert_eq!(out.summary.applied, 1, "{:?}", out.items);
+            std::fs::read_to_string(&recorder).unwrap()
+        }
+    };
+
+    assert_eq!(run(false).await, "false\n");
+    assert_eq!(run(true).await, "true\n");
+
+    // An upgrade never carries the permission, whatever the shared options say.
+    std::fs::write(&recorder, b"").unwrap();
+    let releases = vec![
+        rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+        rel(
+            "v1.1.0",
+            1,
+            Some("2026-01-10T00:00:00Z"),
+            Some(UpdateKind::Minor),
+        ),
+    ];
+    let out = workspace(
+        major_update_fake(root.clone(), true, releases),
+        Baseline::default(),
+    )
+    .upgrade(&RunOpts {
+        downgrade_pinned: true,
+        ..opts()
+    })
+    .await;
+    assert!(out.items.iter().any(|item| item.applied), "{:?}", out.items);
+    assert_eq!(std::fs::read_to_string(&recorder).unwrap(), "false\n");
 }
 
 /// The round-budget backstop: when the final round still applied changes (and its re-lock floated

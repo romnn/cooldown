@@ -692,7 +692,8 @@ pub struct ExplainDeclaration {
     /// The version the member's own lock entry resolves to, when the lock records it per member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
-    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …).
+    /// The manifest fields declaring the package at this range (`dependencies`, `peerDependencies`,
+    /// …).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
     /// Whether the run's scope and exclude policy ignore this member's declaration: it is neither

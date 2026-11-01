@@ -43,6 +43,14 @@ range provably excludes is reported `peer_held` instead — including a same-lin
 bound like `>=5.6.0 <5.6.2` is broken by a mere patch bump. Edit that range yourself to authorize
 the move; `--rewrite` does not cross it.
 
+A package declared in several install fields of one manifest (npm family: `dependencies` beside
+`devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
+target must sit inside each range, the strictest explicit bound across them caps it, and an exact
+pin in any field holds the move like a pin in the only field would, even where the lock records
+just the other declaration (pnpm keeps one specifier per importer). The held row names the pin
+(`not_eligible` on npm, yarn, and bun, `multi_version_held` on pnpm); pass `--rewrite` to rewrite
+it, or edit it yourself.
+
 The lock-only default is honored where the tool can pin an exact in-range version without editing the manifest:
 
 | Tool | In-range pin | Behavior |

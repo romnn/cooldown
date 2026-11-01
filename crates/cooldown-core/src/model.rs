@@ -957,8 +957,8 @@ pub struct Declaration {
     pub range: Option<String>,
     /// The version the member's own lock entry resolves to, when the lock records it per member.
     pub resolved: Option<String>,
-    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …), in manifest
-    /// order; empty when only the lock records the declaration.
+    /// The manifest fields declaring the package at this range (`dependencies`,
+    /// `peerDependencies`, …), in manifest order; empty when only the lock records the declaration.
     pub fields: Vec<String>,
 }
 
@@ -1014,6 +1014,16 @@ pub struct Plan {
     /// flag).
     /// Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
+    /// Whether the run may rewrite the exact pins of the changes it moves downward (`fix
+    /// --downgrade-pinned`).
+    ///
+    /// Under [`RewriteMode::Auto`] an adapter otherwise holds a move whose declaring manifest pins
+    /// the dependency exactly to a version excluding the target, whatever the lock shows, rather
+    /// than rewriting the pin.
+    /// It authorizes only [`Change::downgrade`] moves; a forward move rewrites a pin only under
+    /// [`RewriteMode::Always`].
+    /// Defaults to `false`.
+    pub rewrite_pins: bool,
     /// How the adapter treats resolved lock edge bindings after the re-resolve (the
     /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key).
     /// Defaults to [`EdgePolicy::Preserve`].

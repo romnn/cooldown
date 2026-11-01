@@ -2760,6 +2760,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             changes: changes.to_vec(),
             evaluated_at: Some(self.ws.now()),
             rewrite: self.ctx.opts.rewrite,
+            // Only `fix --downgrade-pinned` authorizes rewriting a pin; the downgrades an upgrade
+            // reconciles never do.
+            rewrite_pins: matches!(
+                self.mode,
+                PlanMode::Fix {
+                    downgrade_pinned: true,
+                    ..
+                }
+            ),
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
             excluded_members: self.excluded_members.clone(),
