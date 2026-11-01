@@ -261,7 +261,10 @@ mod tests {
         let before = view(CHURNED_LOCK);
         let after = view(CHURNED_LOCK);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// A planned same-major move (`uuid 1.20.0` → `1.24.0`) replaces the version in the lock: the
@@ -286,7 +289,10 @@ mod tests {
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
 
         // diesel's binding moved 1.20.0 → 1.24.0, but 1.20.0 is gone from the lock: not churn.
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// The luup fix-collapse shape: diesel's wide `uuid >=0.7,<2.0` edge was bound to `1.25.0`, a
@@ -347,7 +353,10 @@ mod tests {
         let after = view(&after_text);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
 
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// The `0.0.x` corner: [`version::major_key`] collapses every `0.0.z` to one `"0.0"` key,
@@ -419,7 +428,10 @@ mod tests {
         let graph = graph_with_resolved(&[("widget", "1.0.0", "nano", ">=0.0.3, <2")], &["1.0.0"]);
 
         assert!(!has_potential_restoration(&before, &after_bystander));
-        assert!(restorations(&before, &after_bystander, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after_bystander, &RequirementIndex::new(&graph)),
+            []
+        );
 
         // Counterfactual guarding against a vacuous pass: the same shape with a genuinely new
         // `0.0.z` node (0.0.4, absent from the before-lock) is a real successor candidate.
@@ -525,7 +537,10 @@ mod tests {
         let graph = graph_with_resolved(&[("widget", "1.0.0", "nano", ">=0.0.3, <2")], &["1.0.0"]);
 
         assert!(!has_potential_restoration(&before, &after));
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// The successor no longer satisfies the dependent's requirement (a narrowed range that only
@@ -542,7 +557,10 @@ mod tests {
         let after = view(CHURNED_LOCK);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", "^0.8")]);
 
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// A cross-major planned move rewrote the manifest requirement; the old binding still exists
@@ -558,7 +576,10 @@ mod tests {
         let after = view(&before_text);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", "^1")]);
 
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     /// No declared requirement is known for the edge (metadata gap): no license to rewrite.
@@ -572,7 +593,10 @@ mod tests {
         let before = view(&before_text);
         let graph = graph_with(&[]);
 
-        assert!(restorations(&before, &after, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(
+            restorations(&before, &after, &RequirementIndex::new(&graph)),
+            []
+        );
     }
 
     #[test]

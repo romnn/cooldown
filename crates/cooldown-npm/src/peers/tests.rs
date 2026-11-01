@@ -113,7 +113,7 @@ fn peer_gate_judges_union_ranges() {
     let cross = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Pnpm>(&cross, Some(lock));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped
             .first()
@@ -253,7 +253,7 @@ fn peer_gate_passes_a_change_whose_members_are_disjoint_from_the_dependent() {
     docs.members = vec![member("apps/docs")];
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Pnpm>(&plan_of(vec![docs]), Some(lock));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(skipped.len(), 1);
 }
 
@@ -299,7 +299,7 @@ fn peer_gate_never_holds_on_a_range_with_an_unrepresentable_branch() {
     let wildcard = lock_with_range("^16.0.0 || 17.x");
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Pnpm>(&plan, Some(&wildcard));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(skipped.len(), 1);
 }
 
@@ -336,7 +336,7 @@ fn peer_gate_holds_an_optional_peer_that_is_present_but_incompatible() {
     let plan = plan_of(vec![change("typescript", "5.5.4", "6.0.0")]);
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped
             .first()
@@ -527,7 +527,7 @@ fn peer_gate_resolves_npm_name_splits_physically() {
     }"#};
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Npm>(&plan, Some(unambiguous));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped
             .first()
@@ -951,7 +951,7 @@ fn workspace_manifest_peer_holds_a_cross_major_move() {
     let plan = plan_of(vec![change("eslint", "8.57.0", "9.8.0")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped.first().and_then(|held| held.detail.as_deref()),
         Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
@@ -1032,7 +1032,7 @@ fn workspace_manifest_peer_holds_an_injected_cross_major_move() {
     let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped.first().and_then(|held| held.detail.as_deref()),
         Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
@@ -1081,7 +1081,7 @@ fn workspace_manifest_peer_holds_across_a_parenthesized_injected_path() {
     let plan = plan_of(vec![change("eslint", "8.57.1", "10.8.0")]);
     let PeerPartition { retained, skipped } =
         partition_peer_held::<crate::lock::Pnpm>(&plan, &evidence);
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     assert_eq!(
         skipped.first().and_then(|held| held.detail.as_deref()),
         Some("held: local-eslint-shim@0.1.0 requires eslint@^8.0.0")
@@ -1991,7 +1991,7 @@ fn peer_gate_recomputes_when_the_exempting_dependent_is_itself_held() {
     ]);
     let PeerPartition { retained, skipped } =
         peer_partition::<crate::lock::Pnpm>(&plan, Some(lock));
-    assert!(retained.changes.is_empty());
+    assert_eq!(retained.changes, []);
     let blame_for = |name: &str| {
         skipped
             .iter()

@@ -190,7 +190,7 @@ mod tests {
                 to: "0.8.2".to_string(),
             }],
         );
-        assert!(orphaning.accepted.is_empty());
+        assert_eq!(orphaning.accepted, []);
         assert_eq!(orphaning.rejected.len(), 1);
         assert!(
             orphaning.rejected[0].reason.contains("orphan"),

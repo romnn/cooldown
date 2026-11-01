@@ -1084,7 +1084,7 @@ mod tests {
         let overshoot = [change("referencing", "0.36.1", "0.36.2")];
         assert_eq!(collateral_changes(&before, &after, &overshoot).len(), 1);
         let exact = [change("referencing", "0.36.1", "0.36.4")];
-        assert!(collateral_changes(&before, &after, &exact).is_empty());
+        assert_eq!(collateral_changes(&before, &after, &exact), []);
     }
 
     #[test]

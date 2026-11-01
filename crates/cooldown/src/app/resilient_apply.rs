@@ -1248,7 +1248,7 @@ mod tests {
         let plan = plan(&["a", "b", "c"]);
         let report = apply_resilient(&writer, &project, &plan).await.unwrap();
 
-        assert!(report.applied.is_empty());
+        assert_eq!(report.applied, []);
         assert_eq!(skipped_names(&report), names(&plan.changes));
     }
 

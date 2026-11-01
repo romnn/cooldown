@@ -690,12 +690,12 @@ mod tests {
         )?;
 
         assert_eq!(found[0].primary, vec![root.join("rust")]);
-        assert!(found[0].nested.is_empty());
+        assert_eq!(found[0].nested, [] as [Utf8PathBuf; 0]);
         assert_eq!(
             found[1].primary,
             vec![root.join("go"), root.join("go/service")]
         );
-        assert!(found[1].nested.is_empty());
+        assert_eq!(found[1].nested, [] as [Utf8PathBuf; 0]);
         Ok(())
     }
 
@@ -810,13 +810,16 @@ mod tests {
             )
         };
 
-        assert!(scan(None)?.is_empty());
+        assert_eq!(scan(None)?, [] as [Utf8PathBuf; 0]);
         assert_eq!(
             scan(Some(&root.join("apps/web")))?,
             vec![root.join("apps/web"), root.join("apps/web/tools")],
             "the selection and what lies below it are found; the sibling `apps/api` is not"
         );
-        assert!(scan(Some(Utf8Path::new("/elsewhere")))?.is_empty());
+        assert_eq!(
+            scan(Some(Utf8Path::new("/elsewhere")))?,
+            [] as [Utf8PathBuf; 0]
+        );
         Ok(())
     }
 
@@ -1121,7 +1124,7 @@ mod tests {
 
         let found = find_marker_dirs(&root, "Cargo.lock", false, &[], true)?;
 
-        assert!(found.is_empty());
+        assert_eq!(found, [] as [Utf8PathBuf; 0]);
         Ok(())
     }
 
@@ -1162,7 +1165,7 @@ mod tests {
             found.dirs,
             vec![root.join(".hidden/project"), root.join("ignored/project")]
         );
-        assert!(found.skipped_unreadable.is_empty());
+        assert_eq!(found.skipped_unreadable, [] as [String; 0]);
         Ok(())
     }
 

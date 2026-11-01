@@ -860,7 +860,7 @@ async fn checked_write_failure_after_an_author_edit_is_restored_by_the_outer_jou
     assert_eq!(checks.get(), 2);
     assert_ne!(std::fs::read(&fixture.project.manifest)?, original_manifest);
     assert_eq!(std::fs::read_to_string(&follower_path)?, follower_original);
-    assert!(fixture.invocations()?.is_empty());
+    assert_eq!(fixture.invocations()?, [] as [String; 0]);
     journal.restore()?;
     assert_eq!(std::fs::read(&fixture.project.manifest)?, original_manifest);
     Ok(())
@@ -945,7 +945,7 @@ async fn a_joint_filesystem_failure_after_one_widen_stops_before_resolving() -> 
         .ok_or_else(|| eyre::eyre!("read-only candidate manifest must terminate the probe"))?;
     assert!(matches!(err, CoreError::Filesystem(_)), "{err:?}");
     assert_ne!(std::fs::read(&first)?, original);
-    assert!(fixture.invocations()?.is_empty());
+    assert_eq!(fixture.invocations()?, [] as [String; 0]);
     assert_eq!(stats.joint_full_successes, 0);
     assert_eq!(stats.partial_replays_kept, 0);
     // Fatal errors unwind to the outer journal, without a rejected probe replay.

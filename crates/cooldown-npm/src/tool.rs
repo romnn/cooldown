@@ -3414,7 +3414,10 @@ packages:
             1
         );
         let stale_duplicate_baseline = [change("shared", "1.3.9", "1.4.3")];
-        assert!(collateral_changes::<Pnpm>(&before, &after, &stale_duplicate_baseline).is_empty());
+        assert_eq!(
+            collateral_changes::<Pnpm>(&before, &after, &stale_duplicate_baseline),
+            []
+        );
     }
 
     #[tokio::test]
@@ -3978,7 +3981,7 @@ packages:
         assert_eq!(skip.change.package.name, "react");
         assert_eq!(skip.change.to.as_str(), "19.0.0");
         let detail = skip.detail.as_deref().expect("a non-empty detail");
-        assert!(!detail.is_empty());
+        assert_ne!(detail, "");
         assert!(detail.contains("catalog-managed"), "{detail}");
         assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
     }
@@ -4683,7 +4686,7 @@ packages:
         let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
         let report = tool.apply(&mutation).await?;
 
-        assert!(report.applied.is_empty());
+        assert_eq!(report.applied, []);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].reason, SkipReason::NotEligible);
         let manifest = std::fs::read_to_string(root.join("package.json"))?;
@@ -5841,7 +5844,7 @@ mod whole_graph_tests {
         };
 
         let held = apply(&tool, &project(&root), plan("7.4.0")).await?;
-        assert!(held.applied.is_empty());
+        assert_eq!(held.applied, []);
         let [skip] = held.skipped.as_slice() else {
             panic!("{:?}", held.skipped);
         };
@@ -5921,7 +5924,7 @@ mod whole_graph_tests {
         };
 
         let held = apply(&tool, &project(&root), plan(RewriteMode::Auto)).await?;
-        assert!(held.applied.is_empty());
+        assert_eq!(held.applied, []);
         let [skip] = held.skipped.as_slice() else {
             panic!("{:?}", held.skipped);
         };
@@ -6061,7 +6064,7 @@ mod whole_graph_tests {
 
         let report = apply(&tool, &project(&root), plan).await?;
 
-        assert!(report.applied.is_empty());
+        assert_eq!(report.applied, []);
         assert_eq!(report.skipped.len(), 2, "{:?}", report.skipped);
         for skip in &report.skipped {
             assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
@@ -6074,7 +6077,7 @@ mod whole_graph_tests {
             assert!(!detail.contains("pass --rewrite"), "{detail}");
             assert!(!detail.contains("not every declared range"), "{detail}");
         }
-        assert!(legs(&root).is_empty());
+        assert_eq!(legs(&root), [] as [String; 0]);
         Ok(())
     }
 

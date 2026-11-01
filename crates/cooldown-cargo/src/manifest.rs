@@ -743,7 +743,7 @@ mod tests {
         )
         .expect("widen");
 
-        assert!(rewrite.modified.is_empty());
+        assert_eq!(rewrite.modified, [] as [Utf8PathBuf; 0]);
         let root_after = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root");
         assert_eq!(root_after, root_manifest);
         let member_after =
@@ -887,7 +887,7 @@ mod tests {
             RewriteMode::Always,
         )
         .expect("widen again");
-        assert!(repeated.modified.is_empty());
+        assert_eq!(repeated.modified, [] as [Utf8PathBuf; 0]);
     }
 
     #[test]
@@ -976,7 +976,7 @@ mod tests {
             RewriteMode::Always,
         )
         .expect("widen");
-        assert!(rewrite.modified.is_empty());
+        assert_eq!(rewrite.modified, [] as [Utf8PathBuf; 0]);
     }
 
     /// A hakari-shaped generated manifest: two hash-aliased lines of one crate, a plain-key line,
@@ -1219,7 +1219,7 @@ mod tests {
         // An inherited entry is the workspace's requirement, not the generated manifest's.
         let rewrite =
             follow_constraint(&root, &[hack], "serde", "1.0.0", "2.0.0").expect("follow serde");
-        assert!(rewrite.modified.is_empty());
+        assert_eq!(rewrite.modified, [] as [Utf8PathBuf; 0]);
         let unchanged =
             std::fs::read_to_string(root.join("crates/workspace-hack/Cargo.toml")).expect("read");
         assert!(
@@ -1242,7 +1242,7 @@ mod tests {
             "0.15.5",
         )
         .expect("follow");
-        assert!(within.modified.is_empty());
+        assert_eq!(within.modified, [] as [Utf8PathBuf; 0]);
         // … nor does a crate the manifest never mentions, or a version no line admits.
         let absent = follow_constraint(
             &root,
@@ -1252,10 +1252,10 @@ mod tests {
             "2.0.0",
         )
         .expect("follow");
-        assert!(absent.modified.is_empty());
+        assert_eq!(absent.modified, [] as [Utf8PathBuf; 0]);
         let other_line =
             follow_constraint(&root, &[hack], "hashbrown", "0.12.0", "0.17.1").expect("follow");
-        assert!(other_line.modified.is_empty());
+        assert_eq!(other_line.modified, [] as [Utf8PathBuf; 0]);
         let unchanged =
             std::fs::read_to_string(root.join("crates/workspace-hack/Cargo.toml")).expect("read");
         assert_eq!(unchanged, HACK_MANIFEST);
@@ -1269,6 +1269,6 @@ mod tests {
         let hack = member("workspace-hack", "crates/workspace-hack");
         let rewrite = widen_constraint(&root, &[hack], "hashbrown", "0.17.1", RewriteMode::Always)
             .expect("widen");
-        assert!(rewrite.modified.is_empty());
+        assert_eq!(rewrite.modified, [] as [Utf8PathBuf; 0]);
     }
 }

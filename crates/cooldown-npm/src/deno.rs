@@ -762,7 +762,7 @@ mod tests {
         let overshoot = [change("debug", NPM, "4.3.6", false)];
         assert_eq!(collateral_changes(&before, &after, &overshoot).len(), 1);
         let exact = [change("debug", NPM, "4.3.7", false)];
-        assert!(collateral_changes(&before, &after, &exact).is_empty());
+        assert_eq!(collateral_changes(&before, &after, &exact), []);
     }
 
     #[test]

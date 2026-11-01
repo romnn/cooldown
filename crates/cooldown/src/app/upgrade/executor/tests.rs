@@ -545,7 +545,7 @@ fn verify_applied_targets_turns_unreached_planned_success_into_skip() {
 
     let verified = verify_applied_targets(report, &planned, &[dep("serde", "1.0.0")]);
 
-    assert!(verified.applied.is_empty());
+    assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 1);
     // The resolve ran and the graph does not hold the target: a ceiling, not a rejection.
     assert_eq!(verified.skipped[0].reason, SkipReason::GraphCeilingHeld);
@@ -585,7 +585,7 @@ fn verify_applied_targets_requires_the_planned_direct_member_to_land() {
 
     let verified = verify_applied_targets(report, &planned, &[old_dep, other_member_dep]);
 
-    assert!(verified.applied.is_empty());
+    assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 1);
     assert_eq!(verified.skipped[0].change, planned_change);
 }
@@ -612,7 +612,7 @@ fn verify_applied_targets_rejects_a_target_reached_through_a_sibling_entry() {
 
     let verified = verify_applied_targets(report, &planned, &[old_line.clone(), new_line.clone()]);
 
-    assert!(verified.applied.is_empty());
+    assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 1);
     assert_eq!(verified.skipped[0].change, planned_change);
 
@@ -650,7 +650,7 @@ fn verify_applied_targets_keeps_each_held_member_when_targets_collide() {
 
     let verified = verify_applied_targets(report, &planned, &[a_dep, b_dep]);
 
-    assert!(verified.applied.is_empty());
+    assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 2);
     let held: Vec<&Change> = verified.skipped.iter().map(|skip| &skip.change).collect();
     assert!(held.contains(&&held_a));
@@ -673,7 +673,7 @@ fn verify_applied_targets_does_not_split_transitive_attribution_by_member() {
 
     let verified = verify_applied_targets(report, &planned, &[dep("shared", "1.0.0")]);
 
-    assert!(verified.applied.is_empty());
+    assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 1);
     assert_eq!(verified.skipped[0].change, held_a);
 }
@@ -797,8 +797,8 @@ fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
     let conflict = indeterminate_trial(vec![committed, failed]);
 
     assert!(conflict.has_restore_conflict());
-    assert!(conflict.items.is_empty());
-    assert!(conflict.edge_items.is_empty());
+    assert_eq!(conflict.items, []);
+    assert_eq!(conflict.edge_items, []);
     assert_eq!(conflict.errors.len(), 1);
 }
 
@@ -816,7 +816,7 @@ fn residual_gate_flags_a_replacement_violating_version() {
 #[test]
 fn residual_gate_allows_an_unchanged_pre_existing_violation() {
     let before = violations(&[("t", "0.5.0")]);
-    assert!(newly_introduced_violations(&before, &before).is_empty());
+    assert_eq!(newly_introduced_violations(&before, &before), []);
 }
 
 #[test]
@@ -1381,12 +1381,12 @@ fn restored_applied_rows_are_not_landed_evidence() {
         violations_after: HashSet::new(),
         reconcile_needed: false,
     });
-    assert!(
+    assert_eq!(
         landed_upgrade_changes(
             &[candidate],
             &[restored, committed],
             &[dep("safe", "1.2.0")]
-        )
-        .is_empty()
+        ),
+        []
     );
 }

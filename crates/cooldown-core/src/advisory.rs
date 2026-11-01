@@ -981,7 +981,7 @@ mod tests {
             &identity,
         );
         assert!(advisory.unorderable);
-        assert!(advisory.ranges.is_empty());
+        assert_eq!(advisory.ranges, []);
         assert!(!advisory.affects(&Version::new("1.0.0"), Some(&ReleaseOrder(vec![0]))));
         assert!(advisory.fixed_by(&Version::new("9.9.9")));
     }
@@ -1034,7 +1034,7 @@ mod tests {
         let zero_fix = raw("GHSA-0f", Some("1.0.0"), Some("0"));
         let advisory = classify_advisory(&zero_fix, OSV, &releases, &identity);
         assert!(advisory.unorderable);
-        assert!(advisory.ranges.is_empty());
+        assert_eq!(advisory.ranges, []);
     }
 
     /// The OSV `BeforeLimits` rule: limits describe alternative branches, so an order before
@@ -1117,7 +1117,7 @@ mod tests {
         );
         let advisory = classify_advisory(&unfindable, OSV, &releases, &identity);
         assert!(advisory.unorderable, "an unorderable limit drops the range");
-        assert!(advisory.ranges.is_empty());
+        assert_eq!(advisory.ranges, []);
     }
 
     /// The events fold into one vulnerable/not-vulnerable state, so a redundant event changes
@@ -1150,7 +1150,7 @@ mod tests {
         // Evaluation starts *not* vulnerable, so a range that only ever closes affects nothing.
         let closes_only = raw_with("GHSA-c", vec![RawRangeEvent::Fixed("3.0.0".to_string())]);
         let advisory = classify_advisory(&closes_only, OSV, &releases, &identity);
-        assert!(advisory.ranges.is_empty());
+        assert_eq!(advisory.ranges, []);
         assert!(!advisory.affects(&Version::new("1.0.0"), Some(&ReleaseOrder(vec![0]))));
         assert!(
             advisory.fixed_by(&Version::new("3.0.0")),

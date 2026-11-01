@@ -1,3 +1,7 @@
+# Pin an exact Rust release so local development and CI compile, lint, and test with the same
+# compiler, rustfmt, and clippy.
+# A floating `stable` would let a new release change lints or behavior on one side only, and CI
+# reads this channel to install the identical toolchain.
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]

@@ -371,11 +371,9 @@ mod tests {
         assert_eq!(cfg.tool_exclude_packages["npm"].patterns(), ["@scope/*"]);
         assert!(!cfg.tool_exclude_packages.contains_key("cargo"));
         // Folders and packages are independent surfaces.
-        assert!(
-            cfg.resolved("outdated")
-                .exclude_folders
-                .patterns()
-                .is_empty()
+        assert_eq!(
+            cfg.resolved("outdated").exclude_folders.patterns(),
+            [] as [String; 0]
         );
     }
 
@@ -500,11 +498,14 @@ gitignore = false
         "});
         let merged = parent.merge(child);
         let outdated = merged.resolved("outdated");
-        assert!(outdated.exclude_folders.patterns().is_empty());
+        assert_eq!(outdated.exclude_folders.patterns(), [] as [String; 0]);
         // Only the lists the child names are cleared.
         assert_eq!(outdated.exclude_packages.patterns(), ["internal-*"]);
-        assert!(merged.exclude_folders_for(&[], "cargo").is_empty());
-        assert!(merged.tool_exclude_packages["cargo"].patterns().is_empty());
+        assert_eq!(merged.exclude_folders_for(&[], "cargo"), [] as [String; 0]);
+        assert_eq!(
+            merged.tool_exclude_packages["cargo"].patterns(),
+            [] as [String; 0]
+        );
         assert_eq!(
             merged.tool_exclude_package_patterns()["cargo"],
             Vec::<String>::new()
@@ -614,12 +615,9 @@ gitignore = false
             [outdated]
             exclude-folders = { replace = [] }
         "#});
-        assert!(
-            same_file
-                .resolved("outdated")
-                .exclude_folders
-                .patterns()
-                .is_empty()
+        assert_eq!(
+            same_file.resolved("outdated").exclude_folders.patterns(),
+            [] as [String; 0]
         );
         // Scalars keep folding per key: a `[<command>]` value in any file beats `[global]` in
         // every file.
@@ -795,7 +793,10 @@ dry-run = true
             [".agents"]
         );
         // The folder excludes are a separate key.
-        assert!(cfg.resolved("check").exclude_folders.patterns().is_empty());
+        assert_eq!(
+            cfg.resolved("check").exclude_folders.patterns(),
+            [] as [String; 0]
+        );
 
         let added = cfg
             .clone()
@@ -805,12 +806,9 @@ dry-run = true
             [".agents", ".ci"]
         );
         let cleared = cfg.merge(scan("[global]\ninclude-hidden = []\n"));
-        assert!(
-            cleared
-                .resolved("upgrade")
-                .include_hidden
-                .patterns()
-                .is_empty()
+        assert_eq!(
+            cleared.resolved("upgrade").include_hidden.patterns(),
+            [] as [String; 0]
         );
         assert!(
             scan("[global]\ninclude-hidden = [\".agents\"]\n").sets_scan_lists(),
@@ -827,24 +825,18 @@ dry-run = true
     #[test]
     fn empty_config_is_inert() {
         let cfg = scan("min-age = \"7d\"\n");
-        assert!(cfg.exclude_folders_for(&[], "cargo").is_empty());
-        assert!(
-            cfg.resolved("outdated")
-                .exclude_folders
-                .patterns()
-                .is_empty()
+        assert_eq!(cfg.exclude_folders_for(&[], "cargo"), [] as [String; 0]);
+        assert_eq!(
+            cfg.resolved("outdated").exclude_folders.patterns(),
+            [] as [String; 0]
         );
-        assert!(
-            cfg.resolved("outdated")
-                .exclude_packages
-                .patterns()
-                .is_empty()
+        assert_eq!(
+            cfg.resolved("outdated").exclude_packages.patterns(),
+            [] as [String; 0]
         );
-        assert!(
-            cfg.resolved("outdated")
-                .include_hidden
-                .patterns()
-                .is_empty()
+        assert_eq!(
+            cfg.resolved("outdated").include_hidden.patterns(),
+            [] as [String; 0]
         );
         assert!(!cfg.sets_scan_lists());
         assert_eq!(cfg.resolved("outdated").gitignore, None);

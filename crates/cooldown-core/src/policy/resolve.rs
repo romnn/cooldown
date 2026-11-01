@@ -682,7 +682,10 @@ mod exempt_tests {
             ByKind::scalar(WindowSpec::MinAge(SignedDuration::from_hours(24 * 14))),
             false,
         ));
-        assert!(exempt_package_globs(&[layer], crate::model::ToolId("pnpm")).is_empty());
+        assert_eq!(
+            exempt_package_globs(&[layer], crate::model::ToolId("pnpm")),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -699,7 +702,10 @@ mod exempt_tests {
             exempt_package_globs(std::slice::from_ref(&layer), crate::model::ToolId("npm")),
             vec!["shared".to_string()]
         );
-        assert!(exempt_package_globs(&[layer], crate::model::ToolId("pnpm")).is_empty());
+        assert_eq!(
+            exempt_package_globs(&[layer], crate::model::ToolId("pnpm")),
+            [] as [String; 0]
+        );
     }
 }
 

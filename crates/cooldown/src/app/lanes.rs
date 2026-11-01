@@ -478,7 +478,7 @@ mod tests {
         .run(|_| async {})
         .await;
 
-        assert!(outputs.is_empty());
+        assert_eq!(outputs, []);
     }
 
     /// A project that matches its tool's lane and contends with another lane folds the two
