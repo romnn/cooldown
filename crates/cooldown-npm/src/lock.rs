@@ -356,6 +356,12 @@ pub enum SplitHold {
     Unresolved,
     /// Importers resolve the name at several versions, and none records a plain range.
     NoRange,
+    /// A declaring member's manifest could not be read to confirm that every install declaration
+    /// takes the ceiling widen.
+    ManifestUnavailable {
+        /// The manifest, project-relative and `/`-separated.
+        manifest: String,
+    },
     /// The name resolves at one version, and this declared range excludes the target in a way
     /// `--major` does not widen.
     Declaration {

@@ -1570,6 +1570,10 @@ fn upgrade_major_respects_an_explicit_bound_beside_a_caret() {
     ]);
     assert!(upgrade.ok(), "{upgrade:#?}");
     assert_eq!(upgrade.summary_applied(), 0, "{upgrade:#?}");
+    // The planner holds the cross-major target at the bound; the split hold never sees it.
+    let reasons = upgrade.skipped_reasons_for("chalk");
+    assert!(reasons.contains("declared_bound_held"), "{upgrade:#?}");
+    assert!(!reasons.contains("multi_version_held"), "{upgrade:#?}");
     assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
     assert_eq!(chalk_range(&fixture, "a"), "^4.1.0");
     assert_eq!(chalk_range(&fixture, "b"), "^4.0.0");

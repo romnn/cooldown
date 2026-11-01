@@ -78,8 +78,7 @@ pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>>
     Ok(None)
 }
 
-/// Every install-field range declaring `name` in this manifest, in field order, or none when the
-/// manifest is absent.
+/// Every install-field range declaring `name` in this manifest, in field order.
 ///
 /// Unlike [`declared_range`], a name declared in several install fields yields each of them, since
 /// [`widen_constraints`] rewrites them all.
@@ -88,13 +87,12 @@ pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>>
 ///
 /// # Errors
 ///
-/// Returns a [`CoreError`] if the manifest exists but cannot be read or is not valid JSON.
+/// Returns a [`CoreError`] if the manifest is absent, cannot be read, or is not valid JSON: a
+/// caller confirming that no declaration forbids a widen cannot treat a missing manifest as one
+/// that declares nothing.
 pub fn install_ranges(manifest: &Utf8Path, name: &str) -> Result<Vec<String>> {
-    let content = match std::fs::read_to_string(manifest) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(CoreError::Filesystem(format!("{manifest}: {e}"))),
-    };
+    let content = std::fs::read_to_string(manifest)
+        .map_err(|e| CoreError::Filesystem(format!("{manifest}: {e}")))?;
     let doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
     Ok(WIDENABLE_FIELDS
@@ -763,10 +761,7 @@ mod tests {
             install_ranges(&manifest, "dep")?,
             vec!["^20.11.1".to_string(), "20.14.5".to_string()]
         );
-        assert_eq!(
-            install_ranges(&root.join("absent.json"), "dep")?,
-            Vec::<String>::new()
-        );
+        assert!(install_ranges(&root.join("absent.json"), "dep").is_err());
         Ok(())
     }
 

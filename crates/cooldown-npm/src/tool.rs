@@ -2996,6 +2996,9 @@ fn split_hold_reason(
             format!("the lock resolves none of its declarations, so {target} cannot be judged")
         }
         Some(SplitHold::NoRange) => format!("no plain range to judge against {target}"),
+        Some(SplitHold::ManifestUnavailable { manifest }) => format!(
+            "{manifest} could not be read to confirm that every declaration may widen to {target}"
+        ),
         Some(SplitHold::Declaration { range, hold }) => match hold {
             CeilingHold::ExactPin => format!("the exact pin {range} excludes {target}"),
             CeilingHold::NotPlain => {
@@ -3048,7 +3051,9 @@ pub(crate) struct HeldSplits {
 /// The lock records one specifier per importer, so a second install field (an exact pin under
 /// `devDependencies` beside a caret under `dependencies`) is visible only there, and the widen
 /// would rewrite it too.
-/// Without a `root`, or with a manifest that cannot be read, the name stays held.
+/// Without a `root`, or with a declaring manifest that cannot be read, the name stays held.
+/// Only a declared (direct) change is confirmed this way: a transitive copy of the same name has
+/// no declaring manifest and is held by its own transitive verdict.
 ///
 /// Judged over the pre-apply `content` with the plan's excluded importers left out
 /// ([`NodeLock::member_sources_excluding`]): an importer the run excludes is not cooldown's to
@@ -3084,13 +3089,16 @@ pub(crate) fn held_splits<L: NodeLock>(
         let hold = match index.split_verdict(name, target) {
             SplitVerdict::Joint => continue,
             SplitVerdict::Held(hold) => Some(hold),
-            SplitVerdict::CeilingWiden => {
-                match root.map(|root| manifest_ceiling_hold(root, change)) {
-                    Some(Ok(None)) => continue,
-                    Some(Ok(Some(hold))) => Some(hold),
-                    None | Some(Err(_)) => None,
-                }
-            }
+            // A copy no importer declares has no manifest to confirm, and its own transitive
+            // verdict holds it; only the declared copy decides whether the name is held.
+            SplitVerdict::CeilingWiden if !change.direct => continue,
+            SplitVerdict::CeilingWiden => match root {
+                Some(root) => match manifest_ceiling_hold(root, change) {
+                    None => continue,
+                    hold => hold,
+                },
+                None => None,
+            },
         };
         splits.names.insert(name.to_string());
         if let Some(hold) = hold {
@@ -3101,19 +3109,24 @@ pub(crate) fn held_splits<L: NodeLock>(
 }
 
 /// The first install-field range in `change`'s declaring manifests that the cross-major ceiling
-/// widen cannot carry to its target.
-fn manifest_ceiling_hold(root: &Utf8Path, change: &Change) -> Result<Option<SplitHold>> {
+/// widen cannot carry to its target, or the manifest that could not be read to tell.
+fn manifest_ceiling_hold(root: &Utf8Path, change: &Change) -> Option<SplitHold> {
     let mut ranges = Vec::new();
     for rel in manifest::manifest_rels(&change.members) {
-        ranges.extend(manifest::install_ranges(
-            &root.join(rel),
-            &change.package.name,
-        )?);
+        match manifest::install_ranges(&root.join(&rel), &change.package.name) {
+            Ok(found) => ranges.extend(found),
+            Err(_) => {
+                return Some(SplitHold::ManifestUnavailable {
+                    manifest: rel
+                        .components()
+                        .map(|component| component.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                });
+            }
+        }
     }
-    Ok(SplitHold::first_declaration_hold(
-        ranges.iter().map(String::as_str),
-        change.to.as_str(),
-    ))
+    SplitHold::first_declaration_hold(ranges.iter().map(String::as_str), change.to.as_str())
 }
 
 /// Every distinct target the plan names per package, ascending — several when the lines of a split
@@ -6638,6 +6651,91 @@ mod whole_graph_tests {
             );
         }
         assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// A declaring member whose manifest is gone cannot confirm the widen, so the name stays held
+    /// and its row names the manifest.
+    #[tokio::test]
+    async fn a_missing_declaring_manifest_keeps_the_hold() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        caret_spellings_fixture(&root)?;
+        std::fs::remove_file(root.join("apps/legacy/package.json"))?;
+        let script = fake_pnpm(&root, "")?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "21.0.4",
+                &CARET_SPELLING_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("apps/legacy/package.json could not be read"),
+            "{detail}"
+        );
+        assert_eq!(legs(&root), [] as [String; 0]);
+        Ok(())
+    }
+
+    /// A transitive copy of a name has no declaring manifest, so it cannot confirm or veto the
+    /// ceiling widen of the declared copy; in particular the root manifest it would fall back to
+    /// may belong to an excluded importer whose exact pin is not the run's to judge.
+    #[test]
+    fn a_transitive_copy_does_not_veto_the_widen_of_the_declared_copy() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: ".",
+                    name: "root",
+                    deps: vec![("happy-dom", "20.14.5", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/frontend",
+                    name: "frontend",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/legacy",
+                    name: "legacy",
+                    deps: vec![("happy-dom", "^20.9.0", "20.14.5")],
+                },
+            ],
+        )?;
+        let members = &CARET_SPELLING_MEMBERS[..2];
+        let transitive = Change {
+            from: Version::new("19.4.0"),
+            direct: false,
+            members: Vec::new(),
+            ..change("happy-dom", "19.4.0", "21.0.4", &[])
+        };
+        let plan = Plan {
+            changes: vec![
+                change("happy-dom", "20.14.5", "21.0.4", members),
+                transitive,
+            ],
+            excluded_members: vec![member("root", ".")],
+            ..Plan::default()
+        };
+
+        assert!(
+            held_splits::<Pnpm>(Some(&root), Some(&lock), &plan)
+                .names
+                .is_empty()
+        );
         Ok(())
     }
 
