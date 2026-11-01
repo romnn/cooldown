@@ -8,6 +8,7 @@
 
 mod apply;
 pub mod deno;
+mod exclusions;
 pub mod jsr;
 pub mod lock;
 mod manifest;
