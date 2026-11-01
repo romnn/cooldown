@@ -2137,12 +2137,9 @@ impl<L: NodeLock> NpmTool<L> {
     /// candidate's own window, and the exemption is a no-op for a pin old enough to pass anyway.
     /// The command-line list replaces the effective configured one, so its entries are carried too.
     ///
-    /// pnpm reads a configured scalar as one pattern per character, so it is carried as that list.
-    ///
     /// # Errors
     ///
-    /// A failed configuration query is a [`CoreError::System`] error, never a resolver verdict, so
-    /// candidate isolation does not hold every candidate over a configuration it could not read.
+    /// See [`Self::effective_minimum_age_exclusions`].
     async fn joint_update_exclusions(
         &self,
         project: &Project,
@@ -2151,6 +2148,17 @@ impl<L: NodeLock> NpmTool<L> {
         if L::NATIVE_MIN_AGE_FILE.is_none() {
             return Ok(Vec::new());
         }
+        let configured = self.effective_minimum_age_exclusions(project).await?;
+        Ok(crate::exclusions::grant_pins(pins, configured))
+    }
+
+    /// pnpm's effective `minimumReleaseAgeExclude` rules, in order, as pnpm reads them.
+    ///
+    /// # Errors
+    ///
+    /// A failed configuration query is a [`CoreError::System`] error, never a resolver verdict, so
+    /// candidate isolation does not hold every candidate over a configuration it could not read.
+    async fn effective_minimum_age_exclusions(&self, project: &Project) -> Result<Vec<String>> {
         let configured = self
             .configured_value::<ConfigStringList>(project, "minimumReleaseAgeExclude")
             .await
@@ -2159,11 +2167,7 @@ impl<L: NodeLock> NpmTool<L> {
                     "could not read pnpm's effective minimumReleaseAgeExclude: {err}"
                 ))
             })?;
-        let configured = match configured {
-            ConfigStringList::Many(configured) => configured,
-            ConfigStringList::One(scalar) => scalar.chars().map(String::from).collect(),
-        };
-        Ok(pinned_minimum_age_exclusions(pins, configured))
+        Ok(crate::exclusions::configured_rules(configured))
     }
 
     async fn repair_policy_rejected_graph(
@@ -2208,10 +2212,7 @@ impl<L: NodeLock> NpmTool<L> {
         })?;
         let native_rel = Utf8PathBuf::from(native);
         let native_snapshot = ProjectMutationJournal::capture(&project.root, [&native_rel])?;
-        let configured_exclusions = self
-            .configured_value::<ConfigStringList>(project, "minimumReleaseAgeExclude")
-            .await?
-            .into_vec();
+        let configured_exclusions = self.effective_minimum_age_exclusions(project).await?;
         let exact_versions = minimum_age_repair_versions(plan);
         let exclusions = minimum_age_repair_exclusions(plan, configured_exclusions);
         let mut overrides = self
@@ -2277,22 +2278,7 @@ impl<L: NodeLock> NpmTool<L> {
             }
         };
         let locked = resolved_version_lines::<L>(&read_lock::<L>(project)?)?;
-        let mut globs = Vec::new();
         let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
-        for entry in native_age.exclusions.into_vec() {
-            if let Some((name, versions)) = exact_exclusion(&entry) {
-                if let Some(present) = locked.get(name) {
-                    exact_versions.entry(name.to_string()).or_default().extend(
-                        versions
-                            .into_iter()
-                            .filter(|version| present.contains(*version))
-                            .map(str::to_string),
-                    );
-                }
-            } else {
-                globs.push(entry);
-            }
-        }
         if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
             for (name, versions) in permitted_versions {
                 for version in versions.iter().filter(|version| {
@@ -2333,7 +2319,18 @@ impl<L: NodeLock> NpmTool<L> {
                 }
             }
         }
-        let exclusions = minimum_age_exclusions(&globs, &exact_versions)?;
+        // Grant before pruning, so a version admitted now is never pruned as unlocked, and keep
+        // the native rules in order: pnpm lets the first rule naming a package decide.
+        let mut exclusions = crate::exclusions::configured_rules(native_age.exclusions);
+        for (name, versions) in &exact_versions {
+            crate::exclusions::set_exact_permission(
+                &mut exclusions,
+                name,
+                &BTreeSet::new(),
+                versions,
+            );
+        }
+        let exclusions = crate::exclusions::prune_unlocked(&exclusions, &locked);
         set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, false)?;
         Ok(())
     }
@@ -2756,174 +2753,35 @@ fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
     }
 }
 
-/// pnpm stops at the first matching exclusion rule, so one package's exact versions must share a
-/// `version||version` union rather than appearing as separate entries.
-/// A targeted package excludes only its approved destination; allowing its rejected starting version
-/// would let the settlement resolve float back to it after the temporary override is removed.
-fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
-    let mut exclusions = BTreeSet::new();
-    let mut exact_versions = minimum_age_repair_versions(plan);
-    for entry in configured_exclusions {
-        if let Some((name, versions)) = exact_exclusion(&entry) {
-            exact_versions.entry(name.to_string()).or_default().extend(
-                versions
-                    .into_iter()
-                    .filter(|version| {
-                        // A repair must not reauthorize the rejected starting pin of its target.
-                        !plan.baseline_violations.iter().any(|violation| {
-                            violation.package.name == name
-                                && violation.version.as_str() == *version
-                                && plan
-                                    .changes
-                                    .iter()
-                                    .any(|change| change.package.name == name)
-                        })
-                    })
-                    .map(str::to_string),
-            );
-        } else {
-            exclusions.insert(entry);
-        }
-    }
-    exclusions.extend(
-        exact_versions
-            .into_iter()
-            .filter(|(_, versions)| !versions.is_empty())
-            .map(|(package, versions)| {
-                format!(
-                    "{package}@{}",
-                    versions.into_iter().collect::<Vec<_>>().join("||")
-                )
-            }),
-    );
-    exclusions.into_iter().collect()
-}
-
-/// Adds each pin's exact version to the configured release-age exclusions without changing what
-/// they permit for any other package or version.
+/// The exclusion list the repair and settlement installs pass: the configured rules, in order,
+/// granting every version the repair lands ([`minimum_age_repair_versions`]).
 ///
-/// pnpm evaluates the rules in order, and the first rule whose name pattern matches a package
-/// decides alone: a rule without versions exempts every version, an exact rule only its union.
-/// So the configured rules keep their order and spelling.
-/// A pin whose package no rule names gets a rule of its own.
-/// A pin whose first matching rule is an exact rule for that literal name joins its union.
-/// One whose first match is a negated exact rule gets its own rule just before it, carrying that
-/// rule's versions, so the negated rule keeps its meaning for every other package.
-fn pinned_minimum_age_exclusions(
-    pins: &[(String, String)],
-    configured_exclusions: Vec<String>,
-) -> Vec<String> {
-    struct FirstMatch {
-        index: usize,
-        literal: bool,
-        versions: Option<String>,
-    }
-
+/// A targeted package's rejected starting pin is withheld from its exact first-match rule: allowing
+/// it would let the settlement resolve float back to it after the temporary override is removed.
+/// A package whose first-match rule exempts every version keeps that exemption, since pnpm cannot
+/// express every version but one ([`crate::exclusions::set_exact_permission`]).
+fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
+    let targeted = plan
+        .changes
+        .iter()
+        .map(|change| change.package.name.as_str())
+        .collect::<HashSet<_>>();
     let mut exclusions = configured_exclusions;
-    for (name, target) in pins {
-        let first_match = exclusions.iter().enumerate().find_map(|(index, entry)| {
-            let rule = PnpmVersionRule::parse(entry);
-            pnpm_name_matches(rule.name, name).then(|| FirstMatch {
-                index,
-                literal: rule.name == name,
-                versions: rule.versions.map(str::to_string),
-            })
-        });
-        let Some(FirstMatch {
-            index,
-            literal,
-            versions,
-        }) = first_match
-        else {
-            exclusions.push(format!("{name}@{target}"));
-            continue;
+    for (name, granted) in minimum_age_repair_versions(plan) {
+        let withheld: BTreeSet<String> = if targeted.contains(name.as_str()) {
+            plan.baseline_violations
+                .iter()
+                .filter(|violation| violation.package.name == name)
+                .filter_map(|violation| {
+                    crate::exclusions::version_identity(violation.version.as_str())
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
         };
-        // A rule without versions already exempts every version.
-        let Some(versions) = versions else {
-            continue;
-        };
-        if union_contains(&versions, target) {
-            continue;
-        }
-        let union = format!("{name}@{versions}||{target}");
-        match exclusions.get_mut(index) {
-            Some(entry) if literal => *entry = union,
-            _ => exclusions.insert(index, union),
-        }
+        crate::exclusions::set_exact_permission(&mut exclusions, &name, &withheld, &granted);
     }
     exclusions
-}
-
-/// One `minimumReleaseAgeExclude` entry split the way pnpm's version-policy parser splits it.
-struct PnpmVersionRule<'a> {
-    /// The package-name pattern.
-    name: &'a str,
-    /// The raw `||` union of exact versions, or `None` for a rule covering every version.
-    versions: Option<&'a str>,
-}
-
-impl<'a> PnpmVersionRule<'a> {
-    fn parse(entry: &'a str) -> Self {
-        // A scope's leading `@` is part of the name, so the version separator is searched after it.
-        let search_from = usize::from(entry.starts_with('@'));
-        match entry
-            .get(search_from..)
-            .and_then(|rest| rest.find('@'))
-            .map(|offset| offset + search_from)
-        {
-            Some(at) => PnpmVersionRule {
-                name: entry.get(..at).unwrap_or(entry),
-                versions: entry.get(at + 1..),
-            },
-            None => PnpmVersionRule {
-                name: entry,
-                versions: None,
-            },
-        }
-    }
-}
-
-/// Matches a package name against a pnpm name pattern.
-///
-/// pnpm's pattern language is not a general glob: `*` matches any run of characters including
-/// `/`, a leading `!` negates the pattern, and every other character is literal.
-fn pnpm_name_matches(pattern: &str, name: &str) -> bool {
-    match pattern.strip_prefix('!') {
-        Some(negated) => !wildcard_matches(negated, name),
-        None => wildcard_matches(pattern, name),
-    }
-}
-
-fn wildcard_matches(pattern: &str, name: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let Some(prefix) = parts.next() else {
-        return name.is_empty();
-    };
-    let Some(mut rest) = name.strip_prefix(prefix) else {
-        return false;
-    };
-    let mut middles: Vec<&str> = parts.collect();
-    // Without a `*`, the prefix is the whole pattern.
-    let Some(suffix) = middles.pop() else {
-        return rest.is_empty();
-    };
-    for middle in middles {
-        match rest.find(middle) {
-            Some(at) => rest = rest.get(at + middle.len()..).unwrap_or_default(),
-            None => return false,
-        }
-    }
-    rest.ends_with(suffix)
-}
-
-/// Whether a raw pnpm version union already names `version`.
-///
-/// pnpm accepts loose spellings such as `1.0.0 || v1.1.0`, so each member is trimmed of whitespace
-/// and a leading `v` before comparing.
-fn union_contains(union: &str, version: &str) -> bool {
-    union
-        .split("||")
-        .any(|member| member.trim().trim_start_matches('v').eq(version))
 }
 
 fn minimum_age_repair_versions(plan: &Plan) -> BTreeMap<String, BTreeSet<String>> {
@@ -3537,107 +3395,10 @@ mod tests {
         }
     }
 
-    fn strings(entries: &[&str]) -> Vec<String> {
-        entries.iter().map(ToString::to_string).collect()
-    }
-
-    fn pin(name: &str, version: &str) -> (String, String) {
-        (name.to_string(), version.to_string())
-    }
-
+    /// The repair keeps the configured rules in order, grants the repair's destinations in each
+    /// package's first matching rule, and withholds a targeted package's rejected starting pin.
     #[test]
-    fn pinned_minimum_age_exclusions_keep_every_configured_rule_in_order() {
-        let configured = strings(&[
-            "@scope/limited@1.0.0",
-            "@scope/*",
-            "nanoid",
-            "eslint@10.5.0",
-            "flatted@3.4.1",
-            "flatted@3.4.2",
-        ]);
-        let exclusions = pinned_minimum_age_exclusions(
-            &[
-                pin("eslint", "10.6.0"),
-                pin("@scope/limited", "1.1.0"),
-                pin("@scope/other", "2.0.0"),
-                pin("lodash", "4.17.21"),
-            ],
-            configured,
-        );
-        // A pin joins the first exact rule naming its package, a scope glob already exempts every
-        // version of its other members, and an unnamed package gets a rule appended at the end.
-        // The glob stays behind the narrower rule and the second `flatted` rule stays shadowed,
-        // so no other package or version gains an exemption.
-        assert_eq!(
-            exclusions,
-            strings(&[
-                "@scope/limited@1.0.0||1.1.0",
-                "@scope/*",
-                "nanoid",
-                "eslint@10.5.0||10.6.0",
-                "flatted@3.4.1",
-                "flatted@3.4.2",
-                "lodash@4.17.21",
-            ])
-        );
-    }
-
-    #[test]
-    fn pinned_minimum_age_exclusions_extend_loosely_spelled_exact_unions() {
-        // pnpm accepts spaces and `v` prefixes in a union, so these rules are the first match and
-        // must carry the pin rather than shadow an appended rule.
-        assert_eq!(
-            pinned_minimum_age_exclusions(
-                &[pin("foo", "2.0.0"), pin("bar", "1.1.0")],
-                strings(&["foo@1.0.0 || 1.1.0", "bar@v1.0.0 || v1.1.0"]),
-            ),
-            strings(&["foo@1.0.0 || 1.1.0||2.0.0", "bar@v1.0.0 || v1.1.0"])
-        );
-    }
-
-    #[test]
-    fn pinned_minimum_age_exclusions_leave_a_negated_rule_alone() {
-        // `!foo@1.0.0` exempts version 1.0.0 of every package but `foo`.
-        // Widening it for `bar` would widen it for all of them, so `bar` gets its own rule ahead.
-        assert_eq!(
-            pinned_minimum_age_exclusions(
-                &[pin("bar", "2.0.0"), pin("foo", "3.0.0")],
-                strings(&["!foo@1.0.0"]),
-            ),
-            strings(&["bar@1.0.0||2.0.0", "!foo@1.0.0", "foo@3.0.0"])
-        );
-    }
-
-    #[test]
-    fn pinned_minimum_age_exclusions_are_the_pins_without_configured_rules() {
-        assert_eq!(
-            pinned_minimum_age_exclusions(
-                &[pin("lodash", "4.17.21"), pin("@types/node", "26.6.6")],
-                Vec::new(),
-            ),
-            strings(&["lodash@4.17.21", "@types/node@26.6.6"])
-        );
-    }
-
-    #[test]
-    fn pnpm_name_patterns_match_like_pnpm() {
-        assert!(pnpm_name_matches("*", "@scope/pkg"));
-        assert!(pnpm_name_matches("@scope/*", "@scope/pkg"));
-        assert!(pnpm_name_matches("@types/*-utils", "@types/react-utils"));
-        assert!(!pnpm_name_matches("@types/*-utils", "@types/react"));
-        assert!(pnpm_name_matches("a*b*c", "aXbYc"));
-        assert!(!pnpm_name_matches("a*b*c", "aXcYb"));
-        assert!(pnpm_name_matches("foo", "foo"));
-        assert!(!pnpm_name_matches("foo", "foobar"));
-        assert!(pnpm_name_matches("!foo", "bar"));
-        assert!(!pnpm_name_matches("!foo", "foo"));
-        // Glob metacharacters other than `*` are literal in pnpm patterns.
-        assert!(!pnpm_name_matches("lodas?", "lodash"));
-        assert!(pnpm_name_matches("lodas?", "lodas?"));
-    }
-
-    #[test]
-    fn minimum_age_repair_exclusions_are_exact_and_deterministic() {
+    fn minimum_age_repair_exclusions_keep_the_configured_order() {
         let plan = Plan {
             changes: vec![change("eslint", "10.7.0", "10.6.0")],
             baseline_violations: vec![
@@ -3670,11 +3431,40 @@ mod tests {
             ),
             vec![
                 "@typescript-eslint/*".to_string(),
-                "eslint@10.5.0||10.6.0".to_string(),
-                "flatted@3.4.1||3.4.2||3.4.3".to_string(),
                 "nanoid".to_string(),
+                "eslint@10.5.0||10.6.0".to_string(),
+                // Shadowed by the first `eslint` rule, so its rejected pin stays unexempt.
+                "eslint@10.7.0".to_string(),
+                "flatted@3.4.1||3.4.2||3.4.3".to_string(),
             ]
         );
+        let exclusions = minimum_age_repair_exclusions(
+            &plan,
+            vec!["eslint@10.5.0".to_string(), "eslint@10.7.0".to_string()],
+        );
+        assert!(crate::exclusions::exempts(&exclusions, "eslint", "10.6.0"));
+        assert!(!crate::exclusions::exempts(&exclusions, "eslint", "10.7.0"));
+        // An untargeted baseline violation is granted so the starting lock passes pnpm's gate.
+        assert!(crate::exclusions::exempts(&exclusions, "flatted", "3.4.2"));
+    }
+
+    /// A rejected starting pin listed in the target's own first rule is withheld in place, so the
+    /// wildcard behind that rule never takes over the package.
+    #[test]
+    fn minimum_age_repair_exclusions_withhold_without_exposing_a_later_rule() {
+        let plan = Plan {
+            changes: vec![change("foo", "1.0.0", "2.0.0")],
+            baseline_violations: vec![cooldown_core::BaselineViolation {
+                package: PackageId::new(ToolId(NPM), "foo", None),
+                version: Version::new("1.0.0"),
+            }],
+            ..Plan::default()
+        };
+        let exclusions =
+            minimum_age_repair_exclusions(&plan, vec!["foo@1.0.0".to_string(), "*".to_string()]);
+        assert_eq!(exclusions, vec!["foo@2.0.0".to_string(), "*".to_string()]);
+        assert!(!crate::exclusions::exempts(&exclusions, "foo", "1.0.0"));
+        assert!(crate::exclusions::exempts(&exclusions, "bar", "9.0.0"));
     }
 
     #[test]
@@ -5427,6 +5217,57 @@ mod whole_graph_tests {
         Ok(())
     }
 
+    /// The repair leg reads the exclusion setting too, and a failed read there is the same broken
+    /// environment: a transitive-only plan takes that leg, and the apply fails before any install.
+    #[tokio::test]
+    async fn a_failed_exclusion_query_fails_the_repair_leg_before_the_install() -> eyre::Result<()>
+    {
+        let (_dir, root) = tempdir_root()?;
+        let mut lock = workspace(
+            &root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![("parent", "^1.0.0", "1.0.0")],
+            }],
+        )?;
+        lock.push_str(&package_entry("foo", "1.0.0"));
+        lock.push_str(indoc! {"
+
+            snapshots:
+              parent@1.0.0:
+                dependencies:
+                  foo: 1.0.0
+        "});
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let script = fake_pnpm_answering_exclusions(
+            &root,
+            "",
+            "echo 'ERR_PNPM_CONFIG unreadable' >&2; exit 1",
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![Change {
+                direct: false,
+                ..change("foo", "1.0.0", "1.1.0", &[])
+            }],
+            ..Plan::default()
+        };
+
+        let error = apply(&tool, &project(&root), plan)
+            .await
+            .expect_err("an unreadable configuration must not be reported as held candidates");
+
+        assert!(error.is_local_environment_failure(), "{error:?}");
+        assert!(
+            error.to_string().contains("minimumReleaseAgeExclude"),
+            "{error}"
+        );
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
     /// pnpm reads a scalar exclusion setting as one pattern per character, so the update carries
     /// those patterns as its list and adds the pin only where none of them already exempts it.
     #[tokio::test]
@@ -5482,13 +5323,125 @@ mod whole_graph_tests {
         Ok(())
     }
 
+    /// The native exclusion rules before the run, and the ones persisted after it lands `foo@1.1.0`.
+    struct NativeRules<'a> {
+        before: &'a [&'a str],
+        persisted: &'a [&'a str],
+    }
+
+    const CORP_RULES: NativeRules<'static> = NativeRules {
+        before: &["@corp/*", "foo@0.9.0"],
+        persisted: &["@corp/*", "foo@1.1.0"],
+    };
+
+    /// A persisted admission keeps the native rules in pnpm's order: it joins the package's first
+    /// matching rule (here a negated one, ahead of which it gets its own), the shadowed stale rule
+    /// goes, and every other rule keeps its place and spelling, a backslash included.
+    #[tokio::test]
+    async fn persisted_admissions_keep_the_native_rule_order() -> eyre::Result<()> {
+        for direct in [true, false] {
+            assert_young_native_exclusions_with(
+                direct,
+                &[],
+                &NativeRules {
+                    before: &["!other@1.0.0", "foo@0.9.0", "@corp/*", r"back\slash"],
+                    persisted: &["foo@1.1.0", "!other@1.0.0", "@corp/*", r"back\slash"],
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn assert_young_native_exclusions(
         direct: bool,
         effective_exclusions: &[&str],
     ) -> eyre::Result<()> {
+        assert_young_native_exclusions_with(direct, effective_exclusions, &CORP_RULES).await
+    }
+
+    async fn assert_young_native_exclusions_with(
+        direct: bool,
+        effective_exclusions: &[&str],
+        rules: &NativeRules<'_>,
+    ) -> eyre::Result<()> {
         let (_dir, root) = tempdir_root()?;
-        let mut lock = workspace(
+        let lock = write_young_pin_lock(&root, direct)?;
+        let native_before = write_native_rules(&root, rules.before)?;
+        let script = fake_pnpm_with_exclusions(
             &root,
+            indoc! {r#"
+                      *"--frozen-lockfile"*)
+                        grep -q 'foo@1.1.0' pnpm-workspace.yaml || exit 1
+                        exit 0 ;;
+                      *" update "*|*"install"*)
+                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            effective_exclusions,
+        )?;
+
+        // The planner can admit a two-day-old security fix through its shorter window.
+        // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
+        // The fixed January clock keeps the pin young even when this test runs months later.
+        // The planner can admit a two-day-old security fix through its shorter window.
+        // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
+        // The fixed January clock keeps the pin young even when this test runs months later.
+        let cache = tempfile::tempdir()?;
+        let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
+        let tool = young_pin_tool(cache.path(), &script, now)?;
+        let mut target = change("foo", "1.0.0", "1.1.0", &[("app", ".")]);
+        target.direct = direct;
+        if !direct {
+            target.members.clear();
+        }
+        let plan = Plan {
+            changes: vec![target],
+            evaluated_at: Some(now),
+            ..Plan::default()
+        };
+        let project = project(&root);
+        let manifest_before = read(&root, "package.json")?;
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
+        assert_eq!(applied_names(&report), vec!["foo"], "direct={direct}");
+        let native = read(&root, "pnpm-workspace.yaml")?;
+        assert!(!native.contains("overrides:"), "{native}");
+        assert_eq!(
+            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
+                .exclusions
+                .into_vec(),
+            rules.persisted,
+            "direct={direct}: {native}"
+        );
+        for exclusion in effective_exclusions {
+            assert!(
+                read(&root, "legs.log")?.contains(exclusion),
+                "effective config should remain available to repair CLI arguments"
+            );
+        }
+        if direct {
+            assert_joint_update_exempts_the_pin(&root, effective_exclusions)?;
+        }
+        assert_eq!(
+            tool.verify_lock_current(&project).await?.status,
+            cooldown_core::LockStatus::Current,
+            "the persisted exception must prevent stale_lock"
+        );
+
+        // Candidate rejection uses the same journal after the native write, so the exact
+        // allowance must disappear together with the rejected lock.
+        mutation.journal().restore()?;
+        assert_eq!(read(&root, "package.json")?, manifest_before);
+        assert_eq!(read(&root, "pnpm-workspace.yaml")?, native_before);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// Writes the lock holding `foo@1.0.0`, directly declared or only reached through `parent`,
+    /// and the lock the fake resolve settles on with `foo@1.1.0`; returns the first.
+    fn write_young_pin_lock(root: &Utf8Path, direct: bool) -> eyre::Result<String> {
+        let mut lock = workspace(
+            root,
             &[Importer {
                 path: ".",
                 name: "app",
@@ -5517,34 +5470,31 @@ mod whole_graph_tests {
         };
         std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
         std::fs::write(root.join("settled.yaml"), settled)?;
-        let native_before = indoc! {r#"
-                packages: []
-                minimumReleaseAge: 10080
-                minimumReleaseAgeExclude:
-                  - "@corp/*"
-                  - "foo@0.9.0"
-            "#};
-        std::fs::write(root.join("pnpm-workspace.yaml"), native_before)?;
-        let script = fake_pnpm_with_exclusions(
-            &root,
-            indoc! {r#"
-                      *"--frozen-lockfile"*)
-                        grep -q 'foo@1.1.0' pnpm-workspace.yaml || exit 1
-                        exit 0 ;;
-                      *" update "*|*"install"*)
-                        cp settled.yaml pnpm-lock.yaml; exit 0 ;;
-                "#},
-            effective_exclusions,
-        )?;
+        Ok(lock)
+    }
 
-        // The planner can admit a two-day-old security fix through its shorter window.
-        // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
-        // The fixed January clock keeps the pin young even when this test runs months later.
-        let cache = tempfile::tempdir()?;
-        let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
+    /// Writes a native config with a seven-day window and `rules`, returning its text.
+    fn write_native_rules(root: &Utf8Path, rules: &[&str]) -> eyre::Result<String> {
+        let rules = rules
+            .iter()
+            .map(|rule| Ok(format!("  - {}\n", serde_json::to_string(rule)?)))
+            .collect::<eyre::Result<String>>()?;
+        let native =
+            format!("packages: []\nminimumReleaseAge: 10080\nminimumReleaseAgeExclude:\n{rules}");
+        std::fs::write(root.join("pnpm-workspace.yaml"), &native)?;
+        Ok(native)
+    }
+
+    /// A pnpm tool driving `script` offline, whose registry cache publishes `foo@1.1.0` two days
+    /// before `now`.
+    fn young_pin_tool(
+        cache: &std::path::Path,
+        script: &Utf8Path,
+        now: jiff::Timestamp,
+    ) -> eyre::Result<NpmTool<Pnpm>> {
         let published = now.checked_sub(jiff::SignedDuration::from_hours(48))?;
         cooldown_registry::cache::write_entry(
-            cache.path(),
+            cache,
             &cooldown_registry::CacheEntry {
                 url: "https://registry.npmjs.org/foo".to_string(),
                 fetched_at: now.to_string(),
@@ -5559,90 +5509,51 @@ mod whole_graph_tests {
             },
         )?;
         let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
-            cache.path(),
+            cache,
             cooldown_registry::HttpOptions {
                 offline: true,
                 ..cooldown_registry::HttpOptions::default()
             },
         )?);
         tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
-        let mut target = change("foo", "1.0.0", "1.1.0", &[("app", ".")]);
-        target.direct = direct;
-        if !direct {
-            target.members.clear();
-        }
-        let plan = Plan {
-            changes: vec![target],
-            evaluated_at: Some(now),
-            ..Plan::default()
-        };
-        let project = project(&root);
-        let manifest_before = read(&root, "package.json")?;
-        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-        let report = tool.apply(&mutation).await?;
-        assert_eq!(applied_names(&report), vec!["foo"], "direct={direct}");
-        let native = read(&root, "pnpm-workspace.yaml")?;
-        assert!(native.contains("foo@1.1.0"), "direct={direct}: {native}");
-        assert!(native.contains("@corp/*"), "{native}");
-        assert!(!native.contains("foo@0.9.0"), "{native}");
-        assert!(!native.contains("overrides:"), "{native}");
-        assert_eq!(
-            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
-                .exclusions
-                .into_vec(),
-            vec!["@corp/*", "foo@1.1.0"]
-        );
-        for exclusion in effective_exclusions {
-            assert!(
-                read(&root, "legs.log")?.contains(exclusion),
-                "effective config should remain available to repair CLI arguments"
-            );
-        }
-        if direct {
-            // The joint update exempts the young pin itself, beside the effective configured
-            // entries its command-line list replaces, so pnpm's strict gate never asks for an
-            // approval that `--no-save` cannot record.
-            let legs = read(&root, "legs.log")?;
-            let update = legs
-                .lines()
-                .find(|leg| leg.contains(" update "))
-                .expect("the direct pin takes the joint update");
-            let mut expected: Vec<String> = effective_exclusions
-                .iter()
-                .map(|exclusion| format!("--config.minimumReleaseAgeExclude={exclusion}"))
-                .collect();
-            expected.push("--config.minimumReleaseAgeExclude=foo@1.1.0".to_string());
-            for flag in &expected {
-                assert!(
-                    update.contains(flag.as_str()),
-                    "{flag} missing from {update}"
-                );
-            }
-            let pin_flags = update
-                .matches("--config.minimumReleaseAgeExclude=foo@1.1.0")
-                .count();
-            assert_eq!(
-                pin_flags,
-                if effective_exclusions.is_empty() {
-                    2
-                } else {
-                    1
-                },
-                "a lone exclusion is repeated so pnpm reads a list: {update}"
-            );
-        }
-        assert_eq!(
-            tool.verify_lock_current(&project).await?.status,
-            cooldown_core::LockStatus::Current,
-            "the persisted exception must prevent stale_lock"
-        );
+        Ok(tool)
+    }
 
-        // Candidate rejection uses the same journal after the native write, so the exact
-        // allowance must disappear together with the rejected lock.
-        mutation.journal().restore()?;
-        assert_eq!(read(&root, "package.json")?, manifest_before);
-        assert_eq!(read(&root, "pnpm-workspace.yaml")?, native_before);
-        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+    /// The joint update exempts the young pin itself, beside the effective configured entries its
+    /// command-line list replaces, so pnpm's strict gate never asks for an approval that
+    /// `--no-save` cannot record.
+    fn assert_joint_update_exempts_the_pin(
+        root: &Utf8Path,
+        effective_exclusions: &[&str],
+    ) -> eyre::Result<()> {
+        let legs = read(root, "legs.log")?;
+        let update = legs
+            .lines()
+            .find(|leg| leg.contains(" update "))
+            .expect("the direct pin takes the joint update");
+        let mut expected: Vec<String> = effective_exclusions
+            .iter()
+            .map(|exclusion| format!("--config.minimumReleaseAgeExclude={exclusion}"))
+            .collect();
+        expected.push("--config.minimumReleaseAgeExclude=foo@1.1.0".to_string());
+        for flag in &expected {
+            assert!(
+                update.contains(flag.as_str()),
+                "{flag} missing from {update}"
+            );
+        }
+        let pin_flags = update
+            .matches("--config.minimumReleaseAgeExclude=foo@1.1.0")
+            .count();
+        assert_eq!(
+            pin_flags,
+            if effective_exclusions.is_empty() {
+                2
+            } else {
+                1
+            },
+            "a lone exclusion is repeated so pnpm reads a list: {update}"
+        );
         Ok(())
     }
 

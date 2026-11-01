@@ -212,6 +212,73 @@ fn assert_shorter_package_window_persists_exact_native_exclusion(
     Ok(())
 }
 
+/// Persisting an admitted young pin keeps a hand-ordered native exclusion list in pnpm's order:
+/// the pin joins its package's first rule in place, and the rules after it keep their places, so
+/// pnpm's first-match evaluation grants exactly what it did before plus the admitted version.
+#[test]
+fn upgrade_persists_an_admission_into_the_packages_first_native_rule() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-pnpm-ordered-exclusions-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": { "lodash": "^4.17.20" }
+            }
+        "#},
+    );
+    fixture.write("pnpm-workspace.yaml", "packages: []\n");
+    seed_lock(&fixture, "2020-09-01T00:00:00Z");
+
+    let native_minutes = minimum_release_age_minutes("2020-09-01T00:00:00Z");
+    let package_minutes = minimum_release_age_minutes("2021-03-01T00:00:00Z");
+    fixture.write(
+        "pnpm-workspace.yaml",
+        &indoc::formatdoc! {r#"
+            packages: []
+            minimumReleaseAge: {native_minutes}
+            minimumReleaseAgeExclude:
+              - "lodash@4.17.19"
+              - "@types/*"
+        "#},
+    );
+    fixture.write(
+        "cooldown.toml",
+        &indoc::formatdoc! {r#"
+            min-age = "{native_minutes}m"
+
+            [package.lodash]
+            min-age = "{package_minutes}m"
+        "#},
+    );
+
+    let upgraded =
+        fixture.cooldown_json_traced("adopt lodash inside the native window", &["upgrade"])?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert_eq!(upgraded.summary_applied(), 1, "{upgraded:#?}");
+    let native = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml"))?;
+    assert!(
+        native.contains("minimumReleaseAgeExclude:\n  - \"lodash@4.17.21\"\n  - \"@types/*\"\n"),
+        "{native}"
+    );
+
+    // pnpm itself, with no cooldown arguments, accepts the adopted lock under the persisted rules.
+    let lock = fixture.read_bytes("pnpm-lock.yaml");
+    fixture
+        .run_tool_traced(
+            "verify native policy accepts the adopted lock",
+            "pnpm",
+            &["install", "--frozen-lockfile", "--lockfile-only"],
+            &[],
+        )?
+        .require_success()?;
+    assert_eq!(lock, fixture.read_bytes("pnpm-lock.yaml"));
+    Ok(())
+}
+
 fn assert_pnpm_lock_current(report: &support::Envelope) {
     assert_eq!(
         report.lock_status(),

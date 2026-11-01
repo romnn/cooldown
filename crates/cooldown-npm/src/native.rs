@@ -263,7 +263,13 @@ pub(crate) fn set_yaml_block_list(
         Vec::new()
     } else {
         std::iter::once(format!("{key}:"))
-            .chain(items.iter().map(|item| format!("  - \"{item}\"")))
+            .chain(
+                items
+                    .iter()
+                    .map(|item| serde_json::to_string(item).map(|item| format!("  - {item}")))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| CoreError::Serialization(error.to_string()))?,
+            )
             .collect()
     };
 
