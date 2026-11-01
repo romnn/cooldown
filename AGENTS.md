@@ -178,8 +178,8 @@ CI runs on Windows too, so path handling must not assume a separator:
 - Fix clippy findings for real rather than silencing them. `#[allow(...)]` is a
   last resort and must carry a `reason = "…"`.
 - `task lint:fc` (see [Task runner](#task-runner)) is the gate — clippy across
-  every feature combination plus the ast-grep rules in `rules/`. Run the task as
-  written; do not substitute a hand-rolled `cargo clippy`.
+  every feature combination plus the ast-grep rules in `.ast-grep/rules/`. Run
+  the task as written; do not substitute a hand-rolled `cargo clippy`.
 - `unwrap`/`expect`/`panic!`/indexing are denied in production code and allowed
   only in tests (`clippy.toml`), reinforcing the error rule above.
 
