@@ -586,9 +586,9 @@ fn normalize_severity(entry: &OsvSeverity) -> AdvisorySeverity {
     match entry.kind.as_str() {
         "CVSS_V3" => entry
             .score
-            .parse::<cvss::v3::Base>()
+            .parse::<cvss::v3::Vector>()
             .ok()
-            .map(|base| qualitative(base.severity()))
+            .map(|vector| qualitative(vector.severity()))
             .unwrap_or(AdvisorySeverity::Unknown),
         "CVSS_V4" => entry
             .score
