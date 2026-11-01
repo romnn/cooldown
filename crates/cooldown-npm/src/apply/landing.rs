@@ -112,18 +112,21 @@ impl CandidateLanding {
 pub(crate) enum LandingPlan {
     /// Land the candidate through this transaction.
     Land(CandidateLanding),
-    /// The candidate is not eligible, and nothing was written.
-    NotEligible {
-        /// Why, when there is more to say than that no manifest declares the dependency.
-        detail: Option<String>,
+    /// No manifest declares the dependency, so nothing may be written for it.
+    NotEligible,
+    /// An exact install-field pin excludes the target ([`holds_exact_pins`]), and nothing was
+    /// written.
+    PinHeld {
+        /// The row naming the pin and the authority that would rewrite it.
+        detail: String,
     },
 }
 
 /// Plans the manifest authorization and resolver command for one candidate.
 ///
 /// A candidate no manifest declares is not eligible, so adding a root dependency is not authorized.
-/// Neither is one whose declaring manifests hold an exact install-field pin excluding the target,
-/// unless `mode` or `rewrite_pins` authorizes rewriting it ([`holds_exact_pins`]).
+/// One whose declaring manifests hold an exact install-field pin excluding the target is held on
+/// the pin, unless `mode` or `rewrite_pins` authorizes rewriting it ([`holds_exact_pins`]).
 /// Eligibility depends on declarations rather than the files widening happened to modify.
 /// A published-contract-only declaration deliberately has an empty write set but can still
 /// authorize an exact lock move.
@@ -146,8 +149,8 @@ pub(crate) fn candidate_landing<L: NodeLock>(
         )
         .map_err(|unreadable| unreadable.error)?
     {
-        return Ok(LandingPlan::NotEligible {
-            detail: Some(exact_pin_hold_detail(&pin, change)),
+        return Ok(LandingPlan::PinHeld {
+            detail: exact_pin_hold_detail(&pin, change),
         });
     }
     if let Some(args) = lockonly_command::<L>(project, change, mode)? {
@@ -159,7 +162,7 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     let declarations =
         manifest::declarations(&project.root, &change.members, &change.package.name)?;
     if declarations.absent() {
-        return Ok(LandingPlan::NotEligible { detail: None });
+        return Ok(LandingPlan::NotEligible);
     }
     let preserving_pin = preserving_pin::<L>(project, change, declarations.install_workspaces());
     // Without an exact preserving pin, shifting even an in-range declaration is the only way to
@@ -1117,10 +1120,10 @@ mod tests {
     }
 
     /// npm, yarn, and bun hold a move off an exact pin in a second install field instead of
-    /// rewriting it, with a row naming the pin, its field, and its manifest, and leave the manifest
-    /// byte-identical.
+    /// rewriting it, with a pin hold naming the pin, its field, and its manifest, and leave the
+    /// manifest byte-identical.
     #[test]
-    fn a_hidden_exact_pin_is_not_eligible_for_npm_yarn_and_bun() -> eyre::Result<()> {
+    fn a_hidden_exact_pin_holds_npm_yarn_and_bun() -> eyre::Result<()> {
         fn assert_held<L: NodeLock>() -> eyre::Result<()> {
             let DeclaredProject {
                 guard: _guard,
@@ -1129,18 +1132,16 @@ mod tests {
             let before = std::fs::read_to_string(&project.manifest)?;
             let upgrade = change("nanoid", "3.1.0", "3.3.0");
 
-            let LandingPlan::NotEligible { detail } =
+            let LandingPlan::PinHeld { detail } =
                 candidate_landing::<L>(&project, &upgrade, RewriteMode::Auto, false)?
             else {
                 eyre::bail!("{}: the hidden pin was rewritten", L::ID.as_str())
             };
 
             assert_eq!(
-                detail.as_deref(),
-                Some(
-                    "the exact pin 3.1.0 in devDependencies of package.json excludes 3.3.0; \
-                     pass --rewrite to rewrite it, or edit the pin"
-                ),
+                detail,
+                "the exact pin 3.1.0 in devDependencies of package.json excludes 3.3.0; \
+                 pass --rewrite to rewrite it, or edit the pin",
                 "{}",
                 L::ID.as_str()
             );
@@ -1181,10 +1182,7 @@ mod tests {
 
         // A downgrade without the permission names `fix --downgrade-pinned`, never `--rewrite`.
         let (plan, manifest) = landing_of("3.3.0", &downgrade, RewriteMode::Auto, false)?;
-        let LandingPlan::NotEligible {
-            detail: Some(detail),
-        } = plan
-        else {
+        let LandingPlan::PinHeld { detail } = plan else {
             eyre::bail!("the downgrade rewrote the pin without permission")
         };
         assert!(detail.contains("the exact pin 3.3.0"), "{detail}");
@@ -1210,7 +1208,7 @@ mod tests {
 
         // The permission is for downgrades only.
         let (plan, _) = landing_of("3.1.0", &upgrade, RewriteMode::Auto, true)?;
-        assert!(matches!(plan, LandingPlan::NotEligible { .. }));
+        assert!(matches!(plan, LandingPlan::PinHeld { .. }));
 
         // A pin already at the target lands without any authority.
         let (plan, manifest) = landing_of("3.3.0", &upgrade, RewriteMode::Auto, false)?;

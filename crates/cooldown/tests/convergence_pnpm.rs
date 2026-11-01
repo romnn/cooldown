@@ -1734,8 +1734,7 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
     assert!(held.ok(), "{held:#?}");
     assert_eq!(held.summary_applied(), 0, "{held:#?}");
     assert!(
-        held.skipped_reasons_for("chalk")
-            .contains("multi_version_held"),
+        held.skipped_reasons_for("chalk").contains("pin_held"),
         "{held:#?}"
     );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
@@ -1775,7 +1774,8 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
 const HIDDEN_PIN_FIX_FREEZE: &str = "2021-06-01T00:00:00Z";
 
 /// A plain `fix` holds a downgrade off a too-fresh exact pin in `devDependencies`, naming
-/// `--downgrade-pinned`, which then rewrites the pin and lands the downgrade.
+/// `--downgrade-pinned`, and fails under `--strict`; `--downgrade-pinned` then rewrites the pin,
+/// lands the downgrade, and passes.
 #[test]
 fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     skip_if_missing!("pnpm");
@@ -1787,8 +1787,14 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
         Some("4.1.2")
     );
 
-    let held = fixture.cooldown_json(&["fix", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    // The held downgrade leaves the violation in place, so a strict `fix` fails.
+    let held = fixture.cooldown_json(&["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    assert!(!held.ok(), "{held:#?}");
     assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
     assert!(
         detail.contains("the exact pin 4.1.2 excludes 4.1.1"),
@@ -1801,6 +1807,7 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
 
     let fixed = fixture.cooldown_json(&[
         "fix",
+        "--strict",
         "--downgrade-pinned",
         "--freeze",
         HIDDEN_PIN_FIX_FREEZE,

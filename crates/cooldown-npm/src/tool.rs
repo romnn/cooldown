@@ -1574,12 +1574,21 @@ impl<L: NodeLock> NpmTool<L> {
             let landing =
                 match candidate_landing::<L>(project, change, plan.rewrite, plan.rewrite_pins)? {
                     LandingPlan::Land(landing) => landing,
-                    LandingPlan::NotEligible { detail } => {
+                    LandingPlan::NotEligible => {
                         report.skipped.push(Skipped {
                             change: change.clone(),
                             reason: SkipReason::NotEligible,
                             offending: Some(change.package.clone()),
-                            detail,
+                            detail: None,
+                        });
+                        continue;
+                    }
+                    LandingPlan::PinHeld { detail } => {
+                        report.skipped.push(Skipped {
+                            change: change.clone(),
+                            reason: SkipReason::PinHeld,
+                            offending: Some(change.package.clone()),
+                            detail: Some(detail),
                         });
                         continue;
                     }
@@ -2573,8 +2582,11 @@ fn catalog_managed_hold(change: &Change) -> Skipped {
 /// The row ends with `--rewrite`, which widens the ranges, except for a range whose floor sits
 /// above the target, which no widen to that target fixes, and an unreadable manifest, which no
 /// widen can rewrite.
-/// An exact pin holding a downgrade ends with `fix --downgrade-pinned` instead, the authority that
-/// rewrites a pin downward.
+/// An exact pin holds as [`SkipReason::PinHeld`], which unlike a range split depends on the
+/// target.
+/// Holding a downgrade, a manifest pin the lock does not show ends with `fix --downgrade-pinned`
+/// instead, the authority that rewrites it; a pin beside another importer's range, which that
+/// authority does not release, ends with editing the pin.
 fn multi_version_hold(
     change: &Change,
     after_members: &MemberIndex,
@@ -2598,13 +2610,14 @@ fn multi_version_hold(
     // Should the retained plan ever show a single target for such a name, the list is left out
     // rather than shortened to a misleading one.
     let several_targets = targets.len() > 1 || plan.rewrite == RewriteMode::Always;
-    let (reason, action) = if several_targets {
+    let (skip_reason, reason, action) = if several_targets {
         let listed = if targets.len() > 1 {
             format!(" ({})", targets.into_iter().collect::<Vec<_>>().join(", "))
         } else {
             String::new()
         };
         (
+            SkipReason::MultiVersionHeld,
             format!("planned at several targets{listed}, which one joint pin cannot land"),
             "admit one line for every importer (--major) before --rewrite can converge it"
                 .to_string(),
@@ -2620,28 +2633,37 @@ fn multi_version_hold(
             format!("pass --rewrite to widen every declaring range and converge on {target}");
         let (reason, rewrite_converges) =
             split_hold_reason(hold.as_ref(), after_members, name, target);
-        // `--rewrite` is an `upgrade` flag; a downgrade rewrites an exact pin only under `fix`'s
-        // own authority.
-        let pin_downgrade = change.downgrade
-            && matches!(
-                hold,
-                Some(SplitHold::Declaration {
-                    hold: version::CeilingHold::ExactPin,
-                    ..
-                })
-            );
-        let action = if pin_downgrade {
+        let lock_pin = matches!(
+            hold,
+            Some(SplitHold::Declaration {
+                hold: version::CeilingHold::ExactPin,
+                ..
+            })
+        );
+        let manifest_pin = matches!(hold, Some(SplitHold::ManifestPin { .. }));
+        // `--rewrite` is an `upgrade` flag, so a downgrade names `fix`'s own authority, and only
+        // where it releases the hold: a pin beside another importer's range stays held under it.
+        let action = if change.downgrade && manifest_pin {
             "rerun fix with --downgrade-pinned to rewrite the pin, or edit it".to_string()
+        } else if change.downgrade && lock_pin {
+            "the importers declare it under several ranges, which --downgrade-pinned does not \
+             reconcile; edit the pin to move them together"
+                .to_string()
         } else if rewrite_converges {
             rewrite
         } else {
             String::new()
         };
-        (reason, action)
+        let skip_reason = if lock_pin || manifest_pin {
+            SkipReason::PinHeld
+        } else {
+            SkipReason::MultiVersionHeld
+        };
+        (skip_reason, reason, action)
     };
     Skipped {
         change: change.clone(),
-        reason: SkipReason::MultiVersionHeld,
+        reason: skip_reason,
         offending: None,
         detail: Some(if action.is_empty() {
             format!("{lines} and {reason}; each importer is kept on its own line")
@@ -2884,6 +2906,9 @@ fn split_hold_reason(
                 false,
             );
         }
+        Some(SplitHold::ManifestPin { range }) => {
+            format!("the exact pin {range} excludes {target}")
+        }
         Some(SplitHold::Declaration { range, hold }) => match hold {
             CeilingHold::ExactPin => format!("the exact pin {range} excludes {target}"),
             CeilingHold::NotPlain => {
@@ -3034,12 +3059,7 @@ fn manifest_pin_hold(root: &Utf8Path, change: &Change) -> Option<SplitHold> {
         &change.package.name,
         change.to.as_str(),
     ) {
-        Ok(pin) => pin.map(
-            |manifest::ExcludingPin { range, .. }| SplitHold::Declaration {
-                range,
-                hold: version::CeilingHold::ExactPin,
-            },
-        ),
+        Ok(pin) => pin.map(|manifest::ExcludingPin { range, .. }| SplitHold::ManifestPin { range }),
         Err(manifest::UnreadableManifest { manifest, .. }) => {
             Some(SplitHold::ManifestUnavailable { manifest })
         }
@@ -5122,7 +5142,7 @@ packages:
         Ok(())
     }
 
-    /// npm holds a candidate off its exact `devDependencies` pin as not eligible, with the pin named,
+    /// npm holds a candidate on its exact `devDependencies` pin, with the pin named,
     /// while the unrelated sibling in the same batch lands, and no npm command targets the held
     /// candidate.
     #[cfg(unix)]
@@ -5189,7 +5209,7 @@ packages:
             eyre::bail!("one held candidate: {:?}", report.skipped)
         };
         assert_eq!(skip.change.package.name, "dom");
-        assert_eq!(skip.reason, SkipReason::NotEligible);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         assert_eq!(
             skip.detail.as_deref(),
             Some(
@@ -6814,7 +6834,7 @@ mod whole_graph_tests {
         let [skip] = report.skipped.as_slice() else {
             panic!("{:?}", report.skipped);
         };
-        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         let detail = skip.detail.as_deref().expect("detail");
         assert!(
             detail.contains("the exact pin 20.14.5 excludes 21.0.4"),
@@ -6889,7 +6909,7 @@ mod whole_graph_tests {
         let [skip] = report.skipped.as_slice() else {
             panic!("{:?}", report.skipped);
         };
-        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         let detail = skip.detail.as_deref().expect("detail");
         assert!(
             detail.contains("the exact pin 20.14.5 excludes 20.14.6"),
@@ -6941,7 +6961,7 @@ mod whole_graph_tests {
             panic!("{:?}", report.skipped);
         };
         assert_eq!(skip.change.package.name, "happy-dom");
-        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         // The one joint update targets the sibling alone.
         let legs = legs(&root);
         let [update] = legs.as_slice() else {
@@ -6993,7 +7013,7 @@ mod whole_graph_tests {
         let [skip] = held.skipped.as_slice() else {
             panic!("{:?}", held.skipped);
         };
-        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         let detail = skip.detail.as_deref().expect("detail");
         assert!(
             detail.contains("the exact pin 20.14.6 excludes 20.14.5"),
@@ -7018,6 +7038,68 @@ mod whole_graph_tests {
             "{after}"
         );
         assert!(after.contains(r#""happy-dom": "^20.11.1""#), "{after}");
+        Ok(())
+    }
+
+    /// A pin the lock shows beside another importer's range splits the workspace, which the
+    /// permission to rewrite pins does not reconcile: the downgrade stays held even with it, and
+    /// the row asks for an edit instead of recommending `--downgrade-pinned`.
+    #[tokio::test]
+    async fn a_pin_split_across_importers_holds_a_downgrade_despite_the_permission()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "apps/pinned",
+                    name: "pinned",
+                    deps: vec![("happy-dom", "20.14.6", "20.14.6")],
+                },
+                Importer {
+                    path: "apps/caret",
+                    name: "caret",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.6")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let pinned = read(&root, "apps/pinned/package.json")?;
+        let tool = tool_with(&fake_pnpm(&root, "")?)?;
+        let plan = Plan {
+            changes: vec![Change {
+                downgrade: true,
+                ..change(
+                    "happy-dom",
+                    "20.14.6",
+                    "20.14.5",
+                    &[("pinned", "apps/pinned"), ("caret", "apps/caret")],
+                )
+            }],
+            rewrite_pins: true,
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("the exact pin 20.14.6 excludes 20.14.5"),
+            "{detail}"
+        );
+        assert!(detail.contains("edit the pin"), "{detail}");
+        assert!(
+            !detail.contains("rerun fix with --downgrade-pinned"),
+            "the permission was granted and did not release it: {detail}"
+        );
+        assert!(!detail.contains("--rewrite"), "{detail}");
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "apps/pinned/package.json")?, pinned);
         Ok(())
     }
 
@@ -7164,9 +7246,8 @@ mod whole_graph_tests {
         let held = held_splits::<Pnpm>(Some(&root), Some(&lock), &both);
         assert_eq!(
             held.reasons.get("happy-dom"),
-            Some(&SplitHold::Declaration {
+            Some(&SplitHold::ManifestPin {
                 range: "20.14.5".to_string(),
-                hold: version::CeilingHold::ExactPin,
             })
         );
         Ok(())

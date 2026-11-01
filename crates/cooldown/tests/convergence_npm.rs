@@ -1264,7 +1264,7 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
     let held = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
     // The held-back chalk 5 major is reported beside it.
     assert!(
-        held.skipped_reasons_for("chalk").contains("not_eligible"),
+        held.skipped_reasons_for("chalk").contains("pin_held"),
         "{held:#?}"
     );
     assert_eq!(held.summary_applied(), 0, "{held:#?}");
@@ -1288,7 +1288,8 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
 }
 
 /// A plain `fix` holds a downgrade off a too-fresh exact pin in `devDependencies`, naming
-/// `--downgrade-pinned`, which then rewrites the pin and lands the downgrade.
+/// `--downgrade-pinned`, and fails under `--strict`; `--downgrade-pinned` then rewrites the pin,
+/// lands the downgrade, and passes.
 #[test]
 fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     skip_if_missing!("npm");
@@ -1296,8 +1297,14 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     let manifest_before = fixture.read_bytes("package.json");
     let lock_before = fixture.read_bytes("package-lock.json");
 
-    let held = fixture.cooldown_json(&["fix", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    // The held downgrade leaves the violation in place, so a strict `fix` fails.
+    let held = fixture.cooldown_json(&["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    assert!(!held.ok(), "{held:#?}");
     assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
     assert!(
         detail.contains("the exact pin 4.1.2 in devDependencies of package.json excludes 4.1.1"),
@@ -1310,6 +1317,7 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
 
     let fixed = fixture.cooldown_json(&[
         "fix",
+        "--strict",
         "--downgrade-pinned",
         "--freeze",
         HIDDEN_PIN_FIX_FREEZE,

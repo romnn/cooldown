@@ -1131,6 +1131,16 @@ skip_reasons! {
     /// Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
     /// upgrade, so it never fails a `--strict` run.
     MultiVersionHeld = "multi_version_held",
+    /// A declaring manifest pins the dependency exactly, in some install field, to a version that
+    /// excludes the target, and nothing authorized rewriting the pin.
+    /// The lock need not show the pin: a pin in a second install field beside a range, or in one
+    /// workspace member beside another member's range, leaves the dependency movable as a whole.
+    /// Unlike [`NotEligible`](Self::NotEligible) it depends on the target: another target the
+    /// pin admits can still land.
+    /// A forward move held this way is the author's deliberate choice and never fails a
+    /// `--strict` `upgrade`; a downgrade held this way leaves a cooldown violation, so it fails a
+    /// `--strict` `fix`.
+    PinHeld = "pin_held",
 }
 
 impl SkipReason {
@@ -1176,6 +1186,7 @@ impl SkipReason {
             SkipReason::MultiVersionHeld => {
                 "declared at multiple versions across the workspace; kept on its own line"
             }
+            SkipReason::PinHeld => "an exact pin in a declaring manifest excludes this target",
         }
     }
 }

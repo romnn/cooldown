@@ -833,6 +833,59 @@ async fn a_not_eligible_major_tries_no_current_line_target() -> eyre::Result<()>
     Ok(())
 }
 
+/// An exact manifest pin that excludes the major can still admit the in-line target, so unlike a
+/// not-eligible hold the major's current-line target is tried and lands beside the pin-held row,
+/// and the forward pin hold does not fail `--strict`.
+#[tokio::test]
+async fn a_pin_held_major_lands_its_current_line_target() -> eyre::Result<()> {
+    let detail = "the exact pin 1.1.0 in devDependencies of apps/pinned/package.json excludes \
+                  2.0.0; pass --rewrite to rewrite it, or edit the pin";
+    let fixture = fixture(
+        dom_and_safe(
+            TargetFallback::CurrentLine,
+            Script {
+                holds: vec![Hold {
+                    target: "dom@2.0.0",
+                    reason: SkipReason::PinHeld,
+                    offending: None,
+                    detail: Some(detail),
+                }],
+                ..Script::default()
+            },
+            true,
+        ),
+        &[("dom", "1.0.0")],
+    )?;
+
+    let outcome = fixture
+        .workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..major()
+        })
+        .await;
+
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            applied("dom", "1.0.0", "1.1.0"),
+            skipped("dom", "1.0.0", "2.0.0", SkipReason::PinHeld, detail),
+        ])
+    );
+    // The refused major, then its in-line target, which the replay commits.
+    let trials = fixture.fake.trials();
+    assert!(
+        trials
+            .iter()
+            .skip(1)
+            .any(|trial| trial.iter().any(|target| target == "dom@1.1.0")),
+        "{trials:?}"
+    );
+    Ok(())
+}
+
 /// Under `--strict` a held major is judged by its own reason: a conservative split hold never
 /// fails the run, while a resolver rejection whose in-line target also fails still does.
 #[tokio::test]

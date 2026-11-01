@@ -58,7 +58,7 @@ This is safe by construction: the graph floor *is* a version every requirer alre
 `fix` is conservative — it reports, rather than forces, the cases where a downgrade would be wrong or impossible:
 
 - **A graph-pinned transitive.** If no lower version satisfies the dependency's requirers, it can't be rolled back on its own. `fix` reports it so you can address the dependency that forces the fresh pin, instead of breaking resolution.
-- **An exact pin.** A pinned violation is left in place with a warning, since a pin is a deliberate choice. Pass `--downgrade-pinned` to downgrade and rewrite it too. On the npm family this includes a pin in one install field beside a range in another (`"devDependencies": { "chalk": "4.1.2" }` beside `"dependencies": { "chalk": "^4.1.0" }`): the downgrade is held with a row naming the pin and `--downgrade-pinned`.
+- **An exact pin.** A pinned violation is left in place with a warning, since a pin is a deliberate choice. Pass `--downgrade-pinned` to downgrade and rewrite it too. On the npm family this includes a pin in one install field beside a range in another (`"devDependencies": { "chalk": "4.1.2" }` beside `"dependencies": { "chalk": "^4.1.0" }`): the downgrade is held as `pin_held`, with a row naming the pin and `--downgrade-pinned`, and fails `fix --strict`. On pnpm a pin beside another workspace member's range stays held even under `--downgrade-pinned`; edit the pin to move it.
 - **No matured fallback.** A violation with no older matured version to fall back to is reported — [`baseline`]({{< relref "other.md" >}}) it or wait — rather than downgraded to nothing.
 
 ## Locks the run stales itself
