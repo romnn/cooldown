@@ -2566,7 +2566,8 @@ fn catalog_managed_hold(change: &Change) -> Skipped {
 /// The reason recorded when the hold was decided (`split_holds`) wins, since only it saw the
 /// manifests; the post-resolve index judges a name without one.
 /// The row ends with `--rewrite`, which widens the ranges, except for a range whose floor sits
-/// above the target, which no widen to that target fixes.
+/// above the target, which no widen to that target fixes, and an unreadable manifest, which no
+/// widen can rewrite.
 fn multi_version_hold(
     change: &Change,
     after_members: &MemberIndex,
@@ -2996,9 +2997,15 @@ fn split_hold_reason(
             format!("the lock resolves none of its declarations, so {target} cannot be judged")
         }
         Some(SplitHold::NoRange) => format!("no plain range to judge against {target}"),
-        Some(SplitHold::ManifestUnavailable { manifest }) => format!(
-            "{manifest} could not be read to confirm that every declaration may widen to {target}"
-        ),
+        Some(SplitHold::ManifestUnavailable { manifest }) => {
+            return (
+                format!(
+                    "{manifest} could not be read to confirm that every declaration may widen to \
+                     {target}; restore or repair it"
+                ),
+                false,
+            );
+        }
         Some(SplitHold::Declaration { range, hold }) => match hold {
             CeilingHold::ExactPin => format!("the exact pin {range} excludes {target}"),
             CeilingHold::NotPlain => {
@@ -6684,6 +6691,11 @@ mod whole_graph_tests {
         assert!(
             detail.contains("apps/legacy/package.json could not be read"),
             "{detail}"
+        );
+        assert!(detail.contains("restore or repair it"), "{detail}");
+        assert!(
+            !detail.contains("--rewrite"),
+            "no widen rewrites a missing manifest: {detail}"
         );
         assert_eq!(legs(&root), [] as [String; 0]);
         Ok(())
