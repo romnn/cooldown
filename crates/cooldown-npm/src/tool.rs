@@ -2319,19 +2319,18 @@ impl<L: NodeLock> NpmTool<L> {
                 }
             }
         }
-        // Grant before pruning, so a version admitted now is never pruned as unlocked, and keep
-        // the native rules in order: pnpm lets the first rule naming a package decide.
-        let mut exclusions = crate::exclusions::configured_rules(native_age.exclusions);
-        for (name, versions) in &exact_versions {
-            crate::exclusions::set_exact_permission(
-                &mut exclusions,
-                name,
-                &BTreeSet::new(),
-                versions,
-            );
+        match crate::exclusions::persisted_rules(native_age.exclusions, &exact_versions, &locked) {
+            crate::exclusions::Persisted::Unchanged => {}
+            crate::exclusions::Persisted::Rules(exclusions) => {
+                set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, false)?;
+            }
+            crate::exclusions::Persisted::ScalarSetting => {
+                return Err(CoreError::Config(format!(
+                    "{path}: minimumReleaseAgeExclude is a single string; make it a list so \
+                     cooldown can record the release-age exemptions it admitted"
+                )));
+            }
         }
-        let exclusions = crate::exclusions::prune_unlocked(&exclusions, &locked);
-        set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, false)?;
         Ok(())
     }
 

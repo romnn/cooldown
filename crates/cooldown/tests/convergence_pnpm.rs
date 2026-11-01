@@ -213,8 +213,8 @@ fn assert_shorter_package_window_persists_exact_native_exclusion(
 }
 
 /// Persisting an admitted young pin keeps a hand-ordered native exclusion list in pnpm's order:
-/// the pin joins its package's first rule in place, and the rules after it keep their places, so
-/// pnpm's first-match evaluation grants exactly what it did before plus the admitted version.
+/// the pin joins its package's first rule in place, the stale version it held is pruned, and the
+/// rules after it keep their places, so no other package's exemption changes.
 #[test]
 fn upgrade_persists_an_admission_into_the_packages_first_native_rule() -> eyre::Result<()> {
     skip_if_missing!("pnpm", Ok(()));

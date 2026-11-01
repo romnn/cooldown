@@ -207,10 +207,11 @@ pub(crate) fn set_exact_permission(
             .collect::<Vec<_>>()
             .join("||")
     } else {
+        // Survivors keep their raw spelling: trimming could turn a member pnpm rejects into a
+        // valid one.
         join(
             surviving
                 .into_iter()
-                .map(str::trim)
                 .map(str::to_string)
                 .chain(added.into_iter().cloned()),
         )
@@ -251,8 +252,8 @@ pub(crate) fn grant_pins(pins: &[(String, String)], configured: Vec<String>) -> 
     exclusions
 }
 
-/// Drops the versions of literal exact rules that the lock no longer resolves, never widening
-/// what any package is exempt from.
+/// Drops the versions of literal exact rules that the lock no longer resolves, removing stale
+/// exemptions without widening any.
 ///
 /// Removing members from a rule that keeps at least one cannot expose a later rule, because pnpm
 /// stops at the first rule whose name matches.
@@ -260,7 +261,8 @@ pub(crate) fn grant_pins(pins: &[(String, String)], configured: Vec<String>) -> 
 /// shadowed by an earlier rule for its package, or no later rule matches its package.
 /// The last remaining rule is never deleted either, since an empty list removes the setting and
 /// exposes whatever exclusions pnpm inherits from user or global configuration.
-/// Negated, wildcard and versionless rules, and members pnpm would reject, are kept verbatim.
+/// Negated, wildcard and versionless rules, and members pnpm would reject, are kept verbatim, and
+/// surviving members keep their raw spelling.
 pub(crate) fn prune_unlocked(
     exclusions: &[String],
     locked: &HashMap<String, BTreeSet<String>>,
@@ -290,11 +292,7 @@ pub(crate) fn prune_unlocked(
         if surviving.len() == members.len() {
             kept.push(entry.clone());
         } else if !surviving.is_empty() {
-            kept.push(format!(
-                "{}@{}",
-                rule.name,
-                join(surviving.into_iter().map(str::trim))
-            ));
+            kept.push(format!("{}@{}", rule.name, join(surviving.into_iter())));
         } else {
             let shadowed = kept
                 .iter()
@@ -311,6 +309,47 @@ pub(crate) fn prune_unlocked(
         }
     }
     kept
+}
+
+/// What persisting admitted versions does to the native `minimumReleaseAgeExclude` setting.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Persisted {
+    /// The setting stays as written.
+    Unchanged,
+    /// The setting becomes these rules, which are never empty.
+    Rules(Vec<String>),
+    /// The setting is a scalar and versions must be granted.
+    /// pnpm may expand `${VAR}` in a scalar before reading it one pattern per character, which no
+    /// rewritten list reproduces, so the user has to make it a list.
+    ScalarSetting,
+}
+
+/// Grants the `granted` versions in the native rules, then prunes unlocked versions
+/// ([`set_exact_permission`], [`prune_unlocked`]), keeping the rules in pnpm's order.
+///
+/// Granting comes first, so a version admitted now is never pruned as unlocked.
+/// An empty result leaves the setting as written: writing an empty list removes the setting and
+/// would expose inherited exclusions an explicit empty one masked, and pruning never empties a
+/// non-empty list.
+pub(crate) fn persisted_rules(
+    native: ConfigStringList,
+    granted: &BTreeMap<String, BTreeSet<String>>,
+    locked: &HashMap<String, BTreeSet<String>>,
+) -> Persisted {
+    let mut rules = match native {
+        ConfigStringList::Many(rules) => rules,
+        ConfigStringList::One(_) if granted.is_empty() => return Persisted::Unchanged,
+        ConfigStringList::One(_) => return Persisted::ScalarSetting,
+    };
+    for (name, versions) in granted {
+        set_exact_permission(&mut rules, name, &BTreeSet::new(), versions);
+    }
+    let rules = prune_unlocked(&rules, locked);
+    if rules.is_empty() {
+        Persisted::Unchanged
+    } else {
+        Persisted::Rules(rules)
+    }
 }
 
 /// Whether `version` of `name` is exempt under `exclusions`, evaluated the way pnpm does.
@@ -444,7 +483,7 @@ mod tests {
             // A loose spelling of the withheld pin, build metadata included, is still withheld.
             (
                 &["foo@ v1.0.0+build || 1.1.0", "*"],
-                &["foo@1.1.0||2.0.0", "*"],
+                &["foo@ 1.1.0||2.0.0", "*"],
             ),
             // An all-version rule already exempts every version and cannot express the exception.
             (&["foo", "foo@3.0.0"], &["foo", "foo@3.0.0"]),
@@ -516,6 +555,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A member pnpm rejects keeps its exact bytes through a rebuild, so a configuration pnpm
+    /// refuses never becomes one it accepts.
+    #[test]
+    fn rebuilding_a_union_keeps_rejected_members_byte_for_byte() {
+        let nel = "foo@\u{85}1.0.0\u{85}||2.0.0";
+        let padded = format!("foo@1.0.0{}||2.0.0", " ".repeat(260));
+        for configured in [nel.to_string(), padded] {
+            let invalid = configured
+                .strip_suffix("||2.0.0")
+                .expect("the fixture ends with the valid member");
+            let mut withheld = vec![configured.clone(), "bar@1.0.0".to_string()];
+            set_exact_permission(
+                &mut withheld,
+                "foo",
+                &versions(&["2.0.0"]),
+                &versions(&["3.0.0"]),
+            );
+            assert_eq!(withheld[0], format!("{invalid}||3.0.0"));
+
+            let locked: HashMap<String, BTreeSet<String>> =
+                [("bar".to_string(), versions(&["1.0.0"]))].into();
+            let pruned = prune_unlocked(&[configured.clone(), "bar@1.0.0".to_string()], &locked);
+            assert_eq!(pruned[0], invalid);
+        }
+    }
+
+    #[test]
+    fn persisting_never_removes_the_setting_or_rewrites_a_scalar() {
+        let locked: HashMap<String, BTreeSet<String>> =
+            [("foo".to_string(), versions(&["2.0.0"]))].into();
+        let granted: BTreeMap<String, BTreeSet<String>> =
+            [("foo".to_string(), versions(&["2.0.0"]))].into();
+        let nothing = BTreeMap::new();
+        // An explicit empty list masks inherited exclusions and stays as written.
+        assert_eq!(
+            persisted_rules(ConfigStringList::Many(Vec::new()), &nothing, &locked),
+            Persisted::Unchanged
+        );
+        assert_eq!(
+            persisted_rules(ConfigStringList::Many(Vec::new()), &granted, &locked),
+            Persisted::Rules(strings(&["foo@2.0.0"]))
+        );
+        // A scalar is left alone unless something must be granted, which it cannot record.
+        for scalar in ["", "${COOLDOWN_EXCLUDES}"] {
+            assert_eq!(
+                persisted_rules(ConfigStringList::One(scalar.to_string()), &nothing, &locked),
+                Persisted::Unchanged
+            );
+            assert_eq!(
+                persisted_rules(ConfigStringList::One(scalar.to_string()), &granted, &locked),
+                Persisted::ScalarSetting
+            );
+        }
+        // Granting before pruning keeps the admitted version, and the stale one goes.
+        assert_eq!(
+            persisted_rules(
+                ConfigStringList::Many(strings(&["foo@1.0.0", "*"])),
+                &granted,
+                &locked
+            ),
+            Persisted::Rules(strings(&["foo@2.0.0", "*"]))
+        );
     }
 
     #[test]
