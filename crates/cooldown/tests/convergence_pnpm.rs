@@ -110,9 +110,30 @@ fn seed_lock(fixture: &Fixture, cutoff: &str) {
         .expect_success();
 }
 
+/// A package window shorter than the native one lands its younger target with pnpm's default
+/// `minimumReleaseAgeStrict`, which refuses any young version `--no-save` cannot record.
 #[test]
 fn upgrade_sync_persists_a_shorter_package_windows_exact_native_exclusion() -> eyre::Result<()> {
     skip_if_missing!("pnpm", Ok(()));
+    assert_shorter_package_window_persists_exact_native_exclusion(indoc::indoc! {"
+        packages: []
+    "})
+}
+
+/// The same landing with strictness relaxed, where pnpm admits a young version without approval.
+#[test]
+fn upgrade_sync_persists_a_shorter_package_windows_exact_native_exclusion_without_strictness()
+-> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    assert_shorter_package_window_persists_exact_native_exclusion(indoc::indoc! {"
+        packages: []
+        minimumReleaseAgeStrict: false
+    "})
+}
+
+fn assert_shorter_package_window_persists_exact_native_exclusion(
+    native_config: &str,
+) -> eyre::Result<()> {
     let fixture = Fixture::new().tag_independent();
     fixture.write(
         "package.json",
@@ -125,14 +146,7 @@ fn upgrade_sync_persists_a_shorter_package_windows_exact_native_exclusion() -> e
             }
         "#},
     );
-    // Avoid pnpm 11's interactive approval mode, which refuses any update using --no-save.
-    fixture.write(
-        "pnpm-workspace.yaml",
-        indoc::indoc! {"
-        packages: []
-        minimumReleaseAgeStrict: false
-    "},
-    );
+    fixture.write("pnpm-workspace.yaml", native_config);
     seed_lock(&fixture, "2020-09-01T00:00:00Z");
     assert_eq!(
         pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))

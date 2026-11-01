@@ -202,6 +202,10 @@ pub trait NodeLock: Send + Sync + 'static {
     /// by the caller's transitive-cooldown gate, exactly as for cargo/go (which have no global
     /// cutoff at all). `None` omits the command-line age setting.
     ///
+    /// `minimum_age_excludes` is the complete release-age exclusion list for this resolve.
+    /// It replaces the configured list, so it must carry the configured entries along with the
+    /// exact exemptions for pins the native gate would otherwise refuse.
+    ///
     /// `--no-save`/`--lockfile-only` keep `package.json` and `node_modules` untouched. Returns `None`
     /// for managers without a joint resolve or when there are no exact pins to apply.
     #[must_use]
@@ -209,6 +213,7 @@ pub trait NodeLock: Send + Sync + 'static {
         _pins: &[(String, String)],
         _filters: &[String],
         _window_minutes: Option<i64>,
+        _minimum_age_excludes: &[String],
     ) -> Option<Vec<String>> {
         None
     }
@@ -1464,6 +1469,7 @@ impl NodeLock for Pnpm {
         pins: &[(String, String)],
         filters: &[String],
         window_minutes: Option<i64>,
+        minimum_age_excludes: &[String],
     ) -> Option<Vec<String>> {
         // `pnpm update <name>@<target> …` pins each planned candidate to its EXACT per-package target
         // in one joint re-resolve, so a package whose stricter per-package window admits an older
@@ -1476,6 +1482,8 @@ impl NodeLock for Pnpm {
         // Filters restrict the command to the importers known to declare at least one planned pin. The
         // recursive fallback is reserved for graph-only changes with no declaring-member attribution.
         // A positive `minimumReleaseAge` stays as the transitive floor.
+        // The exclusions exempt pins the native gate would refuse: with pnpm's default strictness,
+        // a refused version needs an approval that `--no-save` cannot record.
         if pins.is_empty() {
             return None;
         }
@@ -1501,6 +1509,7 @@ impl NodeLock for Pnpm {
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
         }
+        push_minimum_age_excludes(&mut args, minimum_age_excludes);
         Some(args)
     }
 
@@ -1517,9 +1526,7 @@ impl NodeLock for Pnpm {
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
         }
-        for exclusion in minimum_age_excludes {
-            args.push(format!("--config.minimumReleaseAgeExclude={exclusion}"));
-        }
+        push_minimum_age_excludes(&mut args, minimum_age_excludes);
         Some(args)
     }
 
@@ -1552,6 +1559,18 @@ impl NodeLock for Pnpm {
 
     fn build_args(_before: Option<&str>) -> Vec<String> {
         vec!["install".into()]
+    }
+}
+
+/// Appends pnpm's release-age exclusion list as repeated `--config` flags.
+///
+/// pnpm builds a list only from a repeated `--config.<key>=` flag.
+/// A lone flag becomes a plain string, which pnpm reads as one pattern per character, so a single
+/// entry is passed twice.
+fn push_minimum_age_excludes(args: &mut Vec<String>, excludes: &[String]) {
+    let repeat = usize::from(excludes.len() == 1);
+    for exclusion in excludes.iter().chain(excludes.iter().take(repeat)) {
+        args.push(format!("--config.minimumReleaseAgeExclude={exclusion}"));
     }
 }
 
