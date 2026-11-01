@@ -3949,7 +3949,7 @@ mod tests {
 
         let facts = generated_facts(&project, &graph);
 
-        assert!(facts.members.is_empty());
+        assert_eq!(facts.members, []);
         let [hint] = facts.notices.as_slice() else {
             panic!("one hint: {:?}", facts.notices);
         };
@@ -3979,7 +3979,7 @@ mod tests {
 
         let facts = generated_facts(&project, &graph);
 
-        assert!(facts.members.is_empty());
+        assert_eq!(facts.members, []);
         assert!(facts.notices.is_empty(), "{:?}", facts.notices);
     }
 
@@ -4636,7 +4636,7 @@ mod tests {
         // duplicate collateral row.
         let landed = lock_with(&[("referencing", "0.46.10")]).locked_versions_by_source();
         let applied = [change("referencing", "0.46.5", "0.46.10", false)];
-        assert!(collateral_changes(&before, &landed, &applied).is_empty());
+        assert_eq!(collateral_changes(&before, &landed, &applied), []);
     }
 
     #[test]

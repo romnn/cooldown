@@ -312,10 +312,9 @@ mod tests {
             directory: _directory,
             manifest,
         } = write_manifest("[project]\nname = \"demo\"\ndependencies = [\"httpx>=0.27\"]\n");
-        assert!(
-            build_requires(&manifest)
-                .expect("build requires")
-                .is_empty()
+        assert_eq!(
+            build_requires(&manifest).expect("build requires"),
+            [] as [BuildRequire; 0]
         );
         assert!(
             build_require_names(&manifest)

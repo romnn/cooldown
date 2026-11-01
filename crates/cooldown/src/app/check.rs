@@ -166,13 +166,13 @@ impl Workspace {
         opts: &RunOpts,
         window: &cooldown_core::WindowSpec,
         warnings: &mut Vec<Diagnostic>,
-    ) -> Result<Vec<cooldown_core::AdmittedVersion>, Diagnostic> {
+    ) -> Result<Vec<cooldown_core::AdmittedVersion>, Box<Diagnostic>> {
         let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
         let Some(read) = self.read_project_ctx(pctx, opts, progress) else {
-            return Err(Diagnostic::new(
+            return Err(Box::new(Diagnostic::new(
                 DiagnosticKind::Config,
                 "missing sync read adapter",
-            ));
+            )));
         };
         let mut runner = CheckRunner::new(self, opts);
         // Native policy serves every locked registry version even when the command hides transitives.
@@ -207,7 +207,7 @@ impl Workspace {
             .or_else(|| runner.acc.items.into_iter().find_map(|item| item.error))
             .or(advisory_error)
         {
-            return Err(error);
+            return Err(Box::new(error));
         }
         let mut admitted = runner.acc.admitted_versions;
         admitted.sort_by(|left, right| {

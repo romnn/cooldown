@@ -391,7 +391,10 @@ mod tests {
             minimum_age_exclusions(&globs, &versions)?,
             ["@scope/*", "z-*", "a@1.2.2||2.0.1", "b@3.0.0"]
         );
-        assert!(minimum_age_exclusions(&[], &BTreeMap::new())?.is_empty());
+        assert_eq!(
+            minimum_age_exclusions(&[], &BTreeMap::new())?,
+            [] as [String; 0]
+        );
         Ok(())
     }
 

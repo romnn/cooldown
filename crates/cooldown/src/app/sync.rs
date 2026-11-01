@@ -327,7 +327,7 @@ impl Workspace {
                     Ok(admitted) => Some(admitted),
                     Err(warning) => {
                         if !warnings.contains(&warning) {
-                            warnings.push(warning);
+                            warnings.push(*warning);
                         }
                         None
                     }
@@ -874,7 +874,7 @@ mod tests {
         let outcome = ws.sync(&RunOpts::default()).await;
         assert_eq!(outcome.summary.errors, 0);
         assert_eq!(outcome.summary.written, 1);
-        assert!(!outcome.warnings.is_empty());
+        assert_ne!(outcome.warnings, []);
         assert!(outcome.items.iter().all(|item| item.error.is_none()));
         assert_eq!(outcome.exit, Exit::Ok);
         assert_eq!(std::fs::read_to_string(path)?, "retained@1.2.3");

@@ -151,7 +151,7 @@ mod tests {
     fn an_exact_requirement_keeps_the_pinned_binding() {
         let lock = view(CHURNED_LOCK);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", "=0.8.2")]);
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
     }
 
     /// A binding already at the canonical version is a fixed point.
@@ -163,7 +163,7 @@ mod tests {
         );
         let lock = view(&healed);
         let graph = graph_with(&[("diesel", "2.3.11", "uuid", ">=0.7.0, <2.0.0")]);
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
     }
 
     /// When several active requirements of one dependent resolve to the same concrete edge, the
@@ -176,7 +176,7 @@ mod tests {
             ("diesel", "2.3.11", "uuid", "^0.8"),
         ]);
         // 1.24.0 fails `^0.8`, so 0.8.2 is canonical and the binding stays.
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
     }
 
     /// No declared requirement known (metadata gap): no license to rewrite.
@@ -184,7 +184,7 @@ mod tests {
     fn an_unknown_requirement_blocks_rebinding() {
         let lock = view(CHURNED_LOCK);
         let graph = graph_with(&[]);
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
     }
 
     /// Cooldown's conservative MSRV tier: with a workspace `rust-version`
@@ -203,7 +203,7 @@ mod tests {
 
         // uuid 1.24.0 demands rustc 1.63 > the workspace's 1.60; the current 0.8.2 (no declared
         // MSRV, which cooldown treats as unconstrained) stays canonical — nothing to rewrite.
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
 
         // Without a workspace MSRV the rule is inert and the highest satisfying version wins.
         graph.workspace_rust_version = None;
@@ -267,6 +267,6 @@ mod tests {
         "#};
         let lock = view(lock_text);
         let graph = graph_with(&[("app", "0.1.0", "uuid", ">=0.7.0, <2.0.0")]);
-        assert!(rebindings(&lock, &RequirementIndex::new(&graph)).is_empty());
+        assert_eq!(rebindings(&lock, &RequirementIndex::new(&graph)), []);
     }
 }

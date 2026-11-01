@@ -2843,7 +2843,7 @@ mod tests {
                 peerDependencies:
                   react: ^18
         "};
-        assert!(parse_pnpm_peer_requirements(lock).is_empty());
+        assert_eq!(parse_pnpm_peer_requirements(lock), []);
         assert!(parse_pnpm_importer_members(lock, &HashSet::new()).is_empty());
     }
 
@@ -3028,7 +3028,10 @@ packages:
         );
         assert_eq!(index.members_for("vite", "7.0.0"), vec!["apps/b"]);
         // The internal workspace link is not a registry package, so it is never attributed.
-        assert!(index.members_for("@airtype/api", "0.0.0").is_empty());
+        assert_eq!(
+            index.members_for("@airtype/api", "0.0.0"),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -3135,7 +3138,7 @@ packages:
         assert_eq!(of("seroval", "1.3.2"), vec!["solid-js@1.9.15"]);
         assert_eq!(of("lodash", "4.17.21"), vec!["vite-plugin-solid@2.11.14"]);
         assert_eq!(of("fsevents", "2.3.3"), vec!["vite-plugin-solid@2.11.14"]);
-        assert!(of("my-lodash", "lodash@4.17.21").is_empty());
+        assert_eq!(of("my-lodash", "lodash@4.17.21"), [] as [String; 0]);
         assert!(
             !dependents
                 .keys()
@@ -3474,7 +3477,7 @@ packages:
         let index = Pnpm::member_sources_excluding(lock, &excluded);
         assert_eq!(index.resolved_versions_of("mongoose"), ["9.9.1"]);
         assert_eq!(index.declared_specifiers_of("tailwindcss"), ["^4.3.3"]);
-        assert!(index.members_for("mongoose", "9.8.0").is_empty());
+        assert_eq!(index.members_for("mongoose", "9.8.0"), [] as [String; 0]);
         assert!(
             !index.splits_for("tailwindcss", "4.3.5"),
             "the excluded importer's v3 line no longer holds the included one"
@@ -3543,7 +3546,7 @@ packages:
     fn member_index_is_empty_by_default() {
         // yarn/bun and the unparsable case: no attribution, so the column stays blank.
         let index = MemberIndex::default();
-        assert!(index.members_for("anything", "1.0.0").is_empty());
+        assert_eq!(index.members_for("anything", "1.0.0"), [] as [String; 0]);
     }
 
     #[test]

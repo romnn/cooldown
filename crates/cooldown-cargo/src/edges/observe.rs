@@ -116,7 +116,7 @@ mod tests {
             "name = \"diesel\"\nversion = \"2.3.12\"",
         );
         let after_moved = view(&moved_dependent);
-        assert!(binding_changes(&before, &after_moved).is_empty());
+        assert_eq!(binding_changes(&before, &after_moved), []);
     }
 
     /// The observation diff must also see edges the policies cannot rewrite: `app` holds `uuid`

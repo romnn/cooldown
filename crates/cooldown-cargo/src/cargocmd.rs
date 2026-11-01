@@ -1979,7 +1979,7 @@ mod tests {
             required by package `app v0.1.0 (/repo/app)`
         "#};
 
-        assert!(conflict_parties(stderr).is_empty());
+        assert_eq!(conflict_parties(stderr), []);
     }
 
     /// CI exports `CARGO_TERM_COLOR=always`, under which cargo wraps `error:` in escape codes and
@@ -2875,7 +2875,7 @@ mod tests {
         // The root's exact pin still caps the collapsed view (masked behind `pinned` by the
         // dependency builder) but contributes no attributed edge.
         assert!(graph.is_graph_capped("itoa", "1.0.11"));
-        assert!(graph.node_hold_edges("itoa", "1.0.11").is_empty());
+        assert_eq!(graph.node_hold_edges("itoa", "1.0.11"), []);
     }
 
     #[test]
@@ -3422,7 +3422,7 @@ mod tests {
         assert_eq!(member_names(graph.direct_members("it13")), ["app", "hack"]);
         assert_eq!(member_names(graph.direct_members("it14")), ["hack"]);
         assert!(graph.is_exact_pinned("pinned", "1.0.0"));
-        assert!(graph.nodes_reached_only_via_generated().is_empty());
+        assert_eq!(graph.nodes_reached_only_via_generated(), []);
     }
 
     /// Declared generated, the hack's declarations follow rather than drive: nothing it alone
@@ -3448,7 +3448,7 @@ mod tests {
         assert_eq!(member_names(graph.direct_members("it13")), ["app"]);
         // The line only the hack mirrors is transitive, reached through `mid`.
         assert!(!graph.is_direct("it14"));
-        assert!(graph.direct_members("it14").is_empty());
+        assert_eq!(graph.direct_members("it14"), []);
         assert_eq!(member_names(graph.reaching_members("it14")), ["app"]);
         // A generated pin is the generator's last output, not the project's choice.
         assert!(!graph.is_exact_pinned("pinned", "1.0.0"));

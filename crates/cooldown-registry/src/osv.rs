@@ -1171,7 +1171,7 @@ mod tests {
 
         let raw = raw_advisory(&vuln, "crates.io", "widget");
         assert_eq!(raw.summary, "first line");
-        assert!(raw.fixes.is_empty());
+        assert_eq!(raw.fixes, [] as [String; 0]);
         assert_eq!(
             raw.ranges,
             vec![RawAffectedRange {

@@ -585,7 +585,7 @@ async fn missing_seed_binary_propagates_without_bisection() -> eyre::Result<()> 
         .await
         .expect_err("spawn failure must propagate");
     assert!(matches!(error, CoreError::ToolSpawn { .. }));
-    assert!(fixture.invocations()?.is_empty());
+    assert_eq!(fixture.invocations()?, [] as [Vec<String>; 0]);
     assert_eq!(
         std::fs::read(fixture.project.root.join("Cargo.lock"))?,
         original

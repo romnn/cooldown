@@ -76,7 +76,7 @@ fn clean_cargo_project_recovers_as_unchanged() -> eyre::Result<()> {
         "recover failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, [] as [u8; 0]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(
         document
@@ -122,7 +122,7 @@ fn non_git_recovery_evidence_fails_closed() -> eyre::Result<()> {
         .output()?;
 
     assert_eq!(output.status.code(), Some(4));
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, [] as [u8; 0]);
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(
         document.pointer("/ok").and_then(serde_json::Value::as_bool),

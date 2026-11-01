@@ -159,8 +159,8 @@ async fn attempt_twice(flag: &str) -> eyre::Result<()> {
         PreparedMutation::prepare_isolated(writer, &stage.mutation_project(), &plan).await?;
     let first = writer.apply(&mutation).await?;
     let second = writer.apply(&mutation).await?;
-    assert!(first.applied.is_empty());
-    assert!(second.applied.is_empty());
+    assert_eq!(first.applied, []);
+    assert_eq!(second.applied, []);
     assert_eq!(first.skipped.len(), 1);
     let first_details = first
         .skipped

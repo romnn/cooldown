@@ -1286,7 +1286,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Ok(candidates) => candidates,
             Err(error) => {
                 let mut outcome = BatchOutcome::default();
-                outcome.errors.push(error);
+                outcome.errors.push(*error);
                 return UpgradeSelectionResult::Aborted { outcome, rejected };
             }
         };
@@ -1381,13 +1381,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn fallback_candidates(
         &mut self,
         changes: Vec<Change>,
-    ) -> Result<Vec<UpgradeFallback>, Diagnostic> {
+    ) -> Result<Vec<UpgradeFallback>, Box<Diagnostic>> {
         let mut candidates = Vec::new();
         for change in changes {
             let alternatives = self
                 .upgrade_fallbacks(&change)
                 .await
-                .map_err(|err| self.project_diag(&err, Some(&change.package.name)))?;
+                .map_err(|err| Box::new(self.project_diag(&err, Some(&change.package.name))))?;
             candidates.push(UpgradeFallback {
                 original: change,
                 alternatives,

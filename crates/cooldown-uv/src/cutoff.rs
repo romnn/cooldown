@@ -231,7 +231,7 @@ mod tests {
                 "onnxruntime=false",
             ]
         );
-        assert!(Cutoffs::uniform(None).args().is_empty());
+        assert_eq!(Cutoffs::uniform(None).args(), [] as [String; 0]);
     }
 
     /// A package's own entry wins over the default, and a disabled entry means no cutoff.

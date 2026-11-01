@@ -141,7 +141,7 @@ mod tests {
         let (_dir, root) = project()?;
 
         // No configuration
-        assert!(declared_patch_files(&root).is_empty());
+        assert_eq!(declared_patch_files(&root), [] as [Utf8PathBuf; 0]);
 
         // Malformed manifest and a declared patch that does not exist
         write(&root, "package.json", "{not json")?;
@@ -150,7 +150,7 @@ mod tests {
             "pnpm-workspace.yaml",
             "patchedDependencies:\n  \"a@1.0.0\": patches/missing.patch\n",
         )?;
-        assert!(declared_patch_files(&root).is_empty());
+        assert_eq!(declared_patch_files(&root), [] as [Utf8PathBuf; 0]);
         Ok(())
     }
 }

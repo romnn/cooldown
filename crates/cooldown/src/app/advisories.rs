@@ -927,8 +927,8 @@ mod tests {
             )
             .await;
         assert!(outcome.advisories.is_none());
-        assert!(outcome.warnings.is_empty());
-        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.warnings, []);
+        assert_eq!(outcome.errors, []);
     }
 
     /// The fail-open contract: an unreachable feed is a warning and un-shortened windows, never
@@ -974,7 +974,7 @@ mod tests {
             )
             .await;
         assert!(outcome.advisories.is_none());
-        assert!(outcome.warnings.is_empty());
+        assert_eq!(outcome.warnings, []);
         assert_eq!(outcome.errors.len(), 1, "the gate refuses to certify");
         assert_eq!(
             outcome.errors[0].kind,
@@ -1194,7 +1194,7 @@ mod tests {
             initial.by_package.get("serde").map(Vec::len),
             "the original entry is carried over untouched"
         );
-        assert!(merged.unqueried(&deps).is_empty());
+        assert_eq!(merged.unqueried(&deps), [] as [String; 0]);
     }
 
     /// Stale data may annotate but never shorten, and a project's shorten mode is settled by its
@@ -1296,7 +1296,7 @@ mod tests {
             )
             .await;
         assert!(topped_up.advisories.is_some());
-        assert!(topped_up.warnings.is_empty());
+        assert_eq!(topped_up.warnings, []);
     }
 
     /// A failed top-up is fail-open like the initial fetch: the new packages stay unadvised,

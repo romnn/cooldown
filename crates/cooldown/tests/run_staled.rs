@@ -474,7 +474,7 @@ async fn a_lock_stale_at_the_start_is_not_refreshed() -> eyre::Result<()> {
 
     assert_eq!(stale_lock_projects(&out.errors), ["bb"]);
     assert_eq!(out.exit, Exit::Environment);
-    assert!(refreshes(&repo)?.is_empty());
+    assert_eq!(refreshes(&repo)?, [] as [Utf8PathBuf; 0]);
     Ok(())
 }
 
@@ -518,7 +518,7 @@ async fn a_dry_run_refreshes_nothing() -> eyre::Result<()> {
     let out = repo.ws.upgrade(&opts).await;
 
     assert!(out.errors.is_empty(), "{:?}", out.errors);
-    assert!(refreshes(&repo)?.is_empty());
+    assert_eq!(refreshes(&repo)?, [] as [Utf8PathBuf; 0]);
     Ok(())
 }
 
@@ -547,7 +547,7 @@ async fn a_lock_an_earlier_projects_edit_left_unresolvable_is_refreshed() -> eyr
         out.warnings
     );
     assert_eq!(conflict_refreshes(&repo)?, [repo.root.join("zz-nested")]);
-    assert!(refreshes(&repo)?.is_empty());
+    assert_eq!(refreshes(&repo)?, [] as [Utf8PathBuf; 0]);
     assert_eq!(out.summary.applied, 2, "{:?}", out.items);
     Ok(())
 }
@@ -587,8 +587,8 @@ async fn an_unresolvable_lock_whose_inputs_did_not_change_is_not_refreshed() -> 
 
     let out = repo.ws.upgrade(&RunOpts::default()).await;
 
-    assert!(conflict_refreshes(&repo)?.is_empty());
-    assert!(refreshes(&repo)?.is_empty());
+    assert_eq!(conflict_refreshes(&repo)?, [] as [Utf8PathBuf; 0]);
+    assert_eq!(refreshes(&repo)?, [] as [Utf8PathBuf; 0]);
     assert!(
         stale_lock_projects(&out.warnings).is_empty(),
         "{:?}",

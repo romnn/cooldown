@@ -252,7 +252,7 @@ mod reaching_tests {
         // A directly-required target resolves to its single root.
         assert_eq!(reaching_roots(edges, &roots, "b"), vec!["a"]);
         // A node not in the graph yields nothing (no panic).
-        assert!(reaching_roots(edges, &roots, "zzz").is_empty());
+        assert_eq!(reaching_roots(edges, &roots, "zzz"), [] as [&str; 0]);
         // Cycles are handled (the visited set bounds the walk).
         let cyclic = [("a", "b"), ("b", "c"), ("c", "b")];
         assert_eq!(reaching_roots(cyclic, &roots, "c"), vec!["a"]);

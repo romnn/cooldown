@@ -978,7 +978,7 @@ async fn mutation_recovery_precedes_dependency_discovery() {
         .upgrade(&opts())
         .await;
 
-    assert!(outcome.errors.is_empty());
+    assert_eq!(outcome.errors, []);
     // An empty error list alone would also pass if the pipeline never reached discovery at all;
     // the marker proves the recovery hook genuinely ran (and therefore ran before the discovery
     // that would otherwise have errored).
@@ -1021,7 +1021,7 @@ async fn dry_run_refuses_pending_source_state_without_recovering_it() {
         "the refusal must surface the adapter's pending-mutation detail, got: {}",
         error.message
     );
-    assert!(outcome.items.is_empty());
+    assert_eq!(outcome.items, []);
     // Refusing means refusing: the read-side dry run must never invoke the mutating recovery hook.
     assert!(
         !root.join("recovery-invoked").exists(),
@@ -1202,7 +1202,7 @@ async fn restore_conflict_stops_before_a_later_lock_batch() -> eyre::Result<()> 
         .await;
 
     // The editor's bytes survive and the later runtime lock batch never reaches the adapter.
-    assert!(!outcome.errors.is_empty());
+    assert_ne!(outcome.errors, []);
     assert_eq!(
         std::fs::read_to_string(root.join("record-apply-batches"))?,
         "build-tool\n"
@@ -1687,7 +1687,7 @@ async fn upgrade_dedupes_a_planned_transitive_with_its_mvs_collateral_while_fix_
     // `fix` never moves a dep forward — both pins are already matured, so nothing is touched.
     let fixed = make().fix(&opts()).await;
     assert_eq!(fixed.summary.applied, 0);
-    assert!(fixed.items.is_empty());
+    assert_eq!(fixed.items, []);
 
     // `upgrade` plans both; `t`'s planned advance and its MVS-collateral report collapse into one
     // applied row (never silent, never doubled).
@@ -1796,7 +1796,7 @@ async fn upgrade_advances_a_matured_in_range_transitive_no_direct_pin_drags() {
     let out = make().upgrade(&hide).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
 
     // An engine that cannot pin an undeclared package (`supports_transitive_advance` false, the
     // npm/yarn/bun family) keeps direct-only upgrade planning even under the default gate —
@@ -3082,7 +3082,7 @@ async fn upgrade_does_not_report_a_bound_without_a_matured_target_beyond_it() {
         })
         .await;
 
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(out.summary.skipped, 0);
 }
 
@@ -3455,7 +3455,7 @@ async fn fix_downgrades_too_fresh_direct_to_newest_matured() {
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 1);
     assert_eq!(out.summary.skipped, 0);
-    assert!(out.warnings.is_empty());
+    assert_eq!(out.warnings, []);
     assert_eq!(out.items[0].name, "a");
     assert_eq!(out.items[0].from, "v1.0.2");
     assert_eq!(out.items[0].to, "v1.0.1");
@@ -3495,7 +3495,7 @@ async fn fix_downgrades_two_simultaneously_too_fresh_deps_in_one_batch() {
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 2);
     assert_eq!(out.summary.skipped, 0);
-    assert!(out.warnings.is_empty());
+    assert_eq!(out.warnings, []);
     for name in ["a", "b"] {
         let item = out.items.iter().find(|item| item.name == name).expect(name);
         assert_eq!(item.from, "v1.0.2");
@@ -3524,7 +3524,7 @@ async fn fix_warns_and_leaves_exact_pin_unless_opted_in() {
 
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(out.warnings.len(), 1);
     assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
     assert!(out.warnings[0].message.contains("--downgrade-pinned"));
@@ -3551,7 +3551,7 @@ async fn fix_strict_fails_when_a_violation_is_left_unresolved() {
 
     assert_eq!(out.exit, Exit::Policy);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(out.warnings.len(), 1);
     assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
 }
@@ -3599,7 +3599,7 @@ async fn fix_warns_and_leaves_graph_held_violation() {
 
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(out.warnings.len(), 1);
     assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
     assert!(out.warnings[0].message.contains("resolved graph requires"));
@@ -3764,7 +3764,7 @@ async fn fix_warning_names_the_compliant_holder() {
 
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(out.warnings.len(), 1);
     assert_eq!(out.warnings[0].kind, DiagnosticKind::Held);
     assert!(
@@ -4052,7 +4052,7 @@ async fn fix_downgrades_transitive_deps_by_default_with_modes_to_relax() {
     let out = make().fix(&hide).await;
     assert_eq!(out.exit, Exit::Ok);
     assert_eq!(out.summary.applied, 0);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
 
     // `--transitive allow`: the transitive is evaluated and reported, but left in place; only direct
     // deps would be downgraded.
@@ -4360,7 +4360,7 @@ async fn upgrade_restores_once_when_reconcile_metadata_fetch_fails() {
     assert_eq!(out.summary.applied, 0);
     assert_eq!(out.summary.skipped, 0);
     assert_eq!(out.summary.errors, 1);
-    assert!(out.items.is_empty());
+    assert_eq!(out.items, []);
     assert_eq!(
         out.errors.len(),
         1,

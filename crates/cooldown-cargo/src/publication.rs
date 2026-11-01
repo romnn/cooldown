@@ -557,7 +557,7 @@ mod tests {
         let scope = crate::RecoveryScope::repository(&repository.root)?;
         let discovery = recovery_authority_projects(&scope)?;
 
-        assert!(discovery.projects.is_empty());
+        assert_eq!(discovery.projects, [] as [Utf8PathBuf; 0]);
         assert_eq!(discovery.warnings.len(), 1);
         assert_eq!(discovery.warnings[0].path, anchor_path);
         Ok(())
