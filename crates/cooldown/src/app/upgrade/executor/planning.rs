@@ -31,6 +31,38 @@ pub(super) fn lower_adoptable_targets<'a>(
         .collect()
 }
 
+/// Selects the highest adoptable target on the current version's major line, for a planned
+/// target on another line.
+///
+/// This is the target a run without `--major` would adopt, so a held cross-major move still
+/// takes it.
+/// A same-line target has no such alternative: anything lower on its line is
+/// [`lower_adoptable_targets`]'s concern.
+/// Either version missing from `releases` yields none, because its line cannot be proven.
+pub(super) fn current_line_target<'a>(
+    releases: &[Release],
+    verdict: &'a Verdict,
+    from: &Version,
+    target: &Version,
+) -> Option<&'a Candidate> {
+    let release_of =
+        |version: &Version| releases.iter().find(|release| release.version == *version);
+    let (current, selected) = (release_of(from)?, release_of(target)?);
+    if current.major == selected.major {
+        return None;
+    }
+    verdict
+        .candidates
+        .iter()
+        .rev()
+        .filter(|candidate| matches!(candidate.status, Status::Adoptable | Status::Exempt))
+        .find(|candidate| {
+            release_of(&candidate.version).is_some_and(|release| {
+                release.major == current.major && release.order > current.order
+            })
+        })
+}
+
 /// Selects the dependency scope that supplies upgrade or downgrade candidates.
 ///
 /// Both directions walk the resolved graph by default. Resolvers only promote the minimum a

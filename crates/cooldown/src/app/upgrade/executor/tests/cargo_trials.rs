@@ -13,8 +13,8 @@ use cooldown_core::{
     EdgeBindingAction, EdgeRebind, FetchContext, GeneratedMembers, GraphHoldEdge, GraphHoldKind,
     LockStatus, LockVerifyReport, MajorKey, NativePolicyLayer, PackageId, Plan, PolicyStack,
     PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, SkipReason, Skipped, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    ReleaseOrder, ReleaseQuality, SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use indoc::indoc;
 use std::collections::{BTreeMap, HashSet};
@@ -324,8 +324,8 @@ impl ToolWrite for FakeCargo {
         true
     }
 
-    fn supports_target_fallback(&self) -> bool {
-        true
+    fn target_fallback(&self) -> TargetFallback {
+        TargetFallback::LowerOnSelectedLine
     }
 
     async fn lock_edge_snapshot(

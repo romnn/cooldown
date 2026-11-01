@@ -813,6 +813,38 @@ impl ApplyAttempt {
     }
 }
 
+/// The alternative targets an upgrade may retry when a planned target fails to land, as a
+/// writer declares through [`ToolWrite::target_fallback`].
+///
+/// Every alternative is a matured version cooldown already judged adoptable (or exempt) for the
+/// same dependency, so a fallback never admits a target the planner would not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TargetFallback {
+    /// A held or rejected target stays held; nothing else is tried.
+    #[default]
+    None,
+    /// Up to three lower adoptable targets on the line of the selected target, newest first.
+    ///
+    /// Every held or rejected candidate enters the fallback, and a candidate with no lower
+    /// target keeps its original target in the retries.
+    /// The accepted subset is replayed from the restored baseline even when no candidate has a
+    /// lower target.
+    LowerOnSelectedLine,
+    /// The highest adoptable target on the current version's major line, tried only for a
+    /// candidate whose planned target crosses to another line.
+    ///
+    /// A rejected cross-major candidate thus still adopts, as best effort, what a run without
+    /// `--major` would have, and its major target stays reported as held with its original
+    /// reason.
+    /// The retries carry only these in-line targets on top of the accepted subset: one joint
+    /// attempt, then one attempt per candidate when there are several.
+    /// A candidate held as not eligible has no in-line target, because its missing editable
+    /// requirement holds every target alike.
+    /// When no rejected candidate has an in-line target, the run's outcome is exactly what it
+    /// would be without a fallback.
+    CurrentLine,
+}
+
 /// The mutation-side port for tools that can rewrite project state.
 ///
 /// Read-only commands depend only on [`ToolRead`]. Commands such as `upgrade` and `sync` opt
@@ -863,11 +895,13 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
-    /// Whether upgrade trials may retry lower adoptable targets on the selected major line
-    /// after the original target fails to land.
-    /// The executor limits retries and reports the target that actually lands.
-    fn supports_target_fallback(&self) -> bool {
-        false
+    /// Which alternative targets upgrade trials may retry after a planned target fails to land.
+    ///
+    /// The executor bounds the retries, never trades an accepted target away, and reports the
+    /// target that actually lands.
+    /// See [`TargetFallback`] for each strategy's contract.
+    fn target_fallback(&self) -> TargetFallback {
+        TargetFallback::None
     }
 
     /// Absolute paths that this tool's resolver must read during a trial resolve but that the

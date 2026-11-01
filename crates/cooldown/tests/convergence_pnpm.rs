@@ -1954,6 +1954,119 @@ fn upgrade_holds_a_cross_major_move_an_injected_workspace_dependents_peer_exclud
     );
 }
 
+/// Seed cutoff for the in-line fallback: after the plugin's exact `6.21.0` (2024-02-05) and
+/// before eslint `8.57.0` (2024-02-23), so the seed resolves eslint below its line's last
+/// release.
+/// At `FREEZE` the peer-held eslint 9 then sits beside a matured move on eslint's own v8 line.
+const PEER_HELD_IN_LINE_SEED: &str = "2024-02-10T00:00:00Z";
+
+/// A `--major` run whose cross-major target is peer-held still takes the matured in-line move a
+/// `--no-major` run takes (issue #11): the lock moves along the v8 line, the in-line move is its
+/// own applied row, and the eslint 9 row stays peer-held with the dependent named.
+/// `outdated --major` agrees, reporting the major blocked.
+#[test]
+fn upgrade_major_takes_the_in_line_move_beside_a_peer_held_major() {
+    skip_if_missing!("pnpm");
+    let fixture = peer_held_fixture(PEER_HELD_IN_LINE_SEED);
+    let seeded = locked_eslint(&fixture);
+    assert!(
+        seeded.starts_with("8."),
+        "the seed must start on the eslint v8 line, got {seeded}"
+    );
+    // Identical seeds, so `--no-major` and `outdated` judge the same starting graph.
+    let no_major_fixture = peer_held_fixture(PEER_HELD_IN_LINE_SEED);
+    let outdated_fixture = peer_held_fixture(PEER_HELD_IN_LINE_SEED);
+    for twin in [&no_major_fixture, &outdated_fixture] {
+        assert_eq!(
+            pnpm_lock_pins(&twin.read_bytes("pnpm-lock.yaml")),
+            pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml")),
+            "the twin fixtures must seed the same graph"
+        );
+    }
+
+    // `--no-major` takes the newest matured release on the v8 line.
+    let no_major = no_major_fixture.cooldown_json(&[
+        "upgrade",
+        "--no-major",
+        "--package",
+        "eslint",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(no_major.ok(), "the --no-major upgrade should succeed");
+    let in_line = locked_eslint(&no_major_fixture);
+    assert!(
+        in_line.starts_with("8.") && in_line != seeded,
+        "the fixture needs a matured in-line move off {seeded}, got {in_line}"
+    );
+
+    let args = [
+        "upgrade",
+        "--major",
+        "--package",
+        "eslint",
+        "--freeze",
+        FREEZE,
+    ];
+    let report = fixture.cooldown_json(&args);
+    assert!(
+        report.ok(),
+        "upgrade should succeed: {}",
+        fixture.cooldown(&args).stderr_str()
+    );
+
+    // The lock lands exactly where `--no-major` does, never on the held major line.
+    assert_eq!(
+        locked_eslint(&fixture),
+        in_line,
+        "--major must take the same in-line move as --no-major"
+    );
+    // One applied in-line row beside one skipped major row, which keeps its peer hold.
+    let rows = report.changes_for("eslint");
+    assert_eq!(rows.len(), 2, "eslint rows: {rows:?}");
+    assert!(
+        rows.contains(&ChangeVersions::new(&seeded, &in_line)),
+        "the in-line move is reported: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.from == seeded && row.to.starts_with("9.")),
+        "the held major is reported: {rows:?}"
+    );
+    assert!(report.applied_names().contains("eslint"));
+    assert_eq!(
+        report.skipped_reasons_for("eslint"),
+        std::collections::BTreeSet::from(["peer_held".to_string()]),
+        "the major keeps its original reason"
+    );
+    assert_eq!(
+        report.skipped_offending_for("eslint").as_deref(),
+        Some("@typescript-eslint/eslint-plugin"),
+        "the hold still names the peer-declaring dependent"
+    );
+
+    // `outdated --major` predicts the same hold for the cross-major target.
+    let outdated = outdated_fixture.cooldown_json(&[
+        "outdated",
+        "--major",
+        "--package",
+        "eslint",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(outdated.ok(), "outdated should succeed");
+    assert!(
+        outdated.outdated_with_status("blocked").contains("eslint"),
+        "eslint's major must be blocked, got blocked={:?}, adoptable={:?}",
+        outdated.outdated_with_status("blocked"),
+        outdated.outdated_with_status("adoptable")
+    );
+    assert_eq!(
+        outdated.item_field_str("eslint", "blockedBy").as_deref(),
+        Some("@typescript-eslint/eslint-plugin")
+    );
+}
+
 /// Seed cutoff for the ceiling-held lockstep pair: react 18.3.1 is the newest react/react-dom
 /// before this date, and react 19 (2024-12) is beyond it.
 const LOCKSTEP_SEED: &str = "2024-11-01T00:00:00Z";

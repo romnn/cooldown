@@ -37,7 +37,7 @@ use cooldown_core::{
     NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
     ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
     ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy, SkipReason, Skipped, SyncReport,
-    SyncScope, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -3028,6 +3028,13 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         L::SUPPORTS_TRANSITIVE_ADVANCE
     }
 
+    fn target_fallback(&self) -> TargetFallback {
+        // A cross-major target is held for reasons the current line escapes (a dependent's peer
+        // range, a range split across importers), so the in-line move `--no-major` would take is
+        // the alternative worth one more trial.
+        TargetFallback::CurrentLine
+    }
+
     fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
         // Declared patch files are in-tree, but their `.patch` basename matches no resolver input.
         crate::patches::declared_patch_files(&project.root)
@@ -4933,6 +4940,132 @@ packages:
         assert_eq!(report.skipped[0].reason, SkipReason::NotEligible);
         let manifest = std::fs::read_to_string(root.join("package.json"))?;
         assert_eq!(manifest, r#"{ "name": "root" }"#);
+        Ok(())
+    }
+
+    /// Writes a `dom`/`safe` npm project pinned at `1.0.0` and a scripted `npm` for it,
+    /// returning the script path.
+    ///
+    /// The pin leg rewrites the pinned entry's lock version; the major is refused as a peer
+    /// conflict, the way npm's resolver rejects it, and the resync leg keeps the pins.
+    #[cfg(unix)]
+    fn current_line_fallback_fixture(root: &Utf8Path) -> eyre::Result<Utf8PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let manifest = indoc! {r#"
+            { "name": "app", "dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" } }
+        "#};
+        std::fs::write(root.join("package.json"), manifest)?;
+        let lock = indoc! {r#"
+            {
+                "name": "app",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "app", "dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" } },
+                    "node_modules/dom": { "version": "1.0.0" },
+                    "node_modules/safe": { "version": "1.0.0" }
+                }
+            }
+        "#};
+        std::fs::write(root.join("package-lock.json"), lock)?;
+        let script = root.join("fake-npm.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                echo "$*" >> legs.log
+                case "$*" in
+                  "install dom@2.0.0 "*)
+                    echo "npm error code ERESOLVE" >&2; exit 1 ;;
+                  "install --package-lock-only"*)
+                    exit 0 ;;
+                  "install "*@*" --package-lock-only"*)
+                    name="${2%@*}"; version="${2##*@}"
+                    sed "s|\"node_modules/$name\": { \"version\": \"[^\"]*\"|\"node_modules/$name\": { \"version\": \"$version\"|" \
+                      package-lock.json > package-lock.next && mv package-lock.next package-lock.json
+                    exit 0 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        Ok(script)
+    }
+
+    /// The per-package npm path supports the executor's current-line fallback: a refused major
+    /// target leaves no manifest edit behind beside a landed companion, and the in-line target
+    /// retried on top of that companion from the restored baseline lands exactly with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_major_restores_its_manifest_and_its_current_line_target_lands()
+    -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let script = current_line_fallback_fixture(&root)?;
+        let mut tool = tool();
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        assert_eq!(tool.target_fallback(), TargetFallback::CurrentLine);
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let trial = |changes| Plan {
+            changes,
+            ..Plan::default()
+        };
+        let locked = |name: &str| -> eyre::Result<Option<String>> {
+            let content = std::fs::read_to_string(root.join("package-lock.json"))?;
+            Ok(locked_versions::<Npm>(&content)?.get(name).cloned())
+        };
+
+        // Initial trial: the major is refused, the companion lands.
+        let initial = trial(vec![
+            change("dom", "1.0.0", "2.0.0"),
+            change("safe", "1.0.0", "1.1.0"),
+        ]);
+        let baseline = tool.mutation_journal(&project, &initial).await?;
+        let mutation = PreparedMutation::prepare(&tool, &project, &initial).await?;
+        let report = tool.apply(&mutation).await?;
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|change| format!("{}@{}", change.package.name, change.to))
+                .collect::<Vec<_>>(),
+            ["safe@1.1.0"]
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].change.to.as_str(), "2.0.0");
+        let declared = std::fs::read_to_string(root.join("package.json"))?;
+        assert!(declared.contains(r#""dom": "^1.0.0""#), "{declared}");
+        assert_eq!(locked("dom")?.as_deref(), Some("1.0.0"));
+        assert_eq!(locked("safe")?.as_deref(), Some("1.1.0"));
+
+        // Current-line attempt from the restored baseline, on top of the accepted companion.
+        baseline.restore()?;
+        let retry = trial(vec![
+            change("dom", "1.0.0", "1.1.0"),
+            change("safe", "1.0.0", "1.1.0"),
+        ]);
+        let mutation = PreparedMutation::prepare(&tool, &project, &retry).await?;
+        let report = tool.apply(&mutation).await?;
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let mut landed: Vec<String> = report
+            .applied
+            .iter()
+            .map(|change| format!("{}@{}", change.package.name, change.to))
+            .collect();
+        landed.sort();
+        assert_eq!(landed, ["dom@1.1.0", "safe@1.1.0"]);
+        assert_eq!(locked("dom")?.as_deref(), Some("1.1.0"));
+        assert_eq!(locked("safe")?.as_deref(), Some("1.1.0"));
+        // The in-line target stays on the major line the manifest declares.
+        let declared = std::fs::read_to_string(root.join("package.json"))?;
+        assert!(!declared.contains("^2"), "{declared}");
         Ok(())
     }
 
