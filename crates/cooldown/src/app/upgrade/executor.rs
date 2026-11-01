@@ -1212,6 +1212,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// replay normally settles too. A replay that blocks or loses an accepted target (the registry
     /// moved between trials) fails closed: the baseline is restored and the accepted candidates report as held rather
     /// than committing a lock no trial verified.
+    ///
+    /// A rejected candidate is reported held only while its own target stays unlanded: one the
+    /// committed replay verifiably moved onto that target (from the same version, for the same
+    /// members) reports only its applied row.
     async fn replay_selected_upgrade_changes(
         &mut self,
         accepted: Vec<Change>,
@@ -1250,6 +1254,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     return ControlFlow::Continue(());
                 }
                 self.ctx.progress.candidates_decided(&accepted);
+                // A retried sibling can float a rejected candidate onto its own target as
+                // collateral; the replay's committed rows then report it applied, and a held row
+                // for the same move would contradict them.
+                let rejected: Vec<_> = rejected
+                    .into_iter()
+                    .filter(|item| {
+                        landed_upgrade_changes(
+                            std::slice::from_ref(&item.change),
+                            &outcomes,
+                            &self.last_gate_graph,
+                        )
+                        .is_empty()
+                    })
+                    .collect();
                 if let ControlFlow::Break(conflict) = self.merge_batch_outcomes(outcomes) {
                     return ControlFlow::Break(conflict);
                 }

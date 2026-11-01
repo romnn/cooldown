@@ -85,7 +85,8 @@ struct Hold {
 }
 
 /// A companion whose landing floats another locked package, the way a joint resolve moves a
-/// shared dependency the plan does not pin.
+/// shared dependency the plan does not land itself (absent from the plan, or held in it).
+/// Each float is logged into its trial as `float:<name>@<version>`.
 struct Float {
     trigger: &'static str,
     floated: &'static str,
@@ -138,6 +139,12 @@ impl FakeNode {
     fn with_releases(mut self, name: &str, versions: &[(&str, bool)]) -> Self {
         self.releases.insert(name.to_string(), releases(versions));
         self
+    }
+
+    /// Whether the resolver refuses `change`'s target outright.
+    fn holds(&self, change: &Change) -> bool {
+        let target = format!("{}@{}", change.package.name, change.to);
+        self.script.holds.iter().any(|hold| hold.target == target)
     }
 
     fn trials(&self) -> Vec<Vec<String>> {
@@ -350,9 +357,12 @@ impl ToolWrite for FakeNode {
                 && !plan
                     .changes
                     .iter()
-                    .any(|planned| planned.package.name == float.floated)
+                    .any(|planned| planned.package.name == float.floated && !self.holds(planned))
             {
                 versions.insert(float.floated.to_string(), float.to.to_string());
+                if let Some(trial) = self.trials.lock().expect("trial log").last_mut() {
+                    trial.push(format!("float:{}@{}", float.floated, float.to));
+                }
                 report.applied.push(Change {
                     package: package(float.floated),
                     from: Version::new(float.from),
@@ -1045,7 +1055,81 @@ async fn warm_and_cold_caches_select_the_same_current_line_target() -> eyre::Res
     ]);
     assert_eq!(rows(&upgrade.items), expected);
     assert_eq!(rows(&preview.items), expected);
-    assert_eq!(previewed.fake.trials(), planned.fake.trials());
+    let trials = planned.fake.trials();
+    assert_eq!(previewed.fake.trials(), trials);
+    // The initial trial really moved the held `dom` off `1.0.0`, so evidence read from the
+    // trial graph would find no dependency to move from; later trials pin `dom` and never float.
+    let floated = |trial: &Vec<String>| trial.iter().any(|entry| entry == "float:dom@1.0.1");
+    assert!(trials.first().is_some_and(floated), "{trials:?}");
+    assert!(!trials.iter().skip(1).any(floated), "{trials:?}");
+    Ok(())
+}
+
+/// A rejected major that a retried sibling floats onto its own target as collateral is reported
+/// as that landing alone: no held row beside it, so neither the skip count nor `outdated` nor
+/// `--strict` reads a target the lock now holds as held.
+#[tokio::test]
+async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            holds: vec![
+                // A conservative hold, so only a stale `c` row could fail `--strict`.
+                Hold {
+                    target: "a@2.0.0",
+                    reason: SkipReason::MultiVersionHeld,
+                    offending: None,
+                    detail: None,
+                },
+                Hold {
+                    target: "c@2.0.0",
+                    reason: SkipReason::ResolverConflict,
+                    offending: None,
+                    detail: None,
+                },
+            ],
+            float: Some(Float {
+                trigger: "a",
+                floated: "c",
+                from: "1.0.0",
+                to: "2.0.0",
+            }),
+            ..Script::default()
+        },
+    )
+    .with_releases("a", &[("1.0.0", false), ("1.1.0", false), ("2.0.0", false)])
+    // `c` has no matured release on its current line, so only `a` has an alternative.
+    .with_releases("c", &[("1.0.0", false), ("1.1.0", true), ("2.0.0", false)]);
+    let fixture = fixture(fake, &[("a", "1.0.0"), ("c", "1.0.0")])?;
+
+    let outcome = fixture
+        .workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..major()
+        })
+        .await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "a")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&fixture, "c")?.as_deref(), Some("2.0.0"));
+    // `a` reports its in-line move beside its held major; `c` reports only the collateral
+    // landing of the very target it was planned at.
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            applied("a", "1.0.0", "1.1.0"),
+            skipped(
+                "a",
+                "1.0.0",
+                "2.0.0",
+                SkipReason::MultiVersionHeld,
+                SkipReason::MultiVersionHeld.message()
+            ),
+            applied("c", "1.0.0", "2.0.0"),
+        ])
+    );
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.items);
     Ok(())
 }
 
