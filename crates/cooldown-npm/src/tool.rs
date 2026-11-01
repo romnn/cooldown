@@ -9,7 +9,9 @@ use crate::apply::landing::{
     restore_after_owned_step, run_candidate_landing_with, target_in_declared_range,
     window_minutes_from_cutoff,
 };
-use crate::lock::{EffectiveRegistryQuery, MemberIndex, NameVersion, NodeLock};
+use crate::lock::{
+    EffectiveRegistryQuery, MemberIndex, NameVersion, NodeLock, SplitHold, SplitVerdict,
+};
 use crate::manifest;
 use crate::native::{
     ConfigStringList, NativeAge, exact_exclusion, minimum_age_exclusions, set_yaml_block_list,
@@ -1800,9 +1802,12 @@ impl<L: NodeLock> NpmTool<L> {
             } else if let Some(hold) = advance_hold {
                 report.skipped.push(hold);
             } else if multi_version.contains(name) {
-                report
-                    .skipped
-                    .push(multi_version_hold(change, &after_in_scope, plan));
+                report.skipped.push(multi_version_hold(
+                    change,
+                    &after_in_scope,
+                    plan,
+                    &evidence.split_holds,
+                ));
             } else {
                 let advanced = matches!(
                     advance.get(&advance_key(change)),
@@ -2065,7 +2070,7 @@ impl<L: NodeLock> NpmTool<L> {
                 // A held workspace split: preserve every distinct line.
                 // A bare pnpm update can write an out-of-range lock entry while leaving
                 // package.json untouched.
-                // (Under `--rewrite` the split is not held — see `held_split_names` — and takes the
+                // (Under `--rewrite` the split is not held — see `held_splits` — and takes the
                 // widen-and-pin path below like any other candidate.)
                 continue;
             }
@@ -2548,18 +2553,26 @@ fn catalog_managed_hold(change: &Change) -> Skipped {
     }
 }
 
-/// The conservative hold for a name the joint resolve must not pin ([`held_split_names`]): it is
+/// The conservative hold for a name the joint resolve must not pin ([`held_splits`]): it is
 /// deliberately kept in range instead of pinned, and it must not be advertised as adoptable —
 /// `outdated`'s verify reclassifies it blocked.
 /// A name planned at several targets is held for that alone, and its row says so: only one target
 /// per name — `--major` admitting the higher line — can settle it, so the row must not blame the
 /// ranges, which may every one admit each target.
-/// Otherwise the detail names the declared ranges, since the ranges are what must converge before
-/// a joint pin becomes possible: a range that excludes the target, or one cooldown cannot judge (a
-/// `||` union, a dist tag), is the hold's whole reason — never the ranges' mere disagreement, which
-/// by itself holds nothing — and the row ends with `--rewrite`, which widens them.
-/// The divergent resolved lines are named too when there are several.
-fn multi_version_hold(change: &Change, after_members: &MemberIndex, plan: &Plan) -> Skipped {
+/// Otherwise the detail names the [`SplitHold`] that keeps the ranges from one joint pin: two
+/// resolved lines, an exact pin, a range that is not a plain caret or tilde, or a ceiling the
+/// target does not cross by a major — never the ranges' mere disagreement, which by itself holds
+/// nothing.
+/// The reason recorded when the hold was decided (`split_holds`) wins, since only it saw the
+/// manifests; the post-resolve index judges a name without one.
+/// The row ends with `--rewrite`, which widens the ranges, except for a range whose floor sits
+/// above the target, which no widen to that target fixes.
+fn multi_version_hold(
+    change: &Change,
+    after_members: &MemberIndex,
+    plan: &Plan,
+    split_holds: &HashMap<String, SplitHold>,
+) -> Skipped {
     let name = change.package.name.as_str();
     let target = change.to.as_str();
     let versions = after_members.resolved_versions_of(name);
@@ -2589,27 +2602,34 @@ fn multi_version_hold(change: &Change, after_members: &MemberIndex, plan: &Plan)
                 .to_string(),
         )
     } else {
-        let specifiers = after_members.declared_specifiers_of(name);
-        let ranges = if specifiers.is_empty() {
-            format!("no plain range to judge against {target}")
-        } else {
-            format!(
-                "not every declared range admits {target} ({})",
-                specifiers.join(", ")
-            )
-        };
+        let hold = split_holds.get(name).cloned().or_else(|| {
+            match after_members.split_verdict(name, target) {
+                SplitVerdict::Held(hold) => Some(hold),
+                SplitVerdict::Joint | SplitVerdict::CeilingWiden => None,
+            }
+        });
+        let rewrite =
+            format!("pass --rewrite to widen every declaring range and converge on {target}");
+        let (reason, rewrite_converges) =
+            split_hold_reason(hold.as_ref(), after_members, name, target);
         (
-            ranges,
-            format!("pass --rewrite to widen every declaring range and converge on {target}"),
+            reason,
+            if rewrite_converges {
+                rewrite
+            } else {
+                String::new()
+            },
         )
     };
     Skipped {
         change: change.clone(),
         reason: SkipReason::MultiVersionHeld,
         offending: None,
-        detail: Some(format!(
-            "{lines} and {reason}; each importer is kept on its own line — {action}"
-        )),
+        detail: Some(if action.is_empty() {
+            format!("{lines} and {reason}; each importer is kept on its own line")
+        } else {
+            format!("{lines} and {reason}; each importer is kept on its own line — {action}")
+        }),
     }
 }
 
@@ -2946,8 +2966,67 @@ fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Opt
         .then_some(detail)
 }
 
+/// Why a range-held name stays off the joint pin, phrased for its hold row, and whether
+/// `--rewrite` converges it.
+fn split_hold_reason(
+    hold: Option<&SplitHold>,
+    after_members: &MemberIndex,
+    name: &str,
+    target: &str,
+) -> (String, bool) {
+    use crate::version::CeilingHold;
+    let reason = match hold {
+        Some(SplitHold::SeveralLines { ranges, .. }) => {
+            let proven = ranges
+                .iter()
+                .all(|range| version::range_match(range, target) == version::RangeMatch::Excludes);
+            let listed = ranges.join(", ");
+            if proven {
+                let verb = if ranges.len() == 1 {
+                    "excludes"
+                } else {
+                    "exclude"
+                };
+                format!("{listed} {verb} {target}")
+            } else {
+                format!("not every declared range is proven to admit {target} ({listed})")
+            }
+        }
+        Some(SplitHold::Unresolved) => {
+            format!("the lock resolves none of its declarations, so {target} cannot be judged")
+        }
+        Some(SplitHold::NoRange) => format!("no plain range to judge against {target}"),
+        Some(SplitHold::Declaration { range, hold }) => match hold {
+            CeilingHold::ExactPin => format!("the exact pin {range} excludes {target}"),
+            CeilingHold::NotPlain => {
+                format!("{range} is not a plain caret or tilde range --major may widen to {target}")
+            }
+            CeilingHold::WithinLine => format!(
+                "{range} excludes {target} within its own major line, which --major does not widen"
+            ),
+            CeilingHold::BelowFloor => {
+                return (format!("{range} sets a floor above {target}"), false);
+            }
+        },
+        None => format!(
+            "not every declared range admits {target} ({})",
+            after_members.declared_specifiers_of(name).join(", ")
+        ),
+    };
+    (reason, true)
+}
+
+/// The planned names the whole-graph resolve must not exact-pin, with why each is held.
+pub(crate) struct HeldSplits {
+    /// Every held name.
+    pub(crate) names: HashSet<String>,
+    /// Why each name held by its declared ranges is held, where the reason is known.
+    /// A name held for several planned targets has no entry.
+    pub(crate) reasons: HashMap<String, SplitHold>,
+}
+
 /// The planned names the whole-graph resolve must NOT exact-pin: those whose workspace declarations
-/// split under the planned target ([`MemberIndex::splits_for`]) — exact-pinning would drag some
+/// split under the planned target ([`MemberIndex::split_verdict`]) — exact-pinning would drag some
 /// importer off its own declared range — unlike everything else, which is exact-pinned.
 /// A name with several planned targets splits when any of them does.
 ///
@@ -2963,6 +3042,14 @@ fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Opt
 /// two pins of one name into one update, land a version nobody planned, and report the planned one.
 /// Its row says what would converge it.
 ///
+/// A name whose differently spelled ranges only need the cross-major ceiling widen
+/// ([`SplitVerdict::CeilingWiden`]) is pinned like a lone declaration once every install-field
+/// range in its declaring members' manifests under `root` agrees.
+/// The lock records one specifier per importer, so a second install field (an exact pin under
+/// `devDependencies` beside a caret under `dependencies`) is visible only there, and the widen
+/// would rewrite it too.
+/// Without a `root`, or with a manifest that cannot be read, the name stays held.
+///
 /// Judged over the pre-apply `content` with the plan's excluded importers left out
 /// ([`NodeLock::member_sources_excluding`]): an importer the run excludes is not cooldown's to
 /// move, so its declaration cannot veto an update in an included one.
@@ -2973,22 +3060,60 @@ fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Opt
 /// the widen so a cross-major/out-of-range target can never land.
 /// A missing lock has no declarations, so nothing splits by range; a name planned at several
 /// targets is held all the same, since that hold needs no lock to be true.
-pub(crate) fn held_split_names<L: NodeLock>(content: Option<&str>, plan: &Plan) -> HashSet<String> {
+pub(crate) fn held_splits<L: NodeLock>(
+    root: Option<&Utf8Path>,
+    content: Option<&str>,
+    plan: &Plan,
+) -> HeldSplits {
     let index = content.map(|content| L::member_sources_excluding(content, &excluded_paths(plan)));
     let targets = planned_targets(plan);
-    plan.changes
-        .iter()
-        .filter(|change| {
-            let name = change.package.name.as_str();
-            let several_targets = targets.get(name).is_some_and(|targets| targets.len() > 1);
-            several_targets
-                || (plan.rewrite == RewriteMode::Auto
-                    && index
-                        .as_ref()
-                        .is_some_and(|index| index.splits_for(name, change.to.as_str())))
-        })
-        .map(|change| change.package.name.clone())
-        .collect()
+    let mut splits = HeldSplits {
+        names: HashSet::new(),
+        reasons: HashMap::new(),
+    };
+    for change in &plan.changes {
+        let name = change.package.name.as_str();
+        let target = change.to.as_str();
+        if targets.get(name).is_some_and(|targets| targets.len() > 1) {
+            splits.names.insert(name.to_string());
+            continue;
+        }
+        let Some(index) = index.as_ref().filter(|_| plan.rewrite == RewriteMode::Auto) else {
+            continue;
+        };
+        let hold = match index.split_verdict(name, target) {
+            SplitVerdict::Joint => continue,
+            SplitVerdict::Held(hold) => Some(hold),
+            SplitVerdict::CeilingWiden => {
+                match root.map(|root| manifest_ceiling_hold(root, change)) {
+                    Some(Ok(None)) => continue,
+                    Some(Ok(Some(hold))) => Some(hold),
+                    None | Some(Err(_)) => None,
+                }
+            }
+        };
+        splits.names.insert(name.to_string());
+        if let Some(hold) = hold {
+            splits.reasons.insert(name.to_string(), hold);
+        }
+    }
+    splits
+}
+
+/// The first install-field range in `change`'s declaring manifests that the cross-major ceiling
+/// widen cannot carry to its target.
+fn manifest_ceiling_hold(root: &Utf8Path, change: &Change) -> Result<Option<SplitHold>> {
+    let mut ranges = Vec::new();
+    for rel in manifest::manifest_rels(&change.members) {
+        ranges.extend(manifest::install_ranges(
+            &root.join(rel),
+            &change.package.name,
+        )?);
+    }
+    Ok(SplitHold::first_declaration_hold(
+        ranges.iter().map(String::as_str),
+        change.to.as_str(),
+    ))
 }
 
 /// Every distinct target the plan names per package, ascending — several when the lines of a split
@@ -5124,8 +5249,9 @@ mod whole_graph_tests {
 
     fn importer_entry(name: &str, specifier: &str, version: &str) -> String {
         // pnpm quotes a protocol specifier (`'catalog:'`), whose colon YAML would otherwise read
-        // as a nested mapping.
-        let specifier = if specifier.contains(':') {
+        // as a nested mapping, and a comparator range (`'>=20.0.0'`), whose `>` would open a
+        // folded block scalar.
+        let specifier = if specifier.contains(':') || specifier.starts_with(['>', '<']) {
             format!("'{specifier}'")
         } else {
             specifier.to_string()
@@ -6225,9 +6351,10 @@ mod whole_graph_tests {
         Ok(())
     }
 
-    /// `~7.3.0` beside `^7.0.0`: a target the tilde range excludes is held on its own line, with
-    /// the row naming the ranges, the target, and `--rewrite` as the way to converge — never
-    /// calling the ranges "incompatible" — and pnpm is not asked to move it.
+    /// `~7.3.0` beside `^7.0.0`: a target the tilde range excludes within its own major line is
+    /// held on its own line, with the row naming that range, why `--major` does not widen it, the
+    /// target, and `--rewrite` as the way to converge — never calling the ranges "incompatible" —
+    /// and pnpm is not asked to move it.
     /// A target both admit lands.
     #[tokio::test]
     async fn a_range_that_excludes_the_target_holds_the_name_with_an_actionable_row()
@@ -6286,12 +6413,12 @@ mod whole_graph_tests {
         assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
         let detail = skip.detail.as_deref().expect("detail");
         assert!(
-            detail.contains("~7.3.0") && detail.contains("^7.0.0"),
-            "{detail}"
+            detail.contains("~7.3.0 excludes 7.4.0 within its own major line"),
+            "the culprit range and why --major does not widen it: {detail}"
         );
         assert!(
-            detail.contains("7.4.0"),
-            "the target the range excludes: {detail}"
+            !detail.contains("^7.0.0"),
+            "the caret admits the target and is not to blame: {detail}"
         );
         assert!(detail.contains("--rewrite"), "the way forward: {detail}");
         assert!(!detail.contains("incompatible"), "{detail}");
@@ -6303,6 +6430,242 @@ mod whole_graph_tests {
         let landed = apply(&tool, &project(&root), plan("7.3.9")).await?;
         assert_eq!(applied_names(&landed), vec!["semver"]);
         assert!(landed.skipped.is_empty(), "{:?}", landed.skipped);
+        Ok(())
+    }
+
+    /// Differently spelled carets on one resolved line, one per importer, beside a third range that
+    /// already admits the target.
+    fn caret_spellings_fixture(root: &Utf8Path) -> eyre::Result<String> {
+        let lock = workspace(
+            root,
+            &[
+                Importer {
+                    path: "apps/frontend",
+                    name: "frontend",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/legacy",
+                    name: "legacy",
+                    deps: vec![("happy-dom", "^20.9.0", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/open",
+                    name: "open",
+                    deps: vec![("happy-dom", ">=20.0.0", "20.14.5")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        Ok(lock)
+    }
+
+    const CARET_SPELLING_MEMBERS: [(&str, &str); 3] = [
+        ("frontend", "apps/frontend"),
+        ("legacy", "apps/legacy"),
+        ("open", "apps/open"),
+    ];
+
+    /// A `--major` target that differently spelled carets exclude only by their implicit ceiling
+    /// lands as it would under one shared range: one joint pin reaches every importer, each
+    /// excluding caret widens to the target, and the range that admits it stays byte-identical.
+    #[tokio::test]
+    async fn differently_spelled_carets_take_a_cross_major_target_together() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = caret_spellings_fixture(&root)?;
+        let open_manifest = read(&root, "apps/open/package.json")?;
+        let landed = moved(
+            &lock,
+            "apps/frontend",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^21.0.4", "21.0.4"),
+        );
+        let landed = moved(
+            &landed,
+            "apps/legacy",
+            "happy-dom",
+            ("^20.9.0", "20.14.5"),
+            ("^21.0.4", "21.0.4"),
+        );
+        let landed = moved(
+            &landed,
+            "apps/open",
+            "happy-dom",
+            (">=20.0.0", "20.14.5"),
+            (">=20.0.0", "21.0.4"),
+        );
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"happy-dom@21.0.4"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "21.0.4",
+                &CARET_SPELLING_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(applied_names(&report), vec!["happy-dom"]);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Both carets widen to the target; the open range already admits it and is untouched.
+        assert!(read(&root, "apps/frontend/package.json")?.contains(r#""happy-dom": "^21.0.4""#));
+        assert!(read(&root, "apps/legacy/package.json")?.contains(r#""happy-dom": "^21.0.4""#));
+        assert_eq!(read(&root, "apps/open/package.json")?, open_manifest);
+        // One joint pin, filtered to every declaring importer.
+        let legs = legs(&root);
+        let [update] = legs.as_slice() else {
+            panic!("one joint update: {legs:?}");
+        };
+        assert!(update.contains("happy-dom@21.0.4"), "{update}");
+        for (_, path) in CARET_SPELLING_MEMBERS {
+            assert!(update.contains(&format!("--filter ./{path}")), "{update}");
+        }
+        Ok(())
+    }
+
+    /// The lock records one specifier per importer, so an exact pin in a second install field is
+    /// visible only in the manifest; the widen would rewrite it, so the name stays held and its
+    /// row names the pin.
+    #[tokio::test]
+    async fn an_exact_pin_in_a_second_install_field_keeps_the_hold() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = caret_spellings_fixture(&root)?;
+        let frontend = indoc! {r#"
+            {
+              "name": "frontend",
+              "dependencies": { "happy-dom": "^20.11.1" },
+              "devDependencies": { "happy-dom": "20.14.5" }
+            }
+        "#};
+        std::fs::write(root.join("apps/frontend/package.json"), frontend)?;
+        let legacy_manifest = read(&root, "apps/legacy/package.json")?;
+        let script = fake_pnpm(&root, "")?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "21.0.4",
+                &CARET_SPELLING_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("the exact pin 20.14.5 excludes 21.0.4"),
+            "{detail}"
+        );
+        assert!(detail.contains("pass --rewrite"), "{detail}");
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "apps/frontend/package.json")?, frontend);
+        assert_eq!(read(&root, "apps/legacy/package.json")?, legacy_manifest);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// Released from the split hold, the joint pin is still verified per importer: when pnpm lands
+    /// it in only some of them, the candidate is rolled back together with the widened carets.
+    #[tokio::test]
+    async fn a_partial_cross_major_landing_restores_the_widened_carets() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = caret_spellings_fixture(&root)?;
+        let manifests = CARET_SPELLING_MEMBERS
+            .iter()
+            .map(|(_, path)| read(&root, &format!("{path}/package.json")))
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let partial = moved(
+            &lock,
+            "apps/frontend",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^21.0.4", "21.0.4"),
+        );
+        std::fs::write(root.join("partial.yaml"), partial)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"happy-dom@21.0.4"*)
+                    cp partial.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "21.0.4",
+                &CARET_SPELLING_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::ResolverConflict);
+        assert!(
+            skip.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("rolled back"))
+        );
+        for ((_, path), before) in CARET_SPELLING_MEMBERS.iter().zip(&manifests) {
+            assert_eq!(
+                &read(&root, &format!("{path}/package.json"))?,
+                before,
+                "{path}"
+            );
+        }
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// Without a project root to confirm the manifests, a ceiling widen stays held.
+    #[test]
+    fn a_ceiling_widen_without_manifests_stays_held() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = caret_spellings_fixture(&root)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "21.0.4",
+                &CARET_SPELLING_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        assert!(
+            held_splits::<Pnpm>(None, Some(&lock), &plan)
+                .names
+                .contains("happy-dom")
+        );
+        assert!(
+            held_splits::<Pnpm>(Some(&root), Some(&lock), &plan)
+                .names
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -6550,7 +6913,9 @@ mod whole_graph_tests {
                 ..Plan::default()
             };
             assert!(
-                held_split_names::<Pnpm>(Some(&lock), &two_targets).contains("@types/node"),
+                held_splits::<Pnpm>(None, Some(&lock), &two_targets)
+                    .names
+                    .contains("@types/node"),
                 "{rewrite:?}"
             );
         }
@@ -6561,7 +6926,11 @@ mod whole_graph_tests {
             ],
             ..Plan::default()
         };
-        assert!(held_split_names::<Pnpm>(Some(&lock), &one_target).is_empty());
+        assert!(
+            held_splits::<Pnpm>(None, Some(&lock), &one_target)
+                .names
+                .is_empty()
+        );
         // The multi-target hold needs no lock: without one the two pins would otherwise reach
         // pnpm together.
         let two_targets = Plan {
@@ -6571,8 +6940,16 @@ mod whole_graph_tests {
             ],
             ..Plan::default()
         };
-        assert!(held_split_names::<Pnpm>(None, &two_targets).contains("@types/node"));
-        assert!(held_split_names::<Pnpm>(None, &one_target).is_empty());
+        assert!(
+            held_splits::<Pnpm>(None, None, &two_targets)
+                .names
+                .contains("@types/node")
+        );
+        assert!(
+            held_splits::<Pnpm>(None, None, &one_target)
+                .names
+                .is_empty()
+        );
         Ok(())
     }
 

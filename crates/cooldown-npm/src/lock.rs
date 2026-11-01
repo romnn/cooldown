@@ -8,6 +8,7 @@
 //! data for both direct/transitive classification and source attribution; older formats fall back to
 //! the root manifest's declared dependency names.
 
+use crate::version::{CeilingHold, is_exact_npm_specifier};
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
@@ -327,6 +328,64 @@ pub enum PreservingPin {
     },
 }
 
+/// How exact-pinning a workspace-declared name to one target relates to its declared ranges
+/// ([`MemberIndex::split_verdict`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitVerdict {
+    /// One joint pin lands without rewriting any declared range.
+    Joint,
+    /// One joint pin lands once each range that excludes the target takes the implicit-ceiling
+    /// widen `--major` authorizes.
+    CeilingWiden,
+    /// The name stays out of the joint pin.
+    Held(SplitHold),
+}
+
+/// Why a workspace-declared name stays out of the joint pin to one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitHold {
+    /// Importers resolve the name at several versions, and these declared ranges do not provably
+    /// admit the target.
+    SeveralLines {
+        /// The resolved versions, ascending.
+        versions: Vec<String>,
+        /// The declared ranges that do not provably admit the target.
+        ranges: Vec<String>,
+    },
+    /// Several importers declare the name, yet the lock resolves none of them.
+    Unresolved,
+    /// Importers resolve the name at several versions, and none records a plain range.
+    NoRange,
+    /// The name resolves at one version, and this declared range excludes the target in a way
+    /// `--major` does not widen.
+    Declaration {
+        /// The declared range, verbatim.
+        range: String,
+        /// Why `--major` cannot widen it.
+        hold: CeilingHold,
+    },
+}
+
+impl SplitHold {
+    /// The first of `ranges` that excludes `target` in a way `--major` does not widen, in the
+    /// given order, or [`None`] when each either admits `target` or takes the ceiling widen.
+    #[must_use]
+    pub fn first_declaration_hold<'a>(
+        ranges: impl IntoIterator<Item = &'a str>,
+        target: &str,
+    ) -> Option<SplitHold> {
+        ranges
+            .into_iter()
+            .filter(|range| !crate::version::version_in_range(range, target))
+            .find_map(|range| {
+                crate::version::ceiling_hold(range, target).map(|hold| SplitHold::Declaration {
+                    range: range.to_string(),
+                    hold,
+                })
+            })
+    }
+}
+
 /// Maps a resolved dependency to the workspace member packages that declare it.
 ///
 /// pnpm records the resolved version per importer, so its entries are keyed exactly by
@@ -428,17 +487,34 @@ impl MemberIndex {
             .collect()
     }
 
-    /// Whether exact-pinning `name` to `target` across every declaring importer would drag some
-    /// importer off its own declared range — the genuine workspace split the whole-graph resolve
-    /// must hold out of the joint update, NOT a transitive duplicate.
+    /// Whether exact-pinning `name` to `target` across every declaring importer must be held —
+    /// the genuine workspace split the whole-graph resolve keeps out of the joint update, NOT a
+    /// transitive duplicate.
+    ///
+    /// See [`Self::split_verdict`] for the rule.
+    #[must_use]
+    pub fn splits_for(&self, name: &str, target: &str) -> bool {
+        matches!(self.split_verdict(name, target), SplitVerdict::Held(_))
+    }
+
+    /// How exact-pinning `name` to `target` across every declaring importer relates to their
+    /// declared ranges.
     ///
     /// Importers that resolve the name to different versions (one member on `chalk@4.1.2`, another
     /// on `chalk@5.3.0`) or declare it under different range specifiers (`~7.3.0` vs `^7.0.0`) are
     /// only a split *relative to the target*: when every distinct declared range provably admits
     /// it, pinning the whole name there is exactly what a plain `pnpm update` does and no manifest
     /// needs rewriting, so two importers on `^4.17.20` and `^4.17.21` both take `4.17.22`.
-    /// The split is held whenever any declared range excludes the target — or cannot be judged at
-    /// all.
+    ///
+    /// Differently spelled ranges on one resolved line that exclude the target only through a
+    /// plain caret or tilde ceiling crossed by a major ([`CeilingHold`]) are no split either: each
+    /// excluding range takes the same implicit-ceiling widen `--major` performs for a lone
+    /// declaration ([`SplitVerdict::CeilingWiden`]).
+    /// Their mere disagreement holds nothing.
+    ///
+    /// Everything else that excludes the target, or cannot be judged at all, is held
+    /// ([`SplitVerdict::Held`]): two resolved lines, an exact pin, a range that is not a plain caret
+    /// or tilde, or a ceiling the target does not cross by a major.
     /// Node-semver forms the Rust parser cannot represent (`||` unions, hyphen ranges, dist tags)
     /// fail [`version_in_range`](crate::version::version_in_range) and so keep the split: the
     /// question is answered only on proof, never by default, since the alternative writes an
@@ -450,17 +526,36 @@ impl MemberIndex {
     /// name with a transitive copy resolved at another version is single-declared and never splits.
     /// Only the version-keyed (pnpm) index carries per-importer data; the name-only (npm) index has
     /// none and never splits.
+    /// The lock records one specifier per importer, so a [`SplitVerdict::CeilingWiden`] still needs
+    /// every install declaration in the manifests confirmed before the widen may run.
     #[must_use]
-    pub fn splits_for(&self, name: &str, target: &str) -> bool {
-        let lines = self.resolved_versions_of(name).len();
+    pub fn split_verdict(&self, name: &str, target: &str) -> SplitVerdict {
+        let versions = self.resolved_versions_of(name);
         let specifiers = self.declared_specifiers_of(name);
-        if lines <= 1 && specifiers.len() <= 1 {
-            return false;
+        if versions.len() <= 1 && specifiers.len() <= 1 {
+            return SplitVerdict::Joint;
         }
-        specifiers.is_empty()
-            || specifiers
-                .iter()
-                .any(|specifier| !crate::version::version_in_range(specifier, target))
+        if specifiers.is_empty() {
+            return SplitVerdict::Held(SplitHold::NoRange);
+        }
+        let excluding: Vec<&str> = specifiers
+            .into_iter()
+            .filter(|specifier| !crate::version::version_in_range(specifier, target))
+            .collect();
+        if excluding.is_empty() {
+            return SplitVerdict::Joint;
+        }
+        match versions.as_slice() {
+            [] => SplitVerdict::Held(SplitHold::Unresolved),
+            [_] => match SplitHold::first_declaration_hold(excluding, target) {
+                Some(hold) => SplitVerdict::Held(hold),
+                None => SplitVerdict::CeilingWiden,
+            },
+            _ => SplitVerdict::Held(SplitHold::SeveralLines {
+                versions: versions.into_iter().map(str::to_string).collect(),
+                ranges: excluding.into_iter().map(str::to_string).collect(),
+            }),
+        }
     }
 
     /// The version `member` (an importer path) resolves `name` to, if this index carries per-importer
@@ -2338,18 +2433,6 @@ fn parse_npm_member_sources(
     Some(map)
 }
 
-/// Whether an npm/pnpm specifier is an exact pin: a bare version (`2.11.0`, `1.0.0-rc.1`) or single
-/// equals range (`=2.11.0`) with no range operator, wildcard, or union. A pinned dependency cannot
-/// move without editing the manifest.
-fn is_exact_npm_specifier(specifier: &str) -> bool {
-    let specifier = specifier.trim();
-    let specifier = specifier
-        .strip_prefix('=')
-        .filter(|version| !version.starts_with('='))
-        .map_or(specifier, str::trim);
-    semver::Version::parse(specifier).is_ok()
-}
-
 /// The `(name, version)` pairs every declaring importer (outside `excluded`) pins exactly in
 /// `pnpm-lock.yaml`.
 /// The importer records both the `specifier:` (the declared range) and the resolved `version:`; a
@@ -3202,12 +3285,8 @@ packages:
         );
     }
 
-    /// The acceptance matrix for target-aware splits: disagreeing ranges or several resolved lines
-    /// split a name only when some declared range excludes (or cannot be judged against) the target
-    /// being pinned.
-    #[test]
-    fn a_split_is_judged_against_the_target() {
-        let lock = indoc! {"
+    /// Workspace declarations exercising every way ranges can disagree about one target.
+    const SPLIT_MATRIX_LOCK: &str = indoc! {"
             importers:
 
               pkgs/a:
@@ -3271,6 +3350,13 @@ packages:
               pinned@2.11.13:
                 resolution: {integrity: sha512-h}
         "};
+
+    /// The acceptance matrix for target-aware splits: disagreeing ranges or several resolved lines
+    /// split a name only when some declared range excludes (or cannot be judged against) the target
+    /// being pinned.
+    #[test]
+    fn a_split_is_judged_against_the_target() {
+        let lock = SPLIT_MATRIX_LOCK;
         let index = Pnpm::member_sources(lock);
         assert!(
             !index.splits_for("lodash", "4.17.22"),
@@ -3299,6 +3385,150 @@ packages:
         assert!(
             index.splits_for("pinned", "2.11.14"),
             "a bare version is an exact npm specifier; it excludes every other target"
+        );
+    }
+
+    /// Each held row of the acceptance matrix names the condition that holds it.
+    #[test]
+    fn a_held_split_names_its_condition() {
+        let index = Pnpm::member_sources(SPLIT_MATRIX_LOCK);
+        let declaration = |range: &str, hold| {
+            SplitVerdict::Held(SplitHold::Declaration {
+                range: range.to_string(),
+                hold,
+            })
+        };
+        assert_eq!(
+            index.split_verdict("semver", "7.4.0"),
+            declaration("~7.3.0", CeilingHold::WithinLine)
+        );
+        assert_eq!(
+            index.split_verdict("tailwindcss", "4.3.3"),
+            SplitVerdict::Held(SplitHold::SeveralLines {
+                versions: vec!["3.4.19".to_string(), "4.3.3".to_string()],
+                ranges: vec!["^3.4.19".to_string()],
+            })
+        );
+        assert_eq!(
+            index.split_verdict("react", "18.3.2"),
+            declaration("^18.0.0 || ^19.0.0", CeilingHold::NotPlain)
+        );
+        assert_eq!(
+            index.split_verdict("pinned", "2.11.14"),
+            declaration("2.11.13", CeilingHold::ExactPin)
+        );
+    }
+
+    /// Differently spelled ranges on one resolved line that exclude a cross-major target only
+    /// through a plain caret or tilde ceiling take the `--major` widen instead of a split hold,
+    /// while every other way of excluding it still holds.
+    #[test]
+    fn a_cross_major_target_past_plain_ceilings_is_no_split() {
+        let lock = indoc! {"
+            importers:
+
+              pkgs/a:
+                dependencies:
+                  caret:
+                    specifier: ^20.11.1
+                    version: 20.14.5
+                  tilde:
+                    specifier: ~20.11.1
+                    version: 20.11.4
+                  zero:
+                    specifier: ^0.3.1
+                    version: 0.3.2
+                  exact:
+                    specifier: 20.14.5
+                    version: 20.14.5
+                  bounded:
+                    specifier: ^20.11.1
+                    version: 20.14.5
+                  floor:
+                    specifier: ^21.0.0
+                    version: 21.1.0
+                  next:
+                    specifier: ~20.0.0-next.1
+                    version: 20.0.0
+                  unresolved:
+                    specifier: ^20.11.1
+
+              pkgs/b:
+                dependencies:
+                  caret:
+                    specifier: ^20.9.0
+                    version: 20.14.5
+                  tilde:
+                    specifier: ^20.9.0
+                    version: 20.11.4
+                  zero:
+                    specifier: ^0.3.0
+                    version: 0.3.2
+                  exact:
+                    specifier: ^20.9.0
+                    version: 20.14.5
+                  bounded:
+                    specifier: '>=20 <21'
+                    version: 20.14.5
+                  floor:
+                    specifier: ^21.1.0
+                    version: 21.1.0
+                  next:
+                    specifier: ^20.0.0
+                    version: 20.0.0
+                  unresolved:
+                    specifier: ^20.9.0
+        "};
+        let index = Pnpm::member_sources(lock);
+        let declaration = |range: &str, hold| {
+            SplitVerdict::Held(SplitHold::Declaration {
+                range: range.to_string(),
+                hold,
+            })
+        };
+
+        // The implicit ceilings widen.
+        assert_eq!(
+            index.split_verdict("caret", "21.0.4"),
+            SplitVerdict::CeilingWiden
+        );
+        assert_eq!(
+            index.split_verdict("tilde", "21.0.4"),
+            SplitVerdict::CeilingWiden
+        );
+        assert_eq!(
+            index.split_verdict("zero", "0.4.0"),
+            SplitVerdict::CeilingWiden,
+            "a 0.x minor is the major line"
+        );
+        assert_eq!(
+            index.split_verdict("next", "21.0.0"),
+            SplitVerdict::CeilingWiden,
+            "a prerelease base is still a plain tilde"
+        );
+        assert!(!index.splits_for("caret", "21.0.4"));
+
+        // An in-line target both ranges admit needs no widen at all.
+        assert_eq!(index.split_verdict("caret", "20.14.6"), SplitVerdict::Joint);
+
+        // Everything else holds, naming why.
+        assert_eq!(
+            index.split_verdict("exact", "21.0.4"),
+            declaration("20.14.5", CeilingHold::ExactPin)
+        );
+        assert_eq!(
+            index.split_verdict("bounded", "21.0.4"),
+            declaration(">=20 <21", CeilingHold::NotPlain)
+        );
+        assert_eq!(
+            index.split_verdict("floor", "20.14.6"),
+            declaration("^21.0.0", CeilingHold::BelowFloor),
+            "a rollback below a caret floor is no ceiling widen"
+        );
+        assert_eq!(
+            index.split_verdict("unresolved", "21.0.4"),
+            SplitVerdict::Held(SplitHold::Unresolved),
+            "the widen needs exactly one resolved line"
         );
     }
 
