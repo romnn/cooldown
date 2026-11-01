@@ -30,9 +30,11 @@ pub(crate) struct PeerEvidence {
     /// Importer attribution: which member declares which `(name, version)`.
     members: crate::lock::MemberIndex,
     /// The planned names the whole-graph resolve will not exact-pin: their workspace declarations
-    /// split under the planned target ([`crate::tool::held_split_names`]).
+    /// split under the planned target ([`crate::tool::held_splits`]).
     /// The gate treats them as staying in place — never as moving, never as a candidate to reject.
     pub(crate) multi_version: HashSet<String>,
+    /// Why each name in `multi_version` held by its declared ranges is held, where known.
+    pub(crate) split_holds: HashMap<String, crate::lock::SplitHold>,
     /// Names *resolved* at multiple versions anywhere in the graph.
     resolved_splits: HashSet<String>,
     /// Peer contracts read from workspace member manifests (empty without a project root).
@@ -63,7 +65,10 @@ impl PeerEvidence {
             (Some(root), Some(lock)) => workspace_peer_requirements::<L>(root, lock, &members),
             _ => Vec::new(),
         };
-        let multi_version = crate::tool::held_split_names::<L>(lock, plan);
+        let crate::tool::HeldSplits {
+            names: multi_version,
+            reasons: split_holds,
+        } = crate::tool::held_splits::<L>(root, lock, plan);
         let (resolved_splits, install) = if requirements.is_empty() && workspace.is_empty() {
             (HashSet::new(), None)
         } else {
@@ -76,6 +81,7 @@ impl PeerEvidence {
             requirements,
             members,
             multi_version,
+            split_holds,
             resolved_splits,
             workspace,
             install,
@@ -185,6 +191,7 @@ pub(crate) fn partition_peer_held<L: NodeLock>(
         requirements,
         members,
         multi_version,
+        split_holds: _,
         resolved_splits,
         workspace,
         install,
@@ -822,7 +829,7 @@ pub(crate) fn first_new_peer_violation<L: NodeLock>(
 }
 
 /// Names the lock resolves at more than one distinct version — the whole resolved graph, nested
-/// copies included, unlike [`held_split_names`](crate::tool::held_split_names), which judges
+/// copies included, unlike [`held_splits`](crate::tool::held_splits), which judges
 /// importer *declarations* only.
 /// Tells the gate when npm's name-only importer attribution is ambiguous — consulted only when no
 /// physical layout can resolve the split instance-exactly (see [`direct_dependent_members`]).

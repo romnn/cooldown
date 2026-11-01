@@ -169,7 +169,7 @@ fn npm_clause(clause: &str) -> String {
 /// Whether `clause` is an npm X-range (`*`, `1.x`, `1.2.X`): a wildcard *version component* before
 /// any prerelease/build suffix — so `1.0.0-x.7` (a prerelease tag that merely contains `x`) is not
 /// one.
-fn is_x_range(clause: &str) -> bool {
+pub(crate) fn is_x_range(clause: &str) -> bool {
     clause
         .split(['-', '+'])
         .next()
@@ -228,6 +228,100 @@ pub fn most_restrictive_declared_bound(ranges: impl IntoIterator<Item = String>)
         }
     }
     best.map(|(_, range)| range)
+}
+
+/// Whether an npm/pnpm specifier is an exact pin: a bare version (`2.11.0`, `1.0.0-rc.1`) or single
+/// equals range (`=2.11.0`) with no range operator, wildcard, or union. A pinned dependency cannot
+/// move without editing the manifest.
+pub(crate) fn is_exact_npm_specifier(specifier: &str) -> bool {
+    let specifier = specifier.trim();
+    let specifier = specifier
+        .strip_prefix('=')
+        .filter(|version| !version.starts_with('='))
+        .map_or(specifier, str::trim);
+    Version::parse(specifier).is_ok()
+}
+
+/// Why `--major` cannot carry a declared range to a target the range excludes.
+///
+/// `--major` authorizes one rewrite: lifting the implicit ceiling of a plain caret or tilde range
+/// across a major line, the same widen it performs for a lone declaration.
+/// Every other way a range can exclude the target needs `--rewrite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingHold {
+    /// The range is an exact version, which no implicit ceiling bounds.
+    ExactPin,
+    /// The range is not a plain `^` or `~` range: a union, hyphen range, comparator set, wildcard,
+    /// explicit bound, or a form cooldown cannot read.
+    NotPlain,
+    /// A plain range excludes the target on its own major line, as `~7.3.0` excludes `7.4.0`.
+    WithinLine,
+    /// A plain range excludes the target by its floor, which sits above the target.
+    BelowFloor,
+}
+
+/// Judges whether `--major` may widen `specifier` to `target`, given that it excludes `target`.
+///
+/// Returns [`None`] when `specifier` is a plain caret or tilde range whose base lies on a lower
+/// major line than `target` (by [`major_key`], so a `0.x` minor counts as the major), and the
+/// reason it is held otherwise.
+///
+/// # Examples
+///
+/// ```
+/// use cooldown_npm::version::{CeilingHold, ceiling_hold};
+///
+/// assert_eq!(ceiling_hold("^20.9.0", "21.0.4"), None);
+/// assert_eq!(ceiling_hold("~20.11.1", "21.0.4"), None);
+/// assert_eq!(ceiling_hold("^0.3.1", "0.4.0"), None);
+/// assert_eq!(ceiling_hold("~7.3.0", "7.4.0"), Some(CeilingHold::WithinLine));
+/// assert_eq!(ceiling_hold("^21.0.0", "20.14.6"), Some(CeilingHold::BelowFloor));
+/// assert_eq!(ceiling_hold("20.14.5", "21.0.4"), Some(CeilingHold::ExactPin));
+/// assert_eq!(ceiling_hold(">=20 <21", "21.0.4"), Some(CeilingHold::NotPlain));
+/// ```
+#[must_use]
+pub fn ceiling_hold(specifier: &str, target: &str) -> Option<CeilingHold> {
+    if is_exact_npm_specifier(specifier) {
+        return Some(CeilingHold::ExactPin);
+    }
+    let (Some(base), Some(target)) = (plain_caret_or_tilde_base(specifier), parse(target)) else {
+        return Some(CeilingHold::NotPlain);
+    };
+    if target <= base {
+        Some(CeilingHold::BelowFloor)
+    } else if major_key(&target.to_string()) == major_key(&base.to_string()) {
+        Some(CeilingHold::WithinLine)
+    } else {
+        None
+    }
+}
+
+/// The base version of a plain caret or tilde range, with a numeric partial (`^20`, `~20.9`)
+/// padded with zeros.
+///
+/// A union, comparator, wildcard component, spacing, or `v` prefix makes the range not plain.
+fn plain_caret_or_tilde_base(specifier: &str) -> Option<Version> {
+    let specifier = specifier.trim();
+    let rest = specifier
+        .strip_prefix('^')
+        .or_else(|| specifier.strip_prefix('~'))?;
+    if let Ok(version) = Version::parse(rest) {
+        return Some(version);
+    }
+    let mut parts = rest.split('.');
+    let major = numeric_component(parts.next()?)?;
+    let minor = parts.next().map_or(Some(0), numeric_component)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Version::new(major, minor, 0))
+}
+
+fn numeric_component(part: &str) -> Option<u64> {
+    if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
 }
 
 /// Returns `true` when `v` carries a prerelease segment (e.g. `1.0.0-rc.1`).
@@ -362,6 +456,45 @@ mod tests {
         assert_eq!(classify_kind("1.2.3", "1.3.0"), Some(UpdateKind::Minor));
         assert_eq!(classify_kind("1.2.3", "1.2.4"), Some(UpdateKind::Patch));
         assert_eq!(classify_kind("bad", "1.2.4"), None);
+    }
+
+    #[test]
+    fn ceiling_hold_widens_only_a_plain_ceiling_crossed_by_a_major() {
+        // Numeric partials are plain ranges padded with zeros.
+        assert_eq!(ceiling_hold("^20", "21.0.0"), None);
+        assert_eq!(ceiling_hold("~20.9", "21.0.0"), None);
+        assert_eq!(ceiling_hold("~20.0.0-next.1", "21.0.0"), None);
+        assert_eq!(ceiling_hold("^0.3", "0.4.0"), None);
+        // The `0.0` line is one major key, so a step within it is no major crossing.
+        assert_eq!(
+            ceiling_hold("^0.0.3", "0.0.4"),
+            Some(CeilingHold::WithinLine)
+        );
+        // A caret excludes an in-major prerelease of a later minor only within its line.
+        assert_eq!(
+            ceiling_hold("^20.0.0", "20.1.0-rc.1"),
+            Some(CeilingHold::WithinLine)
+        );
+        assert_eq!(
+            ceiling_hold("=20.14.5", "21.0.4"),
+            Some(CeilingHold::ExactPin)
+        );
+        for not_plain in [
+            "^20.x",
+            "~>1.2",
+            "^v20.0.0",
+            "^ 20.0.0",
+            "^20.0.0 || ^21.0.0",
+            "20.x",
+            "<21",
+            "latest",
+        ] {
+            assert_eq!(
+                ceiling_hold(not_plain, "21.0.4"),
+                Some(CeilingHold::NotPlain),
+                "{not_plain}"
+            );
+        }
     }
 
     #[test]

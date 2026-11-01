@@ -1417,6 +1417,168 @@ fn upgrade_preserves_distinct_versions_across_members() {
     );
 }
 
+/// Seeds the chalk v4 line before chalk 5.0.0 was published, so every importer, the open `>=`
+/// range included, resolves the single 4.1.2 copy.
+const CARET_SPELLING_SEED: &str = "2021-10-01T00:00:00Z";
+
+/// Three members declare `chalk` on one resolved line under different spellings: two carets
+/// whose implicit ceilings exclude chalk 5, and an open range that admits it.
+fn caret_spelling_fixture() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write(
+        "pkgs/a/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "@cooldown/caret-new",
+              "version": "0.1.0",
+              "dependencies": { "chalk": "^4.1.0", "ms": "^2.1.0" }
+            }
+        "#},
+    );
+    fixture.write(
+        "pkgs/b/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "@cooldown/caret-old",
+              "version": "0.1.0",
+              "dependencies": { "chalk": "^4.0.0" }
+            }
+        "#},
+    );
+    fixture.write(
+        "pkgs/c/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "@cooldown/open",
+              "version": "0.1.0",
+              "dependencies": { "chalk": ">=4.0.0" }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, CARET_SPELLING_SEED);
+    fixture
+}
+
+fn chalk_range(fixture: &Fixture, member: &str) -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes(&format!("pkgs/{member}/package.json")))
+            .expect("member manifest parses");
+    manifest
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get("chalk"))
+        .and_then(serde_json::Value::as_str)
+        .expect("chalk is declared")
+        .to_string()
+}
+
+/// `--major` without `--rewrite` lands a cross-major target across differently spelled carets as
+/// it would under one shared range: one chalk 5 line in every member, each caret widened to the
+/// target, and the declarations that needed no widen left byte-identical.
+#[test]
+fn upgrade_major_converges_differently_spelled_carets_without_rewrite() {
+    skip_if_missing!("pnpm");
+    let fixture = caret_spelling_fixture();
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    assert!(lock_has_chalk_major(&seed, "4.") && !lock_has_chalk_major(&seed, "5."));
+    let open_manifest = fixture.read_bytes("pkgs/c/package.json");
+
+    // `outdated` calls the move adoptable rather than blocked, agreeing with the upgrade below.
+    let outdated = fixture.cooldown_json(&["outdated", "--major", "--freeze", FREEZE]);
+    assert!(
+        outdated.outdated_with_status("adoptable").contains("chalk"),
+        "{outdated:#?}"
+    );
+    assert!(!outdated.outdated_with_status("blocked").contains("chalk"));
+
+    let upgrade = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--package",
+        "chalk",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["chalk".to_string()]),
+        "{upgrade:#?}"
+    );
+
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert!(lock_has_chalk_major(&after, "5.") && !lock_has_chalk_major(&after, "4."));
+    let target = pnpm_lock_pins(&after)
+        .get("chalk")
+        .cloned()
+        .expect("chalk is locked");
+    assert_eq!(chalk_range(&fixture, "a"), format!("^{target}"));
+    assert_eq!(chalk_range(&fixture, "b"), format!("^{target}"));
+    assert_eq!(fixture.read_bytes("pkgs/c/package.json"), open_manifest);
+    let member_a: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("pkgs/a/package.json")).expect("parses");
+    assert_eq!(
+        member_a
+            .get("dependencies")
+            .and_then(|dependencies| dependencies.get("ms")),
+        Some(&serde_json::Value::from("^2.1.0")),
+        "a sibling stays as written"
+    );
+
+    // A converged workspace re-applies to a byte-stable lock.
+    let again = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--package",
+        "chalk",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(again.ok(), "{again:#?}");
+    assert_eq!(again.summary_applied(), 0, "{again:#?}");
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), after);
+}
+
+/// An explicit `<5` bound in one member caps the `--major` target at planning, so the caret beside
+/// it is never widened past the bound.
+#[test]
+fn upgrade_major_respects_an_explicit_bound_beside_a_caret() {
+    skip_if_missing!("pnpm");
+    let fixture = caret_spelling_fixture();
+    fixture.write(
+        "pkgs/c/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "@cooldown/open",
+              "version": "0.1.0",
+              "dependencies": { "chalk": ">=4.0.0 <5" }
+            }
+        "#},
+    );
+    seed_lock(&fixture, CARET_SPELLING_SEED);
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+
+    let upgrade = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--package",
+        "chalk",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(upgrade.summary_applied(), 0, "{upgrade:#?}");
+    // The planner holds the cross-major target at the bound; the split hold never sees it.
+    let reasons = upgrade.skipped_reasons_for("chalk");
+    assert!(reasons.contains("declared_bound_held"), "{upgrade:#?}");
+    assert!(!reasons.contains("multi_version_held"), "{upgrade:#?}");
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
+    assert_eq!(chalk_range(&fixture, "a"), "^4.1.0");
+    assert_eq!(chalk_range(&fixture, "b"), "^4.0.0");
+}
+
 /// `sync` bakes the cooldown.toml policy into pnpm's native config: the default `min-age` becomes
 /// `minimumReleaseAge`, AND every `[package."…"] latest` selector becomes an entry in
 /// `minimumReleaseAgeExclude` — so a package cooldown's own policy exempts is also exempt from pnpm's

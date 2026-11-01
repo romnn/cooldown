@@ -78,6 +78,35 @@ pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>>
     Ok(None)
 }
 
+/// Every install-field range declaring `name` in this manifest, in field order.
+///
+/// Unlike [`declared_range`], a name declared in several install fields yields each of them, since
+/// [`widen_constraints`] rewrites them all.
+/// Protocol specifiers (`catalog:`, `workspace:`, `npm:` aliases) are skipped, as the widen never
+/// rewrites them.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] if the manifest is absent, cannot be read, or is not valid JSON: a
+/// caller confirming that no declaration forbids a widen cannot treat a missing manifest as one
+/// that declares nothing.
+pub fn install_ranges(manifest: &Utf8Path, name: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(manifest)
+        .map_err(|e| CoreError::Filesystem(format!("{manifest}: {e}")))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
+    Ok(WIDENABLE_FIELDS
+        .iter()
+        .filter_map(|field| {
+            doc.get(field)
+                .and_then(|section| section.get(name))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|range| !range.contains(':'))
+        .map(str::to_string)
+        .collect())
+}
+
 /// Which declarations name a dependency and where npm must run a member-owned exact pin.
 ///
 /// The apply distinguishes "nobody declares this" (skip it) from "declared, but only in a field
@@ -402,13 +431,15 @@ fn widen_manifest(
 fn bump_range(old: &str, target: &str) -> String {
     let target = target.split_once('+').map_or(target, |(base, _)| base);
     let trimmed = old.trim();
+    // A wildcard is judged by version component, so a prerelease tag that merely contains an
+    // `x` (`~20.0.0-next.1`) keeps its operator.
+    let wildcard =
+        crate::version::is_x_range(trimmed.trim_start_matches(['^', '~', '=', '>', '<']));
     if trimmed.is_empty()
         || trimmed.contains("||")
         || trimmed.contains(" - ")
         || trimmed.contains(',')
-        || trimmed.contains('*')
-        || trimmed.contains('x')
-        || trimmed.contains('X')
+        || wildcard
         || trimmed.contains(char::is_whitespace)
     {
         return format!("^{target}");
@@ -677,6 +708,63 @@ mod tests {
         assert_eq!(bound.as_deref(), Some(">=5 <6"));
     }
 
+    /// An explicit bound in one importer caps a `--major` target at planning even when another
+    /// importer spells a plain caret the ceiling widen could carry, so the widen never sees it.
+    #[test]
+    fn an_explicit_bound_beside_a_caret_caps_the_major_target() -> color_eyre::eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temp dir {}", path.display()))?;
+        std::fs::create_dir_all(root.join("apps/a"))?;
+        std::fs::create_dir_all(root.join("apps/b"))?;
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "devDependencies": { "happy-dom": "^20.11.1" } }"#,
+        )?;
+        std::fs::write(
+            root.join("apps/b/package.json"),
+            r#"{ "devDependencies": { "happy-dom": ">=20 <21" } }"#,
+        )?;
+
+        let bound = declared_bound(
+            &root,
+            &[member("a", "apps/a"), member("b", "apps/b")],
+            "happy-dom",
+        )?;
+
+        // The planner marks every release outside this bound beyond it.
+        assert_eq!(bound.as_deref(), Some(">=20 <21"));
+        assert!(!crate::version::version_in_range(">=20 <21", "21.0.4"));
+        assert!(crate::version::version_in_range(">=20 <21", "20.14.6"));
+        Ok(())
+    }
+
+    #[test]
+    fn install_ranges_read_every_install_field() -> color_eyre::eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temp dir {}", path.display()))?;
+        let manifest = root.join("package.json");
+        std::fs::write(
+            &manifest,
+            indoc::indoc! {r#"{
+                "dependencies": { "dep": "^20.11.1" },
+                "devDependencies": { "dep": "20.14.5" },
+                "optionalDependencies": { "dep": "catalog:" },
+                "peerDependencies": { "dep": ">=20" }
+            }"#},
+        )?;
+
+        // The widen rewrites every install field, so each counts; a protocol specifier is never
+        // rewritten and a published peer contract is never widened.
+        assert_eq!(
+            install_ranges(&manifest, "dep")?,
+            vec!["^20.11.1".to_string(), "20.14.5".to_string()]
+        );
+        assert!(install_ranges(&root.join("absent.json"), "dep").is_err());
+        Ok(())
+    }
+
     /// A widen rewrites what the package installs and nothing else. `peerDependencies` states what
     /// the package requires *of its consumers*, and [`bump_range`] shifts rather than only loosens,
     /// so rewriting it would drop supported consumers as a side effect of moving a lock pin.
@@ -809,6 +897,10 @@ mod tests {
         // npm's semver ignores build metadata in range matching, so a resolved `1.2.3+build` must not
         // leak into the declared range — across every operator family. A prerelease is preserved.
         assert_eq!(bump_range("^3.0.0", "5.0.0+build.7"), "^5.0.0");
+        // A prerelease tag containing an `x` is no wildcard, so the operator survives.
+        assert_eq!(bump_range("~20.0.0-next.1", "21.0.0"), "~21.0.0");
+        assert_eq!(bump_range("^1.x", "2.0.0"), "^2.0.0");
+        assert_eq!(bump_range("~1.2.x", "2.0.0"), "^2.0.0");
         assert_eq!(bump_range("~3.0.0", "3.3.0+build.7"), "~3.3.0");
         assert_eq!(bump_range(">=3.0.0", "3.3.0+build.7"), ">=3.3.0");
         assert_eq!(bump_range(">3.0.0", "3.3.0+build.7"), ">=3.3.0");
