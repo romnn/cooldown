@@ -244,25 +244,13 @@ pub trait NodeLock: Send + Sync + 'static {
         None
     }
 
-    /// The driver args that move **only** the lock to an exact, already-in-range `version`, leaving
-    /// the declared `package.json` range untouched — the lock-only path for `RewriteMode::Auto`.
-    ///
-    /// `None` (the default) means the package manager has no such command, so it always rewrites the
-    /// manifest. The caller must only use this when `version` already satisfies the declared range:
-    /// these commands re-pin whatever version they are given without validating it against the range,
-    /// so an out-of-range version would leave the lock inconsistent with `package.json`.
-    #[must_use]
-    fn lockonly_update_args(_name: &str, _version: &str) -> Option<Vec<String>> {
-        None
-    }
-
     /// The driver args that refresh the lock pinned to an exact `version`, for the manifest-rewrite
     /// path (so the lock lands on exactly the cooldown-approved target instead of re-resolving the
     /// widened range to its newest member).
     ///
-    /// Unlike [`lockonly_update_args`](NodeLock::lockonly_update_args), this may save a range as a
-    /// side effect. It is only safe inside a preserving transaction that restores cooldown's
-    /// authorized manifest bytes. `None` (the default) means the manager has no exact-pin install,
+    /// This may save a range as a side effect.
+    /// It is only safe inside a preserving transaction that restores cooldown's authorized manifest
+    /// bytes. `None` (the default) means the manager has no exact-pin install,
     /// so the caller re-resolves.
     #[must_use]
     fn pinned_relock_args(
@@ -278,7 +266,10 @@ pub trait NodeLock: Send + Sync + 'static {
     /// capability, which leaves the caller re-resolving.
     ///
     /// `workspaces` scopes managers whose root-level pin cannot safely reach a member-owned
-    /// declaration; managers with intrinsically manifest-free pins may ignore it.
+    /// declaration.
+    ///
+    /// A manager with a joint resolve ([`NodeLock::supports_whole_graph_resolve`]) never lands one
+    /// candidate at a time, so it does not implement this.
     #[must_use]
     fn preserving_pin(
         _name: &str,
@@ -310,22 +301,18 @@ pub trait NodeLock: Send + Sync + 'static {
 ///   silently does nothing.
 ///
 /// So the operation is modeled by what the manager can actually do, not by one argv.
+/// The manager's only exact pin also *saves* the range (npm's `install <name>@<version>`, which
+/// writes into whichever field already declares the package), so it runs bracketed: pin, restore
+/// cooldown's authorized manifest bytes, then run a plain relock.
+/// The final step makes the restore consistent: the pin also rewrote the lock's own copy of the
+/// manifest metadata, and synchronization recopies the restored ranges while keeping the pinned
+/// version, which satisfies them.
 #[derive(Debug)]
-pub enum PreservingPin {
-    /// One command pins the exact version and writes no manifest (pnpm's `update --no-save`).
-    Direct(Vec<String>),
-    /// The manager's only exact pin also *saves* the range (npm's `install <name>@<version>`, which
-    /// writes into whichever field already declares the package), so it runs bracketed: pin, restore
-    /// cooldown's authorized manifest bytes, then run a plain relock. The final step makes the
-    /// restore consistent: the pin also rewrote the lock's own copy of the manifest metadata, and
-    /// synchronization recopies the restored ranges while keeping the pinned version, which
-    /// satisfies them.
-    PinRestoreResync {
-        /// The exact pin, which may edit manifests.
-        pin: Vec<String>,
-        /// The manifest-preserving lock synchronization that follows the restore.
-        resync: Vec<String>,
-    },
+pub struct PreservingPin {
+    /// The exact pin, which may edit manifests.
+    pub pin: Vec<String>,
+    /// The manifest-preserving lock synchronization that follows the restore.
+    pub resync: Vec<String>,
 }
 
 /// How exact-pinning a workspace-declared name to one target relates to its declared ranges
@@ -1489,13 +1476,13 @@ impl NodeLock for Npm {
         // npm has no exact pin that skips the save (`--no-save` makes the install a no-op whenever
         // the tree already satisfies the manifest), so cooldown restores its authorized manifest
         // bytes after the pin. A plain relock then recopies those ranges into package-lock metadata
-        // while retaining the exact, compatible resolution. See [`PreservingPin::PinRestoreResync`].
+        // while retaining the exact, compatible resolution. See [`PreservingPin`].
         let mut pin = Self::pinned_relock_args(name, version, before)?;
         for workspace in workspaces {
             pin.push(format!("--workspace={workspace}"));
         }
         let resync = Self::relock_args(before);
-        Some(PreservingPin::PinRestoreResync { pin, resync })
+        Some(PreservingPin { pin, resync })
     }
 
     fn build_args(before: Option<&str>) -> Vec<String> {
@@ -1641,29 +1628,6 @@ impl NodeLock for Pnpm {
 
     fn lock_consistency_error(content: &str) -> Option<String> {
         pnpm_lock_consistency_error(content)
-    }
-
-    fn preserving_pin(
-        name: &str,
-        version: &str,
-        _before: Option<&str>,
-        _workspaces: &[String],
-    ) -> Option<PreservingPin> {
-        // pnpm's exact pin already skips the manifest (`--no-save`), so one command suffices.
-        Some(PreservingPin::Direct(Self::lockonly_update_args(
-            name, version,
-        )?))
-    }
-
-    fn lockonly_update_args(name: &str, version: &str) -> Option<Vec<String>> {
-        // `pnpm update <name>@<version>` re-pins the lock to exactly that version; `--no-save` keeps
-        // the `package.json` range as the author wrote it, and `--lockfile-only` skips node_modules.
-        Some(vec![
-            "update".into(),
-            format!("{name}@{version}"),
-            "--lockfile-only".into(),
-            "--no-save".into(),
-        ])
     }
 
     fn build_args(_before: Option<&str>) -> Vec<String> {
