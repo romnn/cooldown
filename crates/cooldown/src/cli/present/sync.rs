@@ -86,3 +86,43 @@ pub(in crate::cli) fn render_sync_text(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render_sync_text;
+    use crate::app::{SyncItem, SyncStatus, SyncSummary};
+    use cooldown_core::{Diagnostic, DiagnosticKind};
+
+    /// A native sync warning is printed after the tally, tagged with its kind, so a selector
+    /// pnpm cannot carry is visible on an otherwise clean run.
+    #[test]
+    fn sync_text_lists_native_warnings_after_the_tally() {
+        let items = [SyncItem {
+            tool: "pnpm".to_string(),
+            project: ".".to_string(),
+            status: SyncStatus::Written,
+            path: Some("pnpm-workspace.yaml".to_string()),
+            window: Some("14d".to_string()),
+            error: None,
+        }];
+        let summary = SyncSummary {
+            written: 1,
+            ..SyncSummary::default()
+        };
+        let warnings = [Diagnostic::new(
+            DiagnosticKind::StricterNative,
+            "selector `react-?om` is left out",
+        )
+        .with_tool("pnpm")
+        .with_project(".")];
+        assert_eq!(
+            render_sync_text(&summary, &items, &warnings),
+            indoc::indoc! {"
+                  . (pnpm): written [14d]
+
+                1 written · 0 unchanged · 0 unsupported · 0 errors
+                warning [stricter_native]: selector `react-?om` is left out
+            "}
+        );
+    }
+}

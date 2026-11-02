@@ -947,9 +947,15 @@ impl ToolWrite for UvTool {
             dry_run,
         )?;
         if written {
-            Ok(SyncReport::Written { path })
+            Ok(SyncReport::Written {
+                path,
+                warnings: Vec::new(),
+            })
         } else {
-            Ok(SyncReport::Unchanged { path })
+            Ok(SyncReport::Unchanged {
+                path,
+                warnings: Vec::new(),
+            })
         }
     }
 }

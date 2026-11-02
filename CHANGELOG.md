@@ -13,6 +13,15 @@
   declaration per distinct range. The skip-reason set is part of the JSON contract, so
   `schemaVersion` is now `7`.
 
+- **pnpm `sync` writes only the selectors pnpm matches the same way.** pnpm's
+  `minimumReleaseAgeExclude` knows only `*` and a leading `!`, so a `latest`/`allow` selector using
+  other glob syntax (`@types/{node,react}`, `react-?om`, `[a-c]*`, `**/foo`) exempted different
+  packages on pnpm's side. Such a selector is now left out of the native list and reported as a
+  `stricter_native` warning, so pnpm's own age gate keeps applying to the packages it matches; an
+  admitted exact version is dropped only when a written selector covers it under pnpm's matcher.
+  When every selector is left out and nothing else remains, `sync` writes an explicit
+  `minimumReleaseAgeExclude: []` instead of removing the key, so inherited exclusions stay masked.
+
 ## v0.0.27
 
 - **Cargo upgrades no longer raise an in-range requirement by default.** Without `--rewrite`, a

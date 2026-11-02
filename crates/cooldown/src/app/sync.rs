@@ -345,6 +345,7 @@ impl Workspace {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
+                warnings.extend(report_warnings(report, tool, &project));
                 SyncItem {
                     tool: tool.as_str().to_string(),
                     project,
@@ -418,6 +419,7 @@ impl Workspace {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report);
                 summary.record(status);
+                warnings.extend(report_warnings(report, tool, &project));
                 SyncItem {
                     tool: tool.as_str().to_string(),
                     project,
@@ -516,12 +518,24 @@ struct SyncClassification {
 
 fn classify(report: &SyncReport) -> SyncClassification {
     let (status, path) = match report {
-        SyncReport::Written { path } => (SyncStatus::Written, Some(path.to_string())),
-        SyncReport::Unchanged { path } => (SyncStatus::Unchanged, Some(path.to_string())),
+        SyncReport::Written { path, .. } => (SyncStatus::Written, Some(path.to_string())),
+        SyncReport::Unchanged { path, .. } => (SyncStatus::Unchanged, Some(path.to_string())),
         SyncReport::Deferred { .. } => (SyncStatus::Written, None),
         SyncReport::Unsupported => (SyncStatus::Unsupported, None),
     };
     SyncClassification { status, path }
+}
+
+/// The adapter's non-fatal diagnostics from `report`, attributed to the synced tool and project.
+fn report_warnings(report: SyncReport, tool: ToolId, project: &str) -> Vec<Diagnostic> {
+    let warnings = match report {
+        SyncReport::Written { warnings, .. } | SyncReport::Unchanged { warnings, .. } => warnings,
+        SyncReport::Deferred { .. } | SyncReport::Unsupported => Vec::new(),
+    };
+    warnings
+        .into_iter()
+        .map(|warning| warning.with_tool(tool.as_str()).with_project(project))
+        .collect()
 }
 
 /// A short window label for display (`14d`, a freeze date, or `latest`).
@@ -596,6 +610,8 @@ mod tests {
         deps: Vec<cooldown_core::Dependency>,
         published_at: Option<jiff::Timestamp>,
         fail_fetch: bool,
+        /// The unattributed warnings every native sync reports.
+        native_warnings: Vec<cooldown_core::Diagnostic>,
     }
 
     #[async_trait::async_trait]
@@ -751,7 +767,10 @@ mod tests {
                     cooldown_core::CoreError::Filesystem(format!("failed to write {path}: {err}"))
                 })?;
             }
-            Ok(cooldown_core::SyncReport::Written { path })
+            Ok(cooldown_core::SyncReport::Written {
+                path,
+                warnings: self.native_warnings.clone(),
+            })
         }
     }
 
@@ -827,6 +846,7 @@ mod tests {
                 deps: deps.clone(),
                 published_at,
                 fail_fetch: false,
+                native_warnings: Vec::new(),
             },
             "2026-06-17T00:00:00Z".parse()?,
             baseline.clone(),
@@ -844,6 +864,7 @@ mod tests {
                 deps,
                 published_at,
                 fail_fetch: false,
+                native_warnings: Vec::new(),
             },
             "2026-07-17T00:00:00Z".parse()?,
             baseline,
@@ -851,6 +872,74 @@ mod tests {
         assert_eq!(mature.sync(&RunOpts::default()).await.summary.errors, 0);
         assert_eq!(std::fs::read_to_string(&path)?, "");
         Ok(())
+    }
+
+    /// An adapter's native sync warnings reach the outcome attributed to the synced tool and
+    /// project, in a dry run as in a real one, beside the written item.
+    #[tokio::test]
+    async fn sync_attributes_native_warnings_to_the_tool_and_project() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let warning = cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::StricterNative,
+            "selector `a?` is left out",
+        );
+        let ws = admission_workspace(
+            &root,
+            AdmissionAdapter {
+                deps: Vec::new(),
+                published_at: None,
+                fail_fetch: false,
+                native_warnings: vec![warning.clone()],
+            },
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+        )?;
+        let expected = warning.with_tool(CARGO.as_str()).with_project(".");
+        for dry_run in [true, false] {
+            let opts = RunOpts {
+                dry_run,
+                ..RunOpts::default()
+            };
+            let outcome = ws.sync(&opts).await;
+            assert_eq!(outcome.summary.written, 1, "dry run: {dry_run}");
+            assert_eq!(
+                outcome.warnings,
+                std::slice::from_ref(&expected),
+                "dry run: {dry_run}"
+            );
+            assert_eq!(outcome.exit, Exit::Ok);
+        }
+        Ok(())
+    }
+
+    /// Only a written or unchanged report carries native warnings, and each is attributed.
+    #[test]
+    fn report_warnings_attribute_written_and_unchanged_reports() {
+        let warning = cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::StricterNative,
+            "selector `a?` is left out",
+        );
+        let expected = [warning.clone().with_tool("uv").with_project(".")];
+        let path = Utf8PathBuf::from("uv.toml");
+        let written = cooldown_core::SyncReport::Written {
+            path: path.clone(),
+            warnings: vec![warning.clone()],
+        };
+        let unchanged = cooldown_core::SyncReport::Unchanged {
+            path,
+            warnings: vec![warning],
+        };
+        assert_eq!(super::report_warnings(written, ToolId("uv"), "."), expected);
+        assert_eq!(
+            super::report_warnings(unchanged, ToolId("uv"), "."),
+            expected
+        );
+        assert_eq!(
+            super::report_warnings(cooldown_core::SyncReport::Unsupported, ToolId("uv"), "."),
+            []
+        );
     }
 
     /// A registry lookup failure warns while preserving the exact native exclusions.
@@ -867,6 +956,7 @@ mod tests {
                 deps: vec![admission_dependency("retained", true)],
                 published_at: None,
                 fail_fetch: true,
+                native_warnings: Vec::new(),
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline::default(),
@@ -896,6 +986,7 @@ mod tests {
                 ],
                 published_at: Some("2026-06-16T00:00:00Z".parse()?),
                 fail_fetch: false,
+                native_warnings: Vec::new(),
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline::default(),
@@ -925,6 +1016,7 @@ mod tests {
             ],
             published_at: Some("2026-06-14T00:00:00Z".parse()?),
             fail_fetch: false,
+            native_warnings: Vec::new(),
         };
         let mut adapters = AdapterSet::new();
         adapters.register_target_verified_mutator(Arc::new(adapter))?;
@@ -1015,6 +1107,7 @@ mod tests {
                 deps: vec![dep],
                 published_at: Some("2026-06-16T00:00:00Z".parse()?),
                 fail_fetch: false,
+                native_warnings: Vec::new(),
             };
             let mut adapters = AdapterSet::new();
             adapters.register_target_verified_mutator(Arc::new(adapter))?;
@@ -1073,6 +1166,7 @@ mod tests {
                 deps: vec![admission_dependency("unknown", true)],
                 published_at: None,
                 fail_fetch: false,
+                native_warnings: Vec::new(),
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline {

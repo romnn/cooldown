@@ -53,6 +53,26 @@ pub(crate) fn name_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// Whether pnpm's name matcher reads a cooldown package `selector` exactly as cooldown does, for
+/// every valid npm package name.
+///
+/// cooldown compiles a selector as a glob whose `*` crosses `/`, which is how pnpm reads `*` too.
+/// The readings therefore agree on a selector built only from single `*` wildcards and
+/// characters both treat literally: ASCII letters and digits, `.`, `_`, `~`, `/` and `-`.
+/// An `@` is allowed only first, as a scope, because pnpm splits a version off at any later `@`.
+/// `**` is excluded because the glob gives `**/` and `/**` a recursive-directory meaning.
+/// `?`, brackets, braces, `\` and `!` are glob syntax for cooldown but literal text or a negation
+/// for pnpm, so a selector using them is excluded as well.
+pub(crate) fn is_pnpm_safe_selector(selector: &str) -> bool {
+    !selector.is_empty()
+        && !selector.contains("**")
+        && selector.char_indices().all(|(index, character)| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '~' | '/' | '-' | '*')
+                || (character == '@' && index == 0)
+        })
+}
+
 fn wildcard_matches(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');
     let Some(prefix) = parts.next() else {
@@ -636,6 +656,142 @@ mod tests {
         // Glob metacharacters other than `*` are literal in pnpm patterns.
         assert!(!name_matches("lodas?", "lodash"));
         assert!(name_matches("lodas?", "lodas?"));
+    }
+
+    /// The selectors `sync` writes verbatim are the ones pnpm's matcher cannot misread: literal
+    /// characters, single `*` wildcards and a leading scope `@`, which pnpm parses as a
+    /// versionless, non-negated rule.
+    #[test]
+    fn pnpm_safe_selectors_use_only_syntax_both_matchers_share() {
+        // Safe
+        for selector in [
+            "*-plugin",
+            "@types/*",
+            "*",
+            "JSONStream",
+            "lodash.merge",
+            "@scope/a_b~c-d",
+            "a*b*c",
+        ] {
+            assert!(is_pnpm_safe_selector(selector), "{selector}");
+            let rule = Rule::parse(selector);
+            assert_eq!(rule.name, selector, "{selector} carries no version");
+            assert!(rule.versions.is_none(), "{selector} carries no version");
+            assert!(!selector.starts_with('!'), "{selector} is not negated");
+        }
+
+        // Unsafe
+        for selector in [
+            "",
+            "**",
+            "@types/**",
+            "**/foo",
+            "foo{,bar}",
+            "{safe,!internal-*}",
+            "\\!x",
+            "!internal-*",
+            "react-?om",
+            "[!a-c]*",
+            "*@types/*",
+            "foo@1.0.0",
+            "foo bar",
+            "react\u{e9}",
+        ] {
+            assert!(!is_pnpm_safe_selector(selector), "{selector}");
+        }
+    }
+
+    /// Over valid npm package names, cooldown's glob and pnpm's matcher agree on every pnpm-safe
+    /// selector.
+    ///
+    /// The selectors are derived from the sample names by replacing one or two runs with `*`, so
+    /// each selector matches at least its source name and misses most others.
+    /// Names cover scopes, the legacy uppercase spelling, and every punctuation character npm
+    /// allows, and a case-flipped selector checks that both matchers are case sensitive.
+    #[test]
+    fn safe_selectors_match_npm_names_as_cooldown_globs_do() -> color_eyre::eyre::Result<()> {
+        let names = [
+            "a",
+            "react",
+            "react-dom",
+            "react.dom",
+            "react_dom",
+            "react~dom",
+            "reactdom",
+            "JSONStream",
+            "jsonstream",
+            "eslint-plugin-react",
+            "@types/node",
+            "@types/react",
+            "@types/react-dom",
+            "@typescript-eslint/eslint-plugin",
+            "@scope/a",
+            "@scope.js/pkg",
+            "@scope/pkg.js",
+            "lodash.merge",
+            "x-plugin-y-plugin",
+        ];
+        let mut selectors = BTreeSet::new();
+        for name in names {
+            selectors.insert(name.to_string());
+            selectors.insert(name.to_ascii_uppercase());
+            let length = name.len();
+            for start in 0..=length {
+                for end in start..=length {
+                    selectors.insert(format!("{}*{}", &name[..start], &name[end..]));
+                }
+            }
+            // Two wildcards around a short literal run, with an empty or one-character prefix
+            // and suffix, keep the sample small while still separating the `*`s.
+            for start in 0..=1.min(length) {
+                for end in start..length {
+                    for middle_end in end + 1..=(end + 2).min(length) {
+                        for tail in [length.saturating_sub(1), length] {
+                            if tail >= middle_end {
+                                selectors.insert(format!(
+                                    "{}*{}*{}",
+                                    &name[..start],
+                                    &name[end..middle_end],
+                                    &name[tail..]
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut positives = 0;
+        let mut negatives = 0;
+        for selector in selectors
+            .iter()
+            .filter(|selector| is_pnpm_safe_selector(selector))
+        {
+            let glob = cooldown_core::PatternGlob::new(selector)?;
+            for name in names {
+                let pnpm = name_matches(selector, name);
+                assert_eq!(glob.is_match(name), pnpm, "selector {selector} on {name}");
+                if pnpm {
+                    positives += 1;
+                } else {
+                    negatives += 1;
+                }
+            }
+        }
+        // Both outcomes are exercised many times over, so the agreement is not vacuous.
+        assert!(positives > 1000, "{positives} positive matches");
+        assert!(negatives > 1000, "{negatives} negative matches");
+
+        // The same sample tells the matchers apart on each kind of unsafe syntax.
+        for selector in ["react-?om", "@types/{node,react}", "[!a-c]*", "**/react"] {
+            let glob = cooldown_core::PatternGlob::new(selector)?;
+            assert!(
+                names
+                    .iter()
+                    .any(|name| glob.is_match(name) != name_matches(selector, name)),
+                "selector {selector} reads the same in both matchers"
+            );
+        }
+        Ok(())
     }
 
     /// The expectations follow node-semver 7.8.4's `valid`, which pnpm uses to read a union.
