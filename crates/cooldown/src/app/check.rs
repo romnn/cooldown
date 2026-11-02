@@ -534,7 +534,10 @@ impl<'a> CheckRunner<'a> {
         // apart from a baselined acknowledgment. A per-version baseline record wins over the blanket
         // policy.
         let allowed_transitive = self.opts.transitive_mode == TransitiveGate::Allow && !dep.direct;
-        let admitted = pv.status == Status::UpToDate || baseline_acked;
+        // An `allow`-exempt pin needs its own exact admission too, because `sync` writes its
+        // selector package-wide only when cooldown exempts every release the selector matches.
+        // A pseudo-version is exempt as well, but it is never an exact registry admission.
+        let admitted = matches!(pv.status, Status::UpToDate | Status::Exempt) || baseline_acked;
         self.record_native_admission(
             dep,
             pv.published_at,

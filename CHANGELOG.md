@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **pnpm `sync` writes a package-wide exemption only when cooldown exempts every release.** A
+  `latest`/`allow` selector used to land in `minimumReleaseAgeExclude` whenever its own rule set
+  `latest` or `allow`, so a plain `pnpm install` could adopt a brand-new major of `@corp/ui` that
+  cooldown still holds back when `[min-age] major = "30d"` applies to it, or when a later layer,
+  a `--min-age` flag, or another layer's `floor` overrides the exemption. A selector is now written
+  only when the fully layered policy exempts the locked version and every major, minor and patch
+  update of every package it matches; any other selector is withheld and reported as a
+  `stricter_native` warning naming it, and when nothing else remains `sync` writes an explicit
+  `minimumReleaseAgeExclude: []`. Packages can therefore lose a broad native exemption, including
+  ones a withheld glob matches that are exempt on their own; the glob check is conservative and
+  withholds a glob whenever a rule for one of its packages could set a window. The young locked
+  versions cooldown admits, including `allow`-exempt ones, keep exact-version entries, so the
+  current lock still installs; other releases of those packages wait for pnpm's own window.
+  The default window `sync` writes (pnpm's `minimumReleaseAge`, uv's `exclude-newer`) no longer
+  becomes `latest` because of a `[package."*"] latest = true` or `allow = ["*"]` rule; it falls
+  back to the bare `min-age` then. When pnpm's window cannot be written (a `freeze` or `latest`
+  default), `sync` no longer leaves `minimumReleaseAgeExclude` untouched: it drops the entries
+  without versions it would not write, keeps every version-qualified entry, and writes an explicit
+  `[]` when a selector was withheld or left out and nothing remains. `sync` also never removes an
+  existing `minimumReleaseAgeExclude` any more: a list it empties, including one under a policy
+  that no longer names any selector, stays as `[]`, so exclusions pnpm inherits from user or
+  global configuration (such as `["*"]`) stay masked.
+
 - **A resolve that moves a manifest-only exact pin is refused.** pnpm records one specifier per
   importer, so an exact pin in a second install field (`devDependencies: 20.14.5` beside
   `dependencies: ^20.11.1`), or in a member the run excludes, was invisible to the lock checks: a

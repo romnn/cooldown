@@ -110,12 +110,37 @@ cooldown sync
 
 The same behavior is available as a global `--sync` flag on any command, which syncs before the command runs (a no-op under `--dry-run`). See [Supported ecosystems]({{< relref "../tools/_index.md" >}}) for which tools have a native cooldown that `sync` can write to.
 
+The default window `sync` writes is the one a package no rule names gets: the bare `min-age`, or a package rule that matches every name, such as `[package."*"]`, when it sets one. When that window is an exemption (`latest` or `allow` on such a package rule), `sync` writes the bare `min-age` instead, since the native window still applies to every package whose native exemption is withheld.
+
 ### pnpm
 
 For pnpm, `sync` writes the project's `pnpm-workspace.yaml`: the default window as
-`minimumReleaseAge` (in minutes), and every `latest` or `allow` package selector as a
-`minimumReleaseAgeExclude` entry, followed by the exact versions of young locked packages cooldown
-admits.
+`minimumReleaseAge` (in minutes), and every `latest` or `allow` package selector that exempts every
+release it matches as a `minimumReleaseAgeExclude` entry, followed by the exact versions of young
+locked packages cooldown admits.
+
+A `minimumReleaseAgeExclude` entry exempts every version of every package it names, so `sync`
+writes a selector there only when cooldown exempts all of them too: for the locked version and
+every major, minor and patch update, with no `floor` that still binds, after every config layer is
+applied. A selector cooldown still gates in part is withheld and reported as a `stricter_native`
+warning, even when only some of the packages it matches are gated:
+
+```toml
+# cooldown.toml
+[min-age]
+default = "7d"
+major = "30d"
+
+[package."@corp/*"]
+latest = true # majors of @corp/* still wait 30 days, so `@corp/*` is withheld
+```
+
+The young locked versions cooldown admits under a withheld selector are written as exact
+versions instead, so the current lock still installs. `sync` admits locked versions only and
+does not look at available updates, so any other release of those packages stays behind pnpm's
+own `minimumReleaseAge`. The check is conservative for glob selectors: when a rule for a package
+inside the glob, such as `[package."@corp/ui"]`, could set a window, the glob is withheld even if
+cooldown happens to resolve that package as exempt.
 
 pnpm matches those entries more simply than cooldown matches its selectors: only `*` is a wildcard
 (and crosses `/`), a leading `!` negates, and every other character is literal. So `sync` writes a
@@ -127,9 +152,17 @@ them unless another written selector covers them. A selector containing `**` is 
 meaning pnpm lacks. To exempt such packages natively as well, write them as separate selectors pnpm
 can read (`[package."@types/node"]` and `[package."@types/react"]`).
 
-When the policy has selectors but nothing can be written, `sync` keeps an explicit
-`minimumReleaseAgeExclude: []`, so pnpm does not fall back to exclusions inherited from user or
-global configuration. Without any selectors an empty list is removed.
+When the policy has selectors but nothing can be written, whether they were withheld or left out,
+`sync` keeps an explicit `minimumReleaseAgeExclude: []`, so pnpm does not fall back to exclusions
+inherited from user or global configuration. For the same reason `sync` never removes an existing
+`minimumReleaseAgeExclude`: a list it empties stays as `[]`. Without any selectors an absent list
+stays absent.
+
+When the default window is a `freeze` or `latest`, which pnpm's minute count cannot express,
+`sync` leaves `minimumReleaseAge` as it is but still removes every `minimumReleaseAgeExclude` entry
+without versions that it would not write, keeping every version-qualified entry as written, so no
+package gains an exemption. A list it empties stays as `[]`, and when a selector was withheld or
+left out it writes `minimumReleaseAgeExclude: []` even where the key or the file was absent.
 
 ### uv
 

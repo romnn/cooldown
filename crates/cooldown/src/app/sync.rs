@@ -9,8 +9,8 @@ use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
 use camino::Utf8Path;
 use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
-    Diagnostic, ResolveKind, ResolveQuery, ResolvedPolicy, SyncReport, SyncScope, ToolId,
-    ToolWrite, WindowSpec, resolve,
+    Diagnostic, NativeExemptions, PolicyContext, ResolveKind, ResolveQuery, ResolvedPolicy,
+    SyncReport, SyncScope, ToolId, ToolWrite, WindowSpec, native_exemptions, resolve,
 };
 
 enum SyncAccessGuard {
@@ -293,25 +293,25 @@ impl Workspace {
         warnings: &mut Vec<Diagnostic>,
     ) -> SyncItem {
         let project = pctx.rel_path.to_string();
-        // Resolve the policy's default (bare) window for this project.
-        // The empty package name
-        // matches no package-specific rule, so this is the window `sync` bakes into the single
-        // native field; per-package and per-kind windows are not expressible there.
-        let query = ResolveQuery {
+        let window = native_default_window(&pctx.policy.layers, tool, &pctx.rel_path, self.now());
+        // Bake the `latest`/`allow` package selectors that exempt every release into the native
+        // per-package exemption list alongside the default window, so a cooldown-exempt package is
+        // exempt natively too.
+        // A selector cooldown still gates in part is withheld; the young locked versions cooldown
+        // admits reach the native list as exact admissions instead.
+        let NativeExemptions { exempt, withheld } = native_exemptions(
+            &[PolicyContext {
+                layers: &pctx.policy.layers,
+                project: &pctx.rel_path,
+            }],
             tool,
-            package: "",
-            registry: None,
-            project: &pctx.rel_path,
-            kind: ResolveKind::CurrentPin,
-        };
-        let resolved = resolve(&pctx.policy.layers, &query, self.now());
-        let window = resolved.window.effective_spec(self.now());
+            self.now(),
+        );
         let mut policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
-            // Bake any `latest`/`allow` package selectors into the native per-package exemption list
-            // alongside the default window, so a cooldown-exempt package is exempt natively too.
-            exempt_packages: cooldown_core::exempt_package_globs(&pctx.policy.layers, tool),
+            exempt_packages: exempt,
+            withheld_exemptions: withheld,
             package_windows: pctx.project.exclude_newer_package.clone(),
         };
         let result = async {
@@ -370,6 +370,9 @@ impl Workspace {
     }
 
     /// Sync a tool's single repo-level native config ([`SyncScope::Repo`]), exactly once.
+    ///
+    /// No package-wide exemptions are written: discovery can exclude projects that still read the
+    /// repo-level file, so no set of policy stacks proves an exemption for every consumer.
     async fn sync_repo(
         &self,
         writer: &dyn cooldown_core::ToolWrite,
@@ -382,21 +385,15 @@ impl Workspace {
         let project = repo_relative_root();
         // Resolve the repo-wide default window once against the repo-root cascade (no native layer),
         // independent of any single project's layers.
-        // The empty package name and `.` project keep it
-        // to the bare default window — the only thing a single native field can carry.
-        let query = ResolveQuery {
-            tool,
-            package: "",
-            registry: None,
-            project: Utf8Path::new("."),
-            kind: ResolveKind::CurrentPin,
-        };
-        let resolved = resolve(self.repo_layers(), &query, self.now());
-        let window = resolved.window.effective_spec(self.now());
+        // The `.` project keeps it to the bare default window — the only thing a single native
+        // field can carry.
+        let window =
+            native_default_window(self.repo_layers(), tool, Utf8Path::new("."), self.now());
         let policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
-            exempt_packages: cooldown_core::exempt_package_globs(self.repo_layers(), tool),
+            exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
             package_windows: cooldown_core::package_windows(
                 self.repo_layers(),
                 tool,
@@ -442,6 +439,40 @@ impl Workspace {
                 }
             }
         }
+    }
+}
+
+/// The default window `sync` bakes into a tool's single native field for `project`.
+///
+/// This is the window cooldown gates a locked pin of an unnamed package with, so a package rule
+/// that matches every name, such as `[package."*"]`, sets it just as the bare `min-age` does.
+/// When that window is an exemption, the project default `min-age`, which package rules do not
+/// change, is used instead: the native field still governs every package whose native exemption
+/// [`native_exemptions`] withholds, so a package rule's `latest` or `allow` must not lift it.
+/// The two windows are never compared by today's cutoffs, since a rolling age and an absolute
+/// freeze trade places as time passes while the persisted value stays.
+/// Per-kind and other per-package windows are not expressible in the single field.
+fn native_default_window(
+    layers: &[cooldown_core::PolicyLayer],
+    tool: ToolId,
+    project: &Utf8Path,
+    now: jiff::Timestamp,
+) -> WindowSpec {
+    let window = |kind| {
+        let query = ResolveQuery {
+            tool,
+            package: "",
+            registry: None,
+            project,
+            kind,
+        };
+        resolve(layers, &query, now).window.effective_spec(now)
+    };
+    // The empty name stands for a package no rule names: only a glob matching the empty name,
+    // such as `*`, applies to it.
+    match window(ResolveKind::CurrentPin) {
+        WindowSpec::Latest => window(ResolveKind::EffectiveDefault),
+        unnamed => unnamed,
     }
 }
 
@@ -696,7 +727,7 @@ mod tests {
                 beyond_latest_tag: false,
                 published_at: self.published_at,
                 yanked: false,
-                quality: cooldown_core::ReleaseQuality::Stable,
+                quality: dep.current_quality,
             })
         }
     }
@@ -765,6 +796,19 @@ mod tests {
             if !dry_run {
                 std::fs::write(&path, exclusions).map_err(|err| {
                     cooldown_core::CoreError::Filesystem(format!("failed to write {path}: {err}"))
+                })?;
+                let selectors_path = project.root.join("native-selectors");
+                let selectors = indoc::formatdoc! {"
+                    exempt: [{exempt}]
+                    withheld: [{withheld}]
+                ",
+                    exempt = policy.exempt_packages.join(","),
+                    withheld = policy.withheld_exemptions.join(","),
+                };
+                std::fs::write(&selectors_path, selectors).map_err(|err| {
+                    cooldown_core::CoreError::Filesystem(format!(
+                        "failed to write {selectors_path}: {err}"
+                    ))
                 })?;
             }
             Ok(cooldown_core::SyncReport::Written {
@@ -1176,6 +1220,395 @@ mod tests {
         let outcome = ws.sync(&RunOpts::default()).await;
         assert_eq!(outcome.summary.errors, 0);
         assert_eq!(std::fs::read_to_string(root.join("native-exclusions"))?, "");
+        Ok(())
+    }
+
+    /// A per-kind window that holds majors to 30 days, as `[min-age]` writes it.
+    const PER_KIND_WINDOW: &str = indoc::indoc! {r#"
+        [min-age]
+        default = "7d"
+        major = "30d"
+    "#};
+
+    /// A `latest` exemption for every `@corp/` package.
+    const CORP_LATEST: &str = indoc::indoc! {r#"
+        [package."@corp/*"]
+        latest = true
+    "#};
+
+    /// [`PER_KIND_WINDOW`] and [`CORP_LATEST`] in one document.
+    const PER_KIND_WINDOW_AND_CORP_LATEST: &str = indoc::indoc! {r#"
+        [min-age]
+        default = "7d"
+        major = "30d"
+
+        [package."@corp/*"]
+        latest = true
+    "#};
+
+    fn repo_config(content: &str) -> eyre::Result<cooldown_core::PolicyLayer> {
+        Ok(cooldown_core::config::parse_config(
+            content,
+            cooldown_core::Origin::Repo("cooldown.toml".into()),
+        )?)
+    }
+
+    /// A workspace whose one project resolves `layers`, lowest authority first, above the
+    /// built-in default.
+    fn policy_workspace(
+        root: &camino::Utf8Path,
+        adapter: AdmissionAdapter,
+        baseline: Baseline,
+        layers: Vec<cooldown_core::PolicyLayer>,
+    ) -> eyre::Result<Workspace> {
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(adapter))?;
+        let mut project = project_ctx(CARGO, root.as_str());
+        project.policy.layers.extend(layers);
+        Ok(Workspace::new(
+            adapters,
+            vec![project],
+            "2026-06-17T00:00:00Z".parse()?,
+            baseline,
+            root.to_owned(),
+            vec![builtin_default_layer()],
+        ))
+    }
+
+    /// An adapter whose locked `deps` were all published at `published_at`.
+    fn locked_adapter(
+        deps: Vec<cooldown_core::Dependency>,
+        published_at: Option<&str>,
+    ) -> eyre::Result<AdmissionAdapter> {
+        Ok(AdmissionAdapter {
+            deps,
+            published_at: published_at.map(str::parse).transpose()?,
+            fail_fetch: false,
+            native_warnings: Vec::new(),
+        })
+    }
+
+    /// The `latest` glob of the issue's policy exempts every kind of `@corp/*` but majors, so
+    /// sync withholds it from the native list whether the per-kind window shares its document or
+    /// sits in a lower-authority one.
+    /// The young pins cooldown passes are admitted exactly instead: `@corp/ui` through its `latest`
+    /// default and `other` through a baseline acknowledgement.
+    #[tokio::test]
+    async fn sync_withholds_a_partially_exempt_glob() -> eyre::Result<()> {
+        let arrangements = [
+            vec![repo_config(PER_KIND_WINDOW_AND_CORP_LATEST)?],
+            vec![
+                cooldown_core::config::parse_config(
+                    PER_KIND_WINDOW,
+                    cooldown_core::Origin::Global,
+                )?,
+                repo_config(CORP_LATEST)?,
+            ],
+        ];
+        for layers in arrangements {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let ws = policy_workspace(
+                &root,
+                locked_adapter(
+                    vec![
+                        admission_dependency("@corp/ui", true),
+                        admission_dependency("other", true),
+                    ],
+                    Some("2026-06-16T00:00:00Z"),
+                )?,
+                Baseline {
+                    entries: vec![acknowledged("other")],
+                },
+                layers,
+            )?;
+
+            let outcome = ws.sync(&RunOpts::default()).await;
+
+            assert_eq!(outcome.summary.errors, 0, "{:?}", outcome.warnings);
+            assert_eq!(
+                std::fs::read_to_string(root.join("native-selectors"))?,
+                indoc::indoc! {"
+                    exempt: []
+                    withheld: [@corp/*]
+                "}
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("native-exclusions"))?,
+                "@corp/ui@1.2.3,other@1.2.3"
+            );
+        }
+        Ok(())
+    }
+
+    /// Without the per-kind window every release of `@corp/*` is exempt, so the glob stays a
+    /// package-wide native exemption.
+    #[tokio::test]
+    async fn sync_keeps_a_fully_exempt_glob() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let ws = policy_workspace(
+            &root,
+            locked_adapter(Vec::new(), None)?,
+            Baseline::default(),
+            vec![repo_config(CORP_LATEST)?],
+        )?;
+
+        assert_eq!(ws.sync(&RunOpts::default()).await.summary.errors, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("native-selectors"))?,
+            indoc::indoc! {"
+                exempt: [@corp/*]
+                withheld: []
+            "}
+        );
+        Ok(())
+    }
+
+    /// A lower layer's floor on `@corp/sensitive` survives the repository's `allow = ["@corp/*"]`,
+    /// so the glob is withheld.
+    /// The young `@corp/ui` the allow exempts gets an exact admission instead, while the floored
+    /// `@corp/sensitive` stays gated.
+    #[tokio::test]
+    async fn sync_admits_exempt_pins_of_a_withheld_allow() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let floor = cooldown_core::config::parse_config(
+            indoc::indoc! {r#"
+                [package."@corp/sensitive"]
+                floor = "30d"
+            "#},
+            cooldown_core::Origin::Global,
+        )?;
+        let ws = policy_workspace(
+            &root,
+            locked_adapter(
+                vec![
+                    admission_dependency("@corp/ui", true),
+                    admission_dependency("@corp/sensitive", true),
+                ],
+                Some("2026-06-16T00:00:00Z"),
+            )?,
+            Baseline::default(),
+            vec![floor, repo_config(r#"allow = ["@corp/*"]"#)?],
+        )?;
+
+        let outcome = ws.sync(&RunOpts::default()).await;
+
+        assert_eq!(outcome.summary.errors, 0, "{:?}", outcome.warnings);
+        assert_eq!(
+            std::fs::read_to_string(root.join("native-selectors"))?,
+            indoc::indoc! {"
+                exempt: []
+                withheld: [@corp/*]
+            "}
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("native-exclusions"))?,
+            "@corp/ui@1.2.3"
+        );
+        Ok(())
+    }
+
+    /// An exempt pin earns an exact admission only as a registry version of known age that is
+    /// still younger than the native window: a pseudo-version, an unknown-age pin and a mature
+    /// pin get none.
+    #[tokio::test]
+    async fn sync_admits_only_young_known_age_exempt_registry_pins() -> eyre::Result<()> {
+        let mut pseudo = admission_dependency("@corp/pseudo", true);
+        pseudo.current_quality = cooldown_core::ReleaseQuality::Pseudo;
+        let cases = [
+            (pseudo, Some("2026-06-16T00:00:00Z")),
+            (admission_dependency("@corp/unknown", true), None),
+            (
+                admission_dependency("@corp/mature", true),
+                Some("2026-05-01T00:00:00Z"),
+            ),
+        ];
+        for (dep, published_at) in cases {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let name = dep.package.name.clone();
+            let ws = policy_workspace(
+                &root,
+                locked_adapter(vec![dep], published_at)?,
+                Baseline::default(),
+                vec![repo_config(r#"allow = ["@corp/*"]"#)?],
+            )?;
+
+            let outcome = ws.sync(&RunOpts::default()).await;
+
+            assert_eq!(outcome.summary.errors, 0, "{name}: {:?}", outcome.warnings);
+            assert_eq!(
+                std::fs::read_to_string(root.join("native-exclusions"))?,
+                "",
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A `[package."*"]` rule sets the native default like the bare `min-age`, shorter or longer,
+    /// yet its exemption does not turn the native default into an opt-out: the native window still
+    /// governs every package whose exemption sync withholds.
+    /// A catch-all freeze stays a freeze although a rolling 7 days is stricter today, since uv and
+    /// pnpm would otherwise admit post-freeze releases once 7 days pass.
+    #[tokio::test]
+    async fn sync_bakes_the_unnamed_package_window_unless_it_is_exempt() -> eyre::Result<()> {
+        let cases = [
+            (
+                indoc::indoc! {r#"
+                    [package."*"]
+                    latest = true
+                "#},
+                "7d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+                    allow = ["*"]
+                "#},
+                "14d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+
+                    [package."*"]
+                    min-age = "30d"
+                "#},
+                "30d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+
+                    [package."*"]
+                    min-age = "3d"
+                "#},
+                "3d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "7d"
+
+                    [package."*"]
+                    freeze = "2026-06-15T00:00:00Z"
+                "#},
+                "2026-06-15T00:00:00Z",
+            ),
+        ];
+        for (config, expected) in cases {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let ws = policy_workspace(
+                &root,
+                locked_adapter(Vec::new(), None)?,
+                Baseline::default(),
+                vec![repo_config(config)?],
+            )?;
+
+            let outcome = ws.sync(&RunOpts::default()).await;
+
+            assert_eq!(
+                outcome.summary.errors, 0,
+                "{config}: {:?}",
+                outcome.warnings
+            );
+            let windows: Vec<_> = outcome
+                .items
+                .iter()
+                .map(|item| item.window.as_deref())
+                .collect();
+            assert_eq!(windows, [Some(expected)], "{config}");
+        }
+        Ok(())
+    }
+
+    /// The review's scenario through the real pnpm adapter: an earlier sync left `["*"]` in
+    /// `minimumReleaseAgeExclude`, and the policy now exempts `*` from every kind but majors.
+    /// sync keeps the 7-day native window, withholds `*` with a warning, and replaces the broad
+    /// entry with an explicit empty list, so pnpm no longer admits a brand-new major.
+    #[tokio::test]
+    async fn sync_replaces_a_withheld_catch_all_in_pnpm_config() -> eyre::Result<()> {
+        const PNPM: ToolId = ToolId("pnpm");
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc::indoc! {r#"
+                {
+                  "name": "cooldown-sync-fixture",
+                  "version": "0.1.0",
+                  "private": true
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")?;
+        let workspace_yaml = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &workspace_yaml,
+            indoc::indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "*"
+            "#},
+        )?;
+        let cache = tempfile::tempdir()?;
+        let tool = cooldown_npm::PnpmTool::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(tool))?;
+        let mut project = project_ctx(PNPM, root.as_str());
+        project.project.manifest = root.join("package.json");
+        project.policy.layers.push(repo_config(indoc::indoc! {r#"
+            [min-age]
+            default = "7d"
+            major = "30d"
+
+            [package."*"]
+            latest = true
+        "#})?);
+        let ws = Workspace::new(
+            adapters,
+            vec![project],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            vec![builtin_default_layer()],
+        );
+
+        let outcome = ws.sync(&RunOpts::default()).await;
+
+        assert_eq!(outcome.summary.errors, 0, "{:?}", outcome.items);
+        assert_eq!(outcome.summary.written, 1, "{:?}", outcome.items);
+        assert!(
+            outcome.warnings.iter().any(|warning| warning
+                .message
+                .contains("cannot prove that every release `*` matches is exempt")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            std::fs::read_to_string(&workspace_yaml)?,
+            indoc::indoc! {"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude: []
+            "}
+        );
+
+        // A second sync finds nothing left to change.
+        assert_eq!(ws.sync(&RunOpts::default()).await.summary.unchanged, 1);
         Ok(())
     }
 }

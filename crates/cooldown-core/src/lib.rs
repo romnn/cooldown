@@ -36,9 +36,10 @@ pub use mutation::{
     ProjectMutationFile, ProjectMutationJournal, ProjectMutationState,
 };
 pub use policy::{
-    ByKind, MaxMajorPick, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,
-    ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, exempt_package_globs,
-    package_windows, resolve, resolve_max_major, window_exclude_newer,
+    ByKind, MaxMajorPick, NativeExemptions, Origin, PatternGlob, PolicyContext, PolicyLayer,
+    PolicyStack, Resolution, ResolveKind, ResolveQuery, ResolvedWindow, Rule, Selector, TraceStep,
+    WindowSpec, native_exemptions, package_windows, resolve, resolve_max_major,
+    window_exclude_newer,
 };
 pub use ports::{
     AcceptedPublication, AdmittedVersion, ApplyAttempt, ApplyAttemptOutcome, ApplyObserver,
