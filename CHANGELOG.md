@@ -7,7 +7,8 @@
   the strictest explicit bound across them, and moves lock-only only when every one admits the
   target. An exact pin beside a range, in another field or another workspace member, is no longer
   rewritten by the Auto widen: the move is reported with a new `pin_held` skip reason naming the
-  pin, and `--rewrite` (or `fix --downgrade-pinned` for a downgrade) rewrites it. A held downgrade
+  pin, and `--rewrite` (or `fix --downgrade-pinned` for a downgrade) rewrites it, except that on
+  pnpm a pin beside another workspace member's range stays held until it is edited. A held downgrade
   fails `fix --strict`; a held major still tries its in-line release. `explain` lists one
   declaration per distinct range. The skip-reason set is part of the JSON contract, so
   `schemaVersion` is now `7`.

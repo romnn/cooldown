@@ -45,9 +45,10 @@ the move; `--rewrite` does not cross it.
 
 A package declared in several install fields of one manifest (npm family: `dependencies` beside
 `devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
-target must sit inside each range, and the strictest explicit bound across them caps it. A package
-every declaration pins to the same exact version is held at planning (`pinned`), even under
-`--rewrite`. A *mixed* declaration — an exact pin beside a range, in another field or another
+target must sit inside each range, and the strictest explicit bound across them caps it. On npm
+and pnpm, a package every declaration in the lock pins to the same exact version is held at
+planning (`pinned`), even under `--rewrite`; Yarn and Bun locks record no per-member pins, so their
+exact pins are judged at apply like the mixed case below. A *mixed* declaration — an exact pin beside a range, in another field or another
 workspace member — leaves the package movable, so the move is planned and the apply holds it
 instead of rewriting the pin, even where the lock records only the range (pnpm keeps one specifier
 per importer). That row is `pin_held` and names the pin; pass `--rewrite` to rewrite it, or edit it
