@@ -11,11 +11,11 @@ use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     AdvisoryFetch, AdvisoryPolicy, AdvisorySource, AdvisorySourceId, ApplyReport, CandidateScope,
     Capabilities, Change, CoreError, DepScope, Dependency, FetchContext, GeneratedMembers,
-    GraphHoldEdge, GraphHoldKind, LockStatus, LockVerifyReport, MajorKey, NativePolicyLayer,
-    PackageAdvisories, PackageId, Plan, PolicyLayer, PolicyStack, PreparedMutation, Project,
-    ProjectMarker, ProjectMutationJournal, RawAdvisory, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind,
-    VerifyReport, Version,
+    GraphHoldEdge, GraphHoldKind, LockStatus, LockVerifyReport, MajorKey, MemberRef,
+    NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer, PolicyStack,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, SkipReason, Skipped, TargetFallback, ToolId,
+    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -94,6 +94,12 @@ struct Float {
     to: &'static str,
 }
 
+/// A workspace member a float leaves on its old version of the floated package.
+struct Straggler {
+    package: &'static str,
+    member: &'static str,
+}
+
 /// Two packages that only resolve at one shared version.
 struct Coupled {
     left: &'static str,
@@ -113,6 +119,10 @@ struct Script {
     /// A target whose landing makes the next graph read drift the manifest behind cooldown's
     /// back.
     drift_after: Option<&'static str>,
+    /// The workspace members declaring every direct dependency; none means the root alone.
+    members: &'static [&'static str],
+    /// A member a float leaves behind, recorded in the lock as a `<name>@<member>` entry.
+    straggler: Option<Straggler>,
 }
 
 struct FakeNode {
@@ -149,6 +159,13 @@ impl FakeNode {
 
     fn trials(&self) -> Vec<Vec<String>> {
         self.trials.lock().expect("trial log").clone()
+    }
+}
+
+fn member_ref(name: &str) -> MemberRef {
+    MemberRef {
+        name: name.to_string(),
+        path: format!("packages/{name}"),
     }
 }
 
@@ -206,8 +223,23 @@ impl ToolRead for FakeNode {
             std::fs::write(project.root.join(MANIFEST), r#"{"drift":true}"#)?;
         }
         let mut dependencies = Vec::new();
-        for (name, version) in &versions {
+        for (key, version) in &versions {
+            let (name, straggler) = key
+                .split_once('@')
+                .map_or((key.as_str(), None), |(name, member)| (name, Some(member)));
             let mut dep = dependency(name, version);
+            if dep.direct {
+                dep.members = self
+                    .script
+                    .members
+                    .iter()
+                    .filter(|member| match straggler {
+                        Some(straggler) => **member == straggler,
+                        None => !versions.contains_key(&format!("{name}@{member}")),
+                    })
+                    .map(|member| member_ref(member))
+                    .collect();
+            }
             if name == "child"
                 && let Some(dom) = versions.get("dom")
                 && dom.starts_with("2.")
@@ -363,13 +395,22 @@ impl ToolWrite for FakeNode {
                 if let Some(trial) = self.trials.lock().expect("trial log").last_mut() {
                     trial.push(format!("float:{}@{}", float.floated, float.to));
                 }
+                if let Some(straggler) = &self.script.straggler
+                    && straggler.package == float.floated
+                {
+                    versions.insert(
+                        format!("{}@{}", float.floated, straggler.member),
+                        float.from.to_string(),
+                    );
+                }
+                // Shaped like the npm adapter's lock-diff rows: transitive and unattributed.
                 report.applied.push(Change {
                     package: package(float.floated),
                     from: Version::new(float.from),
                     to: Version::new(float.to),
                     kind: UpdateKind::Patch,
                     downgrade: false,
-                    direct: true,
+                    direct: false,
                     members: Vec::new(),
                 });
             }
@@ -1118,16 +1159,16 @@ async fn warm_and_cold_caches_select_the_same_current_line_target() -> eyre::Res
     Ok(())
 }
 
-/// A rejected major that a retried sibling floats onto its own target as collateral is reported
-/// as that landing alone: no held row beside it, so neither the skip count nor `outdated` nor
-/// `--strict` reads a target the lock now holds as held.
-#[tokio::test]
-async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
+/// Two members declare `a` and `c`; both majors are rejected and only `a` has an in-line target,
+/// whose landing floats `c` onto `2.0.0` as an unattributed transitive row, the shape the npm
+/// adapter's lock diff reports.
+/// `straggler` names a member that float leaves on `c@1.0.0`.
+fn collateral_major_fixture(straggler: Option<&'static str>) -> eyre::Result<NodeFixture> {
     let fake = FakeNode::new(
         TargetFallback::CurrentLine,
         Script {
             holds: vec![
-                // A conservative hold, so only a stale `c` row could fail `--strict`.
+                // A conservative hold, so only a `c` row can fail `--strict`.
                 Hold {
                     target: "a@2.0.0",
                     reason: SkipReason::MultiVersionHeld,
@@ -1147,27 +1188,42 @@ async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Resul
                 from: "1.0.0",
                 to: "2.0.0",
             }),
+            members: &["web", "api"],
+            straggler: straggler.map(|member| Straggler {
+                package: "c",
+                member,
+            }),
             ..Script::default()
         },
     )
     .with_releases("a", &[("1.0.0", false), ("1.1.0", false), ("2.0.0", false)])
     // `c` has no matured release on its current line, so only `a` has an alternative.
     .with_releases("c", &[("1.0.0", false), ("1.1.0", true), ("2.0.0", false)]);
-    let fixture = fixture(fake, &[("a", "1.0.0"), ("c", "1.0.0")])?;
+    fixture(fake, &[("a", "1.0.0"), ("c", "1.0.0")])
+}
 
-    let outcome = fixture
-        .workspace
-        .upgrade(&RunOpts {
-            strict: true,
-            ..major()
-        })
-        .await;
+fn strict_major() -> RunOpts {
+    RunOpts {
+        strict: true,
+        ..major()
+    }
+}
+
+/// A rejected major that a retried sibling floats onto its own target in every declaring member
+/// is reported as that landing alone: no held row beside it, so neither the skip count nor
+/// `outdated` nor `--strict` reads a target the lock now holds as held.
+#[tokio::test]
+async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
+    let fixture = collateral_major_fixture(None)?;
+
+    let outcome = fixture.workspace.upgrade(&strict_major()).await;
 
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     assert_eq!(locked(&fixture, "a")?.as_deref(), Some("1.1.0"));
     assert_eq!(locked(&fixture, "c")?.as_deref(), Some("2.0.0"));
     // `a` reports its in-line move beside its held major; `c` reports only the collateral
-    // landing of the very target it was planned at.
+    // landing of the very target it was planned at, though that row is transitive and the
+    // planned change named both members.
     assert_eq!(
         rows(&outcome.items),
         sorted(vec![
@@ -1182,7 +1238,41 @@ async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Resul
             applied("c", "1.0.0", "2.0.0"),
         ])
     );
+    let collateral = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "c" && item.applied)
+        .ok_or_else(|| eyre::eyre!("missing collateral row"))?;
+    assert!(!collateral.direct);
     assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.items);
+    Ok(())
+}
+
+/// A collateral move that leaves one declaring member on the old version has not landed the
+/// planned change, so its hold is kept beside the partial landing.
+#[tokio::test]
+async fn a_major_landed_in_only_some_members_keeps_its_hold() -> eyre::Result<()> {
+    let fixture = collateral_major_fixture(Some("api"))?;
+
+    let outcome = fixture.workspace.upgrade(&strict_major()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "c")?.as_deref(), Some("2.0.0"));
+    assert_eq!(locked(&fixture, "c@api")?.as_deref(), Some("1.0.0"));
+    let rows = rows(&outcome.items);
+    assert!(rows.contains(&applied("c", "1.0.0", "2.0.0")), "{rows:?}");
+    assert!(
+        rows.contains(&skipped(
+            "c",
+            "1.0.0",
+            "2.0.0",
+            SkipReason::ResolverConflict,
+            SkipReason::ResolverConflict.message()
+        )),
+        "{rows:?}"
+    );
+    // The kept resolver rejection still fails `--strict`.
+    assert_eq!(outcome.exit, Exit::Policy);
     Ok(())
 }
 
