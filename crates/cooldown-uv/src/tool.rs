@@ -1541,6 +1541,7 @@ mod tests {
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
         };
         let uv_toml = root.join("uv.toml");
@@ -1575,6 +1576,7 @@ mod tests {
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
         };
 
@@ -1605,6 +1607,7 @@ mod tests {
             admitted_versions: Some(Vec::new()),
             default_window: Some(days(14)),
             exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
             package_windows: packages
                 .iter()
                 .map(|(name, window)| ((*name).to_string(), window.clone()))
@@ -1662,6 +1665,7 @@ mod tests {
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
             package_windows: [(
                 "numpy".to_string(),
                 cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_hours(24 * 30)),

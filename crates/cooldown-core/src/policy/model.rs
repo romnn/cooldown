@@ -101,6 +101,16 @@ impl PatternGlob {
         !self.raw.contains(['*', '?', '[', ']', '{', '}', '\\'])
     }
 
+    /// Whether the pattern's only glob syntax is single `*` wildcards, each matching any run of
+    /// characters including `/`.
+    ///
+    /// A literal pattern is simple too.
+    /// `**` is excluded because the glob gives `**/` and `/**` a recursive-directory meaning.
+    #[must_use]
+    pub fn is_simple_wildcard(&self) -> bool {
+        !self.raw.contains(['?', '[', ']', '{', '}', '\\']) && !self.raw.contains("**")
+    }
+
     /// Returns the original pattern text the glob was compiled from.
     #[must_use]
     pub fn raw(&self) -> &str {

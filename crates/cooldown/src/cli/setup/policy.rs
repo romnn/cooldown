@@ -158,7 +158,8 @@ async fn assemble_ctx(
     // window rather than the tool's or environment's default — which may be shorter, silently
     // weakening the supply-chain delay. An age window becomes a *relative* span ("14 days") so the
     // persisted value stays stable across runs (no per-run churn in the file); a freeze becomes its
-    // absolute instant. The default-window query mirrors `sync` (per-kind windows are not
+    // absolute instant. The default-window query resolves a locked pin no package selector names,
+    // except a glob matching the empty name such as `*` (per-kind windows are not
     // expressible as one resolver cutoff; per-package windows travel separately, below), and the
     // effective duration (`now - cutoff`) folds in any floor.
     let query = ResolveQuery {

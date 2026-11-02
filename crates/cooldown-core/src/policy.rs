@@ -15,12 +15,12 @@
 //! - `strict-native` — **security-monotone** OR across layers (handled on [`PolicyStack`]).
 
 mod model;
+mod native;
 mod resolve;
 
 pub use model::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, window_exclude_newer,
 };
-pub use resolve::{
-    MaxMajorPick, exempt_package_globs, package_windows, resolve, resolve_max_major,
-};
+pub use native::{NativeExemptions, PolicyContext, native_exemptions};
+pub use resolve::{MaxMajorPick, package_windows, resolve, resolve_max_major};

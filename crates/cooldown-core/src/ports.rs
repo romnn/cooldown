@@ -1473,16 +1473,29 @@ pub struct AdmittedVersion {
 }
 
 /// The resolved policy handed to [`ToolWrite::write_native`] for `sync`.
+///
+/// A repo-level sync ([`ToolWrite::write_repo_native`]) carries no package-wide exemptions:
+/// discovery can exclude projects that still read the repo-level file, so cooldown cannot prove
+/// an exemption against every stack that file governs.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     /// The default cooldown window to write into native config, if any.
     pub default_window: Option<WindowSpec>,
-    /// Package selector globs the policy exempts from the cooldown (cooldown.toml `latest`/`allow`),
-    /// to bake into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`). Empty for
-    /// tools without such a native knob, which simply ignore it.
+    /// Package selector globs (cooldown.toml `latest`/`allow`) proven to exempt every release of
+    /// every package they match (see [`native_exemptions`](crate::native_exemptions)), to bake
+    /// into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`).
+    /// Empty for tools without such a native knob, which simply ignore it.
     /// An adapter writes only the selectors its native list reads exactly as cooldown does and
     /// reports each other one as a warning on its [`SyncReport`].
     pub exempt_packages: Vec<String>,
+    /// The `latest`/`allow` package selectors withheld from
+    /// [`exempt_packages`](Self::exempt_packages) because cooldown could not prove that it exempts
+    /// every release they match.
+    ///
+    /// An adapter with a native exemption list reports each one as a warning on its
+    /// [`SyncReport`]; the young locked versions cooldown admits reach the native list through
+    /// [`admitted_versions`](Self::admitted_versions) instead.
+    pub withheld_exemptions: Vec<String>,
     /// The effective window of every package a literal `package` selector names (see
     /// [`package_windows`](crate::package_windows)), to bake into a native per-package cutoff
     /// table (uv's `exclude-newer-package`).

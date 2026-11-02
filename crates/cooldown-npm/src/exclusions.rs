@@ -279,8 +279,8 @@ pub(crate) fn grant_pins(pins: &[(String, String)], configured: Vec<String>) -> 
 /// stops at the first rule whose name matches.
 /// A rule left with none is deleted only when that changes nothing a package is exempt from: it is
 /// shadowed by an earlier rule for its package, or no later rule matches its package.
-/// The last remaining rule is never deleted either, since an empty list removes the setting and
-/// exposes whatever exclusions pnpm inherits from user or global configuration.
+/// The last remaining rule is never deleted either, so the setting never empties; an emptied list
+/// would only stay masking the exclusions pnpm inherits because it is written as `[]`.
 /// Negated, wildcard and versionless rules, and members pnpm would reject, are kept verbatim, and
 /// surviving members keep their raw spelling.
 pub(crate) fn prune_unlocked(
@@ -331,6 +331,23 @@ pub(crate) fn prune_unlocked(
     kept
 }
 
+/// Drops every rule without versions that is not in `keep`, keeping the rest verbatim and in order.
+///
+/// A rule without versions exempts every version of each package it is the first match for, so
+/// removing one never widens what the list grants: such a package falls through to a later rule,
+/// which grants at most every version, or to none.
+/// Every other package keeps its first match, because only rules are removed, never added or
+/// reordered.
+/// Removing a version-qualified rule could instead expose a broader later one it shadows, so those
+/// are always kept, whatever their spelling.
+pub(crate) fn drop_versionless_rules(rules: &[String], keep: &[String]) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|rule| keep.contains(rule) || Rule::parse(rule).versions.is_some())
+        .cloned()
+        .collect()
+}
+
 /// What persisting admitted versions does to the native `minimumReleaseAgeExclude` setting.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Persisted {
@@ -348,9 +365,8 @@ pub(crate) enum Persisted {
 /// ([`set_exact_permission`], [`prune_unlocked`]), keeping the rules in pnpm's order.
 ///
 /// Granting comes first, so a version admitted now is never pruned as unlocked.
-/// An empty result leaves the setting as written: writing an empty list removes the setting and
-/// would expose inherited exclusions an explicit empty one masked, and pruning never empties a
-/// non-empty list.
+/// An empty result leaves the setting as written, so an explicit empty list keeps masking the
+/// exclusions pnpm inherits; pruning never empties a non-empty list.
 pub(crate) fn persisted_rules(
     native: ConfigStringList,
     granted: &BTreeMap<String, BTreeSet<String>>,
@@ -573,6 +589,55 @@ mod tests {
                         || exempts(&strings(configured), name, version),
                     "pruning {configured:?} widened {name}@{version}"
                 );
+            }
+        }
+    }
+
+    /// Dropping the rules without versions never widens a grant, whatever the kept rules' version
+    /// spellings: a `v`-prefixed or spaced union stays, and an exact rule keeps shadowing the
+    /// broader rule after it.
+    #[test]
+    fn dropping_versionless_rules_never_widens_an_exemption() {
+        let cases: [(&[&str], &[&str], &[&str]); 6] = [
+            // pnpm-valid exact spellings are kept, so no version moves between them.
+            (
+                &["foo@v1.0.0", "foo@2.0.0", "*"],
+                &[],
+                &["foo@v1.0.0", "foo@2.0.0"],
+            ),
+            (
+                &["foo@1.0.0 || 2.0.0", "@corp/*"],
+                &[],
+                &["foo@1.0.0 || 2.0.0"],
+            ),
+            // The exact rule keeps shadowing the later name-wide rule, which goes.
+            (&["foo@1.0.0", "foo"], &[], &["foo@1.0.0"]),
+            // A negated rule without versions exempts nearly every package and goes too.
+            (&["!foo", "bar@1.0.0"], &[], &["bar@1.0.0"]),
+            // A kept selector stays where it is.
+            (
+                &["*-plugin", "*", "foo@1.0.0"],
+                &["*-plugin"],
+                &["*-plugin", "foo@1.0.0"],
+            ),
+            // Version-qualified rules of any shape are kept, even ones pnpm would reject.
+            (
+                &["@corp/*@1.0.0", "foo@not-a-version", "!bar@1.0.0"],
+                &[],
+                &["@corp/*@1.0.0", "foo@not-a-version", "!bar@1.0.0"],
+            ),
+        ];
+        for (configured, keep, expected) in cases {
+            let before = strings(configured);
+            let after = drop_versionless_rules(&before, &strings(keep));
+            assert_eq!(after, strings(expected), "{configured:?}");
+            for name in ["foo", "bar", "@corp/ui", "eslint-plugin", "zed"] {
+                for version in ["1.0.0", "2.0.0", "3.0.0"] {
+                    assert!(
+                        !exempts(&after, name, version) || exempts(&before, name, version),
+                        "dropping from {configured:?} widened {name}@{version}"
+                    );
+                }
             }
         }
     }

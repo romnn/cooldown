@@ -1,6 +1,8 @@
 //! pnpm native cooldown configuration parsing and text-preserving updates.
 
-use crate::exclusions::{is_pnpm_safe_selector, name_matches};
+use crate::exclusions::{
+    configured_rules, drop_versionless_rules, is_pnpm_safe_selector, name_matches,
+};
 use camino::Utf8Path;
 use cooldown_core::{CoreError, Result, WindowSpec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +62,40 @@ pub(crate) fn minimum_age_exclusions(
         ))
     }));
     exclusions
+}
+
+/// Drops every existing `minimumReleaseAgeExclude` rule at `path` that exempts every version of
+/// its packages and is not a `written` selector ([`drop_versionless_rules`]).
+///
+/// This is the cleanup for a sync that cannot write pnpm's window: a selector the policy withholds
+/// or omits must not stay exempt natively, while the version-qualified rules are kept verbatim
+/// because no admission was evaluated against the window pnpm still applies.
+/// A list that keeps every rule is not rewritten.
+/// An empty result is written as `empty` says: an existing key always stays as `key: []`, so the
+/// exclusions pnpm inherits stay masked, and an [`EmptyList::Explicit`] list is written even where
+/// the key or the file was absent, as a sync with a writable window does.
+/// A scalar setting containing `${` is left alone, since pnpm may expand it into rules this cannot
+/// read.
+/// Returns whether the list changed.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when the file cannot be read, parsed, or written.
+pub(crate) fn prune_exclusions(
+    path: &Utf8Path,
+    written: &[String],
+    empty: EmptyList,
+    dry_run: bool,
+) -> Result<bool> {
+    let rules = match NativeAge::read(path)?.exclusions {
+        ConfigStringList::One(scalar) if scalar.contains("${") => return Ok(false),
+        configured => configured_rules(configured),
+    };
+    let retained = drop_versionless_rules(&rules, written);
+    if !retained.is_empty() && retained == rules {
+        return Ok(false);
+    }
+    set_yaml_block_list(path, "minimumReleaseAgeExclude", &retained, empty, dry_run)
 }
 
 /// Recognizes cooldown-owned exact entries without claiming user-authored version ranges.
@@ -263,21 +299,23 @@ fn replace_top_level_block(
 }
 
 /// How [`set_yaml_block_list`] writes an empty item list.
+///
+/// pnpm reads an explicit empty list as the setting itself, which masks a list inherited from user
+/// or global configuration, while an absent key exposes it.
+/// An existing key, whatever its value, is therefore never removed: an empty list always keeps it
+/// as `key: []`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmptyList {
-    /// The key and its block are removed.
-    Remove,
-    /// The key is kept as an explicit empty sequence (`key: []`).
-    ///
-    /// pnpm reads an explicit empty list as the setting itself, which masks a list inherited from
-    /// user or global configuration, while a removed key exposes it.
+    /// An existing key becomes `key: []`, and an absent key stays absent.
+    IfPresent,
+    /// The key is written as an explicit empty sequence (`key: []`), even where it was absent.
     Explicit,
 }
 
 /// Sets one top-level YAML block sequence while preserving the rest of the document.
 ///
-/// An empty item list is written as `empty` says: [`EmptyList::Remove`] removes the key and its
-/// block, and [`EmptyList::Explicit`] writes `key: []`.
+/// An empty item list is written as `key: []` where the key exists, and where it is absent only
+/// for [`EmptyList::Explicit`]; a key is never removed.
 /// Items are emitted as double-quoted scalars in caller-provided order, which safely preserves
 /// scoped names such as `@scope/pkg` and glob patterns such as `@scope/*`.
 /// A missing file is created only when something is written and `dry_run` is disabled.
@@ -297,11 +335,14 @@ pub(crate) fn set_yaml_block_list(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
     };
-    // An empty desired block means the key should be absent; `key: []` keeps it explicitly empty.
+    let prefix = format!("{key}:");
+    let lines: Vec<&str> = content.lines().collect();
+    let present = replace_top_level_block(&lines, &prefix, &[]).is_some();
+    // An empty desired block leaves an absent key absent; `key: []` keeps it explicitly empty.
     let desired: Vec<String> = if items.is_empty() {
         match empty {
-            EmptyList::Remove => Vec::new(),
-            EmptyList::Explicit => vec![format!("{key}: []")],
+            EmptyList::IfPresent if !present => Vec::new(),
+            EmptyList::IfPresent | EmptyList::Explicit => vec![format!("{key}: []")],
         }
     } else {
         std::iter::once(format!("{key}:"))
@@ -315,8 +356,6 @@ pub(crate) fn set_yaml_block_list(
             .collect()
     };
 
-    let prefix = format!("{key}:");
-    let lines: Vec<&str> = content.lines().collect();
     let replaced = replace_top_level_block(&lines, &prefix, &desired);
     let found = replaced.is_some();
     let (out, existing) = replaced.unwrap_or_default();
@@ -578,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn set_yaml_block_list_adds_updates_removes_and_is_idempotent() -> eyre::Result<()> {
+    fn set_yaml_block_list_adds_updates_empties_and_is_idempotent() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
@@ -596,7 +635,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &items,
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -615,7 +654,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &items,
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
 
@@ -625,7 +664,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &fewer,
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         let updated = std::fs::read_to_string(&path)?;
@@ -635,26 +674,30 @@ mod tests {
         assert!(!updated.contains("@scope/*"), "dropped item is gone");
         assert!(updated.contains("# keep me"), "comment still preserved");
 
-        // Empty list → the key and its block are removed entirely.
+        // Empty list → the existing key stays as an explicit empty sequence, so an inherited list
+        // stays masked.
         assert!(set_yaml_block_list(
             &path,
             "minimumReleaseAgeExclude",
             &[],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
-        let removed = std::fs::read_to_string(&path)?;
-        assert!(!removed.contains("minimumReleaseAgeExclude"), "key removed");
+        let emptied = std::fs::read_to_string(&path)?;
         assert!(
-            removed.contains("minimumReleaseAge: 20160"),
+            emptied.contains("minimumReleaseAgeExclude: []\n"),
+            "key kept empty"
+        );
+        assert!(
+            emptied.contains("minimumReleaseAge: 20160"),
             "scalar untouched"
         );
-        // Removing again is a no-op.
+        // Emptying again is a no-op.
         assert!(!set_yaml_block_list(
             &path,
             "minimumReleaseAgeExclude",
             &[],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         Ok(())
@@ -729,12 +772,22 @@ mod tests {
             "minimumReleaseAge: 20160\nminimumReleaseAgeExclude: []\n"
         );
 
-        // Removal still deletes the explicit empty sequence.
-        assert!(set_yaml_block_list(
+        // An existing explicit empty sequence is never removed.
+        assert!(!set_yaml_block_list(
             &path,
             key,
             &[],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
+            false
+        )?);
+
+        // Only an absent key stays absent.
+        std::fs::write(&path, "minimumReleaseAge: 20160\n")?;
+        assert!(!set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::IfPresent,
             false
         )?);
         assert_eq!(
@@ -771,7 +824,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -810,7 +863,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -849,7 +902,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
 
@@ -857,7 +910,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["b".to_string()],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -870,11 +923,11 @@ mod tests {
         Ok(())
     }
 
-    /// Removing the key must remove the *whole* block — an interior blank line or comment must not
-    /// strand a fragment that turns the document into a YAML parse error (this is the sync path;
-    /// no journal restores the file afterwards).
+    /// Emptying the list must replace the *whole* block — an interior blank line or comment must
+    /// not strand a fragment that turns the document into a YAML parse error (this is the sync
+    /// path; no journal restores the file afterwards).
     #[test]
-    fn set_yaml_block_list_empty_sync_removes_interior_fragments() -> eyre::Result<()> {
+    fn set_yaml_block_list_empty_sync_replaces_interior_fragments() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
@@ -895,12 +948,16 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &[],
-            EmptyList::Remove,
+            EmptyList::IfPresent,
             false
         )?);
         assert_eq!(
             std::fs::read_to_string(&path)?,
-            "packages:\n  - \"x\"\n",
+            indoc! {r#"
+                minimumReleaseAgeExclude: []
+                packages:
+                  - "x"
+            "#},
             "no orphaned fragment may remain"
         );
         Ok(())

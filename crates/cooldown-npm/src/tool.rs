@@ -15,8 +15,8 @@ use crate::lock::{
 use crate::manifest;
 use crate::native::{
     ConfigStringList, EmptyList, NativeAge, NativeSelectors, exact_exclusion,
-    minimum_age_exclusions, set_yaml_block_list, set_yaml_scalar, set_yaml_string_map,
-    window_minutes,
+    minimum_age_exclusions, prune_exclusions, set_yaml_block_list, set_yaml_scalar,
+    set_yaml_string_map, window_minutes,
 };
 use crate::nodecmd::NodeCmd;
 use crate::peers::{
@@ -2569,7 +2569,7 @@ impl<L: NodeLock> NpmTool<L> {
                     &path,
                     "minimumReleaseAgeExclude",
                     &exclusions,
-                    EmptyList::Remove,
+                    EmptyList::IfPresent,
                     false,
                 )?;
             }
@@ -3491,14 +3491,30 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             return Ok(SyncReport::Unsupported); // npm/yarn/bun have no native cooldown knob
         };
         let path = project.root.join(file);
-        // Selectors pnpm would read differently stay out of the native list and are reported on
-        // every outcome, including the early return that writes nothing.
+        // Selectors cooldown could not prove exempt and selectors pnpm would read differently stay
+        // out of the native list and are reported on every outcome, including a sync that cannot
+        // write the window.
         let selectors = NativeSelectors::partition(&policy.exempt_packages);
-        let warnings = omitted_selector_warnings(&selectors.omitted);
+        let mut warnings = withheld_selector_warnings(&policy.withheld_exemptions);
+        warnings.extend(omitted_selector_warnings(&selectors.omitted));
         let Some(minutes) = policy.default_window.as_ref().and_then(window_minutes) else {
             // pnpm's minimumReleaseAge is a rolling minute count; a freeze date or opt-out can't be
-            // expressed, so leave the file untouched.
-            return Ok(SyncReport::Unchanged { path, warnings });
+            // expressed, so the window is left as it is.
+            // The window may still be active, so a selector the policy no longer grants loses its
+            // entry.
+            // An existing key always survives as at least `[]`; only a withheld or omitted
+            // selector calls for adding one, since the written selectors are not added here.
+            let empty = if policy.withheld_exemptions.is_empty() && selectors.omitted.is_empty() {
+                EmptyList::IfPresent
+            } else {
+                EmptyList::Explicit
+            };
+            let changed = prune_exclusions(&path, &selectors.written, empty, dry_run)?;
+            return Ok(if changed {
+                SyncReport::Written { path, warnings }
+            } else {
+                SyncReport::Unchanged { path, warnings }
+            });
         };
         // Policy-exempt names and admitted young versions must also pass pnpm's rolling age gate.
         let exclusions = if let Some(admitted) = &policy.admitted_versions {
@@ -3522,13 +3538,13 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             );
             exclusions
         };
-        // A policy without selectors removes an empty list, so toggling a package back under the
-        // cooldown cleans up after itself.
-        // A policy whose selectors were all omitted keeps an explicit empty list instead, which
-        // masks the exclusions pnpm would otherwise inherit from user or global configuration
-        // just as a non-empty list does.
-        let empty = if policy.exempt_packages.is_empty() {
-            EmptyList::Remove
+        // An emptied list stays as an explicit `[]` wherever the key exists, since removing it
+        // would expose the exclusions pnpm inherits from user or global configuration.
+        // A policy without selectors leaves an absent key absent, while a policy whose selectors
+        // were all withheld or omitted adds the explicit empty list, which masks the inherited
+        // exclusions just as a non-empty list does.
+        let empty = if policy.exempt_packages.is_empty() && policy.withheld_exemptions.is_empty() {
+            EmptyList::IfPresent
         } else {
             EmptyList::Explicit
         };
@@ -3547,6 +3563,23 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             SyncReport::Unchanged { path, warnings }
         })
     }
+}
+
+/// One [`DiagnosticKind::StricterNative`] warning per selector cooldown withholds from pnpm's
+/// `minimumReleaseAgeExclude` because it cannot prove the selector exempts every release.
+fn withheld_selector_warnings(withheld: &[String]) -> Vec<Diagnostic> {
+    withheld
+        .iter()
+        .map(|selector| {
+            Diagnostic::new(
+                DiagnosticKind::StricterNative,
+                format!(
+                    "cooldown cannot prove that every release `{selector}` matches is exempt, so \
+                     it is not exempted natively"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// One [`DiagnosticKind::StricterNative`] warning per selector `sync` leaves out of pnpm's
@@ -4076,6 +4109,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: vec!["@typescript/native-preview".to_string()],
+            withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
             admitted_versions: Some(Vec::new()),
         };
@@ -4132,6 +4166,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: vec!["new-glob".to_string(), "@corp/*".to_string()],
+            withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
             admitted_versions: None,
         };
@@ -4184,6 +4219,7 @@ packages:
                 jiff::SignedDuration::from_hours(24 * 14),
             )),
             exempt_packages: selectors.iter().map(ToString::to_string).collect(),
+            withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
             admitted_versions: admitted.map(|admitted| {
                 admitted
@@ -4314,7 +4350,8 @@ packages:
 
     /// A policy whose selectors are all omitted keeps an explicit empty list, so the exclusions
     /// pnpm inherits from user or global configuration stay masked; the list empties only once
-    /// nothing is left in it, and the key disappears again when the policy drops its selectors.
+    /// nothing is left in it, and it stays an explicit empty list when the policy drops its
+    /// selectors, since removing it would expose the inherited exclusions again.
     #[tokio::test]
     async fn write_native_keeps_an_explicit_empty_list_for_omitted_selectors() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -4376,21 +4413,120 @@ packages:
             ["react-dom@19.0.0"]
         );
 
-        // Without selectors the empty list is removed, as before.
+        // Without selectors the explicit empty list is kept as it is.
         std::fs::write(&path, explicit_empty)?;
         let no_selectors = pnpm_sync_policy(&[], Some(&[]));
-        let removed = tool.write_native(&project, &no_selectors, false).await?;
-        std::assert_matches!(removed, SyncReport::Written { .. });
-        assert_eq!(omitted_selectors(&removed), [] as [String; 0]);
-        assert_eq!(
-            std::fs::read_to_string(&path)?,
-            "packages: []\nminimumReleaseAge: 20160\n"
+        let kept = tool.write_native(&project, &no_selectors, false).await?;
+        std::assert_matches!(kept, SyncReport::Unchanged { .. });
+        assert_eq!(omitted_selectors(&kept), [] as [String; 0]);
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+        Ok(())
+    }
+
+    /// With a writable window, a policy that names no selector empties an existing list to an
+    /// explicit `[]` rather than removing it, which would let an inherited `["*"]` exempt every
+    /// package; an absent key with nothing withheld or omitted stays absent.
+    #[tokio::test]
+    async fn write_native_never_removes_an_existing_list() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let no_selectors = pnpm_sync_policy(&[], Some(&[]));
+
+        // An existing list
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "foo"
+            "#},
+        )?;
+        let emptied = tool.write_native(&project, &no_selectors, false).await?;
+        std::assert_matches!(emptied, SyncReport::Written { .. });
+        let explicit_empty = indoc! {"
+            packages: []
+            minimumReleaseAge: 20160
+            minimumReleaseAgeExclude: []
+        "};
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+        let again = tool.write_native(&project, &no_selectors, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+
+        // An absent key
+        std::fs::write(&path, "packages: []\n")?;
+        tool.write_native(&project, &no_selectors, false).await?;
+        let written = std::fs::read_to_string(&path)?;
+        assert_eq!(NativeAge::read(&path)?.minutes, Some(20160), "{written}");
+        assert!(
+            !written.contains("minimumReleaseAgeExclude"),
+            "an absent key stays absent: {written}"
         );
         Ok(())
     }
 
-    /// A window pnpm cannot express leaves the file untouched, yet the omitted selectors are
-    /// still reported.
+    /// Under a freeze-only policy, cleanup keeps an existing explicit empty list and empties a
+    /// pruned `["foo"]` to `[]`, so an inherited `["*"]` never becomes active; an absent key with
+    /// nothing withheld or omitted stays absent.
+    #[tokio::test]
+    async fn write_native_cleanup_never_removes_an_existing_list() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut freeze_only = pnpm_sync_policy(&[], Some(&[]));
+        freeze_only.default_window = Some(cooldown_core::WindowSpec::Freeze(
+            "2026-10-31T00:00:00Z".parse()?,
+        ));
+        let explicit_empty = indoc! {"
+            packages: []
+            minimumReleaseAge: 10080
+            minimumReleaseAgeExclude: []
+        "};
+
+        // An existing explicit empty list
+        std::fs::write(&path, explicit_empty)?;
+        let kept = tool.write_native(&project, &freeze_only, false).await?;
+        std::assert_matches!(kept, SyncReport::Unchanged { .. });
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+
+        // A list the cleanup empties
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "foo"
+            "#},
+        )?;
+        let emptied = tool.write_native(&project, &freeze_only, false).await?;
+        std::assert_matches!(emptied, SyncReport::Written { .. });
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+        let again = tool.write_native(&project, &freeze_only, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+
+        // An absent key
+        let absent = indoc! {"
+            packages: []
+            minimumReleaseAge: 10080
+        "};
+        std::fs::write(&path, absent)?;
+        let untouched = tool.write_native(&project, &freeze_only, false).await?;
+        std::assert_matches!(untouched, SyncReport::Unchanged { .. });
+        assert_eq!(std::fs::read_to_string(&path)?, absent);
+        Ok(())
+    }
+
+    /// A window pnpm cannot express leaves `minimumReleaseAge` alone and still reports omitted
+    /// selectors; an omitted selector adds an explicit empty list, masking inherited exclusions,
+    /// while a policy whose selectors are all written leaves the file untouched.
     #[tokio::test]
     async fn write_native_reports_omitted_selectors_when_the_window_is_not_written()
     -> eyre::Result<()> {
@@ -4400,14 +4536,409 @@ packages:
         let path = root.join("pnpm-workspace.yaml");
         std::fs::write(&path, "packages: []\n")?;
         let project = pnpm_sync_project(&root);
-        let mut policy = pnpm_sync_policy(&["[!a-c]*", "*-plugin"], Some(&[]));
-        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
         let (_cache, tool) = pnpm_sync_tool()?;
 
-        let report = tool.write_native(&project, &policy, false).await?;
-        std::assert_matches!(report, SyncReport::Unchanged { .. });
-        assert_eq!(omitted_selectors(&report), ["[!a-c]*"]);
+        let mut written_only = pnpm_sync_policy(&["*-plugin"], Some(&[]));
+        written_only.default_window = Some(cooldown_core::WindowSpec::Latest);
+        let untouched = tool.write_native(&project, &written_only, false).await?;
+        std::assert_matches!(untouched, SyncReport::Unchanged { .. });
         assert_eq!(std::fs::read_to_string(&path)?, "packages: []\n");
+
+        let mut policy = pnpm_sync_policy(&["[!a-c]*", "*-plugin"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+        let report = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(report, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&report), ["[!a-c]*"]);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "}
+        );
+        Ok(())
+    }
+
+    /// A 14-day policy that withholds `withheld` and exempts nothing package-wide.
+    fn pnpm_withholding_policy(
+        withheld: &[&str],
+        admitted: Option<&[(&str, &str)]>,
+    ) -> ResolvedPolicy {
+        let mut policy = pnpm_sync_policy(&[], admitted);
+        policy.withheld_exemptions = withheld.iter().map(ToString::to_string).collect();
+        policy
+    }
+
+    /// A withheld selector replaces an existing package-wide entry with an explicit empty list,
+    /// so inherited exclusions stay masked, and each sync names it in a warning that says why.
+    #[tokio::test]
+    async fn write_native_withholds_a_selector_behind_an_explicit_empty_list() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "@corp/*"
+            "#},
+        )?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_withholding_policy(&["@corp/*"], Some(&[]));
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let written = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(written, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&written), ["@corp/*"]);
+        let SyncReport::Written { warnings, .. } = &written else {
+            eyre::bail!("expected a written report: {written:?}");
+        };
+        assert!(
+            warnings.iter().all(|warning| warning
+                .message
+                .contains("cannot prove that every release `@corp/*` matches is exempt")),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            indoc! {"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude: []
+            "}
+        );
+
+        // A second sync is unchanged and still names the withheld selector.
+        let again = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+        assert_eq!(omitted_selectors(&again), ["@corp/*"]);
+        Ok(())
+    }
+
+    /// The young locked versions cooldown admits under a withheld selector are written as exact
+    /// unions instead of the package-wide entry, and a re-sync leaves them unchanged.
+    #[tokio::test]
+    async fn write_native_admits_exact_versions_under_a_withheld_selector() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages: []\n")?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_withholding_policy(
+            &["@corp/*"],
+            Some(&[("@corp/ui", "2.0.0"), ("@corp/ui", "1.0.0")]),
+        );
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let written = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(written, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&written), ["@corp/*"]);
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["@corp/ui@1.0.0||2.0.0"]
+        );
+        let again = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+        Ok(())
+    }
+
+    /// Without admission evidence, a withheld selector's old package-wide entry is still dropped
+    /// while the existing exact entries survive verbatim.
+    #[tokio::test]
+    async fn write_native_drops_a_withheld_selector_when_evaluation_fails() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "@corp/*"
+                  - "@corp/ui@1.0.0"
+            "#},
+        )?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_withholding_policy(&["@corp/*"], None);
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let written = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(written, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&written), ["@corp/*"]);
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["@corp/ui@1.0.0"]
+        );
+        Ok(())
+    }
+
+    /// A window pnpm cannot express leaves `minimumReleaseAge` as it is, yet the broad entry of a
+    /// withheld selector is still dropped, since that stale window keeps gating: otherwise `["*"]`
+    /// would keep admitting brand-new majors cooldown holds back.
+    /// Exact entries survive verbatim, and the list empties to an explicit `[]`.
+    #[tokio::test]
+    async fn write_native_prunes_a_withheld_entry_when_the_window_is_not_written()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let freeze = cooldown_core::WindowSpec::Freeze("2026-01-01T00:00:00Z".parse()?);
+        for window in [cooldown_core::WindowSpec::Latest, freeze] {
+            std::fs::write(
+                &path,
+                indoc! {r#"
+                    packages: []
+                    minimumReleaseAge: 10080
+                    minimumReleaseAgeExclude:
+                      - "*"
+                      - "@corp/ui@1.0.0"
+                "#},
+            )?;
+            let mut policy = pnpm_withholding_policy(&["*"], Some(&[]));
+            policy.default_window = Some(window.clone());
+
+            // A dry run reports the cleanup without touching the file.
+            let dry = tool.write_native(&project, &policy, true).await?;
+            std::assert_matches!(dry, SyncReport::Written { .. }, "{window:?}");
+
+            let written = tool.write_native(&project, &policy, false).await?;
+            std::assert_matches!(written, SyncReport::Written { .. }, "{window:?}");
+            assert_eq!(omitted_selectors(&written), ["*"]);
+            assert_eq!(
+                std::fs::read_to_string(&path)?,
+                indoc! {r#"
+                    packages: []
+                    minimumReleaseAge: 10080
+                    minimumReleaseAgeExclude:
+                      - "@corp/ui@1.0.0"
+                "#},
+                "{window:?}"
+            );
+            let again = tool.write_native(&project, &policy, false).await?;
+            std::assert_matches!(again, SyncReport::Unchanged { .. }, "{window:?}");
+        }
+
+        // A list holding only the withheld entry becomes an explicit empty list.
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "*"
+            "#},
+        )?;
+        let mut policy = pnpm_withholding_policy(&["*"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+        tool.write_native(&project, &policy, false).await?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            indoc! {"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude: []
+            "}
+        );
+        Ok(())
+    }
+
+    /// Without a writable window, the cleanup keeps written selectors and drops omitted and
+    /// withheld ones.
+    #[tokio::test]
+    async fn write_native_prunes_unwritten_selectors_when_the_window_is_not_written()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut policy = pnpm_sync_policy(&["react-?om", "*-plugin"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+        policy.withheld_exemptions = vec!["@corp/*".to_string()];
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAgeExclude:
+                  - "*-plugin"
+                  - "react-?om"
+                  - "@corp/*"
+            "#},
+        )?;
+
+        let pruned = tool.write_native(&project, &policy, false).await?;
+
+        std::assert_matches!(pruned, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&pruned), ["@corp/*", "react-?om"]);
+        assert_eq!(NativeAge::read(&path)?.exclusions.into_vec(), ["*-plugin"]);
+        Ok(())
+    }
+
+    /// Under a freeze, a withheld selector masks inherited exclusions with an explicit empty list
+    /// even where the key, or the whole file, was absent, as a sync with a writable window would,
+    /// and a re-sync leaves it unchanged.
+    #[tokio::test]
+    async fn write_native_masks_inherited_exclusions_when_the_window_is_not_written()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut policy = pnpm_withholding_policy(&["@corp/*"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Freeze(
+            "2026-10-31T00:00:00Z".parse()?,
+        ));
+
+        // An absent key
+        std::fs::write(
+            &path,
+            indoc! {"
+                packages: []
+                minimumReleaseAge: 10080
+            "},
+        )?;
+        let written = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(written, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&written), ["@corp/*"]);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            indoc! {"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude: []
+            "}
+        );
+        let again = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+
+        // An absent file
+        std::fs::remove_file(&path)?;
+        tool.write_native(&project, &policy, false).await?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "minimumReleaseAgeExclude: []\n"
+        );
+        Ok(())
+    }
+
+    /// A scalar setting is read one rule per character, as pnpm reads it, unless pnpm may expand
+    /// an environment variable in it first, which leaves it alone.
+    #[tokio::test]
+    async fn write_native_prunes_a_scalar_setting_only_when_it_can_read_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut policy = pnpm_withholding_policy(&["*"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+
+        let expanded = indoc! {r#"
+            packages: []
+            minimumReleaseAgeExclude: "${EXEMPT}"
+        "#};
+        std::fs::write(&path, expanded)?;
+        let untouched = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(untouched, SyncReport::Unchanged { .. });
+        assert_eq!(std::fs::read_to_string(&path)?, expanded);
+
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAgeExclude: "*"
+            "#},
+        )?;
+        tool.write_native(&project, &policy, false).await?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "}
+        );
+        Ok(())
+    }
+
+    /// Pruning keeps every version-qualified rule in any spelling pnpm accepts, so no version moves
+    /// between rules: `foo@v1.0.0` keeps shadowing `foo@2.0.0`, and an exact rule keeps shadowing
+    /// the name-wide rule after it, which goes.
+    #[tokio::test]
+    async fn write_native_pruning_keeps_every_version_qualified_rule() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut policy = pnpm_withholding_policy(&["@corp/*"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Freeze(
+            "2026-10-31T00:00:00Z".parse()?,
+        ));
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "foo@v1.0.0"
+                  - "foo@2.0.0"
+                  - "bar@1.0.0 || 2.0.0"
+                  - "baz@1.0.0"
+                  - "baz"
+                  - "@corp/*"
+            "#},
+        )?;
+        let before = NativeAge::read(&path)?.exclusions.into_vec();
+
+        tool.write_native(&project, &policy, false).await?;
+
+        let after = NativeAge::read(&path)?.exclusions.into_vec();
+        assert_eq!(
+            after,
+            ["foo@v1.0.0", "foo@2.0.0", "bar@1.0.0 || 2.0.0", "baz@1.0.0"]
+        );
+        for name in ["foo", "bar", "baz", "@corp/ui"] {
+            for version in ["1.0.0", "2.0.0", "3.0.0"] {
+                assert!(
+                    !crate::exclusions::exempts(&after, name, version)
+                        || crate::exclusions::exempts(&before, name, version),
+                    "pruning widened {name}@{version}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Withheld selectors are reported before omitted ones, and both keep the list explicit.
+    #[tokio::test]
+    async fn write_native_reports_withheld_and_omitted_selectors() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages: []\n")?;
+        let project = pnpm_sync_project(&root);
+        let mut policy = pnpm_sync_policy(&["react-?om", "*-plugin"], Some(&[]));
+        policy.withheld_exemptions = vec!["@corp/*".to_string()];
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let written = tool.write_native(&project, &policy, false).await?;
+        assert_eq!(omitted_selectors(&written), ["@corp/*", "react-?om"]);
+        assert_eq!(NativeAge::read(&path)?.exclusions.into_vec(), ["*-plugin"]);
         Ok(())
     }
 

@@ -702,17 +702,23 @@ fn native_minimum_age_migration_fixture() -> eyre::Result<(Fixture, Vec<u8>)> {
             &[],
         )?
         .require_success()?;
-    fixture.write("cooldown.toml", "[package.nanoid]\nlatest = true\n");
     let minimum_age_minutes = minimum_release_age_minutes(FREEZE);
-    let min_age = format!("{minimum_age_minutes}m");
+    // The window shares the `nanoid` rule's layer, where the package selector outranks the bare
+    // default; a `--min-age` flag would outrank the exemption, which sync then withholds.
+    fixture.write(
+        "cooldown.toml",
+        &indoc::formatdoc! {r#"
+            min-age = "{minimum_age_minutes}m"
+
+            [package.nanoid]
+            latest = true
+        "#},
+    );
 
     // Activating the native gate after resolution makes pnpm reject the existing lock. This is the
     // migration state `fix` must cross rather than misclassifying every downgrade as a conflict.
     fixture
-        .cooldown_traced(
-            "activate native minimum age",
-            &["sync", "--tool", "pnpm", "--min-age", &min_age],
-        )?
+        .cooldown_traced("activate native minimum age", &["sync", "--tool", "pnpm"])?
         .require_success()?;
     let native_before_fix = fixture.read_bytes("pnpm-workspace.yaml");
     let native = String::from_utf8(native_before_fix.clone())?;
@@ -2063,6 +2069,145 @@ fn sync_reports_selectors_pnpm_would_match_differently() {
         output.contains("1 unchanged")
             && output.contains("warning [stricter_native]: selector `@types/{node,react}`"),
         "the text report carries the warning: {output}"
+    );
+}
+
+/// The minimal pnpm project `sync` discovers, with `workspace` as its `pnpm-workspace.yaml` and
+/// `config` as its `cooldown.toml`; `sync` writes the native YAML without running the resolver.
+fn sync_fixture(workspace: &str, config: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "cooldown-sync-fixture",
+              "version": "0.1.0",
+              "private": true
+            }
+        "#},
+    );
+    fixture.write("pnpm-workspace.yaml", workspace);
+    fixture.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    fixture.write("cooldown.toml", config);
+    fixture
+}
+
+/// A `latest` glob whose majors cooldown still holds to 30 days is withheld from pnpm's
+/// `minimumReleaseAgeExclude`, since a package-wide entry would let pnpm install a brand-new
+/// major.
+/// The broad entry an earlier sync wrote gives way to an explicit empty list, so exclusions pnpm
+/// inherits stay masked, a `stricter_native` warning names the selector, and a second sync is
+/// unchanged.
+#[test]
+fn sync_withholds_a_partially_exempt_latest_glob() {
+    skip_if_missing!("pnpm");
+    let fixture = sync_fixture(
+        indoc::indoc! {r#"
+            packages: []
+            minimumReleaseAgeExclude:
+              - "@corp/*"
+        "#},
+        indoc::indoc! {r#"
+            [min-age]
+            default = "7d"
+            major = "30d"
+
+            [package."@corp/*"]
+            latest = true
+        "#},
+    );
+
+    let report = fixture.cooldown_json(&["sync", "--tool", "pnpm"]);
+    assert!(report.ok(), "sync should succeed: {report:?}");
+    assert_eq!(
+        report.warning_kinds(),
+        std::collections::BTreeSet::from(["stricter_native".to_string()]),
+        "{report:?}"
+    );
+    assert!(
+        report.warning_messages().iter().any(|message| message
+            .contains("cannot prove that every release `@corp/*` matches is exempt")),
+        "the warning names the withheld selector: {report:?}"
+    );
+
+    let yaml = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8");
+    assert!(
+        yaml.contains("minimumReleaseAge: 10080") && yaml.contains("minimumReleaseAgeExclude: []"),
+        "the default window is synced and the glob is withheld behind an explicit empty list: {yaml}"
+    );
+    assert!(!yaml.contains("@corp/*"), "the broad entry is gone: {yaml}");
+
+    let text = fixture.cooldown(&["sync", "--tool", "pnpm"]);
+    let output = format!("{}{}", text.stdout_str(), text.stderr_str());
+    assert!(
+        output.contains("1 unchanged") && output.contains("`@corp/*`"),
+        "the second sync is unchanged and still warns: {output}"
+    );
+}
+
+/// `[package."*"] latest = true` names every package, yet its exemption neither becomes the native
+/// default nor stays exempt natively once majors wait 30 days: `sync` writes the 7-day default and
+/// replaces the `["*"]` an earlier sync left with an explicit empty list.
+#[test]
+fn sync_withholds_a_partially_exempt_catch_all() {
+    skip_if_missing!("pnpm");
+    let fixture = sync_fixture(
+        indoc::indoc! {r#"
+            packages: []
+            minimumReleaseAge: 10080
+            minimumReleaseAgeExclude:
+              - "*"
+        "#},
+        indoc::indoc! {r#"
+            [min-age]
+            default = "7d"
+            major = "30d"
+
+            [package."*"]
+            latest = true
+        "#},
+    );
+
+    let report = fixture.cooldown_json(&["sync", "--tool", "pnpm"]);
+    assert!(report.ok(), "sync should succeed: {report:?}");
+    assert!(
+        report.warning_messages().iter().any(
+            |message| message.contains("cannot prove that every release `*` matches is exempt")
+        ),
+        "the warning names the withheld selector: {report:?}"
+    );
+    assert_eq!(
+        String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8"),
+        indoc::indoc! {"
+            packages: []
+            minimumReleaseAge: 10080
+            minimumReleaseAgeExclude: []
+        "}
+    );
+}
+
+/// A `latest` glob nothing else narrows exempts every release, so it stays a package-wide
+/// `minimumReleaseAgeExclude` entry without a warning.
+#[test]
+fn sync_writes_a_fully_exempt_latest_glob() {
+    skip_if_missing!("pnpm");
+    let fixture = sync_fixture(
+        "packages: []\n",
+        indoc::indoc! {r#"
+            min-age = "14d"
+
+            [package."@corp/*"]
+            latest = true
+        "#},
+    );
+
+    let report = fixture.cooldown_json(&["sync", "--tool", "pnpm"]);
+    assert!(report.ok(), "sync should succeed: {report:?}");
+    assert!(report.warning_kinds().is_empty(), "{report:?}");
+    let yaml = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8");
+    assert!(
+        yaml.contains("minimumReleaseAgeExclude:\n  - \"@corp/*\"\n"),
+        "the glob is written: {yaml}"
     );
 }
 
