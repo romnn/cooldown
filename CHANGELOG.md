@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **npm and pnpm hold a `v`-prefixed exact pin like a bare one.** node-semver reads `v1.2.3`,
+  `=v1.2.3` and `= v1.2.3` as the exact version `1.2.3`, but cooldown's planner read them as
+  movable ranges: an Auto upgrade widened such a pin to `^target`, and since the pin guard refuses
+  that move after the resolve, the run ended in a resolver conflict instead of the up-front
+  `pin_held` skip a `1.2.3` pin gets. All three spellings are now exact pins everywhere cooldown
+  plans and lands: lock pin detection, hidden install-field pins, range matching, and `--major`
+  ceiling holds. Without `--rewrite` (or `fix --downgrade-pinned` for a downgrade) such a pin is
+  held as `pin_held` with no resolver run; with it the pin is rewritten and stays exact, a bare
+  `v1.2.3` becoming the bare target and an `=` spelling becoming `=target`, never a caret. A pin
+  that already admits the target keeps its spelling. Only whole exact pins read the `v` prefix:
+  ranges such as `^v1.2.3`, `>=v1` or `v1.x` keep their conservative handling.
+
 - **pnpm `sync` writes a package-wide exemption only when cooldown exempts every release.** A
   `latest`/`allow` selector used to land in `minimumReleaseAgeExclude` whenever its own rule set
   `latest` or `allow`, so a plain `pnpm install` could adopt a brand-new major of `@corp/ui` that

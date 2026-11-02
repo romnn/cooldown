@@ -296,7 +296,9 @@ fn violates(pin: &str, field: &str, observed: &Observed, baseline_bound: bool) -
         Observed::Resolved(version) => {
             // npm reads a bare version as an equality and ignores build metadata when matching,
             // so `1.2.3+build.a` satisfies the exact pin `1.2.3`.
-            !crate::version::version_in_range(normalized_pin(pin), version)
+            // The matcher reads every exact-pin spelling the planner holds (`= v1.2.3`), so the
+            // guard and the planner judge one pin alike.
+            !crate::version::version_in_range(pin, version)
         }
         Observed::Missing => baseline_bound && REQUIRED_FIELDS.contains(&field),
         Observed::Unknown => false,
@@ -305,6 +307,9 @@ fn violates(pin: &str, field: &str, observed: &Observed, baseline_bound: bool) -
 
 /// The version an exact pin names, every spelling node-semver reads as equal stripped
 /// (`= v1.2.3` → `1.2.3`); any other specifier is returned trimmed.
+///
+/// Grandfathering compares pins by this, so an authorized replacement that only respells the
+/// baseline pin still judges the same pin.
 fn normalized_pin(pin: &str) -> &str {
     crate::version::exact_pin_version(pin).unwrap_or_else(|| pin.trim())
 }

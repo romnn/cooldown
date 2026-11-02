@@ -1233,11 +1233,19 @@ fn two_field_fixture(pin: &str) -> Fixture {
             &[],
         )
         .expect_success();
+    // The lock records the canonical version, never the pin's `=` or `v` spelling.
     assert_eq!(
         package_lock_version(&fixture, "chalk").as_deref(),
-        Some(pin)
+        Some(pinned_version(pin))
     );
     fixture
+}
+
+/// The version an exact `pin` names, its `=`, spacing, and `v` prefix stripped (`= v4.1.0` →
+/// `4.1.0`).
+fn pinned_version(pin: &str) -> &str {
+    let unequal = pin.trim().trim_start_matches('=').trim_start();
+    unequal.strip_prefix('v').unwrap_or(unequal)
 }
 
 fn declared_chalk(fixture: &Fixture, field: &str) -> String {
@@ -1257,7 +1265,21 @@ fn declared_chalk(fixture: &Fixture, field: &str) -> String {
 #[test]
 fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
     skip_if_missing!("npm");
-    let fixture = two_field_fixture("4.1.0");
+    assert_hidden_pin_holds_until_rewrite("4.1.0", "");
+}
+
+/// A `v`-prefixed pin is held up front like a bare one, rather than widened to a caret and refused
+/// after the resolve, and `--rewrite` rewrites it to the bare target.
+#[test]
+fn upgrade_holds_a_v_prefixed_hidden_exact_pin_until_rewrite() {
+    skip_if_missing!("npm");
+    assert_hidden_pin_holds_until_rewrite("v4.1.0", "");
+}
+
+/// Runs the hidden-pin upgrade against a `devDependencies` pin spelled `pin`, expecting the
+/// authorized rewrite to write `rewritten` before the target, and a second run to change nothing.
+fn assert_hidden_pin_holds_until_rewrite(pin: &str, rewritten: &str) {
+    let fixture = two_field_fixture(pin);
     let manifest_before = fixture.read_bytes("package.json");
     let lock_before = fixture.read_bytes("package-lock.json");
 
@@ -1270,21 +1292,48 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
     assert_eq!(held.summary_applied(), 0, "{held:#?}");
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
     assert!(
-        detail.contains("the exact pin 4.1.0 in devDependencies of package.json excludes"),
+        detail.contains(&format!(
+            "the exact pin {pin} in devDependencies of package.json excludes"
+        )),
         "{detail}"
     );
     assert!(detail.contains("--rewrite"), "{detail}");
     assert_eq!(manifest_before, fixture.read_bytes("package.json"));
     assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
 
-    let rewritten = fixture.cooldown_json(&["upgrade", "--rewrite", "--freeze", FREEZE]);
+    let rewritten_run = fixture.cooldown_json(&["upgrade", "--rewrite", "--freeze", FREEZE]);
     assert!(
-        rewritten.applied_names().contains("chalk"),
-        "{rewritten:#?}"
+        rewritten_run.applied_names().contains("chalk"),
+        "{rewritten_run:#?}"
     );
     let target = package_lock_version(&fixture, "chalk").expect("chalk is locked");
-    assert_ne!(target, "4.1.0");
-    assert_eq!(declared_chalk(&fixture, "devDependencies"), target);
+    assert_ne!(target, pinned_version(pin));
+    assert_eq!(
+        declared_chalk(&fixture, "devDependencies"),
+        format!("{rewritten}{target}")
+    );
+
+    // Convergence: neither a plain run nor the authorized rewrite moves the rewritten pin again.
+    let manifest_after = fixture.read_bytes("package.json");
+    let lock_after = fixture.read_bytes("package-lock.json");
+    for args in [
+        &["upgrade", "--freeze", FREEZE][..],
+        &["upgrade", "--rewrite", "--freeze", FREEZE][..],
+    ] {
+        let second = fixture.cooldown_json(args);
+        assert!(second.ok(), "{args:?}: {second:#?}");
+        assert_eq!(second.summary_applied(), 0, "{args:?}: {second:#?}");
+        assert_eq!(
+            manifest_after,
+            fixture.read_bytes("package.json"),
+            "{args:?}"
+        );
+        assert_eq!(
+            lock_after,
+            fixture.read_bytes("package-lock.json"),
+            "{args:?}"
+        );
+    }
 }
 
 /// A plain `fix` holds a downgrade off a too-fresh exact pin in `devDependencies`, naming
@@ -1293,7 +1342,22 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
 #[test]
 fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     skip_if_missing!("npm");
-    let fixture = two_field_fixture("4.1.2");
+    assert_hidden_pin_downgrades_only_with_downgrade_pinned("4.1.2", "");
+}
+
+/// A spaced `= v` pin is held and downgraded like a bare one, and `--downgrade-pinned` keeps it an
+/// `=` equality.
+#[test]
+fn fix_downgrades_a_spaced_hidden_exact_pin_only_with_downgrade_pinned() {
+    skip_if_missing!("npm");
+    assert_hidden_pin_downgrades_only_with_downgrade_pinned("= v4.1.2", "=");
+}
+
+/// Runs the hidden-pin `fix` against a too-fresh `devDependencies` pin spelled `pin`, expecting
+/// `--downgrade-pinned` to write `rewritten` before the matured version, and a second strict run
+/// to pass without changes.
+fn assert_hidden_pin_downgrades_only_with_downgrade_pinned(pin: &str, rewritten: &str) {
+    let fixture = two_field_fixture(pin);
     let manifest_before = fixture.read_bytes("package.json");
     let lock_before = fixture.read_bytes("package-lock.json");
 
@@ -1307,7 +1371,9 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
     assert!(
-        detail.contains("the exact pin 4.1.2 in devDependencies of package.json excludes 4.1.1"),
+        detail.contains(&format!(
+            "the exact pin {pin} in devDependencies of package.json excludes 4.1.1"
+        )),
         "{held:#?}"
     );
     assert!(detail.contains("--downgrade-pinned"), "{detail}");
@@ -1328,8 +1394,40 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
         Some("4.1.1"),
         "{fixed:#?}"
     );
-    assert_eq!(declared_chalk(&fixture, "devDependencies"), "4.1.1");
+    assert_eq!(
+        declared_chalk(&fixture, "devDependencies"),
+        format!("{rewritten}4.1.1")
+    );
     assert_eq!(declared_chalk(&fixture, "dependencies"), "^4.1.0");
+
+    // Convergence: the downgraded pin passes a second strict run untouched, with or without the
+    // authority that rewrote it.
+    let manifest_after = fixture.read_bytes("package.json");
+    let lock_after = fixture.read_bytes("package-lock.json");
+    for args in [
+        &["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE][..],
+        &[
+            "fix",
+            "--strict",
+            "--downgrade-pinned",
+            "--freeze",
+            HIDDEN_PIN_FIX_FREEZE,
+        ][..],
+    ] {
+        let second = fixture.cooldown_json(args);
+        assert!(second.ok(), "{args:?}: {second:#?}");
+        assert_eq!(second.summary_applied(), 0, "{args:?}: {second:#?}");
+        assert_eq!(
+            manifest_after,
+            fixture.read_bytes("package.json"),
+            "{args:?}"
+        );
+        assert_eq!(
+            lock_after,
+            fixture.read_bytes("package-lock.json"),
+            "{args:?}"
+        );
+    }
 }
 
 /// A workspace member pinning `chalk` exactly in `devDependencies` beside the caret npm also

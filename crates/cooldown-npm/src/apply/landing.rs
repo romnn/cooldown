@@ -1138,4 +1138,139 @@ mod tests {
         );
         Ok(())
     }
+
+    /// node-semver's `v`-prefixed and spaced spellings of an exact pin, each with the prefix an
+    /// authorized rewrite keeps: a bare spelling becomes the bare target, an `=` one `=target`.
+    const PREFIXED_PIN_SPELLINGS: [(&str, &str); 3] = [("v", ""), ("=v", "="), ("= v", "=")];
+
+    /// The npm landing of `change` in [`project_declaring_twice`] with `second` as the pin, and
+    /// the manifest it leaves.
+    fn npm_landing_of(
+        second: &str,
+        change: &Change,
+        mode: RewriteMode,
+        rewrite_pins: bool,
+    ) -> eyre::Result<(LandingPlan, String)> {
+        let DeclaredProject {
+            guard: _guard,
+            project,
+        } = project_declaring_twice(second)?;
+        let plan = candidate_landing::<Npm>(&project, change, mode, rewrite_pins)?;
+        Ok((plan, std::fs::read_to_string(&project.manifest)?))
+    }
+
+    /// The `devDependencies` pin `manifest` declares.
+    fn declared_pin(manifest: &str) -> eyre::Result<String> {
+        let doc: serde_json::Value = serde_json::from_str(manifest)?;
+        doc.pointer("/devDependencies/nanoid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| eyre::eyre!("no pin in {manifest}"))
+    }
+
+    /// A `v`-prefixed or spaced exact pin holds npm, yarn, and bun like a bare one, naming the pin
+    /// as written and leaving the manifest byte-identical, and the permission to rewrite pins does
+    /// not release an upgrade.
+    #[test]
+    fn a_prefixed_hidden_pin_holds_npm_yarn_and_bun() -> eyre::Result<()> {
+        fn assert_held<L: NodeLock>(spelling: &str, rewrite_pins: bool) -> eyre::Result<()> {
+            let DeclaredProject {
+                guard: _guard,
+                project,
+            } = project_declaring_twice(&format!("{spelling}3.1.0"))?;
+            let before = std::fs::read_to_string(&project.manifest)?;
+            let upgrade = change("nanoid", "3.1.0", "3.3.0");
+
+            let LandingPlan::PinHeld { detail } =
+                candidate_landing::<L>(&project, &upgrade, RewriteMode::Auto, rewrite_pins)?
+            else {
+                eyre::bail!("{} {spelling}: the pin was not held", L::ID.as_str())
+            };
+
+            assert_eq!(
+                detail,
+                format!(
+                    "the exact pin {spelling}3.1.0 in devDependencies of package.json excludes \
+                     3.3.0; pass --rewrite to rewrite it, or edit the pin"
+                ),
+                "{}",
+                L::ID.as_str()
+            );
+            assert_eq!(std::fs::read_to_string(&project.manifest)?, before);
+            Ok(())
+        }
+        for (spelling, _) in PREFIXED_PIN_SPELLINGS {
+            for rewrite_pins in [false, true] {
+                assert_held::<Npm>(spelling, rewrite_pins)?;
+                assert_held::<crate::lock::Yarn>(spelling, rewrite_pins)?;
+                assert_held::<crate::lock::Bun>(spelling, rewrite_pins)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Only an explicit authority rewrites a prefixed pin, and the rewrite keeps it exact, never a
+    /// caret: `--rewrite` for an upgrade, `fix --downgrade-pinned` for a downgrade.
+    /// A prefixed pin already at the target is left verbatim, even by the shift that steers npm's
+    /// relock.
+    #[test]
+    fn a_prefixed_hidden_pin_is_rewritten_exactly_under_authority() -> eyre::Result<()> {
+        let upgrade = change("nanoid", "3.1.0", "3.3.0");
+        let downgrade = Change {
+            downgrade: true,
+            ..change("nanoid", "3.3.0", "3.1.0")
+        };
+        for (spelling, rewritten) in PREFIXED_PIN_SPELLINGS {
+            let (plan, manifest) = npm_landing_of(
+                &format!("{spelling}3.1.0"),
+                &upgrade,
+                RewriteMode::Always,
+                false,
+            )?;
+            assert!(matches!(plan, LandingPlan::Land { .. }), "{spelling}");
+            assert_eq!(declared_pin(&manifest)?, format!("{rewritten}3.3.0"));
+
+            let (plan, manifest) = npm_landing_of(
+                &format!("{spelling}3.3.0"),
+                &downgrade,
+                RewriteMode::Auto,
+                false,
+            )?;
+            let LandingPlan::PinHeld { detail } = plan else {
+                eyre::bail!("{spelling}: the downgrade rewrote the pin without permission")
+            };
+            assert!(
+                detail.contains("rerun fix with --downgrade-pinned"),
+                "{detail}"
+            );
+            assert_eq!(declared_pin(&manifest)?, format!("{spelling}3.3.0"));
+
+            let (plan, manifest) = npm_landing_of(
+                &format!("{spelling}3.3.0"),
+                &downgrade,
+                RewriteMode::Auto,
+                true,
+            )?;
+            assert!(matches!(plan, LandingPlan::Land { .. }), "{spelling}");
+            assert_eq!(declared_pin(&manifest)?, format!("{rewritten}3.1.0"));
+            assert!(
+                manifest.contains(r#""dependencies": { "nanoid": "^3.0.0" }"#),
+                "{manifest}"
+            );
+
+            let (plan, manifest) = npm_landing_of(
+                &format!("{spelling}3.3.0"),
+                &upgrade,
+                RewriteMode::Auto,
+                false,
+            )?;
+            assert!(matches!(plan, LandingPlan::Land { .. }), "{spelling}");
+            assert_eq!(declared_pin(&manifest)?, format!("{spelling}3.3.0"));
+            assert!(
+                manifest.contains(r#""dependencies": { "nanoid": "^3.3.0" }"#),
+                "the relock is still steered by the shifted caret: {manifest}"
+            );
+        }
+        Ok(())
+    }
 }

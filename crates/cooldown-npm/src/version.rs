@@ -34,6 +34,8 @@ pub fn parse(v: &str) -> Option<Version> {
 /// Rust parser would assume an implicit caret for both. [`normalized_requirement`] translates each
 /// clause accordingly before parsing; operator-led partials need no translation (the parser's
 /// `>I.J`-style desugarings already match node-semver's X-range rules).
+/// A whole exact pin is read in every spelling node-semver accepts (`v1.2.3`, `=v1.2.3`,
+/// `= v1.2.3`), the `v` prefix nowhere else.
 ///
 /// Conservative by design: whitespace-separated comparator clauses are normalized into the
 /// parser's comma-separated `AND` form, while ranges it still cannot represent (npm hyphen ranges,
@@ -51,6 +53,8 @@ pub fn parse(v: &str) -> Option<Version> {
 /// // npm token semantics: a bare version is an equality, a bare partial an X-range.
 /// assert!(!version_in_range("3.0.0", "3.4.1"));
 /// assert!(version_in_range("3.4", "3.4.1"));
+/// // node-semver's prefixed and spaced exact pins name the same version.
+/// assert!(version_in_range("= v3.4.1", "3.4.1"));
 /// assert!(!version_in_range("workspace:*", "3.4.1")); // unrepresentable → rewrite
 /// ```
 #[must_use]
@@ -133,7 +137,18 @@ fn branch_admits(branch: &str, target: &Version) -> Option<bool> {
     Some(requirement.matches(target))
 }
 
+/// Translates a whole `spec` into the Rust parser's comma-separated syntax, or [`None`] for a form
+/// it cannot represent.
+///
+/// A whole exact pin in any spelling node-semver reads ([`exact_pin_version`]) becomes its plain
+/// equality first, since the Rust parser rejects the `v` prefix and a space after `=`.
+/// Only the exact pin is read this loosely: node-semver also accepts `^v1.2.3`, `>=v1`, and `v1.x`,
+/// but those stay unrepresentable here, so their callers keep the conservative fallback instead of
+/// reinterpreting peer proofs, explicit bounds, and widen eligibility.
 fn normalized_requirement(spec: &str) -> Option<String> {
+    if let Some(version) = exact_pin_version(spec) {
+        return Some(format!("={version}"));
+    }
     let spec = spec.trim();
     if spec.contains("||") || spec.contains(" - ") {
         return None;
@@ -230,24 +245,22 @@ pub fn most_restrictive_declared_bound(ranges: impl IntoIterator<Item = String>)
     best.map(|(_, range)| range)
 }
 
-/// Whether an npm/pnpm specifier is an exact pin: a bare version (`2.11.0`, `1.0.0-rc.1`) or single
-/// equals range (`=2.11.0`) with no range operator, wildcard, or union. A pinned dependency cannot
-/// move without editing the manifest.
+/// Whether an npm/pnpm specifier is an exact pin, in any spelling [`exact_pin_version`] reads: a
+/// bare version (`2.11.0`, `1.0.0-rc.1`, `v2.11.0`) or a single `=` equality (`=2.11.0`,
+/// `= v2.11.0`) with no range operator, wildcard, or union.
+/// A pinned dependency cannot move without editing the manifest.
+///
+/// Classification, matching ([`version_in_range`]), and the widen share this one grammar, so a pin
+/// that is held here is also judged and rewritten as exact.
 pub(crate) fn is_exact_npm_specifier(specifier: &str) -> bool {
-    let specifier = specifier.trim();
-    let specifier = specifier
-        .strip_prefix('=')
-        .filter(|version| !version.starts_with('='))
-        .map_or(specifier, str::trim);
-    Version::parse(specifier).is_ok()
+    exact_pin_version(specifier).is_some()
 }
 
 /// The version an exact npm pin names, as node-semver reads it: a bare version or a single `=`
 /// equality, each optionally spaced and `v`-prefixed (`= v1.2.3` → `1.2.3`); `None` for any other
 /// specifier.
 ///
-/// [`is_exact_npm_specifier`] stays narrower because its callers feed the specifier to
-/// [`version_in_range`] and the widen, neither of which reads a `v` prefix.
+/// Only a lowercase `v` directly before the version is read, as node-semver's strict grammar does.
 pub(crate) fn exact_pin_version(specifier: &str) -> Option<&str> {
     let trimmed = specifier.trim();
     let unequal = trimmed.strip_prefix('=').map_or(trimmed, str::trim_start);
@@ -293,6 +306,7 @@ pub enum CeilingHold {
 /// assert_eq!(ceiling_hold("~7.3.0", "7.4.0"), Some(CeilingHold::WithinLine));
 /// assert_eq!(ceiling_hold("^21.0.0", "20.14.6"), Some(CeilingHold::BelowFloor));
 /// assert_eq!(ceiling_hold("20.14.5", "21.0.4"), Some(CeilingHold::ExactPin));
+/// assert_eq!(ceiling_hold("= v20.14.5", "21.0.4"), Some(CeilingHold::ExactPin));
 /// assert_eq!(ceiling_hold(">=20 <21", "21.0.4"), Some(CeilingHold::NotPlain));
 /// ```
 #[must_use]
@@ -561,6 +575,97 @@ mod tests {
         assert_eq!(range_match("latest", "1.0.0"), RangeMatch::Unknown);
     }
 
+    /// node-semver reads `v1.2.3`, `=v1.2.3` and `= v1.2.3` as the same exact version as `1.2.3`,
+    /// so every spelling is classified, matched, and held as an exact pin.
+    #[test]
+    fn every_exact_pin_spelling_is_one_exact_version() {
+        use RangeMatch::{Excludes, Matches};
+        for (spelling, version) in [
+            ("1.2.3", "1.2.3"),
+            ("=1.2.3", "1.2.3"),
+            ("v1.2.3", "1.2.3"),
+            ("=v1.2.3", "1.2.3"),
+            ("= v1.2.3", "1.2.3"),
+            ("  =   v1.2.3 ", "1.2.3"),
+            ("v1.0.0-rc.1", "1.0.0-rc.1"),
+            ("= v1.0.0-rc.1", "1.0.0-rc.1"),
+            ("v1.2.3+build.7", "1.2.3+build.7"),
+            ("=v1.2.3+build.7", "1.2.3+build.7"),
+        ] {
+            assert!(is_exact_npm_specifier(spelling), "{spelling}");
+            assert_eq!(exact_pin_version(spelling), Some(version), "{spelling}");
+            assert!(version_in_range(spelling, version), "{spelling}");
+            assert_eq!(range_match(spelling, version), Matches, "{spelling}");
+            assert!(!version_in_range(spelling, "1.2.4"), "{spelling}");
+            assert_eq!(range_match(spelling, "1.2.4"), Excludes, "{spelling}");
+            assert_eq!(
+                ceiling_hold(spelling, "2.0.0"),
+                Some(CeilingHold::ExactPin),
+                "{spelling}"
+            );
+        }
+        // npm ignores build metadata when matching, on either side.
+        assert!(version_in_range("v1.2.3", "1.2.3+build.7"));
+        assert!(version_in_range("= v1.2.3+build.7", "1.2.3"));
+        // A prerelease pin is exact too: the stable release is outside it.
+        assert!(!version_in_range("v1.0.0-rc.1", "1.0.0"));
+        assert_eq!(range_match("= v1.0.0-rc.1", "1.0.0"), Excludes);
+    }
+
+    /// Only a whole exact pin reads a `v` prefix: a partial, wildcard, protocol, union, or a
+    /// malformed prefix is no exact pin, and the operator-led `v` forms node-semver also accepts
+    /// (`^v1.2.3`, `>=v1`, `v1.x`) stay unrepresentable, so their callers keep the conservative
+    /// fallback.
+    #[test]
+    fn only_a_whole_exact_pin_reads_a_v_prefix() {
+        for not_exact in [
+            "v1",
+            "v1.2",
+            "v1.x",
+            "=v1.2",
+            "^v1.2.3",
+            "~v1.2.3",
+            ">=v1",
+            ">=v1.2.3",
+            "v1.2.3 || v1.2.4",
+            "v1.2.3 - v1.2.4",
+            "==1.2.3",
+            "==v1.2.3",
+            "v=1.2.3",
+            "vv1.2.3",
+            "V1.2.3",
+            "v 1.2.3",
+            "=v 1.2.3",
+            "v1.2.3.4",
+            "npm:chalk@v1.2.3",
+            "workspace:v1.2.3",
+            "*",
+            "",
+            "latest",
+        ] {
+            assert!(!is_exact_npm_specifier(not_exact), "{not_exact}");
+            assert_eq!(exact_pin_version(not_exact), None, "{not_exact}");
+            assert_ne!(
+                ceiling_hold(not_exact, "2.0.0"),
+                Some(CeilingHold::ExactPin),
+                "{not_exact}"
+            );
+        }
+        for unrepresentable in ["^v1.2.3", "~v1.2.3", ">=v1", "v1.x", "v1.2"] {
+            assert!(
+                !version_in_range(unrepresentable, "1.2.3"),
+                "{unrepresentable}"
+            );
+            assert_eq!(
+                range_match(unrepresentable, "1.2.3"),
+                RangeMatch::Unknown,
+                "{unrepresentable}"
+            );
+        }
+        // Registry versions stay strict SemVer.
+        assert!(parse("v1.2.3").is_none());
+    }
+
     #[test]
     fn range_match_distinguishes_proof_from_ignorance() {
         use RangeMatch::{Excludes, Matches, Unknown};
@@ -577,6 +682,13 @@ mod tests {
         assert_eq!(range_match("workspace:*", "1.0.0"), Unknown);
         // An unparsable target proves nothing either.
         assert_eq!(range_match("^1.0.0", "not-a-version"), Unknown);
+        // Each union branch that is a whole exact pin is read in any spelling, so the union is
+        // judged in full; a branch with an operator-led `v` stays unrepresentable.
+        assert_eq!(range_match("v1.2.3 || = v1.2.4", "1.2.4"), Matches);
+        assert_eq!(range_match("v1.2.3 || = v1.2.4", "1.2.5"), Excludes);
+        assert_eq!(range_match("v1.2.3 || ^v2.0.0", "1.2.4"), Unknown);
+        // The union-free matcher never reads a union, whatever its branches.
+        assert!(!version_in_range("v1.2.3 || = v1.2.4", "1.2.4"));
     }
 
     #[test]

@@ -8,7 +8,6 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, MemberRef, Result, RewriteMode};
-use semver::Version;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
@@ -679,9 +678,26 @@ fn widen_manifest(
 /// Build metadata on `target` (`1.2.3+build` → `1.2.3`) is stripped first: npm's semver ignores it in
 /// range matching, so carrying it into the declared range would be meaningless noise. A prerelease
 /// segment (`-rc1`) is kept — unlike build metadata, it is significant to a range.
+///
+/// An exact pin in any spelling node-semver reads ([`crate::version::exact_pin_version`]) stays
+/// exact, with its spelling normalized: a bare `1.2.3` or `v1.2.3` becomes the bare target, and an
+/// `=` equality (`=v1.2.3`, `= v1.2.3`) becomes `=target`.
+/// A pin already admitting `target` is returned verbatim, so a rewrite that only shifts ranges
+/// never respells a pin it did not need to move.
 fn bump_range(old: &str, target: &str) -> String {
     let target = target.split_once('+').map_or(target, |(base, _)| base);
     let trimmed = old.trim();
+    // This runs before the whitespace fallback, which would turn a spaced `= v1.2.3` into a caret.
+    if crate::version::exact_pin_version(trimmed).is_some() {
+        if crate::version::version_in_range(trimmed, target) {
+            return old.to_string();
+        }
+        return if trimmed.starts_with('=') {
+            format!("={target}")
+        } else {
+            target.to_string()
+        };
+    }
     // A wildcard is judged by version component, so a prerelease tag that merely contains an
     // `x` (`~20.0.0-next.1`) keeps its operator.
     let wildcard =
@@ -706,11 +722,7 @@ fn bump_range(old: &str, target: &str) -> String {
             return format!("{op}{target}");
         }
     }
-    if Version::parse(trimmed).is_ok() {
-        target.to_string()
-    } else {
-        format!("^{target}")
-    }
+    format!("^{target}")
 }
 
 /// Replace the string value of `name` within the top-level `field` object, returning the rewritten
@@ -1257,6 +1269,115 @@ mod tests {
         assert_eq!(bump_range("3.0.0", "3.3.0+build.7"), "3.3.0");
         assert_eq!(bump_range("<4.0.0", "5.0.0+build.7"), "^5.0.0");
         assert_eq!(bump_range("3.0.0", "2.0.0-rc1+build.5"), "2.0.0-rc1");
+    }
+
+    /// An exact pin in any node-semver spelling stays exact when rewritten, never a caret: a bare
+    /// spelling becomes the bare target, an `=` spelling `=target`, the target's prerelease kept
+    /// and its build metadata stripped.
+    /// A pin already admitting the target keeps its spelling.
+    #[test]
+    fn bump_range_keeps_every_exact_pin_spelling_exact() {
+        for (old, target, bumped) in [
+            ("1.2.3", "1.3.0", "1.3.0"),
+            ("v1.2.3", "1.3.0", "1.3.0"),
+            ("=1.2.3", "1.3.0", "=1.3.0"),
+            ("=v1.2.3", "1.3.0", "=1.3.0"),
+            ("= v1.2.3", "1.3.0", "=1.3.0"),
+            (" =  v1.2.3 ", "1.3.0", "=1.3.0"),
+            ("v1.2.3", "2.0.0-rc.1+build.5", "2.0.0-rc.1"),
+            ("= v1.2.3", "1.3.0+build.7", "=1.3.0"),
+            ("v1.0.0-rc.1", "1.0.0", "1.0.0"),
+            ("v1.2.3", "1.2.2", "1.2.2"),
+            ("v1.2.3", "1.2.3", "v1.2.3"),
+            ("= v1.2.3", "1.2.3+build.7", "= v1.2.3"),
+            ("v1.2.3+build.1", "1.2.3", "v1.2.3+build.1"),
+        ] {
+            assert_eq!(bump_range(old, target), bumped, "{old} -> {target}");
+        }
+        // Operator-led `v` forms are no exact pin and keep the conservative caret fallback.
+        assert_eq!(bump_range("^v1.2.3", "1.3.0"), "^1.3.0");
+        assert_eq!(bump_range(">= v1.2.3", "1.3.0"), "^1.3.0");
+    }
+
+    /// A prefixed or spaced exact pin is found, discovered as a protected pin, and widened like a
+    /// bare one: held when it excludes the target, kept verbatim under Auto when it admits it, and
+    /// rewritten exact under Always.
+    #[test]
+    fn prefixed_exact_pins_are_found_and_widened_as_exact() -> color_eyre::eyre::Result<()> {
+        for (spelling, rewritten) in [("v", ""), ("=v", "="), ("= v", "=")] {
+            let dir = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+                .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temp dir {}", path.display()))?;
+            let content = indoc::formatdoc! {r#"
+                {{
+                  "dependencies": {{ "dep": "^20.11.1" }},
+                  "devDependencies": {{ "dep": "{spelling}20.14.5" }},
+                  "optionalDependencies": {{ "opt": "{spelling}1.0.0" }},
+                  "peerDependencies": {{ "peer": "{spelling}2.0.0" }}
+                }}
+            "#};
+            std::fs::write(root.join("package.json"), &content)?;
+            let pin = format!("{spelling}20.14.5");
+
+            assert_eq!(
+                excluding_exact_pin(&root, &[], "dep", "20.14.6")
+                    .map_err(|unreadable| unreadable.error)?,
+                Some(ExcludingPin {
+                    manifest: "package.json".to_string(),
+                    field: "devDependencies",
+                    range: pin.clone(),
+                }),
+                "{spelling}"
+            );
+            assert_eq!(
+                excluding_exact_pin(&root, &[], "dep", "20.14.5")
+                    .map_err(|unreadable| unreadable.error)?,
+                None,
+                "{spelling}: a pin at the target excludes nothing"
+            );
+            let declared: Vec<(&str, String, String)> = exact_install_declarations(".", &content)?
+                .into_iter()
+                .map(|ExactDeclaration { key, pin }| (key.field, key.dependency, pin))
+                .collect();
+            assert_eq!(
+                declared,
+                [
+                    ("devDependencies", "dep".to_string(), pin.clone()),
+                    (
+                        "optionalDependencies",
+                        "opt".to_string(),
+                        format!("{spelling}1.0.0")
+                    ),
+                ],
+                "{spelling}: install pins only, the peer contract aside"
+            );
+            assert_eq!(
+                declared_ranges(&root.join("package.json"), "dep")?,
+                ["^20.11.1".to_string(), pin.clone()],
+                "{spelling}: declarations keep their spelling"
+            );
+
+            let auto = widen_constraints(&root, &[], "dep", "20.14.5", RewriteMode::Auto)?;
+            assert!(auto.rewritten.is_empty(), "{spelling}");
+            assert_eq!(std::fs::read_to_string(root.join("package.json"))?, content);
+
+            let always = widen_constraints(&root, &[], "dep", "20.14.6", RewriteMode::Always)?;
+            let replacements: Vec<(&str, &str)> = always
+                .rewritten
+                .iter()
+                .map(|declaration| (declaration.key.field, declaration.replacement.as_str()))
+                .collect();
+            let exact = format!("{rewritten}20.14.6");
+            assert_eq!(
+                replacements,
+                [
+                    ("dependencies", "^20.14.6"),
+                    ("devDependencies", exact.as_str())
+                ],
+                "{spelling}"
+            );
+        }
+        Ok(())
     }
 
     /// The root manifest is an owner only when the root importer is attributed: with members

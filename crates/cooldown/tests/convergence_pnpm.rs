@@ -1728,7 +1728,22 @@ const HIDDEN_PIN_SEED: &str = "2021-01-01T00:00:00Z";
 #[test]
 fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
     skip_if_missing!("pnpm");
-    let fixture = two_field_fixture("4.1.0", HIDDEN_PIN_SEED);
+    assert_hidden_pin_holds_until_rewrite("4.1.0", "");
+}
+
+/// A spaced `= v` pin is held up front like a bare one, rather than widened to a caret and refused
+/// after the resolve, and `--rewrite` keeps it an `=` equality.
+#[test]
+fn upgrade_holds_a_spaced_hidden_exact_pin_until_rewrite() {
+    skip_if_missing!("pnpm");
+    assert_hidden_pin_holds_until_rewrite("= v4.1.0", "=");
+}
+
+/// Runs the hidden-pin upgrade against a `devDependencies` pin spelled `pin` of chalk 4.1.0,
+/// expecting the authorized rewrite to write `rewritten` before the target, and a second run to
+/// change nothing.
+fn assert_hidden_pin_holds_until_rewrite(pin: &str, rewritten: &str) {
+    let fixture = two_field_fixture(pin, HIDDEN_PIN_SEED);
     let seed = fixture.read_bytes("pnpm-lock.yaml");
     let manifest = fixture.read_bytes("pkgs/a/package.json");
     assert_eq!(
@@ -1744,12 +1759,15 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
         "{held:#?}"
     );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
-    assert!(detail.contains("the exact pin 4.1.0 excludes"), "{detail}");
+    assert!(
+        detail.contains(&format!("the exact pin {pin} excludes")),
+        "{detail}"
+    );
     assert!(detail.contains("--rewrite"), "{detail}");
     assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
     assert_eq!(fixture.read_bytes("pkgs/a/package.json"), manifest);
 
-    let rewritten = fixture.cooldown_json(&[
+    let rewritten_run = fixture.cooldown_json(&[
         "upgrade",
         "--rewrite",
         "--package",
@@ -1757,22 +1775,50 @@ fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
         "--freeze",
         FREEZE,
     ]);
-    assert!(rewritten.ok(), "{rewritten:#?}");
+    assert!(rewritten_run.ok(), "{rewritten_run:#?}");
     assert_eq!(
-        rewritten.applied_names(),
+        rewritten_run.applied_names(),
         std::collections::BTreeSet::from(["chalk".to_string()]),
-        "{rewritten:#?}"
+        "{rewritten_run:#?}"
     );
     let target = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
         .get("chalk")
         .cloned()
         .expect("chalk is locked");
     assert_ne!(target, "4.1.0");
-    assert_eq!(member_chalk_range(&fixture, "devDependencies"), target);
+    assert_eq!(
+        member_chalk_range(&fixture, "devDependencies"),
+        format!("{rewritten}{target}")
+    );
     assert_eq!(
         member_chalk_range(&fixture, "dependencies"),
         format!("^{target}")
     );
+
+    // Convergence: neither a plain run nor the authorized rewrite moves the rewritten pin again.
+    let lock_after = fixture.read_bytes("pnpm-lock.yaml");
+    let manifest_after = fixture.read_bytes("pkgs/a/package.json");
+    for args in [
+        &["upgrade", "--package", "chalk", "--freeze", FREEZE][..],
+        &[
+            "upgrade",
+            "--rewrite",
+            "--package",
+            "chalk",
+            "--freeze",
+            FREEZE,
+        ][..],
+    ] {
+        let second = fixture.cooldown_json(args);
+        assert!(second.ok(), "{args:?}: {second:#?}");
+        assert_eq!(second.summary_applied(), 0, "{args:?}: {second:#?}");
+        assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), lock_after, "{args:?}");
+        assert_eq!(
+            fixture.read_bytes("pkgs/a/package.json"),
+            manifest_after,
+            "{args:?}"
+        );
+    }
 }
 
 /// A cutoff after chalk 4.1.1 and before 4.1.2, so a 4.1.2 seed is too fresh and 4.1.1 is the
@@ -1785,7 +1831,22 @@ const HIDDEN_PIN_FIX_FREEZE: &str = "2021-06-01T00:00:00Z";
 #[test]
 fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     skip_if_missing!("pnpm");
-    let fixture = two_field_fixture("4.1.2", CARET_SPELLING_SEED);
+    assert_hidden_pin_downgrades_only_with_downgrade_pinned("4.1.2", "");
+}
+
+/// A `v`-prefixed pin is held and downgraded like a bare one, and `--downgrade-pinned` rewrites it
+/// to the bare matured version.
+#[test]
+fn fix_downgrades_a_v_prefixed_hidden_exact_pin_only_with_downgrade_pinned() {
+    skip_if_missing!("pnpm");
+    assert_hidden_pin_downgrades_only_with_downgrade_pinned("v4.1.2", "");
+}
+
+/// Runs the hidden-pin `fix` against a too-fresh `devDependencies` pin spelled `pin` of chalk
+/// 4.1.2, expecting `--downgrade-pinned` to write `rewritten` before the matured version, and a
+/// second strict run to pass without changes.
+fn assert_hidden_pin_downgrades_only_with_downgrade_pinned(pin: &str, rewritten: &str) {
+    let fixture = two_field_fixture(pin, CARET_SPELLING_SEED);
     let seed = fixture.read_bytes("pnpm-lock.yaml");
     let manifest = fixture.read_bytes("pkgs/a/package.json");
     assert_eq!(
@@ -1803,7 +1864,7 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     );
     let detail = held.skip_detail_for("chalk").unwrap_or_default();
     assert!(
-        detail.contains("the exact pin 4.1.2 excludes 4.1.1"),
+        detail.contains(&format!("the exact pin {pin} excludes 4.1.1")),
         "{held:#?}"
     );
     assert!(detail.contains("--downgrade-pinned"), "{detail}");
@@ -1826,8 +1887,36 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
         Some("4.1.1"),
         "{fixed:#?}"
     );
-    assert_eq!(member_chalk_range(&fixture, "devDependencies"), "4.1.1");
+    assert_eq!(
+        member_chalk_range(&fixture, "devDependencies"),
+        format!("{rewritten}4.1.1")
+    );
     assert_eq!(member_chalk_range(&fixture, "dependencies"), "^4.1.0");
+
+    // Convergence: the downgraded pin passes a second strict run untouched, with or without the
+    // authority that rewrote it.
+    let lock_after = fixture.read_bytes("pnpm-lock.yaml");
+    let manifest_after = fixture.read_bytes("pkgs/a/package.json");
+    for args in [
+        &["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE][..],
+        &[
+            "fix",
+            "--strict",
+            "--downgrade-pinned",
+            "--freeze",
+            HIDDEN_PIN_FIX_FREEZE,
+        ][..],
+    ] {
+        let second = fixture.cooldown_json(args);
+        assert!(second.ok(), "{args:?}: {second:#?}");
+        assert_eq!(second.summary_applied(), 0, "{args:?}: {second:#?}");
+        assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), lock_after, "{args:?}");
+        assert_eq!(
+            fixture.read_bytes("pkgs/a/package.json"),
+            manifest_after,
+            "{args:?}"
+        );
+    }
 }
 
 /// The version importer `importer` of `lock` resolves `name` to, as its `version:` line records
